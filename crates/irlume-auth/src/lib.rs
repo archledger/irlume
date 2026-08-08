@@ -91,6 +91,35 @@ pub struct Engine {
     /// The gate treats `false` as "not seen yet", which is the fail-closed
     /// reading: the worst a stale `false` can do is ask for another gesture.
     gesture_seen_before_match: bool,
+    /// Consecutive dimming self-heals on ONE camera pairing, keyed by the same
+    /// `cameras.conf` identity string the stored verdict is written under (#100).
+    ///
+    /// Keyed rather than a bare count because [`Engine::set_devices`] repoints
+    /// the cameras at runtime: with a plain integer, two events gathered on a
+    /// dimming camera plus one on the camera that replaced it would demote a
+    /// pairing that produced a single event. Comparing the key makes that
+    /// structural instead of a rule someone must remember.
+    ///
+    /// IN MEMORY ONLY. A restart, a package upgrade or the post-panic rebuild
+    /// zeroes it, which only delays a switch: the self-heal keeps recovering the
+    /// frame meanwhile, so the cost of forgetting is one extra RGB capture per
+    /// login, not a failure. Persisting it would put a read-modify-fsync-rename
+    /// of `/etc/irlume/cameras.conf` on the login path for every dim frame, and
+    /// create a second on-disk source of truth beside the verdict it exists to
+    /// produce.
+    self_heals: Option<(String, u32)>,
+    /// Per-authentication latch for [`Engine::self_heals`]: `None` outside
+    /// [`Engine::authenticate_for`], `Some(false)` inside one that has not
+    /// counted yet, `Some(true)` once it has.
+    ///
+    /// Two jobs, both load-bearing. It SCOPES the tally to authentications, so
+    /// enrolment (which coaches the user through dozens of deliberately partial
+    /// poses), `identify`, and the liveness self-test cannot contribute. And it
+    /// DE-DUPLICATES within one authentication: the grace window retries every
+    /// presence-retryable outcome for up to 15s, and a self-heal can feed its own
+    /// retry by widening the capture skew past the cross-spectrum limit, so
+    /// without a latch a single bad login could book a whole streak in seconds.
+    auth_self_heal_counted: Option<bool>,
     /// Asked between whole captures: "should this long operation stop now?".
     ///
     /// The daemon points this at its arbiter so an enrolment yields the camera
@@ -728,12 +757,18 @@ fn sequential_capture_selected(rgb_dev: &str, ir_dev: &str) -> (bool, &'static s
 /// (ASUS) to 1.3 s (NexiGo) of capture latency, and only until a measured
 /// verdict is stored; enrollment now probes an unmeasured pair, so most
 /// installs leave this arm at their first enrollment (#340).
+/// The `mode_source` string [`capture_mode_decision`] returns when the operator
+/// set the env var. Named once so the guard that refuses to LEARN from an
+/// operator-forced mode binds to the same spelling that produces it, instead of
+/// two string literals that a rename would silently separate.
+const ENV_CAPTURE_MODE_SOURCE: &str = "IRLUME_SEQUENTIAL_CAPTURE";
+
 fn capture_mode_decision(
     env: Option<&str>,
     stored: Option<irlume_camera::CaptureMode>,
 ) -> (bool, &'static str) {
     match env {
-        Some(v) => (v.trim() == "1", "IRLUME_SEQUENTIAL_CAPTURE"),
+        Some(v) => (v.trim() == "1", ENV_CAPTURE_MODE_SOURCE),
         None => match stored {
             Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
             None => (true, "default"),
@@ -800,6 +835,292 @@ mod capture_mode_decision_tests {
     }
 }
 
+/// Consecutive dimming self-heals on one camera pairing before irlume stops
+/// asking that pairing to capture concurrently (#100).
+///
+/// THREE, CHOSEN BY THE REPO OWNER, NOT MEASURED. Every other number this rule
+/// leans on was earned on hardware and says so in its own doc comment
+/// ([`irlume_camera::CONCURRENT_SIGNAL_FLOOR`] at 0.80,
+/// [`irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS`] at 100.0, the NexiGo's
+/// measured 42-56% retention). Nothing in this repo has ever counted self-heal
+/// firings, because the only trace they leave is a `dlog!` that is off unless
+/// `IRLUME_LOG` is set, so there is no rate to fit a threshold to. That is
+/// precisely why every clause around this number errs toward UNDER-counting:
+/// not switching costs one extra RGB capture per login, which is the behaviour
+/// that already ships, while switching wrongly taxes every later capture.
+const SELF_HEAL_SWITCH_AFTER: u32 = 3;
+
+/// What one authentication observed about capturing both sensors at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureModeSignal {
+    /// The overlapped RGB frame lost the face AND arrived measurably dimmer
+    /// than the same camera's solo frame: the contention signature.
+    Dimming,
+    /// The overlapped RGB frame found the face on its own. Counter-evidence.
+    Clean,
+    /// Neither established: says nothing, changes nothing.
+    Inconclusive,
+}
+
+/// Did this self-heal measure the fault the switch exists for?
+///
+/// Pure over the two RGB frames the self-heal already holds, so the rule is
+/// testable without a camera. Two clauses, and BOTH are needed:
+///
+/// `recovered` alone is not the signature. `rgb_top.is_none() && ir_top.is_some()`
+/// is also the shape of a legitimate DARK login, which this codebase supports on
+/// purpose (see `uncertain_short_circuits`, observed live: rgb faces=0, ir
+/// faces=1 at 0.92). It is equally the shape of a user still walking up, where
+/// the solo recapture succeeds ~700ms later because the person stopped moving,
+/// not because the link went idle. Counting either would demote a healthy camera.
+///
+/// So the second clause asks the question the probe asks: did the overlapped
+/// frame arrive DIM? That is `CONCURRENT_SIGNAL_FLOOR`, applied to one round
+/// instead of the probe's six, which is what counting to three compensates for.
+/// The `CONCLUSIVE_SCENE_BRIGHTNESS` floor throws away the light level where the
+/// repo has already measured this reading to be worthless: the same NexiGo read
+/// 0.42-0.56 retention against a sequential arm at 117-143, then 0.91 an hour
+/// later in a dark room against an arm at 62. A dark scene hides the fault, so
+/// it must not be allowed to manufacture it either.
+fn self_heal_is_dimming(recovered: bool, concurrent_mean: f32, solo_mean: f32) -> bool {
+    recovered
+        && solo_mean >= irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS
+        && concurrent_mean < solo_mean * irlume_camera::CONCURRENT_SIGNAL_FLOOR
+}
+
+/// Fold one observation into the consecutive streak.
+///
+/// `Clean` resets to zero rather than merely not incrementing: a capture that
+/// found the face with both sensors running is direct counter-evidence, and an
+/// action that OVERWRITES an operator's measurement must not be reached by
+/// summing coincidences a healthy camera produced weeks apart.
+fn self_heal_streak(prev: u32, signal: CaptureModeSignal) -> u32 {
+    match signal {
+        CaptureModeSignal::Dimming => prev.saturating_add(1),
+        CaptureModeSignal::Clean => 0,
+        CaptureModeSignal::Inconclusive => prev,
+    }
+}
+
+/// Is a switch due? Pure over the two things that decide it.
+///
+/// An operator-forced mode is never learned from. `IRLUME_SEQUENTIAL_CAPTURE=0`
+/// is the only env value that can reach a self-heal at all (`=1` makes the
+/// capture sequential, and the self-heal only runs on concurrent captures), and
+/// [`capture_mode_decision`] already states the authority rule: a set env var
+/// "decides alone ... because setting it is an explicit instruction and the
+/// stored answer must not outrank it". Writing a persistent verdict inferred
+/// from a mode the operator forced for one debugging session inverts that rule
+/// from the other side: the write would sit inert while the var is set, then
+/// take effect the moment it is unset.
+fn capture_mode_switch_due(mode_source: &str, streak: u32) -> bool {
+    mode_source != ENV_CAPTURE_MODE_SOURCE && streak >= SELF_HEAL_SWITCH_AFTER
+}
+
+/// The one journal line the switch leaves behind, or `None` when there is
+/// nothing to say.
+///
+/// Pure over the write's outcome, so the wording AND the rule that a failed
+/// write never fails the login are both testable without a camera or root. The
+/// signature is the pin: this takes a `&Result` and returns text, so there is no
+/// way for the write's error to propagate into the authentication.
+fn capture_mode_switch_line(
+    events: u32,
+    stored: &irlume_common::Result<irlume_camera::StoreIfConcurrent>,
+) -> Option<String> {
+    match stored {
+        Ok(irlume_camera::StoreIfConcurrent::Stored) => Some(format!(
+            "capture mode switched to sequential for this camera pair after {events} consecutive \
+             concurrent-capture RGB losses; captures are slower and reliable. Measure this camera \
+             directly with `sudo irlume camera-tune` to replace this with a measurement."
+        )),
+        // Already what the switch wanted: nothing changed, nothing to announce.
+        Ok(irlume_camera::StoreIfConcurrent::Superseded(Some(
+            irlume_camera::CaptureMode::Sequential,
+        ))) => None,
+        Ok(irlume_camera::StoreIfConcurrent::Superseded(other)) => Some(format!(
+            "capture mode: {events} consecutive concurrent-capture RGB losses on this camera pair, \
+             but the stored verdict changed underneath ({other:?}); left it alone"
+        )),
+        Err(e) => Some(format!(
+            "capture mode: could not persist the sequential switch for this camera pair after \
+             {events} consecutive concurrent-capture RGB losses ({e}); run `sudo irlume doctor` \
+             to see the mode in force"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod capture_mode_switch_tests {
+    use super::*;
+    use irlume_camera::{CaptureMode, StoreIfConcurrent};
+
+    /// Both clauses are required, and neither is sufficient. The four rows are
+    /// the four situations this rule exists to separate, each with numbers the
+    /// repo has already measured on hardware.
+    #[test]
+    fn a_counted_event_needs_recovery_and_measured_dimming() {
+        // The NexiGo shape: concurrent parks near 60 while the solo arm tracks
+        // the lit room at 117-143. This is the fault the switch exists for.
+        assert!(self_heal_is_dimming(true, 60.0, 130.0));
+        // The recapture did not recover the face, so nothing was demonstrated:
+        // the frame may simply not have held one.
+        assert!(!self_heal_is_dimming(false, 60.0, 130.0));
+        // The dark-login shape. A night login legitimately shows a face in IR
+        // and none in RGB, and the same camera measured 0.91 retention in a dark
+        // room, so a ratio taken here says nothing. Counting it would demote a
+        // healthy camera for anyone who logs in after dark.
+        assert!(!self_heal_is_dimming(true, 30.0, 62.0));
+        // The healthy/settling shape: the user was still moving, and the solo
+        // frame is no dimmer than the overlapped one (the ASUS measured 1.04).
+        assert!(!self_heal_is_dimming(true, 125.0, 130.0));
+    }
+
+    /// Both boundaries in both directions, so a mutant that relaxes `<` to `<=`
+    /// or `>=` to `>` dies, and the constants stay the camera crate's rather
+    /// than drifting local copies.
+    #[test]
+    fn the_dimming_test_is_the_probes_own_rule_at_both_boundaries() {
+        assert_eq!(irlume_camera::CONCURRENT_SIGNAL_FLOOR, 0.80);
+        assert_eq!(irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS, 100.0);
+        // The scene-brightness floor: a solo arm at the floor can be judged, one
+        // just under it cannot.
+        assert!(self_heal_is_dimming(true, 79.9, 100.0));
+        assert!(!self_heal_is_dimming(true, 79.9, 99.9));
+        // The retention floor: exactly 80% retained is not a loss; a hair under is.
+        assert!(!self_heal_is_dimming(true, 80.0, 100.0));
+        assert!(self_heal_is_dimming(true, 79.99, 100.0));
+    }
+
+    /// The threshold itself, pinned in both directions so a mutant that changes
+    /// the constant OR moves the comparison dies.
+    #[test]
+    fn the_switch_lands_on_the_third_consecutive_event_and_not_before() {
+        assert_eq!(
+            SELF_HEAL_SWITCH_AFTER, 3,
+            "three was chosen by the repo owner in #100; nothing here measures it"
+        );
+        assert_eq!(
+            (0..=4)
+                .map(|n| capture_mode_switch_due("cameras.conf", n))
+                .collect::<Vec<_>>(),
+            vec![false, false, false, true, true]
+        );
+        // The premise that makes the self-heal reachable at all: an unmeasured
+        // pair already captures sequentially, so only a stored concurrent verdict
+        // (or the env override) can put a camera where this rule applies. If that
+        // default is ever flipped back, this rule needs rethinking, and this
+        // assertion is where that surfaces.
+        assert!(
+            capture_mode_decision(None, None).0,
+            "the unmeasured default is sequential"
+        );
+    }
+
+    /// The three-way split matters: a mutant that folds `Inconclusive` into
+    /// either neighbour changes when a camera gets demoted.
+    #[test]
+    fn a_clean_concurrent_capture_clears_the_streak() {
+        let fold = |signals: &[CaptureModeSignal]| {
+            signals
+                .iter()
+                .fold(0u32, |acc, s| self_heal_streak(acc, *s))
+        };
+        use CaptureModeSignal::{Clean, Dimming, Inconclusive};
+        // Counter-evidence in the middle resets, so this never reaches three.
+        assert_eq!(fold(&[Dimming, Dimming, Clean, Dimming, Dimming]), 2);
+        // Inconclusive is neutral in both directions.
+        assert_eq!(
+            fold(&[Dimming, Inconclusive, Dimming, Inconclusive, Dimming]),
+            3
+        );
+        assert_eq!(self_heal_streak(2, Clean), 0);
+        assert_eq!(self_heal_streak(2, Inconclusive), 2);
+        assert_eq!(self_heal_streak(2, Dimming), 3);
+    }
+
+    /// A mode the operator forced is never learned from, at any streak length.
+    #[test]
+    fn an_operator_forced_mode_is_never_written_back() {
+        for n in [1, SELF_HEAL_SWITCH_AFTER, SELF_HEAL_SWITCH_AFTER + 1, 99] {
+            assert!(
+                !capture_mode_switch_due(ENV_CAPTURE_MODE_SOURCE, n),
+                "streak {n} under an operator-forced mode must not switch"
+            );
+        }
+        // Bind the guard to the one place that produces the string, so a rename
+        // breaks this test instead of silently disabling the guard.
+        assert_eq!(
+            capture_mode_decision(Some("0"), Some(CaptureMode::Concurrent)).1,
+            ENV_CAPTURE_MODE_SOURCE
+        );
+        // And the one mode the switch may act on.
+        assert_eq!(
+            capture_mode_decision(None, Some(CaptureMode::Concurrent)),
+            (false, "cameras.conf")
+        );
+        assert!(capture_mode_switch_due(
+            "cameras.conf",
+            SELF_HEAL_SWITCH_AFTER
+        ));
+    }
+
+    /// The journal line is checked by RETURN VALUE, never by capturing stderr:
+    /// the debug-log switch freezes in a `OnceLock`, which is why the comparable
+    /// notes in this codebase return their text instead of printing it.
+    #[test]
+    fn the_switch_announces_itself_and_names_the_override() {
+        let line = capture_mode_switch_line(3, &Ok(StoreIfConcurrent::Stored))
+            .expect("a completed switch says so");
+        assert!(line.contains("sequential"), "names the new mode: {line}");
+        assert!(line.contains('3'), "names the evidence: {line}");
+        assert!(
+            line.contains("camera-tune"),
+            "names how to replace it with a measurement: {line}"
+        );
+    }
+
+    /// A verdict that changed under us is left alone, and the line says which
+    /// happened. Silence is only correct when the stored mode already agrees.
+    #[test]
+    fn a_verdict_that_changed_under_us_is_left_alone() {
+        assert_eq!(
+            capture_mode_switch_line(
+                3,
+                &Ok(StoreIfConcurrent::Superseded(Some(CaptureMode::Sequential)))
+            ),
+            None,
+            "already sequential: nothing was done and nothing needs saying"
+        );
+        let line = capture_mode_switch_line(3, &Ok(StoreIfConcurrent::Superseded(None)))
+            .expect("a verdict that vanished is worth a line");
+        assert!(
+            !line.contains("switched to sequential"),
+            "must not claim a write that did not happen: {line}"
+        );
+    }
+
+    /// A failed write is reported and never claims the mode changed. The
+    /// signature is the real pin: taking a `&Result` and returning text means
+    /// the error has no path into the authentication's own result.
+    #[test]
+    fn a_failed_write_is_reported_and_never_claims_the_mode() {
+        let line = capture_mode_switch_line(
+            3,
+            &Err(irlume_common::Error::Hardware(
+                "cannot identify the RGB camera".into(),
+            )),
+        )
+        .expect("a failed write must be visible");
+        assert!(line.contains("could not persist"), "{line}");
+        assert!(line.contains("cannot identify the RGB camera"), "{line}");
+        assert!(
+            !line.contains("switched to sequential"),
+            "must not claim the switch landed: {line}"
+        );
+    }
+}
+
 impl Engine {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
@@ -856,6 +1177,8 @@ impl Engine {
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             gesture_seen_before_match: false,
+            self_heals: None,
+            auth_self_heal_counted: None,
             stop_requested: None,
         })
     }
@@ -964,6 +1287,10 @@ impl Engine {
         // a runtime camera switch to (or from) an IR-less pair retiers the
         // engine instead of trusting the load-time snapshot (#281).
         self.ir_available = selected_ir_available(ir);
+        // Evidence gathered about the OLD pairing says nothing about this one.
+        // The keyed streak already refuses to spend it elsewhere; dropping it
+        // here means a repoint cannot even leave a stale key behind.
+        self.self_heals = None;
     }
 
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the
@@ -1535,6 +1862,16 @@ impl Engine {
             rgb_faces.len(),
             rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
+        // What the OVERLAPPED capture managed on its own, for the capture-mode
+        // tally (#100): whether the primary detector found a face, and how bright
+        // the frame was. Taken here, BEFORE the rescue detector runs, on purpose:
+        // a blaze-rescued face is neither proof the concurrent capture was
+        // healthy nor proof it dimmed, so it must neither reset the streak nor
+        // feed it. Computed only when it can be used, so a sequential capture, a
+        // hard RGB retry, or anything that is not an authentication pays nothing.
+        let mode_watch =
+            (!sequential && !rgb_hard_retried && self.auth_self_heal_counted.is_some())
+                .then(|| (rgb_top.is_some(), irlume_camera::frame_mean(&rgb.data)));
         if rgb_top.is_none() {
             rgb_top = self.rescue_detect(
                 &align::RgbView {
@@ -1606,6 +1943,34 @@ impl Engine {
                 rgb.height,
                 rgb_faces.len(),
                 rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
+            );
+            // Was this the contention the capture-mode probe measures, or just a
+            // frame that happened to miss? The solo recapture is the control:
+            // same camera, same denoise path, idle link. Compare the two frames
+            // the way the probe compares its arms (#100).
+            if let Some((_, concurrent_mean)) = mode_watch {
+                let signal = if self_heal_is_dimming(
+                    rgb_top.is_some(),
+                    concurrent_mean,
+                    irlume_camera::frame_mean(&rgb.data),
+                ) {
+                    CaptureModeSignal::Dimming
+                } else {
+                    CaptureModeSignal::Inconclusive
+                };
+                self.note_capture_mode_signal(mode_source, signal);
+            }
+        } else if let Some((clean, _)) = mode_watch {
+            // No self-heal was needed. If the overlapped frame found the face by
+            // itself, that is direct evidence this pairing captures concurrently
+            // just fine, and it clears any streak standing against it.
+            self.note_capture_mode_signal(
+                mode_source,
+                if clean {
+                    CaptureModeSignal::Clean
+                } else {
+                    CaptureModeSignal::Inconclusive
+                },
             );
         }
 
@@ -2412,6 +2777,36 @@ impl Engine {
         service: Option<&str>,
         purpose: AuthenticationPurpose,
     ) -> irlume_common::Result<Outcome> {
+        // Arm the capture-mode tally for THIS authentication (#100), then clear
+        // it however the attempt ends. Only authentications may contribute: the
+        // enrolment capture loop reaches the same assess path while coaching the
+        // user through deliberately partial poses, and a latch left armed by an
+        // error return is exactly how those poses would start counting. The
+        // clearing lives out here, around a body that is free to use `?`,
+        // because there is no other way to make every exit path clear it.
+        self.auth_self_heal_counted = Some(false);
+        let out = self.authenticate_within_grace(user, service, purpose);
+        if out.is_ok() {
+            // The streak is complete only once the grace window has settled: a
+            // window holds several captures, and switching mid-window would act
+            // on part of the evidence the next capture is still producing.
+            self.maybe_switch_capture_mode();
+        }
+        self.auth_self_heal_counted = None;
+        // The gesture belongs to the authentication that just ended.
+        self.gesture_seen_before_match = false;
+        out
+    }
+
+    /// [`Self::authenticate_for`]'s body: the grace window itself. Split out so
+    /// its caller can arm and clear per-authentication state around it without
+    /// every `?` in here becoming a leak.
+    fn authenticate_within_grace(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+    ) -> irlume_common::Result<Outcome> {
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
         // Watch for the consent gesture BEFORE the first capture, so a user who
@@ -2447,9 +2842,92 @@ impl Engine {
             // entire grace window is one silent stretch on the daemon's clock.
             self.note_capture_boundary();
         };
-        // The gesture belongs to the authentication that just ended.
-        self.gesture_seen_before_match = false;
         Ok(out)
+    }
+
+    /// Record what one authentication observed about capturing both sensors at
+    /// once, if this is an authentication and the observation can teach anything.
+    ///
+    /// Every guard here is a reason NOT to count, and they are ordered cheapest
+    /// first. The latch scopes the tally to authentications and holds each one to
+    /// a single event. An operator-forced mode teaches nothing, because the
+    /// verdict this would learn is one the env var already outranks. An
+    /// unidentifiable pairing cannot be keyed, and evidence that cannot be keyed
+    /// must not be spent on whichever camera is present later.
+    fn note_capture_mode_signal(&mut self, mode_source: &'static str, signal: CaptureModeSignal) {
+        let Some(counted) = self.auth_self_heal_counted else {
+            return;
+        };
+        if mode_source == ENV_CAPTURE_MODE_SOURCE {
+            return;
+        }
+        match signal {
+            // Counter-evidence is free to arrive more than once per attempt.
+            CaptureModeSignal::Clean => self.self_heals = None,
+            CaptureModeSignal::Inconclusive => {}
+            CaptureModeSignal::Dimming => {
+                if counted {
+                    return;
+                }
+                let Some(key) =
+                    irlume_camera::capture_mode_pair_identity(&self.rgb_dev, &self.ir_dev)
+                else {
+                    return;
+                };
+                let prev = match self.self_heals.take() {
+                    Some((k, n)) if k == key => n,
+                    _ => 0,
+                };
+                self.self_heals = Some((key, self_heal_streak(prev, signal)));
+                self.auth_self_heal_counted = Some(true);
+            }
+        }
+    }
+
+    /// Stop asking a pairing to capture concurrently once it has lost the RGB
+    /// frame to contention [`SELF_HEAL_SWITCH_AFTER`] authentications in a row.
+    ///
+    /// Runs after the grace window has settled, never inside a capture: the mode
+    /// for the capture in flight was decided before the first frame, and by the
+    /// time a self-heal has run it has already produced a usable frame. There is
+    /// nothing to invalidate afterwards either, because every assess re-reads
+    /// `cameras.conf`, so the next authentication simply picks the new mode up.
+    ///
+    /// A failed write is reported and dropped. This is a latency optimisation
+    /// running at the tail of an authentication that has already reached its
+    /// verdict, and read-only `/etc` must not turn a successful login into an
+    /// error.
+    fn maybe_switch_capture_mode(&mut self) {
+        let Some((key, streak)) = self.self_heals.clone() else {
+            return;
+        };
+        let (_, mode_source) = sequential_capture_selected(&self.rgb_dev, &self.ir_dev);
+        if !capture_mode_switch_due(mode_source, streak) {
+            return;
+        }
+        // One attempt per completed streak, whatever comes back. On success the
+        // pairing is sequential and the self-heal cannot fire on it again; on
+        // failure the next attempt needs three fresh events, which bounds retries
+        // against a blocking lock without inventing a backoff timer.
+        self.self_heals = None;
+        // The cameras can be repointed between the evidence and the write, so
+        // prove the pairing is still the one the streak was gathered on.
+        if irlume_camera::capture_mode_pair_identity(&self.rgb_dev, &self.ir_dev).as_deref()
+            != Some(key.as_str())
+        {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let stored =
+            irlume_camera::store_sequential_if_still_concurrent(&self.rgb_dev, &self.ir_dev, now);
+        if let Some(line) = capture_mode_switch_line(streak, &stored) {
+            // A journal line, not a dlog: this writes /etc on the user's behalf,
+            // and an automatic change nobody can see afterwards is the silent
+            // adaptation #100 exists to prevent.
+            eprintln!("irlumed: {line}");
+        }
     }
 
     fn authenticate_once(

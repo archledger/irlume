@@ -59,7 +59,10 @@ dim/dark paths add `match(fusion)`, `match(ir-fallback)`,
 wall-clock time goes to camera I/O; the `assess:` lines show it, which helps
 when chasing a slow login. When the measured capture mode is concurrent
 (`irlume camera-tune`, stored in cameras.conf; an unmeasured pair captures one
-stream at a time), the RGB and IR captures run overlapped on the IR path, so
+stream at a time, and a concurrent pair that loses its RGB frame to contention
+on three logins in a row is switched to sequential by the daemon, which logs one
+`irlumed: capture mode switched...` line), the RGB and IR captures run
+overlapped on the IR path, so
 those two times overlap rather than sum; setting
 `IRLUME_SEQUENTIAL_CAPTURE=1` on the daemon forces back-to-back order
 when isolating a camera problem, whatever the stored mode says.

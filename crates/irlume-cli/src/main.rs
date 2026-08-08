@@ -3531,6 +3531,10 @@ enum CaptureModeReport {
     NoPinnedPair,
     /// A verdict was measured for this pair and stored.
     Measured(irlume_camera::CaptureMode),
+    /// irlume demoted this pair to sequential itself, after it repeatedly lost
+    /// the RGB frame to concurrent-capture contention during real logins (#100).
+    /// `age_days` is how long ago, when the stamp carried a readable time.
+    AutoSwitched { age_days: Option<u64> },
     /// The pair is pinned but no verdict was ever measured for it.
     Unmeasured,
     /// `IRLUME_SEQUENTIAL_CAPTURE` is set in THIS process's environment and
@@ -3614,6 +3618,25 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
              faster path)"
                 .to_string(),
         ),
+        // Deliberately never says "measured": irlume inferred this from how the
+        // camera behaved during logins, which is weaker evidence than the probe,
+        // and a support report that conflated the two would hide the difference
+        // that matters when this turns out to be wrong.
+        CaptureModeReport::AutoSwitched { age_days } => (
+            State::Info,
+            format!(
+                "sequential, switched automatically{} after this camera repeatedly lost its RGB \
+                 frame while both sensors streamed at once. Captures are slower and reliable. \
+                 Run `sudo irlume camera-tune` to measure this camera directly and replace the \
+                 inference with a measurement",
+                match age_days {
+                    Some(0) => " today".to_string(),
+                    Some(1) => " about 1 day ago".to_string(),
+                    Some(d) => format!(" about {d} days ago"),
+                    None => String::new(),
+                }
+            ),
+        ),
         CaptureModeReport::Unmeasured => (
             State::Info,
             "not measured for this camera pair; using the safe sequential default. \
@@ -3624,8 +3647,20 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
     }
 }
 
+/// Whole days between `at_unix` and now, or `None` if the stamp is in the future
+/// or the clock cannot be read. A stamp from ahead of the current clock is not
+/// rendered as an age: a machine whose clock moved backwards would otherwise
+/// report a nonsense number, and saying nothing is the honest answer.
+fn age_days_since_unix(at_unix: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    now.checked_sub(at_unix).map(|secs| secs / 86_400)
+}
+
 /// Doctor's capture-mode block: which capture strategy the active camera pair
-/// uses, and whether that was measured or is the unmeasured default.
+/// uses, and whether that was measured, inferred automatically, or the default.
 ///
 /// Reads the pinned pair without opening the camera ([`irlume_camera::configured_pair_no_probe`]),
 /// then the stored verdict; both live in root-only `cameras.conf`, so an
@@ -3653,6 +3688,22 @@ fn report_capture_mode(report: &mut crate::doctor_report::Report) {
             _ => match irlume_camera::configured_pair_no_probe() {
                 None => CaptureModeReport::NoPinnedPair,
                 Some((rgb, ir)) => match irlume_camera::stored_capture_mode(&rgb, &ir) {
+                    // An origin stamp only describes a SEQUENTIAL verdict, because
+                    // that is the only mode the automatic switch writes. One left
+                    // beside anything else is stale and is ignored rather than
+                    // believed.
+                    Some(irlume_camera::CaptureMode::Sequential) => {
+                        match irlume_camera::stored_capture_mode_origin(&rgb, &ir) {
+                            Some(irlume_camera::CaptureModeOrigin::AutoSwitched { at_unix }) => {
+                                CaptureModeReport::AutoSwitched {
+                                    age_days: at_unix.and_then(age_days_since_unix),
+                                }
+                            }
+                            None => {
+                                CaptureModeReport::Measured(irlume_camera::CaptureMode::Sequential)
+                            }
+                        }
+                    }
                     Some(mode) => CaptureModeReport::Measured(mode),
                     None => CaptureModeReport::Unmeasured,
                 },
@@ -5046,6 +5097,89 @@ mod tests {
             "700ms is the figure for a camera that never gets this verdict: {seq_line}"
         );
         assert!(seq_line.contains("1.3s"), "{seq_line}");
+
+        // Re-derived rather than reusing `line`, which the blocks above have
+        // since reassigned. Merging two branches' assertions left this one
+        // checking the sequential line for a phrase that belongs to the no-pin
+        // line, and it failed loudly, which is the argument for the message
+        // strings being asserted at all.
+        let (_, no_pin) = capture_mode_report_line(&CaptureModeReport::NoPinnedPair);
+        assert!(
+            no_pin.contains("set-cameras"),
+            "and says how to pin one so the verdict can be looked up: {no_pin}"
+        );
+    }
+
+    /// An automatic switch must never be reported as a measurement. irlume
+    /// inferred it from how the camera behaved during logins, which is weaker
+    /// evidence than `camera-tune`, and a support report that blurred the two
+    /// would hide exactly the distinction that matters when the switch is wrong
+    /// (#100).
+    #[test]
+    fn an_auto_switched_mode_is_never_reported_as_measured() {
+        use crate::doctor_report::State;
+
+        for age in [Some(12), Some(1), Some(0), None] {
+            let (state, line) =
+                capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days: age });
+            assert!(
+                matches!(state, State::Info),
+                "a mode is a strategy, not a fault"
+            );
+            assert!(line.contains("sequential"), "names the mode: {line}");
+            assert!(
+                line.contains("automatically"),
+                "says irlume did it, not the operator: {line}"
+            );
+            assert!(
+                line.contains("camera-tune"),
+                "names how to replace it with a measurement: {line}"
+            );
+            assert!(
+                !line.contains("measured for this camera pair"),
+                "an inference must not claim to be the probe's measurement: {line}"
+            );
+        }
+        // The age is rendered when known, and simply omitted when it is not.
+        assert!(
+            capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days: Some(12) })
+                .1
+                .contains("12 days ago")
+        );
+        assert!(
+            capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days: Some(1) })
+                .1
+                .contains("1 day ago")
+        );
+        assert!(
+            capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days: Some(0) })
+                .1
+                .contains("today")
+        );
+        assert!(
+            !capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days: None })
+                .1
+                .contains("ago"),
+            "with no readable stamp the line must not invent a time"
+        );
+    }
+
+    /// A stamp from ahead of the clock is not rendered as an age.
+    #[test]
+    fn a_future_origin_stamp_reports_no_age_rather_than_a_nonsense_one() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs()
+            + 86_400;
+        assert_eq!(age_days_since_unix(future), None);
+        // And a stamp from the past reads as whole days.
+        let two_days_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs()
+            - (2 * 86_400 + 60);
+        assert_eq!(age_days_since_unix(two_days_ago), Some(2));
     }
 
     /// The on/off word is positional. Scanning argv for it meant a flag value

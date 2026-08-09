@@ -2504,24 +2504,6 @@ fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// Peak IR brightness near the eye landmarks (corneal glint, supporting cue).
-fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &irlume_vision::Landmarks5) -> f32 {
-    let mut peak = 0u8;
-    for &(ex, ey) in &landmarks[0..2] {
-        let r = 8i32;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let x = ex as i32 + dx;
-                let y = ey as i32 + dy;
-                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-                    peak = peak.max(grey[(y as u32 * w + x as u32) as usize]);
-                }
-            }
-        }
-    }
-    peak as f32
-}
-
 /// P2 probe: capture RGB + IR and report what the IR stream gives us: mean/min/
 /// max brightness (is the emitter illuminating?), and whether YuNet finds a face
 /// in each spectrum (the basis for the cross-spectrum liveness cue). Diagnostic,
@@ -2592,11 +2574,24 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_center_edge_ratio = ir_top_face
             .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        // Single frame, no burst stats, so no white level is known: the
-        // `white: None` arm passes the peak through exactly as before, the same
-        // honesty this probe already applies to ir_saturated_frac below (#222).
-        let ir_eye_glint =
-            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks));
+        // Ceiling-aware, the same call `padcapture` makes. The comment here used
+        // to say no white level was known, which was true while this probe
+        // captured without burst stats; it takes them now (#358), so the ceiling
+        // is in scope and there is no reason left to read the peak raw.
+        //
+        // Measured 2026-08-08 on the ASUS FHD IR module: with glasses on, ten
+        // consecutive probes read the eye-window peak at exactly 255, the
+        // format's ceiling. Read raw, every one of those reported as the
+        // STRONGEST POSSIBLE glint, which is the conflation #222 removed from
+        // the auth path and the corpus. The tool a developer opens to diagnose a
+        // glint problem was the one place still giving the old answer.
+        let ir_eye_glint = irlume_auth::eye_glint_of(
+            ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+            ir.width,
+            ir.height,
+            ir_top_face.map(|f| &f.landmarks),
+            ir_stats.white_level,
+        );
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
@@ -5331,22 +5326,5 @@ mod tests {
         let mut out = Vec::new();
         collect_images(std::path::Path::new("/nonexistent/irlume-imgs"), &mut out);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn eye_glint_takes_the_peak_near_the_eye_landmarks_only() {
-        let (w, h) = (64u32, 64u32);
-        let mut grey = vec![0u8; (w * h) as usize];
-        let landmarks: irlume_vision::Landmarks5 = [
-            (10.0, 10.0), // left eye
-            (30.0, 10.0), // right eye
-            (20.0, 20.0),
-            (12.0, 28.0),
-            (28.0, 28.0),
-        ];
-        assert_eq!(eye_glint(&grey, w, h, &landmarks), 0.0);
-        grey[(12 * w + 12) as usize] = 200; // within radius 8 of the left eye
-        grey[(60 * w + 60) as usize] = 255; // far from both eyes: must not count
-        assert_eq!(eye_glint(&grey, w, h, &landmarks), 200.0);
     }
 }

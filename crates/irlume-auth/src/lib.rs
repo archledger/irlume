@@ -5766,6 +5766,28 @@ mod tests {
         // Landmarks fully outside the frame: nothing sampled, peak 0.
         let far: Landmarks5 = [(-500.0, -500.0); 5];
         assert_eq!(eye_glint(&grey, 64, 48, &far), 0.0);
+
+        // The window is BOUNDED: a bright pixel away from both eyes must not
+        // be picked up. Moved here from a duplicate of this function that
+        // irlume-cli carried for its dev probe; the probe now calls this one
+        // (#222), and the copy went with it rather than the assertion.
+        let (w, h) = (64u32, 48u32);
+        let mut plain = vec![0u8; (w * h) as usize];
+        let lm: Landmarks5 = [
+            (10.0, 10.0),
+            (30.0, 10.0),
+            (20.0, 20.0),
+            (12.0, 28.0),
+            (28.0, 28.0),
+        ];
+        assert_eq!(eye_glint(&plain, w, h, &lm), 0.0);
+        plain[(12 * w + 12) as usize] = 200; // inside radius 8 of the left eye
+        plain[(44 * w + 60) as usize] = 255; // far from both: must not count
+        assert_eq!(
+            eye_glint(&plain, w, h, &lm),
+            200.0,
+            "a bright pixel outside both eye windows must not become the peak"
+        );
     }
 
     #[test]

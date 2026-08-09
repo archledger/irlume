@@ -140,13 +140,72 @@ jobs:
           echo "IR node: $ir"
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT
-          cargo run -q -p irlume-camera --example burst_dump -- "$out" "$ir" 6
+          # Run the burst as ROOT when we can. irlume guards its emitter
+          # bookkeeping with a lock in /run/lock, and the daemon creates that
+          # file under `UMask=0027`, so it lands 0640 root:root. The runner
+          # account cannot open it, and irlume then REFUSES to write the
+          # emitter for the rest of the process, saying so on stderr.
+          #
+          # That refusal is why this step needs to be explicit about privilege.
+          # The check below asserts the emitter strobes, and an unprivileged
+          # run measures whatever state the emitter was left in by the last
+          # root process rather than anything irlume did. It passed at a spread
+          # of 17.9 on 2026-08-08 with irlume's emitter control disabled
+          # throughout (#384). Root is also the production context: irlumed
+          # runs as root, so this exercises the path users actually get.
+          burst="${CARGO_TARGET_DIR:-target}/debug/examples/burst_dump"
+          cargo build -q -p irlume-camera --example burst_dump
+          if [ ! -x "$burst" ]; then
+            echo "::error::burst_dump not built at $burst"
+            exit 1
+          fi
+          err="$(mktemp)"
+          # Privilege is required, not preferred. The emitter lock lives in
+          # /run/lock and the daemon creates it 0640 root:root under UMask=0027,
+          # so an unprivileged run cannot take it and irlume declines to write.
+          # Root is also the production context: irlumed drives the emitter as
+          # root.
+          if ! sudo -n true 2>/dev/null; then
+            echo "::error::passwordless sudo is required to drive the emitter here (#384)"
+            exit 1
+          fi
+          sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"
+          cat "$err"
+          # A POSITIVE marker, not the absence of one refusal string. The first
+          # version of this guard grepped for the lock refusal, which covers one
+          # of at least six inert paths through `ir_emitter::enable`: an
+          # unreadable USB identity, a recovery reporting Busy or
+          # OwnerStillRunning (both silent by design), no applicable control, and
+          # a failed apply_device_default or apply_known_payload. Any of those
+          # captures frames that look exactly like a successful run.
+          #
+          # `AlreadyHeld` is deliberately NOT accepted: it shows the control
+          # holds the wanted value, which is not the same as this invocation
+          # having driven it, and driving it is what this step claims to test
+          # (#384 review).
+          if ! grep -Fxq "irlume: capture emitter write completed" "$err"; then
+            echo "::error::irlume did not complete the emitter write, so the spread below is the emitter's leftover state rather than evidence irlume can light it (#384)"
+            exit 1
+          fi
           frames=$(find "$out" -name "frame*.pgm" | wc -l)
           echo "captured $frames frames"
           test "$frames" -ge 4
-          # The strobe must actually strobe: require a real spread between the
-          # brightest (emitter-lit) and darkest frame means, the same signal
-          # capture_ir keys on. A dead emitter shows as a flat, dark burst.
+          # A flat, dark burst means no usable IR frames at all, which is worth
+          # catching. It does NOT mean irlume drove the emitter, and the comment
+          # here used to say it did.
+          #
+          # Measured 2026-08-08 on both modules, five consecutive runs per
+          # condition so no run inherits the previous one's emitter state:
+          #
+          #   NexiGo, IRLUME_IR_EMITTER=off   brightest frame 134.5 31.6 139.9 27.8 134.5
+          #   NexiGo, irlume managing it       brightest frame  31.1 139.5 29.1 148.0 25.1
+          #
+          # Both alternate between roughly 30 and roughly 135: the camera cycles
+          # its own state between capture sessions (#264's self-strobing seen
+          # from the other side), and every run clears this floor by a wide
+          # margin either way. So this asserts that the camera delivers
+          # alternating frames, not that irlume's extension-unit write reached
+          # it. A discriminator that depends on the write is tracked on #384.
           awk '{print $2}' "$out/means.txt" | sort -n | awk 'NR==1{min=$1} END{max=$1; d=max-min; printf "mean spread: %.1f\n", d; exit (d < 5)}'
 
       # Forensics on failure only. A hardware-only failure is otherwise

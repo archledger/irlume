@@ -3246,8 +3246,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
 
-            let (mut ir_cos, mut ir_bri, mut ir_center_edge_ratio, mut ir_glint) =
-                (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
+            let (mut ir_cos, mut ir_bri, mut ir_center_edge_ratio) = (f32::NAN, 0.0f32, 0.0f32);
+            // `Option`, because a railed peak is not a dim eye. See the swap below.
+            let mut ir_glint: Option<f32> = None;
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
@@ -3256,7 +3257,24 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
                 ir_center_edge_ratio =
                     irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
-                ir_glint = irlume_auth::eye_glint(&irf.data, irf.width, irf.height, &t.landmarks);
+                // `eye_glint_of` on the RAW frame with the negotiated ceiling, the
+                // same pair the daemon and `pad.rs` already pass. `eye_glint`
+                // returns the window maximum, and a maximum that reached the
+                // ceiling says the true value was at least that and never what
+                // it was: with glasses on, the repo's own measurements pin this
+                // peak at 255 in all 30 frames, where it reads the lens
+                // specular rather than the cornea (#222).
+                //
+                // Raw and not `irf.data`, because ambient subtraction moves a
+                // railed 255 to 254 and a subtracted frame stops reading as
+                // railed, which would silently disable the refusal (#238 review).
+                ir_glint = irlume_auth::eye_glint_of(
+                    ir_stats.saturation_frame.as_deref().unwrap_or(&irf.data),
+                    irf.width,
+                    irf.height,
+                    Some(&t.landmarks),
+                    ir_stats.white_level,
+                );
                 if let Some(a) = adapter.as_mut() {
                     let adapted = a.apply(&raw)?;
                     if !ir_scans.is_empty() {
@@ -3294,7 +3312,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                     "ir_center_edge_ratio".into(),
                     json_f32(ir_center_edge_ratio),
                 );
-                rec.insert("ir_glint".into(), json_f32(ir_glint));
+                // `null` is unambiguous here in a way it is not elsewhere: this
+                // key is written only inside the `if let Some(t) = &ir_top`
+                // branch, so a missing IR face leaves it ABSENT with
+                // `ir_present: false` beside it. Written, `null` can only mean
+                // the peak reached the ceiling (#222).
+                rec.insert(
+                    "ir_glint".into(),
+                    ir_glint.map_or(serde_json::Value::Null, json_f32),
+                );
                 rec.insert(
                     "ir_emb_raw".into(),
                     serde_json::to_value(raw.to_vec()).unwrap(),
@@ -3313,7 +3339,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 if ir_top.is_some() { "✓" } else { "·" },
                 ir_bri,
                 ir_center_edge_ratio,
-                ir_glint
+                // "railed" rather than a number, so a reader of the console
+                // trace sees the same distinction the corpus records.
+                ir_glint.map_or_else(|| "railed".to_string(), |g| format!("{g:.1}"))
             );
         }
         Ok(written)

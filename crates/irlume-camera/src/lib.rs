@@ -1177,48 +1177,7 @@ pub fn select_pair() -> (String, String) {
             best = Some((p.rgb, p.ir));
         }
     }
-    // Evidence before convention. `list_pairs` only yields nodes it could pair
-    // to ONE physical device, so it comes up empty on a machine whose RGB and
-    // IR sit on separate devices, or where the sysfs link that pairs them could
-    // not be read. Falling straight to the compiled numbers there discards the
-    // classification that DID succeed.
-    best.or_else(|| pair_from_classified(&discover_nodes()))
-        .unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
-}
-
-/// Last-resort pair from already-classified nodes, before the compiled numbers.
-///
-/// Pure over its input so the choice is testable without a camera; the caller
-/// does the enumerating.
-///
-/// This exists because `/dev/video2` is a convention, not a measurement, and two
-/// separate findings landed on it. The #341 external-camera survey names the
-/// pattern directly: the node count is not a class invariant, so nodes must be
-/// selected by capability and advertised formats rather than by "video2
-/// folklore". #385 named the consequence: the compiled fallback is one of three
-/// paths by which a COLOUR node can arrive in the IR slot, where
-/// `exposure_refusal`'s `!ir_ceiling_known` branch is currently the only thing
-/// stopping cues fitted on an emitter-lit IR image from judging a room-lit
-/// colour frame.
-///
-/// A node that classified as [`Role::Ir`] is evidence. The number 2 is not.
-/// This does not remove the compiled fallback, which still covers the case
-/// where nothing classified at all; it stops that fallback being reached while
-/// a positively identified IR node was sitting in the list unused.
-///
-/// Deliberately NOT a ranking: `list_pairs` above already ranks by pin,
-/// allowlist and built-in, and it had its chance. This is the floor.
-fn pair_from_classified(nodes: &[(String, Role)]) -> Option<(String, String)> {
-    let first = |want: Role| {
-        nodes
-            .iter()
-            .find(|(_, role)| *role == want)
-            .map(|(path, _)| path.clone())
-    };
-    // BOTH or nothing. An IR node with no RGB partner is not a pair, and
-    // inventing the RGB half from the compiled default would reintroduce the
-    // guess this function exists to avoid.
-    Some((first(Role::Rgb)?, first(Role::Ir)?))
+    best.unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
 }
 
 fn device_exists(dev: &str) -> bool {
@@ -5480,47 +5439,6 @@ mod tests {
         );
         // A bogus identity never matches a real node either.
         assert_eq!(find_node_by_identity("dead:beef:none", Role::Ir), None);
-    }
-
-    /// `/dev/video2` is a convention. A node that CLASSIFIED as IR is evidence,
-    /// and evidence must win, which is what stops the compiled fallback being
-    /// reached while a real IR node sits unused in the list (#341, #385).
-    #[test]
-    fn a_classified_ir_node_beats_the_compiled_number() {
-        let nodes = vec![
-            ("/dev/video0".to_string(), Role::Rgb),
-            ("/dev/video1".to_string(), Role::Other),
-            // Deliberately NOT video2: the whole point is that the number does
-            // not decide, so a machine whose IR node is video3 must still pair.
-            ("/dev/video3".to_string(), Role::Ir),
-        ];
-        assert_eq!(
-            pair_from_classified(&nodes),
-            Some(("/dev/video0".to_string(), "/dev/video3".to_string()))
-        );
-    }
-
-    /// Both halves or nothing. Half a pair completed from the compiled default
-    /// would reintroduce exactly the guess this function exists to remove, and
-    /// an all-colour machine is the shape that puts a colour node in the IR
-    /// slot.
-    #[test]
-    fn a_pair_is_never_completed_from_a_guess() {
-        let no_ir = vec![
-            ("/dev/video0".to_string(), Role::Rgb),
-            ("/dev/video2".to_string(), Role::Rgb),
-        ];
-        assert_eq!(pair_from_classified(&no_ir), None);
-
-        let no_rgb = vec![("/dev/video2".to_string(), Role::Ir)];
-        assert_eq!(pair_from_classified(&no_rgb), None);
-
-        // An unreadable node never reaches here: `discover_nodes` yields only
-        // what classified. `Other` answered and is neither, so it must not
-        // stand in for either half.
-        let only_other = vec![("/dev/video0".to_string(), Role::Other)];
-        assert_eq!(pair_from_classified(&only_other), None);
-        assert_eq!(pair_from_classified(&[]), None);
     }
 
     #[test]

@@ -90,19 +90,31 @@ fn read_pgm(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), String> {
 }
 
 /// Every `.pgm` under `root`, depth first, sorted so a run is reproducible.
-fn pgms(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return;
-    };
-    let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+///
+/// FALLIBLE on purpose. The first version returned quietly when a directory
+/// could not be read, so an unreadable segment vanished from the walk and the
+/// run still reported success. For an instrument whose output would be used to
+/// reason about authentication thresholds, a silently short corpus is worse
+/// than no corpus: the CSV looks complete and the population denominator is
+/// wrong (#404 review). Per-entry errors are surfaced for the same reason,
+/// since `flatten` on `read_dir` drops every `Err` without a trace.
+fn pgms(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    let rd = std::fs::read_dir(root).map_err(|e| format!("read dir {}: {e}", root.display()))?;
+    let mut entries = rd
+        .map(|e| {
+            e.map(|e| e.path())
+                .map_err(|e| format!("read entry under {}: {e}", root.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     entries.sort();
     for p in entries {
         if p.is_dir() {
-            pgms(&p, out);
+            pgms(&p, out)?;
         } else if p.extension().is_some_and(|e| e == "pgm") {
             out.push(p);
         }
     }
+    Ok(())
 }
 
 /// `None` becomes an EMPTY field, never 0. A cue that refused to answer is not
@@ -132,7 +144,10 @@ fn main() {
     };
 
     let mut files = Vec::new();
-    pgms(root, &mut files);
+    if let Err(e) = pgms(root, &mut files) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     if files.is_empty() {
         eprintln!("no .pgm under {}", root.display());
         std::process::exit(1);
@@ -216,4 +231,15 @@ fn main() {
     }
     let _ = sink.flush();
     eprintln!("{rows} rows from {} files, {skipped} skipped", files.len());
+    // A partial corpus exits NON-ZERO. Reporting the skip on stderr and then
+    // exiting 0 lets a harness that checks only the status accept incomplete
+    // evidence, which is the failure this tool would otherwise introduce into
+    // any threshold derived from its output (#404 review).
+    if skipped > 0 {
+        eprintln!(
+            "refusing to report success: {skipped} of {} frames produced no row",
+            files.len()
+        );
+        std::process::exit(1);
+    }
 }

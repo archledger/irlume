@@ -719,6 +719,75 @@ fn median_ear(values: &mut [f32]) -> f32 {
 /// closures. Three rounds and a median cost about a minute and remove that.
 const CALIBRATION_ROUNDS_DEFAULT: usize = 3;
 
+/// The guidance shown before `calibrate-closure` captures. It names the two
+/// conditions the stored eye shape is tied to: the light in the room, and
+/// whether the user is wearing glasses.
+///
+/// Glasses get their own line because the measurement makes them the sharper
+/// trap (#173, 2026-08-04, ASUS FHD IR module). A lens lifts the CLOSED-eye EAR
+/// about sixfold (median 0.018 bare-eyed to 0.113 with glasses) while the open
+/// extreme barely moves, so the shift eats the bottom of the range rather than
+/// offsetting it. A calibration taken bare-eyed then places its closed threshold
+/// (0.088 there) below every glasses-on closure (0.107-0.130), and the consent
+/// gesture silently never fires: 0 of 5 genuine closures registered. The
+/// glasses-on calibration classified both states, so a user who sometimes wears
+/// glasses should calibrate with them on. This is the interim guidance the
+/// measurement called for; holding more than one calibration per user is the
+/// full fix and is still open.
+///
+/// # The direction this loosens, taken deliberately
+///
+/// This advice is a tradeoff, not a free win, and the cost lands on the user
+/// who calibrates with glasses and then authenticates without them.
+/// `closed_threshold` is `ear_closed + CLOSURE_DEEP_FRACTION * gap`, so the
+/// glasses-on pair (0.271 / 0.113) puts it at 0.160, while the bare-eyed pair
+/// (0.253 / 0.018) puts it at 0.088. Measured against the BARE-EYED range,
+/// 0.160 sits at openness fraction 0.61: about twice the 0.30 that
+/// [`irlume_liveness::CLOSURE_DEEP_FRACTION`] was validated at, whose own doc
+/// says the point of that number is to separate a held closure from a squint.
+///
+/// The same #173 session recorded an intermediate state that lands in the gap.
+/// The operator's excluded run, watching the terminal instead of the camera,
+/// read 0.07 to 0.16 "because looking down closes the measured eye shape".
+/// Every value in that band is under the glasses-on 0.160; only 0.07 to 0.088
+/// is under the bare-eyed 0.088. So a glance down at the keyboard held for the
+/// 11 to 25 face frames `detect_deliberate_closure` wants, followed by looking
+/// back up (bare-eyed open 0.246-0.254 clears the 0.208 reopen bar), can form a
+/// qualifying run under the glasses-on calibration and mostly cannot under the
+/// bare-eyed one. That path has no motion, glint, brightness or head-pose test.
+///
+/// It is still the right default, because the alternative is measured at 0 of 5
+/// genuine closures registering, which stops the gesture firing at all for a
+/// glasses wearer; that failure is fail-closed to the password, this one
+/// loosens a consent gate. The issue's own analysis compared only the two
+/// extremes and did not look at intermediate states, which is why this is
+/// written down here rather than left implied.
+fn closure_calibration_intro(rounds: usize) -> String {
+    format!(
+        "[calibrate] this teaches irlume your open/closed eye shape for the polkit\n            \
+         'close your eyes to approve' gesture. {rounds} round(s), two phases each.\n            \
+         Sit the way you actually sit, in the light you actually use: what is stored\n            \
+         describes this position and this lighting.\n            \
+         If you sometimes wear glasses, wear them for this. A lens lifts your\n            \
+         closed-eye reading toward your open one, so a calibration taken without\n            \
+         glasses can stop registering a real closure once you put them on;\n            \
+         calibrating with them on covers both.\n"
+    )
+}
+
+/// The note shown after a calibration is stored, at the one moment the user
+/// still has the camera up and can redo it. Names the same two conditions the
+/// stored eye shape depends on as [`closure_calibration_intro`]: the room light
+/// and glasses. The head nod reassurance stays, so a user this gate keeps
+/// missing knows the other gesture needs none of this.
+fn closure_calibration_stored_note() -> &'static str {
+    "[calibrate] this reading is tied to the conditions you are in now. Eye shape is\n            \
+     stored as absolute values and they shift as the room changes, so a calibration\n            \
+     taken in daylight can stop registering after dark: re-run this in the light you\n            \
+     actually use. For the same reason, if you wear glasses sometimes, calibrate with\n            \
+     them on. The head nod needs no calibration and is not affected."
+}
+
 /// `irlume calibrate-closure [--rounds N]`: teach irlume the user's open and
 /// closed eye shape (EAR) for the deliberate-closure consent gesture used by
 /// polkit prompts ("close your eyes for a second to approve").
@@ -843,12 +912,7 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
         }
     }
     println!("[calibrate] eye-closure consent calibration for '{user}'.");
-    println!(
-        "[calibrate] this teaches irlume your open/closed eye shape for the polkit\n            \
-         'close your eyes to approve' gesture. {rounds} round(s), two phases each.\n            \
-         Sit the way you actually sit, in the light you actually use: what is stored\n            \
-         describes this position and this lighting.\n"
-    );
+    println!("{}", closure_calibration_intro(rounds));
 
     // Capture one phase, returning the median EAR or a printed error.
     let capture_phase = |label: &str| -> Result<f32, String> {
@@ -989,14 +1053,9 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
             println!("[calibrate] the polkit consent gesture is now calibrated for '{user}'.");
             // Said HERE, where the user still has the camera up and can redo it,
             // rather than only in doctor. What was just stored describes the eye
-            // shape under the light in the room right now.
-            println!(
-                "[calibrate] this reading is tied to the light you are in now. Eye shape is \
-                 stored\n            as absolute values and they shift as the room changes, \
-                 so a calibration\n            taken in daylight can stop registering after \
-                 dark. Re-run this in the\n            light you actually use. The head nod \
-                 needs no calibration and is not\n            affected."
-            );
+            // shape under the light in the room, and behind whatever eyewear the
+            // user had on, right now.
+            println!("{}", closure_calibration_stored_note());
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
@@ -5046,6 +5105,41 @@ mod tests {
             "700ms is the figure for a camera that never gets this verdict: {seq_line}"
         );
         assert!(seq_line.contains("1.3s"), "{seq_line}");
+    }
+
+    /// The stored eye shape is tied to two conditions, room light and glasses,
+    /// and the user reads this guidance once. If it names only the light, a user
+    /// who calibrates bare-eyed is not warned that putting glasses on can strand
+    /// their closures (#173: measured 0 of 5 glasses-on closures registering
+    /// against a bare-eyed calibration). Both the pre-capture guidance and the
+    /// post-store note must name both conditions, and neither may drop the round
+    /// count or the "the nod needs none of this" reassurance.
+    #[test]
+    fn closure_calibration_guidance_names_light_and_glasses() {
+        let intro = closure_calibration_intro(3);
+        assert!(intro.contains("3 round(s)"), "intro states the round count");
+        assert!(
+            intro.to_ascii_lowercase().contains("glasses"),
+            "intro must tell a glasses wearer to calibrate with them on"
+        );
+        assert!(
+            intro.contains("light you actually use"),
+            "intro must keep the room-light guidance"
+        );
+
+        let note = closure_calibration_stored_note();
+        assert!(
+            note.to_ascii_lowercase().contains("glasses"),
+            "stored note must name glasses too"
+        );
+        assert!(
+            note.contains("light you"),
+            "stored note must keep the room-light guidance"
+        );
+        assert!(
+            note.contains("nod"),
+            "stored note must keep the reassurance that the nod path is unaffected"
+        );
     }
 
     /// The on/off word is positional. Scanning argv for it meant a flag value

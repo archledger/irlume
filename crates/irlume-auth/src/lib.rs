@@ -770,6 +770,39 @@ fn capture_mode_decision(
     }
 }
 
+/// May the cross-spectrum self-heal recapture RGB on its own?
+///
+/// Pure over its five observations, so the one clause that keeps costing
+/// people their enrolment is testable without a camera.
+///
+/// The first four are the degradation signature: the overlapped RGB frame lost
+/// the face, IR kept it (so the user is present), the capture was concurrent,
+/// and RGB has not already been re-fetched.
+///
+/// `held_sessions` is the clause this function exists for. The recapture is a
+/// STANDALONE reopen of the RGB node, and enrolment holds both streams open for
+/// the whole capture loop, so under held sessions it opens a device this very
+/// process is already streaming. Most UVC modules permit that second open and
+/// nothing is visible; a module that answers EBUSY fails the enrolment outright,
+/// which is #187: a Chicony 04f2:b874 that never completed one capture cycle and
+/// reported the camera busy. The hard retry a hundred lines above already
+/// refuses a standalone reopen for exactly this reason and says so; this path
+/// was written later and did not inherit the rule.
+///
+/// Skipping the recovery when sessions are held costs little: the caller is a
+/// loop that captures repeatedly, so the next scan gets a fresh pair of frames
+/// anyway. Authentication is unaffected — it captures one-shot, holds nothing,
+/// and still self-heals exactly as before.
+fn self_heal_may_recapture(
+    rgb_lost_the_face: bool,
+    ir_kept_the_face: bool,
+    sequential: bool,
+    rgb_hard_retried: bool,
+    held_sessions: bool,
+) -> bool {
+    rgb_lost_the_face && ir_kept_the_face && !sequential && !rgb_hard_retried && !held_sessions
+}
+
 /// The `mode_source` string [`capture_mode_decision`] returns when the operator
 /// set the env var. Named once so the guard that refuses to LEARN from an
 /// operator-forced mode binds to the same spelling that produces it, instead of
@@ -821,6 +854,26 @@ mod capture_mode_decision_tests {
         // concurrent fallback broke an enrollment on hardware that cannot
         // stream both nodes (#308).
         assert_eq!(capture_mode_decision(None, None), (true, "default"));
+    }
+
+    #[test]
+    fn the_self_heal_never_reopens_a_camera_the_caller_is_streaming() {
+        use super::self_heal_may_recapture;
+        // The degradation signature, on the one-shot path the self-heal was
+        // written for: RGB lost the face, IR kept it, captured concurrently,
+        // nothing re-fetched yet.
+        assert!(self_heal_may_recapture(true, true, false, false, false));
+        // The same signature during ENROLMENT, which holds both streams open
+        // for the whole capture loop. Recapturing here opens a device this
+        // process is already streaming, and a module that answers EBUSY to the
+        // second open fails the enrolment outright (#187). The hard retry
+        // above refuses for exactly this reason; so must this.
+        assert!(!self_heal_may_recapture(true, true, false, false, true));
+        // The rest of the signature still has to hold.
+        assert!(!self_heal_may_recapture(false, true, false, false, false));
+        assert!(!self_heal_may_recapture(true, false, false, false, false));
+        assert!(!self_heal_may_recapture(true, true, true, false, false));
+        assert!(!self_heal_may_recapture(true, true, false, true, false));
     }
 
     #[test]
@@ -1926,7 +1979,13 @@ impl Engine {
         // degradation signature (a genuinely absent user shows no face in
         // either, so this does not fire). Recapture RGB alone on the idle
         // link. Skipped in sequential mode and if RGB was already re-fetched.
-        if rgb_top.is_none() && ir_top.is_some() && !sequential && !rgb_hard_retried {
+        if self_heal_may_recapture(
+            rgb_top.is_none(),
+            ir_top.is_some(),
+            sequential,
+            rgb_hard_retried,
+            held_sessions,
+        ) {
             irlume_common::dlog!(
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );

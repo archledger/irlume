@@ -2504,24 +2504,6 @@ fn collect_images(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// Peak IR brightness near the eye landmarks (corneal glint, supporting cue).
-fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &irlume_vision::Landmarks5) -> f32 {
-    let mut peak = 0u8;
-    for &(ex, ey) in &landmarks[0..2] {
-        let r = 8i32;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let x = ex as i32 + dx;
-                let y = ey as i32 + dy;
-                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-                    peak = peak.max(grey[(y as u32 * w + x as u32) as usize]);
-                }
-            }
-        }
-    }
-    peak as f32
-}
-
 /// P2 probe: capture RGB + IR and report what the IR stream gives us: mean/min/
 /// max brightness (is the emitter illuminating?), and whether YuNet finds a face
 /// in each spectrum (the basis for the cross-spectrum liveness cue). Diagnostic,
@@ -5344,22 +5326,5 @@ mod tests {
         let mut out = Vec::new();
         collect_images(std::path::Path::new("/nonexistent/irlume-imgs"), &mut out);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn eye_glint_takes_the_peak_near_the_eye_landmarks_only() {
-        let (w, h) = (64u32, 64u32);
-        let mut grey = vec![0u8; (w * h) as usize];
-        let landmarks: irlume_vision::Landmarks5 = [
-            (10.0, 10.0), // left eye
-            (30.0, 10.0), // right eye
-            (20.0, 20.0),
-            (12.0, 28.0),
-            (28.0, 28.0),
-        ];
-        assert_eq!(eye_glint(&grey, w, h, &landmarks), 0.0);
-        grey[(12 * w + 12) as usize] = 200; // within radius 8 of the left eye
-        grey[(60 * w + 60) as usize] = 255; // far from both eyes: must not count
-        assert_eq!(eye_glint(&grey, w, h, &landmarks), 200.0);
     }
 }

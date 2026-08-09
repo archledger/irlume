@@ -2592,9 +2592,11 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_center_edge_ratio = ir_top_face
             .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        let ir_eye_glint = ir_top_face
-            .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-            .unwrap_or(0.0);
+        // Single frame, no burst stats, so no white level is known: the
+        // `white: None` arm passes the peak through exactly as before, the same
+        // honesty this probe already applies to ir_saturated_frac below (#222).
+        let ir_eye_glint =
+            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks));
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
@@ -2636,19 +2638,25 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             rgb_moire_score: 0.0,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}  face_frac {:.3}  clipped {}", signals.face_frac,
+        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {}  face_frac {:.3}  clipped {}",
+            signals
+                .ir_eye_glint
+                .map(|g| format!("{g:.0}"))
+                .unwrap_or_else(|| "n/a".into()),
+            signals.face_frac,
             signals
                 .ir_saturated_frac
                 .map(|f| format!("{:.1}%", f * 100.0))
                 .unwrap_or_else(|| "n/a".into()));
         println!(
-            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
+            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={} glint_readable={}",
             cues.face_in_rgb,
             cues.face_in_ir,
             cues.cross_spectrum_aligned,
             cues.ir_reflectance_ok,
             cues.center_edge_ratio_ok,
-            cues.glint_present
+            cues.glint_present,
+            cues.glint_readable
         );
         println!("[GATE] {verdict:?}: {reason}");
         Ok(())
@@ -4261,8 +4269,31 @@ fn doctor_run(
     // then silently falls to the password on every polkit prompt.
     // Same parse the engine gates on and the PAM module instructs from, so doctor
     // can never report a gesture the daemon would refuse.
-    let gesture_is_closure = irlume_common::config::consent_gesture_mode()
-        == irlume_common::config::ConsentGesture::Closure;
+    let gesture_mode = irlume_common::config::consent_gesture_mode();
+    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
+    // `Misconfigured` is not "some gesture other than closure". It permits
+    // NEITHER, so every face prompt falls back to the password, and comparing
+    // only against `Closure` reported that state as ordinary nod operation:
+    // a gate that can never pass, shown as healthy, on the surface whose whole
+    // job is to say what is wrong (#365 review). The parser has already told
+    // the operator on stderr; doctor is where they look afterwards.
+    //
+    // Reported as a human line and not as a new check id on purpose. The
+    // machine-API registry conformance test asserts BOTH directions (every id
+    // emitted has a row, and every row is emitted), so a conditionally-emitted
+    // id fails on every healthy machine. Giving it an always-emitted id is a
+    // public contract addition and belongs in its own change, not in a review
+    // fix.
+    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+        dout!(
+            report,
+            "[doctor] consent gesture: MISCONFIGURED. `consent_gesture` is set to a \
+             value irlume cannot read (expected `nod` or `closure`), so NO gesture is \
+             accepted and every face prompt for a polkit action or the keyring falls \
+             back to the password. Fix or remove the key in /etc/irlume/settings.conf, \
+             or unset IRLUME_CONSENT_GESTURE."
+        );
+    }
     let closure_calibrated = matches!(
         daemon_request(&irlume_common::Request::ListProfiles {
             user: user.clone(),

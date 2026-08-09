@@ -165,8 +165,15 @@ jobs:
           # so an unprivileged run cannot take it and irlume declines to write.
           # Root is also the production context: irlumed drives the emitter as
           # root.
+          #
+          # The gate here and the invocation below must name the same mechanism.
+          # This step runs the burst through `sudo -n`, so passwordless sudo is
+          # what it needs, and a message offering a remedy this step cannot
+          # honour sends an operator to a change that leaves the nightly red.
+          # The #393 review caught exactly that: the group route on #392 is only
+          # half a fix while the burst still goes through sudo.
           if ! sudo -n true 2>/dev/null; then
-            echo "::error::this runner cannot take the emitter lock, so the emitter check cannot run. It is /run/lock/irlume-emitter-*.lock, created 0640 root:root by the daemon under UMask=0027, and this job runs as an unprivileged service account. Either give that account passwordless sudo for the burst, or make the lock reachable by the group that can already drive the camera (/dev/video* is root:video). Tracked on #392; failing rather than passing, because a check that cannot run has not passed"
+            echo "::error::this runner cannot take the emitter lock, so the emitter check cannot run. The lock is /run/lock/irlume-emitter-*.lock, created 0640 root:root by the daemon under UMask=0027, and this job runs as an unprivileged service account. This step invokes the burst through sudo -n, so passwordless sudo for that account is what it needs today. The route tracked on #392 is a pair: make the lock reachable by the group that can already drive the camera (/dev/video* is root:video), and change this step to run the burst unprivileged. Neither half has been run on hardware. Failing rather than passing, because a check that cannot run has not passed"
             exit 1
           fi
           sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"

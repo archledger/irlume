@@ -1308,6 +1308,31 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
     let active = write
         .as_ref()
         .is_some_and(|w| w.outcome != Applied::Nothing);
+    // A POSITIVE statement of what the emitter path did, for a caller that
+    // needs to verify it rather than infer it.
+    //
+    // The nightly hardware suite used to assert this by the ABSENCE of one
+    // refusal message, which only covers the lock branch. `enable` returns
+    // inert from several others: an unreadable USB identity, a recovery that
+    // reports Busy or OwnerStillRunning (both deliberately silent), no
+    // applicable control, and a failed `apply_device_default` or
+    // `apply_known_payload`. Every one of those produces a capture that looks
+    // exactly like a successful one from outside, and the comment beside
+    // `applied_known_payload` already warns that a bool cannot tell "no ioctl
+    // reached the device" from "the device rejected it" (#384 review).
+    //
+    // Off unless asked for: this is per-capture and would otherwise be noise on
+    // the authentication path.
+    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+        eprintln!(
+            "irlume: capture emitter {}",
+            match write.as_ref().map(|w| w.outcome) {
+                Some(Applied::Wrote) => "write completed",
+                Some(Applied::AlreadyHeld) => "already held the requested value",
+                Some(Applied::Nothing) | None => "was not activated",
+            }
+        );
+    }
     // What the guard owns: a write of its own, with the value it displaced —
     // or a crash leftover claimed through the stream record (#188). A control
     // already holding the wanted bytes is another writer's state EXCEPT when a
@@ -3942,6 +3967,40 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    /// The nightly hardware suite greps for this line EXACTLY
+    /// (`grep -Fxq` in .github/workflows/hardware-suite.yml), so a reword here
+    /// silently turns that gate into one that can never pass, and the camera
+    /// stage would fail every night for a reason nobody would look for in this
+    /// file.
+    ///
+    /// That is not hypothetical: #383 is the same drift one layer over, where
+    /// doctor's node line gained a suffix and the workflow's anchored match
+    /// stopped firing for eight nights. Change the string here and change it
+    /// there in the same commit (#384).
+    #[test]
+    fn the_emitter_write_marker_matches_what_ci_greps_for() {
+        let workflow = include_str!("../../../.github/workflows/hardware-suite.yml");
+        assert!(
+            workflow.contains("irlume: capture emitter write completed"),
+            "the workflow no longer greps for the marker this file emits"
+        );
+        // ...and the source really does emit that exact text, so the assertion
+        // above cannot pass against a workflow string with no producer.
+        //
+        // The needles are assembled with `concat!` because `include_str!` pulls
+        // in THIS module: spelled inline, they match their own assertion and the
+        // check stays green with the marker reworded. Caught by mutation, which
+        // is the only reason this comment exists (defect pattern 70, hit for the
+        // third time in one session).
+        let src = include_str!("ir_emitter.rs");
+        let produced = concat!("\"write ", "completed\"");
+        let format = concat!("irlume: capture ", "emitter {}");
+        assert!(
+            src.contains(produced) && src.contains(format),
+            "the marker is no longer produced here; the workflow gate has no source"
+        );
+    }
+
     use super::*;
 
     /// Build a fake /proc tree: `pids` maps a pid to (comm, fd-targets).

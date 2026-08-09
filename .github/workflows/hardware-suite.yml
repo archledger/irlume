@@ -160,18 +160,31 @@ jobs:
             exit 1
           fi
           err="$(mktemp)"
-          if sudo -n true 2>/dev/null; then
-            sudo -n "$burst" "$out" "$ir" 6 2>"$err"
-          else
-            echo "::warning::no passwordless sudo; running the burst unprivileged"
-            "$burst" "$out" "$ir" 6 2>"$err"
+          # Privilege is required, not preferred. The emitter lock lives in
+          # /run/lock and the daemon creates it 0640 root:root under UMask=0027,
+          # so an unprivileged run cannot take it and irlume declines to write.
+          # Root is also the production context: irlumed drives the emitter as
+          # root.
+          if ! sudo -n true 2>/dev/null; then
+            echo "::error::passwordless sudo is required to drive the emitter here (#384)"
+            exit 1
           fi
+          sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"
           cat "$err"
-          # "Could not manage the emitter" must not read as "the emitter is
-          # fine". Same rule as the node parse above and as #227: a check that
-          # could not run is not a check that passed.
-          if grep -q "will not write to this camera.s emitter" "$err"; then
-            echo "::error::irlume could not take the emitter lock, so it never drove the emitter. Any spread below is the emitter's leftover state, not evidence that irlume can light it (#384)"
+          # A POSITIVE marker, not the absence of one refusal string. The first
+          # version of this guard grepped for the lock refusal, which covers one
+          # of at least six inert paths through `ir_emitter::enable`: an
+          # unreadable USB identity, a recovery reporting Busy or
+          # OwnerStillRunning (both silent by design), no applicable control, and
+          # a failed apply_device_default or apply_known_payload. Any of those
+          # captures frames that look exactly like a successful run.
+          #
+          # `AlreadyHeld` is deliberately NOT accepted: it shows the control
+          # holds the wanted value, which is not the same as this invocation
+          # having driven it, and driving it is what this step claims to test
+          # (#384 review).
+          if ! grep -Fxq "irlume: capture emitter write completed" "$err"; then
+            echo "::error::irlume did not complete the emitter write, so the spread below is the emitter's leftover state rather than evidence irlume can light it (#384)"
             exit 1
           fi
           frames=$(find "$out" -name "frame*.pgm" | wc -l)

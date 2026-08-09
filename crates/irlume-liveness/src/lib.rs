@@ -125,9 +125,11 @@ pub struct Signals {
     pub face_frac: f32,
     /// Fraction (0-1) of the IR face region at or above the sensor's ceiling,
     /// or `None` when the reading could not be taken: no IR face, the RGB-only
-    /// path, or a negotiated format whose decode cannot say where its ceiling
-    /// is (the Y16 family is rescaled per frame; YUV ceilings depend on a
-    /// quantization irlume does not carry). `None` is NOT zero clipping.
+    /// path, or a negotiated format the camera crate declines to give a ceiling
+    /// for (the Y16 family is rescaled per frame, so its 255 is the frame's own
+    /// maximum; the YUV pair is refused for a reason that is not about the
+    /// quantization being unknown, which irlume does carry, see
+    /// `clipping_white_level` and #385). `None` is NOT zero clipping.
     ///
     /// GATED since #237, at [`IR_SATURATED_FRAC_MAX`]. Saturation compresses
     /// [`ir_center_edge_ratio`] toward 1 the way an ambient pedestal does,

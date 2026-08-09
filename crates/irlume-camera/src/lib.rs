@@ -198,10 +198,22 @@ pub struct IrCaptureStats {
     /// sensor's full-scale sample. The Y16 family does not, because
     /// `grey16_shift` picks the shift from the frame's OWN maximum, so a
     /// decoded 255 means "the brightest pixel in this frame" and a dim frame
-    /// full of them is ordinary. NV12 and YUYV do not either, because their
-    /// ceiling depends on the negotiated quantization (limited range puts
-    /// nominal white at 235, full range at 255) and irlume does not carry that
-    /// field, so a clipped face could read as no clipping at all.
+    /// full of them is ordinary.
+    ///
+    /// NV12 and YUYV answer `None` for a different reason, and it is NOT that
+    /// the quantization is unknown. This comment used to say irlume does not
+    /// carry that field; it does. `IrCamera::open` stores `fmt.quantization`
+    /// and `clipping_white_level` already takes it, so their ceiling is
+    /// computable (limited range puts nominal white at 235, full range at 255).
+    ///
+    /// The `None` is load-bearing somewhere else. `role_from_formats` calls any
+    /// node advertising either fourcc `Role::Rgb`, whatever else it advertises,
+    /// so no DISCOVERED pair ever reaches an IR decode with them. The ones that
+    /// do arrive by the `IRLUME_CAMERA_*` override, a saved pin, or the
+    /// `/dev/video2` fallback, and there this `None` is what makes
+    /// `exposure_refusal` refuse the frame. Answering a ceiling would delete
+    /// that refusal and hand cues fitted on an emitter-lit IR image a room-lit
+    /// colour frame (#385).
     pub white_level: Option<u8>,
     /// The gate frame's RAW pixels, present only when the returned frame is no
     /// longer them: ambient subtraction replaces the payload, and a caller
@@ -1926,6 +1938,19 @@ fn grey16_shift(buf: &[u8]) -> u32 {
 /// there instead would be the cautious-looking choice and would disable the
 /// gate on every camera anyone actually has, which is the failure this exists
 /// to prevent. If a module ever reports limited range, the 235 arm covers it.
+///
+/// That citation is a userspace tool's opinion, and the kernel's own format
+/// table disagrees with it: `V4L2_MAP_QUANTIZATION_DEFAULT` resolves `Default`
+/// to LIMITED for Y'CbCr unless the colorspace is JPEG, and `v4l2-ctl` prints
+/// GREY as full range only because its `is_rgb_or_hsv` fourcc switch ends in
+/// `default: return true` and GREY is not in the list. The committed corpora
+/// settle it by measurement rather than by either claim: across
+/// `docs/pad-results/2026-08-02-center-edge-corpus.jsonl` and
+/// `2026-08-04-occluder-gate.jsonl`, `ir_saturated_frac` is nonzero in 75 of
+/// the 129 records carrying it (59 of 103, peaking at 0.547, and 16 of 26),
+/// and those captures were measured against a 255 ceiling. Real GREY8 frames
+/// from the ASUS module do reach 255, so the stream is full range in fact,
+/// whatever the metadata says (#385).
 pub(crate) fn clipping_white_level(pix: IrPixel, quantization: Quantization) -> Option<u8> {
     match (pix, quantization) {
         (IrPixel::Grey8, Quantization::LimitedRange) => Some(235),
@@ -4444,9 +4469,13 @@ mod tests {
 
     /// Which formats can support a clipping claim at all. A decoded 255 means
     /// "the sensor's full-scale sample" ONLY for the native 8-bit greys: the
-    /// Y16 family is rescaled by a shift taken from the frame's own maximum,
-    /// and the YUV ceilings depend on a quantization irlume does not carry.
-    /// Saying None there is what keeps #221's corpus interpretable.
+    /// Y16 family is rescaled by a shift taken from the frame's own maximum.
+    /// The YUV pair is a different case and this comment used to get it wrong:
+    /// irlume does carry their quantization, so their ceiling is computable,
+    /// and the `None` is there because no discovered pair reaches an IR decode
+    /// with those fourccs and the refusal it produces is what stops a colour
+    /// node in the IR slot (#385). Saying None keeps #221's corpus
+    /// interpretable either way.
     #[test]
     fn only_native_8bit_grey_can_claim_a_clipping_ceiling() {
         for q in [

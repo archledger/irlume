@@ -177,9 +177,22 @@ jobs:
           frames=$(find "$out" -name "frame*.pgm" | wc -l)
           echo "captured $frames frames"
           test "$frames" -ge 4
-          # The strobe must actually strobe: require a real spread between the
-          # brightest (emitter-lit) and darkest frame means, the same signal
-          # capture_ir keys on. A dead emitter shows as a flat, dark burst.
+          # A flat, dark burst means no usable IR frames at all, which is worth
+          # catching. It does NOT mean irlume drove the emitter, and the comment
+          # here used to say it did.
+          #
+          # Measured 2026-08-08 on both modules, five consecutive runs per
+          # condition so no run inherits the previous one's emitter state:
+          #
+          #   NexiGo, IRLUME_IR_EMITTER=off   brightest frame 134.5 31.6 139.9 27.8 134.5
+          #   NexiGo, irlume managing it       brightest frame  31.1 139.5 29.1 148.0 25.1
+          #
+          # Both alternate between roughly 30 and roughly 135: the camera cycles
+          # its own state between capture sessions (#264's self-strobing seen
+          # from the other side), and every run clears this floor by a wide
+          # margin either way. So this asserts that the camera delivers
+          # alternating frames, not that irlume's extension-unit write reached
+          # it. A discriminator that depends on the write is tracked on #384.
           awk '{print $2}' "$out/means.txt" | sort -n | awk 'NR==1{min=$1} END{max=$1; d=max-min; printf "mean spread: %.1f\n", d; exit (d < 5)}'
 
       # Forensics on failure only. A hardware-only failure is otherwise

@@ -29,7 +29,7 @@ arm64 onnxruntime + rebuild validation, not anything in the code.
 | Ubuntu 26.04 LTS GNOME | ThinkPad X13 Yoga G4, Chicony RGB camera + Synaptics fingerprint | Convenience | PPA install end to end, lock-screen face unlock, fingerprint companion, correct password-only refusals for login and sudo, AppArmor profile enforcing (soak-tested, zero denials) |
 | Arch | desktop, no camera | none | package build, daemon + full CLI stack, PAM wiring dry-run, clean camera-less refusals |
 | Debian 12 | container (no camera) | none | from-source build, `.deb` install, `irlume doctor` |
-| external IR camera | NexiGo HelloCam N930W (USB) | IR/Secure | presentation-attack testing (photo, screen, replay denied), daemon-to-password fallback end to end |
+| external IR camera | NexiGo HelloCam N930W (`3443:c803`) | IR/Secure | presentation-attack testing (photo, screen, replay denied), daemon-to-password fallback end to end |
 | external IR camera | Logitech Brio 4K (046d:085e) | link-dependent, see below | sequential capture both links; emitter strobe and dark-room IR measured on USB3; RGB starvation measured on both links |
 
 ### Logitech Brio 4K: capability depends on the USB link
@@ -55,6 +55,39 @@ emitter (the NexiGo above). On USB3 the measured pieces (emitter, dark-room
 IR, sequential capture) support Hello-class use, but full enrollment and
 authentication on that link are not yet exercised; the verdict is only as
 wide as those measurements.
+
+### Buying an external camera: what the model name does not tell you
+
+**The NexiGo N930W name covers two different products.** The one measured above
+is the HelloCam, `3443:c803`, which carries an IR sensor. NexiGo also sells a
+60fps N930W with no IR sensor and no Hello support, enumerating as `3443:930d`.
+Check the USB id with `lsusb`, not the box.
+
+More generally, a camera advertised as "Windows Hello compatible" is not
+evidence of anything irlume can use. Microsoft's own implementation guide
+describes three arrangements: RGB-only, IR-only, and one camera carrying both.
+Only the last, or a paired RGB and IR pair inside one physical device, gives a
+secure tier. What to check before trusting a camera:
+
+- It presents a node advertising a GREY or Y-family format, not only YUYV and
+  MJPEG. `irlume doctor` reports what each node advertises.
+- The node count tells you nothing. A simple RGB plus IR camera commonly shows
+  four `/dev/video*` entries, two of them image nodes and two secondary, and
+  more elaborate devices show more. Never select by number; irlume selects by
+  advertised format and device topology, and so should you when reading `lsusb`
+  output.
+- The emitter is the part most likely to be missing. irlume discovers it
+  through the Microsoft camera extension unit where present, and `irlume
+  ir-setup` covers the rest, but a camera whose vendor exposes no control at all
+  can still capture IR only when the room supplies infrared.
+
+Two models turn up often in searches and are **not** recommendable on current
+evidence: the Dell UltraSharp WB7022 and the Lenovo 510 / Performance FHD. Both
+are documented by their vendors as Hello cameras and both plausibly work, but
+neither has a public, reproducible Linux report pairing an IR stream with a
+working emitter, and neither has been measured here. Absence of a report is not
+a verdict against them; it is a reason not to spend money on this project's
+say-so.
 
 The first cross-distro survey (build, daemon, PAM plan, tier detection on
 Arch and Ubuntu) is written up in

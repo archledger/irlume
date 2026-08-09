@@ -119,6 +119,13 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
             payload: HELLO_FACE_AUTH.to_vec(),
         }),
         // NexiGo HelloCam N930W; MS-XU is unit 4.
+        //
+        // The product NAME is ambiguous and the identity here is not. NexiGo
+        // also sells a 60fps N930W with no IR sensor and no Hello support,
+        // which enumerates as 3443:930d and is known to the kernel through an
+        // unrelated audio quirk. Only c803 is the HelloCam this payload was
+        // validated against, so do not "correct" this entry to the other id on
+        // the strength of a matching model number (#341 survey).
         (0x3443, 0xc803) => Some(EmitterControl {
             unit: 4,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
@@ -7382,6 +7389,13 @@ mod tests {
             nexigo.selector,
             crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
         );
+
+        // The SAME model name, a different product. NexiGo sells a 60fps N930W
+        // with no IR sensor that enumerates as 3443:930d. It must get nothing,
+        // because the payload above was validated against the HelloCam and a
+        // model-number match is not an identity match. This is the assertion
+        // that fails if someone reconciles the table to the other id (#341).
+        assert_eq!(known_control(0x3443, 0x930d), None);
 
         // A different camera gets nothing, however it names itself. The old
         // table matched `card.contains("ASUS")`, so any camera with that word

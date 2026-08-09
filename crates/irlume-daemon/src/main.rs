@@ -146,8 +146,23 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
             );
             if strict {
+                // Says "start", not "run", and the distinction is real. This
+                // gate covers the STARTUP load and nothing after it: the camera
+                // worker's post-panic rebuild reaches `Engine::load` with no
+                // verified bytes and no manifest comparison, so a file swapped
+                // after this point is loaded unchecked (#346).
+                //
+                // That path fails CLOSED rather than granting: a substituted
+                // recognizer produces a different `embed:<sha256>` space tag and
+                // `recognizer_space_matches` is strict, so every stored scan is
+                // filtered out and the attempt denies to password. Worth saying
+                // plainly here anyway, because an operator who sets this expects
+                // a promise about the process, and what it covers is the load.
                 eprintln!(
-                    "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models"
+                    "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models \
+                     (this checks the models loaded at startup; a rebuild after a worker panic \
+                     reloads from disk without re-checking, and denies rather than granting if \
+                     the file changed)"
                 );
                 std::process::exit(1);
             }

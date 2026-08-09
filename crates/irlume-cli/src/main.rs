@@ -3246,8 +3246,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             }
             rec.insert("rgb_present".into(), rgb_top.is_some().into());
 
-            let (mut ir_cos, mut ir_bri, mut ir_center_edge_ratio, mut ir_glint) =
-                (f32::NAN, 0.0f32, 0.0f32, 0.0f32);
+            let (mut ir_cos, mut ir_bri, mut ir_center_edge_ratio) = (f32::NAN, 0.0f32, 0.0f32);
+            // `Option`, because a railed peak is not a dim eye. See the swap below.
+            let mut ir_glint: Option<f32> = None;
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
@@ -3256,7 +3257,24 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
                 ir_center_edge_ratio =
                     irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
-                ir_glint = irlume_auth::eye_glint(&irf.data, irf.width, irf.height, &t.landmarks);
+                // `eye_glint_of` on the RAW frame with the negotiated ceiling, the
+                // same pair the daemon and `pad.rs` already pass. `eye_glint`
+                // returns the window maximum, and a maximum that reached the
+                // ceiling says the true value was at least that and never what
+                // it was: with glasses on, the repo's own measurements pin this
+                // peak at 255 in all 30 frames, where it reads the lens
+                // specular rather than the cornea (#222).
+                //
+                // Raw and not `irf.data`, because ambient subtraction moves a
+                // railed 255 to 254 and a subtracted frame stops reading as
+                // railed, which would silently disable the refusal (#238 review).
+                ir_glint = irlume_auth::eye_glint_of(
+                    ir_stats.saturation_frame.as_deref().unwrap_or(&irf.data),
+                    irf.width,
+                    irf.height,
+                    Some(&t.landmarks),
+                    ir_stats.white_level,
+                );
                 if let Some(a) = adapter.as_mut() {
                     let adapted = a.apply(&raw)?;
                     if !ir_scans.is_empty() {
@@ -3294,7 +3312,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                     "ir_center_edge_ratio".into(),
                     json_f32(ir_center_edge_ratio),
                 );
-                rec.insert("ir_glint".into(), json_f32(ir_glint));
+                // `null` is unambiguous here in a way it is not elsewhere: this
+                // key is written only inside the `if let Some(t) = &ir_top`
+                // branch, so a missing IR face leaves it ABSENT with
+                // `ir_present: false` beside it. Written, `null` can only mean
+                // the peak reached the ceiling (#222).
+                rec.insert(
+                    "ir_glint".into(),
+                    ir_glint.map_or(serde_json::Value::Null, json_f32),
+                );
                 rec.insert(
                     "ir_emb_raw".into(),
                     serde_json::to_value(raw.to_vec()).unwrap(),
@@ -3306,14 +3332,14 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
             written += 1;
             println!(
-                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>3.0}",
+                "  [{:>2}/{n}] rgb {} bri {:>5.1} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>6}",
                 idx + 1,
                 if rgb_top.is_some() { "✓" } else { "·" },
                 rgb_bri,
                 if ir_top.is_some() { "✓" } else { "·" },
                 ir_bri,
                 ir_center_edge_ratio,
-                ir_glint
+                format_ir_glint(ir_top.is_some(), ir_glint)
             );
         }
         Ok(written)
@@ -3332,6 +3358,26 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
 
 /// JSON number from an f32, mapping non-finite to JSON null (so `NaN` for an
 /// absent cosine round-trips cleanly instead of breaking the encoder).
+/// The console trace's glint field, as a value a test can observe.
+///
+/// Three states, and the first two used to be one. `ir_glint` starts `None` and
+/// stays `None` when no IR face was detected, so mapping `None` straight to
+/// "railed" told a reader the peak reached the ceiling on frames where no eye
+/// was ever sampled.
+///
+/// Returned as a plain string with a WIDTH and no precision. `{:>3.0}` was the
+/// old numeric spec, and precision on a non-numeric argument is a maximum
+/// output width rather than a decimal count, so `.0` truncated every value to
+/// nothing and printed an empty field for readings and refusals alike (#398
+/// review).
+fn format_ir_glint(ir_present: bool, glint: Option<f32>) -> String {
+    match (ir_present, glint) {
+        (false, _) => "n/a".to_string(),
+        (true, None) => "railed".to_string(),
+        (true, Some(g)) => format!("{g:.1}"),
+    }
+}
+
 fn json_f32(x: f32) -> serde_json::Value {
     serde_json::Number::from_f64(x as f64)
         .map(serde_json::Value::Number)
@@ -5270,6 +5316,32 @@ mod tests {
         assert_eq!(json_f32(0.0), serde_json::json!(0.0));
         assert_eq!(json_f32(f32::NAN), serde_json::Value::Null);
         assert_eq!(json_f32(f32::INFINITY), serde_json::Value::Null);
+    }
+
+    /// The three states must stay distinguishable in the trace. Two of them
+    /// were one: `ir_glint` is `None` both when no IR face was found and when
+    /// the peak railed, so a bare `map_or` reported "railed" on frames that
+    /// sampled no eye at all.
+    ///
+    /// The emptiness assertions are the other half. The field carried the
+    /// numeric spec `{:>3.0}`, and precision on a non-numeric argument is a
+    /// maximum width, so every value printed blank. Anything this function
+    /// returns has to survive being formatted as a string (#398 review).
+    #[test]
+    fn the_glint_trace_field_separates_absent_railed_and_measured() {
+        assert_eq!(format_ir_glint(false, None), "n/a");
+        assert_eq!(format_ir_glint(true, None), "railed");
+        assert_eq!(format_ir_glint(true, Some(126.0)), "126.0");
+        // A face detected but no glint recorded is NOT the same as no face.
+        assert_ne!(format_ir_glint(false, None), format_ir_glint(true, None));
+        for s in [
+            format_ir_glint(false, None),
+            format_ir_glint(true, None),
+            format_ir_glint(true, Some(126.0)),
+        ] {
+            assert!(!s.is_empty(), "the trace field must not render empty");
+            assert!(!format!("{s:>6}").trim().is_empty());
+        }
     }
 
     #[test]

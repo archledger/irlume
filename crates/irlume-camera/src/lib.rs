@@ -3340,10 +3340,6 @@ pub enum ContentionCause {
     /// requested, confirmed by uvcvideo saying so. `-EIO` alone does NOT reach
     /// this: see the note on the trace gate below.
     DeviceRequestExceedsAltsettings,
-    /// The device asked for more than its endpoint carries and the kernel
-    /// clamped it, which it announces unconditionally at warning level. This is
-    /// the one device-side signature reliably visible on a stock system.
-    DeviceOverRequestClamped,
     /// A busy or ownership conflict in the V4L2 queue or the device. Not a
     /// bandwidth question, and deliberately not narrowed to "the sibling is
     /// streaming", which `EBUSY` does not establish on its own.
@@ -3384,10 +3380,6 @@ const USB_CORE_NO_BANDWIDTH: &str = "Not enough bandwidth for altsetting";
 /// it is printed on `COMP_BANDWIDTH_ERROR` and `COMP_SECONDARY_BANDWIDTH_ERROR`
 /// and nothing else. Observed in reports from 2017 through the current tree.
 const XHCI_NO_BANDWIDTH: &str = "Not enough bandwidth for new device state";
-/// uvcvideo announcing it clamped an over-large request down to the endpoint
-/// limit. Unconditional `dev_warn_ratelimited`, so unlike the altsetting-scan
-/// message this one is visible on a stock system.
-const UVC_CLAMPED_PAYLOAD: &str = "Reducing max payload transfer size";
 /// uvcvideo saying no altsetting fits the device's request. This is `uvc_dbg`
 /// under the VIDEO class, so it is ABSENT unless an administrator set
 /// uvcvideo's `trace` parameter. Treat its presence as strong evidence and its
@@ -3420,9 +3412,6 @@ pub fn classify_contention_failure(errno: Option<i32>, kernel_lines: &[&str]) ->
     if errno == libc::EIO && saw(UVC_NO_FAST_ENOUGH_ALT) {
         return ContentionCause::DeviceRequestExceedsAltsettings;
     }
-    if saw(UVC_CLAMPED_PAYLOAD) {
-        return ContentionCause::DeviceOverRequestClamped;
-    }
     if errno == libc::EBUSY {
         return ContentionCause::Busy;
     }
@@ -3447,12 +3436,7 @@ pub fn classify_contention_failure(errno: Option<i32>, kernel_lines: &[&str]) ->
 pub fn reduction_may_help(cause: ContentionCause) -> bool {
     match cause {
         ContentionCause::HostBudget | ContentionCause::DeviceRequestExceedsAltsettings => true,
-        // Clamping already happened, so the request the host saw was the
-        // endpoint limit, not the device's ask; making the ask smaller changes
-        // nothing the host was told.
-        ContentionCause::DeviceOverRequestClamped
-        | ContentionCause::Busy
-        | ContentionCause::Unknown => false,
+        ContentionCause::Busy | ContentionCause::Unknown => false,
     }
 }
 
@@ -4384,12 +4368,20 @@ mod tests {
             ),
             ContentionCause::DeviceRequestExceedsAltsettings
         );
+        // A clamp warning is a SUCCESSFUL fix-up, not a failure cause:
+        // `uvc_fixup_video_ctrl` reduces the request and carries on. Seeing one
+        // in the window establishes that a clamp happened, never that it is why
+        // a later call failed, so it must not name a cause on its own (#402
+        // review). It must also not outrank a real EBUSY.
+        let clamp =
+            ["uvcvideo 1-5:1.0: UVC non compliance: Reducing max payload transfer size (3072) to fit endpoint limit (2048)."];
         assert_eq!(
-            classify_contention_failure(
-                Some(libc::EIO),
-                &["uvcvideo 1-5:1.0: UVC non compliance: Reducing max payload transfer size (3072) to fit endpoint limit (2048)."]
-            ),
-            ContentionCause::DeviceOverRequestClamped
+            classify_contention_failure(Some(libc::EIO), &clamp),
+            ContentionCause::Unknown
+        );
+        assert_eq!(
+            classify_contention_failure(Some(libc::EBUSY), &clamp),
+            ContentionCause::Busy
         );
         assert_eq!(
             classify_contention_failure(Some(libc::EBUSY), &[]),
@@ -4444,11 +4436,7 @@ mod tests {
         assert!(reduction_may_help(
             ContentionCause::DeviceRequestExceedsAltsettings
         ));
-        for refused in [
-            ContentionCause::DeviceOverRequestClamped,
-            ContentionCause::Busy,
-            ContentionCause::Unknown,
-        ] {
+        for refused in [ContentionCause::Busy, ContentionCause::Unknown] {
             assert!(!reduction_may_help(refused), "{refused:?} must not qualify");
         }
     }

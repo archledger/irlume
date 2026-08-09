@@ -5,7 +5,68 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The IR eye-glint cue recorded the sensor's ceiling as the strongest possible
+  reading.** `eye_glint` returned the window maximum with no notion of a
+  ceiling, so a peak that railed at the negotiated format's white level was
+  stored as a measurement rather than as a reading that established nothing. A
+  clipped sample says the true value was AT LEAST the ceiling and never what it
+  was, and a maximum is exactly the statistic that destroys.
+
+  Measured in the corpora already committed here. In
+  `docs/pad-results/2026-08-04-occluder-gate.jsonl` all 8 records that recorded
+  a glint are railed at exactly 255, and no record has `glint_present` with an
+  unpegged peak, so "glint present" and "the peak railed" named the same set;
+  the highest genuine reading in that file is 126, far under `GLINT_MIN` (180).
+  In `docs/pad-results/2026-08-02-center-edge-corpus.jsonl` 16 of 104 are railed
+  while 20 records carry a genuine sub-ceiling glint, so a real population does
+  exist and marking the railed ones absent separates it rather than erasing it.
+  This is the shape #222 named after measuring all three supported modules.
+
+  #237's exposure gate mostly cannot catch it, because a specular blob inside a
+  17x17 eye window is a rounding error against a whole face region. Of the 24
+  railed records across both corpora, 22 clip 0.42% to 7.70% of the face, under
+  `IR_SATURATED_FRAC_MAX` (0.10), and are judged normally. The other two are
+  `live_close` captures clipping 30.5% and 54.7%, which that gate already
+  refuses as `Uncertain` for whole-face blowout: a different failure from the
+  one #222 names, and the reason this is a distinct defect rather than a
+  duplicate. `Signals::ir_eye_glint` is now `Option<f32>`, `None` for a railed peak,
+  a missing IR face, or the RGB-only path; the corpus writes `ir_glint: null`
+  and a new `cues.glint_readable` separates "read and dim" from "not readable".
+  No threshold moved: `GLINT_MIN` stays 180, and the ceiling comes from
+  `clipping_white_level`, which was already plumbed to both call sites. A format
+  that cannot name its ceiling (Grey16, NV12, YUYV) passes the peak through
+  unchanged, which is #237's own settled precedent.
+
+  No authentication verdict changes: the cue reaches the PAD corpus and a dev
+  probe print, and nothing else. Records written BEFORE this change keep the old
+  semantics, so any future re-derivation of `GLINT_MIN` must treat the existing
+  corpora as railed-contaminated.
+
 ### Security
+
+- **The IR exposure gate was off, not lenient, on every IR camera that is not
+  8-bit grey.** `exposure_refusal` read "could not measure" as "clean", so on a
+  node negotiating `Y16`/`Y10`/`Y12`/`NV12`/`YUYV` the #237 gate never ran and
+  every liveness cue below it judged a frame nobody had checked.
+  `clipping_white_level` answers `None` for those formats, and `is_none_or`
+  turned that into a pass. The gate now states its own precondition,
+  `Signals::ir_ceiling_known`, defaulting to false, and a format that names no
+  ceiling is refused rather than passed: a gate that could not run is not a
+  gate that passed.
+
+  The refusal is not presence-retryable on either evaluator. It is a property
+  of the camera, identical on every frame, so retrying would spend the whole
+  grace window reaching the same answer while advising something that cannot
+  help; the message deliberately does not say "move back".
+
+  Blast radius, measured: `IR_CANDIDATES` tries `GREY`/`Y8`/`Y800` first, so any
+  module offering 8-bit grey is untouched. Every IR camera in the project's
+  record negotiates GREY, including both user-reported ones, and no camera
+  without a grey path has ever been reported. Such a camera can no longer
+  enroll or authenticate, and `docs/PLATFORMS.md` now says so instead of
+  listing it as untested.
 
 - **One socket request reached the keyring with an unscreened username.**
   The daemon screens the account name in every request against path

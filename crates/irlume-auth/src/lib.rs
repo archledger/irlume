@@ -537,18 +537,52 @@ pub fn presence_retryable(o: &Outcome) -> bool {
     )
 }
 
+/// Start of the reason irlume-liveness produces when the IR format defines no
+/// sensor ceiling. Pinned against that text by
+/// `an_unmeasurable_exposure_is_not_retryable`, the same way the `no face in IR`
+/// prefix below is pinned.
+const EXPOSURE_UNMEASURABLE_PREFIX: &str = "IR exposure unmeasurable";
+
 /// Kind of a non-Live cross-spectrum gate verdict on the RGB primary path.
 /// The `no face in IR` reason is singled out because it is the retryable
 /// RGB-yes/IR-no transient; the prefix is pinned against the string
 /// irlume-liveness produces by `grace_retries_only_presence_failures`.
 fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
     match verdict {
+        // Uncertain normally means framing or quality, which the grace window
+        // retries. An unmeasurable IR format is neither: it is a property of
+        // the camera that will hold for every frame, so retrying spends the
+        // whole window to reach the same answer while telling the user to
+        // adjust something that cannot help (#358). OtherDeny is the
+        // non-retryable class for a state refusal like this.
+        Verdict::Uncertain if reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX) => {
+            OutcomeKind::OtherDeny
+        }
         Verdict::Uncertain => OutcomeKind::Uncertain,
         Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
         Verdict::Spoof => OutcomeKind::Spoof,
         // Callers only classify rejections; a Live verdict never reaches here.
         Verdict::Live => OutcomeKind::OtherDeny,
     }
+}
+
+/// Which gestures a consent mode permits: `(nod, closure)`.
+///
+/// Extracted so the decision can be tested. It is written as POSITIVE
+/// membership, never `!= Closure` / `!= Nod`: those read as YES for any state
+/// that is neither, so `Misconfigured` would enable BOTH gestures, which is the
+/// exact failure that state exists to prevent. A nod would then release the
+/// TPM-sealed keyring secret on a system whose operator asked for eye closure
+/// and mistyped it (#365).
+///
+/// This lived inline in `consent_gesture_inputs`, which needs an `Engine` and an
+/// `Enrollment` to call, so nothing in the workspace tested it and reverting the
+/// two lines left the whole suite green (#365 review).
+const fn gestures_permitted_by(mode: ConsentGesture) -> (bool, bool) {
+    (
+        matches!(mode, ConsentGesture::Nod | ConsentGesture::Either),
+        matches!(mode, ConsentGesture::Closure | ConsentGesture::Either),
+    )
 }
 
 /// Calibration-aware IR match result (see [`ir_match_in`]).
@@ -1672,13 +1706,15 @@ impl Engine {
             ir_face: None,
             ir_face_brightness: 0.0,
             ir_center_edge_ratio: 0.0,
-            ir_eye_glint: 0.0,
+            // RGB-only path: no IR frame exists to glint.
+            ir_eye_glint: None,
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // RGB-only path: no IR burst to measure
             face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
             // RGB-only path: no IR frame exists to clip.
             ir_saturated_frac: None,
+            ir_ceiling_known: false,
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
@@ -2110,10 +2146,16 @@ impl Engine {
             ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
             ir_face_brightness: ir_brightness,
             ir_center_edge_ratio,
-            ir_eye_glint: ir_top
-                .as_ref()
-                .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-                .unwrap_or(0.0),
+            // Same RAW-frame rule as `ir_saturated_frac` below, for the same
+            // reason: the ceiling test has to see the samples that actually
+            // railed, and subtraction moves a 255 to 254 (#238 review).
+            ir_eye_glint: eye_glint_of(
+                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+                ir.width,
+                ir.height,
+                ir_top.as_ref().map(|f| &f.landmarks),
+                ir_stats.white_level,
+            ),
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: ir_stats.ambient_mean,
@@ -2131,6 +2173,10 @@ impl Engine {
                 ir_top.as_ref().map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
+            // Whether the FORMAT could be measured, which is not the same
+            // question as whether this capture produced a number: the call
+            // above also yields None when no face was found (#358).
+            ir_ceiling_known: ir_stats.white_level.is_some(),
             rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -2139,8 +2185,14 @@ impl Engine {
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
-            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} ir_clipped={} (face_frac #174, recorded only; clipped #237, refused past the limit)",
-            signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} ir_clipped={} (face_frac #174, recorded only; clipped #237, refused past the limit)",
+            signals.ir_face_brightness, signals.ir_center_edge_ratio,
+            // Same "n/a" rule as ir_clipped: a peak that railed measured
+            // nothing, and printing a number would claim otherwise (#222).
+            signals
+                .ir_eye_glint
+                .map(|g| format!("{g:.2}"))
+                .unwrap_or_else(|| "n/a".into()),
             signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac,
             signals.face_frac,
             // "n/a" is a real answer: this format cannot say where its ceiling
@@ -2484,8 +2536,8 @@ impl Engine {
         enr: &irlume_core::storage::Enrollment,
     ) -> (bool, Option<irlume_liveness::ClosureCalibration>) {
         let mode = consent_gesture_mode();
-        let allow_nod = mode != ConsentGesture::Closure;
-        let closure_cal = (mode != ConsentGesture::Nod && self.mesh.is_some())
+        let (allow_nod, closure_allowed) = gestures_permitted_by(mode);
+        let closure_cal = (closure_allowed && self.mesh.is_some())
             .then(|| {
                 enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
                     let cal = irlume_liveness::ClosureCalibration {
@@ -2789,6 +2841,12 @@ impl Engine {
                 // `ConsentGesture::instruction`: a denial is the worst possible
                 // moment to offer the gesture that needs a calibration to work.
                 ConsentGesture::Either => "keep nodding your head to approve",
+                // No gesture is enabled, so no gesture could have been seen and
+                // none is worth suggesting. Name the setting: the person who can
+                // clear this is whoever typed it (#365).
+                ConsentGesture::Misconfigured => {
+                    "consent_gesture is set to a value irlume does not recognise                      (expected nod or closure); use your password"
+                }
             }))
         }
     }
@@ -3224,18 +3282,31 @@ impl Engine {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
-            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0}",
-                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint,
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0}",
+                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio,
+                a.signals
+                    .ir_eye_glint
+                    .map(|g| format!("{g:.2}"))
+                    .unwrap_or_else(|| "n/a".into()),
                 a.signals.ir_ambient);
             if verdict != Verdict::Live {
                 // Dark-path kinds: Uncertain retries under grace, any Spoof
                 // does not (the retryable RGB-yes/IR-no transient cannot occur
                 // here: this path only runs when RGB saw no face).
-                let kind = if verdict == Verdict::Uncertain {
-                    OutcomeKind::Uncertain
-                } else {
-                    OutcomeKind::Spoof
-                };
+                //
+                // Routed through the shared classifier rather than mapped
+                // inline. `exposure_refusal` is deliberately shared by BOTH
+                // evaluators, so the unmeasurable-format refusal arrives here
+                // as Uncertain too, and an inline map would leave it in the
+                // retryable class on exactly the camera this gate exists for:
+                // six full captures reaching the identical answer, every dark
+                // login, forever. The classifier holds the one prefix rule
+                // (#358 review).
+                //
+                // `reason` here is the raw liveness string; the "dark liveness"
+                // prefix is applied in the `format!` below, after this call, so
+                // the prefix match still sees what irlume-liveness produced.
+                let kind = liveness_deny_kind(verdict, &reason);
                 return Ok(Outcome::deny(
                     kind,
                     format!("dark liveness {verdict:?}: {reason}"),
@@ -3437,12 +3508,14 @@ impl Engine {
         let live = a.verdict == Verdict::Live;
         let detail = if live {
             format!(
-                "Live: RGB face {}, IR face {} · IR brightness {:.0}, center/edge {:.2}, glint {:.0}",
+                "Live: RGB face {}, IR face {} · IR brightness {:.0}, center/edge {:.2}, glint {}",
                 if s.rgb_face.is_some() { "✓" } else { "✗" },
                 if s.ir_face.is_some() { "✓" } else { "✗" },
                 a.ir_brightness,
                 a.ir_center_edge_ratio,
-                s.ir_eye_glint,
+                s.ir_eye_glint
+                    .map(|g| format!("{g:.0}"))
+                    .unwrap_or_else(|| "n/a".into()),
             )
         } else {
             format!("{:?}: {}", a.verdict, a.reason)
@@ -4573,6 +4646,48 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     peak as f32
 }
 
+/// [`eye_glint`], but honest about a reading that reached the sensor's ceiling.
+///
+/// `None` means the peak established nothing, for one of three reasons, and it
+/// is NOT a dark eye. Same distinction [`saturated_frac_of`] draws next door,
+/// and for the same reason: a number nobody could measure must not be recorded
+/// as a number that was measured.
+///
+/// - No IR face (`landmarks` is `None`), so no eye window exists to sample.
+/// - The peak reached `white`, the negotiated format's ceiling. A clipped
+///   sample tells you the true value was AT LEAST that, never what it was, and
+///   a maximum is exactly the statistic that destroys. This is the #222
+///   reading: the repo's own measurements have the peak pinned at 255 in all
+///   30 frames with glasses on, where it is reading the lens specular rather
+///   than the cornea, and 8 of 8 `glint_present` records in
+///   `docs/pad-results/2026-08-04-occluder-gate.jsonl` are railed at exactly
+///   255. In that corpus "glint present" and "the peak railed" are the same
+///   set, so the cue records the sensor's limit rather than the eye.
+///
+/// `white` of `None` means the format could not name a ceiling (`Grey16`,
+/// `Nv12Luma`, `YuyvLuma`), and there the peak passes through unchanged. That
+/// is #237's settled precedent, not a fresh judgement: refusing on a number
+/// nobody produced would deny every module that does not negotiate GREY8.
+///
+/// Note the ceiling test wants the RAW frame. Ambient subtraction moves a
+/// railed 255 to 254, so a subtracted frame would quietly stop reading as
+/// railed; callers pass the same unsubtracted samples `saturated_frac_of` gets.
+pub fn eye_glint_of(
+    grey: &[u8],
+    w: u32,
+    h: u32,
+    landmarks: Option<&Landmarks5>,
+    white: Option<u8>,
+) -> Option<f32> {
+    // Delegates so the truncated-frame and NaN-landmark guards above are
+    // inherited rather than copied; a second copy would drift.
+    let peak = eye_glint(grey, w, h, landmarks?);
+    match white {
+        Some(ceiling) if peak >= f32::from(ceiling) => None,
+        _ => Some(peak),
+    }
+}
+
 /// Specular contrast at the eyes = peak − local-mean brightness, max over both
 /// eyes. A live OPEN eye makes a sharp corneal specular spike (high contrast); a
 /// CLOSED lid (or a printed/vinyl "eye") is diffuse (low). This is the basis of
@@ -4631,6 +4746,50 @@ mod tests {
     /// `IRLUME_STATE_DIR`, `IRLUME_METHOD_CONF`, ...) across this binary's
     /// parallel test threads. Engine tests share it via `super::tests`.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `Misconfigured` permits NO gesture, which is the entire reason the
+    /// variant exists.
+    ///
+    /// This had no test. The decision lived inline in `consent_gesture_inputs`,
+    /// which needs an `Engine` and an `Enrollment` to call, so restoring the old
+    /// `mode != ConsentGesture::Closure` left `cargo test --workspace` green
+    /// while a head nod alone released the TPM-sealed keyring password on a
+    /// system configured for eye closure by an operator who typed `clousure`
+    /// (#365 review).
+    #[test]
+    fn misconfigured_enables_no_gesture() {
+        use irlume_common::config::ConsentGesture;
+
+        assert_eq!(
+            gestures_permitted_by(ConsentGesture::Misconfigured),
+            (false, false),
+            "an unreadable setting must not permit a nod OR a closure"
+        );
+
+        // Every other mode is unchanged, so the fail-closed state cannot have
+        // been bought by breaking the working ones.
+        assert_eq!(gestures_permitted_by(ConsentGesture::Nod), (true, false));
+        assert_eq!(
+            gestures_permitted_by(ConsentGesture::Closure),
+            (false, true)
+        );
+        assert_eq!(gestures_permitted_by(ConsentGesture::Either), (true, true));
+
+        // The negative form this function must never be written in. `!= Closure`
+        // answers YES for Misconfigured, and that is the whole defect; asserting
+        // the two disagree pins the difference rather than the spelling.
+        let negative_form_would_allow_nod =
+            ConsentGesture::Misconfigured != ConsentGesture::Closure;
+        assert!(
+            negative_form_would_allow_nod,
+            "precondition: the negative form really does permit a nod here"
+        );
+        assert_ne!(
+            gestures_permitted_by(ConsentGesture::Misconfigured).0,
+            negative_form_would_allow_nod,
+            "the decision has been rewritten in the negative form the comment forbids"
+        );
+    }
 
     pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -4794,6 +4953,138 @@ mod tests {
         assert_eq!(
             irlume_common::pam_service::classify("doas"),
             Some(ServiceKind::Elevation)
+        );
+    }
+
+    /// An unmeasurable IR exposure must NOT be retried (#358).
+    ///
+    /// It arrives as `Verdict::Uncertain`, which is the retryable class, and
+    /// that is the trap: the condition is a property of the camera's negotiated
+    /// format, identical on every frame. Retrying spends the entire grace
+    /// window to reach the same answer and then falls back to the password
+    /// anyway, while the user is told to adjust something that cannot help.
+    #[test]
+    fn an_unmeasurable_exposure_is_not_retryable() {
+        use irlume_liveness::Verdict;
+        // Built from the real producer's wording, not a literal, so a reword in
+        // irlume-liveness that drops the prefix fails here instead of silently
+        // making the refusal retryable again.
+        let mut sig = irlume_liveness::Signals {
+            rgb_face: Some(irlume_liveness::FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face: Some(irlume_liveness::FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face_brightness: 90.0,
+            ir_center_edge_ratio: 1.2,
+            // Option since #222: a railed peak records as absent, so the
+            // readable case has to say so.
+            ir_eye_glint: Some(220.0),
+            ..Default::default()
+        };
+        sig.ir_ceiling_known = false;
+        let (verdict, _, reason) = irlume_liveness::LivenessGate::new().evaluate(&sig);
+        assert_eq!(verdict, Verdict::Uncertain, "precondition for this test");
+        assert!(
+            reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
+            "the prefix this routing keys on moved: {reason}"
+        );
+
+        let kind = liveness_deny_kind(verdict, &reason);
+        assert_eq!(
+            kind,
+            OutcomeKind::OtherDeny,
+            "must leave the retryable class"
+        );
+        assert!(
+            !presence_retryable(&denied(kind, &reason, false)),
+            "retrying an unmeasurable format burns the grace window for nothing"
+        );
+
+        // A blown-out frame IS still retryable: moving back really can fix it,
+        // so this change must not have swept the ordinary case out with it.
+        let mut blown = sig.clone();
+        blown.ir_ceiling_known = true;
+        blown.ir_saturated_frac = Some(0.9);
+        let (bv, _, br) = irlume_liveness::LivenessGate::new().evaluate(&blown);
+        let bk = liveness_deny_kind(bv, &br);
+        assert_eq!(bk, OutcomeKind::Uncertain, "{br}");
+        assert!(presence_retryable(&denied(bk, &br, false)), "{br}");
+
+        // The DARK evaluator reaches the same refusal, because
+        // `exposure_refusal` is deliberately shared by both. The first version
+        // of this fix routed only the cross-spectrum site and left the dark
+        // site mapping inline, so on the one camera class this gate exists for
+        // a dark login burned the whole grace window reaching this answer
+        // repeatedly (#358 review).
+        let (dv, _, dr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&sig);
+        assert_eq!(dv, Verdict::Uncertain, "precondition: {dr}");
+        assert!(
+            dr.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
+            "the dark evaluator stopped producing the pinned prefix: {dr}"
+        );
+        let dk = liveness_deny_kind(dv, &dr);
+        assert_eq!(dk, OutcomeKind::OtherDeny, "{dr}");
+        assert!(!presence_retryable(&denied(dk, &dr, false)), "{dr}");
+
+        // And the dark path's ordinary refusals stay exactly as they were, so
+        // routing it through the shared classifier changed nothing else.
+        let mut dark_flat = sig.clone();
+        dark_flat.ir_ceiling_known = true;
+        dark_flat.ir_saturated_frac = Some(0.0);
+        dark_flat.ir_center_edge_ratio = 0.1;
+        let (fv, _, fr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&dark_flat);
+        assert_eq!(fv, Verdict::Spoof, "precondition: {fr}");
+        assert_eq!(liveness_deny_kind(fv, &fr), OutcomeKind::Spoof, "{fr}");
+    }
+
+    /// Every liveness verdict becomes an `OutcomeKind` through
+    /// [`liveness_deny_kind`], never through a comparison written at the call
+    /// site.
+    ///
+    /// The rule exists because the failure mode is a NEW deny site, or an old
+    /// one nobody revisited, classifying inline. `liveness_deny_kind` is where
+    /// the retryability rules live; a site that maps `Verdict::Uncertain`
+    /// itself silently opts out of all of them. That is exactly what happened
+    /// with the dark path in #358: the classifier gained the unmeasurable arm,
+    /// the dark site kept `let kind = if verdict == Verdict::Uncertain`, and no
+    /// behavioural test could see it because the refusal is only reachable
+    /// with a camera whose format names no ceiling.
+    #[test]
+    fn no_deny_site_classifies_a_liveness_verdict_by_hand() {
+        let src = include_str!("lib.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let l = l.trim();
+                // The shape that was removed, and the shape a future site would
+                // most naturally reintroduce.
+                (l.starts_with("let kind = if") || l.starts_with("let kind = match"))
+                    && !l.contains("liveness_deny_kind")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these sites classify a liveness verdict by hand instead of calling \
+             liveness_deny_kind, so they do not inherit its retryability rules: {offenders:?}"
+        );
+        // Not vacuous: the call site must actually be there, or this test
+        // would pass by having nothing to look at. The needle is assembled
+        // from pieces so it does not appear verbatim in the file it scans;
+        // spelled inline, the assertion matched its own source and stayed
+        // green with the real call site deleted.
+        let needle = concat!("liveness_deny_kind", "(verdict, &reason)");
+        assert!(
+            src.matches(needle).count() >= 2,
+            "the deny sites that route through liveness_deny_kind are gone; \
+             the rule this test pins has nothing left to hold"
         );
     }
 
@@ -5900,6 +6191,47 @@ mod tests {
             grey[20 * w + 44] = 250;
         }
         (grey, lm)
+    }
+
+    /// A peak that reached the format's ceiling measured nothing, and must not
+    /// be recorded as the strongest possible reading (#222).
+    #[test]
+    fn a_glint_at_the_ceiling_reads_as_absent_not_as_maximal() {
+        // ONE glint, so the peak over both eye windows is the value set here;
+        // with two the other eye's 250 would mask what is being tested.
+        let (mut grey, lm) = ir_frame_with_glints(true, false);
+        grey[20 * 64 + 20] = 255;
+
+        // Full-range GREY8: 255 is the ceiling, so the reading says nothing.
+        assert_eq!(eye_glint_of(&grey, 64, 48, Some(&lm), Some(255)), None);
+        // One grey level below the ceiling is a real measurement.
+        grey[20 * 64 + 20] = 254;
+        assert_eq!(
+            eye_glint_of(&grey, 64, 48, Some(&lm), Some(255)),
+            Some(254.0)
+        );
+
+        // Limited-range (235) rails earlier, and `>=` covers 236..=255 as well,
+        // matching how the saturation fraction tests its own ceiling.
+        grey[20 * 64 + 20] = 235;
+        assert_eq!(eye_glint_of(&grey, 64, 48, Some(&lm), Some(235)), None);
+        assert_eq!(
+            eye_glint_of(&grey, 64, 48, Some(&lm), Some(255)),
+            Some(235.0)
+        );
+
+        // A format that cannot name its ceiling passes the peak through, which
+        // is exactly today's behaviour. #237 settled this direction: refusing on
+        // a number nobody produced would deny every non-GREY8 module.
+        grey[20 * 64 + 20] = 255;
+        assert_eq!(
+            eye_glint_of(&grey, 64, 48, Some(&lm), None),
+            Some(255.0),
+            "no known ceiling means no ceiling test"
+        );
+
+        // No IR face is an absence, not a measured dark eye.
+        assert_eq!(eye_glint_of(&grey, 64, 48, None, Some(255)), None);
     }
 
     #[test]

@@ -743,12 +743,29 @@ fn try_unseal(pamh: &Pam, user: &str) -> (PamError, Released) {
         service,
     }) {
         Ok(Response::PasswordUnsealed { secret, kind }) => {
-            match release_secret(pamh, user, &secret, kind) {
-                Released::Failed => (PamError::IGNORE, Released::Failed),
-                delivered => (PamError::SUCCESS, delivered),
-            }
+            let delivered = release_secret(pamh, user, &secret, kind);
+            (code_for(delivered), delivered)
         }
         _ => (PamError::IGNORE, Released::Failed),
+    }
+}
+
+/// The PAM code a delivery outcome earns.
+///
+/// Exhaustive with no catch-all (#365). The arm this replaces was
+/// `delivered => PamError::SUCCESS`, which enumerated exactly one way to fail
+/// and read every other variant, including any added later, as "the secret
+/// reached its consumer". On a `kr` cold-login stack that answer short-circuits
+/// `auth sufficient`, so `pam_unix` never runs and nothing puts a password in
+/// `PAM_AUTHTOK`: the user is logged in with a keyring nothing can open, and no
+/// diagnostic anywhere says why. A new variant now fails to compile until
+/// someone states which of the two it is.
+fn code_for(delivered: Released) -> PamError {
+    match delivered {
+        Released::AuthtokSet | Released::WalletStarted | Released::TokenStashed => {
+            PamError::SUCCESS
+        }
+        Released::Failed => PamError::IGNORE,
     }
 }
 
@@ -897,6 +914,34 @@ pam_module!(IrlumePam);
 
 #[cfg(test)]
 mod tests {
+
+    /// Only a delivery that actually reached a consumer may continue the stack.
+    ///
+    /// The catch-all this replaced answered SUCCESS for anything that was not
+    /// `Failed`, so a variant added later would silently short-circuit
+    /// `auth sufficient` and leave the login with no password in PAM_AUTHTOK
+    /// (#365). Exhaustiveness is the compiler's job now; this pins what each
+    /// existing variant MEANS, which the compiler cannot.
+    #[test]
+    fn only_a_real_delivery_continues_the_stack() {
+        use super::{code_for, Released};
+        for delivered in [
+            Released::AuthtokSet,
+            Released::WalletStarted,
+            Released::TokenStashed,
+        ] {
+            assert_eq!(
+                code_for(delivered),
+                pamsm::PamError::SUCCESS,
+                "{delivered:?} did reach its consumer"
+            );
+        }
+        assert_eq!(
+            code_for(Released::Failed),
+            pamsm::PamError::IGNORE,
+            "a failed release must cascade to the password, never grant"
+        );
+    }
     use super::*;
 
     #[test]

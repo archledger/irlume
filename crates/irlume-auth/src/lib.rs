@@ -1379,7 +1379,8 @@ impl Engine {
             ir_face: None,
             ir_face_brightness: 0.0,
             ir_center_edge_ratio: 0.0,
-            ir_eye_glint: 0.0,
+            // RGB-only path: no IR frame exists to glint.
+            ir_eye_glint: None,
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // RGB-only path: no IR burst to measure
@@ -1780,10 +1781,16 @@ impl Engine {
             ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
             ir_face_brightness: ir_brightness,
             ir_center_edge_ratio,
-            ir_eye_glint: ir_top
-                .as_ref()
-                .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-                .unwrap_or(0.0),
+            // Same RAW-frame rule as `ir_saturated_frac` below, for the same
+            // reason: the ceiling test has to see the samples that actually
+            // railed, and subtraction moves a 255 to 254 (#238 review).
+            ir_eye_glint: eye_glint_of(
+                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+                ir.width,
+                ir.height,
+                ir_top.as_ref().map(|f| &f.landmarks),
+                ir_stats.white_level,
+            ),
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: ir_stats.ambient_mean,
@@ -1813,8 +1820,14 @@ impl Engine {
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
-            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} ir_clipped={} (face_frac #174, recorded only; clipped #237, refused past the limit)",
-            signals.ir_face_brightness, signals.ir_center_edge_ratio, signals.ir_eye_glint,
+            "liveness(cross-spectrum): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0} yaw_asym={:.2} pitch={:.2} face_frac={:.3} ir_clipped={} (face_frac #174, recorded only; clipped #237, refused past the limit)",
+            signals.ir_face_brightness, signals.ir_center_edge_ratio,
+            // Same "n/a" rule as ir_clipped: a peak that railed measured
+            // nothing, and printing a number would claim otherwise (#222).
+            signals
+                .ir_eye_glint
+                .map(|g| format!("{g:.2}"))
+                .unwrap_or_else(|| "n/a".into()),
             signals.ir_ambient, signals.head_yaw_asym, signals.head_pitch_frac,
             signals.face_frac,
             // "n/a" is a real answer: this format cannot say where its ceiling
@@ -2791,8 +2804,12 @@ impl Engine {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
             let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
-            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={:.2} ambient={:.0}",
-                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio, a.signals.ir_eye_glint,
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0}",
+                a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio,
+                a.signals
+                    .ir_eye_glint
+                    .map(|g| format!("{g:.2}"))
+                    .unwrap_or_else(|| "n/a".into()),
                 a.signals.ir_ambient);
             if verdict != Verdict::Live {
                 // Dark-path kinds: Uncertain retries under grace, any Spoof
@@ -3013,12 +3030,14 @@ impl Engine {
         let live = a.verdict == Verdict::Live;
         let detail = if live {
             format!(
-                "Live: RGB face {}, IR face {} · IR brightness {:.0}, center/edge {:.2}, glint {:.0}",
+                "Live: RGB face {}, IR face {} · IR brightness {:.0}, center/edge {:.2}, glint {}",
                 if s.rgb_face.is_some() { "✓" } else { "✗" },
                 if s.ir_face.is_some() { "✓" } else { "✗" },
                 a.ir_brightness,
                 a.ir_center_edge_ratio,
-                s.ir_eye_glint,
+                s.ir_eye_glint
+                    .map(|g| format!("{g:.0}"))
+                    .unwrap_or_else(|| "n/a".into()),
             )
         } else {
             format!("{:?}: {}", a.verdict, a.reason)
@@ -4149,6 +4168,48 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     peak as f32
 }
 
+/// [`eye_glint`], but honest about a reading that reached the sensor's ceiling.
+///
+/// `None` means the peak established nothing, for one of three reasons, and it
+/// is NOT a dark eye. Same distinction [`saturated_frac_of`] draws next door,
+/// and for the same reason: a number nobody could measure must not be recorded
+/// as a number that was measured.
+///
+/// - No IR face (`landmarks` is `None`), so no eye window exists to sample.
+/// - The peak reached `white`, the negotiated format's ceiling. A clipped
+///   sample tells you the true value was AT LEAST that, never what it was, and
+///   a maximum is exactly the statistic that destroys. This is the #222
+///   reading: the repo's own measurements have the peak pinned at 255 in all
+///   30 frames with glasses on, where it is reading the lens specular rather
+///   than the cornea, and 8 of 8 `glint_present` records in
+///   `docs/pad-results/2026-08-04-occluder-gate.jsonl` are railed at exactly
+///   255. In that corpus "glint present" and "the peak railed" are the same
+///   set, so the cue records the sensor's limit rather than the eye.
+///
+/// `white` of `None` means the format could not name a ceiling (`Grey16`,
+/// `Nv12Luma`, `YuyvLuma`), and there the peak passes through unchanged. That
+/// is #237's settled precedent, not a fresh judgement: refusing on a number
+/// nobody produced would deny every module that does not negotiate GREY8.
+///
+/// Note the ceiling test wants the RAW frame. Ambient subtraction moves a
+/// railed 255 to 254, so a subtracted frame would quietly stop reading as
+/// railed; callers pass the same unsubtracted samples `saturated_frac_of` gets.
+pub fn eye_glint_of(
+    grey: &[u8],
+    w: u32,
+    h: u32,
+    landmarks: Option<&Landmarks5>,
+    white: Option<u8>,
+) -> Option<f32> {
+    // Delegates so the truncated-frame and NaN-landmark guards above are
+    // inherited rather than copied; a second copy would drift.
+    let peak = eye_glint(grey, w, h, landmarks?);
+    match white {
+        Some(ceiling) if peak >= f32::from(ceiling) => None,
+        _ => Some(peak),
+    }
+}
+
 /// Specular contrast at the eyes = peak − local-mean brightness, max over both
 /// eyes. A live OPEN eye makes a sharp corneal specular spike (high contrast); a
 /// CLOSED lid (or a printed/vinyl "eye") is diffuse (low). This is the basis of
@@ -4443,7 +4504,9 @@ mod tests {
             }),
             ir_face_brightness: 90.0,
             ir_center_edge_ratio: 1.2,
-            ir_eye_glint: 220.0,
+            // Option since #222: a railed peak records as absent, so the
+            // readable case has to say so.
+            ir_eye_glint: Some(220.0),
             ..Default::default()
         };
         sig.ir_ceiling_known = false;
@@ -5650,6 +5713,47 @@ mod tests {
             grey[20 * w + 44] = 250;
         }
         (grey, lm)
+    }
+
+    /// A peak that reached the format's ceiling measured nothing, and must not
+    /// be recorded as the strongest possible reading (#222).
+    #[test]
+    fn a_glint_at_the_ceiling_reads_as_absent_not_as_maximal() {
+        // ONE glint, so the peak over both eye windows is the value set here;
+        // with two the other eye's 250 would mask what is being tested.
+        let (mut grey, lm) = ir_frame_with_glints(true, false);
+        grey[20 * 64 + 20] = 255;
+
+        // Full-range GREY8: 255 is the ceiling, so the reading says nothing.
+        assert_eq!(eye_glint_of(&grey, 64, 48, Some(&lm), Some(255)), None);
+        // One grey level below the ceiling is a real measurement.
+        grey[20 * 64 + 20] = 254;
+        assert_eq!(
+            eye_glint_of(&grey, 64, 48, Some(&lm), Some(255)),
+            Some(254.0)
+        );
+
+        // Limited-range (235) rails earlier, and `>=` covers 236..=255 as well,
+        // matching how the saturation fraction tests its own ceiling.
+        grey[20 * 64 + 20] = 235;
+        assert_eq!(eye_glint_of(&grey, 64, 48, Some(&lm), Some(235)), None);
+        assert_eq!(
+            eye_glint_of(&grey, 64, 48, Some(&lm), Some(255)),
+            Some(235.0)
+        );
+
+        // A format that cannot name its ceiling passes the peak through, which
+        // is exactly today's behaviour. #237 settled this direction: refusing on
+        // a number nobody produced would deny every non-GREY8 module.
+        grey[20 * 64 + 20] = 255;
+        assert_eq!(
+            eye_glint_of(&grey, 64, 48, Some(&lm), None),
+            Some(255.0),
+            "no known ceiling means no ceiling test"
+        );
+
+        // No IR face is an absence, not a measured dark eye.
+        assert_eq!(eye_glint_of(&grey, 64, 48, None, Some(255)), None);
     }
 
     #[test]

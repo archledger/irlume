@@ -2686,15 +2686,18 @@ pub mod ir_probe {
     /// capture-quality signal, not a hard gate.
     ///
     /// `white` is a parameter rather than a hardcoded 255 because
-    /// [`clipping_white_level`] can answer 235: a limited-range stream rails at
+    /// `clipping_white_level` can answer 235: a limited-range stream rails at
     /// nominal white, not at the type's maximum. Counting only `== 255` on such
     /// a stream reports every frame as pristine, which does not merely lose a
     /// signal. `Some(_)` is what switches ON #221's clip-aware gate-frame
     /// selection, so the selection would run against an all-zero measurement,
     /// pass every frame under `CLIPPED_FRAC_MAX`, and hand back the brightest
     /// lit frame, which is the blown one #221 exists to avoid. The face-region
-    /// instrument [`irlume_auth::saturated_frac_in_bbox`] has always taken the
-    /// ceiling, so the two disagreed about the same burst (#394).
+    /// instrument `saturated_frac_in_bbox` in irlume-auth has always taken the
+    /// ceiling, so the two disagreed about the same burst (#394). Named in
+    /// backticks and not as an intra-doc link: irlume-camera cannot depend on
+    /// irlume-auth, so the link would not resolve and CI treats that as an
+    /// error.
     ///
     /// `>=` rather than `==` for the same reason the bbox instrument uses it: a
     /// sample above nominal white is out-of-range excursion, which is still not

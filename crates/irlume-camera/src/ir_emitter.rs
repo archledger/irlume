@@ -4001,6 +4001,38 @@ mod tests {
         );
     }
 
+    /// The same drift as above, one field over: the gate that refuses to run the
+    /// emitter check and the line that actually runs it must name the same
+    /// mechanism. The step invokes the burst through `sudo -n`, so passwordless
+    /// sudo is the only thing that lets it proceed, and a failure message
+    /// offering any other remedy sends an operator to a change the step ignores.
+    /// #393 shipped exactly that: the message offered a lock-permission route
+    /// while the gate still exited on `sudo -n true`, so following it left the
+    /// nightly red for a reason the message had ruled out.
+    ///
+    /// Both directions matter, which is why the first assertion is here. When
+    /// #392 is decided and the burst stops going through sudo, this fails and
+    /// forces the message to be rewritten in the same commit rather than
+    /// quietly becoming false.
+    ///
+    /// No `concat!` dance is needed: this reads the workflow only, and the
+    /// workflow does not contain this file's source, so a needle cannot match
+    /// itself the way it did in the test above.
+    #[test]
+    fn the_sudo_gate_offers_the_remedy_the_step_can_act_on() {
+        let workflow = include_str!("../../../.github/workflows/hardware-suite.yml");
+        assert!(
+            workflow.contains("sudo -n env IRLUME_LOG_EMITTER_WRITES=1"),
+            "the burst no longer runs through sudo, so the gate message below \
+             has stopped being true; rewrite it with the change (#392)"
+        );
+        assert!(
+            workflow.contains("This step invokes the burst through sudo -n, so passwordless sudo"),
+            "the gate message no longer names passwordless sudo, which is the \
+             only remedy this step can act on while the burst uses it (#393)"
+        );
+    }
+
     use super::*;
 
     /// Build a fake /proc tree: `pids` maps a pid to (comm, fd-targets).

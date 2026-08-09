@@ -146,23 +146,21 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
             );
             if strict {
-                // Says "start", not "run", and the distinction is real. This
-                // gate covers the STARTUP load and nothing after it: the camera
-                // worker's post-panic rebuild reaches `Engine::load` with no
-                // verified bytes and no manifest comparison, so a file swapped
-                // after this point is loaded unchecked (#346).
+                // Strict verification runs once in the startup thread. Only the
+                // recognizer's verified bytes are carried into the initial load;
+                // the detector, adapter, mesh and Blaze models are reopened by
+                // path, and a post-panic rebuild reopens every model path without
+                // repeating this manifest check (#346).
                 //
-                // That path fails CLOSED rather than granting: a substituted
-                // recognizer produces a different `embed:<sha256>` space tag and
-                // `recognizer_space_matches` is strict, so every stored scan is
-                // filtered out and the attempt denies to password. Worth saying
-                // plainly here anyway, because an operator who sets this expects
-                // a promise about the process, and what it covers is the load.
+                // A changed recognizer fails closed for identity matching: its
+                // full digest changes the `embed:<sha256>` space tag, so
+                // `recognizer_space_matches` excludes every stored scan from the
+                // old space. That argument does not cover the other artifacts.
                 eprintln!(
                     "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models \
-                     (this checks the models loaded at startup; a rebuild after a worker panic \
-                     reloads from disk without re-checking, and denies rather than granting if \
-                     the file changed)"
+                     (verification is a one-time startup path check; only the recognizer bytes \
+                     are carried from this check into the initial load, and a rebuild after a \
+                     worker panic reloads model paths without re-checking)"
                 );
                 std::process::exit(1);
             }
@@ -6532,6 +6530,12 @@ mod tests {
         assert!(
             err.contains("refusing to start with unverified models"),
             "stderr: {err}"
+        );
+        assert!(
+            err.contains(
+                "verification is a one-time startup path check; only the recognizer bytes"
+            ),
+            "the refusal must not claim every checked path stays verified through load: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
 

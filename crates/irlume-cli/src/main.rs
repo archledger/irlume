@@ -2592,11 +2592,24 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_center_edge_ratio = ir_top_face
             .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        // Single frame, no burst stats, so no white level is known: the
-        // `white: None` arm passes the peak through exactly as before, the same
-        // honesty this probe already applies to ir_saturated_frac below (#222).
-        let ir_eye_glint =
-            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks));
+        // Ceiling-aware, the same call `padcapture` makes. The comment here used
+        // to say no white level was known, which was true while this probe
+        // captured without burst stats; it takes them now (#358), so the ceiling
+        // is in scope and there is no reason left to read the peak raw.
+        //
+        // Measured 2026-08-08 on the ASUS FHD IR module: with glasses on, ten
+        // consecutive probes read the eye-window peak at exactly 255, the
+        // format's ceiling. Read raw, every one of those reported as the
+        // STRONGEST POSSIBLE glint, which is the conflation #222 removed from
+        // the auth path and the corpus. The tool a developer opens to diagnose a
+        // glint problem was the one place still giving the old answer.
+        let ir_eye_glint = irlume_auth::eye_glint_of(
+            ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+            ir.width,
+            ir.height,
+            ir_top_face.map(|f| &f.landmarks),
+            ir_stats.white_level,
+        );
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {

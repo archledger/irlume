@@ -1675,9 +1675,6 @@ pub(crate) mod tests {
         assert_eq!(&*got, secret, "signed-PCR round-trip must match");
     }
 
-    /// Real Tier-2 pcrlock seal→unseal on the host TPM. Ignored by default: needs
-    /// /dev/tpmrm0, root, and a provisioned pcrlock policy
-    /// (`systemd-pcrlock make-policy`, NV index in /var/lib/systemd/pcrlock.json).
     /// A synthetic systemd-pcrlock policy, provisioned for the guard's lifetime.
     ///
     /// Extracted from `seal_unseal_pcrlock_roundtrip_provisioned_nv`, which built

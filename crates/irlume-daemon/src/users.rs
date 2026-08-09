@@ -128,6 +128,10 @@ mod tests {
 
     #[test]
     fn uid_and_name_round_trip_for_root_and_the_current_user() {
+        // Shared guard: these resolve usernames, so they read `environ` inside
+        // glibc and must exclude the environment writers in main.rs's tests,
+        // which share this test binary (#380 review).
+        let _passwd = crate::test_support::env_read();
         // root is uid 0 on every Linux, in both directions.
         assert_eq!(uid_for_name("root"), Some(0));
         assert_eq!(name_for_uid(0).as_deref(), Some("root"));
@@ -141,6 +145,10 @@ mod tests {
 
     #[test]
     fn absent_and_unencodable_users_resolve_to_none() {
+        // Shared guard: these resolve usernames, so they read `environ` inside
+        // glibc and must exclude the environment writers in main.rs's tests,
+        // which share this test binary (#380 review).
+        let _passwd = crate::test_support::env_read();
         assert_eq!(uid_for_name("no-such-user-irlume-test"), None);
         // Interior NUL cannot become a C string: None, not a panic.
         assert_eq!(uid_for_name("a\0b"), None);

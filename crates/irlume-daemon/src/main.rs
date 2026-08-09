@@ -15,6 +15,41 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use zeroize::Zeroize;
 
+/// The one lock that serialises `environ` access across this binary's tests.
+///
+/// It lives at crate scope, not inside `main.rs`'s `mod tests`, because
+/// `irlume-daemon` is a single bin target: `users.rs`'s own `#[cfg(test)] mod
+/// tests` compiles into the SAME test binary and libtest runs both across one
+/// thread pool. A lock private to one module cannot be taken by the other, so
+/// two `users.rs` tests resolved usernames against every environment writer
+/// with nothing between them (#380 review).
+///
+/// A `RwLock`, not a `Mutex`, because the hazard is asymmetric. `getpwnam_r`
+/// READS `environ` inside glibc; `set_var` REWRITES it. Concurrent readers do
+/// not race each other, only a writer. Shared read guards let the passwd
+/// lookups overlap, which is what keeps a suite-wide guard from serialising
+/// every socket timeout behind it: an earlier attempt at this took the daemon
+/// suite from 17s to 131s.
+///
+/// Never taken inside `users::uid_for_name`/`name_for_uid` themselves. A test
+/// holding the write guard reaches those functions through production code,
+/// and a nested read acquisition would deadlock.
+#[cfg(test)]
+pub(crate) mod test_support {
+    static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Shared: this test only READS the environment, which is what a passwd
+    /// lookup does inside glibc.
+    pub(crate) fn env_read() -> std::sync::RwLockReadGuard<'static, ()> {
+        ENV_LOCK.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Exclusive: this test calls `set_var`/`remove_var`.
+    pub(crate) fn env_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+        ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 mod arbiter;
 mod users;
 
@@ -4527,9 +4562,16 @@ mod tests {
     /// The rule this encodes: a lock that only its writers take is no
     /// exclusion at all. Any test that reaches a username lookup takes this
     /// too, whatever it thinks it is testing.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Exclusive. For a test that MUTATES the environment.
+    fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+        crate::test_support::env_write()
+    }
+
+    /// Shared. For a test that only reaches a passwd lookup, which reads
+    /// `environ` rather than writing it. Several may be held at once, so this
+    /// does not serialise the socket work the exclusive guard would.
+    fn passwd_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+        crate::test_support::env_read()
     }
 
     /// Every test that reaches a passwd lookup holds [`env_lock`].
@@ -4541,9 +4583,25 @@ mod tests {
     /// once in a while, which is how it reached us.
     #[test]
     fn every_test_that_resolves_a_user_holds_the_env_lock() {
-        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-            .expect("read the daemon source");
-        // The calls that end in glibc's getpwnam_r/getpwuid_r.
+        // EVERY module in this binary, not just main.rs. `irlume-daemon` is a
+        // single bin target, so `users.rs`'s own `#[cfg(test)] mod tests`
+        // compiles into the SAME test binary and libtest runs both across one
+        // thread pool. Scanning only main.rs is how two unguarded passwd
+        // lookups in users.rs sat under a rule test that reported everything
+        // clean, and the `scanned > 50` floor could not notice a whole file
+        // was missing (#380 review).
+        //
+        // `include_str!` and not a runtime read: a renamed or deleted module
+        // is then a compile error rather than a silently smaller scan.
+        let sources: [(&str, &str); 3] = [
+            ("main.rs", include_str!("main.rs")),
+            ("users.rs", include_str!("users.rs")),
+            ("arbiter.rs", include_str!("arbiter.rs")),
+        ];
+        // The calls that end in glibc's getpwnam_r/getpwuid_r. `serve(` is
+        // here because it REACHES them: `dispatch_status`/`dispatch_before_engine`
+        // both call `pregate`, and a test that spawns it was invisible to a
+        // rule that only looked for the lookup names.
         let readers = [
             "pregate(",
             "authorized_for(",
@@ -4551,77 +4609,176 @@ mod tests {
             "uid_for_name(",
             "name_for_uid(",
             "identify_scope(",
+            "serve(",
         ];
-        let lines: Vec<&str> = src.lines().collect();
+        /// Drops char literals, string literals and line comments so a brace
+        /// inside one is not counted as structure.
+        ///
+        /// The old counter counted them, and the three lines holding `'{'`,
+        /// `'}'` and `'{'` are in THIS function, so it computed its own extent
+        /// as running to the end of the file instead of stopping at its closing
+        /// brace. Measured: 4543..8122 against a real end of 4639. It happened
+        /// to report nothing wrong only because the offender check skips this
+        /// function by name; the dangerous direction is the other one, where a
+        /// stray `}` truncates a body and an offender inside it goes unseen
+        /// (#380 review).
+        fn structural(line: &str) -> String {
+            let mut out = String::with_capacity(line.len());
+            let b: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            while i < b.len() {
+                match b[i] {
+                    '/' if i + 1 < b.len() && b[i + 1] == '/' => break,
+                    '\'' => {
+                        // A char literal, or a lifetime like `'static` (which
+                        // has no closing quote and must not eat the rest).
+                        let mut j = i + 1;
+                        if j < b.len() && b[j] == '\\' {
+                            j += 2;
+                        } else {
+                            j += 1;
+                        }
+                        if j < b.len() && b[j] == '\'' {
+                            i = j + 1;
+                        } else {
+                            out.push(b[i]);
+                            i += 1;
+                        }
+                    }
+                    '"' => {
+                        let mut j = i + 1;
+                        while j < b.len() {
+                            if b[j] == '\\' {
+                                j += 2;
+                                continue;
+                            }
+                            if b[j] == '"' {
+                                break;
+                            }
+                            j += 1;
+                        }
+                        i = j + 1;
+                    }
+                    c => {
+                        out.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+
         let mut offenders = Vec::new();
         let mut recursive = Vec::new();
+        let mut undetached = Vec::new();
+        let mut per_file: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
         let mut scanned = 0usize;
-        // Anchor on the attribute, then take the next `fn` line: attributes
-        // between the two (`#[ignore]`, `#[expect]`) are common here, so
-        // looking only at the line above would miss those tests silently.
-        for (n, _) in lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.trim() == "#[test]")
-        {
-            let Some(sig) = (n + 1..(n + 10).min(lines.len()))
-                .find(|&k| lines[k].trim_start().starts_with("fn "))
-            else {
-                continue;
-            };
-            let name = lines[sig]
-                .trim_start()
-                .trim_start_matches("fn ")
-                .split('(')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let (mut depth, mut started, mut end) = (0i32, false, sig);
-            while end < lines.len() {
-                depth += lines[end].matches('{').count() as i32;
-                depth -= lines[end].matches('}').count() as i32;
-                if lines[end].contains('{') {
-                    started = true;
-                }
-                if started && depth <= 0 {
-                    break;
-                }
-                end += 1;
-            }
-            // Comment lines dropped first: these guards are explained in prose
-            // right where they are taken, so a body scanned raw reports the
-            // explanation as if it were the call.
-            let body = lines[sig..=end.min(lines.len() - 1)]
+        for (file, src) in sources {
+            let lines: Vec<&str> = src.lines().collect();
+            // Anchor on the attribute, then take the next `fn` line: attributes
+            // between the two (`#[ignore]`, `#[expect]`) are common here, so
+            // looking only at the line above would miss those tests silently.
+            for (n, _) in lines
                 .iter()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n");
-            scanned += 1;
-            // `enrollment_summary_test_lock()` RETURNS `env_lock()`, so a test
-            // holding it is already covered — and must not take it again, which
-            // would deadlock a non-reentrant mutex.
-            let takes_env = body.contains("env_lock()");
-            let takes_summary = body.contains("enrollment_summary_test_lock()");
-            if name != "every_test_that_resolves_a_user_holds_the_env_lock"
-                && takes_env
-                && takes_summary
+                .enumerate()
+                .filter(|(_, l)| l.trim() == "#[test]")
             {
-                recursive.push(format!("{name} (line {})", sig + 1));
-            }
-            let holds_the_lock = takes_env || takes_summary;
-            // This test names the readers in order to look for them.
-            if name != "every_test_that_resolves_a_user_holds_the_env_lock"
-                && readers.iter().any(|r| body.contains(r))
-                && !holds_the_lock
-            {
-                offenders.push(format!("{name} (line {})", sig + 1));
+                let Some(sig) = (n + 1..(n + 10).min(lines.len()))
+                    .find(|&k| lines[k].trim_start().starts_with("fn "))
+                else {
+                    continue;
+                };
+                let name = lines[sig]
+                    .trim_start()
+                    .trim_start_matches("fn ")
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let (mut depth, mut started, mut end) = (0i32, false, sig);
+                while end < lines.len() {
+                    let structure = structural(lines[end]);
+                    depth += structure.matches('{').count() as i32;
+                    depth -= structure.matches('}').count() as i32;
+                    if structure.contains('{') {
+                        started = true;
+                    }
+                    if started && depth <= 0 {
+                        break;
+                    }
+                    end += 1;
+                }
+                // Comment lines dropped first: these guards are explained in prose
+                // right where they are taken, so a body scanned raw reports the
+                // explanation as if it were the call.
+                let body = lines[sig..=end.min(lines.len() - 1)]
+                    .iter()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                scanned += 1;
+                *per_file.entry(file).or_default() += 1;
+                // `enrollment_summary_test_lock()` RETURNS `env_lock()`, so a test
+                // holding it is already covered — and must not take it again, which
+                // would deadlock a non-reentrant mutex.
+                let takes_env = body.contains("env_lock()");
+                let takes_summary = body.contains("enrollment_summary_test_lock()");
+                // Shared coverage counts too: a passwd lookup only READS `environ`,
+                // so a read guard excludes every writer, which is all it needs.
+                let takes_passwd = body.contains("passwd_lock()") || body.contains("env_read()");
+                let is_this_test = name == "every_test_that_resolves_a_user_holds_the_env_lock";
+                if !is_this_test && takes_env && takes_summary {
+                    recursive.push(format!("{file}:{name} (line {})", sig + 1));
+                }
+                let holds_the_lock = takes_env || takes_summary || takes_passwd;
+                // This test names the readers in order to look for them.
+                if !is_this_test && readers.iter().any(|r| body.contains(r)) && !holds_the_lock {
+                    offenders.push(format!("{file}:{name} (line {})", sig + 1));
+                }
+                // A guard in the test body cannot cover work on a thread that
+                // outlives it. Every spawned `serve` must be joined, or it can
+                // still be inside NSS when the next test starts writing `environ`.
+                if !is_this_test
+                    && body.contains("thread::spawn")
+                    && body.contains("serve(")
+                    && !body.contains(".join()")
+                {
+                    undetached.push(format!("{file}:{name} (line {})", sig + 1));
+                }
             }
         }
         assert!(
             scanned > 50,
             "expected to walk the daemon's tests, walked {scanned}"
         );
+        // Per-file, because the total floor above cannot notice that one whole
+        // module contributed nothing: main.rs alone clears 50, which is exactly
+        // how users.rs went unscanned while this test reported everything clean.
+        for (file, _) in sources {
+            assert!(
+                per_file.contains_key(file),
+                "no #[test] was found in {file}; the walk is not reaching it"
+            );
+        }
+        // ...and the list itself is tied to the crate's real module set, or
+        // deleting an entry would delete its own check with it. Every `mod x;`
+        // in main.rs compiles into this test binary, so every one must be
+        // scanned. (`test_support` is excluded: it declares no tests.)
+        let declared: Vec<String> = include_str!("main.rs")
+            .lines()
+            .filter_map(|l| l.strip_prefix("mod ").and_then(|m| m.strip_suffix(';')))
+            .map(|m| format!("{m}.rs"))
+            .collect();
+        for m in &declared {
+            assert!(
+                sources.iter().any(|(f, _)| f == m),
+                "`mod {}` compiles into this test binary but {m} is not in the scan list; \
+                 add it beside main.rs",
+                m.trim_end_matches(".rs")
+            );
+        }
         assert!(
             recursive.is_empty(),
             "these tests take BOTH `env_lock()` and `enrollment_summary_test_lock()`. The second \
@@ -4631,10 +4788,19 @@ mod tests {
         );
         assert!(
             offenders.is_empty(),
-            "these tests resolve a username without holding env_lock(). A passwd lookup reads \
-             the environment inside glibc, so it races the tests that write it and dies in \
-             getenv. Add `let _g = env_lock();`:\n{}",
+            "these tests resolve a username without holding any environment guard. A passwd \
+             lookup reads the environment inside glibc, so it races the tests that write it and \
+             dies in getenv. Add `let _passwd = passwd_lock();` (shared, for a test that only \
+             reads) or `let _g = env_lock();` (exclusive, if it also writes):\n{}",
             offenders.join("\n")
+        );
+        assert!(
+            undetached.is_empty(),
+            "these tests spawn `serve` and never join it. The passwd lookup runs on that thread, \
+             so it can still be inside NSS after the test returns and its guard drops, which is \
+             the race with the next test's `set_var`. Keep the JoinHandle, `drop` the client end \
+             so the server reads EOF, and join it:\n{}",
+            undetached.join("\n")
         );
     }
 
@@ -5090,7 +5256,7 @@ mod tests {
     /// between a cache test's `publish` and its read, turning the hit these
     /// tests assert into a miss. One lock covers both kinds of shared state.
     /// No test acquires both helpers, so this cannot recurse.
-    fn enrollment_summary_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn enrollment_summary_test_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         env_lock()
     }
 
@@ -5117,7 +5283,14 @@ mod tests {
         let a = std::sync::Arc::clone(&arbiter);
         // The engine has NOT been published yet: exactly the startup window.
         let ready = std::sync::atomic::AtomicBool::new(false);
-        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
+        let server = std::thread::spawn(move || {
+            // The passwd lookup this reaches runs HERE, on a thread that
+            // outlives the test body, so a guard in the test body cannot
+            // cover it. Shared, so these overlap rather than serialising
+            // the socket work (#380 review).
+            let _passwd = crate::test_support::env_read();
+            serve(theirs, &a, &ready).unwrap();
+        });
 
         let mut line = String::new();
         BufReader::new(&ours)
@@ -5131,6 +5304,12 @@ mod tests {
             ),
             other => panic!("a request needing the engine must be refused, got {other:?}"),
         }
+        // Joined, not detached: a thread still inside NSS when the next test
+        // starts mutating `environ` is the race this whole change is about.
+        // Dropping the client end makes the server read EOF, so this does not
+        // wait out the socket timeout.
+        drop(ours);
+        server.join().unwrap();
     }
 
     /// The startup path answers a keyring release before the engine exists,
@@ -5257,13 +5436,20 @@ mod tests {
         let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
-        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
+        let server = std::thread::spawn(move || {
+            // See the sibling spawn above: the passwd lookup happens on this
+            // thread, so the guard must live here and the test must join.
+            let _passwd = crate::test_support::env_read();
+            serve(theirs, &a, &ready).unwrap();
+        });
 
         let mut line = String::new();
         BufReader::new(&ours).read_line(&mut line).unwrap();
         let resp: Response = serde_json::from_str(line.trim()).unwrap();
         assert!(matches!(resp, Response::Pong), "got {resp:?}");
 
+        drop(ours);
+        server.join().unwrap();
         arbiter.close();
         worker.join().unwrap();
     }
@@ -5305,11 +5491,19 @@ mod tests {
             (
                 // Own-uid query: authorized, answered from files, no engine.
                 format!("{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n", {
-                    // Held for the passwd lookup ALONE, not for the rest of
-                    // this test: the socket work below waits on timeouts,
-                    // and holding a suite-wide lock across that stalls every
-                    // other test that touches the environment. See `env_lock`.
-                    let _g = env_lock();
+                    // Shared, and held for the passwd lookup ALONE. The
+                    // socket work below waits on timeouts, and an EXCLUSIVE
+                    // guard across that stalls every other test touching the
+                    // environment: an earlier attempt took this suite from
+                    // 17s to 131s. A read guard cannot, because the other
+                    // readers overlap it.
+                    //
+                    // The narrow scope used to be the whole defect: it covered
+                    // this lookup, and then the spawned `serve` thread below
+                    // did the SAME lookup on the way to `pregate` with nothing
+                    // held at all. That thread now takes its own read guard and
+                    // is joined (#380 review).
+                    let _passwd = passwd_lock();
                     // SAFETY: getuid takes no arguments, reads only this process's own real
                     // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
@@ -5328,13 +5522,21 @@ mod tests {
             let a = std::sync::Arc::clone(&arbiter);
             // These cover the SERVING daemon; the not-ready path has its own test.
             let ready = std::sync::atomic::AtomicBool::new(true);
-            std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
+            let server = std::thread::spawn(move || {
+                // `HasSealedPassword` classifies as `Class::Status`, so `serve`
+                // answers it on THIS thread via `dispatch_status` -> `pregate`
+                // -> `getpwnam_r`. The guard has to be here.
+                let _passwd = crate::test_support::env_read();
+                serve(theirs, &a, &ready).unwrap();
+            });
             let mut line = String::new();
             BufReader::new(&ours)
                 .read_line(&mut line)
                 .expect("a status answer within the deadline");
             let resp: Response = serde_json::from_str(line.trim()).unwrap();
             assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
+            drop(ours);
+            server.join().unwrap();
         }
     }
 
@@ -5616,7 +5818,12 @@ mod tests {
         let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
-        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
+        let server = std::thread::spawn(move || {
+            // See the sibling spawn above: the passwd lookup happens on this
+            // thread, so the guard must live here and the test must join.
+            let _passwd = crate::test_support::env_read();
+            serve(theirs, &a, &ready).unwrap();
+        });
 
         let mut line = String::new();
         BufReader::new(&ours).read_line(&mut line).unwrap();
@@ -5628,6 +5835,8 @@ mod tests {
             ),
             other => panic!("a queued authentication must refuse preview work, got {other:?}"),
         }
+        drop(ours);
+        server.join().unwrap();
     }
 
     #[test]

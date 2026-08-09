@@ -46,6 +46,39 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- **The require-eyes-open gate granted with the eyes closed, behind glasses.**
+  `both_eyes_open` took the maximum grey level in a window around each eye
+  landmark and compared it against a fixed 200, with no notion of the sensor's
+  ceiling. Its sibling `eye_glint_of` was made ceiling-aware for #222 and its
+  doc already records why: the measurements committed here pin the eye peak at
+  255 in all 30 frames with glasses on, where the window reads the lens specular
+  rather than the cornea. This gate sampled the same statistic and never got the
+  same treatment.
+
+  Demonstrated on hardware 2026-08-08 on the ASUS FHD IR module, one variable at
+  a time. Bare-eyed with the eyes OPEN it denied 5 of 5. With glasses on and the
+  eyes CLOSED it granted 3 of 3. Eye-window peaks read 170 to 226 bare-eyed, 0 of
+  10 railed, against 255 with glasses, 10 of 10 railed. The gate whose only
+  purpose is refusing a sleeping or unconscious user was admitting exactly that
+  case (#386).
+
+  A railed eye window now establishes nothing, and since this gate is deny-only
+  and answers a bool, nothing collapses to `false`. The call also moves to the
+  RAW frame and the negotiated ceiling, the pair its two siblings already take:
+  ambient subtraction moves a railed 255 to 254, so on a subtracted frame the
+  refusal would never fire. A format that names no ceiling passes the peak
+  through unchanged, which is #237's settled precedent.
+
+  This DENIES more than before, for profiles that opted in; the gate defaults
+  off. The other half of #386 is not fixed here. A peak of 170 to 226 still fails
+  a threshold of 200, so bare-eyed users are still denied, and no replacement
+  threshold can be certified from what the repository holds:
+  `ClosureCalibration` records the same subject's median open EAR at 0.109 under
+  an ambient of 22-42 and 0.166 under an ambient of 1, a 52% shift, and states
+  that no single calibration spans both sessions. A global constant on any of
+  these statistics reproduces this defect in the other direction. That half stays
+  open and wants the per-user `calibrate-closure` route.
+
 - **The IR exposure gate was off, not lenient, on every IR camera that is not
   8-bit grey.** `exposure_refusal` read "could not measure" as "clean", so on a
   node negotiating `Y16`/`Y10`/`Y12`/`NV12`/`YUYV` the #237 gate never ran and
@@ -954,7 +987,7 @@ Fixes a camera-firmware hazard present in 0.7.1. Please upgrade.
 
 - **Six checks reported success having checked nothing.** One theme in six places:
   a zero-match, zero-iteration or zero-sample case indistinguishable from a clean
-  pass — a conformance run that attempted nothing and exited 0, a set comparison
+  pass: a conformance run that attempted nothing and exited 0, a set comparison
   where no line carried the field, a `zip()` over an empty side. Each was proved
   by reproducing the failure first. Closes [#161], [#162], [#163], [#164], [#165]
   and [#166].

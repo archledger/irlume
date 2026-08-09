@@ -1905,9 +1905,24 @@ impl Engine {
         // Eyes-open (IR corneal-glint heuristic), for the opt-in require-eyes-open
         // gate. Needs an IR face (the emitter lights the cornea); conservative:
         // false when it can't be verified.
+        //
+        // Same RAW-frame and ceiling pair its two siblings above take, and for
+        // the same reasons: subtraction moves a railed 255 to 254 so the
+        // clipping test must see `saturation_frame`, and a railed eye window
+        // reads the lens rather than the cornea (#386, #238 review). This call
+        // passed `&ir.data` with no ceiling until then, which is both halves of
+        // that mistake at once.
         let eyes_open = ir_top
             .as_ref()
-            .map(|f| both_eyes_open(&ir.data, ir.width, ir.height, &f.landmarks))
+            .map(|f| {
+                both_eyes_open(
+                    ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+                    ir.width,
+                    ir.height,
+                    &f.landmarks,
+                    ir_stats.white_level,
+                )
+            })
             .unwrap_or(false);
         Ok(Assessment {
             verdict,
@@ -3910,7 +3925,38 @@ const EYE_OPEN_PEAK_MIN: f32 = 200.0;
 /// eyelid does not. Conservative: requires the glint, so an unverifiable eye
 /// reads closed (auth falls back to password). Heuristic; used only when a
 /// profile opts into the require-eyes-open gate.
-pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks5) -> bool {
+///
+/// `white` is the negotiated format's ceiling, and passing it is what stops
+/// this gate reading a lens instead of an eye. [`eye_glint_of`] next door
+/// already refuses a railed peak, and its doc records why: the repo's own
+/// measurements pin the peak at 255 in all 30 frames with glasses on, where it
+/// reads the lens specular rather than the cornea. This function sampled the
+/// same statistic and never got the same treatment, so on 2026-08-08 it
+/// GRANTED 3/3 with the eyes CLOSED behind glasses while denying 5/5 bare-eyed
+/// with them open (#386). A maximum is exactly the statistic clipping
+/// destroys: a railed window says the true value was at least the ceiling and
+/// never what it was, so no eyelid state can be read out of it.
+///
+/// Unlike `eye_glint_of`, which answers `None` for "not established", this gate
+/// is deny-only and returns a bool, so unreadable collapses to `false`. That is
+/// the fail-safe direction for a gate whose whole purpose is refusing a
+/// sleeping or unconscious user.
+///
+/// `white` of `None` means the format named no ceiling (`Grey16`, `Nv12Luma`,
+/// `YuyvLuma`) and the peak passes through unchanged, which is #237's settled
+/// precedent and the same choice `eye_glint_of` makes.
+///
+/// Pass the RAW frame. Ambient subtraction moves a railed 255 to 254, so a
+/// subtracted frame stops reading as railed and this refusal would not fire;
+/// the callers of `eye_glint_of` and `saturated_frac_of` already pass
+/// `saturation_frame` for that reason (#238 review) and this one now does too.
+pub fn both_eyes_open(
+    grey: &[u8],
+    w: u32,
+    h: u32,
+    lm: &irlume_vision::Landmarks5,
+    white: Option<u8>,
+) -> bool {
     // Same w*h invariant guard as eye_glint/mean_in_bbox: eye_open_at's in-bounds
     // test is against the logical w/h, so a truncated IR frame (buffer < w*h)
     // would index past the slice and panic the root daemon. A short frame reads
@@ -3931,10 +3977,19 @@ pub fn both_eyes_open(grey: &[u8], w: u32, h: u32, lm: &irlume_vision::Landmarks
     }
     let iod = ((lm[1].0 - lm[0].0).powi(2) + (lm[1].1 - lm[0].1).powi(2)).sqrt();
     let r = (iod * 0.20).max(2.0) as i32;
-    eye_open_at(grey, w, h, lm[0], r) && eye_open_at(grey, w, h, lm[1], r)
+    // BOTH eyes, so one readable eye cannot vouch for a railed one. Same
+    // whole-set rule `eye_glint_contrast` states for unplaceable landmarks.
+    eye_open_at(grey, w, h, lm[0], r, white) && eye_open_at(grey, w, h, lm[1], r, white)
 }
 
-fn eye_open_at(grey: &[u8], w: u32, h: u32, (ex, ey): (f32, f32), r: i32) -> bool {
+fn eye_open_at(
+    grey: &[u8],
+    w: u32,
+    h: u32,
+    (ex, ey): (f32, f32),
+    r: i32,
+    white: Option<u8>,
+) -> bool {
     let (cx, cy) = (ex as i32, ey as i32);
     let mut peak = 0u8;
     for dy in -r..=r {
@@ -3945,7 +4000,14 @@ fn eye_open_at(grey: &[u8], w: u32, h: u32, (ex, ey): (f32, f32), r: i32) -> boo
             }
         }
     }
-    peak as f32 >= EYE_OPEN_PEAK_MIN
+    match white {
+        // Railed: the window carries the sensor's limit, not the eye. Checked
+        // BEFORE the threshold, because a railed peak clears
+        // EYE_OPEN_PEAK_MIN by construction and that is precisely the path
+        // that granted with closed eyes (#386).
+        Some(ceiling) if peak >= ceiling => false,
+        _ => peak as f32 >= EYE_OPEN_PEAK_MIN,
+    }
 }
 
 /// Mean luma (0–255) and the fraction of near-white ("hot") pixels inside `bbox`
@@ -5811,7 +5873,7 @@ mod tests {
         let nan: Landmarks5 = [(f32::NAN, f32::NAN); 5];
         assert_eq!(eye_glint(&grey, 64, 48, &nan), 0.0);
         assert_eq!(eye_glint_contrast(&grey, 64, 48, &nan), 0.0);
-        assert!(!both_eyes_open(&grey, 64, 48, &nan));
+        assert!(!both_eyes_open(&grey, 64, 48, &nan, Some(255)));
         // One placeable eye is still not both eyes, and the glint helpers
         // score the whole set 0.0 rather than letting the valid eye vouch
         // for a set whose producer emitted a non-finite point (#293 review:
@@ -5826,7 +5888,7 @@ mod tests {
         }
         bright[0] = 255;
         let one: Landmarks5 = [lm[0], (f32::NAN, 20.0), lm[2], lm[3], lm[4]];
-        assert!(!both_eyes_open(&bright, 64, 48, &one));
+        assert!(!both_eyes_open(&bright, 64, 48, &one, Some(255)));
         assert_eq!(eye_glint(&bright, 64, 48, &one), 0.0);
         assert_eq!(eye_glint_contrast(&bright, 64, 48, &one), 0.0);
     }
@@ -5834,12 +5896,50 @@ mod tests {
     #[test]
     fn both_eyes_open_requires_a_glint_at_each_eye() {
         let (grey, lm) = ir_frame_with_glints(true, true);
-        assert!(both_eyes_open(&grey, 64, 48, &lm));
+        assert!(both_eyes_open(&grey, 64, 48, &lm, Some(255)));
         // One closed lid (no specular point) fails the gate, conservatively.
         let (grey, lm) = ir_frame_with_glints(true, false);
-        assert!(!both_eyes_open(&grey, 64, 48, &lm));
+        assert!(!both_eyes_open(&grey, 64, 48, &lm, Some(255)));
         let (grey, lm) = ir_frame_with_glints(false, false);
-        assert!(!both_eyes_open(&grey, 64, 48, &lm));
+        assert!(!both_eyes_open(&grey, 64, 48, &lm, Some(255)));
+    }
+
+    /// #386, and the reason the suite above never went red: `ir_frame_with_glints`
+    /// models a closed eye as NO specular at all. A real closed lid behind a
+    /// spectacle lens still returns the emitter, railed. On hardware on
+    /// 2026-08-08 that granted 3/3 with the eyes shut, and every frame with
+    /// glasses on in the repo's own measurements has the eye peak pinned at 255.
+    ///
+    /// A railed window is therefore built here explicitly. It clears
+    /// EYE_OPEN_PEAK_MIN by construction, so before this fix it read as an open
+    /// eye no matter what the eyelid was doing.
+    #[test]
+    fn a_railed_eye_window_cannot_report_an_open_eye() {
+        let (mut grey, lm) = ir_frame_with_glints(false, false);
+        // Rail both eye windows, the lens-specular signature.
+        for &(ex, ey) in &lm[0..2] {
+            let (cx, cy) = (ex as usize, ey as usize);
+            for dy in 0..3usize {
+                for dx in 0..3usize {
+                    grey[(cy + dy - 1) * 64 + (cx + dx - 1)] = 255;
+                }
+            }
+        }
+        assert!(
+            !both_eyes_open(&grey, 64, 48, &lm, Some(255)),
+            "a window at the sensor ceiling establishes nothing about the eyelid"
+        );
+        // The refusal is the CEILING's doing, not a lower threshold sneaking in:
+        // told the format names no ceiling, the same buffer still reads open,
+        // which is #237's settled precedent for Grey16/NV12/YUYV.
+        assert!(
+            both_eyes_open(&grey, 64, 48, &lm, None),
+            "with no ceiling to compare against, the peak passes through"
+        );
+        // And a genuine sub-ceiling corneal glint is untouched: this fix must
+        // not deny the users the gate is supposed to admit.
+        let (open, lm) = ir_frame_with_glints(true, true);
+        assert!(both_eyes_open(&open, 64, 48, &lm, Some(255)));
     }
 
     #[test]
@@ -5868,7 +5968,7 @@ mod tests {
         // The require-eyes-open gate reads the same frame via a different index
         // path; a truncated frame there must fail-closed (eyes read closed), not
         // panic the daemon on an out-of-bounds index.
-        assert!(!both_eyes_open(short, 64, 48, &lm));
+        assert!(!both_eyes_open(short, 64, 48, &lm, Some(255)));
     }
 }
 

@@ -182,7 +182,10 @@ fn main() {
             "| {name} | {} | {} | {} | {} | {} | {align} |",
             fmt(eye_glint(&ir, W, H, &lm)),
             fmt(eye_glint_contrast(&ir, W, H, &lm)),
-            both_eyes_open(&ir, W, H, &lm),
+            // `None`: these are synthetic pathology frames with no negotiated
+            // format behind them, so there is no ceiling to honour. The probe
+            // measures landmark failure, not clipping (#386).
+            both_eyes_open(&ir, W, H, &lm, None),
             fmt(pose.yaw_asym),
             fmt(pose.pitch_frac),
         );

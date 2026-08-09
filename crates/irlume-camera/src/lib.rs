@@ -3351,6 +3351,136 @@ impl ContentionReport {
     }
 }
 
+/// Why a concurrent capture attempt failed, as far as the evidence supports.
+///
+/// `PairSample::failed` counts rounds that errored and says nothing about why,
+/// even though the kernel returned a specific number that names the cause. The
+/// doc on that field already quotes one: the BRIO's RGB open answers EINVAL
+/// while its IR sibling streams. This enum is the count's missing half (#341).
+///
+/// The variants come from reading the current tree, not from the issue's
+/// summary, which had the rule wrong. Four distinct origins exist and the errno
+/// ALONE does not separate them, because two of them are `ENOSPC`:
+///
+/// - `usb_hcd_alloc_bandwidth`, reached from `usb_set_interface`, returns
+///   `-ENOSPC` on the xHCI completion codes `COMP_BANDWIDTH_ERROR` and
+///   `COMP_SECONDARY_BANDWIDTH_ERROR`. This is the host controller refusing.
+/// - `uvc_probe_video` returns `-ENOSPC` when the device asks for more than its
+///   own endpoint carries and `UVC_QUIRK_PROBE_MINMAX` blocks renegotiating
+///   compression. Nothing about the host is involved.
+///
+/// What separates them is the kernel log, so [`classify_contention_failure`]
+/// takes both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentionCause {
+    /// The host controller refused to admit the altsetting: `ENOSPC` WITH a
+    /// bandwidth message. The only positively identified cause here, and the
+    /// only one a reduction can address by asking the host for less.
+    HostBudget,
+    /// No altsetting's endpoint is large enough for the payload the DEVICE
+    /// requested, confirmed by uvcvideo saying so. `-EIO` alone does NOT reach
+    /// this: see the note on the trace gate below.
+    DeviceRequestExceedsAltsettings,
+    /// A busy or ownership conflict in the V4L2 queue or the device. Not a
+    /// bandwidth question, and deliberately not narrowed to "the sibling is
+    /// streaming", which `EBUSY` does not establish on its own.
+    Busy,
+    /// The evidence does not identify a cause. The DEFAULT, and deliberately
+    /// not a synonym for "no problem".
+    ///
+    /// Most failures land here on purpose. `EIO` has at least four origins on
+    /// this path (no adequate altsetting, a malformed or short probe response,
+    /// a missing or zero-sized bulk endpoint, a normalized USB control
+    /// failure), and `EINVAL` has more (wrong buffer type, unconfigured queue,
+    /// too few queued buffers, a nonexistent altsetting, an invalid xHCI
+    /// command or context). Naming a cause from either number alone would be
+    /// asserting one member of a set (#341 follow-up research).
+    Unknown,
+}
+
+/// The USB core logs this immediately before returning the host controller's
+/// error from `usb_set_interface`.
+///
+/// Matched as a substring rather than an anchored line, because #383 was
+/// exactly this: a workflow matched `/: Ir$/` against a doctor line that gained
+/// a suffix, and the gate silently stopped firing for eight nights. A substring
+/// survives a prefix or suffix changing; it does not survive a rewording, and
+/// nothing here can. That is recorded rather than hidden: these two strings
+/// couple this classifier to the kernel's wording, and a kernel that rewords
+/// them degrades `HostBudget` to `DeviceOverRequestNoRenegotiation`, which is
+/// wrong but not permissive, since only `HostBudget` licenses a workaround.
+/// Present since the 2010 USB bandwidth-allocation rework and unchanged in the
+/// current tree.
+///
+/// NOT specific on its own: the USB core prints it for ANY negative return from
+/// `usb_hcd_alloc_bandwidth`, including `ENOMEM` while disabling link power
+/// management. It is the errno that narrows it, which is why this is only ever
+/// consulted together with `ENOSPC`.
+const USB_CORE_NO_BANDWIDTH: &str = "Not enough bandwidth for altsetting";
+/// xHCI's own message at the point it returns `-ENOSPC`, and the specific one:
+/// it is printed on `COMP_BANDWIDTH_ERROR` and `COMP_SECONDARY_BANDWIDTH_ERROR`
+/// and nothing else. Observed in reports from 2017 through the current tree.
+const XHCI_NO_BANDWIDTH: &str = "Not enough bandwidth for new device state";
+/// uvcvideo saying no altsetting fits the device's request. This is `uvc_dbg`
+/// under the VIDEO class, so it is ABSENT unless an administrator set
+/// uvcvideo's `trace` parameter. Treat its presence as strong evidence and its
+/// absence as no evidence at all.
+const UVC_NO_FAST_ENOUGH_ALT: &str = "No fast enough alt setting";
+
+/// Name the cause of a failed concurrent capture from the kernel's own evidence.
+///
+/// Pure over its inputs on purpose: it needs no camera, no root and no access to
+/// the kernel log, so the decision can be proven while the collection of
+/// `kernel_lines` is still being designed. Collecting them is a separate
+/// question, and an empty slice is a valid input meaning "no log evidence
+/// available", not "no bandwidth message was logged".
+///
+/// `errno` is `None` when the failure was not a syscall at all (a decode
+/// refusal, a preemption). That is not the same as a syscall returning zero and
+/// must not be read as one.
+#[must_use]
+pub fn classify_contention_failure(errno: Option<i32>, kernel_lines: &[&str]) -> ContentionCause {
+    let saw = |needle: &str| kernel_lines.iter().any(|l| l.contains(needle));
+    let Some(errno) = errno else {
+        return ContentionCause::Unknown;
+    };
+    // Ordered by how much the evidence establishes, strongest first. Each arm
+    // needs a LOG line as well as a number, except `EBUSY`, whose name claims
+    // nothing a bare errno cannot carry.
+    if errno == libc::ENOSPC && (saw(XHCI_NO_BANDWIDTH) || saw(USB_CORE_NO_BANDWIDTH)) {
+        return ContentionCause::HostBudget;
+    }
+    if errno == libc::EIO && saw(UVC_NO_FAST_ENOUGH_ALT) {
+        return ContentionCause::DeviceRequestExceedsAltsettings;
+    }
+    if errno == libc::EBUSY {
+        return ContentionCause::Busy;
+    }
+    // Everything else, INCLUDING bare `EIO`, bare `EINVAL` and bare `ENOSPC`.
+    // Each of those numbers has several origins on this path and no log line
+    // separated them, so nothing has been established.
+    ContentionCause::Unknown
+}
+
+/// Whether a bandwidth reduction could address this cause.
+///
+/// The gate #341's research asks for. Only a cause whose mechanism is "the
+/// request was too large" can be helped by making the request smaller, and only
+/// a confirmed one: `Unknown` answers false, so an unclassifiable failure never
+/// licenses an experiment.
+///
+/// Nothing calls this yet, and that is deliberate. No camera in this project's
+/// record produces either addressable signature, so the reduction itself is not
+/// built; the gate exists written down and tested so that whoever builds it
+/// cannot skip it.
+#[must_use]
+pub fn reduction_may_help(cause: ContentionCause) -> bool {
+    match cause {
+        ContentionCause::HostBudget | ContentionCause::DeviceRequestExceedsAltsettings => true,
+        ContentionCause::Busy | ContentionCause::Unknown => false,
+    }
+}
+
 /// Guard against dividing by a sequential arm that captured nothing: with no
 /// baseline there is no measured loss, so report full retention.
 fn retained(concurrent: f32, sequential: f32) -> f32 {
@@ -4258,6 +4388,98 @@ mod tests {
             CaptureMode::Sequential
         );
         assert!(ir_loss_in_the_dark.conclusive());
+    }
+
+    /// Each arm needs a log line as well as a number, and this pins which.
+    /// Deleting any single rule flips a case here.
+    #[test]
+    fn a_cause_is_named_only_when_a_log_line_supports_it() {
+        let xhci = ["xhci_hcd 0000:00:14.0: Not enough bandwidth for new device state."];
+        let core = ["usb 1-5: Not enough bandwidth for altsetting 1"];
+        for lines in [xhci.as_slice(), core.as_slice()] {
+            assert_eq!(
+                classify_contention_failure(Some(libc::ENOSPC), lines),
+                ContentionCause::HostBudget
+            );
+        }
+        assert_eq!(
+            classify_contention_failure(
+                Some(libc::EIO),
+                &["uvcvideo: No fast enough alt setting for requested bandwidth"]
+            ),
+            ContentionCause::DeviceRequestExceedsAltsettings
+        );
+        // A clamp warning is a SUCCESSFUL fix-up, not a failure cause:
+        // `uvc_fixup_video_ctrl` reduces the request and carries on. Seeing one
+        // in the window establishes that a clamp happened, never that it is why
+        // a later call failed, so it must not name a cause on its own (#402
+        // review). It must also not outrank a real EBUSY.
+        let clamp =
+            ["uvcvideo 1-5:1.0: UVC non compliance: Reducing max payload transfer size (3072) to fit endpoint limit (2048)."];
+        assert_eq!(
+            classify_contention_failure(Some(libc::EIO), &clamp),
+            ContentionCause::Unknown
+        );
+        assert_eq!(
+            classify_contention_failure(Some(libc::EBUSY), &clamp),
+            ContentionCause::Busy
+        );
+        assert_eq!(
+            classify_contention_failure(Some(libc::EBUSY), &[]),
+            ContentionCause::Busy
+        );
+    }
+
+    /// The assertions that stop this over-claiming, and the reason the first
+    /// draft of this classifier was wrong. Every one of these numbers has
+    /// several origins on this path, so a bare errno establishes nothing.
+    ///
+    /// `ENOSPC` is the one that matters most: it is reachable both from the
+    /// host controller and from uvcvideo's own probe limit, and only the first
+    /// licenses a workaround.
+    #[test]
+    fn a_bare_errno_names_no_cause() {
+        for errno in [
+            libc::ENOSPC,
+            libc::EIO,
+            libc::EINVAL,
+            libc::EPIPE,
+            libc::ENODEV,
+        ] {
+            assert_eq!(
+                classify_contention_failure(Some(errno), &[]),
+                ContentionCause::Unknown,
+                "errno {errno} has more than one origin and must not name a cause alone"
+            );
+        }
+        // Unrelated kernel chatter is not evidence either.
+        let noise = [
+            "usb 1-5: new high-speed USB device number 7 using xhci_hcd",
+            "uvcvideo: Found UVC 1.00 device ASUS FHD webcam (13d3:56ff)",
+        ];
+        assert_eq!(
+            classify_contention_failure(Some(libc::ENOSPC), &noise),
+            ContentionCause::Unknown
+        );
+        // A failure that was never a syscall carries no number, and absence is
+        // not a value.
+        assert_eq!(
+            classify_contention_failure(None, &["Not enough bandwidth for new device state."]),
+            ContentionCause::Unknown
+        );
+    }
+
+    /// The gate is open only for the two causes whose mechanism is "the request
+    /// was too large", and never for an unidentified failure.
+    #[test]
+    fn only_a_too_large_request_licenses_a_bandwidth_reduction() {
+        assert!(reduction_may_help(ContentionCause::HostBudget));
+        assert!(reduction_may_help(
+            ContentionCause::DeviceRequestExceedsAltsettings
+        ));
+        for refused in [ContentionCause::Busy, ContentionCause::Unknown] {
+            assert!(!reduction_may_help(refused), "{refused:?} must not qualify");
+        }
     }
 
     // The BRIO shape, measured 2026-08-04 on archhost: every concurrent

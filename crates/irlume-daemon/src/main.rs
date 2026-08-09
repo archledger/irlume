@@ -4607,6 +4607,38 @@ mod tests {
     /// The rule this encodes: a lock that only its writers take is no
     /// exclusion at all. Any test that reaches a username lookup takes this
     /// too, whatever it thinks it is testing.
+    /// Run `client` against a live `serve` on a socket pair, and JOIN that
+    /// server however the client ends.
+    ///
+    /// `std::thread::scope` is load-bearing, not tidiness. With a plain
+    /// `spawn`, a panic anywhere before `join()` (a read deadline, a JSON
+    /// parse, a failed assertion) unwinds, DROPS the `JoinHandle`, which
+    /// detaches the thread, and then drops the caller's environment guard. The
+    /// detached server can still reach `pregate` and `getpwnam_r` after that,
+    /// with a writer free to run: exactly the race #380 exists to stop,
+    /// reintroduced on the failure path of the test that reports it.
+    ///
+    /// A scope joins its threads even while unwinding, so the guard the CALLER
+    /// holds outlives the server under every exit. Declare that guard before
+    /// calling this and it covers the whole thing (#390 review).
+    fn with_serve<R>(
+        arbiter: &arbiter::Arbiter<Queued>,
+        ready: &std::sync::atomic::AtomicBool,
+        client: impl FnOnce(&UnixStream) -> R,
+    ) -> R {
+        std::thread::scope(|scope| {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let server = scope.spawn(|| serve(theirs, arbiter, ready).unwrap());
+            let out = client(&ours);
+            // Dropped before the join so the server reads EOF rather than
+            // waiting out the socket timeout. On the panic path the scope
+            // drops it during unwinding and joins anyway.
+            drop(ours);
+            server.join().unwrap();
+            out
+        })
+    }
+
     /// Exclusive. For a test that MUTATES the environment.
     fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         crate::test_support::env_write()
@@ -4713,6 +4745,19 @@ mod tests {
             out
         }
 
+        /// A test that hands `serve` to a bare `thread::spawn` and never joins
+        /// the handle. `with_serve` is exempt: it joins inside a
+        /// `std::thread::scope`, which joins even while unwinding, so the
+        /// caller's environment guard outlives the server on every exit path.
+        /// A `.join()` anywhere is NOT enough on its own, which is how a
+        /// detached site rode along on an unrelated `worker.join()` (#390).
+        fn spawns_serve_undetached(body: &str) -> bool {
+            body.contains("thread::spawn")
+                && body.contains("serve(")
+                && !body.contains("with_serve(")
+                && !body.contains("server.join()")
+        }
+
         let mut offenders = Vec::new();
         let mut recursive = Vec::new();
         let mut undetached = Vec::new();
@@ -4785,15 +4830,37 @@ mod tests {
                 // A guard in the test body cannot cover work on a thread that
                 // outlives it. Every spawned `serve` must be joined, or it can
                 // still be inside NSS when the next test starts writing `environ`.
-                if !is_this_test
-                    && body.contains("thread::spawn")
-                    && body.contains("serve(")
-                    && !body.contains(".join()")
-                {
+                //
+                // `with_serve` joins inside a `thread::scope`, which joins even
+                // while UNWINDING, so a test using it needs no join of its own
+                // and is exempt. A bare `thread::spawn` still has to bind a
+                // handle called `server` and join it, because any `.join()` was
+                // not enough: the detached site in
+                // `an_unpublished_listing_reaches_the_worker_instead_of_erroring`
+                // satisfied this check on an unrelated `worker.join()` (#390).
+                if !is_this_test && spawns_serve_undetached(&body) {
                     undetached.push(format!("{file}:{name} (line {})", sig + 1));
                 }
             }
         }
+        // Pinned on synthetic bodies. Every real caller now goes through
+        // `with_serve`, so the predicate has nothing left to fire on and would
+        // silently rot; these three keep it honest.
+        assert!(
+            spawns_serve_undetached("std::thread::spawn(move || serve(a, b, c));"),
+            "a bare spawn of serve with no join must be reported"
+        );
+        assert!(
+            !spawns_serve_undetached(
+                "let server = std::thread::spawn(|| serve(a,b,c)); server.join();"
+            ),
+            "a named, joined server is fine"
+        );
+        assert!(
+            !spawns_serve_undetached("let r = with_serve(&arb, &ready, |ours| ours);"),
+            "with_serve joins inside a scope, even while unwinding"
+        );
+
         assert!(
             scanned > 50,
             "expected to walk the daemon's tests, walked {scanned}"
@@ -5313,35 +5380,35 @@ mod tests {
     /// to name the cause, because it reaches the user through PAM (#244).
     #[test]
     fn a_request_needing_the_engine_is_refused_while_it_loads() {
+        // Held by the PARENT across the spawn and the join, not by the child.
+        // A read guard already excludes every writer for as long as it is held,
+        // so the spawned `serve` is covered without acquiring anything itself.
+        // Guarding inside the child made it BLOCK on the lock while this test
+        // was already counting down its socket deadline, and under ASan a
+        // writer held long enough to turn that into WouldBlock (#380 follow-up).
+        let _passwd = passwd_lock();
         use std::io::{BufRead, BufReader, Write};
         let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        ours.set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        (&ours)
-            .write_all(
-                format!("{{\"ListProfiles\":{{\"user\":\"{me}\",\"structured_errors\":false}}}}\n")
-                    .as_bytes(),
-            )
-            .unwrap();
-        let a = std::sync::Arc::clone(&arbiter);
         // The engine has NOT been published yet: exactly the startup window.
         let ready = std::sync::atomic::AtomicBool::new(false);
-        let server = std::thread::spawn(move || {
-            // The passwd lookup this reaches runs HERE, on a thread that
-            // outlives the test body, so a guard in the test body cannot
-            // cover it. Shared, so these overlap rather than serialising
-            // the socket work (#380 review).
-            let _passwd = crate::test_support::env_read();
-            serve(theirs, &a, &ready).unwrap();
+        let resp = with_serve(&arbiter, &ready, |ours| {
+            ours.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            (&*ours)
+                .write_all(
+                    format!(
+                        "{{\"ListProfiles\":{{\"user\":\"{me}\",\"structured_errors\":false}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(ours)
+                .read_line(&mut line)
+                .expect("a refusal within the deadline, not a wait for the engine");
+            serde_json::from_str::<Response>(line.trim()).unwrap()
         });
-
-        let mut line = String::new();
-        BufReader::new(&ours)
-            .read_line(&mut line)
-            .expect("a refusal within the deadline, not a wait for the engine");
-        let resp: Response = serde_json::from_str(line.trim()).unwrap();
         match resp {
             Response::Error(e) => assert!(
                 e.contains("still starting"),
@@ -5349,12 +5416,6 @@ mod tests {
             ),
             other => panic!("a request needing the engine must be refused, got {other:?}"),
         }
-        // Joined, not detached: a thread still inside NSS when the next test
-        // starts mutating `environ` is the race this whole change is about.
-        // Dropping the client end makes the server read EOF, so this does not
-        // wait out the socket timeout.
-        drop(ours);
-        server.join().unwrap();
     }
 
     /// The startup path answers a keyring release before the engine exists,
@@ -5426,25 +5487,29 @@ mod tests {
             })
         };
 
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        ours.set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        (&ours)
-            .write_all(
-                format!("{{\"ListProfiles\":{{\"user\":\"{me}\",\"structured_errors\":false}}}}\n")
-                    .as_bytes(),
-            )
-            .unwrap();
-        let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
-        std::thread::spawn(move || serve(theirs, &a, &ready).unwrap());
-
-        let mut line = String::new();
-        BufReader::new(&ours)
-            .read_line(&mut line)
-            .expect("an answer within the deadline");
-        let resp: Response = serde_json::from_str(line.trim()).unwrap();
+        // Was a bare `spawn` whose handle was DISCARDED, so the server was
+        // detached outright. It passed the rule test only because the unrelated
+        // `worker.join()` below satisfied a check that looks for any `.join()`
+        // in the function (#390 review).
+        let resp = with_serve(&arbiter, &ready, |ours| {
+            ours.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            (&*ours)
+                .write_all(
+                    format!(
+                        "{{\"ListProfiles\":{{\"user\":\"{me}\",\"structured_errors\":false}}}}\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(ours)
+                .read_line(&mut line)
+                .expect("an answer within the deadline");
+            serde_json::from_str::<Response>(line.trim()).unwrap()
+        });
         match resp {
             Response::Enrollment { profiles, .. } => {
                 assert_eq!(
@@ -5461,6 +5526,13 @@ mod tests {
 
     #[test]
     fn serve_routes_a_request_through_the_arbiter_and_answers_the_client() {
+        // Held by the PARENT across the spawn and the join, not by the child.
+        // A read guard already excludes every writer for as long as it is held,
+        // so the spawned `serve` is covered without acquiring anything itself.
+        // Guarding inside the child made it BLOCK on the lock while this test
+        // was already counting down its socket deadline, and under ASan a
+        // writer held long enough to turn that into WouldBlock (#380 follow-up).
+        let _passwd = passwd_lock();
         // The whole path a client sees, minus the engine: parse, queue, worker,
         // reply. A fake worker stands in for the camera so this stays a test of
         // the wiring rather than of inference.
@@ -5476,25 +5548,16 @@ mod tests {
             })
         };
 
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        (&ours).write_all(b"\"Ping\"\n").unwrap();
-        let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
-        let server = std::thread::spawn(move || {
-            // See the sibling spawn above: the passwd lookup happens on this
-            // thread, so the guard must live here and the test must join.
-            let _passwd = crate::test_support::env_read();
-            serve(theirs, &a, &ready).unwrap();
+        let resp = with_serve(&arbiter, &ready, |ours| {
+            (&*ours).write_all(b"\"Ping\"\n").unwrap();
+            let mut line = String::new();
+            BufReader::new(ours).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(line.trim()).unwrap()
         });
-
-        let mut line = String::new();
-        BufReader::new(&ours).read_line(&mut line).unwrap();
-        let resp: Response = serde_json::from_str(line.trim()).unwrap();
         assert!(matches!(resp, Response::Pong), "got {resp:?}");
 
-        drop(ours);
-        server.join().unwrap();
         arbiter.close();
         worker.join().unwrap();
     }
@@ -5508,6 +5571,16 @@ mod tests {
     /// test only passed because a worker drained the queue, it would hang.
     #[test]
     fn a_status_request_answers_while_the_queue_is_wedged_and_workerless() {
+        // One read guard for the whole test, covering both the lookup that
+        // builds the request AND the spawned `serve` that repeats it on its way
+        // to `pregate`. Held by the parent, never by the child: a child that
+        // blocks on this lock stalls a client already counting down its socket
+        // deadline (#380 follow-up).
+        //
+        // Holding it across the socket work is affordable BECAUSE it is shared.
+        // The exclusive guard that took this suite from 17s to 131s is what the
+        // narrow scope was avoiding; readers overlap each other.
+        let _passwd = passwd_lock();
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
         // Wedge: an authentication sits queued forever (no worker exists).
         let (dead_reply, _keep) = std::sync::mpsc::channel();
@@ -5536,19 +5609,6 @@ mod tests {
             (
                 // Own-uid query: authorized, answered from files, no engine.
                 format!("{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n", {
-                    // Shared, and held for the passwd lookup ALONE. The
-                    // socket work below waits on timeouts, and an EXCLUSIVE
-                    // guard across that stalls every other test touching the
-                    // environment: an earlier attempt took this suite from
-                    // 17s to 131s. A read guard cannot, because the other
-                    // readers overlap it.
-                    //
-                    // The narrow scope used to be the whole defect: it covered
-                    // this lookup, and then the spawned `serve` thread below
-                    // did the SAME lookup on the way to `pregate` with nothing
-                    // held at all. That thread now takes its own read guard and
-                    // is joined (#380 review).
-                    let _passwd = passwd_lock();
                     // SAFETY: getuid takes no arguments, reads only this process's own real
                     // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
@@ -5556,32 +5616,23 @@ mod tests {
                 Box::new(|r: &Response| matches!(r, Response::HasPassword(_))),
             ),
         ] {
-            let (ours, theirs) = UnixStream::pair().unwrap();
-            // A status answer comes from the connection thread in
-            // microseconds; a regression queues it behind the wedge for the
-            // full 300s worker budget. The client-side deadline turns that
-            // hang into a fast, attributable failure.
-            ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            (&ours).write_all(wire.as_bytes()).unwrap();
-            let a = std::sync::Arc::clone(&arbiter);
             // These cover the SERVING daemon; the not-ready path has its own test.
             let ready = std::sync::atomic::AtomicBool::new(true);
-            let server = std::thread::spawn(move || {
-                // `HasSealedPassword` classifies as `Class::Status`, so `serve`
-                // answers it on THIS thread via `dispatch_status` -> `pregate`
-                // -> `getpwnam_r`. The guard has to be here.
-                let _passwd = crate::test_support::env_read();
-                serve(theirs, &a, &ready).unwrap();
+            let resp = with_serve(&arbiter, &ready, |ours| {
+                // A status answer comes from the connection thread in
+                // microseconds; a regression queues it behind the wedge for the
+                // full 300s worker budget. The client-side deadline turns that
+                // hang into a fast, attributable failure.
+                ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                (&*ours).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(ours)
+                    .read_line(&mut line)
+                    .expect("a status answer within the deadline");
+                serde_json::from_str::<Response>(line.trim()).unwrap()
             });
-            let mut line = String::new();
-            BufReader::new(&ours)
-                .read_line(&mut line)
-                .expect("a status answer within the deadline");
-            let resp: Response = serde_json::from_str(line.trim()).unwrap();
             assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
-            drop(ours);
-            server.join().unwrap();
         }
     }
 
@@ -5835,6 +5886,13 @@ mod tests {
 
     #[test]
     fn a_camera_request_is_refused_while_an_authentication_is_queued() {
+        // Held by the PARENT across the spawn and the join, not by the child.
+        // A read guard already excludes every writer for as long as it is held,
+        // so the spawned `serve` is covered without acquiring anything itself.
+        // Guarding inside the child made it BLOCK on the lock while this test
+        // was already counting down its socket deadline, and under ASan a
+        // writer held long enough to turn that into WouldBlock (#380 follow-up).
+        let _passwd = passwd_lock();
         // No worker: the refusal must be answered by the connection thread
         // itself, without the request ever reaching the camera. If this only
         // worked because a worker drained the queue, the test would hang here.
@@ -5856,23 +5914,16 @@ mod tests {
             )
             .unwrap();
 
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        (&ours)
-            .write_all(b"{\"PositionSample\":{\"user\":null}}\n")
-            .unwrap();
-        let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
-        let server = std::thread::spawn(move || {
-            // See the sibling spawn above: the passwd lookup happens on this
-            // thread, so the guard must live here and the test must join.
-            let _passwd = crate::test_support::env_read();
-            serve(theirs, &a, &ready).unwrap();
+        let resp = with_serve(&arbiter, &ready, |ours| {
+            (&*ours)
+                .write_all(b"{\"PositionSample\":{\"user\":null}}\n")
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(ours).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(line.trim()).unwrap()
         });
-
-        let mut line = String::new();
-        BufReader::new(&ours).read_line(&mut line).unwrap();
-        let resp: Response = serde_json::from_str(line.trim()).unwrap();
         match resp {
             Response::Error(msg) => assert!(
                 msg.contains("authentication has priority"),
@@ -5880,8 +5931,6 @@ mod tests {
             ),
             other => panic!("a queued authentication must refuse preview work, got {other:?}"),
         }
-        drop(ours);
-        server.join().unwrap();
     }
 
     #[test]

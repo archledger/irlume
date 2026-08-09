@@ -2426,10 +2426,14 @@ impl IrSession<'_> {
         // only when the camera classified frames; on either fallback this is
         // the first frame holding the max mean, exactly the original
         // incremental scan.
-        let clipped_fracs: Option<Vec<f64>> = white_level.map(|_| {
+        // `map(|w| ...)`, NOT `map(|_| ...)`. Binding the ceiling and discarding
+        // it is what made this measurement disagree with the one that judges the
+        // face region: presence switched the clip-aware selection on while the
+        // count stayed pinned to 255 (#394).
+        let clipped_fracs: Option<Vec<f64>> = white_level.map(|w| {
             frames
                 .iter()
-                .map(|f| ir_probe::saturated_fraction(f))
+                .map(|f| ir_probe::saturated_fraction(f, w))
                 .collect()
         });
         let best_i =
@@ -2496,20 +2500,36 @@ impl IrSession<'_> {
                         ir_window = ir_window.union(CaptureWindow::at(taken[ai]));
                     }
                     if debug_ir {
-                        let clipped = ir_probe::saturated_fraction(&frames[best_i]);
+                        // Reads the same ceiling the gate-frame selection above
+                        // used, so the debug percentage and the decision cannot
+                        // disagree.
+                        //
+                        // `None` prints no percentage at all rather than
+                        // substituting 255. Defaulting was the wrong instinct
+                        // twice over: the count is `p >= white`, so 255 passes
+                        // the FEWEST pixels and under-reports, which on a
+                        // diagnostic means failing to warn; and a format that
+                        // names no ceiling has no clipping figure to report, so
+                        // printing one states a measurement nobody took. Same
+                        // rule `eye_glint_of` and `saturated_frac_of` follow
+                        // next door (#394).
+                        let clipped =
+                            white_level.map(|w| ir_probe::saturated_fraction(&frames[best_i], w));
                         let action = if sub_mean >= SUBTRACT_MIN_RESULT {
                             "applied"
                         } else {
                             "reverted (result too dark; face would vanish)"
                         };
+                        let clip_note = match clipped {
+                            Some(c) if c > ir_metadata::CLIPPED_FRAC_MAX => format!(
+                                "; lit clipped {:.1}% (blown exposure; subtracted frame unreliable)",
+                                c * 100.0
+                            ),
+                            Some(c) => format!("; lit clipped {:.1}%", c * 100.0),
+                            None => String::new(),
+                        };
                         eprintln!(
-                        "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}; lit clipped {:.1}%{}",
-                        clipped * 100.0,
-                        if clipped > ir_metadata::CLIPPED_FRAC_MAX {
-                            " (blown exposure; subtracted frame unreliable)"
-                        } else {
-                            ""
-                        }
+                        "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}{clip_note}"
                     );
                     }
                 } else if debug_ir {
@@ -2666,15 +2686,45 @@ pub mod ir_probe {
             .collect()
     }
 
-    /// Fraction of pixels at the 8-bit ceiling (255). A high clipped fraction in
-    /// the lit frame means the exposure is blown: those pixels lost their true
-    /// emitter return, so both the raw and the ambient-subtracted frame are
-    /// unreliable there. Used as a capture-quality signal, not a hard gate.
-    pub fn saturated_fraction(data: &[u8]) -> f64 {
+    /// Fraction of pixels at or above `white`, the ceiling the negotiated format
+    /// actually reports. A high clipped fraction in the lit frame means the
+    /// exposure is blown: those pixels lost their true emitter return, so both
+    /// the raw and the ambient-subtracted frame are unreliable there. Used as a
+    /// capture-quality signal, not a hard gate.
+    ///
+    /// `white` is a parameter rather than a hardcoded 255 because
+    /// `clipping_white_level` can answer 235: a limited-range stream rails at
+    /// nominal white, not at the type's maximum. Counting only `== 255` on such
+    /// a stream reports every frame as pristine, which does not merely lose a
+    /// signal. `Some(_)` is what switches ON #221's clip-aware gate-frame
+    /// selection, so the selection would run against an all-zero measurement,
+    /// pass every frame under `CLIPPED_FRAC_MAX`, and hand back the brightest
+    /// lit frame, which is the blown one #221 exists to avoid. The face-region
+    /// instrument `saturated_frac_in_bbox` in irlume-auth has always taken the
+    /// ceiling, so the two disagreed about the same burst (#394). Named in
+    /// backticks and not as an intra-doc link: irlume-camera cannot depend on
+    /// irlume-auth, so the link would not resolve and CI treats that as an
+    /// error.
+    ///
+    /// `>=` rather than `==` for the same reason the bbox instrument uses it: a
+    /// sample above nominal white is out-of-range excursion, which is still not
+    /// a pixel carrying a usable emitter return.
+    ///
+    /// KILL CONDITION for the first limited-range module anyone finds. At a 235
+    /// ceiling `>=` also counts 236..=255, which BT.601/709 calls legal
+    /// excursion rather than saturation, so this governs a strictly larger
+    /// pixel population than the one `CLIPPED_FRAC_MAX` (0.05) was fitted on:
+    /// #221's captures were taken against a 255 ceiling, where 236..=254 was
+    /// ordinary signal counting for nothing. If a healthy frame from such a
+    /// module puts more than 5% of its pixels above 235, `best_gate_frame`
+    /// takes its `least` branch on every burst. Dump the per-frame fractions
+    /// from a real limited-range device before trusting 0.05 there; do not
+    /// assume the constant transfers.
+    pub fn saturated_fraction(data: &[u8], white: u8) -> f64 {
         if data.is_empty() {
             return 0.0;
         }
-        let clipped = data.iter().filter(|&&p| p == 255).count();
+        let clipped = data.iter().filter(|&&p| p >= white).count();
         clipped as f64 / data.len() as f64
     }
 
@@ -4562,9 +4612,38 @@ mod tests {
 
     #[test]
     fn saturated_fraction_counts_clipped_pixels() {
-        assert_eq!(ir_probe::saturated_fraction(&[255, 255, 0, 0]), 0.5);
-        assert_eq!(ir_probe::saturated_fraction(&[0, 1, 254]), 0.0);
-        assert_eq!(ir_probe::saturated_fraction(&[]), 0.0);
+        assert_eq!(
+            ir_probe::saturated_fraction(&[255, 255, 0, 0], u8::MAX),
+            0.5
+        );
+        assert_eq!(ir_probe::saturated_fraction(&[0, 1, 254], u8::MAX), 0.0);
+        assert_eq!(ir_probe::saturated_fraction(&[], u8::MAX), 0.0);
+    }
+
+    /// The whole of #394: a limited-range stream rails at 235, and counting
+    /// `== 255` reported it as pristine. Both readings below come from the SAME
+    /// buffer, so this fails on the old signature no matter what ceiling is
+    /// passed: it could only ever answer 0.0 for these pixels.
+    ///
+    /// The second half is what makes it a regression test rather than a
+    /// tautology: at a 255 ceiling the same frame must still read clean, so a
+    /// fix that simply lowered the constant is not enough to pass.
+    #[test]
+    fn a_frame_railed_at_nominal_white_is_clipped_only_against_its_own_ceiling() {
+        let railed_at_235 = [235u8, 235, 235, 235];
+        assert_eq!(
+            ir_probe::saturated_fraction(&railed_at_235, 235),
+            1.0,
+            "a limited-range frame at nominal white is entirely clipped"
+        );
+        assert_eq!(
+            ir_probe::saturated_fraction(&railed_at_235, u8::MAX),
+            0.0,
+            "the same pixels are not clipped on a full-range stream"
+        );
+        // Out-of-range excursion above nominal white still carries no usable
+        // emitter return, so `>=` and not `==`.
+        assert_eq!(ir_probe::saturated_fraction(&[236u8, 0, 0, 0], 235), 0.25);
     }
 
     #[test]

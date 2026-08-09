@@ -508,12 +508,27 @@ pub fn presence_retryable(o: &Outcome) -> bool {
     )
 }
 
+/// Start of the reason irlume-liveness produces when the IR format defines no
+/// sensor ceiling. Pinned against that text by
+/// `an_unmeasurable_exposure_is_not_retryable`, the same way the `no face in IR`
+/// prefix below is pinned.
+const EXPOSURE_UNMEASURABLE_PREFIX: &str = "IR exposure unmeasurable";
+
 /// Kind of a non-Live cross-spectrum gate verdict on the RGB primary path.
 /// The `no face in IR` reason is singled out because it is the retryable
 /// RGB-yes/IR-no transient; the prefix is pinned against the string
 /// irlume-liveness produces by `grace_retries_only_presence_failures`.
 fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
     match verdict {
+        // Uncertain normally means framing or quality, which the grace window
+        // retries. An unmeasurable IR format is neither: it is a property of
+        // the camera that will hold for every frame, so retrying spends the
+        // whole window to reach the same answer while telling the user to
+        // adjust something that cannot help (#358). OtherDeny is the
+        // non-retryable class for a state refusal like this.
+        Verdict::Uncertain if reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX) => {
+            OutcomeKind::OtherDeny
+        }
         Verdict::Uncertain => OutcomeKind::Uncertain,
         Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
         Verdict::Spoof => OutcomeKind::Spoof,
@@ -1353,6 +1368,7 @@ impl Engine {
             face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
             // RGB-only path: no IR frame exists to clip.
             ir_saturated_frac: None,
+            ir_ceiling_known: false,
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
             rgb_moire_score: rgb_moire,
@@ -1773,6 +1789,10 @@ impl Engine {
                 ir_top.as_ref().map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
+            // Whether the FORMAT could be measured, which is not the same
+            // question as whether this capture produced a number: the call
+            // above also yields None when no face was found (#358).
+            ir_ceiling_known: ir_stats.white_level.is_some(),
             rgb_face_brightness: rgb_brightness,
             rgb_moire_score: 0.0,
             rgb_specular_frac: 0.0,
@@ -2770,11 +2790,20 @@ impl Engine {
                 // Dark-path kinds: Uncertain retries under grace, any Spoof
                 // does not (the retryable RGB-yes/IR-no transient cannot occur
                 // here: this path only runs when RGB saw no face).
-                let kind = if verdict == Verdict::Uncertain {
-                    OutcomeKind::Uncertain
-                } else {
-                    OutcomeKind::Spoof
-                };
+                //
+                // Routed through the shared classifier rather than mapped
+                // inline. `exposure_refusal` is deliberately shared by BOTH
+                // evaluators, so the unmeasurable-format refusal arrives here
+                // as Uncertain too, and an inline map would leave it in the
+                // retryable class on exactly the camera this gate exists for:
+                // six full captures reaching the identical answer, every dark
+                // login, forever. The classifier holds the one prefix rule
+                // (#358 review).
+                //
+                // `reason` here is the raw liveness string; the "dark liveness"
+                // prefix is applied in the `format!` below, after this call, so
+                // the prefix match still sees what irlume-liveness produced.
+                let kind = liveness_deny_kind(verdict, &reason);
                 return Ok(Outcome::deny(
                     kind,
                     format!("dark liveness {verdict:?}: {reason}"),
@@ -4377,6 +4406,138 @@ mod tests {
         assert_eq!(
             irlume_common::pam_service::classify("doas"),
             Some(ServiceKind::Elevation)
+        );
+    }
+
+    /// An unmeasurable IR exposure must NOT be retried (#358).
+    ///
+    /// It arrives as `Verdict::Uncertain`, which is the retryable class, and
+    /// that is the trap: the condition is a property of the camera's negotiated
+    /// format, identical on every frame. Retrying spends the entire grace
+    /// window to reach the same answer and then falls back to the password
+    /// anyway, while the user is told to adjust something that cannot help.
+    #[test]
+    fn an_unmeasurable_exposure_is_not_retryable() {
+        use irlume_liveness::Verdict;
+        // Built from the real producer's wording, not a literal, so a reword in
+        // irlume-liveness that drops the prefix fails here instead of silently
+        // making the refusal retryable again.
+        let mut sig = irlume_liveness::Signals {
+            rgb_face: Some(irlume_liveness::FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face: Some(irlume_liveness::FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face_brightness: 90.0,
+            ir_center_edge_ratio: 1.2,
+            // Option since #222: a railed peak records as absent, so the
+            // readable case has to say so.
+            ir_eye_glint: Some(220.0),
+            ..Default::default()
+        };
+        sig.ir_ceiling_known = false;
+        let (verdict, _, reason) = irlume_liveness::LivenessGate::new().evaluate(&sig);
+        assert_eq!(verdict, Verdict::Uncertain, "precondition for this test");
+        assert!(
+            reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
+            "the prefix this routing keys on moved: {reason}"
+        );
+
+        let kind = liveness_deny_kind(verdict, &reason);
+        assert_eq!(
+            kind,
+            OutcomeKind::OtherDeny,
+            "must leave the retryable class"
+        );
+        assert!(
+            !presence_retryable(&denied(kind, &reason, false)),
+            "retrying an unmeasurable format burns the grace window for nothing"
+        );
+
+        // A blown-out frame IS still retryable: moving back really can fix it,
+        // so this change must not have swept the ordinary case out with it.
+        let mut blown = sig.clone();
+        blown.ir_ceiling_known = true;
+        blown.ir_saturated_frac = Some(0.9);
+        let (bv, _, br) = irlume_liveness::LivenessGate::new().evaluate(&blown);
+        let bk = liveness_deny_kind(bv, &br);
+        assert_eq!(bk, OutcomeKind::Uncertain, "{br}");
+        assert!(presence_retryable(&denied(bk, &br, false)), "{br}");
+
+        // The DARK evaluator reaches the same refusal, because
+        // `exposure_refusal` is deliberately shared by both. The first version
+        // of this fix routed only the cross-spectrum site and left the dark
+        // site mapping inline, so on the one camera class this gate exists for
+        // a dark login burned the whole grace window reaching this answer
+        // repeatedly (#358 review).
+        let (dv, _, dr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&sig);
+        assert_eq!(dv, Verdict::Uncertain, "precondition: {dr}");
+        assert!(
+            dr.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
+            "the dark evaluator stopped producing the pinned prefix: {dr}"
+        );
+        let dk = liveness_deny_kind(dv, &dr);
+        assert_eq!(dk, OutcomeKind::OtherDeny, "{dr}");
+        assert!(!presence_retryable(&denied(dk, &dr, false)), "{dr}");
+
+        // And the dark path's ordinary refusals stay exactly as they were, so
+        // routing it through the shared classifier changed nothing else.
+        let mut dark_flat = sig.clone();
+        dark_flat.ir_ceiling_known = true;
+        dark_flat.ir_saturated_frac = Some(0.0);
+        dark_flat.ir_center_edge_ratio = 0.1;
+        let (fv, _, fr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&dark_flat);
+        assert_eq!(fv, Verdict::Spoof, "precondition: {fr}");
+        assert_eq!(liveness_deny_kind(fv, &fr), OutcomeKind::Spoof, "{fr}");
+    }
+
+    /// Every liveness verdict becomes an `OutcomeKind` through
+    /// [`liveness_deny_kind`], never through a comparison written at the call
+    /// site.
+    ///
+    /// The rule exists because the failure mode is a NEW deny site, or an old
+    /// one nobody revisited, classifying inline. `liveness_deny_kind` is where
+    /// the retryability rules live; a site that maps `Verdict::Uncertain`
+    /// itself silently opts out of all of them. That is exactly what happened
+    /// with the dark path in #358: the classifier gained the unmeasurable arm,
+    /// the dark site kept `let kind = if verdict == Verdict::Uncertain`, and no
+    /// behavioural test could see it because the refusal is only reachable
+    /// with a camera whose format names no ceiling.
+    #[test]
+    fn no_deny_site_classifies_a_liveness_verdict_by_hand() {
+        let src = include_str!("lib.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let l = l.trim();
+                // The shape that was removed, and the shape a future site would
+                // most naturally reintroduce.
+                (l.starts_with("let kind = if") || l.starts_with("let kind = match"))
+                    && !l.contains("liveness_deny_kind")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these sites classify a liveness verdict by hand instead of calling \
+             liveness_deny_kind, so they do not inherit its retryability rules: {offenders:?}"
+        );
+        // Not vacuous: the call site must actually be there, or this test
+        // would pass by having nothing to look at. The needle is assembled
+        // from pieces so it does not appear verbatim in the file it scans;
+        // spelled inline, the assertion matched its own source and stayed
+        // green with the real call site deleted.
+        let needle = concat!("liveness_deny_kind", "(verdict, &reason)");
+        assert!(
+            src.matches(needle).count() >= 2,
+            "the deny sites that route through liveness_deny_kind are gone; \
+             the rule this test pins has nothing left to hold"
         );
     }
 

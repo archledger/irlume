@@ -157,6 +157,13 @@ fn capture_once(
             ir_top.as_ref().map(|f| &f.bbox),
             ir_stats.white_level,
         ),
+        // Set from the SAME white level the fraction above is computed from.
+        // `Signals::default()` says false, the fail-safe answer for a struct
+        // nobody filled in, and `..Default::default()` below would silently
+        // apply it here: PAD capture would refuse every frame as unmeasurable
+        // on a camera that measures perfectly well, and produce none of the
+        // corpus rows this gate exists to be tuned from (#358 review).
+        ir_ceiling_known: ir_stats.white_level.is_some(),
         ..Default::default()
     };
     let gate = LivenessGate::new();
@@ -225,6 +232,15 @@ fn presentation_record(
         },
     );
     rec.insert("ir_exposure_ok".into(), cues.ir_exposure_ok.into());
+    // Recorded beside it so a row the gate never read is distinguishable from a
+    // row it read and found clean. Without this the corpus said "clean" for
+    // every frame on a camera whose format defines no ceiling, which is exactly
+    // the population any retune of IR_SATURATED_FRAC_MAX would be fitted on
+    // (#358).
+    rec.insert(
+        "ir_exposure_measured".into(),
+        cues.ir_exposure_measured.into(),
+    );
     rec.insert(
         "ir_center_edge_ratio".into(),
         crate::json_f32(s.ir_center_edge_ratio),
@@ -792,6 +808,10 @@ mod tests {
             "ir_brightness",
             "ir_saturated_frac",
             "ir_exposure_ok",
+            // Added with the field itself: this list IS the corpus schema, so a
+            // key missing from it can be deleted from the record with every
+            // assertion here still passing (#358 review).
+            "ir_exposure_measured",
             "ir_center_edge_ratio",
             "ir_glint",
             "cross_dist",

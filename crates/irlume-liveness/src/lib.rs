@@ -80,6 +80,20 @@ pub struct Signals {
     /// not measured (RGB-only path, older callers); the flood rewording below
     /// then never triggers. See [`IR_AMBIENT_FLOOD`].
     pub ir_ambient: f32,
+    /// Whether the negotiated IR format defines where its sensor ceiling is,
+    /// i.e. whether [`Self::ir_saturated_frac`] could be measured at all.
+    ///
+    /// Separate from `ir_saturated_frac` being `None`, which is ambiguous:
+    /// `saturated_frac_of` also yields `None` when no face was detected. The
+    /// evaluators happen to require an IR face before they reach the exposure
+    /// gate, so today the two cannot be confused there, but that is a distant
+    /// invariant in another crate and the gate now states its own precondition
+    /// rather than inheriting one (#358).
+    ///
+    /// Defaults to FALSE, the fail-safe direction: a `Signals` nobody filled in
+    /// measured no ceiling, and a permissive default here is what let the gate
+    /// pass unread frames in the first place.
+    pub ir_ceiling_known: bool,
     /// Face width as a fraction of frame width, from the frame the IR cues
     /// were measured in (the RGB frame on the RGB-only path). 0.0 when no
     /// face was found.
@@ -146,7 +160,8 @@ impl Default for Signals {
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
-            ir_ambient: 0.0, // not measured
+            ir_ambient: 0.0,
+            ir_ceiling_known: false, // not measured
         }
     }
 }
@@ -346,10 +361,18 @@ pub struct Cues {
     /// head-orientation gate.
     pub frontal_ok: bool,
     /// The IR face region is readable rather than blown out: at most
-    /// [`IR_SATURATED_FRAC_MAX`] of it sits at the sensor ceiling, or the format
-    /// cannot say where its ceiling is. False means no cue below it was worth
-    /// reading (#237).
+    /// [`IR_SATURATED_FRAC_MAX`] of it sits at the sensor ceiling. False means
+    /// no cue below it was worth reading (#237).
+    ///
+    /// Read together with [`Self::ir_exposure_measured`]. This used to be true
+    /// when the format could not say where its ceiling was, which recorded
+    /// "clean" into the PAD corpus for frames the gate never read, on exactly
+    /// the cameras where the question is hardest (#358).
     pub ir_exposure_ok: bool,
+    /// Whether the exposure above was actually measured. False means the
+    /// negotiated IR format defines no sensor ceiling, so nothing was read and
+    /// `ir_exposure_ok` carries no information.
+    pub ir_exposure_measured: bool,
 }
 
 /// IR face region must be at least this bright (0..255). A lit live face ran ~83
@@ -411,8 +434,11 @@ pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
 /// widen the corpus before trusting it elsewhere (#101).
 ///
 /// Only measurable where the source format names its ceiling
-/// (`clipping_white_level`); an unmeasurable frame is judged as before, since
-/// refusing on a number nobody produced would deny every non-GREY8 module.
+/// (`clipping_white_level`), which today means the 8-bit greys. A frame whose
+/// format names no ceiling is REFUSED rather than judged, because a gate that
+/// could not run is not a gate that passed; see [`Signals::ir_ceiling_known`]
+/// (#358). This sentence used to say the opposite, and anyone retuning the
+/// constant should know the population it is fitted to is GREY8 only.
 pub const IR_SATURATED_FRAC_MAX: f32 = 0.10;
 
 /// Ambient IR (see [`Signals::ir_ambient`]) above which the brightness and
@@ -678,9 +704,34 @@ impl LivenessGate {
 /// accepting the frames the cross-spectrum path had just started refusing.
 /// Adding a third evaluator means calling this, not copying it.
 fn exposure_refusal(s: &Signals, cues: &mut Cues) -> Option<(Verdict, String)> {
+    // Not measurable at all. This used to read as "clean" and let every cue
+    // below run on a frame nobody had checked, which is off on any IR node that
+    // negotiates Y16/Y10/Y12/NV12/YUYV rather than 8-bit grey (#358).
+    //
+    // Refused rather than passed: the cues below degrade together as clipping
+    // rises, so running them on an unverified frame is reading noise, and a
+    // gate that cannot run is not a gate that passed.
+    //
+    // Worded so it does NOT say "move back". Moving cannot repair a format that
+    // defines no ceiling, and the reason prefix is what keeps this out of the
+    // presence-retryable set: retrying would burn the whole grace window every
+    // login and then fall back to the password anyway, while advising something
+    // that cannot help. See `liveness_deny_kind` in irlume-auth.
+    cues.ir_exposure_measured = s.ir_ceiling_known;
+    if !s.ir_ceiling_known {
+        cues.ir_exposure_ok = false;
+        return Some((
+            Verdict::Uncertain,
+            "IR exposure unmeasurable: this camera's IR format defines no sensor \
+             ceiling, so clipping cannot be checked and the liveness cues cannot \
+             be trusted. Report the camera so its format can be supported."
+                .to_string(),
+        ));
+    }
+
     cues.ir_exposure_ok = s
         .ir_saturated_frac
-        .is_none_or(|f| f <= IR_SATURATED_FRAC_MAX);
+        .is_some_and(|f| f <= IR_SATURATED_FRAC_MAX);
     if cues.ir_exposure_ok {
         return None;
     }
@@ -2248,6 +2299,17 @@ mod tests {
             ir_face_brightness: 90.0,
             ir_center_edge_ratio: 1.2,
             ir_eye_glint: Some(220.0),
+            // A Grey8 camera, which is what the fleet actually runs and what
+            // every cue below this is written against. Stated rather than
+            // defaulted: the default is FALSE (fail-safe), so a fixture that
+            // wants to exercise a cue past the exposure gate has to say so
+            // (#358).
+            ir_ceiling_known: true,
+            // ...and a face that was actually read and found unclipped. Leaving
+            // this None while claiming a known ceiling is a state production
+            // cannot reach, because a measurable format with a face present
+            // always yields a number (#358).
+            ir_saturated_frac: Some(0.0),
             ..Default::default() // frontal pose
         }
     }
@@ -2286,12 +2348,22 @@ mod tests {
     }
 
     /// The refusal is an exposure ceiling, not a new spoof cue: everything at
-    /// or under the limit is judged exactly as before, and an unmeasurable
-    /// fraction (a format with no known ceiling) must not deny anyone.
+    /// or under the limit is judged exactly as before.
+    ///
+    /// The unmeasurable case is deliberately NOT here. This doc used to claim
+    /// that a format with no known ceiling "must not deny anyone", which is the
+    /// fail-open #358 removed, and the body three lines down now asserts the
+    /// opposite. A test whose documentation states the inverse of its own
+    /// assertions is worse than an undocumented one.
     #[test]
     fn a_readable_ir_face_is_judged_as_before() {
         let gate = LivenessGate::new();
-        for frac in [None, Some(0.0), Some(0.063), Some(IR_SATURATED_FRAC_MAX)] {
+        // `None` was in this list and asserted Live, which is the fail-open
+        // #358 removed: on a camera whose format defines no ceiling the gate
+        // was passing frames it had not read. A measurable camera with a face
+        // present always yields Some, so the readable cases are the Some ones;
+        // the unmeasurable case has its own test below.
+        for frac in [Some(0.0), Some(0.063), Some(IR_SATURATED_FRAC_MAX)] {
             let mut live = live_signals();
             live.ir_saturated_frac = frac;
             let mut flat = live_signals();
@@ -2487,9 +2559,71 @@ mod tests {
             rgb_face: Some(fb(0.5, 0.5)),
             ir_face: Some(fb(0.5, 0.5)),
             ir_face_brightness: 12.0,
+            // A readable Grey8 frame, so the darkness below is what decides
+            // this and not the exposure gate above it (#358).
+            ir_ceiling_known: true,
+            ir_saturated_frac: Some(0.0),
             ..Default::default()
         };
         assert_eq!(LivenessGate::new().evaluate(&s).0, Verdict::Spoof);
+    }
+
+    /// A camera whose IR format defines no sensor ceiling is refused, not
+    /// passed (#358).
+    ///
+    /// This was the fail-open: `is_none_or` read "could not measure" as "clean",
+    /// so on any IR node negotiating Y16/Y10/Y12/NV12/YUYV the #237 exposure
+    /// gate was off entirely and every cue below it ran on a frame nobody had
+    /// checked. The signals here are otherwise a textbook live face, so only
+    /// the missing ceiling can move the verdict.
+    #[test]
+    fn an_unmeasurable_ir_format_is_refused_on_every_credential_releasing_path() {
+        let gate = LivenessGate::new();
+        let mut s = live_signals();
+        s.ir_ceiling_known = false;
+        s.ir_saturated_frac = None;
+
+        for (path, (verdict, cues, reason)) in [
+            ("cross-spectrum", gate.evaluate(&s)),
+            ("ir-only", gate.evaluate_ir_only(&s)),
+        ] {
+            assert_eq!(
+                verdict,
+                Verdict::Uncertain,
+                "{path}: an unread frame is not a passed frame"
+            );
+            assert!(
+                !cues.ir_exposure_measured,
+                "{path}: the corpus must record that nothing was measured"
+            );
+            assert!(
+                !cues.ir_exposure_ok,
+                "{path}: an unmeasured exposure is not a clean one"
+            );
+            // The wording carries two jobs: it must not tell the user to move,
+            // which cannot help, and its prefix is what keeps the refusal out
+            // of the presence-retryable set in irlume-auth.
+            assert!(
+                reason.starts_with("IR exposure unmeasurable"),
+                "{path}: prefix is pinned by irlume-auth's liveness_deny_kind: {reason}"
+            );
+            assert!(
+                !reason.contains("move back"),
+                "{path}: moving cannot repair a format with no ceiling: {reason}"
+            );
+        }
+    }
+
+    /// The same signals with a measurable ceiling stay Live, so the refusal
+    /// above is attributable to the missing ceiling and nothing else.
+    #[test]
+    fn a_measurable_ceiling_still_passes_a_live_face() {
+        let gate = LivenessGate::new();
+        let s = live_signals();
+        assert!(s.ir_ceiling_known);
+        let (verdict, cues, _) = gate.evaluate(&s);
+        assert_eq!(verdict, Verdict::Live);
+        assert!(cues.ir_exposure_measured && cues.ir_exposure_ok);
     }
 
     #[test]

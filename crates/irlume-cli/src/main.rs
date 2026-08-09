@@ -2553,8 +2553,11 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             rgb_faces.len(),
             rgb_top
         );
-        // IR
-        let ir = irlume_camera::capture_ir(ir_dev)?;
+        // IR. Taken with stats rather than bare, because the exposure gate
+        // needs the negotiated format's ceiling and `capture_ir` is literally
+        // `capture_ir_with_stats(..)?.0`, so the burst already happened and the
+        // plain call was only throwing the answer away (#358 review).
+        let (ir, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
         let (mn, mx, sum) = ir.data.iter().fold((255u8, 0u8, 0u64), |(mn, mx, s), &p| {
             (mn.min(p), mx.max(p), s + p as u64)
         });
@@ -2608,10 +2611,28 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             face_frac: ir_top_face
                 .map(|f| irlume_auth::bbox_width_frac(&f.bbox, ir.width))
                 .unwrap_or(0.0),
-            // Dev gate probe: a single frame with no burst stats, so the
-            // negotiated format's ceiling is not available here and the
-            // reading is honestly absent rather than guessed at 255.
-            ir_saturated_frac: None,
+            // Measured the same way the auth path and `padcapture` measure it,
+            // off the same burst stats, so this probe judges the frame instead
+            // of refusing it.
+            //
+            // Hardcoding `None`/`false` here was wrong twice over: the ceiling
+            // is a property of the negotiated format, not of the burst, and the
+            // burst existed anyway. It made `evaluate` return at the exposure
+            // gate before `ir_reflectance_ok`, `center_edge_ratio_ok` and
+            // `glint_present` were ever assigned, so the cue line printed three
+            // constants and the probe told the operator that a GREY camera
+            // whose ceiling is 255 defines no ceiling (#358 review).
+            //
+            // Raw frame, not the subtracted one: ambient subtraction moves a
+            // railed 255 to 254 and hides the clipping this measures.
+            ir_saturated_frac: irlume_auth::saturated_frac_of(
+                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+                ir.width,
+                ir.height,
+                ir_top_face.map(|f| &f.bbox),
+                ir_stats.white_level,
+            ),
+            ir_ceiling_known: ir_stats.white_level.is_some(),
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,

@@ -46,6 +46,28 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- **The IR exposure gate was off, not lenient, on every IR camera that is not
+  8-bit grey.** `exposure_refusal` read "could not measure" as "clean", so on a
+  node negotiating `Y16`/`Y10`/`Y12`/`NV12`/`YUYV` the #237 gate never ran and
+  every liveness cue below it judged a frame nobody had checked.
+  `clipping_white_level` answers `None` for those formats, and `is_none_or`
+  turned that into a pass. The gate now states its own precondition,
+  `Signals::ir_ceiling_known`, defaulting to false, and a format that names no
+  ceiling is refused rather than passed: a gate that could not run is not a
+  gate that passed.
+
+  The refusal is not presence-retryable on either evaluator. It is a property
+  of the camera, identical on every frame, so retrying would spend the whole
+  grace window reaching the same answer while advising something that cannot
+  help; the message deliberately does not say "move back".
+
+  Blast radius, measured: `IR_CANDIDATES` tries `GREY`/`Y8`/`Y800` first, so any
+  module offering 8-bit grey is untouched. Every IR camera in the project's
+  record negotiates GREY, including both user-reported ones, and no camera
+  without a grey path has ever been reported. Such a camera can no longer
+  enroll or authenticate, and `docs/PLATFORMS.md` now says so instead of
+  listing it as untested.
+
 - **One socket request reached the keyring with an unscreened username.**
   The daemon screens the account name in every request against path
   traversal before it builds a `<user>.json` path, but the guard read a

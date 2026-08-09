@@ -3605,6 +3605,28 @@ pub fn store_capture_mode(
         &capture_mode_pair_key(&rgb_id, &ir_id),
         mode.as_str(),
     )
+    .map_err(|e| Error::Io(e.to_string()))?;
+    // A direct measurement supersedes an inference, so the auto-switch stamp
+    // must not outlive it. Nothing cleared it before, which made the one action
+    // doctor recommends unable to change what doctor reports: `camera-tune`
+    // measured the camera, agreed with the inference, stored `sequential`, and
+    // the report still said "switched automatically N days ago" forever, with
+    // the real measurement invisible. The only recourse was hand-editing
+    // /etc/irlume/cameras.conf (#100 review).
+    //
+    // Cleared AFTER the mode, deliberately. A crash between the two renames
+    // then leaves a measured verdict still wearing an inference stamp, which
+    // understates what irlume knows; the other order would leave the previous
+    // verdict claiming to be a measurement, which overstates it. Same rule the
+    // auto-switch writer follows in the opposite direction.
+    //
+    // An empty value is the clear: `read_kv` treats an empty value as absent,
+    // which is what `stored_capture_mode_origin` reads through.
+    irlume_common::config::write_kv(
+        "cameras.conf",
+        &capture_mode_origin_key(&rgb_id, &ir_id),
+        "",
+    )
     .map_err(|e| Error::Io(e.to_string()))
 }
 
@@ -5637,6 +5659,55 @@ mod tests {
             verify_pinned("/dev/null").is_err(),
             "a prefix must not satisfy the exact-path escape"
         );
+    }
+
+    /// Writing an empty value is what CLEARS the origin stamp, which is the
+    /// assumption `store_capture_mode` now rests on.
+    ///
+    /// It matters because nothing cleared the stamp before: `camera-tune`
+    /// wrote only the mode key, so a pairing that had been switched
+    /// automatically kept reporting "switched automatically N days ago" even
+    /// after the user ran the measurement doctor told them to run, and the
+    /// measurement itself never showed up in a support report. The only way
+    /// out was hand-editing /etc/irlume/cameras.conf (#100 review).
+    ///
+    /// `device_identity` reads sysfs, so `store_capture_mode` itself cannot run
+    /// against a synthetic pair here; what is pinned is the mechanism it uses.
+    #[test]
+    fn an_empty_value_clears_the_origin_stamp() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-origin-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _conf = EnvGuard::set("IRLUME_CONFIG_DIR", dir.to_str().unwrap());
+
+        let (rgb_id, ir_id) = ("046d:085e:abc", "046d:085e:def");
+        let mode_key = capture_mode_pair_key(rgb_id, ir_id);
+        let origin_key = capture_mode_origin_key(rgb_id, ir_id);
+
+        irlume_common::config::write_kv("cameras.conf", &mode_key, "sequential").unwrap();
+        irlume_common::config::write_kv("cameras.conf", &origin_key, "auto-switch 1786320000")
+            .unwrap();
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", &origin_key).as_deref(),
+            Some("auto-switch 1786320000"),
+            "precondition: the stamp is readable before it is cleared"
+        );
+
+        irlume_common::config::write_kv("cameras.conf", &origin_key, "").unwrap();
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", &origin_key),
+            None,
+            "an empty value must read as absent, or the stamp outlives the measurement"
+        );
+        // ...and clearing the sidecar must not disturb the mode it sits beside.
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", &mode_key).as_deref(),
+            Some("sequential"),
+            "clearing the provenance must not change which mode is in force"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

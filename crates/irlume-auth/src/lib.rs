@@ -757,12 +757,6 @@ fn sequential_capture_selected(rgb_dev: &str, ir_dev: &str) -> (bool, &'static s
 /// (ASUS) to 1.3 s (NexiGo) of capture latency, and only until a measured
 /// verdict is stored; enrollment now probes an unmeasured pair, so most
 /// installs leave this arm at their first enrollment (#340).
-/// The `mode_source` string [`capture_mode_decision`] returns when the operator
-/// set the env var. Named once so the guard that refuses to LEARN from an
-/// operator-forced mode binds to the same spelling that produces it, instead of
-/// two string literals that a rename would silently separate.
-const ENV_CAPTURE_MODE_SOURCE: &str = "IRLUME_SEQUENTIAL_CAPTURE";
-
 fn capture_mode_decision(
     env: Option<&str>,
     stored: Option<irlume_camera::CaptureMode>,
@@ -775,6 +769,12 @@ fn capture_mode_decision(
         },
     }
 }
+
+/// The `mode_source` string [`capture_mode_decision`] returns when the operator
+/// set the env var. Named once so the guard that refuses to LEARN from an
+/// operator-forced mode binds to the same spelling that produces it, instead of
+/// two string literals that a rename would silently separate.
+const ENV_CAPTURE_MODE_SOURCE: &str = "IRLUME_SEQUENTIAL_CAPTURE";
 
 #[cfg(test)]
 mod capture_mode_decision_tests {

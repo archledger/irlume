@@ -2502,27 +2502,34 @@ impl IrSession<'_> {
                     if debug_ir {
                         // Reads the same ceiling the gate-frame selection above
                         // used, so the debug percentage and the decision cannot
-                        // disagree. `unwrap_or(u8::MAX)` only affects a format
-                        // that names no ceiling, where this line is the sole
-                        // consumer and 255 is the most conservative reading
-                        // available (#394).
-                        let clipped = ir_probe::saturated_fraction(
-                            &frames[best_i],
-                            white_level.unwrap_or(u8::MAX),
-                        );
+                        // disagree.
+                        //
+                        // `None` prints no percentage at all rather than
+                        // substituting 255. Defaulting was the wrong instinct
+                        // twice over: the count is `p >= white`, so 255 passes
+                        // the FEWEST pixels and under-reports, which on a
+                        // diagnostic means failing to warn; and a format that
+                        // names no ceiling has no clipping figure to report, so
+                        // printing one states a measurement nobody took. Same
+                        // rule `eye_glint_of` and `saturated_frac_of` follow
+                        // next door (#394).
+                        let clipped =
+                            white_level.map(|w| ir_probe::saturated_fraction(&frames[best_i], w));
                         let action = if sub_mean >= SUBTRACT_MIN_RESULT {
                             "applied"
                         } else {
                             "reverted (result too dark; face would vanish)"
                         };
+                        let clip_note = match clipped {
+                            Some(c) if c > ir_metadata::CLIPPED_FRAC_MAX => format!(
+                                "; lit clipped {:.1}% (blown exposure; subtracted frame unreliable)",
+                                c * 100.0
+                            ),
+                            Some(c) => format!("; lit clipped {:.1}%", c * 100.0),
+                            None => String::new(),
+                        };
                         eprintln!(
-                        "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}; lit clipped {:.1}%{}",
-                        clipped * 100.0,
-                        if clipped > ir_metadata::CLIPPED_FRAC_MAX {
-                            " (blown exposure; subtracted frame unreliable)"
-                        } else {
-                            ""
-                        }
+                        "[ir] ambient-subtract {action}: lit {best_i} ({lit_mean:.0}) - ambient {ai} ({amb_mean:.0}) => mean {sub_mean:.0}{clip_note}"
                     );
                     }
                 } else if debug_ir {
@@ -2702,6 +2709,17 @@ pub mod ir_probe {
     /// `>=` rather than `==` for the same reason the bbox instrument uses it: a
     /// sample above nominal white is out-of-range excursion, which is still not
     /// a pixel carrying a usable emitter return.
+    ///
+    /// KILL CONDITION for the first limited-range module anyone finds. At a 235
+    /// ceiling `>=` also counts 236..=255, which BT.601/709 calls legal
+    /// excursion rather than saturation, so this governs a strictly larger
+    /// pixel population than the one `CLIPPED_FRAC_MAX` (0.05) was fitted on:
+    /// #221's captures were taken against a 255 ceiling, where 236..=254 was
+    /// ordinary signal counting for nothing. If a healthy frame from such a
+    /// module puts more than 5% of its pixels above 235, `best_gate_frame`
+    /// takes its `least` branch on every burst. Dump the per-frame fractions
+    /// from a real limited-range device before trusting 0.05 there; do not
+    /// assume the constant transfers.
     pub fn saturated_fraction(data: &[u8], white: u8) -> f64 {
         if data.is_empty() {
             return 0.0;

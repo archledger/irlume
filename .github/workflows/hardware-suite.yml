@@ -166,7 +166,7 @@ jobs:
           # Root is also the production context: irlumed drives the emitter as
           # root.
           if ! sudo -n true 2>/dev/null; then
-            echo "::error::passwordless sudo is required to drive the emitter here (#384)"
+            echo "::error::this runner cannot take the emitter lock, so the emitter check cannot run. It is /run/lock/irlume-emitter-*.lock, created 0640 root:root by the daemon under UMask=0027, and this job runs as an unprivileged service account. Either give that account passwordless sudo for the burst, or make the lock reachable by the group that can already drive the camera (/dev/video* is root:video). Tracked on #392; failing rather than passing, because a check that cannot run has not passed"
             exit 1
           fi
           sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"

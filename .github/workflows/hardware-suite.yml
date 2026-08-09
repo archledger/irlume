@@ -140,7 +140,40 @@ jobs:
           echo "IR node: $ir"
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT
-          cargo run -q -p irlume-camera --example burst_dump -- "$out" "$ir" 6
+          # Run the burst as ROOT when we can. irlume guards its emitter
+          # bookkeeping with a lock in /run/lock, and the daemon creates that
+          # file under `UMask=0027`, so it lands 0640 root:root. The runner
+          # account cannot open it, and irlume then REFUSES to write the
+          # emitter for the rest of the process, saying so on stderr.
+          #
+          # That refusal is why this step needs to be explicit about privilege.
+          # The check below asserts the emitter strobes, and an unprivileged
+          # run measures whatever state the emitter was left in by the last
+          # root process rather than anything irlume did. It passed at a spread
+          # of 17.9 on 2026-08-08 with irlume's emitter control disabled
+          # throughout (#384). Root is also the production context: irlumed
+          # runs as root, so this exercises the path users actually get.
+          burst="${CARGO_TARGET_DIR:-target}/debug/examples/burst_dump"
+          cargo build -q -p irlume-camera --example burst_dump
+          if [ ! -x "$burst" ]; then
+            echo "::error::burst_dump not built at $burst"
+            exit 1
+          fi
+          err="$(mktemp)"
+          if sudo -n true 2>/dev/null; then
+            sudo -n "$burst" "$out" "$ir" 6 2>"$err"
+          else
+            echo "::warning::no passwordless sudo; running the burst unprivileged"
+            "$burst" "$out" "$ir" 6 2>"$err"
+          fi
+          cat "$err"
+          # "Could not manage the emitter" must not read as "the emitter is
+          # fine". Same rule as the node parse above and as #227: a check that
+          # could not run is not a check that passed.
+          if grep -q "will not write to this camera.s emitter" "$err"; then
+            echo "::error::irlume could not take the emitter lock, so it never drove the emitter. Any spread below is the emitter's leftover state, not evidence that irlume can light it (#384)"
+            exit 1
+          fi
           frames=$(find "$out" -name "frame*.pgm" | wc -l)
           echo "captured $frames frames"
           test "$frames" -ge 4

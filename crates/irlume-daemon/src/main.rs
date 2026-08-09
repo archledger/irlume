@@ -34,6 +34,13 @@ use zeroize::Zeroize;
 /// Never taken inside `users::uid_for_name`/`name_for_uid` themselves. A test
 /// holding the write guard reaches those functions through production code,
 /// and a nested read acquisition would deadlock.
+///
+/// Nor inside a spawned `serve` thread, even though that is where the lookup
+/// runs. A waiting writer stops a new reader from entering, so a thread that
+/// asks for its own guard waits there while the client that spawned it is
+/// already counting down a socket deadline. The test thread takes the guard
+/// before the spawn and joins afterwards, which covers the same work without
+/// spending the deadline on it.
 #[cfg(test)]
 pub(crate) mod test_support {
     static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
@@ -4713,9 +4720,47 @@ mod tests {
             out
         }
 
+        /// True when an environment guard is acquired INSIDE a `thread::spawn`
+        /// closure instead of on the test thread before it.
+        ///
+        /// Takes text already run through [`structural`], so the braces it
+        /// matches are real code and not the ones inside the JSON request
+        /// literals these tests write down the socket.
+        fn guard_taken_inside_spawn(structure: &str) -> bool {
+            let bytes = structure.as_bytes();
+            let mut from = 0usize;
+            while let Some(rel) = structure[from..].find("thread::spawn") {
+                let spawn = from + rel;
+                from = spawn + "thread::spawn".len();
+                let Some(open) = structure[spawn..].find('{').map(|o| spawn + o) else {
+                    break;
+                };
+                let (mut depth, mut end) = (0i32, open);
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                let closure = &structure[open..end.min(bytes.len())];
+                if closure.contains("env_read()") || closure.contains("passwd_lock()") {
+                    return true;
+                }
+            }
+            false
+        }
+
         let mut offenders = Vec::new();
         let mut recursive = Vec::new();
         let mut undetached = Vec::new();
+        let mut late_guards = Vec::new();
         let mut per_file: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
         let mut scanned = 0usize;
@@ -4792,6 +4837,17 @@ mod tests {
                 {
                     undetached.push(format!("{file}:{name} (line {})", sig + 1));
                 }
+                // ...and a guard the spawned thread acquires for itself is a
+                // guard the client's deadline is already spending. Joined
+                // threads do not need it: the test body outlives them.
+                let structure = lines[sig..=end.min(lines.len() - 1)]
+                    .iter()
+                    .map(|l| structural(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !is_this_test && guard_taken_inside_spawn(&structure) {
+                    late_guards.push(format!("{file}:{name} (line {})", sig + 1));
+                }
             }
         }
         assert!(
@@ -4846,6 +4902,15 @@ mod tests {
              the race with the next test's `set_var`. Keep the JoinHandle, `drop` the client end \
              so the server reads EOF, and join it:\n{}",
             undetached.join("\n")
+        );
+        assert!(
+            late_guards.is_empty(),
+            "these tests acquire the environment guard on the spawned `serve` thread. `RwLock` \
+             refuses a new reader while a writer is waiting, so that thread queues behind the \
+             suite's `env_lock()` writers while the client is already counting down its read \
+             timeout: 7 of 20 runs of this suite failed that way. Take the guard on the test \
+             thread before the spawn; the join keeps it covering the thread:\n{}",
+            late_guards.join("\n")
         );
     }
 
@@ -5328,12 +5393,21 @@ mod tests {
         let a = std::sync::Arc::clone(&arbiter);
         // The engine has NOT been published yet: exactly the startup window.
         let ready = std::sync::atomic::AtomicBool::new(false);
+        // Taken here, on the test thread, BEFORE the spawn and before the
+        // deadline below starts running. `serve` reaches the passwd lookup on
+        // the spawned thread, but the guard does not have to be acquired there
+        // to cover it: the test joins that thread before returning, so the
+        // thread cannot outlive this binding.
+        //
+        // Acquiring it inside the thread instead is what made this test flaky.
+        // `RwLock` refuses a new reader while a writer is waiting, so the
+        // server thread queued behind the suite's `env_lock()` writers while
+        // the client below was already counting down its ten seconds. Measured
+        // on the merged form: 7 of 20 runs of the daemon suite timed out in
+        // `read_line`, this test and its sibling below sharing the failures.
+        // Acquired first, the same wait happens before the clock starts.
+        let _passwd = passwd_lock();
         let server = std::thread::spawn(move || {
-            // The passwd lookup this reaches runs HERE, on a thread that
-            // outlives the test body, so a guard in the test body cannot
-            // cover it. Shared, so these overlap rather than serialising
-            // the socket work (#380 review).
-            let _passwd = crate::test_support::env_read();
             serve(theirs, &a, &ready).unwrap();
         });
 
@@ -5481,10 +5555,10 @@ mod tests {
         let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
+        // Before the spawn, and held until the join: see the sibling test
+        // above for why the guard cannot be acquired on the server thread.
+        let _passwd = passwd_lock();
         let server = std::thread::spawn(move || {
-            // See the sibling spawn above: the passwd lookup happens on this
-            // thread, so the guard must live here and the test must join.
-            let _passwd = crate::test_support::env_read();
             serve(theirs, &a, &ready).unwrap();
         });
 
@@ -5527,6 +5601,17 @@ mod tests {
             )
             .unwrap();
 
+        // One guard for the whole test: the lookup in the request line below,
+        // and the one every spawned `serve` reaches through `pregate`. Shared,
+        // so the other reading tests still overlap this and only the writers
+        // wait. An EXCLUSIVE guard held this wide stalls every test that
+        // touches the environment, which took this suite from 17s to 131s.
+        //
+        // It is one guard rather than one per lookup because `RwLock` reads do
+        // not nest safely: a second `read()` on this thread deadlocks the
+        // moment a writer is already queued ahead of it.
+        let _passwd = passwd_lock();
+
         for (wire, check) in [
             (
                 "\"Ping\"\n".to_string(),
@@ -5536,19 +5621,6 @@ mod tests {
             (
                 // Own-uid query: authorized, answered from files, no engine.
                 format!("{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n", {
-                    // Shared, and held for the passwd lookup ALONE. The
-                    // socket work below waits on timeouts, and an EXCLUSIVE
-                    // guard across that stalls every other test touching the
-                    // environment: an earlier attempt took this suite from
-                    // 17s to 131s. A read guard cannot, because the other
-                    // readers overlap it.
-                    //
-                    // The narrow scope used to be the whole defect: it covered
-                    // this lookup, and then the spawned `serve` thread below
-                    // did the SAME lookup on the way to `pregate` with nothing
-                    // held at all. That thread now takes its own read guard and
-                    // is joined (#380 review).
-                    let _passwd = passwd_lock();
                     // SAFETY: getuid takes no arguments, reads only this process's own real
                     // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
@@ -5567,11 +5639,11 @@ mod tests {
             let a = std::sync::Arc::clone(&arbiter);
             // These cover the SERVING daemon; the not-ready path has its own test.
             let ready = std::sync::atomic::AtomicBool::new(true);
+            // `HasSealedPassword` classifies as `Class::Status`, so `serve`
+            // answers it on the spawned thread via `dispatch_status` ->
+            // `pregate` -> `getpwnam_r`. The guard taken above the loop covers
+            // that, because every iteration joins before the next begins.
             let server = std::thread::spawn(move || {
-                // `HasSealedPassword` classifies as `Class::Status`, so `serve`
-                // answers it on THIS thread via `dispatch_status` -> `pregate`
-                // -> `getpwnam_r`. The guard has to be here.
-                let _passwd = crate::test_support::env_read();
                 serve(theirs, &a, &ready).unwrap();
             });
             let mut line = String::new();
@@ -5863,10 +5935,11 @@ mod tests {
         let a = std::sync::Arc::clone(&arbiter);
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
+        // Before the spawn, and held until the join: see
+        // `a_request_needing_the_engine_is_refused_while_it_loads` for why the
+        // guard cannot be acquired on the server thread.
+        let _passwd = passwd_lock();
         let server = std::thread::spawn(move || {
-            // See the sibling spawn above: the passwd lookup happens on this
-            // thread, so the guard must live here and the test must join.
-            let _passwd = crate::test_support::env_read();
             serve(theirs, &a, &ready).unwrap();
         });
 

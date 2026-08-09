@@ -200,20 +200,28 @@ pub struct IrCaptureStats {
     /// decoded 255 means "the brightest pixel in this frame" and a dim frame
     /// full of them is ordinary.
     ///
-    /// NV12 and YUYV answer `None` for a different reason, and it is NOT that
-    /// the quantization is unknown. This comment used to say irlume does not
-    /// carry that field; it does. `IrCamera::open` stores `fmt.quantization`
-    /// and `clipping_white_level` already takes it, so their ceiling is
-    /// computable (limited range puts nominal white at 235, full range at 255).
+    /// NV12 and YUYV answer `None`, and the reason this comment used to give
+    /// was wrong. It said irlume does not carry the negotiated quantization.
+    /// irlume does: `IrCamera::open` stores `fmt.quantization` and
+    /// `clipping_white_level` already takes it.
     ///
-    /// The `None` is load-bearing somewhere else. `role_from_formats` calls any
-    /// node advertising either fourcc `Role::Rgb`, whatever else it advertises,
-    /// so no DISCOVERED pair ever reaches an IR decode with them. The ones that
-    /// do arrive by the `IRLUME_CAMERA_*` override, a saved pin, or the
-    /// `/dev/video2` fallback, and there this `None` is what makes
-    /// `exposure_refusal` refuse the frame. Answering a ceiling would delete
-    /// that refusal and hand cues fitted on an emitter-lit IR image a room-lit
-    /// colour frame (#385).
+    /// Carrying it is still not enough to compute their ceiling, which is the
+    /// correction the second draft of this comment needed.
+    /// `Quantization::Default` is not itself an effective range: V4L2 resolves
+    /// it with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`,
+    /// which needs the COLORSPACE, and `IrCamera` keeps only the quantization
+    /// out of the negotiated `Format`. A `Default` YUV stream therefore cannot
+    /// be told apart from a JPEG-colorspace one, and answering 235 for all of
+    /// them is wrong for the second while 255 is wrong for the first.
+    ///
+    /// The `None` is also load-bearing, which matters more than either.
+    /// `role_from_formats` calls any node advertising either fourcc
+    /// `Role::Rgb`, whatever else it advertises, so no DISCOVERED pair ever
+    /// reaches an IR decode with them. The ones that do arrive by the
+    /// `IRLUME_CAMERA_*` override, a saved pin, or the `/dev/video2` fallback,
+    /// and there this `None` is what makes `exposure_refusal` refuse. Do not
+    /// add a ceiling here without first adding something that guarantees the
+    /// selected node is an emitter-lit IR source (#385).
     pub white_level: Option<u8>,
     /// The gate frame's RAW pixels, present only when the returned frame is no
     /// longer them: ambient subtraction replaces the payload, and a caller
@@ -1939,18 +1947,26 @@ fn grey16_shift(buf: &[u8]) -> u32 {
 /// gate on every camera anyone actually has, which is the failure this exists
 /// to prevent. If a module ever reports limited range, the 235 arm covers it.
 ///
-/// That citation is a userspace tool's opinion, and the kernel's own format
-/// table disagrees with it: `V4L2_MAP_QUANTIZATION_DEFAULT` resolves `Default`
-/// to LIMITED for Y'CbCr unless the colorspace is JPEG, and `v4l2-ctl` prints
-/// GREY as full range only because its `is_rgb_or_hsv` fourcc switch ends in
-/// `default: return true` and GREY is not in the list. The committed corpora
-/// settle it by measurement rather than by either claim: across
+/// That citation is a userspace tool's opinion, and the kernel's own mapping
+/// disagrees with it: `V4L2_MAP_QUANTIZATION_DEFAULT` resolves `Default` to
+/// LIMITED for Y'CbCr unless the colorspace is JPEG, and `v4l2-ctl` prints GREY
+/// as full range only because its `is_rgb_or_hsv` fourcc switch ends in
+/// `default: return true` with GREY absent from the list. Neither settles how
+/// GREY should be classified, because the kernel does not class it explicitly.
+///
+/// The committed corpora carry the evidence this arm actually rests on, and it
+/// is per-device rather than universal. Across
 /// `docs/pad-results/2026-08-02-center-edge-corpus.jsonl` and
 /// `2026-08-04-occluder-gate.jsonl`, `ir_saturated_frac` is nonzero in 75 of
-/// the 129 records carrying it (59 of 103, peaking at 0.547, and 16 of 26),
-/// and those captures were measured against a 255 ceiling. Real GREY8 frames
-/// from the ASUS module do reach 255, so the stream is full range in fact,
-/// whatever the metadata says (#385).
+/// 129 non-null readings (59 of 103, peaking at 0.547, and 16 of 26), and those
+/// captures were evaluated against a 255 threshold, so decoded ASUS frames did
+/// contain samples equal to 255.
+///
+/// That supports the 255 policy for these modules. It does NOT establish a
+/// V4L2 rule for GREY in general: the corpora record no fourcc, colorspace,
+/// quantization or white level per row, and a decoded 255 is consistent with
+/// clipping or with metadata that does not describe what the device emits. A
+/// module reporting limited-range GREY still needs the 235 arm (#385).
 pub(crate) fn clipping_white_level(pix: IrPixel, quantization: Quantization) -> Option<u8> {
     match (pix, quantization) {
         (IrPixel::Grey8, Quantization::LimitedRange) => Some(235),
@@ -4471,11 +4487,12 @@ mod tests {
     /// "the sensor's full-scale sample" ONLY for the native 8-bit greys: the
     /// Y16 family is rescaled by a shift taken from the frame's own maximum.
     /// The YUV pair is a different case and this comment used to get it wrong:
-    /// irlume does carry their quantization, so their ceiling is computable,
-    /// and the `None` is there because no discovered pair reaches an IR decode
-    /// with those fourccs and the refusal it produces is what stops a colour
-    /// node in the IR slot (#385). Saying None keeps #221's corpus
-    /// interpretable either way.
+    /// irlume does carry their raw quantization, but resolving `Default` also
+    /// needs the colorspace, which `IrCamera` discards. The `None` is there
+    /// mainly because no discovered pair reaches an IR decode with those
+    /// fourccs, and the refusal it produces is what stops a colour node that
+    /// arrives in the IR slot some other way (#385). Saying None keeps #221's
+    /// corpus interpretable either way.
     #[test]
     fn only_native_8bit_grey_can_claim_a_clipping_ceiling() {
         for q in [

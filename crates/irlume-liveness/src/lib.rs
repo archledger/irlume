@@ -127,8 +127,9 @@ pub struct Signals {
     /// or `None` when the reading could not be taken: no IR face, the RGB-only
     /// path, or a negotiated format the camera crate declines to give a ceiling
     /// for (the Y16 family is rescaled per frame, so its 255 is the frame's own
-    /// maximum; the YUV pair is refused for a reason that is not about the
-    /// quantization being unknown, which irlume does carry, see
+    /// maximum; NV12 and YUYV are declined so that a colour stream placed in
+    /// the IR slot is refused rather than judged, and because resolving their
+    /// `Default` quantization needs a colorspace irlume does not retain, see
     /// `clipping_white_level` and #385). `None` is NOT zero clipping.
     ///
     /// GATED since #237, at [`IR_SATURATED_FRAC_MAX`]. Saturation compresses

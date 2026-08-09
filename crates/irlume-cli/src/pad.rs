@@ -127,10 +127,16 @@ fn capture_once(
         .as_ref()
         .map(|f| crate::center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
         .unwrap_or(0.0);
-    let ir_eye_glint = ir_top
-        .as_ref()
-        .map(|f| crate::eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-        .unwrap_or(0.0);
+    // Ceiling-aware, and on the RAW frame for the same reason the saturation
+    // fraction below uses it: a railed peak measured nothing, and subtraction
+    // would move it off the ceiling and hide that (#222).
+    let ir_eye_glint = irlume_auth::eye_glint_of(
+        ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+        ir.width,
+        ir.height,
+        ir_top.as_ref().map(|f| &f.landmarks),
+        ir_stats.white_level,
+    );
 
     let signals = Signals {
         rgb_face,
@@ -151,6 +157,13 @@ fn capture_once(
             ir_top.as_ref().map(|f| &f.bbox),
             ir_stats.white_level,
         ),
+        // Set from the SAME white level the fraction above is computed from.
+        // `Signals::default()` says false, the fail-safe answer for a struct
+        // nobody filled in, and `..Default::default()` below would silently
+        // apply it here: PAD capture would refuse every frame as unmeasurable
+        // on a camera that measures perfectly well, and produce none of the
+        // corpus rows this gate exists to be tuned from (#358 review).
+        ir_ceiling_known: ir_stats.white_level.is_some(),
         ..Default::default()
     };
     let gate = LivenessGate::new();
@@ -219,11 +232,26 @@ fn presentation_record(
         },
     );
     rec.insert("ir_exposure_ok".into(), cues.ir_exposure_ok.into());
+    // Recorded beside it so a row the gate never read is distinguishable from a
+    // row it read and found clean. Without this the corpus said "clean" for
+    // every frame on a camera whose format defines no ceiling, which is exactly
+    // the population any retune of IR_SATURATED_FRAC_MAX would be fitted on
+    // (#358).
+    rec.insert(
+        "ir_exposure_measured".into(),
+        cues.ir_exposure_measured.into(),
+    );
     rec.insert(
         "ir_center_edge_ratio".into(),
         crate::json_f32(s.ir_center_edge_ratio),
     );
-    rec.insert("ir_glint".into(), crate::json_f32(s.ir_eye_glint));
+    rec.insert(
+        "ir_glint".into(),
+        match s.ir_eye_glint {
+            Some(g) => crate::json_f32(g),
+            None => serde_json::Value::Null,
+        },
+    );
     let cross = match (s.rgb_face, s.ir_face) {
         (Some(r), Some(i)) => ((r.cx - i.cx).powi(2) + (r.cy - i.cy).powi(2)).sqrt(),
         _ => f32::NAN,
@@ -249,6 +277,7 @@ fn presentation_record(
         "ir_reflectance_ok": cues.ir_reflectance_ok,
         "center_edge_ratio_ok": cues.center_edge_ratio_ok,
         "glint_present": cues.glint_present,
+        "glint_readable": cues.glint_readable,
         "frontal_ok": cues.frontal_ok,
     });
     rec.insert("cues".into(), cues_json);
@@ -353,12 +382,14 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                 ""
             };
             println!(
-                "      -> {} | ir {} bri {:>5.1} c/e {:>5.2} glint {:>3.0} | {}{}",
+                "      -> {} | ir {} bri {:>5.1} c/e {:>5.2} glint {} | {}{}",
                 verdict_str(verdict),
                 if s.ir_face.is_some() { "✓" } else { "·" },
                 s.ir_face_brightness,
                 s.ir_center_edge_ratio,
-                s.ir_eye_glint,
+                s.ir_eye_glint
+                    .map(|g| format!("{g:>3.0}"))
+                    .unwrap_or_else(|| "n/a".into()),
                 reason,
                 flag,
             );
@@ -777,6 +808,10 @@ mod tests {
             "ir_brightness",
             "ir_saturated_frac",
             "ir_exposure_ok",
+            // Added with the field itself: this list IS the corpus schema, so a
+            // key missing from it can be deleted from the record with every
+            // assertion here still passing (#358 review).
+            "ir_exposure_measured",
             "ir_center_edge_ratio",
             "ir_glint",
             "cross_dist",

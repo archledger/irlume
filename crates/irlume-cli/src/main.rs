@@ -2553,8 +2553,11 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             rgb_faces.len(),
             rgb_top
         );
-        // IR
-        let ir = irlume_camera::capture_ir(ir_dev)?;
+        // IR. Taken with stats rather than bare, because the exposure gate
+        // needs the negotiated format's ceiling and `capture_ir` is literally
+        // `capture_ir_with_stats(..)?.0`, so the burst already happened and the
+        // plain call was only throwing the answer away (#358 review).
+        let (ir, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
         let (mn, mx, sum) = ir.data.iter().fold((255u8, 0u8, 0u64), |(mn, mx, s), &p| {
             (mn.min(p), mx.max(p), s + p as u64)
         });
@@ -2589,9 +2592,11 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let ir_center_edge_ratio = ir_top_face
             .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
             .unwrap_or(0.0);
-        let ir_eye_glint = ir_top_face
-            .map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks))
-            .unwrap_or(0.0);
+        // Single frame, no burst stats, so no white level is known: the
+        // `white: None` arm passes the peak through exactly as before, the same
+        // honesty this probe already applies to ir_saturated_frac below (#222).
+        let ir_eye_glint =
+            ir_top_face.map(|f| eye_glint(&ir.data, ir.width, ir.height, &f.landmarks));
         let rgb_top = rgb_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
@@ -2606,28 +2611,52 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             face_frac: ir_top_face
                 .map(|f| irlume_auth::bbox_width_frac(&f.bbox, ir.width))
                 .unwrap_or(0.0),
-            // Dev gate probe: a single frame with no burst stats, so the
-            // negotiated format's ceiling is not available here and the
-            // reading is honestly absent rather than guessed at 255.
-            ir_saturated_frac: None,
+            // Measured the same way the auth path and `padcapture` measure it,
+            // off the same burst stats, so this probe judges the frame instead
+            // of refusing it.
+            //
+            // Hardcoding `None`/`false` here was wrong twice over: the ceiling
+            // is a property of the negotiated format, not of the burst, and the
+            // burst existed anyway. It made `evaluate` return at the exposure
+            // gate before `ir_reflectance_ok`, `center_edge_ratio_ok` and
+            // `glint_present` were ever assigned, so the cue line printed three
+            // constants and the probe told the operator that a GREY camera
+            // whose ceiling is 255 defines no ceiling (#358 review).
+            //
+            // Raw frame, not the subtracted one: ambient subtraction moves a
+            // railed 255 to 254 and hides the clipping this measures.
+            ir_saturated_frac: irlume_auth::saturated_frac_of(
+                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+                ir.width,
+                ir.height,
+                ir_top_face.map(|f| &f.bbox),
+                ir_stats.white_level,
+            ),
+            ir_ceiling_known: ir_stats.white_level.is_some(),
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
         };
         let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&signals);
-        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {ir_eye_glint:.0}  face_frac {:.3}  clipped {}", signals.face_frac,
+        println!("[gate] IR face brightness {ir_face_brightness:.0}  center/edge {ir_center_edge_ratio:.2}  eye-glint {}  face_frac {:.3}  clipped {}",
+            signals
+                .ir_eye_glint
+                .map(|g| format!("{g:.0}"))
+                .unwrap_or_else(|| "n/a".into()),
+            signals.face_frac,
             signals
                 .ir_saturated_frac
                 .map(|f| format!("{:.1}%", f * 100.0))
                 .unwrap_or_else(|| "n/a".into()));
         println!(
-            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={}",
+            "[gate] cues: rgb={} ir={} aligned={} ir_reflective={} center_edge={} glint={} glint_readable={}",
             cues.face_in_rgb,
             cues.face_in_ir,
             cues.cross_spectrum_aligned,
             cues.ir_reflectance_ok,
             cues.center_edge_ratio_ok,
-            cues.glint_present
+            cues.glint_present,
+            cues.glint_readable
         );
         println!("[GATE] {verdict:?}: {reason}");
         Ok(())
@@ -4397,8 +4426,31 @@ fn doctor_run(
     // then silently falls to the password on every polkit prompt.
     // Same parse the engine gates on and the PAM module instructs from, so doctor
     // can never report a gesture the daemon would refuse.
-    let gesture_is_closure = irlume_common::config::consent_gesture_mode()
-        == irlume_common::config::ConsentGesture::Closure;
+    let gesture_mode = irlume_common::config::consent_gesture_mode();
+    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
+    // `Misconfigured` is not "some gesture other than closure". It permits
+    // NEITHER, so every face prompt falls back to the password, and comparing
+    // only against `Closure` reported that state as ordinary nod operation:
+    // a gate that can never pass, shown as healthy, on the surface whose whole
+    // job is to say what is wrong (#365 review). The parser has already told
+    // the operator on stderr; doctor is where they look afterwards.
+    //
+    // Reported as a human line and not as a new check id on purpose. The
+    // machine-API registry conformance test asserts BOTH directions (every id
+    // emitted has a row, and every row is emitted), so a conditionally-emitted
+    // id fails on every healthy machine. Giving it an always-emitted id is a
+    // public contract addition and belongs in its own change, not in a review
+    // fix.
+    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+        dout!(
+            report,
+            "[doctor] consent gesture: MISCONFIGURED. `consent_gesture` is set to a \
+             value irlume cannot read (expected `nod` or `closure`), so NO gesture is \
+             accepted and every face prompt for a polkit action or the keyring falls \
+             back to the password. Fix or remove the key in /etc/irlume/settings.conf, \
+             or unset IRLUME_CONSENT_GESTURE."
+        );
+    }
     let closure_calibrated = matches!(
         daemon_request(&irlume_common::Request::ListProfiles {
             user: user.clone(),

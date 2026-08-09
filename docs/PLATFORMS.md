@@ -96,6 +96,11 @@ PAM changes.
   was validated on a NixOS VM with camera passthrough (see
   [NIXOS.md](NIXOS.md)); a face login on a physical NixOS machine has not been
   reported.
-- Other IR cameras: any Windows Hello-capable module that exposes a V4L2 IR
-  node should work; only the two above are confirmed.
+- Other IR cameras: a module whose IR node offers an 8-bit grey format
+  (`GREY`, `Y8`, `Y800`) should work; only the two above are confirmed. A node
+  that offers **only** `Y16`/`Y10`/`Y12`/`NV12`/`YUYV` is refused rather than
+  untested: those formats name no sensor ceiling, so the IR exposure check
+  cannot run, and irlume refuses instead of judging a frame it never read
+  (#358). No such camera has been reported; every module in the record,
+  including the two user-reported ones, offers grey.
 - musl-based distros (Alpine): untested; the release binaries assume glibc.

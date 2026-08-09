@@ -1915,8 +1915,9 @@ impl Engine {
         let eyes_open = ir_top
             .as_ref()
             .map(|f| {
-                both_eyes_open(
-                    ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
+                eyes_open_from_capture(
+                    &ir.data,
+                    ir_stats.saturation_frame.as_deref(),
                     ir.width,
                     ir.height,
                     &f.landmarks,
@@ -3950,6 +3951,31 @@ const EYE_OPEN_PEAK_MIN: f32 = 200.0;
 /// subtracted frame stops reading as railed and this refusal would not fire;
 /// the callers of `eye_glint_of` and `saturated_frac_of` already pass
 /// `saturation_frame` for that reason (#238 review) and this one now does too.
+/// Which buffer the eyes-open gate measures, as a value a test can observe.
+///
+/// This exists because the ceiling refusal and the choice of frame are two
+/// independently necessary halves, and a test that calls [`both_eyes_open`]
+/// with an already-railed buffer proves only the first. Revert the selection to
+/// the returned frame and the fail-open comes straight back with every such
+/// test still green: ambient subtraction moves a railed 255 to 254, which is
+/// under the ceiling and over `EYE_OPEN_PEAK_MIN`, so both eyes report open
+/// (#397 review).
+///
+/// `saturation_frame` is the RAW gate frame, preserved by `capture_with_stats`
+/// precisely so a clipping test can see the samples that actually railed. It is
+/// `None` when nothing replaced the payload, and then the returned frame IS the
+/// raw one.
+fn eyes_open_from_capture(
+    returned: &[u8],
+    saturation_frame: Option<&[u8]>,
+    w: u32,
+    h: u32,
+    lm: &irlume_vision::Landmarks5,
+    white: Option<u8>,
+) -> bool {
+    both_eyes_open(saturation_frame.unwrap_or(returned), w, h, lm, white)
+}
+
 pub fn both_eyes_open(
     grey: &[u8],
     w: u32,
@@ -5940,6 +5966,41 @@ mod tests {
         // not deny the users the gate is supposed to admit.
         let (open, lm) = ir_frame_with_glints(true, true);
         assert!(both_eyes_open(&open, 64, 48, &lm, Some(255)));
+    }
+
+    /// The other half of #386, which the test above cannot see. Rejecting a
+    /// railed peak is worth nothing if the gate is handed the SUBTRACTED frame,
+    /// because subtraction moves every railed 255 to 254: under the ceiling and
+    /// over `EYE_OPEN_PEAK_MIN`, so both eyes report open again.
+    ///
+    /// The first assertion states that trap as a fact rather than describing
+    /// it, so the second one has something to be different from.
+    #[test]
+    fn the_eyes_open_gate_measures_the_raw_frame_not_the_subtracted_one() {
+        let (mut raw, lm) = ir_frame_with_glints(false, false);
+        for &(ex, ey) in &lm[0..2] {
+            let (cx, cy) = (ex as usize, ey as usize);
+            for dy in 0..3usize {
+                for dx in 0..3usize {
+                    raw[(cy + dy - 1) * 64 + (cx + dx - 1)] = 255;
+                }
+            }
+        }
+        // What ambient subtraction does to a railed sample.
+        let returned: Vec<u8> = raw.iter().map(|&p| p.saturating_sub(1)).collect();
+        assert!(
+            both_eyes_open(&returned, 64, 48, &lm, Some(255)),
+            "the subtracted frame alone reads open; this is the regression the \
+             selection exists to prevent"
+        );
+        assert!(
+            !eyes_open_from_capture(&returned, Some(&raw), 64, 48, &lm, Some(255)),
+            "the ceiling test must run against the preserved raw frame"
+        );
+        // With nothing preserved, the returned frame IS the raw one, so the
+        // fallback must not become a second way to skip the check.
+        let (open, lm2) = ir_frame_with_glints(true, true);
+        assert!(eyes_open_from_capture(&open, None, 64, 48, &lm2, Some(255)));
     }
 
     #[test]

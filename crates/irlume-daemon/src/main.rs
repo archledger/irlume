@@ -5313,6 +5313,13 @@ mod tests {
     /// to name the cause, because it reaches the user through PAM (#244).
     #[test]
     fn a_request_needing_the_engine_is_refused_while_it_loads() {
+        // Held by the PARENT across the spawn and the join, not by the child.
+        // A read guard already excludes every writer for as long as it is held,
+        // so the spawned `serve` is covered without acquiring anything itself.
+        // Guarding inside the child made it BLOCK on the lock while this test
+        // was already counting down its socket deadline, and under ASan a
+        // writer held long enough to turn that into WouldBlock (#380 follow-up).
+        let _passwd = passwd_lock();
         use std::io::{BufRead, BufReader, Write};
         let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
@@ -5329,11 +5336,6 @@ mod tests {
         // The engine has NOT been published yet: exactly the startup window.
         let ready = std::sync::atomic::AtomicBool::new(false);
         let server = std::thread::spawn(move || {
-            // The passwd lookup this reaches runs HERE, on a thread that
-            // outlives the test body, so a guard in the test body cannot
-            // cover it. Shared, so these overlap rather than serialising
-            // the socket work (#380 review).
-            let _passwd = crate::test_support::env_read();
             serve(theirs, &a, &ready).unwrap();
         });
 
@@ -5461,6 +5463,13 @@ mod tests {
 
     #[test]
     fn serve_routes_a_request_through_the_arbiter_and_answers_the_client() {
+        // Held by the PARENT across the spawn and the join, not by the child.
+        // A read guard already excludes every writer for as long as it is held,
+        // so the spawned `serve` is covered without acquiring anything itself.
+        // Guarding inside the child made it BLOCK on the lock while this test
+        // was already counting down its socket deadline, and under ASan a
+        // writer held long enough to turn that into WouldBlock (#380 follow-up).
+        let _passwd = passwd_lock();
         // The whole path a client sees, minus the engine: parse, queue, worker,
         // reply. A fake worker stands in for the camera so this stays a test of
         // the wiring rather than of inference.
@@ -5482,9 +5491,6 @@ mod tests {
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
         let server = std::thread::spawn(move || {
-            // See the sibling spawn above: the passwd lookup happens on this
-            // thread, so the guard must live here and the test must join.
-            let _passwd = crate::test_support::env_read();
             serve(theirs, &a, &ready).unwrap();
         });
 
@@ -5508,6 +5514,16 @@ mod tests {
     /// test only passed because a worker drained the queue, it would hang.
     #[test]
     fn a_status_request_answers_while_the_queue_is_wedged_and_workerless() {
+        // One read guard for the whole test, covering both the lookup that
+        // builds the request AND the spawned `serve` that repeats it on its way
+        // to `pregate`. Held by the parent, never by the child: a child that
+        // blocks on this lock stalls a client already counting down its socket
+        // deadline (#380 follow-up).
+        //
+        // Holding it across the socket work is affordable BECAUSE it is shared.
+        // The exclusive guard that took this suite from 17s to 131s is what the
+        // narrow scope was avoiding; readers overlap each other.
+        let _passwd = passwd_lock();
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
         // Wedge: an authentication sits queued forever (no worker exists).
         let (dead_reply, _keep) = std::sync::mpsc::channel();
@@ -5536,19 +5552,6 @@ mod tests {
             (
                 // Own-uid query: authorized, answered from files, no engine.
                 format!("{{\"HasSealedPassword\":{{\"user\":\"{}\"}}}}\n", {
-                    // Shared, and held for the passwd lookup ALONE. The
-                    // socket work below waits on timeouts, and an EXCLUSIVE
-                    // guard across that stalls every other test touching the
-                    // environment: an earlier attempt took this suite from
-                    // 17s to 131s. A read guard cannot, because the other
-                    // readers overlap it.
-                    //
-                    // The narrow scope used to be the whole defect: it covered
-                    // this lookup, and then the spawned `serve` thread below
-                    // did the SAME lookup on the way to `pregate` with nothing
-                    // held at all. That thread now takes its own read guard and
-                    // is joined (#380 review).
-                    let _passwd = passwd_lock();
                     // SAFETY: getuid takes no arguments, reads only this process's own real
                     // uid, and is specified as always succeeding.
                     users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into())
@@ -5568,10 +5571,6 @@ mod tests {
             // These cover the SERVING daemon; the not-ready path has its own test.
             let ready = std::sync::atomic::AtomicBool::new(true);
             let server = std::thread::spawn(move || {
-                // `HasSealedPassword` classifies as `Class::Status`, so `serve`
-                // answers it on THIS thread via `dispatch_status` -> `pregate`
-                // -> `getpwnam_r`. The guard has to be here.
-                let _passwd = crate::test_support::env_read();
                 serve(theirs, &a, &ready).unwrap();
             });
             let mut line = String::new();
@@ -5835,6 +5834,13 @@ mod tests {
 
     #[test]
     fn a_camera_request_is_refused_while_an_authentication_is_queued() {
+        // Held by the PARENT across the spawn and the join, not by the child.
+        // A read guard already excludes every writer for as long as it is held,
+        // so the spawned `serve` is covered without acquiring anything itself.
+        // Guarding inside the child made it BLOCK on the lock while this test
+        // was already counting down its socket deadline, and under ASan a
+        // writer held long enough to turn that into WouldBlock (#380 follow-up).
+        let _passwd = passwd_lock();
         // No worker: the refusal must be answered by the connection thread
         // itself, without the request ever reaching the camera. If this only
         // worked because a worker drained the queue, the test would hang here.
@@ -5864,9 +5870,6 @@ mod tests {
         // These cover the SERVING daemon; the not-ready path has its own test.
         let ready = std::sync::atomic::AtomicBool::new(true);
         let server = std::thread::spawn(move || {
-            // See the sibling spawn above: the passwd lookup happens on this
-            // thread, so the guard must live here and the test must join.
-            let _passwd = crate::test_support::env_read();
             serve(theirs, &a, &ready).unwrap();
         });
 

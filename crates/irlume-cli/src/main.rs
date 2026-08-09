@@ -4240,8 +4240,31 @@ fn doctor_run(
     // then silently falls to the password on every polkit prompt.
     // Same parse the engine gates on and the PAM module instructs from, so doctor
     // can never report a gesture the daemon would refuse.
-    let gesture_is_closure = irlume_common::config::consent_gesture_mode()
-        == irlume_common::config::ConsentGesture::Closure;
+    let gesture_mode = irlume_common::config::consent_gesture_mode();
+    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
+    // `Misconfigured` is not "some gesture other than closure". It permits
+    // NEITHER, so every face prompt falls back to the password, and comparing
+    // only against `Closure` reported that state as ordinary nod operation:
+    // a gate that can never pass, shown as healthy, on the surface whose whole
+    // job is to say what is wrong (#365 review). The parser has already told
+    // the operator on stderr; doctor is where they look afterwards.
+    //
+    // Reported as a human line and not as a new check id on purpose. The
+    // machine-API registry conformance test asserts BOTH directions (every id
+    // emitted has a row, and every row is emitted), so a conditionally-emitted
+    // id fails on every healthy machine. Giving it an always-emitted id is a
+    // public contract addition and belongs in its own change, not in a review
+    // fix.
+    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+        dout!(
+            report,
+            "[doctor] consent gesture: MISCONFIGURED. `consent_gesture` is set to a \
+             value irlume cannot read (expected `nod` or `closure`), so NO gesture is \
+             accepted and every face prompt for a polkit action or the keyring falls \
+             back to the password. Fix or remove the key in /etc/irlume/settings.conf, \
+             or unset IRLUME_CONSENT_GESTURE."
+        );
+    }
     let closure_calibrated = matches!(
         daemon_request(&irlume_common::Request::ListProfiles {
             user: user.clone(),

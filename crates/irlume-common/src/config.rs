@@ -277,8 +277,10 @@ impl ConsentGesture {
 /// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset accepts
 /// EITHER.
 ///
-/// An unrecognised spelling is REPORTED and then falls back to `Either` (#365).
-/// It used to fall back silently, which is the wrong direction twice over:
+/// An unrecognised spelling is REPORTED and returns
+/// [`ConsentGesture::Misconfigured`], which enables NEITHER gesture (#365).
+/// It used to fall back silently to `Either`, which is the wrong direction
+/// twice over:
 /// `Either` is the widest of the three, so an operator writing
 /// `consent_gesture=blink` to tighten the gate got a looser one, and
 /// `Either::instruction` then told them to nod, so the misconfiguration had no
@@ -299,9 +301,19 @@ fn consent_gesture_mode_reporting(mut out: impl std::io::Write) -> ConsentGestur
         "nod" => ConsentGesture::Nod,
         "closure" => ConsentGesture::Closure,
         other => {
+            // Says what actually happens. This line used to end "accepting
+            // either gesture", describing the fallback #365 removed, so an
+            // operator who typed `clousure` was told the gate had WIDENED at
+            // the moment it stopped accepting anything, and the one diagnostic
+            // this state has pointed away from the cause. The long run of
+            // spaces came from a line join written without a continuation, and
+            // rustfmt does not reflow string literals, so the fmt gate never
+            // saw it (#365 review).
             let _ = writeln!(
                 out,
-                "irlume: ignoring {source}={other:?} (expected nod or closure);                  accepting either gesture"
+                "irlume: ignoring {source}={other:?} (expected nod or closure); \
+                 NO consent gesture is accepted until this is fixed, so every \
+                 face prompt falls back to the password"
             );
             ConsentGesture::Misconfigured
         }
@@ -363,7 +375,7 @@ mod consent_gesture_tests {
     /// one, and `Either::instruction` then told them to nod, so nothing about
     /// the running system looked wrong (#365).
     #[test]
-    fn an_unrecognised_gesture_is_reported_and_falls_back_to_either() {
+    fn an_unrecognised_gesture_is_reported_and_enables_neither_gesture() {
         let _g = crate::testenv::lock();
         std::env::set_var("IRLUME_CONSENT_GESTURE", "blink");
         let mut out = Vec::new();
@@ -375,19 +387,29 @@ mod consent_gesture_tests {
             ConsentGesture::Misconfigured,
             "an unreadable value must not resolve to a gesture policy at all"
         );
-        // The point of the state: it enables NEITHER gesture, so it cannot be
-        // looser than what the operator asked for.
-        assert!(
-            !matches!(mode, ConsentGesture::Nod | ConsentGesture::Either),
-            "must not permit a nod"
-        );
-        assert!(
-            !matches!(mode, ConsentGesture::Closure | ConsentGesture::Either),
-            "must not permit a closure"
-        );
+
         let warned = String::from_utf8_lossy(&out);
         assert!(warned.contains("IRLUME_CONSENT_GESTURE"), "{warned}");
         assert!(warned.contains("blink"), "must name the value: {warned}");
+        // The message is the whole justification for this state: the variant
+        // doc rests on "it is loud: the gate stops passing and the warning says
+        // why". It used to end "accepting either gesture" and this test could
+        // not tell, because it only looked for the key and the value, both of
+        // which the wrong tail also satisfied (#365 review).
+        assert!(
+            !warned.contains("either"),
+            "the warning still describes the removed Either fallback: {warned}"
+        );
+        assert!(
+            warned.contains("NO consent gesture is accepted"),
+            "the warning must say the gate now accepts nothing: {warned}"
+        );
+        // Two assertions were dropped from here: `!matches!(mode, Nod|Either)`
+        // and its Closure twin. On a fieldless PartialEq enum they are entailed
+        // by the assert_eq! above, so they could not fail, and they read as
+        // coverage of the gate while testing only the parser. What the gate
+        // does with this value is pinned in irlume-auth by
+        // `misconfigured_enables_no_gesture`, which is where the decision is.
     }
 
     /// A recognised spelling is honoured in either case and says nothing.

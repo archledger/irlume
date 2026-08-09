@@ -522,6 +522,25 @@ fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
     }
 }
 
+/// Which gestures a consent mode permits: `(nod, closure)`.
+///
+/// Extracted so the decision can be tested. It is written as POSITIVE
+/// membership, never `!= Closure` / `!= Nod`: those read as YES for any state
+/// that is neither, so `Misconfigured` would enable BOTH gestures, which is the
+/// exact failure that state exists to prevent. A nod would then release the
+/// TPM-sealed keyring secret on a system whose operator asked for eye closure
+/// and mistyped it (#365).
+///
+/// This lived inline in `consent_gesture_inputs`, which needs an `Engine` and an
+/// `Enrollment` to call, so nothing in the workspace tested it and reverting the
+/// two lines left the whole suite green (#365 review).
+const fn gestures_permitted_by(mode: ConsentGesture) -> (bool, bool) {
+    (
+        matches!(mode, ConsentGesture::Nod | ConsentGesture::Either),
+        matches!(mode, ConsentGesture::Closure | ConsentGesture::Either),
+    )
+}
+
 /// Calibration-aware IR match result (see [`ir_match_in`]).
 struct IrMatch {
     best: f32,
@@ -2060,23 +2079,18 @@ impl Engine {
         enr: &irlume_core::storage::Enrollment,
     ) -> (bool, Option<irlume_liveness::ClosureCalibration>) {
         let mode = consent_gesture_mode();
-        // Positive membership, not `!= Closure` / `!= Nod`. Those read as YES
-        // for any state that is neither, so `Misconfigured` would have enabled
-        // BOTH gestures, which is the failure this state exists to prevent
-        // (#365).
-        let allow_nod = matches!(mode, ConsentGesture::Nod | ConsentGesture::Either);
-        let closure_cal = (matches!(mode, ConsentGesture::Closure | ConsentGesture::Either)
-            && self.mesh.is_some())
-        .then(|| {
-            enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
-                let cal = irlume_liveness::ClosureCalibration {
-                    ear_open,
-                    ear_closed,
-                };
-                cal.is_usable().then_some(cal)
+        let (allow_nod, closure_allowed) = gestures_permitted_by(mode);
+        let closure_cal = (closure_allowed && self.mesh.is_some())
+            .then(|| {
+                enr.closure_calibration.and_then(|(ear_open, ear_closed)| {
+                    let cal = irlume_liveness::ClosureCalibration {
+                        ear_open,
+                        ear_closed,
+                    };
+                    cal.is_usable().then_some(cal)
+                })
             })
-        })
-        .flatten();
+            .flatten();
         (allow_nod, closure_cal)
     }
 
@@ -4105,6 +4119,50 @@ mod tests {
     /// `IRLUME_STATE_DIR`, `IRLUME_METHOD_CONF`, ...) across this binary's
     /// parallel test threads. Engine tests share it via `super::tests`.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `Misconfigured` permits NO gesture, which is the entire reason the
+    /// variant exists.
+    ///
+    /// This had no test. The decision lived inline in `consent_gesture_inputs`,
+    /// which needs an `Engine` and an `Enrollment` to call, so restoring the old
+    /// `mode != ConsentGesture::Closure` left `cargo test --workspace` green
+    /// while a head nod alone released the TPM-sealed keyring password on a
+    /// system configured for eye closure by an operator who typed `clousure`
+    /// (#365 review).
+    #[test]
+    fn misconfigured_enables_no_gesture() {
+        use irlume_common::config::ConsentGesture;
+
+        assert_eq!(
+            gestures_permitted_by(ConsentGesture::Misconfigured),
+            (false, false),
+            "an unreadable setting must not permit a nod OR a closure"
+        );
+
+        // Every other mode is unchanged, so the fail-closed state cannot have
+        // been bought by breaking the working ones.
+        assert_eq!(gestures_permitted_by(ConsentGesture::Nod), (true, false));
+        assert_eq!(
+            gestures_permitted_by(ConsentGesture::Closure),
+            (false, true)
+        );
+        assert_eq!(gestures_permitted_by(ConsentGesture::Either), (true, true));
+
+        // The negative form this function must never be written in. `!= Closure`
+        // answers YES for Misconfigured, and that is the whole defect; asserting
+        // the two disagree pins the difference rather than the spelling.
+        let negative_form_would_allow_nod =
+            ConsentGesture::Misconfigured != ConsentGesture::Closure;
+        assert!(
+            negative_form_would_allow_nod,
+            "precondition: the negative form really does permit a nod here"
+        );
+        assert_ne!(
+            gestures_permitted_by(ConsentGesture::Misconfigured).0,
+            negative_form_would_allow_nod,
+            "the decision has been rewritten in the negative form the comment forbids"
+        );
+    }
 
     pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())

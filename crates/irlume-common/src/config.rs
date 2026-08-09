@@ -311,7 +311,8 @@ pub fn read_camera_pin() -> CameraPin {
     }
 }
 
-/// Publish the camera pin (all four keys) in ONE atomic rename.
+/// Publish the camera pin (all four keys) in ONE atomic rename, under the
+/// file's own lock.
 ///
 /// Replaces four chained [`write_kv`] calls, which published the pin four times
 /// and could leave `cameras.conf` holding one camera's RGB path with another's
@@ -319,8 +320,23 @@ pub fn read_camera_pin() -> CameraPin {
 /// `rgb_id`/`ir_id` clears a stale identity, exactly as the per-key writes did.
 /// The `capture_mode` keys in the same file are untouched: the write rewrites
 /// only the keys it is given.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+///
+/// The lock and the single rename fix DIFFERENT halves and both are needed
+/// (#365 and #374). `write_kv` rewrites the whole file from a snapshot it read,
+/// so an unlocked writer racing `store_capture_mode_if_absent`, which does take
+/// this lock, erased keys that writer had just written; the lock stops that.
+/// But `flock` is advisory and the readers in irlume-camera do not take it, so
+/// only publishing once, by rename, stops a reader observing a torn pair. A
+/// lock alone cannot make four renames one event, and one rename alone does not
+/// exclude the other locked writer.
+///
+/// Not nested: `write_kvs` takes no lock of its own, so this is the only
+/// acquisition on the path.
+///
+/// # Errors
+/// Propagates a failure to take the lock, and the failed write.
 pub fn write_camera_pin(rgb: &str, ir: &str, rgb_id: &str, ir_id: &str) -> std::io::Result<()> {
+    let _guard = lock_exclusive(CAMERAS_CONF)?;
     write_kvs(
         CAMERAS_CONF,
         &[
@@ -370,6 +386,16 @@ pub enum ConsentGesture {
     Closure,
     /// Accept either (the default): the user does whichever suits their position.
     Either,
+    /// The setting was present and unreadable. Enables NEITHER gesture (#365).
+    ///
+    /// Not a synonym for the default. `Nod` and `Closure` are incomparable
+    /// policies, so no valid choice is a safe fallback for a value the operator
+    /// typed and we could not parse: falling back to `Either` widened the gate
+    /// an operator was trying to narrow, and `clousure` for `closure` then
+    /// licensed a nod to release the sealed keyring secret. Enabling nothing is
+    /// the only answer that cannot be looser than what was asked for, and it is
+    /// loud: the gate stops passing and the warning says why.
+    Misconfigured,
 }
 
 impl ConsentGesture {
@@ -384,6 +410,14 @@ impl ConsentGesture {
     /// issue #101; this describes the gesture the engine can actually see.
     pub fn instruction(self, what: &str) -> String {
         match self {
+            // Deliberately not a gesture instruction: no gesture can satisfy
+            // this state, so telling the user to nod would be advising an act
+            // that cannot work. Name the setting instead, because the person
+            // who can fix it is the one who set it.
+            Self::Misconfigured => format!(
+                "cannot {what}: consent_gesture is set to a value irlume does not \
+                 recognise (expected nod or closure)"
+            ),
             Self::Nod => format!("keep nodding your head to {what}"),
             Self::Closure => {
                 format!("close your eyes for about a second, then open, to {what}")
@@ -406,20 +440,165 @@ impl ConsentGesture {
 }
 
 /// The configured consent-gesture mode: `consent_gesture=nod|closure` in
-/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset or any other
-/// value accepts EITHER.
+/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset accepts
+/// EITHER.
+///
+/// An unrecognised spelling is REPORTED and returns
+/// [`ConsentGesture::Misconfigured`], which enables NEITHER gesture (#365).
+/// It used to fall back silently to `Either`, which is the wrong direction
+/// twice over:
+/// `Either` is the widest of the three, so an operator writing
+/// `consent_gesture=blink` to tighten the gate got a looser one, and
+/// `Either::instruction` then told them to nod, so the misconfiguration had no
+/// visible symptom at all. Compare `credential_release_challenge` twenty lines
+/// up, which documents the opposite choice for its own key.
+///
+/// Adding a `ConsentGesture` variant breaks `instruction`, which is exhaustive,
+/// but would NOT break this parser, so a new mode would be unreachable while
+/// appearing configured. The warning is what surfaces that.
 pub fn consent_gesture_mode() -> ConsentGesture {
-    let parse = |v: &str| match v.trim().to_ascii_lowercase().as_str() {
+    consent_gesture_mode_reporting(std::io::stderr())
+}
+
+/// [`consent_gesture_mode`] with the warning stream injected, so a test can
+/// read what an operator would see rather than trusting that it was written.
+fn consent_gesture_mode_reporting(mut out: impl std::io::Write) -> ConsentGesture {
+    let mut parse = |v: &str, source: &str| match v.trim().to_ascii_lowercase().as_str() {
         "nod" => ConsentGesture::Nod,
         "closure" => ConsentGesture::Closure,
-        _ => ConsentGesture::Either,
+        other => {
+            // Says what actually happens. This line used to end "accepting
+            // either gesture", describing the fallback #365 removed, so an
+            // operator who typed `clousure` was told the gate had WIDENED at
+            // the moment it stopped accepting anything, and the one diagnostic
+            // this state has pointed away from the cause. The long run of
+            // spaces came from a line join written without a continuation, and
+            // rustfmt does not reflow string literals, so the fmt gate never
+            // saw it (#365 review).
+            let _ = writeln!(
+                out,
+                "irlume: ignoring {source}={other:?} (expected nod or closure); \
+                 NO consent gesture is accepted until this is fixed, so every \
+                 face prompt falls back to the password"
+            );
+            ConsentGesture::Misconfigured
+        }
     };
     if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
-        return parse(&v);
+        return parse(&v, "IRLUME_CONSENT_GESTURE");
     }
     read_kv("settings.conf", "consent_gesture")
-        .map(|v| parse(&v))
+        .map(|v| parse(&v, "consent_gesture"))
         .unwrap_or(ConsentGesture::Either)
+}
+
+#[cfg(test)]
+mod camera_pin_tests {
+    use super::{read_kv, write_camera_pin};
+
+    /// The pin's keys all land, and the write goes through the file's lock.
+    ///
+    /// Scoped deliberately: this checks that all four keys are published and
+    /// that the lock sidecar was opened, which is what distinguishes this from
+    /// four loose writes, since `store_capture_mode_if_absent` takes the same
+    /// lock and exclusion needs BOTH sides to take it.
+    ///
+    /// It does NOT prove mutual exclusion, one publication, or reader
+    /// coherence. The sidecar existing shows `OpenOptions::open` ran, not that
+    /// `flock` succeeded, and observing a concurrent reader seeing only the
+    /// complete old or complete new tuple needs a harness this repo does not
+    /// have (#365 review).
+    #[test]
+    fn the_camera_pin_lands_whole_and_takes_the_lock() {
+        let _g = crate::testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        write_camera_pin("/dev/video0", "/dev/video2", "rgbid", "irid").expect("pin writes");
+
+        let got = |k: &str| read_kv("cameras.conf", k);
+        assert_eq!(got("rgb").as_deref(), Some("/dev/video0"));
+        assert_eq!(got("ir").as_deref(), Some("/dev/video2"));
+        assert_eq!(got("rgb_id").as_deref(), Some("rgbid"));
+        assert_eq!(got("ir_id").as_deref(), Some("irid"));
+        assert!(
+            dir.join("cameras.conf.lock").exists(),
+            "the write must go through the same lock store_capture_mode_if_absent takes"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod consent_gesture_tests {
+    use super::{consent_gesture_mode_reporting, ConsentGesture};
+
+    /// An unrecognised spelling must SAY so. Silence is what made this a bug
+    /// worth filing: the operator asked for a narrower gate, got the widest
+    /// one, and `Either::instruction` then told them to nod, so nothing about
+    /// the running system looked wrong (#365).
+    #[test]
+    fn an_unrecognised_gesture_is_reported_and_enables_neither_gesture() {
+        let _g = crate::testenv::lock();
+        std::env::set_var("IRLUME_CONSENT_GESTURE", "blink");
+        let mut out = Vec::new();
+        let mode = consent_gesture_mode_reporting(&mut out);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        assert_eq!(
+            mode,
+            ConsentGesture::Misconfigured,
+            "an unreadable value must not resolve to a gesture policy at all"
+        );
+
+        let warned = String::from_utf8_lossy(&out);
+        assert!(warned.contains("IRLUME_CONSENT_GESTURE"), "{warned}");
+        assert!(warned.contains("blink"), "must name the value: {warned}");
+        // The message is the whole justification for this state: the variant
+        // doc rests on "it is loud: the gate stops passing and the warning says
+        // why". It used to end "accepting either gesture" and this test could
+        // not tell, because it only looked for the key and the value, both of
+        // which the wrong tail also satisfied (#365 review).
+        assert!(
+            !warned.contains("either"),
+            "the warning still describes the removed Either fallback: {warned}"
+        );
+        assert!(
+            warned.contains("NO consent gesture is accepted"),
+            "the warning must say the gate now accepts nothing: {warned}"
+        );
+        // Two assertions were dropped from here: `!matches!(mode, Nod|Either)`
+        // and its Closure twin. On a fieldless PartialEq enum they are entailed
+        // by the assert_eq! above, so they could not fail, and they read as
+        // coverage of the gate while testing only the parser. What the gate
+        // does with this value is pinned in irlume-auth by
+        // `misconfigured_enables_no_gesture`, which is where the decision is.
+    }
+
+    /// A recognised spelling is honoured in either case and says nothing.
+    #[test]
+    fn a_recognised_gesture_is_silent() {
+        let _g = crate::testenv::lock();
+        for (raw, want) in [
+            ("nod", ConsentGesture::Nod),
+            ("NOD", ConsentGesture::Nod),
+            (" closure ", ConsentGesture::Closure),
+        ] {
+            std::env::set_var("IRLUME_CONSENT_GESTURE", raw);
+            let mut out = Vec::new();
+            let mode = consent_gesture_mode_reporting(&mut out);
+            std::env::remove_var("IRLUME_CONSENT_GESTURE");
+            assert_eq!(mode, want, "{raw}");
+            assert!(
+                out.is_empty(),
+                "{raw} warned: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
 }
 
 /// The spellings that turn a boolean settings.conf key off.
@@ -886,14 +1065,16 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
 
-        // Unset, and any unrecognized value, accept EITHER.
+        // UNSET accepts either, which is the documented default. An unreadable
+        // value does NOT: it used to land here too, so `clousure` for `closure`
+        // silently widened a gate the operator was narrowing (#365).
         assert_eq!(consent_gesture_mode(), ConsentGesture::Either);
         for (v, want) in [
             ("nod", ConsentGesture::Nod),
             ("closure", ConsentGesture::Closure),
             ("CLOSURE", ConsentGesture::Closure),
             (" nod ", ConsentGesture::Nod),
-            ("wink", ConsentGesture::Either),
+            ("wink", ConsentGesture::Misconfigured),
         ] {
             write_kv("settings.conf", "consent_gesture", v).unwrap();
             assert_eq!(consent_gesture_mode(), want, "consent_gesture={v:?}");

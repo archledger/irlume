@@ -12,8 +12,16 @@ and warns at startup when a loaded model doesn't match (see ../SECURITY.md).
 The same hashes are pinned in `scripts/fetch-models.sh`, the Fedora spec, the
 Arch PKGBUILD, and `flake.nix`. To change a shipped model: upload the new file
 to a fresh `models-vN` release, regenerate `SHA256SUMS`
-(`cd models && sha256sum *.onnx > SHA256SUMS`), and update the hash in all four
-places above plus the `models-vN` reference.
+(`cd models && sha256sum *.onnx *.tflite > SHA256SUMS`), and update the hash in
+all four places above plus the `models-vN` reference.
+
+The `*.tflite` half of that glob is not decoration. `face_landmarks_detector.tflite`
+is the one weight COMMITTED to git rather than fetched, so it is the only model
+present in a tree that has not run `fetch-models.sh`. Two things depend on its
+digest being in `SHA256SUMS`: the daemon verifies the mesh at startup, and
+`strict_verify_refuses_a_tampered_model_and_accepts_a_shipped_one` uses it as
+the fixture proving `IRLUME_MODELS_STRICT=1` still ACCEPTS a manifest-matching
+model. Regenerating with `*.onnx` alone drops the line and breaks both.
 
 | File | Stage | Source | License | Notes |
 |---|---|---|---|---|

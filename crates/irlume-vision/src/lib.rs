@@ -2083,12 +2083,23 @@ mod model_tests {
     /// matching and face login breaks for everyone. #400 sat held across two
     /// sessions on exactly that question with nothing in CI able to answer it.
     ///
-    /// This is NOT a model-identity check. Substituted weights are already
-    /// caught by digest: `verify_models` refuses an unmanifested file, and the
-    /// recognizer's sha256 is the `embed:<sha256>` space tag that
-    /// `recognizer_space_matches` filters stored scans by. What has no check is
-    /// the same weights producing different numbers because the code around
-    /// them changed.
+    /// This is NOT a model-identity check. `verify_models` hashes the
+    /// recognizer at startup: under `IRLUME_MODELS_STRICT=1` an unmanifested
+    /// digest refuses the start, and without it the mismatch warns and carries
+    /// on. Either way that digest becomes the `embed:<sha256>` space tag
+    /// `recognizer_space_matches` filters stored scans by, so substituted
+    /// weights cannot be matched against templates from the old ones. What has
+    /// no check is the same weights producing different numbers because the
+    /// code around them changed.
+    ///
+    /// What it does NOT cover is the runtime it runs against. The required
+    /// lanes download the version hardcoded at `ci.yml:118`, while Nix, Fedora,
+    /// Debian and the PPA each pin their own copy and Arch takes the rolling
+    /// system package. Nothing makes those agree (#411), so a packaging lane
+    /// moving to a newer runtime does not turn this test red. It also runs on
+    /// hosted runners only: `hardware-checks.yml` selects two named test sets
+    /// rather than the workspace, and the nightly hardware suite runs on the
+    /// default branch, so no self-hosted machine executes this on a PR.
     ///
     /// The input is generated from source, so there is no fixture to be
     /// missing. The reference below was produced through this exact call,
@@ -2287,12 +2298,12 @@ mod model_tests {
         // default.
         assert!(
             drift <= PINNED_EMBEDDING_MAX_COSINE_DRIFT,
-            "the recognizer's embedding moved: 1-cos = {drift:e} against a limit of {:e}. \
+            "the recognizer's embedding moved: 1-cos = {drift:e} against a limit of \
+             {PINNED_EMBEDDING_MAX_COSINE_DRIFT:e}. \
              Stored templates are matched against embeddings from this model, so a real \
              shift breaks face login for every enrolled user. Do not widen this limit to \
              make the build green; find what changed (ort version, libonnxruntime version, \
-             session options) and decide whether enrollments must be rebuilt.",
-            PINNED_EMBEDDING_MAX_COSINE_DRIFT
+             session options) and decide whether enrollments must be rebuilt."
         );
     }
 }

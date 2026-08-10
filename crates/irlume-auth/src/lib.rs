@@ -3084,7 +3084,8 @@ impl Engine {
         &mut self,
         want: usize,
         pitch_neutral: Option<f32>,
-    ) -> irlume_common::Result<(Vec<CapturedScan>, CaptureShape)> {
+        observed: &mut CaptureShape,
+    ) -> irlume_common::Result<Vec<CapturedScan>> {
         // Hold the cameras open for the whole loop. This is the heaviest repeated
         // capture in the codebase (the budget below is ten assessments per wanted
         // scan), and every one of them otherwise re-opened, re-negotiated,
@@ -3148,6 +3149,7 @@ impl Engine {
                     pitch_neutral,
                     Some((&mut rs, &mut is)),
                     Some((sequential, mode_source)),
+                    observed,
                 );
             }
         }
@@ -3166,7 +3168,13 @@ impl Engine {
         // config flip mid-loop would otherwise change the one-shot capture
         // shape between scans, which on a starvation-prone camera turns some
         // scans into the failure the stored mode exists to avoid.
-        self.capture_scan_loop(want, pitch_neutral, None, Some((sequential, mode_source)))
+        self.capture_scan_loop(
+            want,
+            pitch_neutral,
+            None,
+            Some((sequential, mode_source)),
+            observed,
+        )
     }
 
     /// The enrolment capture loop, over held streams when `sessions` is given
@@ -3184,7 +3192,8 @@ impl Engine {
             &mut irlume_camera::IrSession<'_>,
         )>,
         capture_mode: Option<(bool, &'static str)>,
-    ) -> irlume_common::Result<(Vec<CapturedScan>, CaptureShape)> {
+        observed: &mut CaptureShape,
+    ) -> irlume_common::Result<Vec<CapturedScan>> {
         let mut out = Vec::new();
         // Read once, before the loop: `sessions` is borrowed per iteration but
         // never taken, so this is the whole loop's answer (#389).
@@ -3230,7 +3239,8 @@ impl Engine {
                 }
             }
         }
-        Ok((out, shape))
+        observed.include(shape);
+        Ok(out)
     }
 
     /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
@@ -3273,9 +3283,14 @@ impl Engine {
         // instead of ten. (First enroll: no neutral yet → capture_scans falls
         // back to the global default band; the scans' pitches become this
         // user's neutral for next time.)
-        let (probe_scans, probe_shape) = self.capture_scans(1, enr.pitch_neutral())?;
+        // ONE tally for the whole enrolment, handed to every capture loop it
+        // runs. The loops fold into it, so a second loop cannot replace what
+        // the first observed and the message cannot claim "on every attempt"
+        // about a subset of them.
+        let mut observed = CaptureShape::default();
+        let probe_scans = self.capture_scans(1, enr.pitch_neutral(), &mut observed)?;
         let probe = probe_scans.into_iter().next().ok_or_else(|| {
-            let advice = capture_advice(probe_shape);
+            let advice = capture_advice(observed);
             irlume_common::Error::Protocol(format!("no live scan captured; {advice}"))
         })?;
         let goal = match enroll_merge_target(
@@ -3304,17 +3319,11 @@ impl Engine {
             None => want,
         };
         let mut captured = vec![probe];
-        // The probe's own shape when the loop never ran again: a `goal` of 1 is
-        // already satisfied, and reporting the top-up's empty shape would say
-        // nothing was observed when one attempt was.
-        let mut shape = probe_shape;
         if goal > 1 {
-            let (more, more_shape) = self.capture_scans(goal - 1, enr.pitch_neutral())?;
-            captured.extend(more);
-            shape = more_shape;
+            captured.extend(self.capture_scans(goal - 1, enr.pitch_neutral(), &mut observed)?);
         }
         if captured.len() < goal {
-            let advice = capture_advice(shape);
+            let advice = capture_advice(observed);
             return Err(irlume_common::Error::Protocol(format!(
                 "only {} live scans (need {goal}); {advice}",
                 captured.len()
@@ -3485,8 +3494,9 @@ impl Engine {
             )));
         }
         let want = count.clamp(1, room);
-        let (captured, shape) = self.capture_scans(want, enr.pitch_neutral())?;
-        if let Some(why) = short_capture_refusal(captured.len(), want, shape) {
+        let mut observed = CaptureShape::default();
+        let captured = self.capture_scans(want, enr.pitch_neutral(), &mut observed)?;
+        if let Some(why) = short_capture_refusal(captured.len(), want, observed) {
             return Err(irlume_common::Error::Protocol(why));
         }
         // Anti-mixing: reject scans whose face belongs to a different profile.
@@ -3854,6 +3864,33 @@ struct CaptureShape {
     /// held path it is ALSO the shape a camera makes when streaming both
     /// sensors starves its RGB node. Nothing here separates the two.
     ir_only_attempts: usize,
+}
+
+impl CaptureShape {
+    /// Fold another loop's observations into this one.
+    ///
+    /// One enrolment can run the loop twice: a probe scan, then a top-up. The
+    /// message says "on every attempt", and every attempt means every attempt
+    /// of the ENROLMENT, so the counts sum. Replacing instead of folding let a
+    /// run whose probe captured an RGB face, which it must have to reach the
+    /// top-up at all, still report that the colour sensor found none.
+    ///
+    /// `held_sessions` ANDs because the diagnosis needs every contributing loop
+    /// to have suppressed the self-heal. One fallback loop in the operation
+    /// means the standalone RGB recapture ran for those attempts and found no
+    /// face with the sensor to itself, which argues against starvation.
+    fn include(&mut self, other: Self) {
+        if self.attempts == 0 {
+            // Nothing observed yet. ANDing `held_sessions` against a default
+            // that has never seen a loop would zero it on the first fold and
+            // the hint could never fire.
+            *self = other;
+            return;
+        }
+        self.held_sessions &= other.held_sessions;
+        self.attempts += other.attempts;
+        self.ir_only_attempts += other.ir_only_attempts;
+    }
 }
 
 /// Fold one attempt's outcome into the running shape.
@@ -5076,6 +5113,57 @@ mod tests {
             (shape.attempts, shape.ir_only_attempts),
             (4, 1),
             "an attempt that saw no face anywhere is an ordinary miss, not starvation"
+        );
+    }
+
+    #[test]
+    fn folding_two_loops_keeps_the_probes_successful_attempt() {
+        // The defect this closes: an enrolment reaches its top-up only by
+        // capturing a probe scan, and a scan is only captured when
+        // `a.embedding` was Some, so RGB demonstrably worked at least once.
+        // Replacing the tally with the top-up's let the message still say the
+        // colour sensor found a face on no attempt.
+        let probe = CaptureShape {
+            held_sessions: true,
+            attempts: 1,
+            ir_only_attempts: 0, // the attempt that produced the scan
+        };
+        let top_up = CaptureShape {
+            held_sessions: true,
+            attempts: 90,
+            ir_only_attempts: 90,
+        };
+        let mut folded = probe;
+        folded.include(top_up);
+        assert_eq!((folded.attempts, folded.ir_only_attempts), (91, 90));
+        assert!(
+            concurrent_starvation_hint(folded).is_none(),
+            "one attempt found an RGB face, so 'on every attempt' would be false"
+        );
+
+        // Two loops that BOTH only ever saw IR still qualify.
+        let mut both_starved = top_up;
+        both_starved.include(top_up);
+        assert!(concurrent_starvation_hint(both_starved).is_some());
+
+        // Folding into a fresh tally ADOPTS it. Every enrolment starts from a
+        // default, and ANDing `held_sessions` against one that has never seen a
+        // loop would zero it on the first fold, so the hint could never fire.
+        let mut fresh = CaptureShape::default();
+        fresh.include(top_up);
+        assert_eq!(fresh, top_up);
+        assert!(concurrent_starvation_hint(fresh).is_some());
+
+        // A single fallback loop anywhere in the operation disqualifies it: the
+        // self-heal recaptured RGB standalone for those attempts.
+        let mut mixed = top_up;
+        mixed.include(CaptureShape {
+            held_sessions: false,
+            ..top_up
+        });
+        assert!(
+            concurrent_starvation_hint(mixed).is_none(),
+            "held_sessions must AND across the loops, not stay true from the first"
         );
     }
 

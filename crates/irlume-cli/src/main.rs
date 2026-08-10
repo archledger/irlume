@@ -1129,7 +1129,8 @@ fn usage_profiles() -> std::process::ExitCode {
         delete --profile P [--scan S]           delete a profile or a scan\n  \
         forget-model <model>                    remove one recognizer's scans from every\n  \
                                                 profile (shipped | a catalog name | embed:<sha256>)\n  \
-        eyes-open <on|off>                      require eyes open to unlock\n  \
+        eyes-open off                           turn OFF the eyes-open check\n  \
+        \x20                                       (it cannot be turned on; see issue #386)\n  \
         challenge <on|off>                      opt-in passive blink liveness"
     );
     std::process::ExitCode::from(2)

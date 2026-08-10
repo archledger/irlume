@@ -400,7 +400,7 @@ fn profiles_usage_errors_exit_2() {
         "rename --profile P [--scan S] --name N",
         "delete --profile P [--scan S]",
         "forget-model <model>",
-        "eyes-open <on|off>",
+        "eyes-open off",
         "challenge <on|off>",
     ] {
         assert!(
@@ -408,6 +408,17 @@ fn profiles_usage_errors_exit_2() {
             "profiles usage must name `{frag}`: {err}"
         );
     }
+    // #386: the daemon refuses to turn this gate on, so the usage must not
+    // offer it. Whoever makes the gate work again changes this line
+    // deliberately, which is the point of pinning it.
+    assert!(
+        !err.contains("eyes-open <on|off>"),
+        "usage must not advertise an enable the daemon refuses: {err}"
+    );
+    assert!(
+        err.contains("#386"),
+        "usage must say where the refusal is recorded: {err}"
+    );
 }
 
 #[test]

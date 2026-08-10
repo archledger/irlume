@@ -2767,6 +2767,35 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
+    // Refuses to turn ON, and this is deliberate (#386). The gate cannot admit
+    // the user it exists for: replaying the committed blink corpus through the
+    // shipped `both_eyes_open`, 12 detected frames per state, bare-eyed with
+    // eyes genuinely OPEN reads open 1 time in 12 and with glasses 0 times in
+    // 12, so no eyewear or lighting state in the record leaves it usable.
+    //
+    // Refused rather than warned because there is no configuration that works:
+    // a warning implies a tradeoff the measurement does not offer. Turning it
+    // OFF is always allowed, so an enrollment already carrying the flag is
+    // never trapped.
+    //
+    // Placed HERE, above the invalidation below, rather than in the match: this
+    // is a refusal, and the invariant in that comment is that a request about
+    // to be refused may not change state. Evicting the summary cache is a state
+    // change, and it is the one #349 exists to prevent.
+    //
+    // What would lift the refusal is a cue that survives a change of light or
+    // eyewear, which #386 records as unavailable: the peak cannot be retuned
+    // because the two distributions overlap behind glasses, and a per-user EAR
+    // threshold fails cross-session, the same subject's median OPEN reading
+    // landing inside another session's open/closed separation window.
+    if matches!(req, Request::SetRequireEyesOpen { on: true, .. }) {
+        return Response::Error(
+            "require-eyes-open cannot be enabled: it refuses the user it exists to admit \
+             (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12 with glasses). \
+             See issue #386; `irlume profiles eyes-open off` still works."
+                .into(),
+        );
+    }
     // AFTER the gate, BEFORE the mutation runs. After the gate because the
     // cache is state, and a request that is about to be refused may not
     // change state: an unprivileged peer could otherwise evict root's summary
@@ -3596,33 +3625,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             s.name = new_name.clone();
             Ok(format!("renamed scan to '{new_name}'"))
         }),
-        // Refuses to turn ON, and this is deliberate (#386). The gate cannot
-        // admit the user it exists for. Replaying the committed blink corpus
-        // through the shipped `both_eyes_open`, 12 detected frames per state:
-        // bare-eyed with eyes genuinely OPEN reads open 1 time in 12, and with
-        // glasses 0 times in 12, so there is no eyewear or lighting state in
-        // the record where enabling it leaves face authentication usable.
-        //
-        // Refused rather than warned because there is no configuration that
-        // works: a warning implies a tradeoff the measurement does not offer.
-        // Turning it OFF is always allowed, so an enrollment that already has
-        // it set is never trapped by this.
-        //
-        // What would lift the refusal is a cue that survives a change of light
-        // or eyewear, which #386 records as unavailable today: the peak cannot
-        // be retuned (the two distributions overlap behind glasses), and a
-        // per-user EAR threshold fails cross-session, the same subject's median
-        // OPEN reading landing inside the open/closed separation window of
-        // another session.
-        Request::SetRequireEyesOpen { user, on } if on => {
-            let _ = user;
-            Response::Error(
-                "require-eyes-open cannot be enabled: it refuses the user it exists to admit \
-                 (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12 with glasses). \
-                 See issue #386; `irlume profiles eyes-open off` still works."
-                    .into(),
-            )
-        }
         Request::SetRequireEyesOpen { user, on } => mutate_enrollment(&user, |enr| {
             enr.require_eyes_open = on;
             Ok(format!(
@@ -7590,6 +7592,53 @@ mod tests {
             Response::Ok(_) => {}
             other => panic!("unexpected response to a disable: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_refused_eyes_open_enable_does_not_evict_the_summary_cache() {
+        // The refusal sits ABOVE `invalidate_enrollment_summary` on purpose.
+        // The comment there states the invariant it protects: a request about
+        // to be refused may not change state, because an unprivileged peer
+        // could otherwise evict root's summary and charge root's next listing a
+        // storage load and its TPM work (#349). A refusal that runs after the
+        // invalidation keeps that cost while doing nothing.
+        let _g = env_lock();
+        let mut e = engine();
+        let root = peer(0);
+        clear_enrollment_summaries();
+        let has_summary = || {
+            enrollment_summaries()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("carol")
+        };
+        publish_enrollment_summary(
+            "carol",
+            EnrollmentSummary {
+                profiles: Vec::new(),
+                require_eyes_open: false,
+                require_challenge: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: false,
+            },
+        );
+        assert!(
+            has_summary(),
+            "the fixture must start with a published summary"
+        );
+        let _ = dispatch(
+            Request::SetRequireEyesOpen {
+                user: "carol".into(),
+                on: true,
+            },
+            &root,
+            &mut e,
+        );
+        assert!(
+            has_summary(),
+            "a refused enable must leave the published summary in place"
+        );
+        clear_enrollment_summaries();
     }
 
     #[test]

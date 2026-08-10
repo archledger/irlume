@@ -3367,6 +3367,17 @@ impl App {
             // Settings.
             (SC_SETTINGS, KeyCode::Enter) | (SC_SETTINGS, KeyCode::Char(' ')) => {
                 let on = !self.eyes_open;
+                // Turning it ON is refused by the daemon (#386), so do not fire
+                // a request known in advance to fail. The refusal still lives
+                // there, because that is the one choke point both this and the
+                // CLI go through; this only avoids offering the user an action
+                // whose only outcome is an error modal.
+                if on {
+                    self.set_error(
+                        "require-eyes-open cannot be enabled: it refuses the user it exists                          to admit (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12                          with glasses). See issue #386.",
+                    );
+                    return;
+                }
                 self.start_async(
                     "toggle require-eyes-open",
                     OpTag::Generic,
@@ -3988,7 +3999,7 @@ impl App {
                     None => "Wires face login into your greeter, lock screen and sudo.",
                 },
                 SC_SETTINGS => {
-                    "[enter] toggles the eyes-open check, [c] the blink challenge; other settings are root or read-only."
+                    "[enter] turns the eyes-open check OFF (it cannot be turned on, see #386), [c] the blink challenge; other settings are root or read-only."
                 }
                 SC_MODELS => {
                     "Measured model options; switching the recognizer means re-enrolling."
@@ -5910,7 +5921,7 @@ impl App {
                 ("s", "show status"),
             ],
             SC_SETTINGS => &[
-                ("enter", "eyes-open"),
+                ("enter", "eyes-open off"),
                 ("c", "blink"),
                 ("g", "keyring gesture"),
                 ("b", "biopolicy"),
@@ -8208,14 +8219,41 @@ mod tests {
     }
 
     #[test]
-    fn settings_enter_toggles_eyes_open_via_the_daemon() {
+    fn settings_enter_refuses_to_enable_eyes_open_and_sends_nothing() {
+        // #386: the daemon refuses to turn this gate on, so Enter from OFF must
+        // not fire a request whose only outcome is an error modal. The refusal
+        // still lives in the daemon, which is the choke point the CLI shares;
+        // this is about not offering the user a dead action.
         let _sock = dead_socket();
         let mut app = test_app();
         app.screen = SC_SETTINGS;
+        assert!(!app.eyes_open, "the fixture starts with the gate off");
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.op.is_none(),
+            "no request may be sent for an enable the daemon refuses"
+        );
+        let err = app.error.as_deref().unwrap_or_default();
+        assert!(err.contains("cannot be enabled"), "{err}");
+        assert!(
+            err.contains("#386"),
+            "the refusal must name the issue: {err}"
+        );
+    }
+
+    #[test]
+    fn settings_enter_still_turns_eyes_open_off_via_the_daemon() {
+        // The OFF direction is the one an enrollment already carrying the flag
+        // needs, so it must still reach the daemon.
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.eyes_open = true;
         app.on_key(KeyCode::Enter);
         assert_eq!(
             app.op.as_ref().map(|o| o.label.as_str()),
-            Some("toggle require-eyes-open")
+            Some("toggle require-eyes-open"),
+            "turning the gate OFF must still fire the request"
         );
         wait_op_done(&mut app);
         assert!(

@@ -6486,9 +6486,10 @@ mod tests {
     // Companion to the missing-model child test: strict mode must also refuse
     // a PRESENT model whose digest is not in the release manifest (tampering),
     // and must ACCEPT a shipped model that matches it. verify_models exits the
-    // process, so both run as re-exec'd children. Both halves assert
-    // unconditionally; the acceptance fixture is the committed mesh so that
-    // there is no environment where the accept direction goes unchecked.
+    // process, so both run as re-exec'd children. The refuse and the accept
+    // half both assert unconditionally, the acceptance fixture being the
+    // committed mesh so that no environment leaves the accept direction
+    // unchecked. A third check on the fetched weights is guarded and runs last.
     #[test]
     fn strict_verify_refuses_a_tampered_model_and_accepts_a_shipped_one() {
         if let Ok(path) = std::env::var("IRLUME_TEST_VERIFY_TAMPER_CHILD") {

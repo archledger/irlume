@@ -146,8 +146,21 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
             );
             if strict {
+                // Strict verification runs once in the startup thread. Only the
+                // recognizer's verified bytes are carried into the initial load;
+                // the detector, adapter, mesh and Blaze models are reopened by
+                // path, and a post-panic rebuild reopens every model path without
+                // repeating this manifest check (#346).
+                //
+                // A changed recognizer fails closed for identity matching: its
+                // full digest changes the `embed:<sha256>` space tag, so
+                // `recognizer_space_matches` excludes every stored scan from the
+                // old space. That argument does not cover the other artifacts.
                 eprintln!(
-                    "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models"
+                    "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models \
+                     (verification is a one-time startup path check; only the recognizer bytes \
+                     are carried from this check into the initial load, and a rebuild after a \
+                     worker panic reloads model paths without re-checking)"
                 );
                 std::process::exit(1);
             }
@@ -6473,7 +6486,10 @@ mod tests {
     // Companion to the missing-model child test: strict mode must also refuse
     // a PRESENT model whose digest is not in the release manifest (tampering),
     // and must ACCEPT a shipped model that matches it. verify_models exits the
-    // process, so both run as re-exec'd children.
+    // process, so both run as re-exec'd children. The refuse and the accept
+    // half both assert unconditionally, the acceptance fixture being the
+    // committed mesh so that no environment leaves the accept direction
+    // unchecked. A third check on the fetched weights is guarded and runs last.
     #[test]
     fn strict_verify_refuses_a_tampered_model_and_accepts_a_shipped_one() {
         if let Ok(path) = std::env::var("IRLUME_TEST_VERIFY_TAMPER_CHILD") {
@@ -6518,23 +6534,56 @@ mod tests {
             err.contains("refusing to start with unverified models"),
             "stderr: {err}"
         );
+        assert!(
+            err.contains(
+                "verification is a one-time startup path check; only the recognizer bytes"
+            ),
+            "the refusal must not claim every checked path stays verified through load: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Shipped: a real release model from the repo matches its manifest
-        // digest and must start even under strict.
-        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../models/blaze_face_short_range.onnx");
-        if !shipped.exists() {
-            eprintln!("skipping known-model half: repo models/ not present");
-            return;
-        }
-        let out = run("IRLUME_TEST_VERIFY_KNOWN_CHILD", shipped.to_str().unwrap());
+        // Shipped: a model whose digest IS in the manifest must start under
+        // strict. The fixture is the mesh because it is the one weight
+        // COMMITTED to git; the four .onnx are ignored at `.gitignore:14` and
+        // fetched by `scripts/fetch-models.sh`, so an .onnx fixture is absent
+        // in any tree that has not run the fetch. `verify_models` matches on
+        // digest alone and never looks at the extension, so a .tflite exercises
+        // the same accept path a .onnx would.
+        //
+        // No exists() guard on purpose. This half used to return early when the
+        // fetched .onnx was missing, which reported the whole test as passed in
+        // a build where strict mode rejected every release model (#406).
+        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/face_landmarks_detector.tflite");
+        let out = run(
+            "IRLUME_TEST_VERIFY_KNOWN_CHILD",
+            committed.to_str().unwrap(),
+        );
         assert!(
             out.status.success(),
-            "strict mode must accept a manifest-matching model; stderr: {}",
+            "strict mode must accept a manifest-matching model. If {} is gone, it \
+             stopped being tracked in git and this test needs another committed \
+             fixture, not a skip; stderr: {}",
+            committed.display(),
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(String::from_utf8_lossy(&out.stdout).contains("known-model-accepted"));
+
+        // The fetched weights get the same check when the fetch has run. Only
+        // this half can catch a download whose bytes the compiled-in manifest
+        // does not know, since the committed fixture never crosses the network.
+        // It is guarded, and it sits last so that skipping it cannot hide the
+        // unconditional assertion above.
+        let fetched = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/blaze_face_short_range.onnx");
+        if fetched.exists() {
+            let out = run("IRLUME_TEST_VERIFY_KNOWN_CHILD", fetched.to_str().unwrap());
+            assert!(
+                out.status.success(),
+                "strict mode must accept the fetched release model; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]

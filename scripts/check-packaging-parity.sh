@@ -229,7 +229,7 @@ ORT_PINNED_BY=(
 # one of those steps leaves the other two agreeing, so a uniqueness check would
 # report ok for a workflow that had silently stopped pinning a lane.
 declare -A ORT_PIN_COUNT=(
-  [.github/workflows/ci.yml]=3
+  [.github/workflows/ci.yml]=2
   [.github/workflows/asan.yml]=1
   [.github/workflows/install-matrix.yml]=1
   [flake.nix]=1

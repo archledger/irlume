@@ -2875,6 +2875,41 @@ impl Engine {
     ) -> irlume_common::Result<Outcome> {
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
+        // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
+        // the camera, decline so the PAM stack cascades to fingerprint/password.
+        if irlume_core::policy::method().face_disabled() {
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                "face disabled (fingerprint mode)",
+            ));
+        }
+        // Load the enrollment once per authentication, not once per retry.
+        // Every retry in the loop below was re-reading the profile file and
+        // re-calling template_key::load_key → tpm::unseal. On a discrete TPM
+        // that unseal costs 2.7s quiet and 18.97s contended, and TPM and
+        // camera are independent devices, so it can leave the critical path
+        // entirely. The key is dropped inside load; only the decrypted
+        // Enrollment is held, which is already plaintext in memory during
+        // each authenticate_once today.
+        let Some(enr) = irlume_core::storage::load(user)? else {
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                format!("'{user}' is not enrolled"),
+            ));
+        };
+        if enr.profiles.iter().all(|p| p.scans.is_empty()) {
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                format!("'{user}' has no face scans enrolled"),
+            ));
+        }
+        // Anti-swap: refuse if the live camera no longer matches the one this
+        // user enrolled on (only enforced once an enrollment carries a binding).
+        if let Some(bind) = &enr.camera_binding {
+            if let Some(reason) = self.binding_mismatch(bind) {
+                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
+            }
+        }
         // Watch for the consent gesture BEFORE the first capture, so a user who
         // nods when the greeter asks is not ignored for the seconds it takes to
         // capture and match a face. Once per authentication, never per retry: a
@@ -2882,9 +2917,7 @@ impl Engine {
         // for a gesture already given.
         self.gesture_seen_before_match = false;
         if purpose.demands_gesture() {
-            if let Some(enr) = irlume_core::storage::load(user)? {
-                self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
-            }
+            self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
         }
         // Hold the camera sessions across the grace window's retries. Every retry
         // otherwise re-opens, re-negotiates, re-maps and re-warms both streams
@@ -2933,7 +2966,7 @@ impl Engine {
         let mut attempt = 0u32;
         let out = loop {
             attempt += 1;
-            let out = self.authenticate_once(user, purpose, &mut held)?;
+            let out = self.authenticate_once(&enr, purpose, &mut held)?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -2959,40 +2992,13 @@ impl Engine {
 
     fn authenticate_once(
         &mut self,
-        user: &str,
+        enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
         held: &mut Option<(
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )>,
     ) -> irlume_common::Result<Outcome> {
-        // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
-        // the camera, decline so the PAM stack cascades to fingerprint/password.
-        if irlume_core::policy::method().face_disabled() {
-            return Ok(Outcome::deny(
-                OutcomeKind::OtherDeny,
-                "face disabled (fingerprint mode)",
-            ));
-        }
-        let Some(enr) = irlume_core::storage::load(user)? else {
-            return Ok(Outcome::deny(
-                OutcomeKind::OtherDeny,
-                format!("'{user}' is not enrolled"),
-            ));
-        };
-        if enr.profiles.iter().all(|p| p.scans.is_empty()) {
-            return Ok(Outcome::deny(
-                OutcomeKind::OtherDeny,
-                format!("'{user}' has no face scans enrolled"),
-            ));
-        }
-        // Anti-swap: refuse if the live camera no longer matches the one this
-        // user enrolled on (only enforced once an enrollment carries a binding).
-        if let Some(bind) = &enr.camera_binding {
-            if let Some(reason) = self.binding_mismatch(bind) {
-                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
-            }
-        }
         let a = if let Some((ref mut rs, ref mut is)) = held {
             self.assess_full_with(Some((*rs, *is)), None)?
         } else {
@@ -3094,7 +3100,7 @@ impl Engine {
             if score >= thr {
                 *held = None;
                 return self.challenge_if_required(
-                    &enr,
+                    enr,
                     purpose,
                     Outcome::grant(score, format!("match: {who} (rgb)")),
                 );
@@ -3110,7 +3116,7 @@ impl Engine {
             // (thresholds AND the fusion Platt calibration are shipped-model
             // measurements), so a marginal RGB miss ends here: password.
             if let Some(ir_probe) = a.ir_embedding.as_ref().filter(|_| self.ir_matching) {
-                let m = self.ir_match(&enr, ir_probe);
+                let m = self.ir_match(enr, ir_probe);
                 if m.n_templates > 0 {
                     let (ir_score, ir_who) = (m.best, m.best_who.clone());
                     // (a) calibrated quality-weighted fusion: the dim/mixed-light path.
@@ -3126,7 +3132,7 @@ impl Engine {
                         let who = if ir_score >= score { ir_who } else { who };
                         *held = None;
                         return self.challenge_if_required(
-                    &enr,
+                    enr,
                     purpose, Outcome::grant(f.prob,
                             format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
                     }
@@ -3147,7 +3153,7 @@ impl Engine {
                     if ir_score >= ir_thr {
                         *held = None;
                         return self.challenge_if_required(
-                    &enr,
+                    enr,
                     purpose, Outcome::grant(ir_score,
                             format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
                     }
@@ -3161,7 +3167,7 @@ impl Engine {
                         if *cs >= cthr {
                             *held = None;
                             return self.challenge_if_required(
-                    &enr,
+                    enr,
                     purpose, Outcome::grant(*cs,
                                 format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
                         }
@@ -3193,7 +3199,7 @@ impl Engine {
                      the shipped recognizer",
                 ));
             }
-            let m = self.ir_match(&enr, &probe);
+            let m = self.ir_match(enr, &probe);
             if m.n_templates == 0 {
                 let reason = if enr.ir_scans().is_empty() {
                     "dark, but no IR scans enrolled; re-enroll to enable dark unlock"
@@ -3295,7 +3301,7 @@ impl Engine {
             if score >= ir_thr {
                 *held = None;
                 return self.challenge_if_required(
-                    &enr,
+                    enr,
                     purpose,
                     Outcome::grant(score, format!("match: {who} (ir/dark)")),
                 );
@@ -3306,7 +3312,7 @@ impl Engine {
                 if *cs >= cthr {
                     *held = None;
                     return self.challenge_if_required(
-                        &enr,
+                        enr,
                         purpose,
                         Outcome::grant(
                             *cs,
@@ -3317,7 +3323,7 @@ impl Engine {
             }
             *held = None;
             return self.challenge_if_required(
-                &enr,
+                enr,
                 purpose,
                 Outcome::deny_live(OutcomeKind::BelowThreshold, score, "below threshold (ir)"),
             );

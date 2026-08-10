@@ -3675,6 +3675,10 @@ enum CaptureModeReport {
     /// `IRLUME_SEQUENTIAL_CAPTURE` is set in THIS process's environment and
     /// decides alone, whatever is stored.
     Overridden(bool),
+    /// irlume switched this pairing to sequential itself after repeated
+    /// concurrent-capture RGB losses (#100). `age_days` is the number of days
+    /// since the switch, or `None` when the stamp carried no readable time.
+    AutoSwitched { age_days: Option<u64> },
 }
 
 /// The `doctor` line and machine state for a capture-mode observation.
@@ -3760,6 +3764,20 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
              and IR concurrently"
                 .to_string(),
         ),
+        CaptureModeReport::AutoSwitched { age_days } => {
+            let age = match age_days {
+                Some(d) => format!("{d} days ago"),
+                None => "at an unknown date".to_string(),
+            };
+            (
+                State::Info,
+                format!(
+                    "sequential, switched automatically {age} after repeated concurrent-capture \
+                     RGB losses; captures are slower and reliable. Run `sudo irlume camera-tune` \
+                     to replace this with a measurement"
+                ),
+            )
+        }
     }
 }
 
@@ -3792,7 +3810,24 @@ fn report_capture_mode(report: &mut crate::doctor_report::Report) {
             _ => match irlume_camera::configured_pair_no_probe() {
                 None => CaptureModeReport::NoPinnedPair,
                 Some((rgb, ir)) => match irlume_camera::stored_capture_mode(&rgb, &ir) {
-                    Some(mode) => CaptureModeReport::Measured(mode),
+                    Some(mode) => {
+                        // An auto-switched verdict is sequential wearing an
+                        // origin stamp; report it separately so it never reads
+                        // as a measurement and the user learns how to replace it.
+                        if let Some(irlume_camera::CaptureModeOrigin::AutoSwitched { at_unix }) =
+                            irlume_camera::stored_capture_mode_origin(&rgb, &ir)
+                        {
+                            let age_days = at_unix.map(|ts| {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_secs());
+                                now.saturating_sub(ts) / 86400
+                            });
+                            CaptureModeReport::AutoSwitched { age_days }
+                        } else {
+                            CaptureModeReport::Measured(mode)
+                        }
+                    }
                     None => CaptureModeReport::Unmeasured,
                 },
             },
@@ -5208,6 +5243,31 @@ mod tests {
             "700ms is the figure for a camera that never gets this verdict: {seq_line}"
         );
         assert!(seq_line.contains("1.3s"), "{seq_line}");
+
+        // An auto-switched pairing is sequential, but it must not read as
+        // measured. The line says how it came to be sequential and names the
+        // command that replaces the inference with a measurement.
+        for (age_days, want_age) in [(Some(5), "5 days ago"), (None, "at an unknown date")] {
+            let (state, line) =
+                capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days });
+            assert!(matches!(state, State::Info));
+            assert!(
+                line.contains("switched automatically"),
+                "must name how it was set: {line}"
+            );
+            assert!(
+                line.contains(want_age),
+                "must name the age ({want_age}): {line}"
+            );
+            assert!(
+                line.contains("camera-tune"),
+                "must name how to replace the inference: {line}"
+            );
+            assert!(
+                !line.contains("measured"),
+                "must not read as a measurement: {line}"
+            );
+        }
     }
 
     /// The stored eye shape is tied to two conditions, room light and glasses,

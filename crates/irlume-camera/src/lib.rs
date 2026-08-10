@@ -3706,6 +3706,66 @@ fn capture_mode_pair_key(rgb_identity: &str, ir_identity: &str) -> String {
     format!("capture_mode.{rgb_identity}+{ir_identity}")
 }
 
+/// `cameras.conf` key recording HOW this pairing's capture mode came to be
+/// stored. A SIDECAR, deliberately not part of the mode's value: an older
+/// irlume reading `capture_mode.<ids>` must keep seeing exactly `sequential`
+/// or `concurrent`, and [`CaptureMode::parse`] must stay a two-word grammar.
+/// The repo already un-shipped one widened config value for this reason.
+fn capture_mode_origin_key(rgb_identity: &str, ir_identity: &str) -> String {
+    format!("capture_mode_origin.{rgb_identity}+{ir_identity}")
+}
+
+/// The `cameras.conf` key this pairing's capture mode is stored under, if both
+/// nodes can be identified.
+///
+/// Exposed so a caller accumulating evidence about a pairing over time can key
+/// that evidence by the same string the verdict is written under. Keying by
+/// device path instead would let evidence gathered on one camera be spent on
+/// whichever camera later occupied `/dev/video0`.
+pub fn capture_mode_pair_identity(rgb_dev: &str, ir_dev: &str) -> Option<String> {
+    let rgb_id = device_identity(rgb_dev)?;
+    let ir_id = device_identity(ir_dev)?;
+    Some(capture_mode_pair_key(&rgb_id, &ir_id))
+}
+
+/// How a stored capture mode came to be there, when irlume recorded it.
+///
+/// Only the automatic switch stamps this today; a verdict from `camera-tune`
+/// carries no origin, which reads as "measured" by absence. That asymmetry is
+/// deliberate for now: stamping the probe's writes too would change a command
+/// this change does not otherwise touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureModeOrigin {
+    /// irlume switched this pairing to sequential itself, after repeated
+    /// concurrent-capture RGB losses during real enrolment attempts (#100).
+    /// `at_unix` is when, or `None` when the stamp carried no readable time.
+    AutoSwitched { at_unix: Option<u64> },
+}
+
+/// Parse the origin sidecar's value. Pure, so the grammar is testable.
+///
+/// Anything unrecognized degrades to `None`, meaning "origin not recorded".
+/// It can never change what mode is in force: the mode lives in its own key,
+/// and this one is read only to describe it.
+fn parse_capture_mode_origin(raw: &str) -> Option<CaptureModeOrigin> {
+    let mut parts = raw.split_whitespace();
+    if parts.next()? != "auto-switch" {
+        return None;
+    }
+    Some(CaptureModeOrigin::AutoSwitched {
+        at_unix: parts.next().and_then(|t| t.parse().ok()),
+    })
+}
+
+/// The recorded origin of this pairing's stored capture mode, if any.
+pub fn stored_capture_mode_origin(rgb_dev: &str, ir_dev: &str) -> Option<CaptureModeOrigin> {
+    let rgb_id = device_identity(rgb_dev)?;
+    let ir_id = device_identity(ir_dev)?;
+    let raw =
+        irlume_common::config::read_kv("cameras.conf", &capture_mode_origin_key(&rgb_id, &ir_id))?;
+    parse_capture_mode_origin(&raw)
+}
+
 /// The stored capture mode for the RGB+IR pairing behind these two devices, if
 /// that pairing was measured. `None` means unmeasured (the caller keeps its
 /// default), an unidentifiable node, or an unreadable config; an unrecognized
@@ -3751,6 +3811,13 @@ fn resolve_stored_pair_mode(
 /// Persist the capture mode for the RGB+IR pairing behind these two devices.
 /// Writes `/etc/irlume/cameras.conf`, so it needs root. Overwrites; the
 /// check-before-write callers use [`store_capture_mode_if_absent`].
+///
+/// Also clears any auto-switch origin stamp so a direct measurement supersedes
+/// an inference. The stamp is cleared AFTER the mode is written: a crash between
+/// the two renames then leaves a measured verdict still wearing an inference
+/// stamp, which understates what irlume knows; the other order would leave the
+/// previous verdict claiming to be a measurement, which overstates it. Same rule
+/// the auto-switch writer follows in the opposite direction.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn store_capture_mode(
     rgb_dev: &str,
@@ -3765,6 +3832,14 @@ pub fn store_capture_mode(
         "cameras.conf",
         &capture_mode_pair_key(&rgb_id, &ir_id),
         mode.as_str(),
+    )
+    .map_err(|e| Error::Io(e.to_string()))?;
+    // An empty value is the clear: `read_kv` treats an empty value as absent,
+    // which is what `stored_capture_mode_origin` reads through.
+    irlume_common::config::write_kv(
+        "cameras.conf",
+        &capture_mode_origin_key(&rgb_id, &ir_id),
+        "",
     )
     .map_err(|e| Error::Io(e.to_string()))
 }
@@ -3800,6 +3875,65 @@ pub fn store_capture_mode_if_absent(
     }
     store_capture_mode(rgb_dev, ir_dev, mode)?;
     Ok(StoreIfAbsent::Stored)
+}
+
+/// What [`store_sequential_if_still_concurrent`] found when it looked.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StoreIfConcurrent {
+    /// The pairing still read `concurrent`; sequential and its origin were written.
+    Stored,
+    /// Something else had already changed the verdict; nothing was written.
+    /// Carries what is stored now (`None` = no verdict at all).
+    Superseded(Option<CaptureMode>),
+}
+
+/// Demote this pairing to sequential, but ONLY if it still reads `concurrent`.
+///
+/// The one writer in this crate that overwrites a MEASURED verdict, which is
+/// why it re-reads under the lock instead of trusting what its caller last saw.
+/// [`store_capture_mode_if_absent`] cannot express this: an absent verdict
+/// already means sequential, so filling an empty key would be a no-op for the
+/// caller this exists for. The evidence behind such a call is gathered across
+/// several enrolment attempts, so its read and its write are separated by the
+/// length of the loop — the widest check-then-write window in the codebase, and
+/// exactly what `config::lock_exclusive` documents itself for. An operator who
+/// ran `camera-tune` in that window measured this camera directly, and a
+/// measurement outranks an inference: that is what `Superseded` reports.
+///
+/// The origin stamp is written FIRST and the mode SECOND, because these are two
+/// renames under one lock and a crash can land between them. In that order the
+/// only reachable wreckage is an origin key with no matching sequential verdict,
+/// which readers ignore; the other order could leave a switched verdict that
+/// nothing marks as automatic, and it would then be reported as measured.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn store_sequential_if_still_concurrent(
+    rgb_dev: &str,
+    ir_dev: &str,
+    origin_unix: u64,
+) -> irlume_common::Result<StoreIfConcurrent> {
+    let _guard = irlume_common::config::lock_exclusive("cameras.conf")
+        .map_err(|e| Error::Io(e.to_string()))?;
+    match stored_capture_mode(rgb_dev, ir_dev) {
+        Some(CaptureMode::Concurrent) => {}
+        other => return Ok(StoreIfConcurrent::Superseded(other)),
+    }
+    let rgb_id = device_identity(rgb_dev)
+        .ok_or_else(|| Error::Hardware(format!("{rgb_dev}: cannot identify the RGB camera")))?;
+    let ir_id = device_identity(ir_dev)
+        .ok_or_else(|| Error::Hardware(format!("{ir_dev}: cannot identify the IR camera")))?;
+    irlume_common::config::write_kv(
+        "cameras.conf",
+        &capture_mode_origin_key(&rgb_id, &ir_id),
+        &format!("auto-switch {origin_unix}"),
+    )
+    .map_err(|e| Error::Io(e.to_string()))?;
+    irlume_common::config::write_kv(
+        "cameras.conf",
+        &capture_mode_pair_key(&rgb_id, &ir_id),
+        CaptureMode::Sequential.as_str(),
+    )
+    .map_err(|e| Error::Io(e.to_string()))?;
+    Ok(StoreIfConcurrent::Stored)
 }
 
 /// Configure the IR emitter for `device` from what the camera documents about
@@ -4685,6 +4819,63 @@ mod tests {
             CaptureMode::parse(CaptureMode::Sequential.as_str()),
             Some(CaptureMode::Sequential)
         );
+    }
+
+    /// The origin is a SIDECAR key, never part of the mode's value. Config keys
+    /// match exactly, so the two must be distinct strings, and the mode's
+    /// grammar must be untouched by the arrival of provenance: an older irlume
+    /// reading this file still sees exactly `sequential` or `concurrent`.
+    #[test]
+    fn the_origin_key_is_a_sidecar_and_never_the_mode_value() {
+        let (rgb, ir) = ("046d:085e:abc", "046d:085e:def");
+        assert_eq!(
+            capture_mode_origin_key(rgb, ir),
+            "capture_mode_origin.046d:085e:abc+046d:085e:def"
+        );
+        assert_ne!(
+            capture_mode_origin_key(rgb, ir),
+            capture_mode_pair_key(rgb, ir)
+        );
+        // Neither key is the other's prefix under exact matching, so a reader
+        // asking for one can never be handed the other's value.
+        assert!(!capture_mode_origin_key(rgb, ir).starts_with(&capture_mode_pair_key(rgb, ir)));
+        // The mode value itself did not gain a word.
+        assert_eq!(CaptureMode::Sequential.as_str(), "sequential");
+        assert_eq!(
+            CaptureMode::parse(CaptureMode::Sequential.as_str()),
+            Some(CaptureMode::Sequential)
+        );
+    }
+
+    /// The origin stamp is descriptive only, so its parse fails soft: an
+    /// unreadable time still says "irlume switched this", and text it does not
+    /// recognize at all reports nothing rather than inventing a provenance.
+    /// What it must never do is change which MODE is in force; that lives in a
+    /// different key this function cannot reach.
+    #[test]
+    fn capture_mode_origin_parses_leniently_or_reports_nothing() {
+        assert_eq!(
+            parse_capture_mode_origin("auto-switch 1786320000"),
+            Some(CaptureModeOrigin::AutoSwitched {
+                at_unix: Some(1_786_320_000)
+            })
+        );
+        // A stamp with no time, or an unparseable one, still records WHO.
+        for raw in ["auto-switch", "auto-switch banana", "  auto-switch  "] {
+            assert_eq!(
+                parse_capture_mode_origin(raw),
+                Some(CaptureModeOrigin::AutoSwitched { at_unix: None }),
+                "{raw:?} must still report the switch"
+            );
+        }
+        // Anything else is "origin not recorded", never a guess.
+        for raw in ["", "auto", "measured 5", "sequential", "camera-tune 12"] {
+            assert_eq!(
+                parse_capture_mode_origin(raw),
+                None,
+                "{raw:?} must not be read as an origin"
+            );
+        }
     }
 
     #[test]
@@ -6373,6 +6564,55 @@ mod tests {
             err.contains("refusing"),
             "virtual node must be refused: {err}"
         );
+    }
+
+    /// Writing an empty value is what CLEARS the origin stamp, which is the
+    /// assumption `store_capture_mode` now rests on.
+    ///
+    /// It matters because nothing cleared the stamp before: `camera-tune`
+    /// wrote only the mode key, so a pairing that had been switched
+    /// automatically kept reporting "switched automatically N days ago" even
+    /// after the user ran the measurement doctor told them to run, and the
+    /// measurement itself never showed up in a support report. The only way
+    /// out was hand-editing /etc/irlume/cameras.conf (#100 review).
+    ///
+    /// `device_identity` reads sysfs, so `store_capture_mode` itself cannot run
+    /// against a synthetic pair here; what is pinned is the mechanism it uses.
+    #[test]
+    fn an_empty_value_clears_the_origin_stamp() {
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join(format!("irlume-origin-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _conf = EnvGuard::set("IRLUME_CONFIG_DIR", dir.to_str().unwrap());
+
+        let (rgb_id, ir_id) = ("046d:085e:abc", "046d:085e:def");
+        let mode_key = capture_mode_pair_key(rgb_id, ir_id);
+        let origin_key = capture_mode_origin_key(rgb_id, ir_id);
+
+        irlume_common::config::write_kv("cameras.conf", &mode_key, "sequential").unwrap();
+        irlume_common::config::write_kv("cameras.conf", &origin_key, "auto-switch 1786320000")
+            .unwrap();
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", &origin_key).as_deref(),
+            Some("auto-switch 1786320000"),
+            "precondition: the stamp is readable before it is cleared"
+        );
+
+        irlume_common::config::write_kv("cameras.conf", &origin_key, "").unwrap();
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", &origin_key),
+            None,
+            "an empty value must read as absent, or the stamp outlives the measurement"
+        );
+        // ...and clearing the sidecar must not disturb the mode it sits beside.
+        assert_eq!(
+            irlume_common::config::read_kv("cameras.conf", &mode_key).as_deref(),
+            Some("sequential"),
+            "clearing the provenance must not change which mode is in force"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

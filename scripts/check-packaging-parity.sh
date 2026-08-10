@@ -193,9 +193,13 @@ echo "== every lane pins the same ONNX Runtime =="
 ort_pin_of() {
   case "$1" in
     .github/workflows/ci.yml|.github/workflows/asan.yml|.github/workflows/install-matrix.yml)
-      sed -n 's/^[[:space:]]*ver=\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$1" | sort -u ;;
+      sed -n 's/^[[:space:]]*ver=\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$1" ;;
     flake.nix|nix/module.nix)
-      sed -n 's/.*[oO]rt[Vv]ersion = "\([0-9][0-9.]*\)".*/\1/p; s/^[[:space:]]*version = "\([0-9][0-9.]*\)";[[:space:]]*$/\1/p' "$1" | sort -u ;;
+      # Only the `ortVersion` binding. Both files interpolate it into the
+      # derivation label and the fetch URL, so reading the binding reads what is
+      # actually downloaded. Matching a bare `version =` instead would read a
+      # label that a bump could move while the URL kept fetching the old archive.
+      sed -n 's/.*[oO]rt[Vv]ersion = "\([0-9][0-9.]*\)".*/\1/p' "$1" ;;
     packaging/fedora/irlume.spec)
       sed -n 's/^%global ort_ver \([0-9][0-9.]*\).*/\1/p' "$1" ;;
     packaging/debian/build-deb.sh|scripts/build-ppa-source.sh)
@@ -220,15 +224,39 @@ ORT_PINNED_BY=(
   scripts/build-ppa-source.sh
 )
 
+# How many times each file is expected to name it. Counting DISTINCT values is
+# not enough: ci.yml fetches the runtime in three separate jobs, and deleting
+# one of those steps leaves the other two agreeing, so a uniqueness check would
+# report ok for a workflow that had silently stopped pinning a lane.
+declare -A ORT_PIN_COUNT=(
+  [.github/workflows/ci.yml]=3
+  [.github/workflows/asan.yml]=1
+  [.github/workflows/install-matrix.yml]=1
+  [flake.nix]=1
+  [nix/module.nix]=1
+  [packaging/fedora/irlume.spec]=1
+  [packaging/debian/build-deb.sh]=1
+  [scripts/build-ppa-source.sh]=1
+)
+
 ort_ref=""
 for f in "${ORT_PINNED_BY[@]}"; do
-  # A file may name the version on several lines; sort -u collapses them, so
-  # more than one line here means that file disagrees with ITSELF, and the count
-  # check catches that before the cross-file comparison runs.
-  found="$(ort_pin_of "$f")"
-  n="$(printf '%s' "$found" | grep -c . || true)"
-  if [ "$n" -ne 1 ]; then
-    printf '  MISS  %-42s expected one version, extracted %s\n' "$f" "$n"
+  want="${ORT_PIN_COUNT[$f]:-}"
+  if [ -z "$want" ]; then
+    echo "  ERROR: no expected pin count for $f; add one to ORT_PIN_COUNT in $0" >&2
+    exit 1
+  fi
+  all="$(ort_pin_of "$f")"
+  n="$(printf '%s' "$all" | grep -c . || true)"
+  if [ "$n" -ne "$want" ]; then
+    printf '  MISS  %-42s expected %s pin(s), found %s\n' "$f" "$want" "$n"
+    fail=1
+    continue
+  fi
+  found="$(printf '%s\n' "$all" | sort -u)"
+  u="$(printf '%s' "$found" | grep -c . || true)"
+  if [ "$u" -ne 1 ]; then
+    printf '  MISS  %-42s names %s different versions\n' "$f" "$u"
     fail=1
     continue
   fi
@@ -249,11 +277,28 @@ done
 if [ -z "$ort_ref" ]; then
   echo "  ERROR: no ONNX Runtime version could be read from any lane"
   fail=1
-elif ! grep -Fq "onnxruntime-linux-x64-$ort_ref.tgz" docs/DEVELOPMENT.md; then
-  printf '  ERROR %-42s does not hand out %s\n' docs/DEVELOPMENT.md "$ort_ref"
-  fail=1
 else
-  printf '  ok    %-42s hands out %s\n' docs/DEVELOPMENT.md "$ort_ref"
+  # EVERY place the recipe names it, not just one. The version appears in the
+  # download URL, the tarball, the tar command, the exported library path, the
+  # dependency table and the .deb soname example. Checking one of them passes a
+  # document that downloads one version and puts a different one on
+  # ORT_DYLIB_PATH, which is a working command sequence that loads the wrong
+  # library.
+  doc_needs=(
+    "onnxruntime **$ort_ref** (\`ORT_DYLIB_PATH\`)"
+    "releases/download/v$ort_ref/onnxruntime-linux-x64-$ort_ref.tgz"
+    "tar xzf onnxruntime-linux-x64-$ort_ref.tgz"
+    "ORT_DYLIB_PATH=\"\$PWD/onnxruntime-linux-x64-$ort_ref/lib/libonnxruntime.so\""
+    "libonnxruntime.so.$ort_ref"
+  )
+  for need in "${doc_needs[@]}"; do
+    if grep -Fq -- "$need" docs/DEVELOPMENT.md; then
+      printf '  ok    %-42s %s\n' docs/DEVELOPMENT.md "$need"
+    else
+      printf '  MISS  %-42s %s\n' docs/DEVELOPMENT.md "$need"
+      fail=1
+    fi
+  done
 fi
 
 echo

@@ -2927,35 +2927,38 @@ impl Engine {
         // the devices, create sessions from them, fall back to per-capture when
         // the session path cannot hold them (sequential mode, or a camera that
         // cannot be opened).
+        //
+        // The cameras are only opened when sessions will be created. Opening them
+        // unconditionally would leave them held in `cams` while the one-shot path
+        // below tries to open the same device again, which is EBUSY on a
+        // single-consumer camera and on any v4l2loopback node with a producer
+        // attached.
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
-        let cams = if self.ir_available {
-            match (
-                irlume_camera::RgbCamera::open(&rgb_dev),
-                irlume_camera::IrCamera::open(&ir_dev),
-            ) {
-                (Ok(r), Ok(i)) => Some((r, i)),
-                _ => None,
-            }
-        } else {
-            None
-        };
         let (sequential, _mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
         // Declared in reverse drop order: `held` borrows from `_rs`/`_is` which
         // borrow from `cams`. Rust drops locals in reverse declaration order, so
         // `held` drops first (releasing the borrow), then the sessions, then the
         // cameras.
+        let mut _cams: Option<(irlume_camera::RgbCamera, irlume_camera::IrCamera)> = None;
         let mut _rs: Option<irlume_camera::RgbSession<'_>> = None;
         let mut _is: Option<irlume_camera::IrSession<'_>> = None;
         let mut held: Option<(
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )> = None;
-        if !sequential {
-            if let Some((r, i)) = &cams {
+        if !sequential && self.ir_available {
+            if let (Ok(r), Ok(i)) = (
+                irlume_camera::RgbCamera::open(&rgb_dev),
+                irlume_camera::IrCamera::open(&ir_dev),
+            ) {
+                _cams = Some((r, i));
                 let progress = self.capture_progress();
+                // SAFETY: _cams is Some, and _rs/_is borrow from it. _cams is
+                // declared before _rs/_is so it outlives them.
+                let (ref cam_r, ref cam_i) = _cams.as_ref().unwrap();
                 if let (Ok(rs), Ok(is)) = (
-                    r.session_with_progress(&progress),
-                    i.session_with_progress(&progress),
+                    cam_r.session_with_progress(&progress),
+                    cam_i.session_with_progress(&progress),
                 ) {
                     _rs = Some(rs);
                     _is = Some(is);

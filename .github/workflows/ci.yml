@@ -55,9 +55,20 @@ concurrency:
 #   "systemd units (verify + exposure ratchet)"
 #   "nix flake check"
 # Renaming a job below without updating the protection rule leaves a PR waiting
-# on a check that never reports, so it can never merge. Change both together.
-# Five of the seven can only run on `arch` (archhost); the two on the shared
-# `ci` label can run on either machine.
+# on a check that never reports, so it can never merge. Change both together,
+# and note that "the protection rule" is TWO settings: classic branch protection
+# lists all seven, the active ruleset (id 19429289) lists five of them, and the
+# effective requirement is the union. Editing one alone does not drop a check.
+#
+# All seven run on `ubuntu-24.04`. Nothing required for a merge runs on a
+# self-hosted machine, which is the fork-PR rule in hardware-checks.yml holding:
+# a `pull_request` trigger executes the workflow file from the PR head, so a
+# required self-hosted check would let a fork edit its way onto a personal
+# machine. An earlier version of this comment said five of the seven could only
+# run on `arch` and two could run on either machine; that predates the 2026-08-07
+# capability routing and was false when #407 was written on its authority.
+# `runs-on: [self-hosted, ci]` needs a runner carrying EVERY listed label, so
+# `ci` never resolves to a hosted runner either.
 jobs:
   check:
     name: fmt · clippy · build · test

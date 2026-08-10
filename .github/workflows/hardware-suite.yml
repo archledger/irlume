@@ -287,15 +287,16 @@ jobs:
           # artifact anyone should be able to fetch weeks later.
           retention-days: 7
 
-  # Hardware-inclusive statement coverage: the same measurement the hosted
-  # ratchet takes, but with the TPM-gated tests on REAL silicon and the
-  # camera/PAM matrices included. Report-only (no floor): the number feeds
-  # the OpenSSF Best Practices gold criterion (test_statement_coverage90),
-  # and the delta against the hosted number shows which hardware-only paths
-  # remain unreached. Runs after the smoke job so the two never contend for
-  # the camera.
+  # Hardware-inclusive statement coverage with a nightly ratchet. The TPM-gated
+  # tests run on real silicon and the camera/PAM matrices are included, so this
+  # is the only measurement that can reach the OpenSSF Best Practices silver
+  # criterion (test_statement_coverage80, 80% statement coverage). The floor
+  # below catches coverage declines within 24 hours of a merge; it is the only
+  # coverage gate in the project after the hosted "line-coverage ratchet" was
+  # removed (the job named that measured no coverage since 2026-08-07).
+  # Runs after the smoke job so the two never contend for the camera.
   coverage:
-    name: coverage (hardware-inclusive, report only)
+    name: coverage (hardware-inclusive, nightly floor)
     needs: hardware
     # `arch` pins this to archhost deliberately: minihost carries tpm and
     # ir-camera too, and this suite's camera-absent path exits 0, so without
@@ -342,4 +343,4 @@ jobs:
           ./scripts/run-tests-guarded.sh --min 5 -- cargo llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 1 -- cargo llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
           ./scripts/run-tests-guarded.sh --min 16 -- cargo llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
-          cargo llvm-cov report --summary-only
+          cargo llvm-cov report --summary-only --fail-under-lines 75

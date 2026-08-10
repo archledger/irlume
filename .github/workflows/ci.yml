@@ -47,11 +47,10 @@ concurrency:
 # control plane to receive a job, and archhost's lane failed at "Set up job"
 # during the 2026-08-06 incident exactly like the hosted lanes did.
 #
-# Branch protection on `main` requires these SEVEN job names as status checks,
-# verified against the live ruleset 2026-08-07:
+# Branch protection on `main` requires these SIX job names as status checks,
+# verified against the live ruleset 2026-08-10:
 #   "fmt · clippy · build · test"
 #   "test (stable)"
-#   "coverage (line-coverage ratchet)"
 #   "fuzz (untrusted-input parsers)"
 #   "cargo-deny (advisories · licenses · duplicate versions)"
 #   "systemd units (verify + exposure ratchet)"
@@ -59,7 +58,7 @@ concurrency:
 # Renaming a job below without updating the protection rule leaves a PR waiting
 # on a check that never reports, so it can never merge. Change both together,
 # and note that "the protection rule" is TWO settings: classic branch protection
-# lists all seven, the active ruleset (id 19429289) lists five of them, and the
+# lists all six, the active ruleset (id 19429289) lists five of them, and the
 # effective requirement is the union. Editing one alone does not drop a check.
 #
 # All seven run on `ubuntu-24.04`. Nothing required for a merge runs on a
@@ -371,271 +370,11 @@ jobs:
       - name: test
         run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
 
-  # Statement coverage with a ratchet: the build fails if line coverage drops
-  # below the floor. The floor moves up as tests are added, never down
-  # (OpenSSF silver test_statement_coverage80 is the long-term target).
-  # REQUIRED (see the seven-check list in the header).
-  coverage:
-    name: coverage (line-coverage ratchet)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Do not leave the job token in .git/config for later steps to reach.
-          persist-credentials: false
-
-      - name: Cache model weights
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: models
-          key: models-${{ hashFiles('models/SHA256SUMS') }}
-
-      - name: Fetch model weights (models-v1 release, sha256-verified)
-        run: bash scripts/fetch-models.sh
-
-      - name: Install system build dependencies
-        run: |
-          # Self-hosted Arch runner: the toolchain deps are preinstalled
-          # (base-devel, clang, pam, tpm2-tss); apt path kept for any future
-          # hosted fallback.
-          if command -v apt-get >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev
-          else
-            for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
-          fi
-
-      - name: Install stable Rust with llvm-tools
-        # @master (declares the `toolchain` input); the version tag branches
-        # (e.g. @1.88.0) have no such input and ignore `with: toolchain:`.
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          # PRs RESTORE from main's cache but never SAVE their own: per-PR
-          # entries were filling the repo's 10 GB cache quota, and LRU
-          # eviction would eventually knock out the LFS model cache that
-          # guards the (scarcer) LFS bandwidth quota.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-llvm-cov
-        # Idempotent on a persistent runner: `cargo install` refuses when the
-        # binary already exists, so only (re)install on a version mismatch.
-        run: |
-          if ! cargo llvm-cov --version 2>/dev/null | grep -q '0\.8\.7'; then
-            cargo install cargo-llvm-cov --version 0.8.7 --locked --force
-          fi
-
-      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
-        run: |
-          ver=1.24.4
-          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
-          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
-          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
-
-      - name: Start swtpm (software TPM)
-        run: |
-          command -v swtpm >/dev/null || sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
-          mkdir -p /tmp/swtpm
-          swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
-            --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
-            --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
-
-      - name: Start virtual cameras (v4l2loopback + ffmpeg feeders)
-        run: |
-          # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
-          # kernel's V4L2 API and fails to load; build upstream at a pinned
-          # commit instead. videodev (its dependency) lives in modules-extra.
-          # v4l2loopback (built from a pinned upstream commit because Ubuntu's
-          # 0.12.x won't load on the runner kernel) plus pam_wrapper/pamtester
-          # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
-          # spare the camera streaming tests feed themselves.
-          # The self-hosted runner provisions video8/9/10 persistently
-          # (v4l2loopback-dkms + modules-load.d + a udev rule granting group
-          # video); build-from-source only on a runner without them.
-          if [ ! -e /dev/video8 ]; then
-          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
-          git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
-          git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
-          make -C /tmp/v4l2loopback -j"$(nproc)"
-          sudo modprobe videodev
-          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
-          # Let udev finish applying its default (root:video 0660) perms BEFORE
-          # our chmod, otherwise a late udev event overrides it and a test opens
-          # the node with EACCES ("permission denied"), an intermittent flake.
-          sudo udevadm settle
-          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
-          fi
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/tmp/feeder-rgb.log 2>&1 &
-          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/tmp/feeder-ir.log 2>&1 &
-          # Readiness gate, derived from the v4l2loopback source and measured
-          # on real hardware rather than assumed:
-          #
-          #  * /sys/.../videoN/state is the cheap, non-blocking truth:
-          #    "output" = no producer attached, "capture" = one is streaming.
-          #    Measured to flip 45ms after a feeder starts.
-          #  * A read only happens once state says capture, so the common
-          #    "not started yet" case never touches a blocking ioctl.
-          #  * timeout -k is mandatory, not decorative: an ffmpeg blocked in
-          #    DQBUF ignores SIGTERM (measured alive 8+ minutes under plain
-          #    `timeout`), because SIGTERM cannot reach a task in that ioctl.
-          #    Only the follow-up SIGKILL ends it.
-          #  * A read that times out AFTER state=capture means the producer
-          #    vanished mid-read: that is a hard failure, not something to
-          #    retry, so say so and stop.
-          #
-          # Do NOT "fix" a flaky feeder with the module's keep_format=1 or
-          # timeout=N options: both make a DEAD feeder look like a live one,
-          # which is the failure this gate exists to catch.
-          wait_for_frame() {
-            local dev limit sys deadline rc
-            dev="$1"; limit="${2:-30}"
-            sys="/sys/devices/virtual/video4linux/${dev##*/}"
-            deadline=$(( SECONDS + limit ))
-            while [ "$SECONDS" -lt "$deadline" ]; do
-              if [ "$(cat "$sys/state" 2>/dev/null)" = capture ]; then
-                timeout -k 1 5 ffmpeg -nostdin -loglevel error \
-                  -f v4l2 -i "$dev" -frames:v 1 -f null - >/dev/null 2>&1
-                rc=$?
-                [ "$rc" = 0 ] && return 0
-                if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-                  echo "::error::$dev: read blocked in DQBUF, producer vanished mid-read"
-                  return 1
-                fi
-              fi
-              sleep 0.2
-            done
-            echo "::error::$dev: no frame in ${limit}s (state=$(cat "$sys/state" 2>/dev/null)," \
-                 "format=$(cat "$sys/format" 2>/dev/null), buffers=$(cat "$sys/buffers" 2>/dev/null))"
-            return 1
-          }
-          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
-          for d in /dev/video8 /dev/video9; do
-            if ! wait_for_frame "$d" 30; then
-              # Every diagnostic channel this step used to discard.
-              echo "--- feeder processes:"; ps -o pid,stat,wchan:20,cmd -C ffmpeg || true
-              echo "--- rgb feeder log:"; tail -20 /tmp/feeder-rgb.log 2>/dev/null || true
-              echo "--- ir feeder log:";  tail -20 /tmp/feeder-ir.log 2>/dev/null || true
-              exit 1
-            fi
-          done
-          ls -l /dev/video8 /dev/video9 /dev/video10
-
-      - name: packaging parity (units in every lane, versions agree)
-        run: ./scripts/check-packaging-parity.sh
-
-      # Nothing validated the AppArmor profiles until 0.9.0, and they are the
-      # only confinement on the Debian/Ubuntu lane. A profile that fails to
-      # parse does not confine, and the two bugs this release fixed (a missing
-      # pcrlock rule that broke every Tier 2 unseal, and a granted-vs-denied
-      # capability) both live in these files. -Q parses without loading into the
-      # kernel and -K skips the policy cache, which together let this run
-      # unprivileged: -Q alone still writes /var/cache/apparmor and dies on
-      # permission, which is how the first version of this step failed.
-      - name: apparmor profiles parse
-        run: |
-          set -euo pipefail
-          command -v apparmor_parser >/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y apparmor; }
-          for f in packaging/apparmor/*; do
-            echo "checking $f on the runner's parser"
-            apparmor_parser -QK "$f"
-          done
-
-      # The runner's parser is 4.x. The universal .deb declares
-      # libc6 (>= 2.35) so it installs on Debian 12 and Ubuntu 22.04, whose
-      # apparmor is 3.0.x, and a profile can parse here and fail there: an
-      # `abi <abi/4.0>` line did exactly that, and since the postinstall did not
-      # report the failure, those installs ran unconfined with nothing said.
-      # Check the OLDEST supported parser too, in the distro that ships it.
-      - name: apparmor profiles parse on the oldest supported parser
-        run: |
-          set -euo pipefail
-          docker run --rm -v "$PWD/packaging/apparmor:/p:ro" ubuntu:22.04 bash -c '
-            set -euo pipefail
-            apt-get -qq update >/dev/null
-            apt-get -qq install -y apparmor >/dev/null
-            apparmor_parser --version
-            useradd -m checker
-            for f in /p/*; do
-              echo "checking $f"
-              su checker -c "apparmor_parser -QK $f"
-            done'
-
-      # The guard that stops a zero-match test filter from reporting success is
-      # itself a parser, so it gets the same treatment it enforces: prove it can
-      # still tell a real run from an empty one. Fixtures only, no Rust build.
-      - name: test-count guard self-test
-        run: ./scripts/run-tests-guarded.sh --self-test
-
-      # The PPA publish check decides whether a release reached Ubuntu users, so
-      # its verdict logic is worth pinning. The live check needs a real upload
-      # and cannot run here; --self-test is fixtures only, no network.
-      - name: PPA publish verifier (verdict logic)
-        run: python3 scripts/verify-ppa-publish.py --self-test
-
-      - name: systemd-analyze verify (unit syntax)
-        run: |
-          set -euo pipefail
-          command -v systemd-analyze >/dev/null || {
-            sudo apt-get update -qq && sudo apt-get install -y -qq systemd; }
-          # verify resolves ExecStart and fails on a binary that is not present,
-          # which on a build runner it never is. Stub the two paths so the check
-          # is about unit syntax, which is what we actually want tested.
-          # Stub ONLY when absent: this runner has a real irlume install,
-          # and the hosted job's unconditional stub would overwrite it.
-          [ -e /usr/bin/irlumed ] || sudo install -Dm755 /bin/true /usr/bin/irlumed
-          [ -e /usr/bin/irlume ] || sudo install -Dm755 /bin/true /usr/bin/irlume
-          for u in packaging/systemd/*.service packaging/systemd/*.timer packaging/systemd/*.path; do
-            echo "::group::verify $(basename "$u")"
-            systemd-analyze verify "$u"
-            echo "::endgroup::"
-          done
-
-      - name: systemd-analyze security (exposure must not regress)
-        run: |
-          set -euo pipefail
-          # Ratchet, in the same spirit as the coverage floor. These numbers are
-          # the CURRENT measured exposure, so any change that loosens sandboxing
-          # fails here instead of shipping quietly. --threshold compares on a
-          # 0-100 scale, so 3.7 as displayed is 37 here, and it fails only when
-          # exposure goes OVER the number.
-          #
-          # To re-baseline deliberately: run
-          #   systemd-analyze security --offline=true packaging/systemd/<unit>
-          # and move the number, in the same commit as whatever changed it.
-          #
-          # The score is systemd-version-sensitive. Measured on the ubuntu-24.04
-          # image (systemd 255); a runner image that moves to a systemd with new
-          # checks may need a re-baseline, which is a deliberate act, not a
-          # silent drift.
-          # Re-measured 2026-08-06 on the self-hosted runner's systemd 261:
-          # identical scores (3.7 / 9.4), so the thresholds carry over.
-          #
-          # irlume-reconcile.service is knowingly high: it is a root oneshot that
-          # rewrites /etc/pam.d, so it holds broad access by design. Locking it
-          # here stops it getting worse. Hardening it is its own change, with its
-          # own validation, because it is the self-heal that repairs broken PAM.
-          fail=0
-          check() {
-            local unit="$1" threshold="$2"
-            echo "::group::security $(basename "$unit") (threshold ${threshold})"
-            if systemd-analyze security --offline=true --threshold="$threshold" "$unit"; then
-              echo "OK: at or below the recorded exposure"
-            else
-              echo "::error::$(basename "$unit") exposure rose above ${threshold} (0-100 scale)"
-              fail=1
-            fi
-            echo "::endgroup::"
-          }
-          check packaging/systemd/irlumed.service 37
-          check packaging/systemd/irlume-reconcile.service 94
-          exit "$fail"
-
+  # Statement coverage is measured nightly on the hardware-suite job (real TPM
+  # + loopback cameras + PAM FFI), which is the only measurement that can reach
+  # the OpenSSF Best Practices silver criterion (test_statement_coverage80).
+  # The hosted coverage job was removed 2026-08-10: it measured no coverage
+  # since 2026-08-07 and its checks were a strict subset of the `units` job.
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
     runs-on: ubuntu-24.04
@@ -718,8 +457,6 @@ jobs:
       # and that parse is why the camera stage did not run for the eight nights
       # after 42c03c6 changed the node line. Nothing hosted has a camera, so the
       # parse itself is what gets pinned: fixtures only, seconds, every PR.
-      # Here and not also in `coverage`, which carries copies of the two steps
-      # above; one job proving a fixture parse is enough.
       - name: doctor IR-node parser (the nightly hardware suite depends on it)
         run: ./scripts/ir-node-from-doctor.sh --self-test
 
@@ -744,7 +481,7 @@ jobs:
       - name: systemd-analyze security (exposure must not regress)
         run: |
           set -euo pipefail
-          # Ratchet, in the same spirit as the coverage floor. These numbers are
+          # Ratchet, in the same spirit as the nightly coverage floor. These numbers are
           # the CURRENT measured exposure, so any change that loosens sandboxing
           # fails here instead of shipping quietly. --threshold compares on a
           # 0-100 scale, so 3.7 as displayed is 37 here, and it fails only when

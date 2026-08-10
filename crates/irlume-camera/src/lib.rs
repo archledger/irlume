@@ -2283,7 +2283,7 @@ impl IrCamera {
         warm_up_stream(&self.device, &mut stream, progress)?;
         Ok(IrSession {
             cam: self,
-            stream,
+            stream: Some(stream),
             dec: IrDecoder::new(self.pix, self.quantization),
             lit: mode.lit(),
             _mode: mode,
@@ -2295,7 +2295,10 @@ impl IrCamera {
 /// A running IR stream with its emitter lit.
 pub struct IrSession<'a> {
     cam: &'a IrCamera,
-    stream: SafeStream<'a>,
+    /// `None` only transiently inside [`Self::recover`]: the broken stream
+    /// must be DROPPED (STREAMOFF + buffer release) before its replacement
+    /// negotiates, and a plain re-assignment builds the new value first.
+    stream: Option<SafeStream<'a>>,
     dec: IrDecoder,
     lit: bool,
     /// The camera's own per-frame illumination reporting, when it has any.
@@ -2322,13 +2325,20 @@ impl IrSession<'_> {
     /// a blown frame both flattens the liveness cues and blinds the PAD model
     /// (#221).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "expect on a logically impossible state"
+    )]
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
         let white_level = self.dec.white_level();
-        let stream = &mut self.stream;
+        let stream = self
+            .stream
+            .as_mut()
+            .expect("stream is None only transiently inside recover");
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
         // frame, the lit strobe phase (linhello lesson). Keep every frame so the
@@ -2648,6 +2658,28 @@ impl IrSession<'_> {
                 white_level,
             },
         ))
+    }
+
+    /// Recover a broken stream in place, on the fd this session already holds.
+    ///
+    /// Drops the failed stream (STREAMOFF + buffer release), then opens a fresh
+    /// one on the same device fd. The metadata queue is reopened and the emitter
+    /// control is re-enabled. The decoder is reset to its initial state.
+    /// No new device open, so no EBUSY from a double-open-rejecting camera.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn recover(&mut self) -> irlume_common::Result<()> {
+        self.stream = None; // drop first: STREAMOFF + buffer release
+        self.meta = None; // drop the metadata queue
+        let stream = SafeStream::open(&self.cam.device, &self.cam.dev)?;
+        let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
+        let mode = ir_emitter::enable(self.cam.dev.handle(), &self.cam.card, &self.cam.device);
+        let lit = mode.lit();
+        self.stream = Some(stream);
+        self.meta = meta;
+        self._mode = mode;
+        self.dec = IrDecoder::new(self.cam.pix, self.cam.quantization);
+        self.lit = lit;
+        Ok(())
     }
 }
 

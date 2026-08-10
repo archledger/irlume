@@ -7802,7 +7802,11 @@ mod tests {
                 assert_eq!(profiles.len(), 1);
                 assert_eq!(profiles[0].name, "Work");
                 assert_eq!(profiles[0].scans, vec!["Front".to_string()]);
-                assert!(require_eyes_open);
+                // The enable above was refused (#386), so the listing must
+                // still report it off. This is the no-write property checked a
+                // second way, through the published enrollment rather than
+                // through storage.
+                assert!(!require_eyes_open);
                 assert!(!require_challenge);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),

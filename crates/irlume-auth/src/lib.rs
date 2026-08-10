@@ -4104,12 +4104,20 @@ fn capture_advice(shape: CaptureShape, solo_probe: Option<bool>) -> String {
         // `solo_mean >= CONCLUSIVE_SCENE_BRIGHTNESS`, so the room being lit is
         // measured rather than assumed, and telling this user to check their
         // lighting would send them after the wrong thing.
+        // The light comes FIRST, and that ordering is measured rather than
+        // stylistic. On a healthy camera in a dark room with a lamp coming on
+        // between the two captures, this branch fires wrongly: 4 runs of 4 on
+        // 2026-08-10, held 28.9 to 31.8 with no face, solo 163 with one. Naming
+        // the camera first would put the wrong cause at the front of the
+        // sentence in every one of them. The second held phase that WOULD
+        // separate the two is what #379's config write needs; a message does
+        // not earn a second pair of session opens on a failed enrolment.
         Some(_) => String::from(
             "the colour frame was dark on every attempt while both sensors were streaming, and \
              a capture taken straight afterwards with only the colour sensor running found a \
-             face. That is the shape of a camera that cannot sustain both streams; run `sudo \
-             irlume camera-tune` in a lit room to measure it directly. Light that changed \
-             between those two moments would look the same from here",
+             face. If the light changed between those two moments, that is the explanation. If \
+             it did not, this is the shape of a camera that cannot sustain both streams, and \
+             `sudo irlume camera-tune` in a lit room measures that directly",
         ),
         // Not confirmed, whether the probe refuted it or never ran. Unchanged
         // from #414: offer both readings, assert neither.
@@ -5528,9 +5536,19 @@ mod tests {
             "{confirmed}"
         );
         assert!(confirmed.contains("camera-tune"), "{confirmed}");
+        // The confound is named FIRST, because on a healthy camera in a dark
+        // room with a lamp switching on this branch fires wrongly in 4 runs of
+        // 4. Leading with the camera would put the wrong cause at the front of
+        // the sentence every one of those times.
+        let light = confirmed
+            .find("If the light changed")
+            .expect("names the light");
+        let camera = confirmed
+            .find("cannot sustain both streams")
+            .expect("names the camera");
         assert!(
-            confirmed.contains("Light that changed"),
-            "a confirmation must name the confound it cannot rule out: {confirmed}"
+            light < camera,
+            "the explanation that cannot be ruled out must come first: {confirmed}"
         );
         assert!(
             !confirmed.contains("so it is dimming"),

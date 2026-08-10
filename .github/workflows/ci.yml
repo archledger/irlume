@@ -8,8 +8,10 @@ name: CI
 # Every job here runs on GitHub-hosted runners, so pull_request is safe and
 # fork PRs get the full required gate. Anything needing the maintainer's
 # hardware lives in hardware-checks.yml, which is push-triggered precisely
-# because a pull_request run would execute the PR head's workflow file on a
-# personal machine.
+# because a pull_request run executes the PR's own merge branch, workflow file
+# included, and a fork controls what goes into it. Observed in this repo's logs:
+# "HEAD is now at 593ba54 Merge 3e20d8c into e971020". Not the raw PR head, and
+# not the base branch either; that second one is `pull_request_target`.
 on:
   push:
     branches: [main]
@@ -62,10 +64,11 @@ concurrency:
 #
 # All seven run on `ubuntu-24.04`. Nothing required for a merge runs on a
 # self-hosted machine, which is the fork-PR rule in hardware-checks.yml holding:
-# a `pull_request` trigger executes the workflow file from the PR head, so a
-# required self-hosted check would let a fork edit its way onto a personal
-# machine. An earlier version of this comment said five of the seven could only
-# run on `arch` and two could run on either machine; that predates the 2026-08-07
+# a `pull_request` run executes the PR's own merge branch, so a required
+# self-hosted check would let a fork run its code on a personal machine.
+#
+# An earlier version of this comment said five of the seven could only run on
+# `arch` and two could run on either machine; that predates the 2026-08-07
 # capability routing and was false when #407 was written on its authority.
 # `runs-on: [self-hosted, ci]` needs a runner carrying EVERY listed label, so
 # `ci` never resolves to a hosted runner either.

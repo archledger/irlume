@@ -650,6 +650,47 @@ pub(crate) fn lock_camera(id: &CameraIdentity) -> Result<Option<CameraLock>, Str
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
+    // /dev/video* is root:video 0660, so the lock guarding that capability
+    // matches rather than being root-only. Without this a non-root caller in
+    // the video group (the nightly CI runner, ir-setup, camera-tune) can open
+    // the camera but not the lock, and ir-setup declines to drive the emitter
+    // with "passwordless sudo is required" even though the caller already owns
+    // the device it is trying to configure.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .permissions();
+        perms.set_mode(0o660);
+        file.set_permissions(perms)
+            .map_err(|e| format!("chmod {:o} {}: {e}", 0o660, path.display()))?;
+    }
+    // Set the group to video so the lock is reachable by the same group that
+    // already owns /dev/video*. The caller is root (the daemon), so fchown
+    // succeeds. If the group does not exist on this system the mode alone is
+    // still an improvement: the lock was 0640 root:root and is now 0660, so a
+    // non-root caller whose primary group is video can open it.
+    //
+    // SAFETY: getgrnam_r reads /etc/group (or the nsswitch equivalent). The
+    // C string is a literal null-terminated byte string.
+    unsafe {
+        let mut grp: libc::group = std::mem::zeroed();
+        let mut buf = vec![0u8; 2048];
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let name = b"video\0";
+        if libc::getgrnam_r(
+            name.as_ptr().cast(),
+            &mut grp,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        ) == 0
+            && !result.is_null()
+        {
+            let _ = libc::fchown(file.as_raw_fd(), u32::MAX, grp.gr_gid);
+        }
+    }
     // SAFETY: `fd` is owned by `file`, which outlives the call and the guard.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();

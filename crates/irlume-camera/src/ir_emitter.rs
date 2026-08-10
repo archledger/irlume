@@ -4026,17 +4026,17 @@ mod tests {
     /// workflow does not contain this file's source, so a needle cannot match
     /// itself the way it did in the test above.
     #[test]
-    fn the_sudo_gate_offers_the_remedy_the_step_can_act_on() {
+    fn the_emitter_gate_names_both_remedies() {
         let workflow = include_str!("../../../.github/workflows/hardware-suite.yml");
         assert!(
-            workflow.contains("sudo -n env IRLUME_LOG_EMITTER_WRITES=1"),
-            "the burst no longer runs through sudo, so the gate message below \
-             has stopped being true; rewrite it with the change (#392)"
+            workflow.contains("env IRLUME_LOG_EMITTER_WRITES=1"),
+            "the burst no longer carries IRLUME_LOG_EMITTER_WRITES in its \
+             invocation; the gate below has stopped being true (#392)"
         );
         assert!(
-            workflow.contains("This step invokes the burst through sudo -n, so passwordless sudo"),
-            "the gate message no longer names passwordless sudo, which is the \
-             only remedy this step can act on while the burst uses it (#393)"
+            workflow.contains("Two remedies"),
+            "the gate message no longer names both remedies: the video group \
+             route and the sudo fallback (#392)"
         );
     }
 

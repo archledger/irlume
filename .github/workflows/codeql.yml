@@ -1,0 +1,66 @@
+# CodeQL analysis for Rust, Python, and GitHub Actions.
+#
+# This checked-in workflow replaces the default setup. The default setup's
+# analyses stalled queued with no runner and no way to re-run or cancel from
+# the CLI (#415). A checked-in workflow is re-runnable, cancelable, and
+# carries a timeout so a stall resolves rather than holding mergeStateStatus
+# at UNSTABLE forever.
+#
+# None of the CodeQL contexts are required for a merge. The cost of a stall is
+# that UNSTABLE is indistinguishable from "checks are still running", so a
+# reviewer applying a green-CI merge bar waits with no end.
+
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    # The branches filter below is the same as the rest of the fleet.
+    branches: ["main"]
+  schedule:
+    # Weekly Saturday at 00:00 UTC.
+    - cron: "0 0 * * 6"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - python
+          - rust
+          # The default setup also included these. Keep them in the matrix
+          # so the set of checks does not change.
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c9402b8612131d4eef358bea70e805bcf5e0e1e6 # v3.28.16
+        with:
+          languages: ${{ matrix.language }}
+          # The default setup uses the default query suite. Keep it.
+          queries: default
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@c9402b8612131d4eef358bea70e805bcf5e0e1e6 # v3.28.16
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@c9402b8612131d4eef358bea70e805bcf5e0e1e6 # v3.28.16
+        with:
+          category: "/language:${{ matrix.language }}"

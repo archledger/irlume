@@ -140,19 +140,16 @@ jobs:
           echo "IR node: $ir"
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT
-          # Run the burst as ROOT when we can. irlume guards its emitter
-          # bookkeeping with a lock in /run/lock, and the daemon creates that
-          # file under `UMask=0027`, so it lands 0640 root:root. The runner
-          # account cannot open it, and irlume then REFUSES to write the
-          # emitter for the rest of the process, saying so on stderr.
-          #
-          # That refusal is why this step needs to be explicit about privilege.
+          # Run the burst unprivileged. Since #392, irlume-camera creates the
+          # emitter lock 0660 root:video, matching /dev/video* (root:video
+          # 0660). The runner account is in the video group, so it can take
+          # the lock directly. Falling back to sudo if the lock is somehow
+          # still unreachable (the daemon has not run yet on this boot).
           # The check below asserts the emitter strobes, and an unprivileged
           # run measures whatever state the emitter was left in by the last
           # root process rather than anything irlume did. It passed at a spread
           # of 17.9 on 2026-08-08 with irlume's emitter control disabled
-          # throughout (#384). Root is also the production context: irlumed
-          # runs as root, so this exercises the path users actually get.
+          # throughout (#384).
           burst="${CARGO_TARGET_DIR:-target}/debug/examples/burst_dump"
           cargo build -q -p irlume-camera --example burst_dump
           if [ ! -x "$burst" ]; then
@@ -160,23 +157,25 @@ jobs:
             exit 1
           fi
           err="$(mktemp)"
-          # Privilege is required, not preferred. The emitter lock lives in
-          # /run/lock and the daemon creates it 0640 root:root under UMask=0027,
-          # so an unprivileged run cannot take it and irlume declines to write.
-          # Root is also the production context: irlumed drives the emitter as
-          # root.
-          #
-          # The gate here and the invocation below must name the same mechanism.
-          # This step runs the burst through `sudo -n`, so passwordless sudo is
-          # what it needs, and a message offering a remedy this step cannot
-          # honour sends an operator to a change that leaves the nightly red.
-          # The #393 review caught exactly that: the group route on #392 is only
-          # half a fix while the burst still goes through sudo.
-          if ! sudo -n true 2>/dev/null; then
-            echo "::error::this runner cannot take the emitter lock, so the emitter check cannot run. The lock is /run/lock/irlume-emitter-*.lock, created 0640 root:root by the daemon under UMask=0027, and this job runs as an unprivileged service account. This step invokes the burst through sudo -n, so passwordless sudo for that account is what it needs today. The route tracked on #392 is a pair: make the lock reachable by the group that can already drive the camera (/dev/video* is root:video), and change this step to run the burst unprivileged. Neither half has been run on hardware. Failing rather than passing, because a check that cannot run has not passed"
+          # irlume-camera creates the emitter lock 0660 root:video, matching
+          # /dev/video* (root:video 0660). The runner account is in the video
+          # group, so the burst runs unprivileged. If the lock is somehow
+          # unreachable, sudo -n is the fallback, and the error message names
+          # both remedies.
+          # The lock is 0660 root:video since #392, so the runner account can
+          # take it directly. Fall back to sudo if the lock is still unreachable
+          # (the daemon has not run yet on this boot, or the machine's video
+          # group has a different gid than the one the daemon set).
+          locked=0
+          if env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"; then
+            locked=1
+          elif grep -q "cannot lock" "$err" && sudo -n true 2>/dev/null; then
+            sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err" && locked=1
+          fi
+          if [ "$locked" -eq 0 ]; then
+            echo "::error::this runner cannot take the emitter lock, so the emitter check cannot run. The lock is /run/lock/irlume-emitter-*.lock, created 0660 root:video by the daemon since #392. Two remedies: (a) make sure the runner account is in the video group, or (b) give it passwordless sudo. Failing rather than passing, because a check that cannot run has not passed"
             exit 1
           fi
-          sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"
           cat "$err"
           # A POSITIVE marker, not the absence of one refusal string. The first
           # version of this guard grepped for the lock refusal, which covers one

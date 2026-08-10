@@ -3084,7 +3084,7 @@ impl Engine {
         &mut self,
         want: usize,
         pitch_neutral: Option<f32>,
-    ) -> irlume_common::Result<Vec<CapturedScan>> {
+    ) -> irlume_common::Result<(Vec<CapturedScan>, CaptureShape)> {
         // Hold the cameras open for the whole loop. This is the heaviest repeated
         // capture in the codebase (the budget below is ten assessments per wanted
         // scan), and every one of them otherwise re-opened, re-negotiated,
@@ -3184,8 +3184,14 @@ impl Engine {
             &mut irlume_camera::IrSession<'_>,
         )>,
         capture_mode: Option<(bool, &'static str)>,
-    ) -> irlume_common::Result<Vec<CapturedScan>> {
+    ) -> irlume_common::Result<(Vec<CapturedScan>, CaptureShape)> {
         let mut out = Vec::new();
+        // Read once, before the loop: `sessions` is borrowed per iteration but
+        // never taken, so this is the whole loop's answer (#389).
+        let mut shape = CaptureShape {
+            held_sessions: sessions.is_some(),
+            ..CaptureShape::default()
+        };
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved) with enough
         // retries that a brief drift near the capture moment doesn't abort enroll.
@@ -3205,6 +3211,7 @@ impl Engine {
                 Some((rs, is)) => self.assess_full_with(Some((rs, is)), capture_mode)?,
                 None => self.assess()?,
             };
+            observe_attempt(&mut shape, a.embedding.as_ref(), a.ir_embedding.as_ref());
             // Authoritative capture gate: LIVE *and* squarely frontal. The guided
             // TUI only decides when to START the 3-2-1; this is what actually
             // decides whether the frame is kept, so a turned/tilted (but live)
@@ -3223,7 +3230,7 @@ impl Engine {
                 }
             }
         }
-        Ok(out)
+        Ok((out, shape))
     }
 
     /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
@@ -3266,15 +3273,11 @@ impl Engine {
         // instead of ten. (First enroll: no neutral yet → capture_scans falls
         // back to the global default band; the scans' pitches become this
         // user's neutral for next time.)
-        let probe = self
-            .capture_scans(1, enr.pitch_neutral())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                irlume_common::Error::Protocol(
-                    "no live scan captured; check lighting and framing".into(),
-                )
-            })?;
+        let (probe_scans, probe_shape) = self.capture_scans(1, enr.pitch_neutral())?;
+        let probe = probe_scans.into_iter().next().ok_or_else(|| {
+            let advice = capture_advice(probe_shape);
+            irlume_common::Error::Protocol(format!("no live scan captured; {advice}"))
+        })?;
         let goal = match enroll_merge_target(
             &enr,
             &[probe.rgb.as_slice()],
@@ -3301,12 +3304,19 @@ impl Engine {
             None => want,
         };
         let mut captured = vec![probe];
+        // The probe's own shape when the loop never ran again: a `goal` of 1 is
+        // already satisfied, and reporting the top-up's empty shape would say
+        // nothing was observed when one attempt was.
+        let mut shape = probe_shape;
         if goal > 1 {
-            captured.extend(self.capture_scans(goal - 1, enr.pitch_neutral())?);
+            let (more, more_shape) = self.capture_scans(goal - 1, enr.pitch_neutral())?;
+            captured.extend(more);
+            shape = more_shape;
         }
         if captured.len() < goal {
+            let advice = capture_advice(shape);
             return Err(irlume_common::Error::Protocol(format!(
-                "only {} live scans (need {goal}); check lighting and framing",
+                "only {} live scans (need {goal}); {advice}",
                 captured.len()
             )));
         }
@@ -3475,8 +3485,8 @@ impl Engine {
             )));
         }
         let want = count.clamp(1, room);
-        let captured = self.capture_scans(want, enr.pitch_neutral())?;
-        if let Some(why) = short_capture_refusal(captured.len(), want) {
+        let (captured, shape) = self.capture_scans(want, enr.pitch_neutral())?;
+        if let Some(why) = short_capture_refusal(captured.len(), want, shape) {
             return Err(irlume_common::Error::Protocol(why));
         }
         // Anti-mixing: reject scans whose face belongs to a different profile.
@@ -3825,12 +3835,99 @@ fn enroll_merge_target(
 /// under-enrolled, so the refusal happens before anything is written, exactly
 /// as enrollment does. A value because the capture it guards sits behind a
 /// camera, so this is the only shape a test can observe.
-fn short_capture_refusal(got: usize, want: usize) -> Option<String> {
+/// What an enrolment capture loop OBSERVED, kept so a loop that captures
+/// nothing can say why without guessing (#389).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CaptureShape {
+    /// The loop ran over held streams, which is the clause that suppresses the
+    /// cross-spectrum self-heal in [`self_heal_may_recapture`]. It matters to
+    /// the message because on the OTHER path the self-heal recaptures RGB
+    /// standalone and reassigns `rgb_top`, so an IR-only attempt there means
+    /// RGB found no face with the sensor to itself, which rules concurrent
+    /// starvation out rather than in.
+    held_sessions: bool,
+    /// Attempts made. Distinguishes "every attempt looked like this" from
+    /// "one did", and a zero here means the loop never ran.
+    attempts: usize,
+    /// Attempts holding an IR embedding and no RGB one. This is the
+    /// dark-login shape [`uncertain_short_circuits`] is named for, and on the
+    /// held path it is ALSO the shape a camera makes when streaming both
+    /// sensors starves its RGB node. Nothing here separates the two.
+    ir_only_attempts: usize,
+}
+
+/// Fold one attempt's outcome into the running shape.
+///
+/// Takes the embeddings themselves rather than two bools. Two `bool` arguments
+/// would let a swapped call site compile and invert the meaning silently, and a
+/// mutation proved no test could catch that; these two types differ, so the
+/// swap is a compile error instead. It takes them rather than the whole
+/// `Assessment` so it can be tested without a camera.
+fn observe_attempt(
+    shape: &mut CaptureShape,
+    rgb_embedding: Option<&[f32; EMBED_DIM]>,
+    ir_embedding: Option<&Vec<f32>>,
+) {
+    shape.attempts += 1;
+    // The dark-login shape. An attempt with NEITHER embedding saw no face at
+    // all, which is the ordinary framing failure and not this.
+    if ir_embedding.is_some() && rgb_embedding.is_none() {
+        shape.ir_only_attempts += 1;
+    }
+}
+
+/// The second reading to offer when an enrolment captured nothing, or `None`
+/// when the evidence does not support offering one (#389).
+///
+/// Deliberately an ADDITION to the lighting advice at every call site, never a
+/// replacement. The two causes are indistinguishable from here: an unlit room
+/// and a camera dimming its colour stream under concurrent load both produce
+/// an IR face with no RGB face, and this repository already records the first
+/// one observed live (`uncertain_short_circuits`, rgb faces=0 / ir faces=1 at
+/// 0.92). Naming only the camera would assert a cause the code cannot
+/// establish, and dropping the room advice would be wrong far more often,
+/// since the shipped capture default is sequential and only a stored
+/// `concurrent` verdict reaches the starvation case at all.
+///
+/// The remedy says "in a lit room" on purpose. `camera-tune` stores its
+/// verdict unconditionally under `ProbeStore::Always`, and `conclusive()`
+/// records retention reading 121%, 122% and 126% at an RGB mean of 17, which
+/// is arithmetic on noise rather than a camera gaining signal. Advising a
+/// re-measure without that qualifier would talk a user in a dark room into
+/// persisting exactly the wrong verdict.
+fn concurrent_starvation_hint(shape: CaptureShape) -> Option<&'static str> {
+    // Held path only, and only when EVERY attempt had the shape. One attempt
+    // out of ten is a user who blinked or turned away; ten out of ten on a
+    // held pair is the structural case #389 measured, where the loop cannot
+    // recover because each attempt fails identically.
+    let every_attempt = shape.attempts > 0 && shape.ir_only_attempts == shape.attempts;
+    (shape.held_sessions && every_attempt).then_some(
+        "The infrared sensor found a face on every attempt and the colour sensor found none. \
+         If the room was lit, this camera may be dimming its colour stream while both sensors \
+         run; re-run `sudo irlume camera-tune` in a lit room to re-measure it.",
+    )
+}
+
+/// The advice tail every enrolment capture failure ends with.
+///
+/// One function because all three failure sites say the same thing and drifted
+/// apart is how one of them keeps blaming the room after the others learn not
+/// to. The lighting clause is unconditional; [`concurrent_starvation_hint`]
+/// only ever appends.
+fn capture_advice(shape: CaptureShape) -> String {
+    let mut advice = String::from("check lighting and framing");
+    if let Some(hint) = concurrent_starvation_hint(shape) {
+        advice.push_str(". ");
+        advice.push_str(hint);
+    }
+    advice
+}
+
+fn short_capture_refusal(got: usize, want: usize, shape: CaptureShape) -> Option<String> {
     (got < want).then(|| {
         let scans = if got == 1 { "scan" } else { "scans" };
-        format!(
-            "only {got} live {scans} captured (need {want}); nothing was saved, check lighting and framing"
-        )
+        let advice = capture_advice(shape);
+        format!("only {got} live {scans} captured (need {want}); nothing was saved, {advice}")
     })
 }
 
@@ -4961,14 +5058,127 @@ mod tests {
     }
 
     #[test]
+    fn an_attempt_counts_as_ir_only_when_ir_saw_a_face_and_rgb_did_not() {
+        // The tally that feeds the hint. Its two arguments have DIFFERENT
+        // types on purpose, so a swapped call site is a compile error rather
+        // than a silent inversion; each combination is pinned here.
+        let rgb = [0.0f32; EMBED_DIM];
+        let ir = vec![0.0f32; 8];
+        let mut shape = CaptureShape::default();
+        observe_attempt(&mut shape, None, Some(&ir)); // the shape #389 is about
+        assert_eq!((shape.attempts, shape.ir_only_attempts), (1, 1));
+        observe_attempt(&mut shape, Some(&rgb), Some(&ir)); // both saw a face
+        assert_eq!((shape.attempts, shape.ir_only_attempts), (2, 1));
+        observe_attempt(&mut shape, Some(&rgb), None); // RGB only: not this shape
+        assert_eq!((shape.attempts, shape.ir_only_attempts), (3, 1));
+        observe_attempt(&mut shape, None, None); // no face at all: framing
+        assert_eq!(
+            (shape.attempts, shape.ir_only_attempts),
+            (4, 1),
+            "an attempt that saw no face anywhere is an ordinary miss, not starvation"
+        );
+    }
+
+    #[test]
+    fn the_starvation_hint_needs_the_held_path_and_every_attempt() {
+        // #389: on a pair stored `concurrent` whose camera starves RGB, every
+        // enrolment attempt comes back with an IR face and no RGB face, and the
+        // message blamed the room. The hint is offered only where the evidence
+        // permits it.
+        let held_all = CaptureShape {
+            held_sessions: true,
+            attempts: 10,
+            ir_only_attempts: 10,
+        };
+        assert!(concurrent_starvation_hint(held_all).is_some());
+
+        // NOT on the fallback path. There `self_heal_may_recapture` returns
+        // true, RGB is recaptured standalone and `rgb_top` reassigned, so an
+        // IR-only attempt means RGB found no face WITH THE SENSOR TO ITSELF.
+        // That rules concurrent starvation out; offering it would assert a
+        // cause the code just disproved.
+        assert!(concurrent_starvation_hint(CaptureShape {
+            held_sessions: false,
+            ..held_all
+        })
+        .is_none());
+
+        // NOT when only some attempts had the shape: that is a user who moved,
+        // and the loop recovers from it. The structural case fails identically
+        // every time, which is why it exhausts the budget.
+        assert!(concurrent_starvation_hint(CaptureShape {
+            ir_only_attempts: 9,
+            ..held_all
+        })
+        .is_none());
+
+        // NOT when the loop never ran. Zero of zero is vacuously "every
+        // attempt", which is the permissive default this guard must not have.
+        assert!(concurrent_starvation_hint(CaptureShape {
+            attempts: 0,
+            ir_only_attempts: 0,
+            ..held_all
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn the_capture_advice_always_keeps_the_lighting_clause() {
+        // The two causes are indistinguishable from here. An unlit room
+        // produces the identical shape, and this repository records it observed
+        // live (`uncertain_short_circuits`: rgb faces=0, ir faces=1 at 0.92).
+        // So the hint ADDS a second reading and never replaces the first.
+        //
+        // Deliberately NOT asserted anywhere: that some message omits the word
+        // lighting. Such an assertion would pin the regression in place, making
+        // the removal of correct dark-room advice a requirement to stay green.
+        let held_all = CaptureShape {
+            held_sessions: true,
+            attempts: 10,
+            ir_only_attempts: 10,
+        };
+        let with_hint = capture_advice(held_all);
+        assert!(
+            with_hint.contains("check lighting and framing"),
+            "the room advice must survive the hint: {with_hint}"
+        );
+        assert!(
+            with_hint.contains("dimming its colour stream"),
+            "the second reading must be offered: {with_hint}"
+        );
+        // The remedy is qualified on purpose. `camera-tune` stores under
+        // `ProbeStore::Always` without consulting `conclusive()`, and retention
+        // reads 121-126% at an RGB mean of 17, so advising a re-measure without
+        // "lit room" talks a user in the dark into persisting a Concurrent
+        // verdict computed from noise.
+        assert!(
+            with_hint.contains("in a lit room"),
+            "the re-measure advice must name the lighting it needs: {with_hint}"
+        );
+        assert!(
+            !with_hint.contains("  "),
+            "doubled space in a user-facing string: {with_hint}"
+        );
+
+        let plain = capture_advice(CaptureShape::default());
+        assert_eq!(
+            plain, "check lighting and framing",
+            "without the evidence the message is unchanged"
+        );
+    }
+
+    #[test]
     fn a_short_capture_is_refused_before_anything_is_saved() {
         // capture_scans is best-effort, so a request for ten that yields one
         // must refuse rather than save a partial set and report success
         // (#290 review). The capture sits behind a camera, so the decision is
         // the observable shape.
-        assert!(short_capture_refusal(3, 3).is_none());
-        assert!(short_capture_refusal(1, 1).is_none());
-        let why = short_capture_refusal(1, 10).expect("a short capture must refuse");
+        // A default shape adds nothing: this test is about the count, and the
+        // starvation hint has its own.
+        let plain = CaptureShape::default();
+        assert!(short_capture_refusal(3, 3, plain).is_none());
+        assert!(short_capture_refusal(1, 1, plain).is_none());
+        let why = short_capture_refusal(1, 10, plain).expect("a short capture must refuse");
         assert!(why.contains("only 1 live scan captured (need 10)"), "{why}");
         assert!(
             why.contains("nothing was saved"),
@@ -4980,10 +5190,10 @@ mod tests {
             !why.contains("  "),
             "doubled space in a user-facing string: {why}"
         );
-        let plural = short_capture_refusal(2, 10).expect("a short capture must refuse");
+        let plural = short_capture_refusal(2, 10, plain).expect("a short capture must refuse");
         assert!(plural.contains("only 2 live scans captured"), "{plural}");
         // Zero is short too, which is the case that always refused.
-        assert!(short_capture_refusal(0, 1).is_some());
+        assert!(short_capture_refusal(0, 1, plain).is_some());
     }
 
     #[test]

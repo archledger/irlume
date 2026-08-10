@@ -177,6 +177,131 @@ for derived in packaging/ppa/build-ppa-container.sh nix/package.nix; do
 done
 
 echo
+echo "== every lane pins the same ONNX Runtime =="
+# irlume builds `ort` with `load-dynamic`, so libonnxruntime.so is whatever the
+# host supplies at runtime and the version each lane bundles IS the version its
+# users run. Eight files name it and nothing made them agree (#411): a lane
+# bumped on its own ships a runtime no CI job ever executed, and the embedding
+# gate in irlume-vision (#407) would stay green while the numbers it pins moved
+# under the shipped package.
+#
+# Each lane spells the pin its own way, so extraction is per file and an
+# unlisted file is a hard error rather than a skip. Same reason as dest_for()
+# above: a pattern that silently matches nothing yields an empty string, and two
+# empty strings compare equal, which is a guard reporting ok while checking
+# nothing.
+ort_pin_of() {
+  case "$1" in
+    .github/workflows/ci.yml|.github/workflows/asan.yml|.github/workflows/install-matrix.yml)
+      sed -n 's/^[[:space:]]*ver=\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$1" ;;
+    flake.nix|nix/module.nix)
+      # Only the `ortVersion` binding. Both files interpolate it into the
+      # derivation label and the fetch URL, so reading the binding reads what is
+      # actually downloaded. Matching a bare `version =` instead would read a
+      # label that a bump could move while the URL kept fetching the old archive.
+      sed -n 's/.*[oO]rt[Vv]ersion = "\([0-9][0-9.]*\)".*/\1/p' "$1" ;;
+    packaging/fedora/irlume.spec)
+      sed -n 's/^%global ort_ver \([0-9][0-9.]*\).*/\1/p' "$1" ;;
+    packaging/debian/build-deb.sh|scripts/build-ppa-source.sh)
+      # shellcheck disable=SC2016  # ${ORT_VER:-...} is literal text in those files
+      sed -n 's/^ORT_VER="${ORT_VER:-\([0-9][0-9.]*\)}".*/\1/p' "$1" ;;
+    *)
+      echo "  ERROR: no ONNX Runtime pin pattern known for $1;" >&2
+      echo "  add one to ort_pin_of() in $0 rather than leaving it unchecked." >&2
+      exit 1
+      ;;
+  esac
+}
+
+ORT_PINNED_BY=(
+  .github/workflows/ci.yml
+  .github/workflows/asan.yml
+  .github/workflows/install-matrix.yml
+  flake.nix
+  nix/module.nix
+  packaging/fedora/irlume.spec
+  packaging/debian/build-deb.sh
+  scripts/build-ppa-source.sh
+)
+
+# How many times each file is expected to name it. Counting DISTINCT values is
+# not enough: ci.yml fetches the runtime in three separate jobs, and deleting
+# one of those steps leaves the other two agreeing, so a uniqueness check would
+# report ok for a workflow that had silently stopped pinning a lane.
+declare -A ORT_PIN_COUNT=(
+  [.github/workflows/ci.yml]=3
+  [.github/workflows/asan.yml]=1
+  [.github/workflows/install-matrix.yml]=1
+  [flake.nix]=1
+  [nix/module.nix]=1
+  [packaging/fedora/irlume.spec]=1
+  [packaging/debian/build-deb.sh]=1
+  [scripts/build-ppa-source.sh]=1
+)
+
+ort_ref=""
+for f in "${ORT_PINNED_BY[@]}"; do
+  want="${ORT_PIN_COUNT[$f]:-}"
+  if [ -z "$want" ]; then
+    echo "  ERROR: no expected pin count for $f; add one to ORT_PIN_COUNT in $0" >&2
+    exit 1
+  fi
+  all="$(ort_pin_of "$f")"
+  n="$(printf '%s' "$all" | grep -c . || true)"
+  if [ "$n" -ne "$want" ]; then
+    printf '  MISS  %-42s expected %s pin(s), found %s\n' "$f" "$want" "$n"
+    fail=1
+    continue
+  fi
+  found="$(printf '%s\n' "$all" | sort -u)"
+  u="$(printf '%s' "$found" | grep -c . || true)"
+  if [ "$u" -ne 1 ]; then
+    printf '  MISS  %-42s names %s different versions\n' "$f" "$u"
+    fail=1
+    continue
+  fi
+  printf '  ok    %-42s %s\n' "$f" "$found"
+  if [ -z "$ort_ref" ]; then
+    ort_ref="$found"
+  elif [ "$found" != "$ort_ref" ]; then
+    printf '  ERROR %-42s pins %s, but %s pins %s\n' \
+      "$f" "$found" "${ORT_PINNED_BY[0]}" "$ort_ref"
+    fail=1
+  fi
+done
+
+# The developer guide hands out copy-paste setup commands carrying the version,
+# so a contributor who follows it after a bump installs a runtime no lane ships.
+# The dated survey under docs/cross-distro/ is deliberately NOT checked: it
+# records what was true on its date and is not instructions.
+if [ -z "$ort_ref" ]; then
+  echo "  ERROR: no ONNX Runtime version could be read from any lane"
+  fail=1
+else
+  # EVERY place the recipe names it, not just one. The version appears in the
+  # download URL, the tarball, the tar command, the exported library path, the
+  # dependency table and the .deb soname example. Checking one of them passes a
+  # document that downloads one version and puts a different one on
+  # ORT_DYLIB_PATH, which is a working command sequence that loads the wrong
+  # library.
+  doc_needs=(
+    "onnxruntime **$ort_ref** (\`ORT_DYLIB_PATH\`)"
+    "releases/download/v$ort_ref/onnxruntime-linux-x64-$ort_ref.tgz"
+    "tar xzf onnxruntime-linux-x64-$ort_ref.tgz"
+    "ORT_DYLIB_PATH=\"\$PWD/onnxruntime-linux-x64-$ort_ref/lib/libonnxruntime.so\""
+    "libonnxruntime.so.$ort_ref"
+  )
+  for need in "${doc_needs[@]}"; do
+    if grep -Fq -- "$need" docs/DEVELOPMENT.md; then
+      printf '  ok    %-42s %s\n' docs/DEVELOPMENT.md "$need"
+    else
+      printf '  MISS  %-42s %s\n' docs/DEVELOPMENT.md "$need"
+      fail=1
+    fi
+  done
+fi
+
+echo
 echo
 echo "== AppArmor runtime rules in both executable-path variants =="
 APPARMOR_PROFILES=(

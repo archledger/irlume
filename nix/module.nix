@@ -78,14 +78,20 @@ let
       };
     };
 
-  # The pinned onnxruntime 1.24.4 build. NixOS stable ships 1.22.2, which is
-  # below irlume's 1.24 API floor and deadlocks the `ort` loader at startup, so
-  # bundle the exact upstream release the RPM and .deb carry.
+  # The pinned onnxruntime build. NixOS stable ships 1.22.2, which is below
+  # irlume's 1.24 API floor and deadlocks the `ort` loader at startup, so bundle
+  # the exact upstream release the RPM and .deb carry.
+  #
+  # One binding, interpolated into the label and the URL, the way flake.nix
+  # already does it. Written out three times, a bump could change the derivation
+  # label while still fetching the old archive, and the parity check in
+  # scripts/check-packaging-parity.sh reads the label (#411).
+  ortVersion = "1.24.4";
   onnxruntime-bin = pkgs.stdenv.mkDerivation {
     pname = "onnxruntime-linux-x64";
-    version = "1.24.4";
+    version = ortVersion;
     src = pkgs.fetchurl {
-      url = "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz";
+      url = "https://github.com/microsoft/onnxruntime/releases/download/v${ortVersion}/onnxruntime-linux-x64-${ortVersion}.tgz";
       hash = "sha256-OiEfvqJSweZikGWPG3NbdyBWFJ8oMh5xwwiULNtUt0c=";
     };
     nativeBuildInputs = [ pkgs.autoPatchelfHook ];

@@ -3674,7 +3674,14 @@ fn accumulate(
     into.rounds += 1;
 }
 
-fn frame_mean(data: &[u8]) -> f32 {
+/// Mean of every byte in a frame.
+///
+/// Public because the enrolment failure probe in `irlume-auth` compares against
+/// [`CONCLUSIVE_SCENE_BRIGHTNESS`] and [`CONCURRENT_SIGNAL_FLOOR`], and those
+/// constants were measured against THIS statistic. A private reimplementation
+/// there would be comparing one brightness definition to thresholds fitted to
+/// another.
+pub fn frame_mean(data: &[u8]) -> f32 {
     if data.is_empty() {
         return 0.0;
     }

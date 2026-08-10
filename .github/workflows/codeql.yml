@@ -51,16 +51,16 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@c9402b8612131d4eef358bea70e805bcf5e0e1e6 # v3.28.16
+        uses: github/codeql-action/init@404bd795832c959ffb8efae2b1b4cc1aafc82058 # v3.37.6
         with:
           languages: ${{ matrix.language }}
           # The default setup uses the default query suite. Keep it.
           queries: default
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@c9402b8612131d4eef358bea70e805bcf5e0e1e6 # v3.28.16
+        uses: github/codeql-action/autobuild@404bd795832c959ffb8efae2b1b4cc1aafc82058 # v3.37.6
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@c9402b8612131d4eef358bea70e805bcf5e0e1e6 # v3.28.16
+        uses: github/codeql-action/analyze@404bd795832c959ffb8efae2b1b4cc1aafc82058 # v3.37.6
         with:
           category: "/language:${{ matrix.language }}"

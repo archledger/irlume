@@ -3304,11 +3304,16 @@ impl Engine {
             width: frame.width,
             height: frame.height,
         };
-        let found = self
-            .det
-            .detect(&view)
-            .map(|faces| faces.iter().any(irlume_vision::detection_is_finite))
-            .unwrap_or(false);
+        // A detector ERROR is not an observation that no face was there, and
+        // collapsing the two would let a broken detector read as a refutation.
+        // Nothing is confirmed without a detection that actually ran.
+        let found = match self.det.detect(&view) {
+            Ok(faces) => faces.iter().any(irlume_vision::detection_is_finite),
+            Err(e) => {
+                irlume_common::dlog!("enroll: solo RGB probe: detector failed ({e}); no verdict");
+                return None;
+            }
+        };
         irlume_common::dlog!(
             "enroll: solo RGB probe after release: held mean {held_mean:.1}, solo mean \
              {solo_mean:.1}, face {found}"
@@ -4007,14 +4012,24 @@ fn observe_attempt(
     }
 }
 
-/// Does a solo RGB frame, taken after the held sessions were released, confirm
-/// that concurrent streaming was starving this camera (#389)?
+/// Did a solo RGB frame, taken after the held sessions were released, come back
+/// bright with a face where the held attempts came back dark without one (#389)?
 ///
-/// This is the discriminator the held path cannot produce for itself. While
-/// both streams run, an unlit room and a starved RGB interface are the same
-/// reading: no RGB face, IR face present. They stop being the same once the
-/// sessions are gone, and the three clauses below are
-/// `irlume_camera`'s own contention rule, reused rather than reinvented.
+/// ⛔ This does NOT establish that concurrency caused the difference, and the
+/// message it feeds must not say so. Nothing here records that the light, the
+/// framing or the person stayed the same between the two observations: a lamp
+/// switching on, or the subject stepping back into frame, produces this reading
+/// with no camera fault at all. What it establishes is that two captures
+/// seconds apart, one overlapped and one not, disagreed.
+///
+/// That is still worth having, because it is the shape a camera that cannot
+/// sustain both streams makes, and because `camera-tune` measures the thing
+/// directly. It is not worth asserting a cause over.
+///
+/// While both streams run, an unlit room and a starved RGB interface are the
+/// same reading: no RGB face, IR face present. They differ after the release,
+/// and the three clauses below are `irlume_camera`'s own contention rule,
+/// reused rather than reinvented.
 ///
 /// Measured on a NexiGo HelloCam N930W, 2026-08-10, ten runs across three
 /// conditions, `frame_mean` throughout so these constants are compared against
@@ -4075,7 +4090,13 @@ fn concurrent_starvation_hint(shape: CaptureShape) -> Option<&'static str> {
 /// to. The lighting clause is unconditional; [`concurrent_starvation_hint`]
 /// only ever appends.
 fn capture_advice(shape: CaptureShape, solo_probe: Option<bool>) -> String {
-    match solo_probe {
+    // A refutation is deliberately treated as no probe at all. It would
+    // otherwise DELETE a correct hint on the strength of an observation that
+    // may have tested a different scene: a user who turned away before the solo
+    // frame refutes a camera that really is starving. Only the confirming
+    // direction changes anything, and even that names an observation rather
+    // than a cause.
+    match solo_probe.filter(|confirmed| *confirmed) {
         // The probe ran and confirmed it. The lighting clause is DROPPED here,
         // which #414 forbade for good reason at the time: darkness and
         // contention were the same reading, so naming one asserted a cause the
@@ -4083,17 +4104,15 @@ fn capture_advice(shape: CaptureShape, solo_probe: Option<bool>) -> String {
         // `solo_mean >= CONCLUSIVE_SCENE_BRIGHTNESS`, so the room being lit is
         // measured rather than assumed, and telling this user to check their
         // lighting would send them after the wrong thing.
-        Some(true) => String::from(
-            "this camera lost its colour frame while both sensors were streaming and found it \
-             again once they were not, so it is dimming its colour stream under concurrent \
-             capture. Run `sudo irlume camera-tune` in a lit room to re-measure it",
+        Some(_) => String::from(
+            "the colour frame was dark on every attempt while both sensors were streaming, and \
+             a capture taken straight afterwards with only the colour sensor running found a \
+             face. That is the shape of a camera that cannot sustain both streams; run `sudo \
+             irlume camera-tune` in a lit room to measure it directly. Light that changed \
+             between those two moments would look the same from here",
         ),
-        // The probe ran and did NOT confirm. That is evidence against the
-        // camera, so the speculative second reading is dropped rather than
-        // offered: a solo frame that also found nothing points at the room or
-        // the framing, which is what the plain advice already says.
-        Some(false) => String::from("check lighting and framing"),
-        // No probe. Unchanged from #414: offer both readings, assert neither.
+        // Not confirmed, whether the probe refuted it or never ran. Unchanged
+        // from #414: offer both readings, assert neither.
         None => {
             let mut advice = String::from("check lighting and framing");
             if let Some(hint) = concurrent_starvation_hint(shape) {
@@ -5490,7 +5509,7 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_probe_names_the_camera_and_a_refuted_one_stops_guessing() {
+    fn a_confirmed_probe_reports_an_observation_and_a_refutation_changes_nothing() {
         let held_all = CaptureShape {
             held_sessions: true,
             attempts: 10,
@@ -5498,28 +5517,37 @@ mod tests {
             ..CaptureShape::default()
         };
 
-        // Confirmed: the room being lit is part of the confirmation, so telling
-        // this user to check their lighting would send them after the wrong
-        // thing. #414 forbade dropping that clause when the two causes were
-        // indistinguishable; they are distinguishable here, by measurement.
+        // Confirmed: the message reports what was OBSERVED and names the
+        // remedy. It must NOT assert a cause. Nothing recorded that the light,
+        // the framing or the person held still between the held attempts and
+        // the solo frame, so a lamp switching on produces this same reading
+        // with no camera fault at all, and the message has to say so.
         let confirmed = capture_advice(held_all, Some(true));
         assert!(
-            confirmed.contains("dimming its colour stream"),
+            confirmed.contains("cannot sustain both streams"),
             "{confirmed}"
         );
-        assert!(confirmed.contains("in a lit room"), "{confirmed}");
+        assert!(confirmed.contains("camera-tune"), "{confirmed}");
         assert!(
-            !confirmed.contains("check lighting and framing"),
-            "a confirmed camera fault must not send the user after the room: {confirmed}"
+            confirmed.contains("Light that changed"),
+            "a confirmation must name the confound it cannot rule out: {confirmed}"
+        );
+        assert!(
+            !confirmed.contains("so it is dimming"),
+            "the message must not assert a mechanism it did not establish: {confirmed}"
         );
 
-        // Refuted: evidence AGAINST the camera, so the speculative second
-        // reading goes away rather than being offered anyway.
+        // Refuted: treated as no probe at all. It must NOT delete the hint,
+        // because a user who turned away before the solo frame refutes a camera
+        // that really is starving.
         let refuted = capture_advice(held_all, Some(false));
-        assert_eq!(refuted, "check lighting and framing");
+        let unprobed = capture_advice(held_all, None);
+        assert_eq!(
+            refuted, unprobed,
+            "a refutation may not suppress a hint it did not disprove"
+        );
 
         // No probe: unchanged from #414, both readings, neither asserted.
-        let unprobed = capture_advice(held_all, None);
         assert!(
             unprobed.contains("check lighting and framing"),
             "{unprobed}"

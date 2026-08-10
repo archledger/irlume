@@ -2074,6 +2074,227 @@ mod model_tests {
         };
         assert!(b.detect_top(&view).expect("blaze flat").is_none());
     }
+
+    /// The recognizer's output for one fixed input, pinned so a runtime bump
+    /// cannot move it silently (#407).
+    ///
+    /// Every bump of `ort` or of the system libonnxruntime raises the same
+    /// question: did the embedding move? If it moves, stored templates stop
+    /// matching and face login breaks for everyone. #400 sat held across two
+    /// sessions on exactly that question with nothing in CI able to answer it.
+    ///
+    /// This is NOT a model-identity check. Substituted weights are already
+    /// caught by digest: `verify_models` refuses an unmanifested file, and the
+    /// recognizer's sha256 is the `embed:<sha256>` space tag that
+    /// `recognizer_space_matches` filters stored scans by. What has no check is
+    /// the same weights producing different numbers because the code around
+    /// them changed.
+    ///
+    /// The input is generated from source, so there is no fixture to be
+    /// missing. The reference below was produced through this exact call,
+    /// `Embedder::embed`, and each literal is the shortest decimal that recovers
+    /// the produced f32 exactly (checked: 0 of 512 bit patterns differ after a
+    /// parse round trip).
+    ///
+    /// To regenerate after a DELIBERATE model change: embed `chip(407)` through
+    /// `Embedder::load_from_file(models/glintr100.onnx)` and print each value
+    /// with `{x}`, which is the shortest form that round-trips. Regenerating it to make a red build green is the one thing
+    /// this test exists to stop; a moved embedding means every stored template
+    /// needs rebuilding, which is a release decision, not a test fix.
+    const PINNED_EMBEDDING_INPUT_SEED: usize = 407;
+
+    #[rustfmt::skip]
+    const PINNED_EMBEDDING: [f32; 512] = [
+        0.029995121, 0.0014166719, 0.0020402235, 0.014254528,
+        0.011926355, -0.036213387, 0.044169907, -0.024813965,
+        0.022162063, 0.046369597, 0.024424369, -0.016525274,
+        0.03849447, -0.096233934, 0.07937545, 0.067336634,
+        -0.053351287, -0.0043647788, 0.0051694303, 0.020206273,
+        -0.015928295, 0.037002437, 0.05370502, -0.020274255,
+        0.04762521, -0.040475655, 0.0040398226, -0.03137684,
+        0.07121896, -0.047310084, 0.036222853, 0.04307064,
+        0.08602117, -0.09514317, 0.04309357, 0.032947503,
+        0.0540207, -0.039501533, 0.015859777, 0.012577115,
+        -0.04054659, 0.023756629, 0.005816215, 0.07307888,
+        0.07079278, -0.016155552, -0.0227572, -0.017830571,
+        0.03363676, 0.03196359, 0.04036348, -0.07874168,
+        -0.089575864, -0.0028569822, -0.031764433, 0.047308303,
+        -0.01766336, 0.062314928, 0.03508153, 0.03512136,
+        0.06157159, 0.020451771, 0.03210424, 0.025157899,
+        0.053755764, -0.00065568404, -0.014167831, -0.06953798,
+        -0.064944424, 0.1122318, 0.0069501544, -0.08314379,
+        0.06111449, 0.009454692, 0.069554135, 0.064254165,
+        -0.004926724, -0.020213386, 0.018369516, 0.010499094,
+        -0.04219804, 0.03278748, 0.037654955, 0.07099966,
+        0.02731853, 0.0005481255, -0.010560577, 0.022787753,
+        0.011686196, -0.038329825, 0.051674422, -0.016532348,
+        -0.038124114, -0.041709226, 0.015981551, 0.053457506,
+        -0.054123078, 0.08355059, 0.041692104, 0.034547962,
+        0.06327536, -0.034453746, -0.0015290545, 0.070491,
+        0.041506633, -0.048917074, -0.057771243, 0.014395404,
+        -0.05335476, 0.031386796, 0.09405001, 0.05391051,
+        0.03973691, 0.006925951, -0.019593082, -0.054839034,
+        -0.03976173, 0.004442516, -0.08442578, -0.08004597,
+        0.005890937, -0.06430008, -0.08777003, 0.030459959,
+        0.0067805075, -0.037434995, -0.065670796, 0.044200324,
+        0.07962629, -0.0412307, -0.048132613, -0.03468675,
+        0.0089764735, 0.032313943, 0.030249655, -0.033929303,
+        -0.04291338, 0.035822757, -0.062125344, 0.010396728,
+        -0.005591359, 0.020371215, -0.01146664, -0.01985034,
+        0.019709282, -0.12048209, -0.0008376113, -0.058092177,
+        -0.06732625, 0.037971944, 0.020402422, -0.094012305,
+        -0.113028206, -0.07724785, 0.016864931, 0.0023048394,
+        0.008175025, -0.02658455, -0.019402573, -0.05312908,
+        -0.0003552251, 0.05567776, -0.041984074, 0.0105409445,
+        0.046553608, -0.021151334, 0.012289747, 0.00043715193,
+        0.008469857, -0.0073228455, 0.033006452, -0.116647504,
+        0.039269354, 0.0071769874, -0.027033756, -0.038385548,
+        0.008482665, -0.0743461, -0.046226416, -0.005535116,
+        0.03913644, 0.07788077, -0.0014398039, -0.019475762,
+        -0.029636044, -0.015861718, -0.018677903, -0.09848652,
+        -0.035407297, -0.056273505, 0.029353442, -0.007670897,
+        0.047211703, 0.07537073, 0.010195655, -0.09893418,
+        -0.023627436, 0.05362179, -0.022168322, 0.04821656,
+        0.006940184, -0.018224979, 0.0016539426, 0.0374971,
+        -0.05726897, -0.055189807, -0.028260823, -0.05005094,
+        0.001970012, -0.0023274536, 0.0052474593, 0.033491407,
+        0.0007445749, 0.062082205, 0.01302158, -0.03595406,
+        0.029813975, 0.021377258, -0.0030084536, -0.035755917,
+        0.04651066, -0.0072153993, -0.038368367, -0.08486164,
+        -0.03418869, -0.025674729, 0.03019814, -0.047547054,
+        0.015668098, -0.039265838, 0.03839465, -0.006413219,
+        -0.014875994, 0.026912363, 0.06524671, 0.022029433,
+        -0.0042617815, -0.065602005, 0.06438596, 0.04757148,
+        0.017477661, 0.04821321, 0.015742544, 0.003198886,
+        -0.004948055, 0.023277516, -0.07057149, 0.06614567,
+        0.0033475268, 0.059136167, 0.02861264, 0.04750015,
+        0.015854942, 0.06569421, 0.054818235, -0.015289793,
+        0.0065297233, 0.06097916, 0.039001312, -0.05915306,
+        0.004535168, 0.012569357, 0.036376618, -0.011379976,
+        0.003721676, 0.019682031, -0.055980593, 0.008417797,
+        0.00043694393, -0.003268377, 0.0077152885, -0.06693971,
+        -0.057957508, -0.00045101187, -0.024090452, -0.036998995,
+        0.005169454, 0.08990616, 0.03277955, 0.093449906,
+        -0.020684492, 0.039875172, 0.06463166, 0.050216857,
+        0.019143794, -0.036567573, -0.011057957, -0.0147665115,
+        0.024982447, -0.009663402, 0.008762217, 0.02258722,
+        0.051427953, 0.0060220268, 0.038549975, 0.055775724,
+        -0.04096853, 0.06137033, 0.00022905042, -0.06756909,
+        -0.048562214, -0.082015306, -0.04214249, 0.033497512,
+        0.028546182, 0.06318826, 0.007077028, 0.018804356,
+        0.027513072, -0.013862382, -0.0898142, -0.0047879545,
+        0.0073032444, -0.06327748, -0.015553002, -0.064446084,
+        0.014829904, -0.0378258, 0.028030988, -0.017138215,
+        0.006445099, -0.022937652, -0.01595658, -0.0060417284,
+        0.017101761, 0.033595897, -0.025956837, -0.055961803,
+        0.036868222, -0.028057002, -0.04787499, -0.03572514,
+        0.00660318, 0.051220655, -0.010776498, -0.0033353288,
+        0.07171235, -0.0022088941, -0.00084178936, 0.008463577,
+        -0.050021872, -0.0148207275, 0.009977487, 0.048792496,
+        0.0021765467, 0.008420294, 0.018199082, -0.011468738,
+        -0.09843892, 0.034041718, 0.031157123, 0.035626657,
+        0.012101083, -0.012440692, 0.060084876, -0.0014965989,
+        -0.06225861, -0.026717385, -0.049237784, 0.06923268,
+        0.035126466, 0.01488954, -0.039162397, 0.018537981,
+        -0.06956496, -0.03425779, 0.04573646, 0.07888888,
+        0.07765283, 0.079706885, 0.032712985, -0.013319591,
+        -0.004507918, 0.059254486, -0.0015158748, 0.024816018,
+        -0.06885232, 0.021429347, 0.051219985, 0.046289153,
+        -0.056514762, -0.03094389, -0.090222284, 0.06912247,
+        0.015735686, -0.05678229, -0.06396115, -0.011889195,
+        0.07139506, -0.058049534, -0.034142558, -0.00578488,
+        0.031156639, -0.007880553, -0.017080659, -0.003923248,
+        -0.047255382, 0.0013203785, 0.10919495, 0.02676319,
+        -0.06627377, 0.01418484, -0.0141885, 0.042260516,
+        -0.044351254, 0.03725843, -0.039528884, 0.011184534,
+        0.031878468, 0.009580645, 0.066129826, 0.00635088,
+        0.08513904, -0.05516454, -0.032080844, -0.0002681059,
+        -0.013004969, -0.007917587, -0.018299233, -0.018449623,
+        -0.040079936, -0.09550881, 0.00673156, -0.003017997,
+        -0.036891825, -0.06264093, 0.015325745, 0.013034053,
+        -0.0687447, 0.036927868, -0.068100065, 0.035950433,
+        0.026464768, 0.0140524, -0.035220604, 0.044109594,
+        0.04929371, -0.0032532164, -0.04743611, -0.0011073439,
+        -0.048087783, -0.0018122109, -0.031735886, 0.081561014,
+        -0.028926082, -0.008528965, -0.034322303, -0.02821908,
+        0.0427432, 0.036655594, 0.052136, -0.048378058,
+        -0.11095038, 0.058948766, 0.027479464, 0.0008392436,
+        -0.010474043, -0.018060707, -0.022299528, 0.06362306,
+        -0.07847769, -0.012682946, 0.019808872, 0.06342296,
+        -0.08643963, -0.09386584, 0.045855936, 0.02614116,
+        -0.046560317, -0.0016023838, 0.05482824, -0.0026462707,
+        0.02828732, 0.094368316, 0.03333053, -0.0035935564,
+        -0.005006819, -0.020800004, 0.015053923, 0.062174212,
+        -0.005102557, -0.004403445, 0.06648165, 0.03559785,
+        -0.0023784845, 0.07042685, -0.020621859, 0.012918192,
+        0.0073931483, -0.076741114, 0.025736488, 0.013970392,
+        -0.08476668, 0.008396308, 0.024548313, -0.05660866,
+        0.008646235, -0.00008671607, 0.055388905, 0.03178783,
+        0.021187669, 0.019238811, -0.054686036, -0.052129336,
+        0.004563334, 0.028938062, -0.010730265, 0.038116764,
+        -0.013360291, -0.088038795, -0.060998444, -0.052077238,
+    ];
+
+    /// How far the embedding may move before the gate fails, as `1 - cosine`.
+    ///
+    /// Measured on this repo's own recognizer rather than chosen: perturbing the
+    /// pipeline in the ways two machines differ moved it by at most 1.5e-12
+    /// (graph optimization Level3 against Level1, Level2 and off; intra-op
+    /// thread counts 1, 2, 4 and 8 were bit-identical), while embedding a
+    /// DIFFERENT input scored 2.7e-1. The floor sits six orders above the
+    /// largest perturbation that could be produced and five below a change that
+    /// would mean anything. In per-element terms it trips when the average
+    /// element moves more than about 6e-5, which is six times the 1e-5
+    /// element-wise band ONNX Runtime maintainers state as expected variation.
+    ///
+    /// It is deliberately NOT a sha256 of the output bytes. ONNX Runtime
+    /// publishes no reproducibility guarantee, its MLAS layer picks a different
+    /// GEMM kernel per CPUID, `GraphOptimizationLevel::Level3` enables layout
+    /// optimization whose NCHWc block size depends on AVX-512 availability, and
+    /// `load-dynamic` means the libonnxruntime under this crate is whatever the
+    /// host installed. A byte gate would go red on a runner swap and teach
+    /// everyone to ignore it.
+    const PINNED_EMBEDDING_MAX_COSINE_DRIFT: f64 = 1e-6;
+
+    #[test]
+    fn the_recognizer_embedding_of_a_fixed_input_has_not_moved() {
+        let mut e = embedder();
+        let got = e
+            .embed(&chip(PINNED_EMBEDDING_INPUT_SEED))
+            .expect("embed the pinned chip");
+
+        // Accumulated in f64 on purpose. `align::cosine` returns f32, whose
+        // spacing near 1.0 is about 6e-8, so it cannot resolve a drift of 1e-6
+        // from one of 1e-12 and the assertion would be reporting its own
+        // precision rather than the model's.
+        let dot: f64 = got
+            .iter()
+            .zip(PINNED_EMBEDDING.iter())
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        let norm = |v: &[f32]| -> f64 {
+            v.iter()
+                .map(|x| f64::from(*x) * f64::from(*x))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let drift = 1.0 - dot / (norm(&got) * norm(&PINNED_EMBEDDING));
+
+        // Spelled `drift <= limit` rather than `!(drift > limit)`: a zero
+        // vector or a NaN anywhere makes `drift` NaN, NaN compares false to
+        // everything, and only this direction turns that into a failure. The
+        // negated form would pass on NaN, which is this guard's own permissive
+        // default.
+        assert!(
+            drift <= PINNED_EMBEDDING_MAX_COSINE_DRIFT,
+            "the recognizer's embedding moved: 1-cos = {drift:e} against a limit of {:e}. \
+             Stored templates are matched against embeddings from this model, so a real \
+             shift breaks face login for every enrolled user. Do not widen this limit to \
+             make the build green; find what changed (ort version, libonnxruntime version, \
+             session options) and decide whether enrollments must be rebuilt.",
+            PINNED_EMBEDDING_MAX_COSINE_DRIFT
+        );
+    }
 }
 
 #[cfg(all(test, feature = "onnx"))]

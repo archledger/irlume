@@ -1013,10 +1013,11 @@ pub const NOD_MIN_FACE_FRAMES: usize = 12;
 /// (pitch too low). Overridable via `IRLUME_SHAKE_YAW_MIN`.
 pub const SHAKE_YAW_MIN: f32 = 0.45;
 /// Maximum yaw RANGE for a deliberate shake. Idle looking-around swings yaw
-/// much wider (measured 4.1 in the test corpus) than a deliberate shake
-/// (sitting median 0.79, max 1.09; reclining median 0.48, max 0.63). 1.5
-/// excludes look-around while allowing all measured shakes.
-pub const SHAKE_YAW_MAX: f32 = 1.5;
+/// much wider (measured 4.1 in the test corpus) than a deliberate shake.
+/// Live daemon shakes measured 1.60-2.04 on 2026-08-11; the calibration
+/// tool's shorter window reported 0.53-1.09. 2.5 excludes look-around while
+/// allowing all measured shakes.
+pub const SHAKE_YAW_MAX: f32 = 2.5;
 /// Maximum pitch RANGE during a shake: the head should not nod up/down while
 /// shaking. Measured 2026-08-10: sitting shakes ranged 0.044-0.169 in pitch,
 /// reclining shakes 0.066-0.133. The sitting nod pitch goes up to 0.156, so
@@ -1173,14 +1174,16 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
     } else if evidence.yaw_range >= shake_yaw_min()
         && evidence.yaw_range <= SHAKE_YAW_MAX
         && evidence.pitch_range <= shake_pitch_max()
-        && yaw_crossings >= shake_min_crossings()
     {
         // Shake checked FIRST: a shake with yaw below NOD_YAW_MAX but
         // above SHAKE_YAW_MIN (reclining shakes, 0.45-0.60) would
-        // otherwise be caught as a nod. The pitch and yaw_crossings
-        // gates keep nods from being misclassified as shakes.
-        // SHAKE_YAW_MAX excludes idle looking-around (yaw swings much
-        // wider than a deliberate shake).
+        // otherwise be caught as a nod. The pitch gate keeps nods from
+        // being misclassified as shakes. SHAKE_YAW_MAX excludes idle
+        // looking-around (yaw swings much wider than a deliberate shake).
+        // yaw_crossings is deliberately NOT gated: the median-crossing
+        // amplitude test can fail when the head is biased to one side,
+        // and the yaw_range + pitch_range combination is sufficient to
+        // separate shakes from nods in the calibration data.
         HeadGesture::Shake
     } else if evidence.pitch_range >= evidence.pitch_min
         && evidence.yaw_range <= NOD_YAW_MAX

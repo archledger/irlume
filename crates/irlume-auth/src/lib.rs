@@ -518,7 +518,16 @@ impl AuthenticationPurpose {
                         .unwrap_or_else(|| irlume_common::config::service_gesture_default(s))
                 })
             }
-            Self::AppConsent => true,
+            Self::AppConsent => {
+                // App-consent services (polkit) default to gesture ON, but honor
+                // an explicit per-service override so `service_gesture.polkit-1=0`
+                // actually disables it. Before this, the arm was an unconditional
+                // `true`, so the CLI could write and report `polkit-1 off` while
+                // the engine still forced the gesture.
+                service
+                    .and_then(irlume_common::config::service_gesture)
+                    .unwrap_or(true)
+            }
             Self::CredentialRelease { temporal_challenge } => {
                 // Per-service override for the credential-release path
                 // (special token "credential_release"), then the global
@@ -8185,6 +8194,39 @@ mod engine_tests {
         assert!(!release(false).demands_gesture(None));
 
         teardown_sandbox(&dir);
+    }
+
+    /// polkit is app-consent, which defaults the gesture ON, but an explicit
+    /// `service_gesture.polkit-1=0` must turn it OFF: the CLI writes that key and
+    /// reports it disabled, and before the fix the AppConsent arm was an
+    /// unconditional `true` that ignored it. Absent or `=1` keeps the gesture.
+    #[test]
+    fn app_consent_honors_the_polkit_service_override() {
+        let _g = env_guard();
+        let dir =
+            std::env::temp_dir().join(format!("irlume-auth-polkitovr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let ac = AuthenticationPurpose::AppConsent;
+        assert!(
+            ac.demands_gesture(Some("polkit-1")),
+            "no override: app-consent must default the gesture ON"
+        );
+        std::fs::write(dir.join("settings.conf"), "service_gesture.polkit-1=0\n").unwrap();
+        assert!(
+            !ac.demands_gesture(Some("polkit-1")),
+            "service_gesture.polkit-1=0 must disable the gesture"
+        );
+        std::fs::write(dir.join("settings.conf"), "service_gesture.polkit-1=1\n").unwrap();
+        assert!(
+            ac.demands_gesture(Some("polkit-1")),
+            "service_gesture.polkit-1=1 must require the gesture"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE invariant behind a default-on gate: with the challenge required, NO

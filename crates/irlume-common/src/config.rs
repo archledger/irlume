@@ -395,9 +395,19 @@ pub fn service_gesture(service: &str) -> Option<bool> {
 }
 
 /// The per-service default for the consent gesture, when no override is set.
-/// Elevation (sudo, su, doas) defaults to ON; everything else defaults to OFF.
+/// Elevation defaults to ON; everything else defaults to OFF.
+///
+/// The elevation set is read from the shared [`crate::pam_service`] table, not
+/// a private list here: that table already carries every spelling
+/// (`sudo`, `sudo-i`, `su`, `su-l`, `runuser`, `runuser-l`, `doas`) and trims
+/// and case-folds the name. A local `matches!("sudo" | "su" | "doas")` is the
+/// exact three-consumer drift #362 unified, and it silently defaulted `su -`
+/// (service `su-l`) and `sudo -i` (service `sudo-i`) to OFF.
 pub fn service_gesture_default(service: &str) -> bool {
-    matches!(service, "sudo" | "su" | "doas")
+    matches!(
+        crate::pam_service::classify(service),
+        Some(crate::pam_service::ServiceKind::Elevation)
+    )
 }
 
 /// Which deliberate gesture the consent gate accepts.
@@ -558,6 +568,60 @@ mod camera_pin_tests {
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod service_gesture_default_tests {
+    use super::service_gesture_default;
+
+    /// The elevation default must cover every spelling the shared pam_service
+    /// table calls Elevation, not the three literals `sudo`/`su`/`doas` the
+    /// first cut used. `su -` reaches PAM as `su-l` and `sudo -i` as `sudo-i`;
+    /// under the private list both defaulted the consent gesture OFF, so a print
+    /// that clears the single-frame cues could elevate to root ungated.
+    #[test]
+    fn every_elevation_spelling_defaults_on() {
+        for svc in [
+            "sudo",
+            "sudo-i",
+            "su",
+            "su-l",
+            "runuser",
+            "runuser-l",
+            "doas",
+        ] {
+            assert!(
+                service_gesture_default(svc),
+                "elevation service {svc} must default the consent gesture ON"
+            );
+        }
+        // Case and surrounding whitespace are folded by the shared classifier.
+        assert!(
+            service_gesture_default(" SUDO "),
+            "the classifier trims and case-folds; a padded name must still match"
+        );
+    }
+
+    /// Non-elevation services default OFF. polkit's gesture comes from the
+    /// AppConsent purpose, not this default, so `polkit-1` is OFF here too; an
+    /// unrecognised name is not elevation and defaults OFF.
+    #[test]
+    fn non_elevation_defaults_off() {
+        for svc in [
+            "kde",
+            "swaylock",
+            "sddm",
+            "gdm-password",
+            "sshd",
+            "polkit-1",
+            "totally-made-up",
+        ] {
+            assert!(
+                !service_gesture_default(svc),
+                "non-elevation service {svc} must default the consent gesture OFF"
+            );
+        }
     }
 }
 

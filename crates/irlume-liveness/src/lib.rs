@@ -1171,20 +1171,25 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
     };
     let verdict = if evidence.frames < NOD_MIN_FACE_FRAMES {
         HeadGesture::NoFace
-    } else if evidence.yaw_range >= shake_yaw_min()
-        && evidence.yaw_range <= SHAKE_YAW_MAX
-        && evidence.pitch_range <= shake_pitch_max()
-    {
-        // Shake checked FIRST: a shake with yaw below NOD_YAW_MAX but
-        // above SHAKE_YAW_MIN (reclining shakes, 0.45-0.60) would
-        // otherwise be caught as a nod. The pitch gate keeps nods from
-        // being misclassified as shakes. SHAKE_YAW_MAX excludes idle
-        // looking-around (yaw swings much wider than a deliberate shake).
+    } else if evidence.yaw_range >= shake_yaw_min() && evidence.yaw_range <= SHAKE_YAW_MAX {
+        // Shake-shaped yaw is a decline or NOTHING, never an approving nod.
+        // The shake band [SHAKE_YAW_MIN, SHAKE_YAW_MAX] overlaps the nod band
+        // (yaw <= NOD_YAW_MAX) across [0.45, 0.60]. Splitting the pitch gate
+        // out of this condition (as it was) let a shake whose pitch exceeded
+        // SHAKE_PITCH_MAX fall THROUGH to the nod branch and grant: a
+        // head-shake "no" with a little vertical bob approved sudo, polkit or
+        // credential release. A genuine nod sits at yaw 0.16-0.37, well below
+        // SHAKE_YAW_MIN, so it never enters this band; ambiguous motion here
+        // fails CLOSED to None rather than being reinterpreted as approval.
         // yaw_crossings is deliberately NOT gated: the median-crossing
-        // amplitude test can fail when the head is biased to one side,
-        // and the yaw_range + pitch_range combination is sufficient to
-        // separate shakes from nods in the calibration data.
-        HeadGesture::Shake
+        // amplitude test can fail when the head is biased to one side, and the
+        // yaw_range + pitch_range combination separates shakes from nods in the
+        // calibration data. SHAKE_YAW_MAX excludes idle looking-around.
+        if evidence.pitch_range <= shake_pitch_max() {
+            HeadGesture::Shake
+        } else {
+            HeadGesture::None
+        }
     } else if evidence.pitch_range >= evidence.pitch_min
         && evidence.yaw_range <= NOD_YAW_MAX
         && evidence.crossings >= NOD_MIN_CROSSINGS
@@ -3161,6 +3166,45 @@ mod nod_evidence_tests {
                 bri: 100.0,
             })
             .collect()
+    }
+
+    fn poses(pitch: &[f32], yaw: &[f32]) -> Vec<PoseSample> {
+        assert_eq!(pitch.len(), yaw.len());
+        pitch
+            .iter()
+            .zip(yaw)
+            .enumerate()
+            .map(|(i, (&p, &y))| PoseSample {
+                idx: i,
+                pitch_frac: Some(p),
+                yaw_signed: Some(y),
+                bri: 100.0,
+            })
+            .collect()
+    }
+
+    /// A head-shake with a little vertical bob must NEVER approve. Its yaw range
+    /// (~0.5) sits in the [0.45, 0.60] overlap of the shake and nod bands, and
+    /// its pitch range (~0.23) exceeds SHAKE_PITCH_MAX, so before the fix the
+    /// shake branch rejected it on pitch and it fell through to the nod branch
+    /// and returned Nod, which grants sudo/polkit/credential release. Shake-shaped
+    /// yaw now resolves to Shake or None, never Nod.
+    #[test]
+    fn shake_band_with_vertical_motion_never_becomes_an_approving_nod() {
+        // yaw swings -0.25..0.25 (range 0.50, inside [SHAKE_YAW_MIN, NOD_YAW_MAX]).
+        let yaw = [
+            -0.25, -0.15, 0.00, 0.15, 0.25, 0.15, 0.00, -0.15, -0.25, -0.10, 0.10, 0.25,
+        ];
+        // pitch oscillates with range 0.23 > SHAKE_PITCH_MAX (0.18), which is what
+        // used to satisfy the nod branch's pitch and crossings gates.
+        let pitch = [
+            0.40, 0.43, 0.48, 0.55, 0.62, 0.58, 0.50, 0.43, 0.39, 0.44, 0.52, 0.61,
+        ];
+        assert_ne!(
+            detect_nod(&poses(&pitch, &yaw)),
+            HeadGesture::Nod,
+            "motion in the shake yaw band must never resolve to an approving nod"
+        );
     }
 
     #[test]

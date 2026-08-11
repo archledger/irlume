@@ -250,12 +250,12 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
     assert!(out.contains("biopolicy     : ENFORCING"), "{out}");
 }
 
-// The credential-release challenge command: default-ON reporting, the warning on
-// the opt-out, the root gate, and the confirm before weakening it. The setting is
-// what stands between a static IR print and the sealed keyring password, so the
+// The credential-release challenge command: DEFAULT-OFF reporting, the root gate,
+// and the global toggle. Off is the default (a greeter cold login and logout
+// release the keyring with no nod), so neither direction confirms or warns; the
 // exact strings a user acts on are pinned here.
 #[test]
-fn credential_release_challenge_reports_defaults_and_gates_the_opt_out() {
+fn credential_release_challenge_reports_defaults_and_toggles() {
     let sb = Sandbox::new("crc");
     let cfg = sb.path("cfg/settings.conf");
     let cmd = "credential-release-challenge";
@@ -265,26 +265,34 @@ fn credential_release_challenge_reports_defaults_and_gates_the_opt_out() {
     assert_eq!(code, 0);
     assert!(out.contains("sudo: REQUIRED"), "{out}");
     assert!(out.contains("polkit-1: REQUIRED"), "{out}");
-    assert!(out.contains("credential_release: off"), "{out}");
+    assert!(out.contains("credential_release: off (default)"), "{out}");
+    assert!(
+        out.contains("global credential_release_challenge: off (default)"),
+        "{out}"
+    );
 
     // No subcommand behaves as status (same as `irlume biopolicy`).
     let (code, out, _) = run(&mut sb.cmd(&[cmd]), cmd);
     assert_eq!(code, 0);
     assert!(out.contains("sudo:"), "{out}");
 
-    // Opted out globally: the global state shows DISABLED.
-    std::fs::write(&cfg, "credential_release_challenge=0\n").unwrap();
+    // Opted IN globally: the global state and the keyring line show REQUIRED.
+    std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
     assert_eq!(code, 0);
     assert!(
-        out.contains("global credential_release_challenge: DISABLED"),
+        out.contains("global credential_release_challenge: REQUIRED"),
         "{out}"
     );
+    assert!(out.contains("credential_release: REQUIRED"), "{out}");
 
-    // An unrecognized value must NOT read as off (fail secure).
-    std::fs::write(&cfg, "credential_release_challenge=disabled\n").unwrap();
+    // An unrecognized value reads as the default (off), not on.
+    std::fs::write(&cfg, "credential_release_challenge=enabled\n").unwrap();
     let (_, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
-    assert!(out.contains("REQUIRED"), "a typo must stay on:\n{out}");
+    assert!(
+        out.contains("global credential_release_challenge: off (default)"),
+        "a typo must read as the default (off):\n{out}"
+    );
 
     // Bad subcommand: usage, exit 2, and nothing written.
     let (code, _, err) = run(&mut sb.cmd(&[cmd, "maybe"]), cmd);
@@ -306,43 +314,23 @@ fn credential_release_challenge_reports_defaults_and_gates_the_opt_out() {
         }
         // The refusal must not have touched the file.
         assert!(
-            std::fs::read_to_string(&cfg).unwrap().contains("=disabled"),
+            std::fs::read_to_string(&cfg).unwrap().contains("=enabled"),
             "a refused write must leave settings.conf alone"
         );
         return;
     }
 
-    // Running as root (containerized CI): the confirm actually gates the write.
-    std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
-    let (code, out, _) = run_stdin(&mut sb.cmd(&[cmd, "off"]), "n\n", cmd);
-    assert_eq!(code, 0);
-    assert!(out.contains("left enabled"), "{out}");
-    assert!(
-        std::fs::read_to_string(&cfg).unwrap().contains("=1"),
-        "answering n must not disable the gate"
-    );
-    // A closed stdin is not consent either.
-    let (_, out, _) = run(&mut sb.cmd(&[cmd, "off"]), cmd);
-    assert!(out.contains("left enabled"), "{out}");
-    // An explicit y disables it, and the warning still goes out.
-    let (code, _, err) = run_stdin(&mut sb.cmd(&[cmd, "off"]), "y\n", cmd);
-    assert_eq!(code, 0);
-    assert!(
-        err.contains("WARNING") && err.contains("static IR print"),
-        "{err}"
-    );
-    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
-    // --yes skips the prompt but not the warning.
-    std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
-    let (code, _, err) = run(&mut sb.cmd(&[cmd, "off", "--yes"]), cmd);
-    assert_eq!(code, 0);
-    assert!(err.contains("WARNING"), "{err}");
-    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
-    // Turning it back on needs no confirm and reports what it now requires.
+    // Running as root (containerized CI): the global toggle needs no confirm in
+    // either direction. `on` adds the opt-in gesture; `off` returns to the default.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "on"]), cmd);
     assert_eq!(code, 0);
     assert!(out.contains("REQUIRED") && out.contains("nod"), "{out}");
     assert!(std::fs::read_to_string(&cfg).unwrap().contains("=1"));
+
+    let (code, out, _) = run(&mut sb.cmd(&[cmd, "off"]), cmd);
+    assert_eq!(code, 0);
+    assert!(out.contains("off (the default)"), "{out}");
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
 }
 
 // enrollment-query error is a distinct arm from "none"/populated; and when the

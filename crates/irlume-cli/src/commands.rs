@@ -768,20 +768,15 @@ pub fn status(args: &[String]) -> ExitCode {
         }
     );
 
-    // The credential-release gesture gate (default on). Only interesting when it
-    // is OFF or unreadable, but print it always: a security default the user can
-    // turn off should be visible where they look for the current state.
+    // The credential-release gesture gate (DEFAULT OFF). Print it always: an
+    // opt-in step the user may want to know is available shows where they look
+    // for the current state. Off is the default, not a warning.
     println!(
         "  keyring gate  : {}",
         match irlume_common::config::credential_release_challenge_visible() {
-            Some(true) => format!("gesture required {OK} (default)"),
-            // Qualified, matching CREDENTIAL_RELEASE_RISK. Saying a print
-            // "may release the password" overstates it: it must pass the
-            // face and liveness checks first, and none of 24 measured
-            // presentations did.
-            Some(false) => format!(
-                "DISABLED {WARN} (an IR print that passes the face checks could release it)"
-            ),
+            Some(true) => format!("gesture required {OK} (opt-in)"),
+            Some(false) =>
+                "off (default): the keyring releases after the face match with no nod".into(),
             None => "root-only setting (re-run with sudo)".into(),
         }
     );
@@ -1277,60 +1272,76 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
     }
 }
 
-/// One line naming what the challenge is, for the places that have to explain the
-/// consequence of turning it off. Kept in one place so the CLI, the TUI confirm and
-/// doctor cannot drift into describing different security properties.
-pub const CREDENTIAL_RELEASE_RISK: &str =
-    "a static IR print that passes the face checks can then release your \
-     TPM-sealed login-keyring password";
-
-/// `irlume credential-release-challenge <on|off|status>`: the deliberate-gesture
-/// gate on releasing the sealed login-keyring password (`credential_release_challenge`
-/// in settings.conf). DEFAULT ON. The daemon reads it live per request, so no
-/// restart is needed.
+/// `irlume credential-release-challenge [<service>] <on|off|status>`: the
+/// per-service consent-gesture toggle, plus the global credential-release gate on
+/// releasing the sealed login-keyring password (`credential_release_challenge` in
+/// settings.conf). The daemon reads all of it live per request, so no restart is
+/// needed.
 ///
-/// Turning it off never locks anyone out (the typed password is always the
-/// fallback) but it does drop the deliberate-intent check on credential release,
-/// so `off` asks for confirmation and says why. It is INTENT that is dropped,
-/// not liveness: measured 2026-07-27, the gesture fired on a hand-held print 2
-/// times in 24, so it never was the layer standing between a photograph and the
-/// credential; cross-spectrum liveness and the PAD cue are.
+/// The keyring gate DEFAULTS OFF: a greeter cold login and logout release the
+/// keyring after the face match with no nod, because the gesture is INTENT, not
+/// liveness (measured 2026-07-27, the gesture fired on a hand-held print 2 times
+/// in 24, so it never stood between a photograph and the credential; the
+/// cross-spectrum liveness and PAD cues do, and the typed password is always the
+/// fallback). Turning any gesture on adds a deliberate step; disabling it for a
+/// high-privilege escalation service (sudo, su, doas, polkit) asks for
+/// confirmation first.
 pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
     const TAG: &str = "[credential-release-challenge]";
     match sub {
         None | Some("status") => {
-            // Show per-service status and the global credential-release setting.
-            let services = ["sudo", "polkit-1", "credential_release"];
+            // The EFFECTIVE per-service policy, then the global credential-release
+            // setting. An absent key reports its effective default, not a guess; an
+            // unreadable root-only file says so rather than printing a state it
+            // could not read (settings.conf is 0600, so an unprivileged `status`
+            // sees Unknown, not the value).
+            let services = ["sudo", "su", "doas", "polkit-1", "credential_release"];
             for svc in services {
                 let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
-                let visible = irlume_common::config::read_kv("settings.conf", &key);
-                let default = irlume_common::config::service_gesture_default(svc);
-                match visible {
-                    Some(ref v) if !irlume_common::config::falsy(v) => {
-                        println!("{TAG} {svc}: REQUIRED {OK} (explicitly on)");
-                    }
-                    Some(_) => {
-                        println!("{TAG} {svc}: DISABLED {WARN} (explicitly off)");
-                    }
-                    None => {
-                        let state = if default || forced_consent_service(svc) {
-                            format!("REQUIRED {OK} (default)")
+                match irlume_common::config::observe_kv("settings.conf", &key) {
+                    // Per-service keys use `!falsy` (the daemon's `service_gesture`
+                    // reading), NOT the global `truthy`, so the display agrees with
+                    // what the engine does for this key.
+                    irlume_common::config::KvObservation::Value(v) => {
+                        if !irlume_common::config::falsy(&v) {
+                            println!("{TAG} {svc}: REQUIRED {OK} (explicit)");
                         } else {
-                            "off (default)".to_string()
+                            println!("{TAG} {svc}: off (explicit)");
+                        }
+                    }
+                    irlume_common::config::KvObservation::Absent => {
+                        let required = match svc {
+                            // The keyring release falls back to the global gate,
+                            // which now defaults OFF.
+                            "credential_release" => {
+                                irlume_common::config::credential_release_challenge()
+                            }
+                            // polkit (AppConsent) defaults ON, overridable.
+                            "polkit-1" => true,
+                            _ => irlume_common::config::service_gesture_default(svc),
                         };
-                        println!("{TAG} {svc}: {state}");
+                        if required {
+                            println!("{TAG} {svc}: REQUIRED {OK} (default)");
+                        } else {
+                            println!("{TAG} {svc}: off (default)");
+                        }
+                    }
+                    irlume_common::config::KvObservation::Unknown(_) => {
+                        println!("{TAG} {svc}: root-only setting, re-run with sudo");
                     }
                 }
             }
-            // Global credential-release-challenge fallback
+            // Global credential-release-challenge fallback (DEFAULT OFF).
             match irlume_common::config::credential_release_challenge_visible() {
                 Some(true) => {
-                    println!("{TAG} global credential_release_challenge: REQUIRED {OK} (default)")
+                    println!("{TAG} global credential_release_challenge: REQUIRED {OK}")
                 }
                 Some(false) => {
-                    println!("{TAG} global credential_release_challenge: DISABLED {WARN}")
+                    println!("{TAG} global credential_release_challenge: off (default)")
                 }
-                None => println!("{TAG} global credential_release_challenge: root-only setting"),
+                None => println!(
+                    "{TAG} global credential_release_challenge: root-only setting, re-run with sudo"
+                ),
             }
             ExitCode::SUCCESS
         }
@@ -1350,22 +1361,21 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                         );
                         return ExitCode::FAILURE;
                     }
-                    // High-privilege services get a confirmation before the
-                    // gesture is disabled. `credential_release` is the special
-                    // token for the sealed-keyring path (not a PAM service, so
-                    // the classifier cannot see it) and is the single most
-                    // dangerous gate, so it is named explicitly; the elevation
-                    // and app-consent spellings come from the shared
-                    // pam_service table rather than a private list that already
-                    // omitted sudo-i, su-l and runuser (the #362 drift).
-                    let high_priv = svc == "credential_release"
-                        || matches!(
-                            irlume_common::pam_service::classify(svc),
-                            Some(
-                                irlume_common::pam_service::ServiceKind::Elevation
-                                    | irlume_common::pam_service::ServiceKind::AppConsent
-                            )
-                        );
+                    // Disabling the gesture for a high-privilege escalation
+                    // service (sudo, su, doas, sudo-i, su-l, runuser, polkit) asks
+                    // for confirmation first: a face match alone would then
+                    // approve it. The set comes from the shared pam_service table,
+                    // not a private list that already omitted sudo-i/su-l/runuser
+                    // (the #362 drift). The keyring release (`credential_release`)
+                    // is NOT here: it defaults OFF by design, so disabling it is
+                    // the default state, not a weakening that warrants a warning.
+                    let high_priv = matches!(
+                        irlume_common::pam_service::classify(svc),
+                        Some(
+                            irlume_common::pam_service::ServiceKind::Elevation
+                                | irlume_common::pam_service::ServiceKind::AppConsent
+                        )
+                    );
                     if v == "off" && high_priv {
                         let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
                         if !assumed_yes && !confirm_high_privilege_disable(svc) {
@@ -1379,16 +1389,8 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                         Ok(()) => {
                             if v == "on" {
                                 println!("{TAG} {svc}: consent gesture REQUIRED {OK}");
-                            } else if svc == "credential_release" {
-                                // The credential-release gate is what the legacy
-                                // global toggle guards; name the same risk here
-                                // so the two paths to the same effect warn alike.
-                                eprintln!(
-                                    "{TAG} {svc}: consent gesture DISABLED {WARN}. \
-                                     {CREDENTIAL_RELEASE_RISK}. Your typed password still works."
-                                );
                             } else {
-                                eprintln!("{TAG} {svc}: consent gesture DISABLED {WARN}");
+                                eprintln!("{TAG} {svc}: consent gesture off {WARN}");
                             }
                             ExitCode::SUCCESS
                         }
@@ -1405,15 +1407,12 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             }
         }
         Some(v @ ("on" | "off")) => {
-            // Legacy global toggle
+            // Global keyring-release gate. DEFAULT OFF, so `on` is the notable
+            // action (it ADDS a deliberate step) and `off` just returns to the
+            // default; neither needs a confirmation.
             if !crate::is_root() {
                 eprintln!("{TAG} needs root: sudo irlume credential-release-challenge {v}");
                 return ExitCode::FAILURE;
-            }
-            let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
-            if v == "off" && !assumed_yes && !confirm_disable() {
-                println!("{TAG} left enabled.");
-                return ExitCode::SUCCESS;
             }
             let val = if v == "on" { "1" } else { "0" };
             match irlume_common::config::write_kv(
@@ -1429,11 +1428,9 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                              the face match. Takes effect on the next face auth."
                         );
                     } else {
-                        eprintln!(
-                            "{TAG} WARNING: the deliberate-consent gate on credential \
-                             release is DISABLED. {CREDENTIAL_RELEASE_RISK}. Your typed password still \
-                             works either way. Re-enable: sudo irlume \
-                             credential-release-challenge on"
+                        println!(
+                            "{TAG} temporal challenge off (the default): the keyring releases \
+                             after the face match with no nod. Your typed password still works."
                         );
                     }
                     ExitCode::SUCCESS
@@ -1466,30 +1463,6 @@ fn confirm_high_privilege_disable(service: &str) -> bool {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).unwrap_or_default();
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
-}
-
-/// True when the service always forces the consent gesture regardless of config.
-fn forced_consent_service(service: &str) -> bool {
-    // polkit is always AppConsent, which always demands_gesture.
-    // The per-service config only applies to Verify and CredentialRelease.
-    matches!(service, "polkit-1")
-}
-
-/// The confirm step before disabling the gate. A non-terminal stdin (a script, a
-/// pipe) is NOT taken as consent: it must send an explicit `y`, or pass `--yes`.
-fn confirm_disable() -> bool {
-    use std::io::Write as _;
-    println!(
-        "WARNING: Disabling the credential-release challenge means {CREDENTIAL_RELEASE_RISK}.\n\
-         Your typed password remains available either way."
-    );
-    print!("Disable the challenge? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 pub fn reseal(args: &[String]) -> ExitCode {

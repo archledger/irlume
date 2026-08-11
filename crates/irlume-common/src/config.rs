@@ -351,24 +351,26 @@ pub fn write_camera_pin(rgb: &str, ir: &str, rgb_id: &str, ir_id: &str) -> std::
 /// The settings.conf key for the credential-release temporal-liveness gate.
 pub const CREDENTIAL_RELEASE_CHALLENGE_KEY: &str = "credential_release_challenge";
 
-/// Is the credential-release temporal challenge required? DEFAULT ON.
+/// Is the credential-release temporal challenge required? DEFAULT OFF.
 ///
-/// Releasing the TPM-sealed login-keyring password is the one operation where a
-/// successful spoof hands the attacker a reusable secret instead of one session,
-/// so it asks for a deliberate gesture (nod, or a calibrated eye closure) on top
-/// of the face match. Everything else (login, lock screen, sudo) is unaffected.
+/// Releasing the TPM-sealed login-keyring password happens on a greeter cold
+/// login (from reboot) and after logout. Requiring a nod there was measured to
+/// be intent, not liveness: the gesture fired on a hand-held print 2 times in 24
+/// (2026-07-27), so it never stood between a photograph and the credential;
+/// cross-spectrum liveness and the PAD cue do, and the typed password is always
+/// the fallback. So this defaults OFF: a cold login and logout release the
+/// keyring after the face match with no nod. Only an explicit truthy spelling
+/// turns it on, for a user who wants the extra deliberate-intent step. Everything
+/// else (lock screen, sudo, polkit) is decided by its own service policy.
 ///
-/// FAILS SECURE: absent key, empty value, unreadable file, or an unrecognized
-/// spelling all leave the gate ON. Only an explicit `0|false|no|off` disables it,
-/// so a typo can never quietly weaken credential release. Read live per request
-/// (no daemon restart needed), mirroring `enforce_biopolicy`.
-///
-/// `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` overrides the file, for tests.
+/// Read live per request (no daemon restart needed). An unrecognized value reads
+/// as the default (off), not as on. `IRLUME_CREDENTIAL_RELEASE_CHALLENGE`
+/// overrides the file.
 pub fn credential_release_challenge() -> bool {
     if let Ok(v) = std::env::var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE") {
-        return !falsy(&v);
+        return truthy(&v);
     }
-    !read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| falsy(&v))
+    read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| truthy(&v))
 }
 
 /// The settings.conf key prefix for per-service consent-gesture overrides.
@@ -717,23 +719,36 @@ pub fn falsy(v: &str) -> bool {
     )
 }
 
+/// The spellings that turn a boolean settings.conf key ON. Not the complement of
+/// [`falsy`]: an unrecognized value is neither, and a default-off key reads it as
+/// off. The single set both the value read and its `_visible` display use, so
+/// they cannot disagree on what `yes` means.
+pub fn truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// [`credential_release_challenge`], but honest about not knowing.
 ///
 /// `None` when settings.conf exists and this process may not read it. That is
 /// every unprivileged caller: the file is 0600 root-only, so `irlume status` as an
-/// ordinary user cannot tell "key absent" (on) from "key set to off". Reporting a
-/// guessed security state is worse than saying to re-run under sudo, so the
-/// display paths take the `None` and say so. The daemon is root and never sees it.
+/// ordinary user cannot tell "key absent" (off, the default) from "key set to on".
+/// Reporting a guessed security state is worse than saying to re-run under sudo,
+/// so the display paths take the `None` and say so. The daemon is root and never
+/// sees it. Mirrors [`enforce_biopolicy_visible`]: same truthy set, same env
+/// override, Absent means the default.
 pub fn credential_release_challenge_visible() -> Option<bool> {
     // An explicit env override answers regardless of file permissions.
     if std::env::var_os("IRLUME_CREDENTIAL_RELEASE_CHALLENGE").is_some() {
         return Some(credential_release_challenge());
     }
-    match std::fs::File::open(config_path("settings.conf")) {
-        Ok(_) => Some(credential_release_challenge()),
-        // No file at all is not ambiguous: no key means the default, on.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
-        Err(_) => None,
+    match observe_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY) {
+        KvObservation::Value(v) => Some(truthy(&v)),
+        // No file, or no key in it, is unambiguous: the default is off.
+        KvObservation::Absent => Some(false),
+        KvObservation::Unknown(_) => None,
     }
 }
 
@@ -1218,10 +1233,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one default-ON security key: absent means ON, only an explicit falsy
-    /// spelling turns it off, and an unrecognized value fails SECURE (stays on).
+    /// DEFAULT OFF: absent means OFF, only an explicit truthy spelling turns it
+    /// on, and an unrecognized value reads as the default (off), not on. The nod
+    /// on a greeter cold login / logout was retired to intent-not-liveness, so the
+    /// keyring releases after the face match with no nod unless a user opts in.
     #[test]
-    fn credential_release_challenge_defaults_on_and_fails_secure() {
+    fn credential_release_challenge_defaults_off() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-crc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1230,25 +1247,22 @@ mod tests {
         std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
 
         let key = CREDENTIAL_RELEASE_CHALLENGE_KEY;
-        // No settings.conf at all -> on.
-        assert!(credential_release_challenge(), "missing file must stay on");
+        // No settings.conf at all -> off (the default).
+        assert!(!credential_release_challenge(), "missing file must be off");
 
-        // Every falsy spelling, in either case, turns it off.
-        for v in ["0", "false", "no", "off", "OFF", "False"] {
+        // Every truthy spelling, in either case, turns it on.
+        for v in ["1", "true", "yes", "on", "ON", "True"] {
             write_kv("settings.conf", key, v).unwrap();
-            assert!(
-                !credential_release_challenge(),
-                "'{v}' must disable the gate"
-            );
+            assert!(credential_release_challenge(), "'{v}' must enable the gate");
         }
-        // Truthy spellings and a typo both leave it ON (fail secure).
-        for v in ["1", "true", "yes", "on", "0ff", "disabled", "maybe"] {
+        // Falsy spellings and an unrecognized value all read as off (the default).
+        for v in ["0", "false", "no", "off", "0ff", "enabled", "maybe"] {
             write_kv("settings.conf", key, v).unwrap();
-            assert!(credential_release_challenge(), "'{v}' must leave it on");
+            assert!(!credential_release_challenge(), "'{v}' must leave it off");
         }
-        // An empty value reads as absent -> on.
+        // An empty value reads as absent -> off.
         write_kv("settings.conf", key, "").unwrap();
-        assert!(credential_release_challenge(), "empty value must stay on");
+        assert!(!credential_release_challenge(), "empty value must be off");
 
         // The env override wins over the file, both directions.
         write_kv("settings.conf", key, "off").unwrap();
@@ -1261,7 +1275,7 @@ mod tests {
 
         // Unrelated keys survive a write of ours.
         write_kv("settings.conf", "consent_gesture", "nod").unwrap();
-        write_kv("settings.conf", key, "0").unwrap();
+        write_kv("settings.conf", key, "1").unwrap();
         assert_eq!(
             read_kv("settings.conf", "consent_gesture").as_deref(),
             Some("nod")
@@ -1283,13 +1297,14 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
 
-        // No override and no global key: defaults ON (fail secure).
+        // No override and no global key: defaults OFF (the greeter/logout nod was
+        // retired to intent-not-liveness), so the keyring releases with no nod.
         assert!(
-            credential_release_gesture_required(),
-            "default must require the gesture"
+            !credential_release_gesture_required(),
+            "default is off: a cold login releases the keyring with no nod"
         );
 
-        // Global OFF with no override disables it; a per-service override ON wins.
+        // A per-service override ON requires it even against the default/global.
         write_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY, "off").unwrap();
         assert!(
             !credential_release_gesture_required(),

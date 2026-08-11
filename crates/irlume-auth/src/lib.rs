@@ -2769,35 +2769,14 @@ impl Engine {
             let seen = self.gesture_seen_before_match;
             return self.consent_gesture_gate(enr, outcome, seen);
         }
-        // Credential release with the challenge switched OFF, and no per-enrollment
-        // gate either: the operator chose this, so honour it, but say so on every
-        // release. A journal line is the only durable record that a stored
-        // credential left the TPM behind a gate the operator weakened. A global
-        // opt-out does NOT cancel a user's own `require_challenge`, which still
-        // runs below, so the warning is limited to the genuinely ungated case.
-        if !enr.require_challenge
-            && matches!(
-                purpose,
-                AuthenticationPurpose::CredentialRelease {
-                    temporal_challenge: false
-                }
-            )
-        {
-            eprintln!(
-                "irlumed: WARNING: credential release WITHOUT a temporal challenge \
-                 ({key}=off): a static IR print that passes the face checks can \
-                 release this password. Re-enable: sudo irlume \
-                 credential-release-challenge on",
-                key = irlume_common::config::CREDENTIAL_RELEASE_CHALLENGE_KEY
-            );
-        }
-        // The per-enrollment require_challenge (passive blink liveness) gate is
-        // removed. Gesture-based intent (nod/shake) proves both liveness and
-        // intent; a print cannot produce a coherent head pose sequence. The
-        // consent gesture gate above already covers the AppConsent and
-        // CredentialRelease paths; the Verify path never demanded a gesture.
-        // The passive liveness infrastructure (run_passive_liveness,
-        // capture_ear_samples) stays for require_eyes_open.
+        // No gesture is demanded here. Releasing the keyring with no nod is the
+        // DEFAULT now (a greeter cold login and logout release after the face
+        // match; the gesture is intent, not the anti-print layer, so there is
+        // nothing to warn about on every release). The blink `require_challenge`
+        // gate is gone; the consent gesture gate above covers the AppConsent and
+        // CredentialRelease paths when their policy asks for it, and the Verify
+        // path is gated per service. run_passive_liveness / capture_ear_samples
+        // stay for require_eyes_open.
         Ok(outcome)
     }
 

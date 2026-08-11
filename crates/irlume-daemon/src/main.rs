@@ -6421,9 +6421,9 @@ mod tests {
     }
 
     /// The POLICY read behind credential release: `temporal_challenge` tracks the
-    /// live setting so a toggle needs no daemon restart, and DEFAULT ON means an
-    /// absent key still requires the gesture, which is the whole point of the
-    /// change.
+    /// live setting so a toggle needs no daemon restart, and DEFAULT OFF means an
+    /// absent key releases the keyring with no nod (a greeter cold login / logout).
+    /// Only an explicit truthy opt-in adds the gesture.
     ///
     /// Scope, stated plainly: this covers the helper, not the dispatch. That
     /// `UnsealPassword` runs under this purpose rests on
@@ -6434,7 +6434,7 @@ mod tests {
     /// (`no_credential_release_failure_mode_ever_grants`) and the end-to-end proof
     /// in irlume-pam (`pamwrap_refused_challenge_falls_through_to_the_password_module`).
     #[test]
-    fn credential_release_purpose_defaults_to_a_required_challenge() {
+    fn credential_release_purpose_defaults_to_no_challenge() {
         use irlume_auth::AuthenticationPurpose::CredentialRelease;
         let _g = env_lock();
         let dir = std::env::temp_dir().join(format!("irlume-crp-{}", std::process::id()));
@@ -6443,26 +6443,15 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
 
-        // No settings.conf at all: the challenge is REQUIRED.
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: true
-            },
-            "an absent key must still require the gesture"
-        );
-        // An explicit opt-out, read live, is the only way to drop it.
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=off\n",
-        )
-        .unwrap();
+        // No settings.conf at all: the challenge is OFF (the default).
         assert_eq!(
             credential_release_purpose(),
             CredentialRelease {
                 temporal_challenge: false
-            }
+            },
+            "an absent key must release the keyring with no nod"
         );
+        // An explicit opt-in, read live, is the only way to add it.
         std::fs::write(
             dir.join("settings.conf"),
             "credential_release_challenge=on\n",
@@ -6472,6 +6461,17 @@ mod tests {
             credential_release_purpose(),
             CredentialRelease {
                 temporal_challenge: true
+            }
+        );
+        std::fs::write(
+            dir.join("settings.conf"),
+            "credential_release_challenge=off\n",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_release_purpose(),
+            CredentialRelease {
+                temporal_challenge: false
             }
         );
         // Whatever the setting says, the purpose is never Verify or AppConsent:

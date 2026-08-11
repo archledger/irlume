@@ -287,26 +287,27 @@ with a fabricated print.
   extra challenge beyond the gesture and the default IR liveness gate: adding
   one would impose latency and false rejects on a factor whose fallback (the
   password) is always one keystroke away.
-- **Credential release requires a temporal gesture (default on).** Releasing the
-  TPM-sealed login-keyring password is treated as a stronger operation than
-  logging in, and it is the one place where the single-frame IR gate is not
-  considered sufficient on its own. A session grant buys an attacker that
-  session; a released keyring password is a reusable secret that outlives the
-  attempt and unlocks a password manager. So on the `UnsealPassword` path the
-  match must be followed by a deliberate gesture the user performs on request: a
-  head nod, or a calibrated eye closure (the same gate polkit prompts use). A
-  print lying on a desk cannot produce one. Login, the lock screen, `sudo` and
-  polkit are unchanged. A nod needs no calibration, so existing enrollments keep
-  working without re-enrolling. Every way the gesture can fail to happen (no
-  gesture in the window, no IR camera, FaceMesh not deployed, camera busy,
-  closure-only mode without a calibration) ends in the typed-password path, never
-  a lockout, and the keyring then unlocks from the typed password exactly as it
-  would have from a released one. Operators who accept the weaker posture can
-  turn it off with `sudo irlume credential-release-challenge off`, which warns
-  and requires confirmation; `irlume doctor` reports the state and flags a gate
-  that is enabled but cannot run. This is a replay-resistance measure, not proof
-  of physical liveness: it raises the cost of a static-presentation attack on the
-  credential path, and it does not make a face grant equivalent to a live person.
+- **Credential release can require a temporal gesture (default OFF, opt-in).**
+  Releasing the TPM-sealed login-keyring password happens on a greeter cold login
+  (from reboot) and after logout. It defaults to releasing after the face match
+  with no gesture, because the gesture was measured to be intent, not liveness (it
+  fired on a hand-held print 2 times in 24 on 2026-07-27, so it never stood
+  between a photograph and the credential; the cross-spectrum liveness and PAD
+  cues do, and the typed password is always the fallback). A user who wants the
+  extra deliberate-intent step turns it on with
+  `sudo irlume credential-release-challenge on`: the `UnsealPassword` match is
+  then followed by a deliberate gesture performed on request, a head nod or a
+  calibrated eye closure (the same gate polkit prompts use). Login, the lock
+  screen, `sudo` and polkit are decided by their own service policy. A nod needs
+  no calibration, so existing enrollments keep working without re-enrolling. When
+  the gesture is on, every way it can fail to happen (no gesture in the window, no
+  IR camera, FaceMesh not deployed, camera busy, closure-only mode without a
+  calibration) ends in the typed-password path, never a lockout, and the keyring
+  then unlocks from the typed password exactly as it would have from a released
+  one. `irlume doctor` reports the state and flags a gate that is enabled but
+  cannot run. When on, this is a replay-resistance measure, not proof of physical
+  liveness: it raises the cost of a static-presentation attack on the credential
+  path, and it does not make a face grant equivalent to a live person.
 
   **What it was measured to do (2026-07-25, one camera, seated user, 17 attempts
   against the real greeter stack).** Nodding continuously released 4 times out of

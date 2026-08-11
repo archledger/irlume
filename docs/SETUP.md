@@ -471,7 +471,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=0` opts OUT of the gesture required before your keyring password is released (default: required); `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in PAD model; `third_party_recognizer=<name>` names an enabled opt-in recognizer (`models add buffalo` writes it); `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge on\|off`; `sudo irlume models enable/add/disable` |
+| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a gesture before your keyring password is released (default: off, so a greeter cold login and logout release with no nod); `service_gesture.<service>=0\|1` overrides the consent gesture per PAM service (`sudo`, `polkit-1`, …) or the special token `credential_release`; `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in PAD model; `third_party_recognizer=<name>` names an enabled opt-in recognizer (`models add buffalo` writes it); `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off`; `sudo irlume models enable/add/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
@@ -490,7 +490,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 |---|---|---|
 | `IRLUME_MODELS_STRICT` | refuse to start when a model file is missing or fails the checksum manifest, instead of warning | warn and continue |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
-| `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` | same switch as `credential_release_challenge` in `settings.conf`; the env var wins. Set `0` to release the keyring password on a face match alone | on |
+| `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` | same switch as `credential_release_challenge` in `settings.conf`. Precedence: `service_gesture.credential_release` has highest priority; when that key is absent, this variable overrides the `settings.conf` key. Set `1` to add a gesture before the keyring password is released | off |
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` |
 | `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |
 | `IRLUME_RGB_DEVICE` / `IRLUME_IR_DEVICE` | camera-pair override; both must be set | auto |

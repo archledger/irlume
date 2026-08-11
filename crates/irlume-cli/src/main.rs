@@ -3520,8 +3520,9 @@ fn report_credential_release(
     report.check(
         "credential-release-challenge",
         match irlume_common::config::credential_release_challenge_visible() {
-            Some(true) => State::Pass,
-            Some(false) => State::Warn,
+            // Off is the DEFAULT (the keyring releases with no nod); on is an
+            // opt-in extra. Neither is a problem, so neither warns.
+            Some(_) => State::Pass,
             None => State::Unknown,
         },
     );
@@ -3535,14 +3536,14 @@ fn report_credential_release(
         return;
     }
     match irlume_common::config::credential_release_challenge_visible() {
+        // The opt-in gate is on: fall through and check it can actually run.
         Some(true) => {}
         Some(false) => {
             dout!(
                 report,
-                "[doctor] ⚠ credential-release challenge: DISABLED\n     \
-                 {risk}.\n     \
-                 Re-enable: sudo irlume credential-release-challenge on",
-                risk = commands::CREDENTIAL_RELEASE_RISK
+                "[doctor] credential-release challenge: off (default); the keyring \
+                 releases after the face match with no nod. Enable the extra step \
+                 with: sudo irlume credential-release-challenge on"
             );
             return;
         }

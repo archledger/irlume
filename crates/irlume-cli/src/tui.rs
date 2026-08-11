@@ -3420,39 +3420,26 @@ impl App {
                     ));
                 }
             }
-            // Credential-release gesture gate. Default ON, and the direction that
-            // needs friction is OFF: it drops the only check that separates a
-            // present person from a photograph of one, for the one operation that
-            // hands out a reusable secret. Enabling goes straight through (it only
-            // restores the default). settings.conf is root-only, so an unprivileged
-            // TUI cannot read the current state; then offer the safe direction (on)
-            // rather than guess.
+            // Credential-release gesture gate. DEFAULT OFF: the keyring releases
+            // after the face match with no nod. 'g' toggles the opt-in extra
+            // step; neither direction needs a confirm (off is the default, on only
+            // adds friction). settings.conf is root-only, so an unprivileged TUI
+            // cannot read the state; then offer to enable the opt-in.
             (SC_SETTINGS, KeyCode::Char('g')) => {
                 match irlume_common::config::credential_release_challenge_visible() {
                     Some(true) => {
-                        self.confirm = Some((
-                            format!(
-                                "Stop requiring a gesture before your keyring password is \
-                                 released? {}. Your typed password keeps working either way.",
-                                crate::commands::CREDENTIAL_RELEASE_RISK
-                            ),
-                            "Disable",
-                            ConfirmAct::Sus(Suspend::CredentialReleaseChallenge(false)),
-                        ));
-                    }
-                    Some(false) => {
                         self.log(
                             '→',
-                            "sudo irlume credential-release-challenge on: restore the gesture \
-                             gate on keyring release",
+                            "sudo irlume credential-release-challenge off: back to the default \
+                             (the keyring releases with no nod)",
                         );
-                        self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
+                        self.suspend = Some(Suspend::CredentialReleaseChallenge(false));
                     }
-                    None => {
+                    Some(false) | None => {
                         self.log(
                             '→',
-                            "the gate's state is root-only; running `credential-release-challenge \
-                             on` to restore the default",
+                            "sudo irlume credential-release-challenge on: add a gesture before \
+                             keyring release",
                         );
                         self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
                     }
@@ -4282,21 +4269,20 @@ impl App {
                 section("Gesture before keyring release"),
                 {
                     // Tri-state, not a bool: settings.conf is root-only, so an
-                    // unprivileged TUI genuinely cannot read this. Showing ○ off
-                    // there would be a false all-clear on a security default, and
-                    // showing ● on would be an unearned one.
+                    // unprivileged TUI genuinely cannot read this. Off is the
+                    // DEFAULT (no nod on a cold login), so it shows neutrally, not
+                    // as a warning; on is the opt-in extra step.
                     let (icon, icon_style, label) =
                         match irlume_common::config::credential_release_challenge_visible() {
                             Some(true) => (
                                 "●",
                                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                "required (default)".to_string(),
+                                "required (opt-in)".to_string(),
                             ),
                             Some(false) => (
                                 "○",
-                                Style::new().fg(th().warn).add_modifier(Modifier::BOLD),
-                                "DISABLED  (an IR print passing the face checks could release it)"
-                                    .to_string(),
+                                Style::new().dim(),
+                                "off (default): the keyring releases with no nod".to_string(),
                             ),
                             None => (
                                 "◐",
@@ -4310,36 +4296,31 @@ impl App {
                         Span::styled(label, Style::new().dim()),
                     ])
                 },
-                // Says what this gate was MEASURED to do, not what it was hoped
-                // to do. It read "so a photo or a screen cannot pull the password
-                // out" until 2026-07-27, when the detector was measured firing on
-                // a hand-held print 2 times in 24; liveness and the PAD cue
-                // refused every one of those, so the claim belonged to them and
-                // never to the gesture. THREAT_MODEL.md carries the numbers.
-                // Kept to FOUR lines: this panel does not scroll, so a fifth line
-                // pushes the bottom section off a short terminal.
+                // Says what this gate was MEASURED to do, not what it was hoped to
+                // do: the gesture proves INTENT, not liveness (it fired on a
+                // hand-held print 2 times in 24 on 2026-07-27; liveness and the
+                // PAD cue refused every one), which is why it defaults OFF for the
+                // greeter cold login and logout. THREAT_MODEL.md carries the
+                // numbers. Kept to FOUR lines: this panel does not scroll.
                 Line::from(Span::styled(
-                    "  Releasing your TPM-sealed keyring password needs CONTINUOUS NODDING (or an",
+                    "  A greeter cold login and logout release your TPM-sealed keyring password",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  eye closure). It proves INTENT, not liveness: a hand-held print can satisfy",
+                    "  after the face match with NO nod. Turning this on adds continuous nodding",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  it, and the IR liveness check is what stops the print. Login, lock screen",
+                    "  (or an eye closure) as a deliberate-intent step; the IR liveness check is",
                     Style::new().dim(),
                 )),
                 Line::from(Span::styled(
-                    "  and sudo are unaffected; a missed gesture falls back to typing the password.",
+                    "  what stops a print. A missed gesture falls back to typing the password.",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
                     Span::styled("  [g]", Style::new().fg(th().accent)),
-                    Span::styled(
-                        " turn it on or off (sudo; off asks first)",
-                        Style::new().dim(),
-                    ),
+                    Span::styled(" turn it on or off (sudo)", Style::new().dim()),
                 ]),
                 Line::raw(""),
                 section("Biopolicy operation-class gate"),
@@ -6889,12 +6870,13 @@ mod tests {
     // title, a single line clamped to the box width, so a long target name was
     // cut off. It must render inside the wrapping body, with the deliberate
     // [y] yes / [n] no hint from 093dc56.
-    /// The keyring-gesture toggle: OFF is the direction that weakens credential
-    /// release, so it must go through the y/n gate and never act on the keypress
-    /// alone. ON (and the unreadable case) restore the default and go straight
-    /// through. The rendered section must report the state it actually read.
+    /// The keyring-gesture toggle: DEFAULT OFF, so neither direction weakens a
+    /// default and [g] acts on the keypress with no y/n gate. The default renders
+    /// as off and [g] there enables the opt-in; an explicit on renders as opt-in
+    /// and [g] there returns to the default off. The rendered section reports the
+    /// state it actually read.
     #[test]
-    fn keyring_gesture_toggle_confirms_before_disabling() {
+    fn keyring_gesture_toggle_needs_no_confirm() {
         let _g = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6908,45 +6890,43 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
 
-        // Default (no settings.conf): shown as required, and [g] asks first.
+        // Default (no settings.conf): shown as off (default); [g] enables the
+        // opt-in with no confirm.
         let text = draw_text(&app);
         assert!(
-            text.contains("Gesture before keyring release") && text.contains("required (default)"),
-            "the default must render as required:\n{text}"
+            text.contains("Gesture before keyring release") && text.contains("off (default)"),
+            "the default must render as off:\n{text}"
         );
         app.on_key(KeyCode::Char('g'));
+        assert!(app.confirm.is_none(), "toggling needs no confirm");
         assert!(
-            app.suspend.is_none(),
-            "disabling must not act on the keypress alone"
+            matches!(
+                app.suspend.take(),
+                Some(Suspend::CredentialReleaseChallenge(true))
+            ),
+            "from the default (off), [g] enables the opt-in"
         );
-        match app.confirm.take() {
-            Some((q, verb, ConfirmAct::Sus(Suspend::CredentialReleaseChallenge(false)))) => {
-                assert_eq!(verb, "Disable");
-                assert!(
-                    q.contains("IR print"),
-                    "the confirm must name the consequence: {q}"
-                );
-            }
-            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
-            None => panic!("disabling must raise a confirm"),
-        }
 
-        // Already off: the row warns, and [g] restores the default with no gate.
+        // Explicitly on: rendered as opt-in; [g] returns to the default off with
+        // no gate.
         std::fs::write(
             dir.join("settings.conf"),
-            "credential_release_challenge=0\n",
+            "credential_release_challenge=1\n",
         )
         .unwrap();
         let text = draw_text(&app);
         assert!(
-            text.contains("DISABLED"),
-            "an opted-out gate must be visible on the page:\n{text}"
+            text.contains("required (opt-in)"),
+            "an enabled gate must render as opt-in:\n{text}"
         );
         app.on_key(KeyCode::Char('g'));
-        assert!(app.confirm.is_none(), "re-enabling needs no confirm");
+        assert!(
+            app.confirm.is_none(),
+            "returning to the default needs no confirm"
+        );
         assert!(matches!(
             app.suspend.take(),
-            Some(Suspend::CredentialReleaseChallenge(true))
+            Some(Suspend::CredentialReleaseChallenge(false))
         ));
 
         match old {
@@ -10742,15 +10722,18 @@ mod tests {
     }
 
     #[test]
-    fn gesture_explainer_uses_the_right_article_across_its_line_break() {
+    fn gesture_explainer_uses_the_right_article() {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
-        // The hand-wrapped pair rendered "…NODDING (or a / eye closure)".
+        // The explainer offers the eye closure as the alternative to nodding; the
+        // article before "eye" must be "an", and the phrase is kept on one line so
+        // it cannot render as "(or a / eye closure)".
         assert!(
-            row_with(&text, "CONTINUOUS NODDING").contains("(or an"),
+            row_with(&text, "or an eye closure").contains("or an eye closure"),
             "{text}"
         );
+        assert!(!text.contains("or a eye closure"), "{text}");
     }
 
     #[test]

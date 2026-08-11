@@ -1,11 +1,21 @@
 # ADR-0002: Challenge-response temporal liveness for IR-reflective print attacks
 
-**Status:** Accepted. The shipped design is **passive EAR** liveness (MediaPipe
-FaceMesh), opt-in/off, implemented & validated 2026-07-01 (APCER 0% / BPCER 0% on
-the banner attack; see below). The earlier *prompted deliberate-blink* variant was
-built then withdrawn for bad UX. Revises the reasoning of
+**Status:** SUPERSEDED. The per-enrollment blink `require_challenge` gate this ADR
+describes was retired: it collapsed in field conditions (11 of 11 genuine sudo
+attempts got no blink verdict, 2026-07-01 daemon path) and, measured against a
+hand-held print, fired 2 times in 24, so it was intent rather than the anti-print
+layer. It is replaced by deliberate NOD (approve) and HEAD-SHAKE (decline) consent
+gestures, gated per service; `require_challenge`, the `profiles challenge` command,
+and the `SetRequireChallenge` request are removed. The passive-liveness capture
+infrastructure stays for `require_eyes_open`. The history below is kept for the
+reasoning and the measurements.
+
+Original status: Accepted. The shipped design was **passive EAR** liveness
+(MediaPipe FaceMesh), opt-in/off, implemented & validated 2026-07-01 (APCER 0% /
+BPCER 0% on the banner attack; see below). The earlier *prompted deliberate-blink*
+variant was built then withdrawn for bad UX. Revises the reasoning of
 [ADR-0001](0001-liveness-pad-strategy.md); does not supersede its rPPG rejection.
-**Date:** 2026-06-30 (passive EAR implemented 2026-07-01)
+**Date:** 2026-06-30 (passive EAR implemented 2026-07-01; superseded 2026-08-11)
 
 ## Context
 

@@ -474,7 +474,6 @@ struct App {
     sel: usize,
     profiles: Vec<ProfileSummary>,
     eyes_open: bool,
-    challenge: bool,
     keyring_armed: Option<bool>,
     /// Seal-tier label from `KeyringInfo` (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -601,7 +600,6 @@ enum ProfilesOutcome {
     Loaded {
         profiles: Vec<ProfileSummary>,
         eyes_open: bool,
-        challenge: bool,
     },
     /// The daemon answered with an error (corrupt enrollment, missing
     /// template key): real state, shown on Repair like the sync path did.
@@ -963,7 +961,6 @@ impl App {
             sel: 0,
             profiles: Vec::new(),
             eyes_open: false,
-            challenge: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -1282,12 +1279,10 @@ impl App {
                 Ok(Response::Enrollment {
                     profiles,
                     require_eyes_open,
-                    require_challenge,
                     ..
                 }) => ProfilesOutcome::Loaded {
                     profiles,
                     eyes_open: require_eyes_open,
-                    challenge: require_challenge,
                 },
                 // A corrupt/unreadable enrollment (or a missing template key
                 // for an encrypted file) surfaces as an Error, not empty;
@@ -1629,19 +1624,6 @@ impl App {
                     Fix::Root(RootFix::RestartDaemon),
                 ));
             }
-        }
-        // Blink challenge configured but the FaceMesh model isn't loaded: the
-        // challenge silently skips; surface it instead.
-        if self.challenge && self.health.as_ref().is_some_and(|h| !h.mesh) {
-            v.push(mk(
-                "Blink challenge",
-                Sev::Fail,
-                "require-challenge is ON but FaceMesh isn't loaded; the challenge is skipped"
-                    .into(),
-                Fix::Manual(
-                    "set IRLUME_MESH_MODEL=<models/face_landmarks_detector.tflite> in the irlumed unit".into(),
-                ),
-            ));
         }
         // Fingerprint reader health: a crashed/aborted enrollment leaves the
         // device CLAIMED and pam_fprintd fails silently (no finger prompt).
@@ -2251,11 +2233,9 @@ impl App {
                     ProfilesOutcome::Loaded {
                         profiles,
                         eyes_open,
-                        challenge,
                     } => {
                         self.profiles = profiles;
                         self.eyes_open = eyes_open;
-                        self.challenge = challenge;
                         self.enroll_error = None;
                         self.profiles_loaded = true;
                     }
@@ -3388,21 +3368,6 @@ impl App {
                     map_settings,
                 );
             }
-            // Blink challenge is a per-user opt-in gate, togglable exactly like
-            // eyes-open; [c] flips it so the anti-spoof stage no longer needs a
-            // drop to the shell (`irlume profiles challenge on|off`).
-            (SC_SETTINGS, KeyCode::Char('c')) => {
-                let on = !self.challenge;
-                self.start_async(
-                    "toggle require-challenge",
-                    OpTag::Generic,
-                    Request::SetRequireChallenge {
-                        user: self.user.clone(),
-                        on,
-                    },
-                    map_settings,
-                );
-            }
             // Biopolicy gate: enabling changes the security posture (restricts
             // which services a face may satisfy), so it is confirmed; disabling
             // just relaxes back to default and goes straight through.
@@ -3986,7 +3951,7 @@ impl App {
                     None => "Wires face login into your greeter, lock screen and sudo.",
                 },
                 SC_SETTINGS => {
-                    "[enter] turns the eyes-open check OFF (it cannot be turned on, see #386), [c] the blink challenge; other settings are root or read-only."
+                    "[enter] turns the eyes-open check OFF (it cannot be turned on, see #386); other settings are root or read-only."
                 }
                 SC_MODELS => {
                     "Measured model options; switching the recognizer means re-enrolling."
@@ -5724,10 +5689,6 @@ impl App {
                 onoff(self.eyes_open),
             ]),
             Line::from(vec![
-                Span::raw("  blink challenge   "),
-                onoff(self.challenge),
-            ]),
-            Line::from(vec![
                 Span::raw("  keyring unlock    "),
                 onoff_opt(self.keyring_armed),
             ]),
@@ -6607,7 +6568,6 @@ mod tests {
             sel: 0,
             profiles: Vec::new(),
             eyes_open: false,
-            challenge: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -6825,7 +6785,6 @@ mod tests {
         let (ok, _) = map_settings(Response::Enrollment {
             profiles: Vec::new(),
             require_eyes_open: true,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         });
@@ -8243,24 +8202,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_c_toggles_blink_challenge_via_the_daemon() {
-        let _sock = dead_socket();
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        app.on_key(KeyCode::Char('c'));
-        assert_eq!(
-            app.op.as_ref().map(|o| o.label.as_str()),
-            Some("toggle require-challenge"),
-            "[c] must fire the SetRequireChallenge toggle, not fall through"
-        );
-        wait_op_done(&mut app);
-        assert!(
-            app.error.is_some(),
-            "a failed toggle must raise the error banner, not vanish"
-        );
-    }
-
-    #[test]
     fn repair_ir_selftest_suspends_to_sudo_not_a_direct_daemon_call() {
         // The daemon root-gates SelfTest (spoof-tuning oracle), so [l] must run
         // it via sudo like every other root action, not fail on a peer-uid
@@ -9103,7 +9044,6 @@ mod tests {
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["s1"])],
             eyes_open: true,
-            challenge: false,
         })
         .unwrap();
         app.poll();
@@ -9147,7 +9087,6 @@ mod tests {
         tx.send(ProfilesOutcome::Loaded {
             profiles: Vec::new(),
             eyes_open: false,
-            challenge: false,
         })
         .unwrap();
         app.poll();
@@ -10247,7 +10186,7 @@ mod tests {
     }
 
     #[test]
-    fn run_checks_flags_version_skew_challenge_gap_and_corrupt_enrollment() {
+    fn run_checks_flags_version_skew_and_corrupt_enrollment() {
         let _sock = dead_socket();
         let mut app = test_app();
         app.health = Some(HealthInfo {
@@ -10262,7 +10201,6 @@ mod tests {
             third_party_detector: None,
             apparmor: None,
         });
-        app.challenge = true;
         app.enroll_error = Some("bad ciphertext".into());
         app.run_checks();
         let find = |label: &str| {
@@ -10277,9 +10215,6 @@ mod tests {
             build.detail.contains("0.0.1-old"),
             "names the stale version"
         );
-        let blink = find("Blink challenge");
-        assert!(blink.sev == Sev::Fail);
-        assert!(blink.detail.contains("challenge is skipped"));
         let enroll = find("Enrollment");
         assert!(enroll.sev == Sev::Fail, "unreadable ≠ not enrolled");
         assert!(enroll.detail.contains("bad ciphertext"));

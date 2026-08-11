@@ -179,12 +179,6 @@ pub struct Enrollment {
     /// Per-user opt-in: require both eyes open to unlock (default off).
     #[serde(default)]
     pub require_eyes_open: bool,
-    /// Per-user opt-in: require a blink challenge (temporal liveness) to unlock
-    /// (default off). Defeats static IR-reflective prints: a print can't blink.
-    /// See ADR-0002. Only enforced when IR is available (the glint challenge needs
-    /// the emitter).
-    #[serde(default)]
-    pub require_challenge: bool,
     /// Camera identity captured at enroll, verified at auth (anti-swap). `None`
     /// for pre-binding enrollments; enforcement only kicks in once bound.
     #[serde(default)]
@@ -234,7 +228,6 @@ impl Enrollment {
             user: user.into(),
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             camera_binding: None,
             closure_calibration: None,
         }
@@ -499,7 +492,6 @@ fn migrate(old: LegacyProfile) -> Enrollment {
             scans,
         }],
         require_eyes_open: false,
-        require_challenge: false,
         camera_binding: None,
         closure_calibration: None,
     }
@@ -1037,7 +1029,6 @@ mod tests {
                 }],
             }],
             require_eyes_open: true,
-            require_challenge: false,
             camera_binding: None,
             closure_calibration: None,
         }
@@ -1333,7 +1324,7 @@ mod tests {
             return;
         }
         let mut e2 = e.clone();
-        e2.require_challenge = true;
+        e2.require_eyes_open = true;
         assert!(
             save(&e2).is_err(),
             "save must fail when the temp file cannot be created"

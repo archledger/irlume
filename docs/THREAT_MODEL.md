@@ -245,7 +245,7 @@ requires a daemon-verified live biometric even against root).
 **Fingerprint presentation attacks: scope.** The fingerprint path's
 anti-spoofing is whatever the sensor and `fprintd` provide, which for common
 match-on-host readers is **none**. irlume's IR liveness gates (emitter
-ratio/glint/center-edge cues, eyes-open, blink challenge) apply to the **face path
+ratio/glint/center-edge cues, eyes-open) apply to the **face path
 only** and do not transfer. For reference, Windows Hello certification
 *requires* fingerprint anti-spoofing; irlume's fingerprint companion makes no
 equivalent claim. Treat it as convenience-tier against a determined attacker

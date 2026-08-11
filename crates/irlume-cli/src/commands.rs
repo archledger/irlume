@@ -667,20 +667,14 @@ pub fn status(args: &[String]) -> ExitCode {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
-            require_challenge,
             ..
         }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
             println!(
-                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}{}",
+                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}",
                 profiles.len(),
                 if require_eyes_open {
                     " · eyes-open required"
-                } else {
-                    ""
-                },
-                if require_challenge {
-                    " · passive blink liveness"
                 } else {
                     ""
                 }
@@ -1852,7 +1846,7 @@ SETUP & STATUS
 
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
-  profiles [list|add-scan|rename|delete|forget-model|eyes-open|challenge <on|off>]   manage profiles
+  profiles [list|add-scan|rename|delete|forget-model|eyes-open <on|off>]   manage profiles
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
   calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
                         prompts; captures N rounds (default 3) and stores the median

@@ -286,7 +286,6 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             }
             if created {
                 println!("[enroll] enrolled '{profile}' with {total} scans");
-                offer_blink_challenge(&user);
             } else {
                 println!(
                     "[enroll] this face is already enrolled as '{profile}'; added {added} scans \
@@ -308,52 +307,6 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
             eprintln!("enroll: {e}");
             std::process::ExitCode::FAILURE
         }
-    }
-}
-
-/// After a fresh enrollment on IR hardware, make the opt-in anti-spoof blink
-/// challenge an informed choice rather than a hidden flag. It stays OFF by
-/// default (every mainstream face authenticator, Windows Hello / Face ID /
-/// Android, ships passive PAD, not an active challenge; the default IR gate is
-/// the passive analogue). This offers the extra print/replay defense to those
-/// who want it, being honest about the latency and glasses cost.
-fn offer_blink_challenge(user: &str) {
-    use std::io::{BufRead, IsTerminal, Write};
-    // Only meaningful on IR-capable (Secure-tier) hardware.
-    if !crate::caps().ir_pair {
-        return;
-    }
-    let tip =
-        "Tip: the opt-in anti-spoof blink challenge blocks printed/screen-replay spoofs.\n      \
-               Enable it any time with: irlume profiles challenge on";
-    if !std::io::stdin().is_terminal() {
-        println!("{tip}");
-        return;
-    }
-    print!(
-        "\nEnable the anti-spoof blink challenge now? It blocks printed-photo and\n\
-         screen-replay spoofs, but adds a few seconds per login and can be finicky\n\
-         with glasses. The default IR gate already blocks screens and matte prints.\n\
-         Enable blink challenge? [y/N] "
-    );
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        println!("{tip}");
-        return;
-    }
-    if matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
-        match daemon_request(&irlume_common::Request::SetRequireChallenge {
-            user: user.to_string(),
-            on: true,
-        }) {
-            Ok(irlume_common::Response::Enrollment { .. }) | Ok(irlume_common::Response::Ok(_)) => {
-                println!("[enroll] anti-spoof blink challenge enabled. Disable with `irlume profiles challenge off`.")
-            }
-            _ => println!("[enroll] could not enable the challenge now; run `irlume profiles challenge on` later."),
-        }
-    } else {
-        println!("[enroll] keeping the default (fast) IR gate. {tip}");
     }
 }
 
@@ -486,26 +439,20 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             Some(on) => Request::SetRequireEyesOpen { user, on },
             None => return std::process::ExitCode::from(2),
         },
-        Some("challenge") => match toggle_value(args, "challenge") {
-            Some(on) => Request::SetRequireChallenge { user, on },
-            None => return std::process::ExitCode::from(2),
-        },
         _ => return usage_profiles(),
     };
     match daemon_request(&req) {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
-            require_challenge,
             ..
         }) => {
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
             } else {
                 println!(
-                    "[profiles] require-eyes-open: {}  ·  require-challenge (blink): {}",
-                    if require_eyes_open { "ON" } else { "off" },
-                    if require_challenge { "ON" } else { "off" }
+                    "[profiles] require-eyes-open: {}",
+                    if require_eyes_open { "ON" } else { "off" }
                 );
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
@@ -1130,8 +1077,7 @@ fn usage_profiles() -> std::process::ExitCode {
         forget-model <model>                    remove one recognizer's scans from every\n  \
                                                 profile (shipped | a catalog name | embed:<sha256>)\n  \
         eyes-open off                           turn OFF the eyes-open check\n  \
-        \x20                                       (it cannot be turned on; see issue #386)\n  \
-        challenge <on|off>                      opt-in passive blink liveness"
+        \x20                                       (it cannot be turned on; see issue #386)"
     );
     std::process::ExitCode::from(2)
 }
@@ -1619,8 +1565,8 @@ pub(crate) fn daemon_sample(
         .map_err(|e| e.to_string())
 }
 
-/// The `on`/`off` word for `profiles eyes-open|challenge`, read as the argument
-/// AFTER the subcommand rather than found anywhere in argv.
+/// The `on`/`off` word for `profiles eyes-open`, read as the argument AFTER the
+/// subcommand rather than found anywhere in argv.
 ///
 /// Scanning the whole command line meant a flag VALUE could be mistaken for the
 /// setting: `irlume profiles eyes-open --user on` turned the feature on for an
@@ -5330,7 +5276,7 @@ mod tests {
             "a --user VALUE must never be read as the setting"
         );
         assert_eq!(
-            toggle_value(&argv(&["challenge", "--user", "off"]), "challenge"),
+            toggle_value(&argv(&["eyes-open", "--user", "off"]), "eyes-open"),
             None
         );
         // Contradictory input stays a usage error rather than first-wins.
@@ -5343,9 +5289,9 @@ mod tests {
             None
         );
         // Missing value, and a value that is neither word.
-        assert_eq!(toggle_value(&argv(&["challenge"]), "challenge"), None);
+        assert_eq!(toggle_value(&argv(&["eyes-open"]), "eyes-open"), None);
         assert_eq!(
-            toggle_value(&argv(&["challenge", "yes"]), "challenge"),
+            toggle_value(&argv(&["eyes-open", "yes"]), "eyes-open"),
             None
         );
     }

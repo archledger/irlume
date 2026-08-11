@@ -472,8 +472,9 @@ fn forced_consent_for(service: Option<&str>) -> bool {
 /// does not, and nothing in between can blur the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationPurpose {
-    /// Prove identity for a session (login, lock screen, sudo). Only the
-    /// per-enrollment `require_challenge` opt-in adds a gate. Unchanged behaviour.
+    /// Prove identity for a session (login, lock screen, sudo). A gesture is
+    /// demanded only when the service's own policy asks for it (elevation
+    /// defaults on; see `demands_gesture`).
     Verify,
     /// Approve one application request (a polkit prompt). Requires the deliberate
     /// consent gesture, because the user is answering a prompt they did not type
@@ -2742,18 +2743,16 @@ impl Engine {
     /// Apply whatever gate the purpose and the enrollment ask for on top of the
     /// match, just before granting.
     ///
-    /// Two different gates live here:
-    ///
-    /// * The DELIBERATE consent gesture (nod / calibrated eye closure), required
-    ///   by [`AuthenticationPurpose::AppConsent`] (polkit) and, by default, by
-    ///   [`AuthenticationPurpose::CredentialRelease`]. A gesture is intent, not
-    ///   just liveness, and it fails closed.
-    /// * The per-enrollment passive natural-blink opt-in (`require_challenge`,
-    ///   ADR-0002), unchanged.
+    /// One gate lives here: the DELIBERATE consent gesture (nod / calibrated eye
+    /// closure), required by [`AuthenticationPurpose::AppConsent`] (polkit), by
+    /// elevation services under [`AuthenticationPurpose::Verify`], and by
+    /// [`AuthenticationPurpose::CredentialRelease`] when the user has opted in
+    /// (it defaults off). A gesture is intent, not just liveness, and it fails
+    /// closed.
     ///
     /// Every failure downgrades to a non-grant with an Uncertain-style reason, so
     /// PAM cascades to the typed password; nothing here can lock a user out. When
-    /// IR or the FaceMesh model is missing, both gates fail closed to the password
+    /// IR or the FaceMesh model is missing, the gate fails closed to the password
     /// rather than hand back a grant weaker than what was asked for.
     fn challenge_if_required(
         &mut self,
@@ -5922,7 +5921,6 @@ mod tests {
         let enr = Enrollment {
             user: "u".into(),
             require_eyes_open: false,
-            require_challenge: false,
             camera_binding: None,
             closure_calibration: None,
             profiles: vec![
@@ -8042,17 +8040,17 @@ mod engine_tests {
             .unwrap();
         assert!(!out.granted, "forced gate must fail closed without IR");
         assert!(out.reason.contains("consent gesture"), "{}", out.reason);
-        let mut opt_in = Enrollment::new("irlume-test-consent");
-        opt_in.require_challenge = true;
+        // A plain Verify with no service demands no gesture, so it grants.
         let out = s
             .engine
-            .challenge_if_required(&opt_in, AuthenticationPurpose::Verify, None, granted())
+            .challenge_if_required(
+                &Enrollment::new("irlume-test-consent"),
+                AuthenticationPurpose::Verify,
+                None,
+                granted(),
+            )
             .unwrap();
-        assert!(
-            out.granted,
-            "require_challenge is no longer gating; gesture-based intent supersedes it: {}",
-            out.reason
-        );
+        assert!(out.granted, "plain Verify must not gate: {}", out.reason);
 
         teardown_sandbox(&dir);
     }
@@ -8060,59 +8058,43 @@ mod engine_tests {
     /// The credential-release gate, purpose by purpose, on an IR-less engine (so
     /// a required gesture always fails and the deny reason names which gate ran).
     ///
-    /// The contract: a credential release with the challenge ON demands the
-    /// deliberate gesture even for an enrollment that opted into nothing; with the
-    /// challenge OFF it falls back to exactly the per-enrollment behaviour, which a
-    /// global opt-out must not cancel. Verify is untouched either way.
+    /// The contract: a credential release whose `temporal_challenge` is ON demands
+    /// the deliberate gesture; with it OFF (the default) the release grants after
+    /// the match. Verify is untouched either way. The purpose carries the resolved
+    /// setting explicitly, so this pins the arm independent of the config default.
     #[test]
-    fn credential_release_requires_the_gesture_by_default_and_honours_the_opt_out() {
+    fn credential_release_gates_on_the_temporal_challenge_flag() {
         let _g = env_guard();
         let mut s = shared();
         let dir = state_sandbox("credrelease");
 
         let plain = Enrollment::new("irlume-test-credrel");
-        let mut opted_in = Enrollment::new("irlume-test-credrel");
-        opted_in.require_challenge = true;
         let grant = || Outcome::grant(0.9, "match");
         let release = |on: bool| AuthenticationPurpose::CredentialRelease {
             temporal_challenge: on,
         };
 
-        // Challenge ON (the default) + an enrollment that opted into nothing:
-        // the deliberate gesture is still required, and fails closed here.
+        // temporal_challenge ON: the deliberate gesture is required, and fails
+        // closed here (IR-less).
         let out = s
             .engine
             .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
-        assert!(!out.granted, "default-on release must gate: {}", out.reason);
+        assert!(!out.granted, "an on release must gate: {}", out.reason);
         assert!(
             out.reason.contains("consent gesture"),
             "the gesture gate must be the one that ran: {}",
             out.reason
         );
 
-        // Challenge OFF + no per-enrollment opt-in: today's behaviour, a grant.
+        // temporal_challenge OFF (the default): a grant, no gesture.
         let out = s
             .engine
             .challenge_if_required(&plain, release(false), None, grant())
             .unwrap();
-        assert!(out.granted, "opt-out must not add a gate: {}", out.reason);
+        assert!(out.granted, "an off release must not gate: {}", out.reason);
 
-        // The per-enrollment require_challenge gate is removed. Gesture-based
-        // intent (nod/shake) proves both liveness and intent; a print cannot
-        // produce a coherent head pose sequence. The require_challenge flag
-        // is kept on the struct for backward compat but is no longer checked.
-        let out = s
-            .engine
-            .challenge_if_required(&opted_in, release(false), None, grant())
-            .unwrap();
-        assert!(
-            out.granted,
-            "require_challenge is no longer gating; gesture-based intent supersedes it: {}",
-            out.reason
-        );
-
-        // Verify is unchanged: no opt-in, no gate.
+        // Verify is unchanged: no service, no gate.
         for purpose in [AuthenticationPurpose::Verify, release(false)] {
             assert!(
                 s.engine
@@ -8396,89 +8378,6 @@ mod engine_tests {
     }
 
     #[test]
-    fn challenge_gate_only_arms_when_grant_flag_and_hardware_align() {
-        let _g = env_guard();
-        let mut s = shared();
-        let enr_flag = |flag: bool| {
-            let mut e = Enrollment::new("u");
-            e.require_challenge = flag;
-            e
-        };
-        let grant = || Outcome::grant(0.9, "match: p (rgb)");
-        // A denial is never escalated into a challenge.
-        let denied = Outcome::deny_live(OutcomeKind::BelowThreshold, 0.0, "below threshold (ir)");
-        let o = s
-            .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, None, denied)
-            .unwrap();
-        assert!(!o.granted);
-        // Grant without the opt-in flag: passes through untouched.
-        let o = s
-            .engine
-            .challenge_if_required(
-                &enr_flag(false),
-                AuthenticationPurpose::Verify,
-                None,
-                grant(),
-            )
-            .unwrap();
-        assert!(o.granted);
-        // The require_challenge flag is no longer checked (gesture-based
-        // intent supersedes it). Flag on with no IR or no mesh: grant passes
-        // through unchanged.
-        assert!(!s.engine.ir_available);
-        let o = s
-            .engine
-            .challenge_if_required(
-                &enr_flag(true),
-                AuthenticationPurpose::Verify,
-                None,
-                grant(),
-            )
-            .unwrap();
-        assert!(
-            o.granted,
-            "require_challenge is no longer gating: {}",
-            o.reason
-        );
-        // Flag on + IR + no mesh: also passes through.
-        s.engine.ir_available = true;
-        let mesh = s.engine.mesh.take();
-        let o = s
-            .engine
-            .challenge_if_required(
-                &enr_flag(true),
-                AuthenticationPurpose::Verify,
-                None,
-                grant(),
-            )
-            .unwrap();
-        assert!(
-            o.granted,
-            "require_challenge is no longer gating: {}",
-            o.reason
-        );
-        // The require_challenge flag is no longer checked. The passive-liveness
-        // capture (run_passive_liveness) still exists for require_eyes_open.
-        s.engine.mesh = mesh;
-        let o = s
-            .engine
-            .challenge_if_required(
-                &enr_flag(true),
-                AuthenticationPurpose::Verify,
-                None,
-                grant(),
-            )
-            .unwrap();
-        assert!(
-            o.granted,
-            "require_challenge is no longer gating: {}",
-            o.reason
-        );
-        s.engine.ir_available = false; // restore the shared baseline
-    }
-
-    #[test]
     fn passive_liveness_without_mesh_reports_no_eyes() {
         let _g = env_guard();
         let mut s = shared();
@@ -8569,7 +8468,6 @@ mod engine_tests {
             &Enrollment {
                 user: "lbuser".into(),
                 require_eyes_open: false,
-                require_challenge: false,
                 camera_binding: None,
                 closure_calibration: None,
                 profiles: vec![FaceProfile {

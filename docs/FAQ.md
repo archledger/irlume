@@ -116,7 +116,7 @@ meantime, so nothing locks you out.
 </details>
 
 <details>
-<summary><b>How fast is a face login, and why is the blink challenge slower?</b></summary>
+<summary><b>How fast is a face login, and when does it ask for a gesture?</b></summary>
 
 A normal face login takes about **2.5 seconds** on an integrated IR camera
 (measured on an ASUS Zenbook, CPU inference). Most of that is opening the
@@ -125,18 +125,14 @@ IR captures run in parallel, which cuts the capture stage by about a third;
 [docs/DEBUGGING.md](DEBUGGING.md) shows how to time every stage on your
 own hardware.
 
-The **opt-in blink challenge** (`irlume profiles challenge on`) is a deterrent
-against a glossy print or vinyl that mimics the infrared relief pattern: it
-watches for a
-natural blink, which a static image cannot do. Detecting a blink is inherently
-temporal, so it captures a roughly 5-second infrared sequence, and the login
-takes about **10 seconds** (measured across six runs, glasses on and off). That
-is the trade: the challenge closes a spoof gap the default single-frame gate
-cannot, at about four times the latency.
-
-It is off by default. Turn it on with `irlume profiles challenge on` if you
-want the extra deterrent, or leave it off for the ~2.5-second login. The
-default IR-structure gate rejected the tested screens, video replays, and
-matte-paper photos, but a glossy vinyl print of the enrolled face passed it;
-see [Limits](LIMITATIONS.md).
+Some operations add a deliberate **consent gesture** after the face match: a
+head nod approves, a head shake declines and closes the prompt. It gates
+app-consent prompts (polkit) and terminal elevation (sudo, su, doas) by default,
+and the keyring-release path only if you opt in with `irlume
+credential-release-challenge on`. A greeter cold login, logout and lock-screen
+unlock need no gesture. The gesture proves intent, not liveness; the
+IR-structure gate is what rejects a print (it stopped the tested screens, video
+replays and matte-paper photos, though a glossy vinyl print of the enrolled face
+passed it; see [Limits](LIMITATIONS.md)), and a missed gesture always falls back
+to typing the password.
 </details>

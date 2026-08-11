@@ -401,7 +401,6 @@ fn profiles_usage_errors_exit_2() {
         "delete --profile P [--scan S]",
         "forget-model <model>",
         "eyes-open off",
-        "challenge <on|off>",
     ] {
         assert!(
             err.contains(frag),
@@ -467,7 +466,6 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
             "N",
         ],
         &["profiles", "eyes-open", "on"],
-        &["profiles", "challenge", "off"],
         &["profiles", "forget-model", "shipped"],
     ];
     for argv in cases {
@@ -1533,7 +1531,6 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
                 live_recognizer: None,
             }],
             require_eyes_open: true,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -1544,7 +1541,6 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
     let (code, out, _) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
     assert_eq!(code, 0);
     assert!(out.contains("require-eyes-open: ON"), "{out}");
-    assert!(out.contains("require-challenge (blink): off"), "{out}");
     assert!(out.contains("Face Profile 1 (2 scans)"), "{out}");
     assert!(out.contains("- Scan 1"), "{out}");
     assert!(out.contains("- Glasses"), "{out}");
@@ -1560,7 +1556,6 @@ fn profiles_empty_listing_says_none_enrolled() {
     serve(&sock(&sb), |_| Response::Enrollment {
         profiles: Vec::new(),
         require_eyes_open: false,
-        require_challenge: false,
         closure_calibrated: false,
         ir_ratio_calibrated: false,
     });
@@ -1682,7 +1677,6 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
                 live_recognizer: None,
             }],
             require_eyes_open: false,
-            require_challenge: true,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -1705,7 +1699,6 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
     assert_eq!(code, 0);
     assert!(out.contains("daemon        : running"), "{out}");
     assert!(out.contains("1 profile(s), 2 scan(s)"), "{out}");
-    assert!(out.contains("passive blink liveness"), "{out}");
     assert!(out.contains("Face Profile 1 (2 scan(s))"), "{out}");
     assert!(out.contains("keyring unlock: armed"), "{out}");
     assert!(out.contains("Tier 2 (pcrlock)"), "{out}");
@@ -1790,7 +1783,6 @@ fn setup_walks_every_step_noninteractively() {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },

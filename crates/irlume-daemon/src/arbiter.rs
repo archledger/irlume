@@ -123,7 +123,6 @@ pub fn classify(req: &Request) -> Class {
         | RenameProfile { .. }
         | RenameScan { .. }
         | SetRequireEyesOpen { .. }
-        | SetRequireChallenge { .. }
         // Stores the numbers CaptureEarMedian already captured; the capture
         // was the camera work, and it is classified Camera above.
         | SetClosureCalibration { .. } => Class::Plain,

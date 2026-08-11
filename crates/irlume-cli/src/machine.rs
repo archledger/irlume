@@ -1872,12 +1872,11 @@ pub fn profiles_list(args: &[String]) -> ExitCode {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
-            require_challenge,
             ..
         }) => emit(
             &success(
                 COMMAND,
-                profiles_data(profiles, require_eyes_open, require_challenge),
+                profiles_data(profiles, require_eyes_open),
                 contract,
             ),
             ExitCode::SUCCESS,
@@ -2051,11 +2050,7 @@ fn third_party_data(stage: irlume_common::thirdparty::Stage) -> Value {
     json!({ "enabled": enabled, "catalog": catalog })
 }
 
-fn profiles_data(
-    profiles: Vec<ProfileSummary>,
-    require_eyes_open: bool,
-    require_challenge: bool,
-) -> Value {
+fn profiles_data(profiles: Vec<ProfileSummary>, require_eyes_open: bool) -> Value {
     // The current enrollment store identifies profiles and scans by their
     // names. Do not falsely present those names as opaque stable IDs. A later
     // contract capability can add mutation-safe IDs after the store owns them.
@@ -2104,8 +2099,7 @@ fn profiles_data(
         .collect::<Vec<_>>();
     json!({
         "profiles": profiles,
-        "require_eyes_open": require_eyes_open,
-        "require_challenge": require_challenge
+        "require_eyes_open": require_eyes_open
     })
 }
 
@@ -2231,7 +2225,6 @@ mod tests {
                 live_recognizer: None,
             }],
             false,
-            false,
         );
         let profile = &data["profiles"][0];
         assert_eq!(profile["scans"].as_array().unwrap().len(), 2);
@@ -2249,7 +2242,6 @@ mod tests {
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
             }],
-            false,
             false,
         );
         assert_eq!(
@@ -2277,7 +2269,6 @@ mod tests {
                 scans_by_recognizer: counts,
                 live_recognizer: Some("embed:model-b".into()),
             }],
-            false,
             false,
         );
         let recs = data["profiles"][0]["recognizers"].as_array().unwrap();
@@ -2311,7 +2302,7 @@ mod tests {
             .expect("an older daemon's summary must still decode");
         assert!(old_wire.scans_by_recognizer.is_empty());
         assert!(old_wire.live_recognizer.is_none());
-        let data = profiles_data(vec![old_wire], false, false);
+        let data = profiles_data(vec![old_wire], false);
         // This used to assert an empty ARRAY. It now asserts the key is absent:
         // an empty array beside a populated `scans` list says "no recognizer has
         // templates in this profile", which is a definite claim the CLI cannot
@@ -3007,7 +2998,6 @@ mod tests {
                 live_recognizer: None,
             }],
             true,
-            false,
         );
 
         assert_eq!(data["profiles"][0]["display_name"], "Face Profile 1");
@@ -3015,7 +3005,6 @@ mod tests {
         assert!(data["profiles"][0].get("profile_id").is_none());
         assert!(data["profiles"][0]["scans"][0].get("scan_id").is_none());
         assert_eq!(data["require_eyes_open"], true);
-        assert_eq!(data["require_challenge"], false);
     }
 
     #[test]

@@ -2008,7 +2008,6 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
         | SetRequireEyesOpen { user, .. }
-        | SetRequireChallenge { user, .. }
         | SetClosureCalibration { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
@@ -2236,7 +2235,6 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
 struct EnrollmentSummary {
     profiles: Vec<irlume_common::ProfileSummary>,
     require_eyes_open: bool,
-    require_challenge: bool,
     closure_calibrated: bool,
     ir_ratio_calibrated: bool,
 }
@@ -2278,7 +2276,6 @@ fn summarize_enrollment(
                 })
                 .collect(),
             require_eyes_open: enr.require_eyes_open,
-            require_challenge: enr.require_challenge,
             closure_calibrated: enr
                 .closure_calibration
                 .map(|(o, c)| {
@@ -2297,7 +2294,6 @@ fn summarize_enrollment(
         None => EnrollmentSummary {
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -2528,7 +2524,6 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 Some(sum) => Response::Enrollment {
                     profiles: sum.profiles,
                     require_eyes_open: sum.require_eyes_open,
-                    require_challenge: sum.require_challenge,
                     closure_calibrated: sum.closure_calibrated,
                     ir_ratio_calibrated: sum.ir_ratio_calibrated,
                 },
@@ -2874,7 +2869,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     Response::Enrollment {
                         profiles: sum.profiles,
                         require_eyes_open: sum.require_eyes_open,
-                        require_challenge: sum.require_challenge,
                         closure_calibrated: sum.closure_calibrated,
                         ir_ratio_calibrated: sum.ir_ratio_calibrated,
                     }
@@ -3629,13 +3623,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             enr.require_eyes_open = on;
             Ok(format!(
                 "require-eyes-open {}",
-                if on { "ENABLED" } else { "disabled" }
-            ))
-        }),
-        Request::SetRequireChallenge { user, on } => mutate_enrollment(&user, |enr| {
-            enr.require_challenge = on;
-            Ok(format!(
-                "require-challenge {}",
                 if on { "ENABLED" } else { "disabled" }
             ))
         }),
@@ -5095,10 +5082,6 @@ mod tests {
             user: u(),
             on: true,
         },
-        SetRequireChallenge => Request::SetRequireChallenge {
-            user: u(),
-            on: false,
-        },
         CaptureEarMedian => Request::CaptureEarMedian { user: u() },
         SetClosureCalibration => Request::SetClosureCalibration {
             user: u(),
@@ -5518,7 +5501,6 @@ mod tests {
                                 live_recognizer: None,
                             }],
                             require_eyes_open: false,
-                            require_challenge: false,
                             closure_calibrated: false,
                             ir_ratio_calibrated: false,
                         },
@@ -5752,7 +5734,6 @@ mod tests {
                     live_recognizer: None,
                 }],
                 require_eyes_open: true,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: true,
             },
@@ -5796,7 +5777,6 @@ mod tests {
             "RenameProfile",
             "RenameScan",
             "SetRequireEyesOpen",
-            "SetRequireChallenge",
             "SetClosureCalibration",
             "RecoverySetup",
             "RecoveryRestore",
@@ -5843,7 +5823,6 @@ mod tests {
             EnrollmentSummary {
                 profiles: Vec::new(),
                 require_eyes_open: true,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -6836,7 +6815,6 @@ mod tests {
                     .collect(),
             }],
             require_eyes_open: false,
-            require_challenge: false,
             camera_binding: None,
             closure_calibration: None,
         }
@@ -7110,7 +7088,6 @@ mod tests {
             Response::Enrollment {
                 profiles,
                 require_eyes_open,
-                require_challenge,
                 ..
             } => {
                 assert_eq!(profiles.len(), 1);
@@ -7120,7 +7097,6 @@ mod tests {
                     vec!["Face Scan 1".to_string(), "Face Scan 2".to_string()]
                 );
                 assert!(require_eyes_open);
-                assert!(!require_challenge);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),
         }
@@ -7171,7 +7147,6 @@ mod tests {
                     live_recognizer: None,
                 }],
                 require_eyes_open: false,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -7617,7 +7592,6 @@ mod tests {
             EnrollmentSummary {
                 profiles: Vec::new(),
                 require_eyes_open: false,
-                require_challenge: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -7773,17 +7747,6 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("cannot be enabled"), "{msg}"),
             other => panic!("enabling require-eyes-open must be refused, got {other:?}"),
         }
-        expect_ok(
-            dispatch(
-                Request::SetRequireChallenge {
-                    user: "carol".into(),
-                    on: false,
-                },
-                &root,
-                &mut e,
-            ),
-            "require-challenge disabled",
-        );
         // The saved state reflects every mutation.
         match dispatch(
             Request::ListProfiles {
@@ -7796,7 +7759,6 @@ mod tests {
             Response::Enrollment {
                 profiles,
                 require_eyes_open,
-                require_challenge,
                 ..
             } => {
                 assert_eq!(profiles.len(), 1);
@@ -7807,7 +7769,6 @@ mod tests {
                 // second way, through the published enrollment rather than
                 // through storage.
                 assert!(!require_eyes_open);
-                assert!(!require_challenge);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),
         }

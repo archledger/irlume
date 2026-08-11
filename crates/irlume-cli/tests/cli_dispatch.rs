@@ -221,7 +221,6 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: one_profile(),
             require_eyes_open: true,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -364,7 +363,6 @@ fn status_enrollment_none_and_keyring_fallback_not_armed() {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -519,7 +517,6 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: one_profile(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -559,7 +556,6 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
@@ -601,7 +597,6 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),
             require_eyes_open: false,
-            require_challenge: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },

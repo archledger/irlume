@@ -480,8 +480,7 @@
       "type": "object",
       "required": [
         "profiles",
-        "require_eyes_open",
-        "require_challenge"
+        "require_eyes_open"
       ],
       "properties": {
         "profiles": {
@@ -541,9 +540,6 @@
           }
         },
         "require_eyes_open": {
-          "type": "boolean"
-        },
-        "require_challenge": {
           "type": "boolean"
         }
       }

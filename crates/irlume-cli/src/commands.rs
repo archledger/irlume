@@ -1299,28 +1299,89 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
     const TAG: &str = "[credential-release-challenge]";
     match sub {
         None | Some("status") => {
-            match irlume_common::config::credential_release_challenge_visible() {
-                Some(true) => println!("{TAG} temporal challenge: REQUIRED {OK} (default)"),
-                Some(false) => {
-                    println!("{TAG} temporal challenge: DISABLED {WARN}");
-                    println!("     {CREDENTIAL_RELEASE_RISK}.");
-                    println!("     Re-enable: sudo irlume credential-release-challenge on");
+            // Show per-service status and the global credential-release setting.
+            let services = ["sudo", "polkit-1", "credential_release"];
+            for svc in services {
+                let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
+                let visible = irlume_common::config::read_kv("settings.conf", &key);
+                let default = irlume_common::config::service_gesture_default(svc);
+                match visible {
+                    Some(ref v) if !irlume_common::config::falsy(v) => {
+                        println!("{TAG} {svc}: REQUIRED {OK} (explicitly on)");
+                    }
+                    Some(_) => {
+                        println!("{TAG} {svc}: DISABLED {WARN} (explicitly off)");
+                    }
+                    None => {
+                        let state = if default || forced_consent_service(svc) {
+                            format!("REQUIRED {OK} (default)")
+                        } else {
+                            "off (default)".to_string()
+                        };
+                        println!("{TAG} {svc}: {state}");
+                    }
                 }
-                // Root-only file: don't print a guessed security state.
-                None => println!(
-                    "{TAG} temporal challenge: root-only setting, re-run with sudo to read it"
-                ),
+            }
+            // Global credential-release-challenge fallback
+            match irlume_common::config::credential_release_challenge_visible() {
+                Some(true) => {
+                    println!("{TAG} global credential_release_challenge: REQUIRED {OK} (default)")
+                }
+                Some(false) => {
+                    println!("{TAG} global credential_release_challenge: DISABLED {WARN}")
+                }
+                None => println!("{TAG} global credential_release_challenge: root-only setting"),
             }
             ExitCode::SUCCESS
         }
+        // Service-specific toggle: irlume credential-release-challenge sudo on|off
+        Some(svc) if svc != "on" && svc != "off" => {
+            let on_off = args.first().map(String::as_str);
+            match on_off {
+                Some(v @ ("on" | "off")) => {
+                    if !crate::is_root() {
+                        eprintln!(
+                            "{TAG} needs root: sudo irlume credential-release-challenge {svc} {v}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    let high_priv = matches!(svc, "sudo" | "su" | "doas" | "polkit-1");
+                    if v == "off" && high_priv {
+                        let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
+                        if !assumed_yes && !confirm_high_privilege_disable(svc) {
+                            println!("{TAG} {svc}: left REQUIRED.");
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                    let val = if v == "on" { "1" } else { "0" };
+                    let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
+                    match irlume_common::config::write_kv("settings.conf", &key, val) {
+                        Ok(()) => {
+                            if v == "on" {
+                                println!("{TAG} {svc}: consent gesture REQUIRED {OK}");
+                            } else {
+                                eprintln!("{TAG} {svc}: consent gesture DISABLED {WARN}");
+                            }
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("{TAG} could not update settings.conf: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Some(v @ ("on" | "off")) => {
+            // Legacy global toggle
             if !crate::is_root() {
                 eprintln!("{TAG} needs root: sudo irlume credential-release-challenge {v}");
                 return ExitCode::FAILURE;
             }
-            // Weakening credential release is the one direction that needs an
-            // explicit yes. `--yes` exists for scripted installs, and still prints
-            // the warning: the point is the record, not the keystroke.
             let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
             if v == "off" && !assumed_yes && !confirm_disable() {
                 println!("{TAG} left enabled.");
@@ -1357,11 +1418,33 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
         }
         Some(other) => {
             eprintln!(
-                "{TAG} usage: irlume credential-release-challenge <on|off|status> (got '{other}')"
+                "{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status> (got '{other}')"
             );
             ExitCode::from(2)
         }
     }
+}
+
+/// Confirmation for disabling the consent gesture on a high-privilege service.
+fn confirm_high_privilege_disable(service: &str) -> bool {
+    use std::io::Write as _;
+    println!(
+        "WARNING: Disabling the consent gesture for '{service}' means a face match alone\n\
+         approves this service. If someone holds a print of your face to the camera,\n\
+         they can use '{service}' without your knowledge."
+    );
+    print!("Disable the gesture for '{service}'? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap_or_default();
+    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
+}
+
+/// True when the service always forces the consent gesture regardless of config.
+fn forced_consent_service(service: &str) -> bool {
+    // polkit is always AppConsent, which always demands_gesture.
+    // The per-service config only applies to Verify and CredentialRelease.
+    matches!(service, "polkit-1")
 }
 
 /// The confirm step before disabling the gate. A non-terminal stdin (a script, a

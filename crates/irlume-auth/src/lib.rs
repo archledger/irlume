@@ -479,11 +479,30 @@ impl AuthenticationPurpose {
 
     /// Whether the deliberate consent gesture is required regardless of the
     /// user's per-enrollment opt-in.
-    fn demands_gesture(self) -> bool {
+    ///
+    /// `service` is the PAM service name when available (e.g. `sudo`, `polkit-1`).
+    /// It is consulted for per-service overrides in `settings.conf` under
+    /// `service_gesture.<service>`. When absent, the per-purpose default is used.
+    fn demands_gesture(self, service: Option<&str>) -> bool {
         match self {
-            Self::Verify => false,
+            Self::Verify => {
+                // Elevation services (sudo, su, doas) default to gesture ON.
+                // The user can override per-service in settings.conf.
+                service.is_some_and(|s| {
+                    irlume_common::config::service_gesture(s)
+                        .unwrap_or_else(|| irlume_common::config::service_gesture_default(s))
+                })
+            }
             Self::AppConsent => true,
-            Self::CredentialRelease { temporal_challenge } => temporal_challenge,
+            Self::CredentialRelease { temporal_challenge } => {
+                // Per-service override for the credential-release path
+                // (special token "credential_release"), then the global
+                // credential_release_challenge fallback.
+                if let Some(v) = irlume_common::config::service_gesture("credential_release") {
+                    return v;
+                }
+                temporal_challenge
+            }
         }
     }
 }
@@ -2677,12 +2696,13 @@ impl Engine {
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
+        service: Option<&str>,
         outcome: Outcome,
     ) -> irlume_common::Result<Outcome> {
         if !outcome.granted {
             return Ok(outcome);
         }
-        if purpose.demands_gesture() {
+        if purpose.demands_gesture(service) {
             let seen = self.gesture_seen_before_match;
             return self.consent_gesture_gate(enr, outcome, seen);
         }
@@ -2916,7 +2936,7 @@ impl Engine {
         // grace window can hold several attempts and none of them should re-ask
         // for a gesture already given.
         self.gesture_seen_before_match = false;
-        if purpose.demands_gesture() {
+        if purpose.demands_gesture(service) {
             self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
         }
         // Hold the camera sessions across the grace window's retries. Every retry
@@ -2969,7 +2989,7 @@ impl Engine {
         let mut attempt = 0u32;
         let out = loop {
             attempt += 1;
-            let out = self.authenticate_once(&enr, purpose, &mut held)?;
+            let out = self.authenticate_once(&enr, purpose, service, &mut held)?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -2997,6 +3017,7 @@ impl Engine {
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
+        service: Option<&str>,
         held: &mut Option<(
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
@@ -3105,6 +3126,7 @@ impl Engine {
                 return self.challenge_if_required(
                     enr,
                     purpose,
+                    service,
                     Outcome::grant(score, format!("match: {who} (rgb)")),
                 );
             }
@@ -3136,7 +3158,9 @@ impl Engine {
                         *held = None;
                         return self.challenge_if_required(
                     enr,
-                    purpose, Outcome::grant(f.prob,
+                    purpose,
+                    service,
+                    Outcome::grant(f.prob,
                             format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
                     }
                     // (b) pure IR fallback: still valid when IR alone is clearly strong
@@ -3157,7 +3181,9 @@ impl Engine {
                         *held = None;
                         return self.challenge_if_required(
                     enr,
-                    purpose, Outcome::grant(ir_score,
+                    purpose,
+                    service,
+                    Outcome::grant(ir_score,
                             format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
                     }
                     // (c) calibrated-centroid fallback (ADR-0004): the mean-
@@ -3171,7 +3197,9 @@ impl Engine {
                             *held = None;
                             return self.challenge_if_required(
                     enr,
-                    purpose, Outcome::grant(*cs,
+                    purpose,
+                    service,
+                    Outcome::grant(*cs,
                                 format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
                         }
                     }
@@ -3306,6 +3334,7 @@ impl Engine {
                 return self.challenge_if_required(
                     enr,
                     purpose,
+                    service,
                     Outcome::grant(score, format!("match: {who} (ir/dark)")),
                 );
             }
@@ -3317,6 +3346,7 @@ impl Engine {
                     return self.challenge_if_required(
                         enr,
                         purpose,
+                        service,
                         Outcome::grant(
                             *cs,
                             format!("match: {cwho} (ir/dark, calibrated centroid)"),
@@ -3328,6 +3358,7 @@ impl Engine {
             return self.challenge_if_required(
                 enr,
                 purpose,
+                service,
                 Outcome::deny_live(OutcomeKind::BelowThreshold, score, "below threshold (ir)"),
             );
         }
@@ -7952,7 +7983,7 @@ mod engine_tests {
         let granted = || Outcome::grant(0.9, "match");
         let out = s
             .engine
-            .challenge_if_required(&enr, AuthenticationPurpose::AppConsent, granted())
+            .challenge_if_required(&enr, AuthenticationPurpose::AppConsent, None, granted())
             .unwrap();
         assert!(!out.granted, "forced gate must fail closed without IR");
         assert!(out.reason.contains("consent gesture"), "{}", out.reason);
@@ -7960,7 +7991,7 @@ mod engine_tests {
         opt_in.require_challenge = true;
         let out = s
             .engine
-            .challenge_if_required(&opt_in, AuthenticationPurpose::Verify, granted())
+            .challenge_if_required(&opt_in, AuthenticationPurpose::Verify, None, granted())
             .unwrap();
         assert!(
             !out.granted,
@@ -7995,7 +8026,7 @@ mod engine_tests {
         // the deliberate gesture is still required, and fails closed here.
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), grant())
+            .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
         assert!(!out.granted, "default-on release must gate: {}", out.reason);
         assert!(
@@ -8007,7 +8038,7 @@ mod engine_tests {
         // Challenge OFF + no per-enrollment opt-in: today's behaviour, a grant.
         let out = s
             .engine
-            .challenge_if_required(&plain, release(false), grant())
+            .challenge_if_required(&plain, release(false), None, grant())
             .unwrap();
         assert!(out.granted, "opt-out must not add a gate: {}", out.reason);
 
@@ -8015,7 +8046,7 @@ mod engine_tests {
         // does NOT cancel it. The passive gate runs, and fails closed IR-less.
         let out = s
             .engine
-            .challenge_if_required(&opted_in, release(false), grant())
+            .challenge_if_required(&opted_in, release(false), None, grant())
             .unwrap();
         assert!(
             !out.granted,
@@ -8032,7 +8063,7 @@ mod engine_tests {
         for purpose in [AuthenticationPurpose::Verify, release(false)] {
             assert!(
                 s.engine
-                    .challenge_if_required(&plain, purpose, grant())
+                    .challenge_if_required(&plain, purpose, None, grant())
                     .unwrap()
                     .granted,
                 "{purpose:?} must not gate a plain enrollment"
@@ -8044,7 +8075,7 @@ mod engine_tests {
         let denied = Outcome::deny_live(OutcomeKind::BelowThreshold, 0.1, "below threshold");
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), denied)
+            .challenge_if_required(&plain, release(true), None, denied)
             .unwrap();
         assert!(!out.granted);
         assert!(
@@ -8061,7 +8092,7 @@ mod engine_tests {
         s.engine.gesture_seen_before_match = true;
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), grant())
+            .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
         assert!(
             out.granted,
@@ -8074,7 +8105,7 @@ mod engine_tests {
         s.engine.gesture_seen_before_match = false;
         let out = s
             .engine
-            .challenge_if_required(&plain, release(true), grant())
+            .challenge_if_required(&plain, release(true), None, grant())
             .unwrap();
         assert!(
             !out.granted,
@@ -8083,10 +8114,10 @@ mod engine_tests {
         );
 
         // demands_gesture is the whole policy surface; pin it.
-        assert!(!AuthenticationPurpose::Verify.demands_gesture());
-        assert!(AuthenticationPurpose::AppConsent.demands_gesture());
-        assert!(release(true).demands_gesture());
-        assert!(!release(false).demands_gesture());
+        assert!(!AuthenticationPurpose::Verify.demands_gesture(None));
+        assert!(AuthenticationPurpose::AppConsent.demands_gesture(None));
+        assert!(release(true).demands_gesture(None));
+        assert!(!release(false).demands_gesture(None));
 
         teardown_sandbox(&dir);
     }
@@ -8127,7 +8158,7 @@ mod engine_tests {
                 // would let the stage pass without exercising its branch at all.
                 let assert_no_grant =
                     |engine: &mut Engine, stage: &str, err_must_say: &str| match engine
-                        .challenge_if_required(enr, release, Outcome::grant(0.95, "match"))
+                        .challenge_if_required(enr, release, None, Outcome::grant(0.95, "match"))
                     {
                         Ok(o) => assert!(
                             !o.granted,
@@ -8292,13 +8323,18 @@ mod engine_tests {
         let denied = Outcome::deny_live(OutcomeKind::BelowThreshold, 0.0, "below threshold (ir)");
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, denied)
+            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, None, denied)
             .unwrap();
         assert!(!o.granted);
         // Grant without the opt-in flag: passes through untouched.
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(false), AuthenticationPurpose::Verify, grant())
+            .challenge_if_required(
+                &enr_flag(false),
+                AuthenticationPurpose::Verify,
+                None,
+                grant(),
+            )
             .unwrap();
         assert!(o.granted);
         // Flag on but no IR hardware (convenience tier): the blink challenge
@@ -8307,7 +8343,12 @@ mod engine_tests {
         assert!(!s.engine.ir_available);
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, grant())
+            .challenge_if_required(
+                &enr_flag(true),
+                AuthenticationPurpose::Verify,
+                None,
+                grant(),
+            )
             .unwrap();
         assert!(!o.granted, "no-IR + require-challenge must fail closed");
         // Flag on + IR + no mesh model deployed: also fails closed to password.
@@ -8315,7 +8356,12 @@ mod engine_tests {
         let mesh = s.engine.mesh.take();
         let o = s
             .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, grant())
+            .challenge_if_required(
+                &enr_flag(true),
+                AuthenticationPurpose::Verify,
+                None,
+                grant(),
+            )
             .unwrap();
         assert!(!o.granted, "require-challenge + no mesh must fail closed");
         // Flag on + IR + mesh loaded: the passive-liveness capture actually
@@ -8324,7 +8370,12 @@ mod engine_tests {
         s.engine.mesh = mesh;
         let err = s
             .engine
-            .challenge_if_required(&enr_flag(true), AuthenticationPurpose::Verify, grant())
+            .challenge_if_required(
+                &enr_flag(true),
+                AuthenticationPurpose::Verify,
+                None,
+                grant(),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("no camera found"), "{err}");
         s.engine.ir_available = false; // restore the shared baseline

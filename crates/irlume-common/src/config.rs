@@ -371,6 +371,35 @@ pub fn credential_release_challenge() -> bool {
     !read_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY).is_some_and(|v| falsy(&v))
 }
 
+/// The settings.conf key prefix for per-service consent-gesture overrides.
+///
+/// Each key is `service_gesture.<service_name>`, where `<service_name>` is the
+/// PAM service name (e.g. `sudo`, `polkit-1`) or the special token
+/// `credential_release` for the cold-login keyring-unlock path. Values are `1`
+/// (gesture required) or `0` (no gesture). An absent key falls through to the
+/// per-service default.
+///
+/// The defaults: elevation services (sudo, su, doas) require the gesture.
+/// Everything else, including the credential-release path, does not. The user
+/// can override any service; a warning is printed when disabling a
+/// high-privilege service.
+pub const SERVICE_GESTURE_KEY: &str = "service_gesture";
+
+/// Read the per-service consent-gesture override from settings.conf.
+///
+/// Returns `Some(true)` when the gesture is explicitly required for this
+/// service, `Some(false)` when explicitly disabled, and `None` when no
+/// override is set (the caller applies the default).
+pub fn service_gesture(service: &str) -> Option<bool> {
+    read_kv("settings.conf", &format!("{SERVICE_GESTURE_KEY}.{service}")).map(|v| !falsy(&v))
+}
+
+/// The per-service default for the consent gesture, when no override is set.
+/// Elevation (sudo, su, doas) defaults to ON; everything else defaults to OFF.
+pub fn service_gesture_default(service: &str) -> bool {
+    matches!(service, "sudo" | "su" | "doas")
+}
+
 /// Which deliberate gesture the consent gate accepts.
 ///
 /// Lives here, not in the auth engine, because two crates must agree on it: the
@@ -602,7 +631,7 @@ mod consent_gesture_tests {
 }
 
 /// The spellings that turn a boolean settings.conf key off.
-fn falsy(v: &str) -> bool {
+pub fn falsy(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"

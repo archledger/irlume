@@ -260,24 +260,24 @@ fn credential_release_challenge_reports_defaults_and_gates_the_opt_out() {
     let cfg = sb.path("cfg/settings.conf");
     let cmd = "credential-release-challenge";
 
-    // No settings.conf at all: REQUIRED, and status never fails.
+    // No settings.conf at all: defaults shown, and status never fails.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
     assert_eq!(code, 0);
-    assert!(out.contains("temporal challenge: REQUIRED"), "{out}");
+    assert!(out.contains("sudo: REQUIRED"), "{out}");
+    assert!(out.contains("polkit-1: REQUIRED"), "{out}");
+    assert!(out.contains("credential_release: off"), "{out}");
 
     // No subcommand behaves as status (same as `irlume biopolicy`).
     let (code, out, _) = run(&mut sb.cmd(&[cmd]), cmd);
     assert_eq!(code, 0);
-    assert!(out.contains("REQUIRED"), "{out}");
+    assert!(out.contains("sudo:"), "{out}");
 
-    // Opted out: the state AND the consequence AND the fix, all three.
+    // Opted out globally: the global state shows DISABLED.
     std::fs::write(&cfg, "credential_release_challenge=0\n").unwrap();
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
     assert_eq!(code, 0);
-    assert!(out.contains("temporal challenge: DISABLED"), "{out}");
-    assert!(out.contains("static IR print"), "{out}");
     assert!(
-        out.contains("sudo irlume credential-release-challenge on"),
+        out.contains("global credential_release_challenge: DISABLED"),
         "{out}"
     );
 

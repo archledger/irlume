@@ -423,6 +423,26 @@ fn completed_consent_take_hit(
         })
 }
 
+/// Resolve a consent watch's verdict from what the stream reported.
+///
+/// `stream_hit` is `capture_ir_streaming`'s break value: `Some(true)` an accepted
+/// nod/closure, `Some(false)` a head-shake decline, `None` the budget ran out with
+/// no in-loop verdict. A `Some(_)` outcome is TERMINAL and returned as-is; the
+/// decline in particular must never be re-examined, or a completed-take nod/closure
+/// reading would overturn it into a grant. `completed_take_hit` is consulted, and
+/// evaluated, ONLY for `None`: it is what closes the trailing-poses boundary the
+/// in-loop cadence leaves (#101). Kept pure so a test can prove a decline stays a
+/// decline; the call site's own coverage cannot reach the camera.
+fn resolve_consent_watch(
+    stream_hit: Option<bool>,
+    completed_take_hit: impl FnOnce() -> bool,
+) -> bool {
+    match stream_hit {
+        Some(accepted) => accepted,
+        None => completed_take_hit(),
+    }
+}
+
 // The consent-gesture mode is defined in irlume_common::config so the PAM module
 // can name the SAME gesture it tells the user to perform; see `ConsentGesture`.
 use irlume_common::config::{consent_gesture_mode, ConsentGesture};
@@ -2300,7 +2320,12 @@ impl Engine {
     /// [`irlume_liveness::detect_blink`] then finds a dip below the open baseline. A
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
     /// natural blink → Blinked, static vinyl banner → NoBlink.
-    #[allow(dead_code)] // used in tests and by require_eyes_open
+    // Production-dead since the blink `require_challenge` gate was removed (nod/
+    // shake supersede it). `require_eyes_open` gates on the per-frame `eyes_open`
+    // flag, not this blink-window detector. Kept for its tests and because it is
+    // the worked example of the EAR path `capture_ear_samples` (still used by the
+    // eyes-open calibration) drives.
+    #[allow(dead_code)]
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
         // ~5s window at the raw ~15 fps rate.
         const SAMPLES: usize = 75;
@@ -2620,18 +2645,22 @@ impl Engine {
         if let Some(e) = err {
             return Err(e);
         }
-        // The in-loop check runs every CHECK_EVERY poses, so a take whose
-        // length is not a multiple of it ends with unevaluated trailing poses,
-        // and a gesture completing in exactly those frames is refused with
-        // whole-take evidence that passes every gate. Measured 2026-08-04
-        // (#101): two 20-pose windows printed pitch_range 0.077-0.085 against
-        // the 0.075 floor after their last check ran at pose 18, and one cost
-        // a real trial its release. One evaluation of the COMPLETE series
-        // closes the boundary at zero capture cost.
-        let hit_in_loop = hit == Some(true);
-        let hit =
-            completed_consent_take_hit(hit_in_loop, allow_nod, &poses, &ears, closure_cal.as_ref());
-        if hit && !hit_in_loop {
+        // Resolve the take. A stream that broke in the loop is TERMINAL, whether
+        // it accepted (`Some(true)`, a nod or closure) or declined (`Some(false)`,
+        // a head-shake, which also set `gesture_cancelled`). Only a budget-
+        // exhausted `None` consults the completed take, to catch a gesture that
+        // finished inside the trailing poses the in-loop cadence never checked
+        // (measured 2026-08-04, #101: two 20-pose windows at pitch_range
+        // 0.077-0.085 against the 0.075 floor, last in-loop check at pose 18; one
+        // cost a real trial its release). The decline must NOT reach that check:
+        // re-reading the whole take (which holds the shake motion) as a nod, or
+        // letting `detect_deliberate_closure` fire on the eye geometry a head-turn
+        // produces, would overturn an explicit decline into a grant.
+        let stream_hit = hit;
+        let hit = resolve_consent_watch(stream_hit, || {
+            completed_consent_take_hit(false, allow_nod, &poses, &ears, closure_cal.as_ref())
+        });
+        if stream_hit.is_none() && hit {
             // Observable in the journal so a hardware replay can show THIS
             // path fired, not just that a trial released.
             irlume_common::dlog!(
@@ -2933,6 +2962,18 @@ impl Engine {
         self.gesture_cancelled = false;
         if purpose.demands_gesture(service) {
             self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
+            // A head-shake during the pre-match watch is an explicit decline.
+            // Close the request now: do not spend the capture and match only to
+            // deny after a second post-match watch, and do not let a later cue
+            // override the decline. `early_consent_watch` sets `gesture_cancelled`
+            // via `consent_watch` when the shake fires.
+            if self.gesture_cancelled {
+                irlume_common::dlog!("consent: head shake before the match cancelled the request");
+                return Ok(Outcome::deny(
+                    OutcomeKind::OtherDeny,
+                    "head shake cancelled the request",
+                ));
+            }
         }
         // Hold the camera sessions across the grace window's retries. Every retry
         // otherwise re-opens, re-negotiates, re-maps and re-warms both streams
@@ -5220,6 +5261,37 @@ mod tests {
     /// `IRLUME_STATE_DIR`, `IRLUME_METHOD_CONF`, ...) across this binary's
     /// parallel test threads. Engine tests share it via `super::tests`.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A head-shake decline is TERMINAL: `resolve_consent_watch` returns the
+    /// stream's `Some(false)` verdict without evaluating the completed-take
+    /// closure, so a completed-take nod or closure reading can never overturn a
+    /// decline into a grant. The panicking closures prove the completed take is
+    /// not consulted for either `Some` outcome; before the fix a shake fell
+    /// through to it and a take carrying the shake motion could be re-read as an
+    /// approval. Only a budget-exhausted `None` consults the boundary check.
+    #[test]
+    fn shake_decline_is_terminal_and_skips_completed_take() {
+        assert!(
+            !resolve_consent_watch(Some(false), || panic!(
+                "a decline must not evaluate the completed take"
+            )),
+            "a head-shake decline must resolve to false"
+        );
+        assert!(
+            resolve_consent_watch(Some(true), || panic!(
+                "an in-loop accept must not evaluate the completed take"
+            )),
+            "an in-loop accept must resolve to true"
+        );
+        assert!(
+            resolve_consent_watch(None, || true),
+            "budget exhausted defers to the completed-take check"
+        );
+        assert!(
+            !resolve_consent_watch(None, || false),
+            "budget exhausted with no completed-take gesture is a miss"
+        );
+    }
 
     /// `Misconfigured` permits NO gesture, which is the entire reason the
     /// variant exists.

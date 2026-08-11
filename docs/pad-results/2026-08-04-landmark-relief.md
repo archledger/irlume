@@ -198,3 +198,105 @@ signal without printing anything and needs no new instrument at all.
 
 Raw frames and landmark CSVs for both sessions are kept, so each of these starts
 from data rather than from scratch.
+
+## 2026-08-10: Emitter-only and head-pitch envelopes
+
+Three new measurements on the same camera (ASUS FHD built-in IR pin, GREY8
+640x400), one subject, four captures. The question was whether the chin ratio
+holds across the envelopes #25 requires: emitter-only dark room, and head pitch
+variation.
+
+### Emitter-only dark room
+
+The emitter is the only light source. A lit room with emitter was also captured
+for comparison.
+
+| Envelope | n | cheek/chin | forehead/chin | chin median |
+|---|---|---|---|---|
+| Room-lit + emitter | 54 | 0.66-1.34 (0.72) | 0.90-2.02 (1.09) | 97.7 |
+| Dark + emitter | 4 lit | 1.76-2.19 (1.81) | 1.83-2.51 (2.11) | 121.0 |
+| Ambient (report above) | 177 | 2.58-3.53 | 3.91-6.27 | 38.2 |
+
+Under room-lit + emitter, the chin is brighter than the cheek (ratio 0.72). The
+co-axial emitter illuminates the chin directly, and ambient light fills the jaw
+shadow. Under dark + emitter, the chin is shadowed but still 3x brighter than
+under ambient (121 vs 38), because the emitter is the only source and the chin
+is closer to it. The ratio (1.81) sits between the ambient face range (2.58-3.53)
+and the print range (1.30-1.61).
+
+**The emitter-only envelope is not separated from the print.** The chin ratio
+only works under ambient light, where the chin is shadowed by the jaw and the
+emitter is not the dominant source.
+
+### Head pitch
+
+Captured straight, looking up, and looking down. All lit by the emitter in a lit
+room. Two runs were taken to check consistency.
+
+**Run 1:**
+
+| Angle | n | cheek/chin | forehead/chin | chin |
+|---|---|---|---|---|
+| Straight | 6 | 2.47-3.16 (2.72) | 3.99-5.09 (4.44) | 37.0 |
+| Up | 18 | 2.49-3.04 (2.81) | 3.82-4.85 (4.35) | 42.9 |
+| Down | 18 | 1.60-2.90 (2.19) | 2.43-4.29 (3.34) | 60.2 |
+
+**Run 2:**
+
+| Angle | n | cheek/chin | forehead/chin | chin |
+|---|---|---|---|---|
+| Straight | 18 | 2.35-2.99 (2.92) | 3.63-4.86 (4.73) | 39.0 |
+| Up | 18 | 1.74-2.37 (1.98) | 2.06-2.75 (2.48) | 38.7 |
+| Down | 18 | 2.04-2.73 (2.41) | 3.12-4.01 (3.65) | 55.4 |
+
+The two runs disagree on which angle is the problem: run 1 has down as the
+failure (min 1.60), run 2 has up as the failure (min 1.74). The chin brightens
+under down-angle (55-60 vs 37-39 straight) because the chin angles toward the
+camera. The cheek darkens under up-angle because the forehead angles toward the
+camera and the cheek away.
+
+**Combined pitch-varied (54 frames):** cheek/chin 1.74-2.99 (median 2.38). The
+report's face range was 2.58-3.53 with a 0.97 gap above print. Head pitch
+shrinks the gap from 0.97 to **0.13** (face min 1.74 vs print max 1.61).
+
+### Glint extent + chin ratio as a distance-robust pair
+
+The two cues were predicted to have opposite distance sensitivity: the chin
+ratio weakens at close range, the bright pupil (retinal retroreflection)
+strengthens at range because the emitter-to-lens angle shrinks.
+
+The existing stage3 close/far/sweep frames (2026-08-05, same camera) were
+replayed through `landmark_replay` and the glint extent (pixel count above a
+dynamic threshold in a 15px radius around each iris center) was measured.
+
+| Distance | Frame mean | Left bright px | Right bright px | L/R ratio |
+|---|---|---|---|---|
+| Close | 83 | 498 | 456 | 1.09 (symmetric) |
+| Far | 59 | 0 | 0 | — (no signal) |
+| Sweep | 84 | 276 | 20 | 13.78 (asymmetric) |
+
+At far range, the 1/r² IR falloff dominates: the frame is too dim for any pixel
+to clear the threshold. At close range, both eyes show bright regions. The bright
+pupil effect is strongest at close range, not far. The angular effect from the
+physics paper (Nguyen et al., PMC4721713) is real but the 1/r² falloff overwhelms
+it at the distances these cameras operate at.
+
+**The two cues do not have opposite distance sensitivity.** They both degrade
+at range. The chin ratio weakens at close range (down-angle chin brightens), and
+the glint extent also weakens at range (1/r² falloff). They track in the same
+direction.
+
+### Verdict
+
+The chin ratio separates face from print under ambient frontal light, but fails
+under emitter-only illumination and head pitch. The glint extent does not
+complement it as a distance-robust pair. The original hypothesis from the issue
+(nose > cheek > socket) is false in 0 of 54 face frames. The landmark-anchored
+approach is a partial improvement over the global centre/edge ratio — it resists
+tilting and curving where the global ratio does not — but it is not a standalone
+gate, and the emitter-only envelope remains unseparated.
+
+The remaining open path: a deliberately darkened chin attack (to test whether
+the ratio can be defeated by printing or occluding the chin), and multiple
+subjects including a clean-shaven face (to test whether the cue separates real
+hair from printed hair rather than relief from flatness).

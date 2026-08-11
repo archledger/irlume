@@ -421,14 +421,16 @@ fn pamwrap_unseal_face_login_releases_sealed_password() {
     }
 }
 
-/// The credential-release challenge, through a real PAM conversation.
+/// The credential-release challenge instruction, through a real PAM conversation.
 ///
-/// Releasing the sealed keyring password needs a deliberate gesture by default,
-/// and a greeter that only says "Password:" gives the user no way to know that, so
-/// the module states it. Two properties are pinned here: the instruction appears
-/// exactly where the gesture is actually required, and it is silent everywhere
-/// else. A user told to nod on a lock screen that never asks for a nod would learn
-/// to ignore the message.
+/// Releasing the sealed keyring password CAN require a deliberate gesture, and a
+/// greeter that only says "Password:" gives the user no way to know that, so the
+/// module states it WHEN the gesture is required. The gate defaults OFF (a greeter
+/// cold login and logout release with no nod), so silence is the default. Two
+/// properties are pinned: the instruction appears exactly where the gesture is
+/// actually required (opted in, on a non-wait greeter), and it is silent
+/// everywhere else. A user told to nod on a screen that never asks for a nod would
+/// learn to ignore the message.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
@@ -442,21 +444,33 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
         Response::Error("face not granted: nod your head to approve".into())
     });
 
-    // Default (no settings.conf): the gate is on, so the greeter is instructed.
-    h.write_settings(None);
     h.write_service("irlume-crc-login", &[h.auth_line("required", "unseal")]);
-    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-    assert!(out.contains(HINT), "the gesture must be explained: {out}");
 
-    // Opted out: no gesture is required, so telling the user to nod would be a
-    // lie that costs them a login attempt.
+    // Default (no settings.conf): the gate is OFF, so the greeter stays silent.
+    h.write_settings(None);
+    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    assert!(
+        !out.contains(HINT),
+        "the default (off) must stay silent: {out}"
+    );
+
+    // Opted in: the gesture is required, so the greeter is instructed.
+    h.write_settings(Some("credential_release_challenge=1\n"));
+    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    assert!(
+        out.contains(HINT),
+        "an opted-in gate must be explained: {out}"
+    );
+
+    // Explicitly off: silent, the same as the default. Telling the user to nod
+    // would be a lie that costs them a login attempt.
     h.write_settings(Some("credential_release_challenge=0\n"));
     let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
     assert!(!out.contains(HINT), "opted out must stay silent: {out}");
 
-    h.write_settings(None);
-    // `wait` (the KDE lock screen runs us as a parallel biometric device): an
-    // unsolicited message there competes with the password field.
+    // Opted in, but `wait` (the KDE lock screen runs us as a parallel biometric
+    // device): an unsolicited message there competes with the password field.
+    h.write_settings(Some("credential_release_challenge=1\n"));
     h.write_service("irlume-crc-lock", &[h.auth_line("required", "unseal wait")]);
     let (_, out) = h.run("irlume-crc-lock", &["authenticate"], "", None);
     assert!(!out.contains(HINT), "wait mode must stay silent: {out}");
@@ -467,9 +481,10 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
     assert!(!out.contains(HINT), "verify must stay silent: {out}");
 }
 
-/// THE fail-safe that makes a default-on challenge acceptable: when the gesture is
-/// not performed, the daemon refuses to release the password, and the PAM stack
-/// must carry on to the password module rather than fail the transaction.
+/// THE fail-safe that makes the challenge acceptable when it is on: when the
+/// gesture is not performed, the daemon refuses to release the password, and the
+/// PAM stack must carry on to the password module rather than fail the
+/// transaction.
 ///
 /// Both greeter layouts are exercised, because the failure would be layout-shaped:
 /// the Fedora `[success=1 default=ignore]` jump form, where an IGNORE must fall

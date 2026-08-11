@@ -998,15 +998,31 @@ pub const NOD_MIN_FACE_FRAMES: usize = 12;
 
 /// Deliberate head-SHAKE consent gesture: minimum yaw RANGE (max-min of
 /// `yaw_signed`) over the window. A shake swings the head left and right;
-/// a still head barely moves. A nod stays within [`NOD_YAW_MAX`] (0.6); a
-/// shake exceeds this. NOT YET TUNED — the threshold is the same as the
-/// nod-yaw-max gate, on the assumption that any yaw exceeding what a nod
-/// produces is a shake. Overridable via `IRLUME_SHAKE_YAW_MIN`.
-pub const SHAKE_YAW_MIN: f32 = 0.6;
+/// a still head barely moves. Measured 2026-08-10 on one subject, two
+/// postures (sitting, reclining), 20 samples each:
+///
+/// | posture | gesture | yaw_range |
+/// |---|---|---|
+/// | sitting | nod | 0.18-0.37 (median 0.27) |
+/// | sitting | shake | 0.53-1.09 (median 0.79) |
+/// | reclining | nod | 0.16-0.32 (median 0.22) |
+/// | reclining | shake | 0.34-0.63 (median 0.48) |
+///
+/// 0.45 separates every nod from the majority of shakes; the reclining
+/// shakes below 0.45 (3 of 10) are the ones the nod detector also misses
+/// (pitch too low). Overridable via `IRLUME_SHAKE_YAW_MIN`.
+pub const SHAKE_YAW_MIN: f32 = 0.45;
+/// Maximum yaw RANGE for a deliberate shake. Idle looking-around swings yaw
+/// much wider (measured 4.1 in the test corpus) than a deliberate shake
+/// (sitting median 0.79, max 1.09; reclining median 0.48, max 0.63). 1.5
+/// excludes look-around while allowing all measured shakes.
+pub const SHAKE_YAW_MAX: f32 = 1.5;
 /// Maximum pitch RANGE during a shake: the head should not nod up/down while
-/// shaking. Uses the same threshold as [`NOD_PITCH_MIN`] to keep the two
-/// gestures orthogonal. Overridable via `IRLUME_SHAKE_PITCH_MAX`.
-pub const SHAKE_PITCH_MAX: f32 = 0.075;
+/// shaking. Measured 2026-08-10: sitting shakes ranged 0.044-0.169 in pitch,
+/// reclining shakes 0.066-0.133. The sitting nod pitch goes up to 0.156, so
+/// 0.18 catches shakes while letting nods through. Overridable via
+/// `IRLUME_SHAKE_PITCH_MAX`.
+pub const SHAKE_PITCH_MAX: f32 = 0.18;
 /// Minimum yaw MEDIAN-CROSSINGS for a shake. Same as [`NOD_MIN_CROSSINGS`]:
 /// one deliberate left-right oscillation. Overridable via
 /// `IRLUME_SHAKE_MIN_CROSSINGS`.
@@ -1154,26 +1170,53 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
     };
     let verdict = if evidence.frames < NOD_MIN_FACE_FRAMES {
         HeadGesture::NoFace
+    } else if evidence.yaw_range >= shake_yaw_min()
+        && evidence.yaw_range <= SHAKE_YAW_MAX
+        && evidence.pitch_range <= shake_pitch_max()
+        && yaw_crossings >= shake_min_crossings()
+    {
+        // Shake checked FIRST: a shake with yaw below NOD_YAW_MAX but
+        // above SHAKE_YAW_MIN (reclining shakes, 0.45-0.60) would
+        // otherwise be caught as a nod. The pitch and yaw_crossings
+        // gates keep nods from being misclassified as shakes.
+        // SHAKE_YAW_MAX excludes idle looking-around (yaw swings much
+        // wider than a deliberate shake).
+        HeadGesture::Shake
     } else if evidence.pitch_range >= evidence.pitch_min
         && evidence.yaw_range <= NOD_YAW_MAX
         && evidence.crossings >= NOD_MIN_CROSSINGS
     {
         HeadGesture::Nod
-    } else if evidence.yaw_range >= shake_yaw_min()
-        && evidence.pitch_range <= shake_pitch_max()
-        && yaw_crossings >= shake_min_crossings()
-    {
-        HeadGesture::Shake
     } else {
         HeadGesture::None
     };
+    // When the shake check nearly fires but doesn't, say why. The caller
+    // has no other way to know whether a shake was close.
+    if verdict == HeadGesture::None
+        && evidence.frames >= NOD_MIN_FACE_FRAMES
+        && evidence.yaw_range >= shake_yaw_min()
+    {
+        // Calibration aid: print to stderr so the daemon's journal captures
+        // it even without IRLUME_LOG. The format string is deliberately
+        // simple so it can't be dead-code eliminated.
+        let msg = format!(
+            "irlumed-shake-check yaw={:.2} need_yaw>={:.2} pitch={:.3} need_pitch<={:.3} yaw_crossings={} need_crossings>={}",
+            evidence.yaw_range,
+            shake_yaw_min(),
+            evidence.pitch_range,
+            shake_pitch_max(),
+            yaw_crossings,
+            shake_min_crossings()
+        );
+        eprintln!("{msg}");
+    }
     (verdict, evidence)
 }
 
 /// Count median crossings of a signal, the rhythmic oscillation of a deliberate
 /// head gesture. Each time the signal moves from clearly-above to clearly-below
 /// its median (or vice versa, past `amp_frac * range`), one crossing is counted.
-fn signal_crossings(signal: &[f32], range: f32, amp_frac: f32) -> usize {
+pub fn signal_crossings(signal: &[f32], range: f32, amp_frac: f32) -> usize {
     let mut sorted = signal.to_vec();
     sorted.sort_by(f32::total_cmp);
     let median = sorted[sorted.len() / 2];

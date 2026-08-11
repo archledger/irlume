@@ -2587,7 +2587,17 @@ impl Engine {
                 return std::ops::ControlFlow::Continue(());
             }
             if allow_nod {
-                match irlume_liveness::detect_nod(&poses) {
+                let g = irlume_liveness::detect_nod(&poses);
+                if !matches!(
+                    g,
+                    irlume_liveness::HeadGesture::Nod | irlume_liveness::HeadGesture::None
+                ) {
+                    irlume_common::dlog!(
+                        "consent: detect_nod returned {g:?} at frame {}",
+                        poses.len()
+                    );
+                }
+                match g {
                     irlume_liveness::HeadGesture::Nod => {
                         return std::ops::ControlFlow::Break(true);
                     }
@@ -8367,7 +8377,11 @@ mod engine_tests {
                 grant(),
             )
             .unwrap();
-        assert!(o.granted, "require_challenge is no longer gating: {}", o.reason);
+        assert!(
+            o.granted,
+            "require_challenge is no longer gating: {}",
+            o.reason
+        );
         s.engine.ir_available = false; // restore the shared baseline
     }
 

@@ -26,7 +26,6 @@
 //! the shipped detector returns. The numbers are what the thresholds are
 //! compared against.
 
-use irlume_liveness;
 use irlume_vision::{align, Detector};
 
 fn main() {

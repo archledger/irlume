@@ -996,6 +996,22 @@ pub const NOD_CROSSING_AMP_FRAC: f32 = 0.25;
 /// The window must have at least this many face frames to judge a nod.
 pub const NOD_MIN_FACE_FRAMES: usize = 12;
 
+/// Deliberate head-SHAKE consent gesture: minimum yaw RANGE (max-min of
+/// `yaw_signed`) over the window. A shake swings the head left and right;
+/// a still head barely moves. A nod stays within [`NOD_YAW_MAX`] (0.6); a
+/// shake exceeds this. NOT YET TUNED — the threshold is the same as the
+/// nod-yaw-max gate, on the assumption that any yaw exceeding what a nod
+/// produces is a shake. Overridable via `IRLUME_SHAKE_YAW_MIN`.
+pub const SHAKE_YAW_MIN: f32 = 0.6;
+/// Maximum pitch RANGE during a shake: the head should not nod up/down while
+/// shaking. Uses the same threshold as [`NOD_PITCH_MIN`] to keep the two
+/// gestures orthogonal. Overridable via `IRLUME_SHAKE_PITCH_MAX`.
+pub const SHAKE_PITCH_MAX: f32 = 0.075;
+/// Minimum yaw MEDIAN-CROSSINGS for a shake. Same as [`NOD_MIN_CROSSINGS`]:
+/// one deliberate left-right oscillation. Overridable via
+/// `IRLUME_SHAKE_MIN_CROSSINGS`.
+pub const SHAKE_MIN_CROSSINGS: usize = 1;
+
 /// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
 /// pitch swings through a range of at least [`NOD_PITCH_MIN`] while the yaw stays
 /// within [`NOD_YAW_MAX`] (not a look-around or shake), oscillating up-and-down
@@ -1114,15 +1130,21 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
             acc
         }
     });
+    let yaw_range = range(&yaw);
+    let yaw_crossings = if yaw.is_empty() {
+        0
+    } else {
+        signal_crossings(&yaw, yaw_range, NOD_CROSSING_AMP_FRAC)
+    };
     let evidence = NodEvidence {
         frames: pitch.len(),
         pitch_range,
         pitch_min: nod_pitch_min(),
-        yaw_range: range(&yaw),
+        yaw_range,
         crossings: if pitch.is_empty() {
             0
         } else {
-            nod_crossings(&pitch, pitch_range)
+            signal_crossings(&pitch, pitch_range, NOD_CROSSING_AMP_FRAC)
         },
         mean_step: if step_n == 0 {
             0.0
@@ -1132,38 +1154,44 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
     };
     let verdict = if evidence.frames < NOD_MIN_FACE_FRAMES {
         HeadGesture::NoFace
-    } else if evidence.pitch_range < evidence.pitch_min || evidence.yaw_range > NOD_YAW_MAX {
-        HeadGesture::None
-    } else if evidence.crossings >= NOD_MIN_CROSSINGS {
+    } else if evidence.pitch_range >= evidence.pitch_min
+        && evidence.yaw_range <= NOD_YAW_MAX
+        && evidence.crossings >= NOD_MIN_CROSSINGS
+    {
         HeadGesture::Nod
+    } else if evidence.yaw_range >= shake_yaw_min()
+        && evidence.pitch_range <= shake_pitch_max()
+        && yaw_crossings >= shake_min_crossings()
+    {
+        HeadGesture::Shake
     } else {
         HeadGesture::None
     };
     (verdict, evidence)
 }
 
-/// Count how many times the pitch signal alternates between clearly-above and
-/// clearly-below its median (each excursion past `range * NOD_CROSSING_AMP_FRAC`
-/// counts once when it flips sign): the rhythmic up-down of a nod.
-fn nod_crossings(pitch: &[f32], pitch_range: f32) -> usize {
-    let mut sorted = pitch.to_vec();
+/// Count median crossings of a signal, the rhythmic oscillation of a deliberate
+/// head gesture. Each time the signal moves from clearly-above to clearly-below
+/// its median (or vice versa, past `amp_frac * range`), one crossing is counted.
+fn signal_crossings(signal: &[f32], range: f32, amp_frac: f32) -> usize {
+    let mut sorted = signal.to_vec();
     sorted.sort_by(f32::total_cmp);
     let median = sorted[sorted.len() / 2];
-    let amp = pitch_range * NOD_CROSSING_AMP_FRAC;
+    let amp = range * amp_frac;
     let (mut crossings, mut sign) = (0usize, 0i8);
-    for &p in pitch {
-        let s = if p > median + amp {
+    for &s in signal {
+        let cur = if s > median + amp {
             1
-        } else if p < median - amp {
+        } else if s < median - amp {
             -1
         } else {
             0
         };
-        if s != 0 && s != sign {
+        if cur != 0 && cur != sign {
             if sign != 0 {
                 crossings += 1;
             }
-            sign = s;
+            sign = cur;
         }
     }
     crossings
@@ -1175,6 +1203,24 @@ fn nod_crossings(pitch: &[f32], pitch_range: f32) -> usize {
 /// pitch range clears it, and the gesture rests on the crossing count alone.
 fn nod_pitch_min() -> f32 {
     env_override("IRLUME_NOD_PITCH_MIN", NOD_PITCH_MIN, |v| v > 0.0)
+}
+
+/// Minimum shake yaw range, overridable via `IRLUME_SHAKE_YAW_MIN`.
+fn shake_yaw_min() -> f32 {
+    env_override("IRLUME_SHAKE_YAW_MIN", SHAKE_YAW_MIN, |v| v > 0.0)
+}
+
+/// Maximum shake pitch range, overridable via `IRLUME_SHAKE_PITCH_MAX`.
+fn shake_pitch_max() -> f32 {
+    env_override("IRLUME_SHAKE_PITCH_MAX", SHAKE_PITCH_MAX, |v| v > 0.0)
+}
+
+/// Minimum shake yaw crossings, overridable via `IRLUME_SHAKE_MIN_CROSSINGS`.
+fn shake_min_crossings() -> usize {
+    std::env::var("IRLUME_SHAKE_MIN_CROSSINGS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SHAKE_MIN_CROSSINGS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

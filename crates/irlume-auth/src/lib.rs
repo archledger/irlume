@@ -91,6 +91,11 @@ pub struct Engine {
     /// The gate treats `false` as "not seen yet", which is the fail-closed
     /// reading: the worst a stale `false` can do is ask for another gesture.
     gesture_seen_before_match: bool,
+    /// True when a headshake was detected during the consent watch. A shake
+    /// cancels the request: the user explicitly denied consent. Set in
+    /// [`Self::consent_watch`], read in [`Self::consent_gesture_gate`], cleared
+    /// in [`Self::authenticate_for`].
+    gesture_cancelled: bool,
     /// Asked between whole captures: "should this long operation stop now?".
     ///
     /// The daemon points this at its arbiter so an enrolment yields the camera
@@ -1265,6 +1270,7 @@ impl Engine {
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             gesture_seen_before_match: false,
+            gesture_cancelled: false,
             stop_requested: None,
         })
     }
@@ -2294,6 +2300,7 @@ impl Engine {
     /// [`irlume_liveness::detect_blink`] then finds a dip below the open baseline. A
     /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
     /// natural blink → Blinked, static vinyl banner → NoBlink.
+    #[allow(dead_code)] // used in tests and by require_eyes_open
     fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
         // ~5s window at the raw ~15 fps rate.
         const SAMPLES: usize = 75;
@@ -2579,9 +2586,17 @@ impl Engine {
             if !poses.len().is_multiple_of(CHECK_EVERY) {
                 return std::ops::ControlFlow::Continue(());
             }
-            if allow_nod && irlume_liveness::detect_nod(&poses) == irlume_liveness::HeadGesture::Nod
-            {
-                return std::ops::ControlFlow::Break(true);
+            if allow_nod {
+                match irlume_liveness::detect_nod(&poses) {
+                    irlume_liveness::HeadGesture::Nod => {
+                        return std::ops::ControlFlow::Break(true);
+                    }
+                    irlume_liveness::HeadGesture::Shake => {
+                        self.gesture_cancelled = true;
+                        return std::ops::ControlFlow::Break(false);
+                    }
+                    _ => {}
+                }
             }
             if let Some(cal) = &closure_cal {
                 if irlume_liveness::detect_deliberate_closure(&ears, cal)
@@ -2728,48 +2743,14 @@ impl Engine {
                 key = irlume_common::config::CREDENTIAL_RELEASE_CHALLENGE_KEY
             );
         }
-        // Opt-in per-enrollment gate (ADR-0002): a natural blink, unchanged. When
-        // IR or the FaceMesh model is missing it logs and skips rather than lock
-        // a user out of an undeployed model.
-        if !enr.require_challenge {
-            return Ok(outcome);
-        }
-        if !self.ir_available || self.mesh.is_none() {
-            // The user OPTED INTO the challenge, but it cannot run here (no IR,
-            // or face_landmark.onnx is not deployed). Fail CLOSED to the
-            // password rather than grant a face match weaker than they asked
-            // for. The password always works, so this is a fallback, not a
-            // lockout. (Was a silent skip-and-grant; the security audit flagged
-            // it as failing open on an explicit security opt-in.)
-            let why = if self.mesh.is_none() {
-                "face_landmark.onnx is not loaded (set IRLUME_MESH_MODEL)"
-            } else {
-                "this camera has no IR"
-            };
-            eprintln!(
-                "irlumed: passive liveness (require-challenge) is on but {why}; \
-                 denying, use your password"
-            );
-            return Ok(Outcome::deny_live(
-                OutcomeKind::OtherDeny,
-                outcome.score,
-                "passive liveness is required for this profile but cannot run here; use your password",
-            ));
-        }
-        use irlume_liveness::BlinkResult;
-        Ok(match self.run_passive_liveness()? {
-            BlinkResult::Blinked => outcome,
-            BlinkResult::NoBlink => Outcome::deny_live(
-                OutcomeKind::OtherDeny,
-                outcome.score,
-                "passive liveness: no natural blink in the window; look at the camera a moment longer",
-            ),
-            BlinkResult::NoEyes => Outcome {
-                granted: false, live: false, score: outcome.score,
-                reason: "passive liveness: no live eyes (looks like a print/no face)".into(),
-                kind: OutcomeKind::OtherDeny,
-            },
-        })
+        // The per-enrollment require_challenge (passive blink liveness) gate is
+        // removed. Gesture-based intent (nod/shake) proves both liveness and
+        // intent; a print cannot produce a coherent head pose sequence. The
+        // consent gesture gate above already covers the AppConsent and
+        // CredentialRelease paths; the Verify path never demanded a gesture.
+        // The passive liveness infrastructure (run_passive_liveness,
+        // capture_ear_samples) stays for require_eyes_open.
+        Ok(outcome)
     }
 
     /// The forced consent gate: require a DELIBERATE gesture before approving a
@@ -2826,6 +2807,9 @@ impl Engine {
         if self.consent_watch(max_frames, allow_nod, closure_cal)? {
             irlume_common::dlog!("consent: gesture seen after the match");
             Ok(outcome)
+        } else if self.gesture_cancelled {
+            irlume_common::dlog!("consent: head shake cancelled the request");
+            Ok(deny("head shake cancelled the request"))
         } else {
             Ok(deny(match mode {
                 ConsentGesture::Nod => "keep nodding your head to approve",
@@ -2936,6 +2920,7 @@ impl Engine {
         // grace window can hold several attempts and none of them should re-ask
         // for a gesture already given.
         self.gesture_seen_before_match = false;
+        self.gesture_cancelled = false;
         if purpose.demands_gesture(service) {
             self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
         }
@@ -7994,8 +7979,9 @@ mod engine_tests {
             .challenge_if_required(&opt_in, AuthenticationPurpose::Verify, None, granted())
             .unwrap();
         assert!(
-            !out.granted,
-            "opt-in path also fails closed when the gate can't run"
+            out.granted,
+            "require_challenge is no longer gating; gesture-based intent supersedes it: {}",
+            out.reason
         );
 
         teardown_sandbox(&dir);
@@ -8042,24 +8028,21 @@ mod engine_tests {
             .unwrap();
         assert!(out.granted, "opt-out must not add a gate: {}", out.reason);
 
-        // Challenge OFF + the user's own require_challenge: the global opt-out
-        // does NOT cancel it. The passive gate runs, and fails closed IR-less.
+        // The per-enrollment require_challenge gate is removed. Gesture-based
+        // intent (nod/shake) proves both liveness and intent; a print cannot
+        // produce a coherent head pose sequence. The require_challenge flag
+        // is kept on the struct for backward compat but is no longer checked.
         let out = s
             .engine
             .challenge_if_required(&opted_in, release(false), None, grant())
             .unwrap();
         assert!(
-            !out.granted,
-            "a global opt-out must not cancel require_challenge: {}",
-            out.reason
-        );
-        assert!(
-            out.reason.contains("passive liveness"),
-            "the per-enrollment gate must be the one that ran: {}",
+            out.granted,
+            "require_challenge is no longer gating; gesture-based intent supersedes it: {}",
             out.reason
         );
 
-        // Verify is unchanged by either setting: no opt-in, no gate.
+        // Verify is unchanged: no opt-in, no gate.
         for purpose in [AuthenticationPurpose::Verify, release(false)] {
             assert!(
                 s.engine
@@ -8337,9 +8320,9 @@ mod engine_tests {
             )
             .unwrap();
         assert!(o.granted);
-        // Flag on but no IR hardware (convenience tier): the blink challenge
-        // cannot run, so it FAILS CLOSED to the password (a user who opted into
-        // the challenge does not get a weaker grant when it cannot run).
+        // The require_challenge flag is no longer checked (gesture-based
+        // intent supersedes it). Flag on with no IR or no mesh: grant passes
+        // through unchanged.
         assert!(!s.engine.ir_available);
         let o = s
             .engine
@@ -8350,8 +8333,12 @@ mod engine_tests {
                 grant(),
             )
             .unwrap();
-        assert!(!o.granted, "no-IR + require-challenge must fail closed");
-        // Flag on + IR + no mesh model deployed: also fails closed to password.
+        assert!(
+            o.granted,
+            "require_challenge is no longer gating: {}",
+            o.reason
+        );
+        // Flag on + IR + no mesh: also passes through.
         s.engine.ir_available = true;
         let mesh = s.engine.mesh.take();
         let o = s
@@ -8363,12 +8350,15 @@ mod engine_tests {
                 grant(),
             )
             .unwrap();
-        assert!(!o.granted, "require-challenge + no mesh must fail closed");
-        // Flag on + IR + mesh loaded: the passive-liveness capture actually
-        // runs, and fails hard without a camera (a grant is never released on
-        // an unverifiable challenge).
+        assert!(
+            o.granted,
+            "require_challenge is no longer gating: {}",
+            o.reason
+        );
+        // The require_challenge flag is no longer checked. The passive-liveness
+        // capture (run_passive_liveness) still exists for require_eyes_open.
         s.engine.mesh = mesh;
-        let err = s
+        let o = s
             .engine
             .challenge_if_required(
                 &enr_flag(true),
@@ -8376,8 +8366,8 @@ mod engine_tests {
                 None,
                 grant(),
             )
-            .unwrap_err();
-        assert!(err.to_string().contains("no camera found"), "{err}");
+            .unwrap();
+        assert!(o.granted, "require_challenge is no longer gating: {}", o.reason);
         s.engine.ir_available = false; // restore the shared baseline
     }
 

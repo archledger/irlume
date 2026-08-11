@@ -107,6 +107,12 @@ const SC_SETTINGS: usize = 9;
 const SC_MODELS: usize = 10;
 const SC_DONE: usize = 11;
 const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
+
+/// The services the Settings tab lets the user toggle the consent gesture for,
+/// with arrow keys + `c`. All four are high-privilege (elevation or app-consent),
+/// so disabling any of them asks for confirmation first. The keyring-release path
+/// has its own `g` toggle, so it is not repeated here.
+const SETTINGS_GESTURE_SERVICES: &[&str] = &["sudo", "su", "doas", "polkit-1"];
 const MAX_PROFILES: usize = 3;
 const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
 /// Scans captured per improve-recognition round (add to an existing profile).
@@ -251,6 +257,14 @@ enum Suspend {
     /// credential release, so the TUI confirms first and the CLI still prints its
     /// own warning in the cooked terminal.
     CredentialReleaseChallenge(bool),
+    /// Toggle the consent gesture for one PAM service (the bool is the target
+    /// state). Root op; runs `sudo irlume credential-release-challenge <service>
+    /// on|off --yes`. Disabling a high-privilege service is confirmed by the TUI
+    /// first (the `--yes` then skips the CLI's own prompt).
+    ServiceGesture {
+        service: String,
+        on: bool,
+    },
     /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
     /// root-gates it; the raw measurements are a spoof-tuning oracle).
     SelfTestLiveness,
@@ -526,6 +540,9 @@ struct App {
     repair_sel: usize,
     /// Cameras-tab pair selection.
     cam_sel: usize,
+    /// Settings-tab per-service consent-gesture selection (index into
+    /// [`SETTINGS_GESTURE_SERVICES`]).
+    settings_svc_sel: usize,
     /// A prominent, dismissible error banner (e.g. "camera busy") so failures
     /// are never silently buried in the Activity log.
     error: Option<String>,
@@ -989,6 +1006,7 @@ impl App {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
+            settings_svc_sel: 0,
             error: None,
             daemon_up: false,
             enroll_error: None,
@@ -2722,6 +2740,20 @@ impl App {
                     "--yes",
                 ],
             ),
+            Suspend::ServiceGesture { service, on } => self.sudo_step(
+                &if on {
+                    format!("require a consent gesture for '{service}'")
+                } else {
+                    format!("stop requiring a consent gesture for '{service}'")
+                },
+                &[
+                    "irlume",
+                    "credential-release-challenge",
+                    service.as_str(),
+                    if on { "on" } else { "off" },
+                    "--yes",
+                ],
+            ),
             Suspend::SelfTestLiveness => self.sudo_step(
                 "run the IR liveness self-test",
                 &["irlume", "selftest", "liveness"],
@@ -2985,6 +3017,13 @@ impl App {
             } else {
                 self.models_scroll.saturating_sub(d.unsigned_abs() as u16)
             };
+            return;
+        }
+        // The Settings tab has no profile/scan list; ↑/↓ pick the per-service
+        // consent-gesture row that [c] toggles.
+        if self.screen == SC_SETTINGS {
+            let n = SETTINGS_GESTURE_SERVICES.len() as i32;
+            self.settings_svc_sel = (((self.settings_svc_sel as i32 + d) % n + n) % n) as usize;
             return;
         }
         let len = match self.screen {
@@ -3382,6 +3421,42 @@ impl App {
                             .into(),
                         "Enable",
                         ConfirmAct::Sus(Suspend::Biopolicy(true)),
+                    ));
+                }
+            }
+            // Per-service consent gesture: ↑/↓ pick the service, [c] toggles it.
+            // settings.conf is root-only, so this shells out to the CLI, the one
+            // place the write and its high-privilege confirmation live. Every
+            // service in the list is elevation or app-consent, so disabling the
+            // gesture (a face match alone would then approve it) asks first;
+            // enabling only adds friction and goes straight through.
+            (SC_SETTINGS, KeyCode::Char('c')) => {
+                let svc = SETTINGS_GESTURE_SERVICES[self.settings_svc_sel];
+                let current = irlume_common::config::service_gesture(svc)
+                    .unwrap_or_else(|| irlume_common::config::service_gesture_default(svc));
+                let target = !current;
+                let sus = Suspend::ServiceGesture {
+                    service: svc.to_string(),
+                    on: target,
+                };
+                if target {
+                    self.log(
+                        '→',
+                        format!(
+                            "sudo irlume credential-release-challenge {svc} on: \
+                             require a consent gesture for '{svc}'"
+                        ),
+                    );
+                    self.suspend = Some(sus);
+                } else {
+                    self.confirm = Some((
+                        format!(
+                            "Disable the consent gesture for '{svc}'? A face match alone would \
+                             then approve it: a print of your face held to the camera could use \
+                             '{svc}'. Your typed password still works."
+                        ),
+                        "Disable",
+                        ConfirmAct::Sus(sus),
                     ));
                 }
             }
@@ -4216,10 +4291,41 @@ impl App {
         );
     }
 
+    /// The Settings tab's per-service consent-gesture section: a header carrying
+    /// the keys, then one row of service names with the picked one
+    /// (`settings_svc_sel`) highlighted and its EFFECTIVE state. Arrow keys pick,
+    /// `c` toggles the picked one. Compact (three lines) because the Settings
+    /// panel does not scroll. settings.conf is root-only, so an unreadable value
+    /// falls
+    /// back to the per-service default (all four default on) rather than guessing
+    /// off on a security setting.
+    fn service_gesture_lines(&self) -> Vec<Line<'static>> {
+        let picked = SETTINGS_GESTURE_SERVICES[self.settings_svc_sel];
+        let required = irlume_common::config::service_gesture(picked)
+            .unwrap_or_else(|| irlume_common::config::service_gesture_default(picked));
+        let mut row: Vec<Span> = vec![Span::raw("  ")];
+        for (i, &svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
+            let style = if i == self.settings_svc_sel {
+                Style::new().fg(th().accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().dim()
+            };
+            row.push(Span::styled(format!("{svc}   "), style));
+        }
+        row.push(Span::raw(format!("   {picked}: ")));
+        row.push(onoff(required));
+        vec![
+            section("Per-service consent gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
+            Line::from(row),
+            Line::raw(""),
+        ]
+    }
+
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
         let bio = biopolicy_on();
         f.render_widget(
-            Paragraph::new(vec![
+            Paragraph::new({
+                let mut v = vec![
                 section("Require eyes open"),
                 Line::from(vec![Span::raw("  state  "), onoff(self.eyes_open)]),
                 Line::from(Span::styled(
@@ -4231,6 +4337,9 @@ impl App {
                     Span::styled(" toggle", Style::new().dim()),
                 ]),
                 Line::raw(""),
+                ];
+                v.extend(self.service_gesture_lines());
+                v.extend(vec![
                 section("Gesture before keyring release"),
                 {
                     // Tri-state, not a bool: settings.conf is root-only, so an
@@ -4261,26 +4370,13 @@ impl App {
                         Span::styled(label, Style::new().dim()),
                     ])
                 },
-                // Says what this gate was MEASURED to do, not what it was hoped to
-                // do: the gesture proves INTENT, not liveness (it fired on a
-                // hand-held print 2 times in 24 on 2026-07-27; liveness and the
-                // PAD cue refused every one), which is why it defaults OFF for the
-                // greeter cold login and logout. THREAT_MODEL.md carries the
-                // numbers. Kept to FOUR lines: this panel does not scroll.
+                // The gesture proves INTENT, not liveness (it fired on a hand-held
+                // print 2 times in 24 on 2026-07-27), which is why it defaults OFF
+                // for the greeter cold login and logout; the IR gate stops a print.
+                // ONE line: this panel does not scroll and the per-service section
+                // above needs the room. THREAT_MODEL.md carries the numbers.
                 Line::from(Span::styled(
-                    "  A greeter cold login and logout release your TPM-sealed keyring password",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  after the face match with NO nod. Turning this on adds continuous nodding",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  (or an eye closure) as a deliberate-intent step; the IR liveness check is",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  what stops a print. A missed gesture falls back to typing the password.",
+                    "  Off by default (a cold login releases with no nod). On adds a nod (or an eye closure).",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
@@ -4445,7 +4541,9 @@ impl App {
                     "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",
                     Style::new().dim(),
                 )),
-            ])
+                ]);
+                v
+            })
             .wrap(Wrap { trim: false }),
             area,
         );
@@ -5864,7 +5962,8 @@ impl App {
             ],
             SC_SETTINGS => &[
                 ("enter", "eyes-open off"),
-                ("c", "blink"),
+                ("↑/↓", "pick service"),
+                ("c", "toggle gesture"),
                 ("g", "keyring gesture"),
                 ("b", "biopolicy"),
                 ("m", "3rd-party model"),
@@ -6592,6 +6691,7 @@ mod tests {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
+            settings_svc_sel: 0,
             error: None,
             daemon_up: false,
             enroll_error: None,
@@ -6887,6 +6987,76 @@ mod tests {
             app.suspend.take(),
             Some(Suspend::CredentialReleaseChallenge(false))
         ));
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-service consent-gesture toggle: ↑/↓ pick a service, [c] toggles
+    /// it. Disabling a high-privilege service (all four in the list are) asks
+    /// first and acts on the confirm, not the keypress; enabling one that is off
+    /// goes straight through. The write shells out to the CLI (settings.conf is
+    /// root-only), so the action is a suspend to
+    /// `credential-release-challenge <service> on|off --yes`.
+    #[test]
+    fn settings_per_service_gesture_toggle_picks_and_confirms() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+
+        // The section renders with the service names.
+        let text = draw_text(&app);
+        assert!(text.contains("Per-service consent gesture"), "{text}");
+        assert!(text.contains("sudo") && text.contains("polkit-1"), "{text}");
+
+        // Default (no key): sudo defaults gesture ON, so [c] DISABLES it and must
+        // confirm first (high-privilege), acting on the confirm, not the keypress.
+        assert_eq!(app.settings_svc_sel, 0, "sudo is first");
+        app.on_key(KeyCode::Char('c'));
+        assert!(
+            app.suspend.is_none(),
+            "disabling a high-priv service must not act on the keypress alone"
+        );
+        match app.confirm.take() {
+            Some((q, verb, ConfirmAct::Sus(Suspend::ServiceGesture { service, on }))) => {
+                assert_eq!(service, "sudo");
+                assert!(!on, "the confirm must target DISABLE");
+                assert_eq!(verb, "Disable");
+                assert!(q.contains("sudo"), "the confirm must name the service: {q}");
+            }
+            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
+            None => panic!("disabling a high-priv service must raise a confirm"),
+        }
+
+        // ↑/↓ move the picked service.
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.settings_svc_sel, 1, "Down picks the next service");
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.settings_svc_sel, 0);
+
+        // A service explicitly OFF: [c] ENABLES it and goes straight through
+        // (turning a gesture ON only adds friction, so no confirm).
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=0\n").unwrap();
+        app.on_key(KeyCode::Char('c'));
+        assert!(app.confirm.is_none(), "enabling needs no confirm");
+        assert!(
+            matches!(
+                app.suspend.take(),
+                Some(Suspend::ServiceGesture { ref service, on: true }) if service == "sudo"
+            ),
+            "enabling must suspend to the on toggle"
+        );
 
         match old {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),

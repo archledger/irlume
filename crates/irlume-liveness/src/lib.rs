@@ -1219,7 +1219,13 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
 /// Count median crossings of a signal, the rhythmic oscillation of a deliberate
 /// head gesture. Each time the signal moves from clearly-above to clearly-below
 /// its median (or vice versa, past `amp_frac * range`), one crossing is counted.
+///
+/// An empty signal has no crossings. Guarded here rather than at every call site
+/// because this is public: the median index `len / 2` panics on an empty slice.
 pub fn signal_crossings(signal: &[f32], range: f32, amp_frac: f32) -> usize {
+    if signal.is_empty() {
+        return 0;
+    }
     let mut sorted = signal.to_vec();
     sorted.sort_by(f32::total_cmp);
     let median = sorted[sorted.len() / 2];
@@ -3135,6 +3141,14 @@ mod tests {
 #[cfg(test)]
 mod nod_evidence_tests {
     use super::*;
+
+    /// `signal_crossings` is public, so an empty slice must return 0 rather than
+    /// panic on the median index `len / 2`. The internal callers guard, but the
+    /// function cannot rely on that once anyone else can call it.
+    #[test]
+    fn signal_crossings_on_empty_is_zero_not_a_panic() {
+        assert_eq!(signal_crossings(&[], 1.0, NOD_CROSSING_AMP_FRAC), 0);
+    }
 
     fn samples(pitches: &[f32]) -> Vec<PoseSample> {
         pitches

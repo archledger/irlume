@@ -410,6 +410,21 @@ pub fn service_gesture_default(service: &str) -> bool {
     )
 }
 
+/// Whether releasing the sealed login-keyring password requires the deliberate
+/// consent gesture, as ONE definition both the daemon (which enforces it) and
+/// the PAM module (which tells the user to perform it) call.
+///
+/// Precedence: the per-service `service_gesture.credential_release` override
+/// wins; absent, it falls back to [`credential_release_challenge`] (itself
+/// `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` over the global `settings.conf` key).
+/// This existed inline in the auth engine while `irlume-pam` computed the
+/// instruction from only the global key, so the greeter could tell a user to
+/// gesture on a release the daemon granted ungated, or stay silent on a release
+/// the daemon gated. One helper keeps the message and the enforcement in step.
+pub fn credential_release_gesture_required() -> bool {
+    service_gesture("credential_release").unwrap_or_else(credential_release_challenge)
+}
+
 /// Which deliberate gesture the consent gate accepts.
 ///
 /// Lives here, not in the auth engine, because two crates must agree on it: the
@@ -1250,6 +1265,48 @@ mod tests {
         assert_eq!(
             read_kv("settings.conf", "consent_gesture").as_deref(),
             Some("nod")
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The credential-release gesture helper the daemon and PAM share must give
+    /// the per-service override priority over the global key, so the greeter
+    /// instruction and the daemon's enforcement cannot disagree.
+    #[test]
+    fn credential_release_gesture_required_prefers_the_service_override() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-crgr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        // No override and no global key: defaults ON (fail secure).
+        assert!(
+            credential_release_gesture_required(),
+            "default must require the gesture"
+        );
+
+        // Global OFF with no override disables it; a per-service override ON wins.
+        write_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY, "off").unwrap();
+        assert!(
+            !credential_release_gesture_required(),
+            "global off with no override disables it"
+        );
+        write_kv("settings.conf", "service_gesture.credential_release", "1").unwrap();
+        assert!(
+            credential_release_gesture_required(),
+            "service override ON wins over global off"
+        );
+
+        // Global ON, but a per-service override OFF wins.
+        write_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY, "on").unwrap();
+        write_kv("settings.conf", "service_gesture.credential_release", "0").unwrap();
+        assert!(
+            !credential_release_gesture_required(),
+            "service override OFF wins over global on"
         );
 
         std::env::remove_var("IRLUME_CONFIG_DIR");

@@ -319,7 +319,7 @@ impl PamServiceModule for IrlumePam {
             // fails secure to ON and at worst over-instructs. It cannot obtain the
             // credential either way, since the daemon refuses a non-root
             // UnsealPassword.
-            if unseal && !wait && irlume_common::config::credential_release_challenge() {
+            if unseal && !wait && irlume_common::config::credential_release_gesture_required() {
                 let how = irlume_common::config::consent_gesture_mode()
                     .instruction("unlock your keyring");
                 let _ = pamh.conv(

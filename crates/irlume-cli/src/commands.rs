@@ -1336,7 +1336,12 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
         }
         // Service-specific toggle: irlume credential-release-challenge sudo on|off
         Some(svc) if svc != "on" && svc != "off" => {
-            let on_off = args.first().map(String::as_str);
+            // `args` is the whole argv minus the program name (main.rs skips 1
+            // and passes the full vector), so args[0] is the subcommand name,
+            // args[1] is `svc` (this arm's `sub`), and the on/off token is
+            // args[2]. Reading args[0] here matched the literal subcommand and
+            // sent every `<service> on|off` to the usage arm (exit 2).
+            let on_off = args.get(2).map(String::as_str);
             match on_off {
                 Some(v @ ("on" | "off")) => {
                     if !crate::is_root() {
@@ -1345,7 +1350,22 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                         );
                         return ExitCode::FAILURE;
                     }
-                    let high_priv = matches!(svc, "sudo" | "su" | "doas" | "polkit-1");
+                    // High-privilege services get a confirmation before the
+                    // gesture is disabled. `credential_release` is the special
+                    // token for the sealed-keyring path (not a PAM service, so
+                    // the classifier cannot see it) and is the single most
+                    // dangerous gate, so it is named explicitly; the elevation
+                    // and app-consent spellings come from the shared
+                    // pam_service table rather than a private list that already
+                    // omitted sudo-i, su-l and runuser (the #362 drift).
+                    let high_priv = svc == "credential_release"
+                        || matches!(
+                            irlume_common::pam_service::classify(svc),
+                            Some(
+                                irlume_common::pam_service::ServiceKind::Elevation
+                                    | irlume_common::pam_service::ServiceKind::AppConsent
+                            )
+                        );
                     if v == "off" && high_priv {
                         let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
                         if !assumed_yes && !confirm_high_privilege_disable(svc) {
@@ -1359,6 +1379,14 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                         Ok(()) => {
                             if v == "on" {
                                 println!("{TAG} {svc}: consent gesture REQUIRED {OK}");
+                            } else if svc == "credential_release" {
+                                // The credential-release gate is what the legacy
+                                // global toggle guards; name the same risk here
+                                // so the two paths to the same effect warn alike.
+                                eprintln!(
+                                    "{TAG} {svc}: consent gesture DISABLED {WARN}. \
+                                     {CREDENTIAL_RELEASE_RISK}. Your typed password still works."
+                                );
                             } else {
                                 eprintln!("{TAG} {svc}: consent gesture DISABLED {WARN}");
                             }

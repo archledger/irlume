@@ -1024,10 +1024,13 @@ pub const SHAKE_YAW_MAX: f32 = 2.5;
 /// 0.18 catches shakes while letting nods through. Overridable via
 /// `IRLUME_SHAKE_PITCH_MAX`.
 pub const SHAKE_PITCH_MAX: f32 = 0.18;
-/// Minimum yaw MEDIAN-CROSSINGS for a shake. Same as [`NOD_MIN_CROSSINGS`]:
-/// one deliberate left-right oscillation. Overridable via
-/// `IRLUME_SHAKE_MIN_CROSSINGS`.
-pub const SHAKE_MIN_CROSSINGS: usize = 1;
+/// Minimum yaw MEDIAN-CROSSINGS for a shake: the yaw must OSCILLATE, not merely
+/// span a range. Measured 2026-08-11 on the ASUS FHD IR module, a STILL face
+/// carries yaw_range 0.48-0.61 (above the 0.45 floor) with ZERO yaw crossings,
+/// while a deliberate shake shows 6-7; a floor of 2 (one full there-and-back)
+/// sits safely between and rejects the still-face drift that range alone read as
+/// a Shake. Overridable via `IRLUME_SHAKE_MIN_CROSSINGS`.
+pub const SHAKE_MIN_CROSSINGS: usize = 2;
 
 /// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
 /// pitch swings through a range of at least [`NOD_PITCH_MIN`] while the yaw stays
@@ -1172,20 +1175,22 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
     let verdict = if evidence.frames < NOD_MIN_FACE_FRAMES {
         HeadGesture::NoFace
     } else if evidence.yaw_range >= shake_yaw_min() && evidence.yaw_range <= SHAKE_YAW_MAX {
-        // Shake-shaped yaw is a decline or NOTHING, never an approving nod.
-        // The shake band [SHAKE_YAW_MIN, SHAKE_YAW_MAX] overlaps the nod band
-        // (yaw <= NOD_YAW_MAX) across [0.45, 0.60]. Splitting the pitch gate
-        // out of this condition (as it was) let a shake whose pitch exceeded
-        // SHAKE_PITCH_MAX fall THROUGH to the nod branch and grant: a
-        // head-shake "no" with a little vertical bob approved sudo, polkit or
-        // credential release. A genuine nod sits at yaw 0.16-0.37, well below
-        // SHAKE_YAW_MIN, so it never enters this band; ambiguous motion here
-        // fails CLOSED to None rather than being reinterpreted as approval.
-        // yaw_crossings is deliberately NOT gated: the median-crossing
-        // amplitude test can fail when the head is biased to one side, and the
-        // yaw_range + pitch_range combination separates shakes from nods in the
-        // calibration data. SHAKE_YAW_MAX excludes idle looking-around.
-        if evidence.pitch_range <= shake_pitch_max() {
+        // Shake-shaped yaw is a decline or NOTHING, never an approving nod. The
+        // shake band [SHAKE_YAW_MIN, SHAKE_YAW_MAX] overlaps the nod band
+        // (yaw <= NOD_YAW_MAX) across [0.45, 0.60], so this band is TERMINAL: a
+        // shake whose pitch exceeded SHAKE_PITCH_MAX must not fall through to the
+        // nod branch and grant (a head-shake "no" with a vertical bob approving
+        // sudo, polkit or credential release). A genuine nod sits at yaw
+        // 0.16-0.37, well below SHAKE_YAW_MIN, so it never enters this band.
+        //
+        // A Shake also requires yaw OSCILLATION, not just yaw range: measured
+        // 2026-08-11 on the ASUS FHD IR module (gesture_calibrate), a STILL face
+        // carries yaw_range 0.48-0.61 with ZERO yaw crossings while a deliberate
+        // shake shows 6-7. Range alone read the still face as a Shake and would
+        // cancel the consent watch of a user who did nothing; the crossing count
+        // separates them cleanly. Non-oscillating drift in the band fails CLOSED
+        // to None. SHAKE_YAW_MAX excludes idle looking-around.
+        if evidence.pitch_range <= shake_pitch_max() && yaw_crossings >= shake_min_crossings() {
             HeadGesture::Shake
         } else {
             HeadGesture::None
@@ -3231,6 +3236,39 @@ mod nod_evidence_tests {
             detect_nod(&poses(&pitch, &yaw)),
             HeadGesture::Nod,
             "motion in the shake yaw band must never resolve to an approving nod"
+        );
+    }
+
+    /// A still-face yaw DRIFT (range in the shake band but no left-right
+    /// oscillation) must NOT read as a Shake. Measured 2026-08-11 on the ASUS FHD
+    /// IR module: a still face carried yaw_range ~0.5 with ZERO yaw crossings, and
+    /// range alone read it as a Shake, which would cancel the consent watch of a
+    /// user who did nothing. The oscillation gate (yaw_crossings >=
+    /// SHAKE_MIN_CROSSINGS) is what separates it from a deliberate shake (6-7
+    /// crossings), and the band stays terminal so it is never a nod either.
+    #[test]
+    fn a_still_face_yaw_drift_is_not_a_shake() {
+        // yaw mostly constant with two outlier frames: range lands in the shake
+        // band but produces 0 median crossings (no oscillation). Pitch flat.
+        let mut yaw = vec![0.15f32; 18];
+        yaw.push(0.65);
+        yaw.push(0.65);
+        let pitch = vec![0.5f32; yaw.len()];
+        let (verdict, ev) = detect_nod_with_evidence(&poses(&pitch, &yaw));
+        assert!(
+            ev.yaw_range >= SHAKE_YAW_MIN,
+            "premise: the yaw range must land in the shake band, got {}",
+            ev.yaw_range
+        );
+        assert_ne!(
+            verdict,
+            HeadGesture::Shake,
+            "a non-oscillating yaw drift is not a deliberate shake"
+        );
+        assert_ne!(
+            verdict,
+            HeadGesture::Nod,
+            "shake-band yaw stays terminal, never an approving nod"
         );
     }
 

@@ -2605,6 +2605,33 @@ mod tests {
         assert_eq!(LivenessGate::new().evaluate(&down).0, Verdict::Uncertain);
     }
 
+    /// The cross-spectrum co-location cue: RGB and IR faces at far-apart centers
+    /// must be refused, because a print or screen can put the two "faces" in
+    /// different places. Every other evaluate() test uses aligned centers
+    /// (dist ~0.02), so a mutant making cross_spectrum_aligned unconditionally
+    /// true survives (pattern #28), letting a mismatched presentation past the
+    /// one cue that ties the two spectra to the same physical object.
+    #[test]
+    fn misaligned_rgb_ir_faces_are_refused() {
+        let mut s = live_signals();
+        s.rgb_face = Some(fb(0.2, 0.2));
+        s.ir_face = Some(fb(0.8, 0.8)); // dist ~0.85, well past CROSS_SPECTRUM_TOLERANCE 0.30
+        let (verdict, cues, reason) = LivenessGate::new().evaluate(&s);
+        assert!(
+            !cues.cross_spectrum_aligned,
+            "far-apart faces are not aligned: {reason}"
+        );
+        assert_ne!(
+            verdict,
+            Verdict::Live,
+            "a cross-spectrum mismatch cannot be Live: {reason}"
+        );
+        assert!(
+            reason.contains("RGB/IR face mismatch"),
+            "the mismatch cue must be the one that refuses: {reason}"
+        );
+    }
+
     #[test]
     fn flat_ir_is_spoof() {
         let mut s = live_signals();

@@ -7230,6 +7230,58 @@ mod tests {
         assert!(both_eyes_open(&open, 64, 48, &lm, Some(255)));
     }
 
+    /// The ceiling test is `peak >= ceiling`, not `peak == ceiling`: a
+    /// limited-range stream rails at 235, so a window peaking ABOVE it (240) is
+    /// railed and must read not-open. The railed test above only exercises
+    /// peak == ceiling == 255, which a `>=` -> `==` mutant also satisfies
+    /// (pattern #28), leaving every 235-ceiling device's #386 fail-open uncaught.
+    #[test]
+    fn a_window_above_a_limited_range_ceiling_reads_not_open() {
+        let (mut grey, lm) = ir_frame_with_glints(false, false);
+        for &(ex, ey) in &lm[0..2] {
+            let (cx, cy) = (ex as usize, ey as usize);
+            for dy in 0..3usize {
+                for dx in 0..3usize {
+                    grey[(cy + dy - 1) * 64 + (cx + dx - 1)] = 240;
+                }
+            }
+        }
+        assert!(
+            !both_eyes_open(&grey, 64, 48, &lm, Some(235)),
+            "peak 240 is at or above the 235 ceiling; == would let it through"
+        );
+        // The same buffer under a 255 ceiling: 240 is genuinely sub-ceiling, so
+        // it passes, proving the refusal is the ceiling comparison and not a
+        // blanket denial of a 240 peak.
+        assert!(
+            both_eyes_open(&grey, 64, 48, &lm, Some(255)),
+            "peak 240 < ceiling 255 is a real sub-ceiling window"
+        );
+    }
+
+    /// ONE non-finite landmark coordinate must fail closed, not only an all-NaN
+    /// pair. `x.is_finite() && y.is_finite()` flipped to `||` lets a (NaN, y)
+    /// landmark through; the NaN then saturates to x=0 and the gate reads the
+    /// frame edge as an eye. The all-NaN test cannot see this: (NaN,NaN) is false
+    /// under `||` too, so both original and mutant fail closed there.
+    #[test]
+    fn a_single_non_finite_eye_coordinate_fails_closed() {
+        let (mut grey, mut lm) = ir_frame_with_glints(true, true);
+        let ey = lm[0].1 as usize;
+        // Make the left edge at that row bright, so a mutant that lets the NaN
+        // through would read x=0 as an open eye.
+        for dy in 0..3usize {
+            for x in 0..3usize {
+                grey[(ey + dy - 1) * 64 + x] = 255;
+            }
+        }
+        lm[0] = (f32::NAN, lm[0].1);
+        assert!(
+            !both_eyes_open(&grey, 64, 48, &lm, None),
+            "a landmark we cannot place is an eye we cannot verify: fail closed"
+        );
+    }
+
     /// The other half of #386, which the test above cannot see. Rejecting a
     /// railed peak is worth nothing if the gate is handed the SUBTRACTED frame,
     /// because subtraction moves every railed 255 to 254: under the ceiling and
@@ -8190,6 +8242,81 @@ mod engine_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The call-site WIRING of `demands_gesture`, not just the
+    /// `service_gesture_default` helper (pattern #75). The `None`-only
+    /// assertions elsewhere are satisfied by a mutant that drops the Verify arm
+    /// (returns `false`) or the CredentialRelease per-service override branch, so
+    /// this pins the two arms through a real service and a real settings.conf.
+    #[test]
+    fn demands_gesture_wires_verify_and_credential_release() {
+        let _g = env_guard();
+        let dir = std::env::temp_dir().join(format!("irlume-auth-dgwire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        let verify = AuthenticationPurpose::Verify;
+        let release = |on| AuthenticationPurpose::CredentialRelease {
+            temporal_challenge: on,
+        };
+
+        // Verify arm: an elevation service demands the gesture by default, a
+        // non-elevation service does not, and the per-service override wins.
+        assert!(
+            verify.demands_gesture(Some("sudo")),
+            "sudo (elevation) must default the gesture ON"
+        );
+        assert!(
+            verify.demands_gesture(Some("su-l")),
+            "su - (service su-l) must default ON via the shared classifier"
+        );
+        assert!(
+            !verify.demands_gesture(Some("kde")),
+            "a lock screen must default OFF"
+        );
+        assert!(!verify.demands_gesture(None), "no service demands nothing");
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=0\n").unwrap();
+        assert!(
+            !verify.demands_gesture(Some("sudo")),
+            "service_gesture.sudo=0 must disable it"
+        );
+
+        // CredentialRelease arm: the per-service credential_release override
+        // wins over the temporal_challenge fallback, both directions.
+        std::fs::write(
+            dir.join("settings.conf"),
+            "service_gesture.credential_release=1\n",
+        )
+        .unwrap();
+        assert!(
+            release(false).demands_gesture(None),
+            "credential_release=1 must win over temporal_challenge=false"
+        );
+        std::fs::write(
+            dir.join("settings.conf"),
+            "service_gesture.credential_release=0\n",
+        )
+        .unwrap();
+        assert!(
+            !release(true).demands_gesture(None),
+            "credential_release=0 must win over temporal_challenge=true"
+        );
+        // No override: the arm falls back to temporal_challenge.
+        let _ = std::fs::remove_file(dir.join("settings.conf"));
+        assert!(
+            release(true).demands_gesture(None),
+            "no override falls back to temporal_challenge=true"
+        );
+        assert!(
+            !release(false).demands_gesture(None),
+            "no override falls back to temporal_challenge=false"
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE invariant behind a default-on gate: with the challenge required, NO
     /// failure mode may hand back a granted outcome. Every case must be a deny or
     /// an Err, both of which the daemon turns into `Response::Error` and PAM turns
@@ -8619,5 +8746,45 @@ mod engine_tests {
             })
             .collect();
         assert!(!completed_consent_take_hit(false, true, &poses, &[], None));
+    }
+
+    /// The CLOSURE operand of the completed-take evaluation, which every other
+    /// completed_take_* test leaves unexercised by passing `None` for closure_cal
+    /// (pattern #75/#28). A closure-calibrated user whose eyes stayed OPEN made no
+    /// gesture, so the take must NOT fire; the fail-open mutant that drops the
+    /// `== Blinked` check (`is_some_and` -> `is_some`) returns true here and is
+    /// caught. This would otherwise release the sealed credential to a user who
+    /// never closed their eyes.
+    #[test]
+    fn completed_take_closure_operand_needs_an_actual_closure() {
+        let cal = irlume_liveness::ClosureCalibration {
+            ear_open: 0.30,
+            ear_closed: 0.05,
+        };
+        assert!(
+            cal.is_usable(),
+            "the calibration must be usable or the operand is skipped upstream"
+        );
+        // Eyes open the whole take: no closure, so no deliberate-closure gesture.
+        let open: Vec<irlume_liveness::EarSample> = (0..20)
+            .map(|idx| irlume_liveness::EarSample {
+                idx,
+                ear: Some(0.30),
+                bri: 60.0,
+                cx: 0.5,
+                cy: 0.5,
+                fsize: 0.3,
+                contrast: 40.0,
+            })
+            .collect();
+        assert_ne!(
+            irlume_liveness::detect_deliberate_closure(&open, &cal),
+            irlume_liveness::BlinkResult::Blinked,
+            "open eyes are not a closure gesture (test premise)"
+        );
+        assert!(
+            !completed_consent_take_hit(false, false, &[], &open, Some(&cal)),
+            "a usable calibration with no closure must not satisfy the take"
+        );
     }
 }

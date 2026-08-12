@@ -5,6 +5,27 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Camera nodes classify without being opened.** Scanning used to open
+  every `/dev/video*` node and enumerate its formats; on kernels before
+  6.16 each such open powers the camera up (uvcvideo moved power-up into
+  the ioctl dispatcher in 6.16), which is a privacy-LED blink per scan, and
+  the #187 workaround existed because those probe opens were believed to
+  contend. On UVC hardware the role is now read from sysfs and the media
+  graph alone: the media controller says which node is the function's
+  capture node (its entity owns pads; the metadata sibling is padless), and
+  the USB descriptors blob names the function's formats, translated through
+  the kernel's own GUID table, including the whole L8 greyscale family
+  (Y8, Y800, D3DFMT_L8, KSMEDIA_L8_IR, the Windows Hello IR format this
+  project's own reference camera advertises), and fed to the same
+  classifier the open probe uses, so the two paths cannot disagree.
+  Everything the no-open path cannot decide falls back to the open probe
+  unchanged: loopback nodes, MC-centric platform stacks (the #425 QUERYCAP
+  gate still names them), vendor-only format lists. On-hardware
+  verification of every source is in
+  `docs/research/2026-08-12-camera-session-measurements.md` (#428).
+
 ### Fixed
 
 - **The backlight-compensation tuning no longer outlives the session onto

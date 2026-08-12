@@ -46,10 +46,81 @@ pub const MSXU_FACE_AUTHENTICATION: u8 = 0x06;
 pub const MSXU_IR_TORCH: u8 = 0x0A;
 
 const DESC_INTERFACE: u8 = 0x04;
+const DESC_IAD: u8 = 0x0B;
 const DESC_CS_INTERFACE: u8 = 0x24;
 const SUBTYPE_EXTENSION_UNIT: u8 = 0x06;
 const CLASS_VIDEO: u8 = 0x0E;
 const SUBCLASS_VIDEOCONTROL: u8 = 0x01;
+const SUBCLASS_VIDEOSTREAMING: u8 = 0x02;
+/// VideoStreaming class-specific subtypes that declare a format (UVC 1.5
+/// table 3-1): uncompressed and frame-based carry a `guidFormat` at bytes
+/// 5..21; MJPEG has no GUID and IS the format.
+const VS_FORMAT_UNCOMPRESSED: u8 = 0x04;
+const VS_FORMAT_MJPEG: u8 = 0x06;
+const VS_FORMAT_FRAME_BASED: u8 = 0x10;
+
+/// The format GUIDs a Hello-class camera's streaming interfaces advertise,
+/// paired with the fourcc uvcvideo would report for each, COPIED from the
+/// kernel's own table (`include/linux/usb/uvc.h` definitions,
+/// `drivers/media/common/uvc.c` mappings) so a descriptor-classified node and
+/// an ENUM_FMT-classified node answer identically (#428). Byte order is
+/// descriptor wire order, the same convention as [`MS_CAMERA_CONTROL_XU`].
+///
+/// The greyscale family matters most and has FOUR members mapping to GREY:
+/// Y8, Y800, D3DFMT_L8, and KSMEDIA_L8_IR, the Windows Hello IR format. The
+/// last two differ only in byte 4 (0x00 against 0x02), and the ASUS camera
+/// this project develops against advertises KSMEDIA_L8_IR, so a table
+/// missing it would classify this very laptop's IR camera as format-unknown.
+/// Matching is whole-GUID: the standard 12-byte tail does NOT cover
+/// KSMEDIA_L8_IR, whose Data2 is 0x0002.
+const GUID_FOURCCS: [([u8; 16], [u8; 4]); 11] = [
+    (guid_std(*b"YUY2"), *b"YUYV"),
+    (guid_std(*b"NV12"), *b"NV12"),
+    (guid_std(*b"UYVY"), *b"UYVY"),
+    (guid_std(*b"Y800"), *b"GREY"),
+    (guid_std(*b"Y8  "), *b"GREY"),
+    (guid_std(*b"Y10 "), *b"Y10 "),
+    (guid_std(*b"Y12 "), *b"Y12 "),
+    (guid_std(*b"Y16 "), *b"Y16 "),
+    // D3DFMT_L8: Data1 0x00000032, standard tail.
+    (guid_data1(0x0000_0032, 0x0000), *b"GREY"),
+    // KSMEDIA_L8_IR: same Data1, Data2 0x0002.
+    (guid_data1(0x0000_0032, 0x0002), *b"GREY"),
+    // BGR3 uses its own GUID, not the standard tail (kernel header).
+    (
+        [
+            0x7d, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b,
+            0xa7, 0x70,
+        ],
+        *b"BGR3",
+    ),
+];
+
+/// A standard-tail format GUID: four fourcc bytes, Data2 zero, then the
+/// fixed `1000-8000-00aa00389b71` tail, in wire order.
+const fn guid_std(fourcc: [u8; 4]) -> [u8; 16] {
+    guid_data1(u32::from_le_bytes(fourcc), 0x0000)
+}
+
+/// A format GUID from its Data1 dword and Data2 word, standard tail.
+const fn guid_data1(data1: u32, data2: u16) -> [u8; 16] {
+    let d1 = data1.to_le_bytes();
+    let d2 = data2.to_le_bytes();
+    [
+        d1[0], d1[1], d1[2], d1[3], d2[0], d2[1], 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+        0x9B, 0x71,
+    ]
+}
+
+/// The fourcc uvcvideo would report for a streaming-format GUID, or `None`
+/// for a format the table does not carry (vendor formats; the caller falls
+/// back to the open probe when nothing at all is recognised).
+fn fourcc_for_guid(guid: &[u8; 16]) -> Option<[u8; 4]> {
+    GUID_FOURCCS
+        .iter()
+        .find(|(g, _)| g == guid)
+        .map(|(_, cc)| *cc)
+}
 
 /// One `VC_EXTENSION_UNIT` descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +258,98 @@ pub fn usb_ids(video_device: &str) -> std::io::Result<(u16, u16)> {
 
 fn read_hex_u16(path: &Path) -> Option<u16> {
     u16::from_str_radix(std::fs::read_to_string(path).ok()?.trim(), 16).ok()
+}
+
+/// The pixel formats a camera FUNCTION advertises, read from its descriptor
+/// blob alone, as the fourccs uvcvideo would report for them (#428).
+///
+/// A UVC function is one VideoControl interface plus its VideoStreaming
+/// interfaces. The grouping comes from the Interface Association Descriptor
+/// covering `vc_interface` when the device publishes IADs (the composite
+/// two-function ASUS module does, one per camera); a device without one gets
+/// the specification's layout instead, where a function's streaming
+/// interfaces follow their VideoControl contiguously until the next
+/// VideoControl interface begins.
+///
+/// Only formats the GUID table recognises are returned. An empty answer
+/// means "this blob names nothing irlume knows", and the caller must treat
+/// that as no evidence rather than as a camera with no formats: a
+/// vendor-format-only device still classifies through the open probe.
+pub(crate) fn function_fourccs(desc: &[u8], vc_interface: u8) -> Vec<[u8; 4]> {
+    // First pass: the IAD covering the VideoControl interface, if any.
+    let mut group: Option<(u8, u8)> = None; // (first, count)
+    let mut i = 0usize;
+    while i + 2 <= desc.len() {
+        let len = usize::from(desc[i]);
+        if len < 2 || i + len > desc.len() {
+            break;
+        }
+        let d = &desc[i..i + len];
+        if d[1] == DESC_IAD && len >= 8 && d[2] <= vc_interface && vc_interface < d[2] + d[3] {
+            group = Some((d[2], d[3]));
+        }
+        i += len;
+    }
+
+    // Second pass: formats on the streaming interfaces of this function.
+    let mut out = Vec::new();
+    let mut in_function_vs = false;
+    let mut past_vc = false;
+    let mut i = 0usize;
+    while i + 2 <= desc.len() {
+        let len = usize::from(desc[i]);
+        if len < 2 || i + len > desc.len() {
+            break;
+        }
+        let d = &desc[i..i + len];
+        match d[1] {
+            DESC_INTERFACE if len >= 7 => {
+                let (num, class, sub) = (d[2], d[5], d[6]);
+                let in_group = match group {
+                    Some((first, count)) => num >= first && num < first + count,
+                    // No IAD: the spec's contiguous layout. Streaming
+                    // interfaces count once their VideoControl has been
+                    // seen, and any LATER VideoControl ends the function.
+                    None => {
+                        if class == CLASS_VIDEO && sub == SUBCLASS_VIDEOCONTROL {
+                            past_vc = num == vc_interface;
+                        }
+                        past_vc
+                    }
+                };
+                in_function_vs = in_group && class == CLASS_VIDEO && sub == SUBCLASS_VIDEOSTREAMING;
+            }
+            DESC_CS_INTERFACE if in_function_vs && len >= 3 => match d[2] {
+                VS_FORMAT_UNCOMPRESSED | VS_FORMAT_FRAME_BASED if len >= 21 => {
+                    let mut guid = [0u8; 16];
+                    guid.copy_from_slice(&d[5..21]);
+                    if let Some(cc) = fourcc_for_guid(&guid) {
+                        out.push(cc);
+                    }
+                }
+                VS_FORMAT_MJPEG => out.push(*b"MJPG"),
+                _ => {}
+            },
+            _ => {}
+        }
+        i += len;
+    }
+    out
+}
+
+/// [`function_fourccs`] for a live node: the sysfs descriptor blob and the
+/// node's VideoControl interface number, no device open. `None` when the
+/// node has no USB descriptors (not a UVC camera: a loopback node, a
+/// platform stack) or when the blob names no format irlume recognises;
+/// either way the caller's open probe remains the authority.
+pub(crate) fn streaming_fourccs(video_device: &str) -> Option<Vec<[u8; 4]>> {
+    let (desc, vc_interface) = usb_context(video_device).ok()?;
+    let fourccs = function_fourccs(&desc, vc_interface);
+    if fourccs.is_empty() {
+        None
+    } else {
+        Some(fourccs)
+    }
 }
 
 /// The USB configuration descriptors and VideoControl interface number backing
@@ -379,7 +542,7 @@ fn ancestor_with(start: &Path, marker: &str) -> Option<PathBuf> {
     None
 }
 
-fn interface_dir(video_device: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn interface_dir(video_device: &str) -> std::io::Result<PathBuf> {
     let node = Path::new(video_device)
         .file_name()
         .ok_or_else(|| bad(format!("{video_device} is not a device node path")))?;
@@ -632,5 +795,115 @@ mod tests {
             i += len;
         }
         assert_eq!(i, ASUS.len());
+    }
+
+    /// The real camera's two functions classify from the blob alone (#428):
+    /// the RGB function (VideoControl interface 0) advertises MJPEG plus
+    /// YUY2, the IR function (interface 2) exactly the 8-bit IR format, and
+    /// the two must never see each other's formats or the composite module
+    /// collapses into one mislabeled camera.
+    #[test]
+    fn the_real_blob_classifies_both_functions_by_their_own_formats() {
+        assert_eq!(
+            function_fourccs(ASUS, 0),
+            vec![*b"MJPG", *b"YUYV"],
+            "the RGB function's streaming formats"
+        );
+        assert_eq!(
+            function_fourccs(ASUS, 2),
+            vec![*b"GREY"],
+            "the IR function's one format, KSMEDIA_L8_IR mapped as uvcvideo maps it"
+        );
+    }
+
+    /// The IR format the real camera advertises is KSMEDIA_L8_IR, whose
+    /// GUID differs from D3DFMT_L8 only in byte 4 and whose Data2 makes the
+    /// standard 12-byte tail NOT match. The wire bytes must appear in the
+    /// fixture and the table must map them; a tail-keyed matcher, or a
+    /// table with only D3DFMT_L8, silently loses this laptop's IR camera
+    /// (the first session write-up made exactly that misreading).
+    #[test]
+    fn ksmedia_l8_ir_is_matched_by_whole_guid_in_wire_order() {
+        let ksmedia = guid_data1(0x0000_0032, 0x0002);
+        assert!(
+            ASUS.windows(16).any(|w| w == ksmedia),
+            "the fixture must carry the KSMEDIA_L8_IR GUID in wire order"
+        );
+        assert_eq!(fourcc_for_guid(&ksmedia), Some(*b"GREY"));
+        let d3d = guid_data1(0x0000_0032, 0x0000);
+        assert_ne!(ksmedia, d3d, "byte 4 separates the two L8 GUIDs");
+        assert!(
+            !ASUS.windows(16).any(|w| w == d3d),
+            "this camera does not advertise D3DFMT_L8; only the table entry \
+             covers cameras that do"
+        );
+    }
+
+    /// A device with no Interface Association Descriptors gets the
+    /// specification's contiguous layout: a function's streaming interfaces
+    /// follow their VideoControl until the next VideoControl begins. Two
+    /// back-to-back functions must still split correctly.
+    #[test]
+    fn without_iads_streaming_interfaces_bind_to_the_preceding_videocontrol() {
+        let mut blob = Vec::new();
+        // interface 0: VideoControl of function A
+        blob.extend_from_slice(&[
+            9,
+            DESC_INTERFACE,
+            0,
+            0,
+            0,
+            CLASS_VIDEO,
+            SUBCLASS_VIDEOCONTROL,
+            0,
+            0,
+        ]);
+        // interface 1: VideoStreaming of function A, YUY2
+        blob.extend_from_slice(&[
+            9,
+            DESC_INTERFACE,
+            1,
+            0,
+            0,
+            CLASS_VIDEO,
+            SUBCLASS_VIDEOSTREAMING,
+            0,
+            0,
+        ]);
+        let mut fmt = vec![27, DESC_CS_INTERFACE, VS_FORMAT_UNCOMPRESSED, 1, 1];
+        fmt.extend_from_slice(&guid_std(*b"YUY2"));
+        fmt.extend_from_slice(&[16, 1, 0, 0, 0, 0]);
+        blob.extend_from_slice(&fmt);
+        // interface 2: VideoControl of function B ends function A
+        blob.extend_from_slice(&[
+            9,
+            DESC_INTERFACE,
+            2,
+            0,
+            0,
+            CLASS_VIDEO,
+            SUBCLASS_VIDEOCONTROL,
+            0,
+            0,
+        ]);
+        // interface 3: VideoStreaming of function B, Y8
+        blob.extend_from_slice(&[
+            9,
+            DESC_INTERFACE,
+            3,
+            0,
+            0,
+            CLASS_VIDEO,
+            SUBCLASS_VIDEOSTREAMING,
+            0,
+            0,
+        ]);
+        let mut fmt = vec![27, DESC_CS_INTERFACE, VS_FORMAT_UNCOMPRESSED, 1, 1];
+        fmt.extend_from_slice(&guid_std(*b"Y8  "));
+        fmt.extend_from_slice(&[8, 1, 0, 0, 0, 0]);
+        blob.extend_from_slice(&fmt);
+
+        assert_eq!(function_fourccs(&blob, 0), vec![*b"YUYV"]);
+        assert_eq!(function_fourccs(&blob, 2), vec![*b"GREY"]);
     }
 }

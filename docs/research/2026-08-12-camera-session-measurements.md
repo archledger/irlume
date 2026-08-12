@@ -54,10 +54,14 @@ video node opened for any of it:
   and sits in the UVC chain; metadata nodes are padless and linkless.
 - **Descriptors blob** (`/sys/.../descriptors`, stable ABI): the RGB VS
   interface advertises MJPEG + YUY2; the IR VS interface advertises GUID
-  `32000000-0000-0010-8000-00aa00389b71`, which is **D3DFMT_L8**, mapped
-  by the kernel's own table (`drivers/media/common/uvc.c`) to
-  V4L2_PIX_FMT_GREY. An irlume descriptor-based classifier must therefore
-  carry the D3DFMT_L8 GUID alongside Y8, or this laptop's own IR camera
-  would classify as format-unknown.
+  `32000000-0200-1000-8000-00aa00389b71`, which is **KSMEDIA_L8_IR**, the
+  Windows Hello IR format GUID, mapped by the kernel's own table
+  (`drivers/media/common/uvc.c`) to V4L2_PIX_FMT_GREY. The first write-up
+  of this session misread it as D3DFMT_L8, whose byte 4 is 0x00 where
+  this GUID carries 0x02; copying the kernel header's definitions rather
+  than eyeballing hex is what caught it. An irlume descriptor-based
+  classifier must carry the whole L8 family (Y8, Y800, D3DFMT_L8,
+  KSMEDIA_L8_IR), or this laptop's own IR camera would classify as
+  format-unknown.
 
 These are the measured basis for #428's implementation and #426's fix.

@@ -51,6 +51,7 @@ that produced it and the dataset it ran on.
 | [`recognition-results/`](recognition-results/) | Recognizer accuracy and demographic spread |
 | [`validation/`](validation/) | End-to-end grant-path validation runs |
 | [`cross-distro/`](cross-distro/) | Distro-family surveys |
+| [`research/`](research/) | Source audits against kernel and library references |
 
 Where each evaluation dataset was actually obtained, which is not always the
 canonical academic page, is in [`../benchmarks/README.md`](../benchmarks/README.md).

@@ -1996,6 +1996,19 @@ impl App {
                     "templates encrypted but no recovery passphrase".into(),
                     Fix::Manual("Recovery tab → [s] set a recovery passphrase".into()),
                 ));
+            } else if r.encrypted && !r.key_present {
+                // Encrypted with the key gone: no passphrase and no reseal opens
+                // it, so this is not a backstop question at all. The Cameras-side
+                // row already says this loudly; the check said "encrypted +
+                // recovery set" and passed.
+                v.push(mk(
+                    "Recovery backstop",
+                    Sev::Fail,
+                    "templates encrypted but the template key is MISSING: nothing can \
+                     open them"
+                        .into(),
+                    Fix::Manual("re-enroll: Profiles tab → [e]".into()),
+                ));
             } else {
                 v.push(mk(
                     "Recovery backstop",
@@ -2946,6 +2959,13 @@ impl App {
                 e.stop.store(true, Ordering::Relaxed);
                 self.enroll = None;
                 self.log('·', "enrollment cancelled");
+                // The daemon may already hold what the cancelled run created:
+                // scan 1 creates the profile before any of the later scans, so
+                // stopping after it leaves a real profile the cached list has
+                // never seen. Without this the screen shows no profile at all,
+                // and the user's reasonable next move is to enroll again on top
+                // of it. Async, so the cancel stays instant.
+                self.refresh_profiles();
             }
             return;
         }
@@ -3090,7 +3110,12 @@ impl App {
         // Fast diagnostics on entering Repair/Fingerprint (no slow profile
         // poll, so the switch is instant); a fresh profile poll only when
         // landing on Profiles, where an external `irlume enroll` should show.
-        if self.screen == SC_CAMERAS {
+        // Repair too, not just Cameras. Its camera verdicts read the same
+        // listing, and Cameras is hidden unless advanced view is on, so on a
+        // default session the list was always empty and the "a privacy switch is
+        // ON" warning could never fire: the one hardware state that silently
+        // stops face auth was unreportable on the screen built to find it.
+        if self.screen == SC_CAMERAS || self.screen == SC_REPAIR {
             self.refresh_camera_listing();
         }
         if self.screen == SC_REPAIR || self.screen == SC_FINGERPRINT {
@@ -3155,7 +3180,7 @@ impl App {
                     self.sel = 0;
                     // Same fast paths as a Tab switch: diagnostics for
                     // Repair/Fingerprint, a fresh profile poll for Profiles.
-                    if target == SC_CAMERAS {
+                    if target == SC_CAMERAS || target == SC_REPAIR {
                         self.refresh_camera_listing();
                     }
                     if target == SC_REPAIR || target == SC_FINGERPRINT {
@@ -5376,7 +5401,10 @@ impl App {
             ("keyring unlock", self.keyring_armed, SC_KEYRING),
             (
                 "recovery + encryption",
-                self.recovery.map(|r| r.encrypted && r.recovery_set),
+                // The key has to be there too: encrypted with no key is not a
+                // completed step, it is an enrollment nothing can read.
+                self.recovery
+                    .map(|r| r.encrypted && r.recovery_set && r.key_present),
                 SC_RECOVERY,
             ),
             ("login wiring", self.login_wired_known(), SC_PAM),
@@ -5987,7 +6015,19 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  templates enc     "),
-                onoff_opt(self.recovery.map(|r| r.encrypted)),
+                // Three states, not two. An encrypted store whose key is gone
+                // cannot be opened by anything, and `encrypted` alone drew it as
+                // a green yes; drawing it as "no" would be just as wrong in the
+                // other direction. The Recovery tab already says this loudly.
+                match self.recovery {
+                    Some(r) if r.encrypted && r.key_present => onoff(true),
+                    Some(r) if r.encrypted => Span::styled(
+                        "✗ key missing",
+                        Style::new().fg(th().err).add_modifier(Modifier::BOLD),
+                    ),
+                    Some(_) => onoff(false),
+                    None => onoff_opt(None),
+                },
             ]),
             Line::from(vec![
                 Span::raw("  recovery pass     "),
@@ -11333,6 +11373,104 @@ mod tests {
             Some(v) => std::env::set_var("IRLUME_SOCKET", v),
             None => std::env::remove_var("IRLUME_SOCKET"),
         }
+    }
+
+    /// An encrypted enrollment whose template key is gone must not read as a
+    /// completed step anywhere.
+    ///
+    /// Nothing opens it: no recovery passphrase, no reseal, only a re-enrol. The
+    /// Recovery tab said so loudly while the Repair check passed it as
+    /// "encrypted + recovery set", the Done row drew a green yes, and the hub
+    /// badge counted the step done.
+    #[test]
+    fn a_missing_template_key_is_not_a_completed_step() {
+        let mut app = test_app();
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: false,
+        });
+        app.run_checks();
+
+        // Repair: a failure with a re-enrol remedy, not an OK.
+        let backstop = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Recovery backstop")
+            .expect("the backstop check is present");
+        assert!(matches!(backstop.sev, Sev::Fail), "{}", backstop.detail);
+        assert!(backstop.detail.contains("MISSING"), "{}", backstop.detail);
+
+        // Done dashboard: not a green yes.
+        app.screen = SC_DONE;
+        let text = draw_text(&app);
+        assert!(text.contains("key missing"), "{text}");
+
+        // Hub badge: the step is not done. (The hub lists only VISIBLE screens,
+        // and the test app has no camera, so make them all visible first, as the
+        // hub-navigation test does.)
+        app.screen = SC_WELCOME;
+        app.visible = (0..SCREENS.len()).collect();
+        let rows = app.hub_rows();
+        let enc = rows
+            .iter()
+            .find(|(label, _, _)| *label == "recovery + encryption")
+            .expect("the hub lists the recovery step");
+        assert_eq!(enc.1, Some(false), "an unopenable store is not done");
+
+        // With the key present, all three read as done again.
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: true,
+        });
+        app.run_checks();
+        let backstop = app
+            .repair
+            .iter()
+            .find(|c| c.label == "Recovery backstop")
+            .unwrap();
+        assert!(matches!(backstop.sev, Sev::Ok), "{}", backstop.detail);
+        app.visible = (0..SCREENS.len()).collect();
+        let rows = app.hub_rows();
+        let enc = rows
+            .iter()
+            .find(|(label, _, _)| *label == "recovery + encryption")
+            .unwrap();
+        assert_eq!(enc.1, Some(true));
+    }
+
+    /// Cancelling a guided enrolment must re-read the profile list.
+    ///
+    /// Scan 1 creates the profile on the daemon before the later scans run, so a
+    /// cancel after it leaves a real profile the cached list has never seen. The
+    /// screen then showed nothing, and enrolling again on top of that is the
+    /// natural next move.
+    #[test]
+    fn cancelling_an_enrolment_re_reads_the_profiles() {
+        let mut app = test_app();
+        let (_tx, rx) = mpsc::channel();
+        app.enroll = Some(EnrollUi {
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            profile: "BEN".into(),
+            last: None,
+            count: None,
+            stalled: None,
+            captured: 1,
+            target: 5,
+            base: 0,
+            ambient_base: 0,
+        });
+        assert!(app.profiles_load.is_none(), "premise: no load in flight");
+        app.on_key(KeyCode::Esc);
+        assert!(app.enroll.is_none(), "Esc cancels the guided enrolment");
+        assert!(
+            app.profiles_load.is_some(),
+            "and asks the daemon what the profile list is now"
+        );
     }
 
     /// With the daemon down and nothing probed, the Repair tab must say it cannot

@@ -4413,9 +4413,14 @@ fn doctor_run(
         ),
     };
     dout!(report, "[doctor] fingerprint reader: {fp}");
+    // The same predicate the text line above uses, and the machine `status`
+    // field beside it. `device_name()` answers "fprintd could NAME a device",
+    // which is a narrower thing than "a reader was found": a present reader that
+    // fprintd will not name printed "present ✓" in the text and "not found" in
+    // the check on the same screen, and the machine field agreed with neither.
     report.check(
         "fingerprint-reader",
-        if irlume_fingerprint::device_name().is_some() {
+        if irlume_fingerprint::available() {
             State::Pass
         } else {
             State::Info
@@ -4704,9 +4709,16 @@ fn doctor_run(
              Re-enroll to activate it: the TUI Profiles tab, or `sudo irlume enroll`."
         );
     }
+    // The greeter the ACTIVE display manager consults, not any-of. `login_wired`
+    // is true when ANY greeter, the lock screen, or the fingerprint-keyring
+    // service carries the line, and this file's own sibling documents where that
+    // misleads: a distro update that strips the active greeter while a stale
+    // inactive greeter file keeps the line leaves it true and the real login
+    // broken. Doctor exists to catch exactly that, and was passing it.
+    let login_ok = crate::pamwire::active_login_wired();
     report.check(
         "login-wiring",
-        if crate::pamwire::login_wired() {
+        if login_ok {
             State::Pass
         } else if enrolled {
             State::Warn
@@ -4714,7 +4726,7 @@ fn doctor_run(
             State::Info
         },
     );
-    if enrolled && !crate::pamwire::login_wired() {
+    if enrolled && !login_ok {
         dout!(
             report,
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \

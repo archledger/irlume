@@ -445,7 +445,11 @@ pub fn status(args: &[String]) -> ExitCode {
                 "keyring": keyring,
                 "recovery": recovery,
                 "camera": camera,
-                "fingerprint": irlume_fingerprint::device_name().is_some(),
+                // "Whether a fingerprint reader was found", as the schema puts
+                // it: fprintd present AND a reader present, the same predicate
+                // doctor's line and its `fingerprint-reader` check use. Naming
+                // the device is a narrower question and disagreed with both.
+                "fingerprint": irlume_fingerprint::available(),
             }),
             contract,
         ),

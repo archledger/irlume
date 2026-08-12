@@ -302,7 +302,7 @@ fn reconcile() -> ExitCode {
 /// active DM actually consults, so reconcile repairs the login that matters. An
 /// absent active-greeter file counts as not-wired too (a deleted /etc override).
 /// Falls back to `login_wired()` when the active DM is unknown/absent.
-fn active_login_wired() -> bool {
+pub(crate) fn active_login_wired() -> bool {
     let Some(dm) = active_display_manager() else {
         return login_wired();
     };

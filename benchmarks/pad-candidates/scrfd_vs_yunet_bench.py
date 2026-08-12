@@ -40,6 +40,42 @@ SCRFD_PATH = os.environ.get(
     "SCRFD_MODEL", str(Path.home() / "datasets/buffalo_l/det_10g.onnx")
 )
 
+# The digests this measurement is published under. Printing a hash and then
+# using the file regardless is a check that authorises nothing (review round,
+# #444): a different det_10g.onnx, or one replaced corpus frame, would have
+# produced a plausible CSV indistinguishable from a reproduction. These are
+# ENFORCED before any inference runs, and --allow-unpinned is the explicit
+# way to measure something else on purpose.
+EXPECTED = {
+    "scrfd": "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+    "yunet": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+}
+# Frames in the committed corpus; a short or long enumeration is a different
+# corpus, whatever the paths say.
+EXPECTED_FRAMES = 512
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_inputs(allow_unpinned):
+    """Refuse before inference when the artifacts are not the published ones."""
+    bad = []
+    for name, path in (("scrfd", SCRFD_PATH), ("yunet", YUNET_PATH)):
+        got = _sha256_file(path)
+        if got != EXPECTED[name]:
+            bad.append(f"{name}: {path}\n    expected {EXPECTED[name]}\n    got      {got}")
+    if bad:
+        msg = "input artifacts do not match the published measurement:\n  " + "\n  ".join(bad)
+        if not allow_unpinned:
+            raise SystemExit(f"{msg}\nrefusing; pass --allow-unpinned to measure anyway")
+        print(f"WARNING: {msg}\ncontinuing under --allow-unpinned", file=sys.stderr)
+
 # irlume's shipped YuNet constants (crates/irlume-vision/src/detect.rs).
 YUNET_INPUT = 640
 YUNET_SCORE = 0.6
@@ -258,17 +294,39 @@ def frames():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/tmp/claude-1000/-home-wisbfime/"
-                    "4f8e3530-ff45-4dea-9ccc-83ad0fa5683e/scratchpad/per_frame.csv")
+    # Defaults to the committed record, so a bare run reproduces what is
+    # published rather than writing to a path that exists on one machine.
+    ap.add_argument(
+        "--out",
+        default=str(
+            Path(__file__).resolve().parents[2]
+            / "docs/pad-results/2026-08-12-scrfd-vs-yunet-frames.csv"
+        ),
+    )
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument(
+        "--allow-unpinned",
+        action="store_true",
+        help="measure artifacts other than the published ones (states so in stderr)",
+    )
     args = ap.parse_args()
 
+    verify_inputs(args.allow_unpinned)
     print(f"yunet_sha256={sha256(YUNET_PATH)}", file=sys.stderr)
     print(f"scrfd_sha256={sha256(SCRFD_PATH)}", file=sys.stderr)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     y, s = YuNet(YUNET_PATH), Scrfd(SCRFD_PATH)
     rows = []
-    for n, (cam, seg, kind, f) in enumerate(frames()):
+    all_frames = list(frames())
+    if not all_frames:
+        raise SystemExit(f"no frames under {CORPUS}; set IRLUME_STAGE3_CORPUS")
+    if not args.limit and len(all_frames) != EXPECTED_FRAMES:
+        raise SystemExit(
+            f"corpus has {len(all_frames)} frames, the published measurement used "
+            f"{EXPECTED_FRAMES}; this is a different corpus"
+        )
+    for n, (cam, seg, kind, f) in enumerate(all_frames):
         if args.limit and n >= args.limit:
             break
         rgb, w, h = read_pnm(f)
@@ -295,7 +353,9 @@ def main():
         if n % 64 == 0:
             print(f"  {n} frames...", file=sys.stderr)
 
-    with open(args.out, "w", newline="") as fh:
+    # newline="\n": csv.writer defaults to CRLF, which makes git diff --check
+    # report every committed row as trailing whitespace (review round, #444).
+    with open(args.out, "w", newline="\n") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         wr.writeheader()
         wr.writerows(rows)

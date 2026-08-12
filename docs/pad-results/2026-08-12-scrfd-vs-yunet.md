@@ -70,9 +70,21 @@ misses. They split exactly in half:
   these made one segment read 66.7% for SCRFD against YuNet's 50%. That
   reading is wrong.
 
-At a matched 0.6 threshold: both detect 221, YuNet-only 2, SCRFD-only 3,
-background false positives 0. The two YuNet-only frames are dim RGB where
-SCRFD scores 0.58 and 0.60 and falls under the bar.
+Raising SCRFD to 0.6, the number irlume happens to use for YuNet: both
+detect 221, YuNet-only 2, SCRFD-only 3, background false positives 0. The
+two YuNet-only frames are dim RGB where SCRFD scores 0.58 and 0.60 and
+falls under the bar.
+
+That 0.6 is a reference point, NOT a matched operating point. The two
+scores come from different models with different preprocessing and no
+shared calibration, so an equal number does not equalise false-positive
+rate, false-negative rate, or anything else. It is also not independently
+chosen: the only evidence that SCRFD's background boxes fall below 0.6 is
+the same corpus the comparison is reported on, which contains 128
+empty-room frames and no attacks. A background box at 0.65 in another
+room would remove the property without contradicting anything measured
+here (the review round on this PR named this; the earlier draft called it
+a matched threshold).
 
 ## Deviations from irlume's own invocation
 

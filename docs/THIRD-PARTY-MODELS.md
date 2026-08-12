@@ -194,23 +194,35 @@ genuine detection rates are within one frame of each other. It recovers
 four saturated lit-strobe IR frames YuNet loses; at its own default 0.5
 threshold it also produces four false boxes on background clutter, and at
 0.6 it drops two dim RGB faces YuNet holds. Availability is a wash and
-the failure modes merely differ.
+the failure modes merely differ. The two score scales are not
+commensurable, so 0.6 is a reference point observed on this corpus, not a
+calibrated equivalence: the same corpus that shows the background boxes
+falling below 0.6 is the only evidence that they do.
 
 It is not enableable for the same reason full-range BlazeFace is not: the
 rescue slot feeds the grant path, and no corpus yet covers prints,
 screens or other faces on the frames where a rescue fires. That corpus is
 issue #440.
 
-**Landmarks: rejected, on the model's own output shape.** The InsightFace
-106-point model (`2d106det.onnx`, sha256 `f001b856...`) emits a single
-`fc1[1,212]` tensor: 106 points, two coordinates each, no iris and no
-depth. irlume's cues are derived from the 478-point FaceMesh V2 with
-iris landmarks: eye-aspect-ratio closure, head pose, and the consent
-gestures all index that mesh. Adopting a 106-point model is not a swap
-but a re-derivation of every cue and a re-measurement of every gate,
-invalidating the calibration corpora in the process. The landmarks stage
-stays closed with nothing to open for, and this candidate does not change
-that.
+**Landmarks: not directly swappable, and the migration is narrower than
+it first looks.** The InsightFace 106-point model (`2d106det.onnx`,
+sha256 `f001b856...`) emits a single `fc1[1,212]` tensor: 106
+two-dimensional points. irlume's eye-aspect-ratio and deliberate-closure
+cues index the MediaPipe mesh topology by number (`EAR_LEFT` and
+`EAR_RIGHT`), so adopting a 106-point model means defining a new eye
+mapping and re-measuring those gates against the calibration corpora.
+
+Head pose and the nod and head-shake consent gestures are NOT part of
+that migration: they read the detector's five landmarks
+(`head_pose(&Landmarks5)`), not the mesh, so a mesh swap leaves them
+untouched. The review round on this PR corrected an earlier draft here
+that claimed otherwise; the iris points are likewise not implicated,
+since every EAR index is below 468. What remains is real but bounded:
+an eye-landmark mapping and a re-measured closure gate.
+
+The stage stays closed regardless, because a mesh feeds cues that
+produce confident numbers from wrong pixels rather than erroring, and
+nothing has measured what this model's landmarks do to those cues.
 
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.

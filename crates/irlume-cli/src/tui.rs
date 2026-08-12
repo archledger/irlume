@@ -2562,6 +2562,32 @@ impl App {
             .unwrap_or_else(|| "irlume".to_string())
     }
 
+    /// The command a privileged step runs: `sudo <args>` normally, but `<args>`
+    /// alone when the TUI is ALREADY root.
+    ///
+    /// A second `sudo` from a root process resets `SUDO_USER` to `root`, because
+    /// root is then the invoking user. Every per-user command resolves its target
+    /// from `SUDO_USER` (see `user_arg`), so `sudo irlume tui` -> `[c]` ->
+    /// `sudo irlume calibrate-closure` taught the consent gesture and stored it
+    /// for **root**, while the daemon reads the calibration from the real user's
+    /// enrollment: the user calibrated, saw it succeed, and their own prompts
+    /// never used it. Found by walking the TUI as root on 2026-08-12. The same
+    /// reset silently retargeted every other per-user step (enrol, keyring).
+    ///
+    /// Running the command directly when root keeps the OUTER sudo's
+    /// `SUDO_USER`, which names the person who started the TUI.
+    fn privileged_cmd(args: &[&str], already_root: bool) -> std::process::Command {
+        if already_root {
+            let mut cmd = std::process::Command::new(args[0]);
+            cmd.args(&args[1..]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sudo");
+            cmd.args(args);
+            cmd
+        }
+    }
+
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
         // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
         // to. Resolve the first "irlume" arg to the current exe; leave
@@ -2576,7 +2602,13 @@ impl App {
             })
             .collect();
         let args: Vec<&str> = resolved.iter().map(String::as_str).collect();
-        eprintln!("\n{what}; running: sudo {}…", args.join(" "));
+        // SAFETY: geteuid() reads the caller's own credentials and cannot fail.
+        let already_root = unsafe { libc::geteuid() } == 0;
+        eprintln!(
+            "\n{what}; running: {}{}…",
+            if already_root { "" } else { "sudo " },
+            args.join(" ")
+        );
         // In the cooked terminal, Ctrl-C goes to the whole foreground group:
         // a user aborting the CHILD (a sudo prompt, the models license flow)
         // must not also kill the TUI. Ignore SIGINT here while the child runs;
@@ -2584,8 +2616,7 @@ impl App {
         // cancels IT. (Found live: Ctrl-C in the license prompt took the whole
         // TUI down.)
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.args(args);
+        let mut cmd = Self::privileged_cmd(&args, already_root);
         // SAFETY: signal() is async-signal-safe; this runs in the forked child
         // just before exec.
         unsafe {
@@ -10888,6 +10919,33 @@ mod tests {
         );
         // "dark mode" reads as a UI theme, not an IR capability.
         assert!(!text.contains("dark mode"), "{text}");
+    }
+
+    /// A privileged step must not re-`sudo` when the TUI is already root: the
+    /// inner sudo resets SUDO_USER to "root", and every per-user command
+    /// resolves its target from it, so `sudo irlume tui` -> `[c]` stored the eye
+    /// calibration for root instead of the person who ran the TUI.
+    #[test]
+    fn a_root_tui_runs_privileged_steps_without_a_second_sudo() {
+        let args = ["/usr/bin/irlume", "calibrate-closure"];
+
+        // Already root: run the binary directly, so the OUTER sudo's SUDO_USER
+        // survives and names the real user.
+        let cmd = App::privileged_cmd(&args, true);
+        assert_eq!(cmd.get_program(), "/usr/bin/irlume");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec!["calibrate-closure"],
+            "no sudo, and the arguments are unchanged"
+        );
+
+        // Unprivileged: sudo is how the step gets its privilege at all.
+        let cmd = App::privileged_cmd(&args, false);
+        assert_eq!(cmd.get_program(), "sudo");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec!["/usr/bin/irlume", "calibrate-closure"]
+        );
     }
 
     /// The PAM tab's [c] row must describe the calibration the CONFIGURED mode

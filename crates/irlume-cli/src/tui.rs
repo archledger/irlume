@@ -3463,7 +3463,11 @@ impl App {
             // gesture (a face match alone would then approve it) asks first;
             // enabling only adds friction and goes straight through.
             (SC_SETTINGS, KeyCode::Char('c')) => {
-                let svc = SETTINGS_GESTURE_SERVICES[self.settings_svc_sel];
+                // Same clamp as the draw: a key must not panic on a stale index.
+                let svc = SETTINGS_GESTURE_SERVICES
+                    .get(self.settings_svc_sel)
+                    .copied()
+                    .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
                 // Same effective read as the badge, so [c] flips what the user
                 // sees. Reading the elevation-only default here meant the first
                 // press on polkit wrote `on` (already the behaviour) and skipped
@@ -3933,8 +3937,15 @@ impl App {
     /// A red, dismissible error banner centred on screen.
     fn error_modal(&self, f: &mut Frame, msg: &str) {
         let area = f.area();
-        let w = area.width.saturating_sub(8).clamp(30, 78);
-        let h = 7u16;
+        // Both dimensions are capped by the frame: the 30-column floor and the
+        // fixed 7 rows are bigger than a small terminal, and a rect that reaches
+        // past the buffer is not something a draw may produce.
+        let w = area
+            .width
+            .saturating_sub(8)
+            .clamp(30, 78)
+            .min(area.width.max(1));
+        let h = 7u16.min(area.height.max(1));
         let rect = Rect {
             x: area.width.saturating_sub(w) / 2,
             y: area.height.saturating_sub(h) / 2,
@@ -4335,7 +4346,15 @@ impl App {
     /// back to the per-service default (all four default on) rather than guessing
     /// off on a security setting.
     fn service_gesture_lines(&self) -> Vec<Line<'static>> {
-        let picked = SETTINGS_GESTURE_SERVICES[self.settings_svc_sel];
+        // Clamped, not indexed. The arrow handler wraps this selection modulo the
+        // list length, so it is in range today, but a DRAW must never be able to
+        // panic: an index that survives a list shrinking (or any future writer
+        // that forgets the wrap) would take the whole interface down mid-setup
+        // instead of mis-highlighting one row.
+        let picked = SETTINGS_GESTURE_SERVICES
+            .get(self.settings_svc_sel)
+            .copied()
+            .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
         // The EFFECTIVE state the engine enforces, not the elevation-only default:
         // polkit is AppConsent and defaults ON, so the old computation rendered
         // `polkit-1: no` on a default install while the daemon required a gesture.
@@ -6123,7 +6142,13 @@ impl App {
         // on any terminal width; borders + 1-col horizontal padding = 4 chars.
         let inner = (w as usize).saturating_sub(4).max(1);
         let lines = wrapped_line_count(body, inner) as u16;
-        let h = (lines + 2).clamp(3, area.height);
+        // `clamp(3, area.height)` PANICS when the frame is shorter than 3 rows
+        // (min > max), taking the whole interface down for anyone whose terminal
+        // is a couple of rows tall (a dragged-narrow window, a small tmux split).
+        // Cap the floor by what the frame actually has, so a tiny frame gets a
+        // cramped box instead of a crash.
+        let max_h = area.height.max(1);
+        let h = (lines + 2).clamp(3.min(max_h), max_h);
         let rect = Rect {
             x: area.width.saturating_sub(w) / 2,
             y: area.height.saturating_sub(h) / 2,
@@ -10919,6 +10944,162 @@ mod tests {
         );
         // "dark mode" reads as a UI theme, not an IR capability.
         assert!(!text.contains("dark mode"), "{text}");
+    }
+
+    /// Every screen must render at any terminal size, including sizes too small
+    /// to hold its content.
+    ///
+    /// Layout arithmetic is where a TUI panics: a width or height subtraction
+    /// that underflows, a constraint that cannot be satisfied, a centred popup
+    /// wider than the frame. A user who drags a terminal narrow, or runs in a tmux
+    /// split, must get a cramped screen and not a crash that takes their setup
+    /// session with it. 1x1 is included deliberately: it is the degenerate case
+    /// every clamp has to survive.
+    #[test]
+    fn every_screen_renders_at_every_size() {
+        let sizes = [
+            (1, 1),
+            (2, 2),
+            (10, 3),
+            (20, 5),
+            (40, 10),
+            (60, 20),
+            (80, 24),
+            (120, 50),
+            (200, 60),
+        ];
+        for screen in 0..SCREENS.len() {
+            for (w, h) in sizes {
+                let mut app = test_app();
+                app.screen = screen;
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                // The same size with the modal layers up: a popup is laid out
+                // against the frame, so it is the case most likely to underflow.
+                let mut app = test_app();
+                app.screen = screen;
+                app.show_help = true;
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                let mut app = test_app();
+                app.screen = screen;
+                app.set_error("an error long enough to need wrapping in a narrow frame");
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                // The confirm and input modals lay out the same way, and a
+                // confirm is what stands between a user and a destructive action,
+                // so it is the worst one to lose to a layout panic.
+                let mut app = test_app();
+                app.screen = screen;
+                app.confirm = Some((
+                    "A confirmation question long enough to wrap more than once in a narrow frame"
+                        .into(),
+                    "Disable",
+                    ConfirmAct::Daemon(Request::Ping),
+                ));
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+
+                let mut app = test_app();
+                app.screen = screen;
+                app.input = Some((
+                    "Rename profile 'a-fairly-long-profile-name' to:".into(),
+                    "typed text".into(),
+                    Pending::RenameProfile("a-fairly-long-profile-name".into()),
+                ));
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+            }
+        }
+    }
+
+    /// Every screen must survive every key without panicking, and must still
+    /// render afterwards.
+    ///
+    /// The TUI is a state machine over 12 screens with per-screen key handlers,
+    /// selection indices into lists that can be empty, and modal states
+    /// (confirm/input/help) layered on top. A handler that indexes its list, or
+    /// that assumes a selection is in range, panics the whole interface for the
+    /// user mid-setup. `on_key` only ever RECORDS a privileged step (the run loop
+    /// executes it), so driving every key here touches no system state.
+    ///
+    /// Crossed with the modal states, because a key that is safe on a screen can
+    /// still be routed to a modal handler that reads different state.
+    #[test]
+    fn every_screen_survives_every_key() {
+        // Some keys spawn a daemon request on a detached worker. Those workers
+        // connect to whatever IRLUME_SOCKET names when they run, so without this
+        // they land on another test's socket and inflate its connection count
+        // (`wedged_daemon_poll_short_circuits_after_ping` counts accepts and says
+        // so in its own comment). Point them at a path nothing is listening on,
+        // under the env lock, so this test cannot perturb another.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dead =
+            std::env::temp_dir().join(format!("irlume-keyfuzz-nothing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dead);
+        let old_sock = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &dead);
+
+        let keys: Vec<KeyCode> = ('a'..='z')
+            .chain('A'..='Z')
+            .chain('0'..='9')
+            .map(KeyCode::Char)
+            .chain([
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Home,
+                KeyCode::End,
+                KeyCode::PageUp,
+                KeyCode::PageDown,
+                KeyCode::Backspace,
+                KeyCode::Delete,
+                KeyCode::Insert,
+                KeyCode::Char(' '),
+                KeyCode::Char('/'),
+                KeyCode::Char('?'),
+                KeyCode::Char('-'),
+                KeyCode::F(1),
+                KeyCode::F(12),
+            ])
+            .collect();
+
+        for screen in 0..SCREENS.len() {
+            for key in &keys {
+                // Fresh app per key: this asserts each key is safe from a clean
+                // state, not that some earlier key happened to guard it.
+                let mut app = test_app();
+                app.screen = screen;
+                app.on_key(*key);
+                let _ = draw_text(&app);
+
+                // Same key with a selection pushed past the end of every list,
+                // which is what an empty profile list plus a remembered index
+                // looks like after a delete.
+                let mut app = test_app();
+                app.screen = screen;
+                app.sel = 99;
+                app.hub_sel = 99;
+                app.settings_svc_sel = 99;
+                app.on_key(*key);
+                let _ = draw_text(&app);
+            }
+        }
+
+        match old_sock {
+            Some(v) => std::env::set_var("IRLUME_SOCKET", v),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
     }
 
     /// A privileged step must not re-`sudo` when the TUI is already root: the

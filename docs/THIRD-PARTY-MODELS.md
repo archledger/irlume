@@ -26,7 +26,8 @@ stage can be installed or wired. Two stages are open:
 - **Liveness (PAD)**, opened first because its wiring is deny-only: a bad
   model there can cost retries or the password, never grant.
 - **Recognition**, opened 2026-08-05 under the split-source threshold
-  protocol recorded on issue #276: the false-accept side measured on public
+  protocol of [ADR-0006](adr/0006-third-party-model-stage-policy.md), first
+  recorded on issue #276: the false-accept side measured on public
   datasets replayed through irlume's own pipeline, the false-reject side on
   this project's cameras, the threshold set from where those populations were
   observed. A third-party recognizer runs RGB matching only: IR matching,

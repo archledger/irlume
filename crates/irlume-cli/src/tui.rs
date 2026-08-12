@@ -7338,6 +7338,22 @@ mod tests {
     fn parity_keys_route_to_the_right_actions() {
         // The new per-screen actions: keys must set the right suspend/confirm,
         // and destructive ones must go through the y/n gate, not act directly.
+        //
+        // A readable config, because [b] now refuses to pick a direction it
+        // cannot read: the shipped settings.conf is 0600 root-owned, so an
+        // unprivileged run sees EACCES and must say so rather than offer to
+        // enable a gate that may already be enforcing.
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-parity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=0\n").unwrap();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+
         let mut app = test_app();
         app.screen = SC_PAM;
         app.on_key(KeyCode::Char('u'));
@@ -7411,6 +7427,11 @@ mod tests {
         assert!(app.mouse_select);
         app.on_key(KeyCode::Char('M'));
         assert!(!app.mouse_select);
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

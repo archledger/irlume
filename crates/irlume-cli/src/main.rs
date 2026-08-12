@@ -268,6 +268,13 @@ fn main() -> std::process::ExitCode {
 /// at the default count. `Ok(None)` means the flag was absent.
 fn scans_flag(args: &[String], tool: &str) -> Result<Option<usize>, std::process::ExitCode> {
     match flag(args, "--scans") {
+        // PRESENT with nothing after it is an omission, not an absence. `flag`
+        // answers None for both, so `enroll --scans` fired a real capture at the
+        // default count while the user had asked for a number and lost it.
+        None if flag_present(args, "--scans") => {
+            eprintln!("[{tool}] --scans requires a count");
+            Err(std::process::ExitCode::from(2))
+        }
         None => Ok(None),
         Some(raw) => match raw.parse::<usize>() {
             Ok(n) if n > 0 => Ok(Some(n)),
@@ -809,6 +816,12 @@ fn calibrate_closure(args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     let rounds = match flag(args, "--rounds") {
+        // A dangling `--rounds` is an omission: silently using the default runs
+        // the camera a different number of times than the operator asked for.
+        None if flag_present(args, "--rounds") => {
+            eprintln!("[calibrate] --rounds requires a number from 1 to 10");
+            return std::process::ExitCode::from(2);
+        }
         None => CALIBRATION_ROUNDS_DEFAULT,
         Some(v) => match v.parse::<usize>() {
             Ok(n) if (1..=10).contains(&n) => n,
@@ -1088,6 +1101,10 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
     // a minute, so an unparseable count is a usage error rather than a silent
     // substitution of the default round count.
     let rounds = match flag(args, "--rounds") {
+        None if flag_present(args, "--rounds") => {
+            eprintln!("[camera-tune] --rounds requires a positive integer");
+            return std::process::ExitCode::from(2);
+        }
         None => None,
         Some(raw) => match raw.parse::<usize>() {
             Ok(n) if n > 0 => Some(n),
@@ -5113,6 +5130,35 @@ mod tests {
     fn flag_with_the_name_in_last_position_has_no_value() {
         let a = argv(&["enroll", "--reset"]);
         assert_eq!(flag(&a, "--reset"), None);
+    }
+
+    /// A value-taking flag given with no value is an omission, not an absence.
+    ///
+    /// `enroll --scans` fired a real camera capture at the DEFAULT count while
+    /// the operator had asked for a number and lost it to the shell or a typo.
+    /// The same shape reached `calibrate-closure --rounds` and `camera-tune
+    /// --rounds`, both of which run the IR emitter.
+    #[test]
+    fn a_value_flag_with_no_value_is_a_usage_error_not_the_default() {
+        let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // Absent: the caller's default applies.
+        assert!(matches!(scans_flag(&argv(&["enroll"]), "enroll"), Ok(None)));
+        // Given properly: that count.
+        assert!(matches!(
+            scans_flag(&argv(&["enroll", "--scans", "7"]), "enroll"),
+            Ok(Some(7))
+        ));
+        assert!(matches!(
+            scans_flag(&argv(&["enroll", "--scans=7"]), "enroll"),
+            Ok(Some(7))
+        ));
+        // Dangling, in both spellings: refused, never the default.
+        assert!(scans_flag(&argv(&["enroll", "--scans"]), "enroll").is_err());
+        assert!(scans_flag(&argv(&["enroll", "--scans="]), "enroll").is_err());
+        // Unparseable or zero stays a usage error, as before.
+        assert!(scans_flag(&argv(&["enroll", "--scans", "abc"]), "enroll").is_err());
+        assert!(scans_flag(&argv(&["enroll", "--scans", "0"]), "enroll").is_err());
     }
 
     /// `--name=value` is as standard a spelling as `--name value`, and it used to

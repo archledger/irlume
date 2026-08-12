@@ -1409,6 +1409,23 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                         );
                         return ExitCode::FAILURE;
                     }
+                    // A name irlume does not recognise still WRITES, because a
+                    // hand-wired PAM service is a real thing and the daemon looks
+                    // the key up by whatever name PAM passes. But a typo is far
+                    // likelier than a custom stack, and it used to report success
+                    // for a service that does not exist: `credential-release-
+                    // challenge sudp off` printed "sudp: consent gesture off" and
+                    // left a key nothing would ever read. Say which it is.
+                    if irlume_common::pam_service::classify(svc).is_none()
+                        && svc != "credential_release"
+                    {
+                        eprintln!(
+                            "{TAG} note: '{svc}' is not a PAM service irlume knows \
+                             (sudo, su, doas, sudo-i, su-l, runuser, polkit-1, or the \
+                             special token credential_release). Writing it anyway: it takes \
+                             effect only if a PAM stack really uses that service name."
+                        );
+                    }
                     // Disabling the gesture for a high-privilege escalation
                     // service (sudo, su, doas, sudo-i, su-l, runuser, polkit) asks
                     // for confirmation first: a face match alone would then

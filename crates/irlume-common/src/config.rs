@@ -849,7 +849,6 @@ pub fn enforce_biopolicy_visible() -> Option<bool> {
     // opinion that decides anything: same truthy set, same env override. The two
     // display sites used to accept "1"|"true" alone, so `enforce_biopolicy=yes`
     // printed "off" while the daemon was enforcing.
-    let truthy = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
     if let Ok(v) = std::env::var("IRLUME_ENFORCE_BIOPOLICY") {
         return Some(truthy(&v));
     }

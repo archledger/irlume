@@ -1134,7 +1134,12 @@ fn env_or(key: &str, default: &str) -> String {
 /// turn on via `IRLUME_ENFORCE_BIOPOLICY=1` or `enforce_biopolicy=1` in
 /// `/etc/irlume/settings.conf`. When off, behaviour is unchanged.
 fn biopolicy_enforced() -> bool {
-    let truthy = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
+    // The SHARED `truthy`, not a local copy. The copy here matched lowercase
+    // literals against a trimmed value, so `enforce_biopolicy=YES` read as off
+    // while `credential_release_challenge=YES` read as on: one operator spelling,
+    // two answers, and the one that silently lost was a gate somebody had asked
+    // for. Every other key in this file's config already uses the shared reader.
+    use irlume_common::config::truthy;
     if let Ok(v) = std::env::var("IRLUME_ENFORCE_BIOPOLICY") {
         return truthy(&v);
     }
@@ -6620,9 +6625,19 @@ mod tests {
         std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "0");
         assert!(!biopolicy_enforced());
         std::fs::write(dir.join("settings.conf"), "enforce_biopolicy=0\n").unwrap();
-        for truthy in ["1", "true", "yes", "on", " on "] {
+        // Case-insensitive, like every other config key: this reader used a local
+        // copy of `truthy` that compared against lowercase literals, so an
+        // operator who wrote `YES` had the gate silently NOT enforced while the
+        // same spelling enabled the keyring gesture.
+        for truthy in [
+            "1", "true", "yes", "on", " on ", "YES", "On", "TRUE", " Yes ",
+        ] {
             std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", truthy);
             assert!(biopolicy_enforced(), "{truthy:?} must enable");
+        }
+        for falsy in ["0", "false", "no", "off", "NO", "Off", "", "wat"] {
+            std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", falsy);
+            assert!(!biopolicy_enforced(), "{falsy:?} must not enable");
         }
         std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
         std::env::remove_var("IRLUME_CONFIG_DIR");

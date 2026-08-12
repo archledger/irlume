@@ -3492,7 +3492,15 @@ impl App {
             // which services a face may satisfy), so it is confirmed; disabling
             // just relaxes back to default and goes straight through.
             (SC_SETTINGS, KeyCode::Char('b')) => {
-                if biopolicy_on() {
+                let Some(on) = irlume_common::config::enforce_biopolicy_visible() else {
+                    self.log(
+                        '·',
+                        "the biopolicy gate is a root-only setting; run the TUI with sudo, \
+                         or check it with: irlume biopolicy status",
+                    );
+                    return;
+                };
+                if on {
                     self.log('→', "sudo irlume biopolicy off: relax back to the default (all services may verify)");
                     self.suspend = Some(Suspend::Biopolicy(false));
                 } else {
@@ -4453,7 +4461,11 @@ impl App {
     }
 
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
-        let bio = biopolicy_on();
+        // The shared reader, which agrees with the daemon's truthy set (`yes` and
+        // `on` count too) and admits when the root-only file cannot be read. The
+        // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
+        // drew "turn it on" while the daemon was already enforcing.
+        let bio = irlume_common::config::enforce_biopolicy_visible();
         f.render_widget(
             Paragraph::new({
                 let mut v = vec![
@@ -4557,10 +4569,10 @@ impl App {
                 Line::from(vec![
                     Span::styled("  [b]", Style::new().fg(th().accent)),
                     Span::styled(
-                        if bio {
-                            " turn it off (sudo)"
-                        } else {
-                            " turn it on (sudo; asks first)"
+                        match bio {
+                            Some(true) => " turn it off (sudo)",
+                            Some(false) => " turn it on (sudo; asks first)",
+                            None => " on/off is root-only; run the TUI with sudo",
                         },
                         Style::new().dim(),
                     ),
@@ -6400,13 +6412,6 @@ fn ort_fallback_check(found: bool) -> Check {
             Fix::Manual("start the daemon first; it reports its real ONNX state".into())
         },
     }
-}
-
-/// Is opt-in biopolicy enforcement enabled (settings.conf)?
-fn biopolicy_on() -> bool {
-    irlume_common::config::read_kv("settings.conf", "enforce_biopolicy")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 // ---- async response mappers (Response -> (ok, message)) -------------------
@@ -11175,6 +11180,57 @@ mod tests {
             Some(v) => std::env::set_var("IRLUME_SOCKET", v),
             None => std::env::remove_var("IRLUME_SOCKET"),
         }
+    }
+
+    /// The biopolicy row must agree with the daemon about what counts as ON.
+    ///
+    /// The daemon accepts `1`, `true`, `yes` and `on`. The TUI had its own reader
+    /// that took only `1` and `true`, so `enforce_biopolicy=yes` drew "turn it on"
+    /// and the key offered to enable a gate the daemon was already enforcing.
+    #[test]
+    fn the_biopolicy_row_reads_every_value_the_daemon_calls_on() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-bio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
+
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        for on in ["1", "true", "yes", "on", " ON "] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("enforce_biopolicy={on}\n"),
+            )
+            .unwrap();
+            let text = draw_text(&app);
+            assert!(
+                text.contains("turn it off"),
+                "enforce_biopolicy={on:?} is ON to the daemon, so the row must offer OFF: {text}"
+            );
+        }
+        for off in ["0", "false", "no", "off"] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("enforce_biopolicy={off}\n"),
+            )
+            .unwrap();
+            let text = draw_text(&app);
+            assert!(
+                text.contains("turn it on"),
+                "enforce_biopolicy={off:?} is OFF, so the row must offer ON: {text}"
+            );
+        }
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// When settings.conf cannot be read, the gesture row must say so rather than

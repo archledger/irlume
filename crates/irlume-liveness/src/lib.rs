@@ -1015,9 +1015,17 @@ pub const SHAKE_YAW_MIN: f32 = 0.45;
 /// Maximum yaw RANGE for a deliberate shake. Idle looking-around swings yaw
 /// much wider (measured 4.1 in the test corpus) than a deliberate shake.
 /// Live daemon shakes measured 1.60-2.04 on 2026-08-11; the calibration
-/// tool's shorter window reported 0.53-1.09. 2.5 excludes look-around while
-/// allowing all measured shakes.
-pub const SHAKE_YAW_MAX: f32 = 2.5;
+/// tool's shorter window reported 0.53-1.09.
+///
+/// RAISED 2.5 -> 3.5 on 2026-08-11 after a live polkit session: deliberate
+/// shakes at a real consent dialog reached yaw 2.81 and 2.99, ABOVE the old
+/// ceiling, so they left the band and could not register at all. The window
+/// accumulates range as it grows, so the old value made a LONGER or more
+/// vigorous shake progressively LESS detectable, the opposite of the intent.
+/// 3.5 sits above every shake measured to date (2.99) and below the measured
+/// look-around (4.1). The oscillation requirement below is what actually
+/// separates a shake from a look-around; this ceiling is the coarse guard.
+pub const SHAKE_YAW_MAX: f32 = 3.5;
 /// Maximum pitch RANGE during a shake: the head should not nod up/down while
 /// shaking. Measured 2026-08-10: sitting shakes ranged 0.044-0.169 in pitch,
 /// reclining shakes 0.066-0.133. The sitting nod pitch goes up to 0.156, so
@@ -1031,6 +1039,22 @@ pub const SHAKE_PITCH_MAX: f32 = 0.18;
 /// sits safely between and rejects the still-face drift that range alone read as
 /// a Shake. Overridable via `IRLUME_SHAKE_MIN_CROSSINGS`.
 pub const SHAKE_MIN_CROSSINGS: usize = 2;
+
+/// Yaw range at which a shake is UNAMBIGUOUS and one crossing is enough.
+///
+/// The 2-crossing floor above exists to reject a STILL face, whose drift measured
+/// 0.42-0.72 yaw. That drift cannot reach 1.5: it is more than double the widest
+/// still reading, and 1.5 is itself below every live shake measured (1.58-2.99 at
+/// a real polkit dialog on 2026-08-11). Requiring a full there-and-back at that
+/// width rejected genuine one-sweep declines: three consecutive live shakes logged
+/// yaw 1.58-2.24 with a single crossing and were read as "no gesture", so the user
+/// had to shake repeatedly. One crossing IS an oscillation (a sweep that returns
+/// through the median); a look-around holds its new heading instead, which is why
+/// the crossing count, not the range, is the real discriminator.
+pub const SHAKE_WIDE_YAW: f32 = 1.5;
+
+/// Crossings required once the yaw range is [`SHAKE_WIDE_YAW`] or wider.
+pub const SHAKE_WIDE_MIN_CROSSINGS: usize = 1;
 
 /// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
 /// pitch swings through a range of at least [`NOD_PITCH_MIN`] while the yaw stays
@@ -1190,7 +1214,17 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
         // cancel the consent watch of a user who did nothing; the crossing count
         // separates them cleanly. Non-oscillating drift in the band fails CLOSED
         // to None. SHAKE_YAW_MAX excludes idle looking-around.
-        if evidence.pitch_range <= shake_pitch_max() && yaw_crossings >= shake_min_crossings() {
+        // The crossing floor is TIERED by width. A still face's drift lives at
+        // 0.42-0.72 yaw and needs the full there-and-back (2) to be excluded; at
+        // SHAKE_WIDE_YAW and above, drift cannot reach the width at all, and
+        // demanding 2 there rejected genuine one-sweep declines measured live at
+        // yaw 1.58-2.24 with a single crossing.
+        let need_crossings = if evidence.yaw_range >= shake_wide_yaw() {
+            SHAKE_WIDE_MIN_CROSSINGS
+        } else {
+            shake_min_crossings()
+        };
+        if evidence.pitch_range <= shake_pitch_max() && yaw_crossings >= need_crossings {
             HeadGesture::Shake
         } else {
             HeadGesture::None
@@ -1212,14 +1246,38 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
         // Calibration aid: print to stderr so the daemon's journal captures
         // it even without IRLUME_LOG. The format string is deliberately
         // simple so it can't be dead-code eliminated.
+        // Names the FIRST unmet condition. The earlier version always printed the
+        // crossing floor, so a shake rejected by the yaw CEILING was reported as if
+        // it lacked oscillation, and a live session spent its diagnosis on the wrong
+        // knob. A diagnostic that points away from the cause is worse than none.
+        let need_crossings = if evidence.yaw_range >= shake_wide_yaw() {
+            SHAKE_WIDE_MIN_CROSSINGS
+        } else {
+            shake_min_crossings()
+        };
+        let why = if evidence.yaw_range > SHAKE_YAW_MAX {
+            format!(
+                "yaw {:.2} ABOVE max {:.2} (reads as look-around)",
+                evidence.yaw_range, SHAKE_YAW_MAX
+            )
+        } else if evidence.pitch_range > shake_pitch_max() {
+            format!(
+                "pitch {:.3} above max {:.3} (nodding while shaking)",
+                evidence.pitch_range,
+                shake_pitch_max()
+            )
+        } else {
+            format!("yaw_crossings {yaw_crossings} below need {need_crossings}")
+        };
         let msg = format!(
-            "irlumed-shake-check yaw={:.2} need_yaw>={:.2} pitch={:.3} need_pitch<={:.3} yaw_crossings={} need_crossings>={}",
+            "irlumed-shake-check REJECTED: {why} [yaw={:.2} in {:.2}..{:.2}, pitch={:.3} max {:.3}, yaw_crossings={} need {}]",
             evidence.yaw_range,
             shake_yaw_min(),
+            SHAKE_YAW_MAX,
             evidence.pitch_range,
             shake_pitch_max(),
             yaw_crossings,
-            shake_min_crossings()
+            need_crossings
         );
         eprintln!("{msg}");
     }
@@ -1283,6 +1341,14 @@ fn shake_min_crossings() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(SHAKE_MIN_CROSSINGS)
+}
+
+/// Yaw width above which one crossing is enough, overridable via
+/// `IRLUME_SHAKE_WIDE_YAW`. Guarded like the other yaw overrides: a
+/// non-positive value would make EVERY shake-band reading "wide" and drop the
+/// still-face protection the 2-crossing floor exists for.
+fn shake_wide_yaw() -> f32 {
+    env_override("IRLUME_SHAKE_WIDE_YAW", SHAKE_WIDE_YAW, |v| v > 0.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3270,6 +3336,89 @@ mod nod_evidence_tests {
             HeadGesture::Nod,
             "shake-band yaw stays terminal, never an approving nod"
         );
+    }
+
+    #[test]
+    fn a_wide_one_sweep_shake_is_a_decline() {
+        // Measured at a live polkit dialog 2026-08-11: deliberate declines logged
+        // yaw 1.58-2.24 with a SINGLE median crossing and were rejected as "no
+        // gesture", so the user had to shake again and again. At this width a still
+        // face cannot reach the range (its drift measured 0.42-0.72), so one
+        // crossing is enough. One sweep out and back through the median.
+        // One sweep: held left, through centre, held right. The centre samples put
+        // the median between the extremes, which is what a real sweep looks like.
+        let yaw: Vec<f32> = std::iter::repeat_n(-0.9, 8)
+            .chain(std::iter::repeat_n(0.0, 4))
+            .chain(std::iter::repeat_n(0.9, 8))
+            .collect();
+        let pitch = vec![0.5f32; yaw.len()];
+        let (verdict, ev) = detect_nod_with_evidence(&poses(&pitch, &yaw));
+        assert!(
+            ev.yaw_range >= SHAKE_WIDE_YAW,
+            "premise: this fixture must be a WIDE shake, got {}",
+            ev.yaw_range
+        );
+        assert_eq!(
+            signal_crossings(&yaw, ev.yaw_range, NOD_CROSSING_AMP_FRAC),
+            1,
+            "premise: one sweep is exactly one crossing"
+        );
+        assert_eq!(
+            verdict,
+            HeadGesture::Shake,
+            "a wide one-sweep shake must read as a decline (yaw {}, one crossing)",
+            ev.yaw_range
+        );
+    }
+
+    #[test]
+    fn a_vigorous_shake_above_the_old_ceiling_is_still_a_decline() {
+        // The live session's shakes reached yaw 2.81 and 2.99, above the OLD 2.5
+        // ceiling, so they fell out of the band entirely and could never register:
+        // shaking harder made the decline LESS likely to be seen. Pinned at 2.99,
+        // the widest measured, which must stay inside SHAKE_YAW_MAX.
+        let yaw: Vec<f32> = std::iter::repeat_n(-1.495, 8)
+            .chain(std::iter::repeat_n(0.0, 4))
+            .chain(std::iter::repeat_n(1.495, 8))
+            .collect();
+        let pitch = vec![0.5f32; yaw.len()];
+        let (verdict, ev) = detect_nod_with_evidence(&poses(&pitch, &yaw));
+        assert!(
+            (ev.yaw_range - 2.99).abs() < 0.01,
+            "premise: fixture reproduces the measured 2.99 yaw, got {}",
+            ev.yaw_range
+        );
+        assert!(
+            ev.yaw_range <= SHAKE_YAW_MAX,
+            "the measured shake must sit inside the ceiling, got {} vs {SHAKE_YAW_MAX}",
+            ev.yaw_range
+        );
+        assert_eq!(
+            verdict,
+            HeadGesture::Shake,
+            "a vigorous shake must still decline"
+        );
+    }
+
+    #[test]
+    fn a_look_around_stays_outside_the_shake_band() {
+        // The ceiling's job: idle looking-around measured 4.1 yaw in the test
+        // corpus, and must NOT cancel a consent watch. Pins that raising the
+        // ceiling to 3.5 kept look-around out (the margin is 2.99 shake -> 3.5
+        // ceiling -> 4.1 look-around, so this is the assertion that fails first if
+        // the ceiling is raised again).
+        let yaw: Vec<f32> = (0..20)
+            .map(|i| if i % 2 == 0 { -2.05 } else { 2.05 })
+            .collect();
+        let pitch = vec![0.5f32; yaw.len()];
+        let (verdict, ev) = detect_nod_with_evidence(&poses(&pitch, &yaw));
+        assert!(
+            ev.yaw_range > SHAKE_YAW_MAX,
+            "premise: look-around must exceed the ceiling, got {}",
+            ev.yaw_range
+        );
+        assert_ne!(verdict, HeadGesture::Shake, "look-around is not a decline");
+        assert_ne!(verdict, HeadGesture::Nod, "look-around is not an approval");
     }
 
     #[test]

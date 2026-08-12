@@ -1670,8 +1670,21 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             return Ok("· SELinux module not loaded".into());
         }
         if apply {
-            let _ = Command::new("semodule").args(["-r", "irlume"]).status();
-            Ok("✓ SELinux module removed".into())
+            // Checked, like the install side a few lines above. Discarding the
+            // status and printing the tick regardless told the operator the
+            // module was gone whenever `semodule -r` failed (policy busy, an
+            // selinux-policy version that refuses, no semodule at all), and the
+            // next `login status` would then disagree with the line they had
+            // just been shown.
+            match Command::new("semodule").args(["-r", "irlume"]).status() {
+                Ok(st) if st.success() => Ok("✓ SELinux module removed".into()),
+                Ok(st) => Err(format!(
+                    "semodule -r irlume failed ({st}); the module is still loaded"
+                )),
+                Err(e) => Err(format!(
+                    "could not run semodule ({e}); the module is still loaded"
+                )),
+            }
         } else {
             Ok("→ would remove the SELinux module (if loaded)".into())
         }

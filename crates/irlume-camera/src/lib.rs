@@ -333,22 +333,139 @@ pub fn no_progress() -> Progress {
 pub const CAPTURE_SILENT_WINDOW_WORST_MS: u64 =
     STREAM_DEQUEUE_TIMEOUT.as_millis() as u64 + WARMUP_GAP.as_millis() as u64;
 
+/// Whether the device's current format still matches what open negotiated,
+/// naming the first field that moved. Pure, so the comparison is testable
+/// without a second process to race against (#427).
+///
+/// EVERY field of the negotiated format is compared, not just the geometry
+/// the decoders read directly. The first version checked width, height and
+/// fourcc and argued quantization was derived from them; the Codex round
+/// refuted that from the kernel spec (a capture application can request
+/// colorimetry conversion where the driver offers
+/// `V4L2_PIX_FMT_FLAG_SET_CSC`), and quantization is authentication-relevant
+/// here: it names the clipping ceiling (235 versus 255 in
+/// `clipping_white_level`), so a racing format change that held the geometry
+/// but flipped the range would either false-clip legitimate frames or, in
+/// the inverse direction, suppress the exposure refusal that protects the
+/// liveness cues. Stride matters the same way: the decoders treat rows as
+/// tightly packed, so a changed `bytesperline` at the same geometry would
+/// decode every row at the wrong offset. Comparing the rest costs nothing
+/// and refuses only when the device state genuinely differs from what this
+/// caller negotiated.
+///
+/// The enum fields compare by their wire discriminant (`as u32`) because the
+/// pinned v4l crate derives no `PartialEq` for them.
+fn format_moved(expect: &v4l::Format, now: &v4l::Format) -> Option<String> {
+    if now.fourcc.repr != expect.fourcc.repr {
+        return Some(format!(
+            "fourcc is now {}, negotiated {}",
+            fourcc_str(&now.fourcc.repr),
+            fourcc_str(&expect.fourcc.repr)
+        ));
+    }
+    if (now.width, now.height) != (expect.width, expect.height) {
+        return Some(format!(
+            "size is now {}x{}, negotiated {}x{}",
+            now.width, now.height, expect.width, expect.height
+        ));
+    }
+    if now.stride != expect.stride {
+        return Some(format!(
+            "stride is now {}, negotiated {}",
+            now.stride, expect.stride
+        ));
+    }
+    if now.size != expect.size {
+        return Some(format!(
+            "image size is now {}, negotiated {}",
+            now.size, expect.size
+        ));
+    }
+    if now.field_order as u32 != expect.field_order as u32 {
+        return Some(format!(
+            "field order is now {:?}, negotiated {:?}",
+            now.field_order, expect.field_order
+        ));
+    }
+    if now.colorspace as u32 != expect.colorspace as u32 {
+        return Some(format!(
+            "colorspace is now {:?}, negotiated {:?}",
+            now.colorspace, expect.colorspace
+        ));
+    }
+    if now.quantization as u32 != expect.quantization as u32 {
+        return Some(format!(
+            "quantization is now {:?}, negotiated {:?}",
+            now.quantization, expect.quantization
+        ));
+    }
+    if now.transfer as u32 != expect.transfer as u32 {
+        return Some(format!(
+            "transfer function is now {:?}, negotiated {:?}",
+            now.transfer, expect.transfer
+        ));
+    }
+    if now.flags.bits() != expect.flags.bits() {
+        return Some(format!(
+            "format flags are now {:?}, negotiated {:?}",
+            now.flags, expect.flags
+        ));
+    }
+    None
+}
+
 impl<'a> SafeStream<'a> {
-    /// Open a stream on `dev` with the standard buffer ring.
+    /// Open a stream on `dev` with the standard buffer ring, and verify the
+    /// device still holds the format the caller negotiated.
+    ///
+    /// The verification exists because the negotiated format is per-device
+    /// state, not per-file-handle: uvcvideo writes S_FMT to the shared
+    /// streaming struct gated only on buffer ownership, and ownership begins
+    /// at REQBUFS, not at open (#427; the audit in
+    /// docs/research/2026-08-12-camera-handling-audit.md, Q3). Between the
+    /// caller's S_FMT and the REQBUFS here, any other process can retarget
+    /// the device, and the capture would then decode frames against stale
+    /// width, height and fourcc assumptions. Once `with_buffers` returns,
+    /// this handle owns the queue and S_FMT answers EBUSY to everyone, so a
+    /// G_FMT read taken HERE is stable for the stream's whole life; the same
+    /// window recurs at every reopen (recover, the frozen-stream restarts),
+    /// which is why the check lives in the one function they all call.
     ///
     /// A dequeue timeout is set explicitly. v4l leaves it unset, which polls
     /// with -1 and waits forever, so a camera that stops delivering frames
     /// without erroring blocks the caller indefinitely. That matters most
     /// during emitter setup: a stall there would hang with a control changed and
     /// the restore never reached. Every wait now ends.
-    fn open(device: &str, dev: &'a Device) -> irlume_common::Result<Self> {
+    fn open(device: &str, dev: &'a Device, expect: &v4l::Format) -> irlume_common::Result<Self> {
         let mut inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| map_io(device, e))?;
         inner.set_timeout(STREAM_DEQUEUE_TIMEOUT);
-        Ok(Self {
+        // Constructed before the read-back so every error path below releases
+        // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)), never
+        // through the v4l crate's panicking one.
+        let stream = Self {
             inner: Some(inner),
             device: device.to_string(),
-        })
+        };
+        let now = Capture::format(dev).map_err(|e| map_io(device, e))?;
+        if let Some(moved) = format_moved(expect, &now) {
+            // Refusing rather than renegotiating, for the same reason the
+            // emitter stands down under a foreign consumer (#169): a format
+            // that moved means another application is actively configuring
+            // this camera, and fighting it over shared state serves nobody.
+            // The cost is one refused capture, which degrades toward the
+            // password prompt.
+            let who = match camera_holder(device) {
+                Some(h) => format!(", likely {h}"),
+                None => String::new(),
+            };
+            return Err(Error::Hardware(format!(
+                "{device}: the stream format changed between negotiation and \
+                 buffer claim ({moved}). Another application is configuring \
+                 this camera{who}; refusing this capture"
+            )));
+        }
+        Ok(stream)
     }
 }
 
@@ -581,6 +698,70 @@ pub enum Role {
     Other,
 }
 
+/// A node whose format list is NOT evidence of a camera, so classifying it by
+/// format would be asserting something the kernel never said (#425).
+///
+/// Two shapes, both from `VIDIOC_QUERYCAP`'s `device_caps` word rather than
+/// from the formats:
+///
+/// - `V4L2_CAP_IO_MC`: the uAPI (open.rst) calls such a node MC-centric, and
+///   vidioc-enum-fmt.rst says its format list describes what the IP core can
+///   consume, not what any camera produces. Intel IPU6/IPU7 ISYS nodes
+///   enumerate YUYV from a static table on every node, up to eight per CSI-2
+///   port, so without this gate an IPU6 laptop scans as a fleet of RGB
+///   cameras that all fail at STREAMON with EPIPE.
+/// - Multi-planar without single-planar capture (`ipu3-cio2`, `qcom-camss`):
+///   irlume's single-planar `ENUM_FMT` probe gets EINVAL there and used to
+///   file these under [`Role::Other`] by accident of the probe shape. Naming
+///   them keeps "irlume cannot use this" apart from "nothing to see".
+///
+/// Kept apart from [`Role`] for the same reason [`Unreadable`] is (#227): the
+/// actions differ. `Other` is correctly ignored, `Unreadable` asks the user to
+/// fix access, and this one is working hardware irlume must refuse to touch,
+/// with a message naming the stack. Details and the per-driver capability
+/// words are in `docs/research/2026-08-12-camera-handling-audit.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McCentric {
+    /// The driver name from `VIDIOC_QUERYCAP`, e.g. `isys` (Intel IPU6),
+    /// `amd_isp_capture`, `qcom-camss`, `ipu3-cio2`.
+    pub driver: String,
+    /// `V4L2_CAP_IO_MC` was set: input/output is controlled by the media
+    /// controller and the node's format list is not camera evidence.
+    pub io_mc: bool,
+    /// The node captures only through the multi-planar API, which irlume's
+    /// capture path does not speak.
+    pub mplane_only: bool,
+}
+
+impl McCentric {
+    /// The cause without the path, same contract as [`Unreadable::cause`]: a
+    /// caller can state one cause once over several nodes that share it. Pure
+    /// over the struct so the wording is testable without MIPI hardware.
+    pub fn cause(&self) -> String {
+        let stack = if self.io_mc {
+            "behind a media-controller stack; its advertised formats describe \
+             the platform's image pipeline, not a camera"
+        } else {
+            "captures only through the multi-planar V4L2 API, which irlume's \
+             capture path does not use"
+        };
+        format!(
+            "driver '{}', {stack}. irlume needs a UVC camera; the RGB side of \
+             this device may work through libcamera/PipeWire, and its IR side \
+             has no Linux support",
+            self.driver
+        )
+    }
+}
+
+/// What `classify_node` decided about one node: a camera role read from its
+/// formats, or a node whose formats must not be read as a role at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeKind {
+    Camera(Role),
+    McCentric(McCentric),
+}
+
 /// Where reading a node failed. A node that could not be read is kept apart
 /// from `Role::Other` all the way to the report, because the two call for
 /// opposite actions: `Other` is a node correctly ignored, while this is a
@@ -592,6 +773,10 @@ pub enum Role {
 pub enum FailedAt {
     /// `open(2)` on the node itself.
     Open,
+    /// The node opened but `VIDIOC_QUERYCAP` failed, which no V4L2 node is
+    /// permitted to refuse; `/dev/null` reaching this arm with ENOTTY is the
+    /// ordinary non-V4L2 case.
+    QueryCaps,
     /// The node opened, then would not enumerate its formats.
     EnumFormats,
 }
@@ -621,6 +806,7 @@ impl Unreadable {
     pub fn cause(&self) -> String {
         let what = match self.at {
             FailedAt::Open => "could not be opened",
+            FailedAt::QueryCaps => "opened but did not answer VIDIOC_QUERYCAP",
             FailedAt::EnumFormats => "opened but would not list its formats",
         };
         let why = match self.errno {
@@ -658,8 +844,11 @@ impl Unreadable {
 /// keeping a failure to read the node apart from a node that read as neither
 /// kind. Defensive: enumerate FORMATS (safe), never `query_controls` (panics on
 /// some UVC drivers; a hard-won linhello lesson).
+///
+/// `VIDIOC_QUERYCAP` runs first, because on an MC-centric node the format
+/// list is not evidence of anything (#425); see [`McCentric`].
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
+pub fn classify_node(device: &str) -> Result<NodeKind, Unreadable> {
     let unreadable = |at, e: std::io::Error| Unreadable {
         path: device.to_string(),
         at,
@@ -669,10 +858,83 @@ pub fn classify_node(device: &str) -> Result<Role, Unreadable> {
         holder: None,
     };
     let dev = Device::with_path(device).map_err(|e| unreadable(FailedAt::Open, e))?;
+    let caps = queried_caps(&dev).map_err(|e| unreadable(FailedAt::QueryCaps, e))?;
+    if let Some(mc) = mc_centric_verdict(&caps) {
+        return Ok(NodeKind::McCentric(mc));
+    }
     capture_formats_answered(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let formats = Capture::enum_formats(&dev).map_err(|e| unreadable(FailedAt::EnumFormats, e))?;
     let fourccs: Vec<[u8; 4]> = formats.iter().map(|f| f.fourcc.repr).collect();
-    Ok(role_from_formats(&fourccs))
+    Ok(NodeKind::Camera(role_from_formats(&fourccs)))
+}
+
+/// `VIDIOC_QUERYCAP`, raw. The pinned v4l crate's `Device::query_caps` cannot
+/// carry this decision: its `Capabilities.capabilities` is filled from the
+/// kernel's `device_caps` word but through `Flags::from_bits_truncate`, and
+/// the crate defines no `IO_MC` bit, so the one flag the gate needs is
+/// silently dropped (v4l 0.14.0, capability.rs:101 and the Flags list at 6-45).
+/// Same direct-ioctl shape as `capture_formats_answered` below.
+fn queried_caps(dev: &Device) -> std::io::Result<v4l::v4l_sys::v4l2_capability> {
+    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+    let mut caps: v4l::v4l_sys::v4l2_capability = unsafe { std::mem::zeroed() };
+    // SAFETY: `dev` owns the fd for the length of this call, and `caps` is a
+    // correctly sized, zeroed v4l2_capability, which is all VIDIOC_QUERYCAP
+    // writes.
+    let rc = unsafe {
+        libc::ioctl(
+            dev.handle().fd(),
+            v4l::v4l2::vidioc::VIDIOC_QUERYCAP,
+            &mut caps as *mut _ as *mut libc::c_void,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(caps)
+}
+
+/// The `device_caps` word of a QUERYCAP answer, or the whole-device word when
+/// the driver predates the split. `V4L2_CAP_DEVICE_CAPS` has been mandatory
+/// since kernel 3.4, so the fallback arm is for out-of-tree stragglers; using
+/// the wrong word there risks reading a sibling node's capabilities, which for
+/// this gate errs toward refusing, the safe direction.
+fn node_device_caps(caps: &v4l::v4l_sys::v4l2_capability) -> u32 {
+    if caps.capabilities & v4l::v4l_sys::V4L2_CAP_DEVICE_CAPS != 0 {
+        caps.device_caps
+    } else {
+        caps.capabilities
+    }
+}
+
+/// The NUL-terminated driver name from a QUERYCAP answer, lossily.
+fn caps_driver(caps: &v4l::v4l_sys::v4l2_capability) -> String {
+    let end = caps
+        .driver
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(caps.driver.len());
+    String::from_utf8_lossy(&caps.driver[..end]).into_owned()
+}
+
+/// Decide from a QUERYCAP answer whether this node's format list may be read
+/// as a camera role at all. Pure over the struct, so the per-driver capability
+/// words measured in the audit are each pinned by a test without the hardware:
+/// Intel IPU6 ISYS (`V4L2_CAP_IO_MC` on single-planar nodes), AMD ISP4
+/// (IO_MC), Qualcomm camss (IO_MC and MPLANE), ipu3-cio2 (MPLANE only), and
+/// the two UVC node shapes plus v4l2loopback, which must all pass through.
+fn mc_centric_verdict(caps: &v4l::v4l_sys::v4l2_capability) -> Option<McCentric> {
+    let dc = node_device_caps(caps);
+    let io_mc = dc & v4l::v4l_sys::V4L2_CAP_IO_MC != 0;
+    let mplane_only = dc & v4l::v4l_sys::V4L2_CAP_VIDEO_CAPTURE_MPLANE != 0
+        && dc & v4l::v4l_sys::V4L2_CAP_VIDEO_CAPTURE == 0;
+    if !(io_mc || mplane_only) {
+        return None;
+    }
+    Some(McCentric {
+        driver: caps_driver(caps),
+        io_mc,
+        mplane_only,
+    })
 }
 
 /// Whether the node ANSWERED the format enumeration, separate from what it
@@ -723,10 +985,14 @@ fn enum_fmt_failure_means_no_formats(e: &std::io::Error) -> bool {
 }
 
 /// `classify_node` for callers that only act on a node they can use. An
-/// unreadable node answers `Other` here, so anything reporting to a human
-/// wants `classify_node` or `scan_nodes` instead.
+/// unreadable node answers `Other` here, and so does an MC-centric one: both
+/// are nodes a camera-picking caller must not open, so anything reporting to
+/// a human wants `classify_node` or `scan_nodes` instead.
 pub fn classify(device: &str) -> Role {
-    classify_node(device).unwrap_or(Role::Other)
+    match classify_node(device) {
+        Ok(NodeKind::Camera(role)) => role,
+        Ok(NodeKind::McCentric(_)) | Err(_) => Role::Other,
+    }
 }
 
 /// Pure classification over a node's advertised fourccs (unit-testable without
@@ -822,9 +1088,28 @@ pub struct NodeScan {
     /// Nodes that answered, excluding `Role::Other`.
     pub classified: Vec<(String, Role)>,
     pub unreadable: Vec<Unreadable>,
+    /// Nodes refused before format enumeration because their format list is
+    /// not camera evidence (#425). Working hardware, deliberately unused;
+    /// reports name these so an IPU6 laptop reads as "MIPI camera irlume
+    /// cannot use", never as a fleet of RGB cameras and never as no camera
+    /// with no explanation.
+    pub mc_centric: Vec<(String, McCentric)>,
     /// Why this scan may be incomplete. An empty scan with this set means the
     /// nodes could not be listed, not that there are none.
     pub listing_error: Option<String>,
+}
+
+/// File one classification outcome into its `NodeScan` bucket. The arms are
+/// the whole point of #425: only `Camera(Rgb|Ir)` may reach `classified`,
+/// because that is the bucket every camera-picking caller consumes. Pure over
+/// the outcome, so the bucketing is testable without a device per arm.
+fn file_node(scan: &mut NodeScan, path: String, outcome: Result<NodeKind, Unreadable>) {
+    match outcome {
+        Ok(NodeKind::Camera(Role::Other)) => {}
+        Ok(NodeKind::Camera(role)) => scan.classified.push((path, role)),
+        Ok(NodeKind::McCentric(mc)) => scan.mc_centric.push((path, mc)),
+        Err(u) => scan.unreadable.push(u),
+    }
 }
 
 /// `with_holders` walks /proc for each busy node to name what holds it. That
@@ -835,16 +1120,13 @@ fn scan(with_holders: bool) -> NodeScan {
     let listing = video_node_paths();
     scan.listing_error = listing.error;
     for path in listing.paths {
-        match classify_node(&path) {
-            Ok(Role::Other) => {}
-            Ok(role) => scan.classified.push((path, role)),
-            Err(mut u) => {
-                if with_holders && u.errno == Some(libc::EBUSY) {
-                    u.holder = camera_holder(&u.path);
-                }
-                scan.unreadable.push(u);
+        let outcome = classify_node(&path).map_err(|mut u| {
+            if with_holders && u.errno == Some(libc::EBUSY) {
+                u.holder = camera_holder(&u.path);
             }
-        }
+            u
+        });
+        file_node(&mut scan, path, outcome);
     }
     scan
 }
@@ -1327,6 +1609,11 @@ pub struct RgbCamera {
     chosen: [u8; 4],
     width: u32,
     height: u32,
+    /// The whole format the driver echoed at open, kept verbatim so sessions
+    /// can verify the device still holds every field of it when they claim
+    /// buffers (#427); see `format_moved` for why the geometry alone is not
+    /// enough.
+    negotiated: v4l::Format,
 }
 
 impl RgbCamera {
@@ -1362,6 +1649,7 @@ impl RgbCamera {
             chosen,
             width: fmt.width,
             height: fmt.height,
+            negotiated: fmt,
         })
     }
 
@@ -1393,7 +1681,7 @@ impl RgbCamera {
             id: V4L2_CID_BACKLIGHT_COMPENSATION,
             value: v4l::control::Value::Integer(2),
         });
-        let stream = SafeStream::open(&self.device, &self.dev)?;
+        let stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
         Ok(RgbSession {
             cam: self,
             stream: Some(stream),
@@ -1607,7 +1895,11 @@ impl<'a> RgbSession<'a> {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.stream = None; // drop first: STREAMOFF + buffer release
-        self.stream = Some(SafeStream::open(&self.cam.device, &self.cam.dev)?);
+        self.stream = Some(SafeStream::open(
+            &self.cam.device,
+            &self.cam.dev,
+            &self.cam.negotiated,
+        )?);
         // The fresh stream's auto-exposure starts unsettled, like any new
         // session's.
         self.warmed = false;
@@ -2180,6 +2472,11 @@ pub struct IrCamera {
     /// The negotiated fourcc, kept for [`Self::spec`]: `pix` names how the
     /// bytes decode, not which of several fourccs mapped to it.
     fourcc: String,
+    /// The whole format the driver echoed at open, kept verbatim so sessions
+    /// can verify the device still holds every field of it when they claim
+    /// buffers (#427); see `format_moved` for why the geometry alone is not
+    /// enough.
+    negotiated: v4l::Format,
     width: u32,
     height: u32,
     card: String,
@@ -2203,6 +2500,7 @@ impl IrCamera {
             pix,
             quantization: fmt.quantization,
             fourcc: fourcc_str(&fmt.fourcc.repr),
+            negotiated: fmt,
             width: fmt.width,
             height: fmt.height,
             card,
@@ -2252,7 +2550,7 @@ impl IrCamera {
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
-        let mut stream = SafeStream::open(&self.device, &self.dev)?;
+        let mut stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
@@ -2673,7 +2971,7 @@ impl IrSession<'_> {
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.stream = None; // drop first: STREAMOFF + buffer release
         self.meta = None; // drop the metadata queue
-        let stream = SafeStream::open(&self.cam.device, &self.cam.dev)?;
+        let stream = SafeStream::open(&self.cam.device, &self.cam.dev, &self.cam.negotiated)?;
         let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
         let mode = ir_emitter::enable(self.cam.dev.handle(), &self.cam.card, &self.cam.device);
         let lit = mode.lit();
@@ -2841,7 +3139,7 @@ pub mod ir_probe {
         // buffers; STREAMON happens on the first dequeue, so the set still
         // lands before streaming starts.
         let mode;
-        let mut stream = super::SafeStream::open(device, &dev)?;
+        let mut stream = super::SafeStream::open(device, &dev, &fmt)?;
         mode = ir_emitter::enable(dev.handle(), &card, device);
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
@@ -2943,7 +3241,7 @@ pub fn capture_ir_streaming<B>(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = SafeStream::open(device, &dev)?;
+    let mut stream = SafeStream::open(device, &dev, &fmt)?;
     mode = ir_emitter::enable(dev.handle(), &card, device);
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
@@ -3012,7 +3310,7 @@ pub fn capture_ir_streaming<B>(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = SafeStream::open(device, &dev)?;
+                stream = SafeStream::open(device, &dev, &fmt)?;
                 mode = ir_emitter::enable(dev.handle(), &card, device);
             }
             continue;
@@ -3084,7 +3382,7 @@ pub fn capture_ir_sequence(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = Some(SafeStream::open(device, &dev)?);
+    let mut stream = Some(SafeStream::open(device, &dev, &fmt)?);
     mode = ir_emitter::enable(dev.handle(), &card, device);
     // Set once above and not re-applied inside the loop. This path also carried
     // an every-eighth-frame re-fire; it went for the same reason, and with the
@@ -3154,7 +3452,7 @@ pub fn capture_ir_sequence(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = Some(SafeStream::open(device, &dev)?);
+                stream = Some(SafeStream::open(device, &dev, &fmt)?);
                 mode = ir_emitter::enable(dev.handle(), &card, device);
             }
             continue;
@@ -4013,7 +4311,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = SafeStream::open(device, &dev)?;
+    let mut stream = SafeStream::open(device, &dev, &fmt)?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
@@ -4389,21 +4687,175 @@ mod tests {
     }
 
     /// The branch the Codex round on #229 found unreachable: a node that opens
-    /// and then refuses to enumerate must be reported, not silently classified
+    /// and then refuses to answer must be reported, not silently classified
     /// as `Other` and dropped. `/dev/null` is exactly that node on any Linux
-    /// machine, since `Device::with_path` only opens (no QUERYCAP) and
-    /// VIDIOC_ENUM_FMT on a non-v4l2 character device returns ENOTTY, so this
-    /// needs no camera, no privilege, and no hardware in CI.
+    /// machine; since the #425 gate it fails at the QUERYCAP that now runs
+    /// before format enumeration (ENOTTY on a non-v4l2 character device), so
+    /// this needs no camera, no privilege, and no hardware in CI.
     #[test]
     fn a_node_that_opens_then_refuses_to_enumerate_is_reported_not_dropped() {
         let u = classify_node("/dev/null")
-            .expect_err("a device that cannot enumerate formats must not classify as a role");
-        assert_eq!(u.at, FailedAt::EnumFormats);
+            .expect_err("a device that answers no V4L2 ioctl must not classify as a role");
+        assert_eq!(u.at, FailedAt::QueryCaps);
         assert_eq!(u.errno, Some(libc::ENOTTY));
         assert!(
-            u.explain().contains("would not list its formats"),
+            u.explain().contains("did not answer VIDIOC_QUERYCAP"),
             "{}",
             u.explain()
+        );
+    }
+
+    /// One QUERYCAP answer per driver the audit measured, built from the
+    /// capability words read out of each driver's registration site in the
+    /// kernel source (docs/research/2026-08-12-camera-handling-audit.md,
+    /// taxonomy section). The gate must refuse every MC-centric and
+    /// MPLANE-only shape and pass every shape irlume actually drives.
+    fn caps_answer(driver: &str, device_caps: u32) -> v4l::v4l_sys::v4l2_capability {
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        let mut caps: v4l::v4l_sys::v4l2_capability = unsafe { std::mem::zeroed() };
+        caps.driver[..driver.len()].copy_from_slice(driver.as_bytes());
+        // The kernel ORs DEVICE_CAPS into the whole-device word, never into
+        // device_caps itself (videodev2.h; v4l2-ioctl.c sets it centrally).
+        caps.capabilities = device_caps | v4l::v4l_sys::V4L2_CAP_DEVICE_CAPS;
+        caps.device_caps = device_caps;
+        caps
+    }
+
+    /// The refusal table: Intel IPU6 ISYS (single-planar capture WITH IO_MC,
+    /// the #425 phantom-RGB case), AMD ISP4 (IO_MC), Qualcomm camss (IO_MC
+    /// and MPLANE), ipu3-cio2 (MPLANE only, no IO_MC). Each word is the
+    /// registration site's, quoted in the audit doc.
+    #[test]
+    fn mc_centric_verdict_refuses_every_measured_mipi_shape() {
+        use v4l::v4l_sys::{
+            V4L2_CAP_IO_MC as IO_MC, V4L2_CAP_META_CAPTURE as META, V4L2_CAP_READWRITE as RW,
+            V4L2_CAP_STREAMING as STREAMING, V4L2_CAP_VIDEO_CAPTURE as CAP,
+            V4L2_CAP_VIDEO_CAPTURE_MPLANE as MPLANE,
+        };
+        let ipu6 = mc_centric_verdict(&caps_answer("isys", STREAMING | IO_MC | CAP | META))
+            .expect("an IPU6 ISYS node must refuse format classification");
+        assert!(ipu6.io_mc && !ipu6.mplane_only, "{ipu6:?}");
+        assert_eq!(ipu6.driver, "isys");
+
+        let amd = mc_centric_verdict(&caps_answer("amd_isp_capture", CAP | STREAMING | IO_MC))
+            .expect("an AMD ISP4 node must refuse");
+        assert!(amd.io_mc, "{amd:?}");
+
+        let camss = mc_centric_verdict(&caps_answer("qcom-camss", MPLANE | STREAMING | RW | IO_MC))
+            .expect("a camss node must refuse");
+        assert!(camss.io_mc && camss.mplane_only, "{camss:?}");
+
+        let cio2 = mc_centric_verdict(&caps_answer("ipu3-cio2", MPLANE | STREAMING))
+            .expect("an ipu3-cio2 node must refuse, deliberately rather than by probe shape");
+        assert!(!cio2.io_mc && cio2.mplane_only, "{cio2:?}");
+    }
+
+    /// The pass-through table: both UVC node shapes and v4l2loopback, the
+    /// hardware irlume drives today, must reach format classification exactly
+    /// as before the gate.
+    #[test]
+    fn mc_centric_verdict_passes_every_shape_irlume_drives() {
+        use v4l::v4l_sys::{
+            V4L2_CAP_META_CAPTURE as META, V4L2_CAP_STREAMING as STREAMING,
+            V4L2_CAP_VIDEO_CAPTURE as CAP, V4L2_CAP_VIDEO_OUTPUT as OUT,
+        };
+        for (name, word) in [
+            ("uvcvideo capture", CAP | STREAMING),
+            ("uvcvideo metadata", META | STREAMING),
+            ("v4l2loopback", CAP | OUT | STREAMING),
+        ] {
+            assert_eq!(
+                mc_centric_verdict(&caps_answer("x", word)),
+                None,
+                "{name} must pass through to format classification"
+            );
+        }
+    }
+
+    /// A driver that never learned the device_caps split (pre-3.4 shape) is
+    /// judged on its whole-device word: refusing on a possibly-borrowed word
+    /// is the safe direction for a gate whose cost is one unusable node.
+    #[test]
+    fn a_querycap_without_device_caps_is_judged_on_the_whole_device_word() {
+        use v4l::v4l_sys::{V4L2_CAP_IO_MC, V4L2_CAP_STREAMING, V4L2_CAP_VIDEO_CAPTURE};
+        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        let mut caps: v4l::v4l_sys::v4l2_capability = unsafe { std::mem::zeroed() };
+        caps.capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | V4L2_CAP_IO_MC;
+        caps.device_caps = 0; // never filled by such a driver
+        assert!(mc_centric_verdict(&caps).is_some());
+    }
+
+    /// The bucketing arms of `file_node`: only `Camera(Rgb|Ir)` may reach
+    /// `classified`, because that bucket feeds every camera-picking caller;
+    /// an MC-centric outcome lands in its own bucket and nowhere else. This
+    /// pins the scan()-side wiring of #425 without a device per arm.
+    #[test]
+    fn file_node_keeps_mc_centric_nodes_out_of_the_usable_bucket() {
+        let mc = || McCentric {
+            driver: "isys".into(),
+            io_mc: true,
+            mplane_only: false,
+        };
+        let mut scan = NodeScan::default();
+        file_node(
+            &mut scan,
+            "/dev/video0".into(),
+            Ok(NodeKind::Camera(Role::Rgb)),
+        );
+        file_node(
+            &mut scan,
+            "/dev/video1".into(),
+            Ok(NodeKind::Camera(Role::Other)),
+        );
+        file_node(
+            &mut scan,
+            "/dev/video2".into(),
+            Ok(NodeKind::McCentric(mc())),
+        );
+        file_node(
+            &mut scan,
+            "/dev/video3".into(),
+            Err(Unreadable {
+                path: "/dev/video3".into(),
+                at: FailedAt::Open,
+                errno: Some(libc::EACCES),
+                holder: None,
+            }),
+        );
+        assert_eq!(
+            scan.classified,
+            vec![("/dev/video0".to_string(), Role::Rgb)]
+        );
+        assert_eq!(scan.mc_centric.len(), 1);
+        assert_eq!(scan.mc_centric[0].0, "/dev/video2");
+        assert_eq!(scan.unreadable.len(), 1);
+    }
+
+    /// The wording contract of `McCentric::cause`, same as `Unreadable`'s: it
+    /// names the driver and says what the user can and cannot expect, and the
+    /// two refusal shapes get different sentences.
+    #[test]
+    fn mc_centric_cause_names_the_driver_and_the_stack() {
+        let io_mc = McCentric {
+            driver: "isys".into(),
+            io_mc: true,
+            mplane_only: false,
+        };
+        assert!(io_mc.cause().contains("isys"), "{}", io_mc.cause());
+        assert!(
+            io_mc.cause().contains("media-controller"),
+            "{}",
+            io_mc.cause()
+        );
+        let mplane = McCentric {
+            driver: "ipu3-cio2".into(),
+            io_mc: false,
+            mplane_only: true,
+        };
+        assert!(
+            mplane.cause().contains("multi-planar"),
+            "{}",
+            mplane.cause()
         );
     }
 
@@ -5137,6 +5589,60 @@ mod tests {
     fn fourcc_str_trims_padding() {
         assert_eq!(fourcc_str(b"YUYV"), "YUYV");
         assert_eq!(fourcc_str(b"Y8  "), "Y8");
+    }
+
+    /// The buffer-claim read-back's comparison (#427): a format another
+    /// process retargeted between the caller's S_FMT and this handle's
+    /// REQBUFS must be named field-by-field, and an unchanged one must pass.
+    /// The race itself needs a second process and real queue ownership, so
+    /// the DECISION is what carries the coverage. Quantization and stride
+    /// are asserted by name: the Codex round on this change showed a
+    /// same-geometry quantization flip moves the clipping ceiling that the
+    /// exposure refusal reads (235 versus 255), and a stride change decodes
+    /// every row at the wrong offset, so those two are the fields a
+    /// geometry-only guard would have waved through.
+    #[test]
+    fn format_moved_names_the_field_that_moved_and_passes_a_match() {
+        use v4l::{Format, FourCC};
+        let expect = Format::new(640, 400, FourCC::new(b"GREY"));
+        assert_eq!(format_moved(&expect, &expect), None);
+
+        let refourcc = format_moved(&expect, &Format::new(640, 400, FourCC::new(b"YUYV")))
+            .expect("a changed fourcc must refuse");
+        assert!(
+            refourcc.contains("YUYV") && refourcc.contains("GREY"),
+            "{refourcc}"
+        );
+
+        let resized = format_moved(&expect, &Format::new(1280, 720, FourCC::new(b"GREY")))
+            .expect("a changed size must refuse");
+        assert!(
+            resized.contains("1280x720") && resized.contains("640x400"),
+            "{resized}"
+        );
+
+        let mut requantized = expect;
+        requantized.quantization = v4l::format::quantization::Quantization::LimitedRange;
+        if requantized.quantization as u32 == expect.quantization as u32 {
+            requantized.quantization = v4l::format::quantization::Quantization::FullRange;
+        }
+        let msg = format_moved(&expect, &requantized)
+            .expect("a changed quantization must refuse: it moves the clipping ceiling");
+        assert!(msg.contains("quantization"), "{msg}");
+
+        let mut restrided = expect;
+        restrided.stride = expect.stride + 64;
+        let msg = format_moved(&expect, &restrided)
+            .expect("a changed stride must refuse: rows would decode at wrong offsets");
+        assert!(msg.contains("stride"), "{msg}");
+
+        let mut recolored = expect;
+        recolored.colorspace = v4l::format::colorspace::Colorspace::SRGB;
+        if recolored.colorspace as u32 == expect.colorspace as u32 {
+            recolored.colorspace = v4l::format::colorspace::Colorspace::Rec709;
+        }
+        let msg = format_moved(&expect, &recolored).expect("a changed colorspace must refuse");
+        assert!(msg.contains("colorspace"), "{msg}");
     }
 
     #[test]

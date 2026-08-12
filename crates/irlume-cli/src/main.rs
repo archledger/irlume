@@ -4210,7 +4210,7 @@ fn doctor_run(
             report,
             "  ⚠ {why}; whether this machine has camera nodes is unknown"
         );
-    } else if nodes.is_empty() && scan.unreadable.is_empty() {
+    } else if nodes.is_empty() && scan.unreadable.is_empty() && scan.mc_centric.is_empty() {
         dout!(report, "  (no /dev/video* nodes on this machine)");
     }
     if nodes.is_empty() {
@@ -4273,6 +4273,19 @@ fn doctor_run(
                 );
             }
         }
+    }
+    // MC-centric nodes are working hardware irlume refuses to classify by
+    // format (#425): an Intel IPU6 laptop puts up to eight capture nodes per
+    // CSI-2 port that all enumerate YUYV from a static table, so before this
+    // gate they listed here as a fleet of RGB cameras that fail at capture.
+    // Grouped by cause like the unreadable nodes below: one IPU6 is one fact,
+    // not thirty-two.
+    let mut mc_by_cause: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+    for (path, mc) in &scan.mc_centric {
+        mc_by_cause.entry(mc.cause()).or_default().push(path);
+    }
+    for (cause, paths) in &mc_by_cause {
+        dout!(report, "  ⚠ {}: {cause}", paths.join(", "));
     }
     // A node irlume could not read is named with its errno, never omitted.
     // Dropping these is what let a permission problem read as absent hardware

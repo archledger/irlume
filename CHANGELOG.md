@@ -22,6 +22,35 @@ All notable changes to irlume are documented here. This project adheres to
   per-stream emitter store, which could refuse new stream writes with no
   surface anywhere saying why the emitter stayed dark (#429).
 
+- **A capture now verifies the device still holds the negotiated format once
+  it claims the buffers.** The V4L2 format is per-device state gated only on
+  buffer ownership, and ownership begins at REQBUFS, so between irlume's
+  open-time S_FMT and a session's buffer claim another application could
+  retarget the device and the capture would decode frames against stale
+  assumptions. Every stream open (sessions, their recovery paths, the
+  frozen-stream restarts, probes and emitter setup) now reads G_FMT back
+  after claiming the queue, at which point the format can no longer move,
+  and refuses when ANY negotiated field changed, naming it and, when
+  visible, who holds the camera. Every field matters, not just geometry:
+  quantization names the clipping ceiling the exposure refusal reads, and a
+  changed stride decodes rows at the wrong offsets. Source audit:
+  `docs/research/2026-08-12-camera-handling-audit.md`, Q3 (#427).
+
+- **Media-controller video nodes no longer classify as cameras.** On Intel
+  IPU6/IPU7 laptops the `isys` driver registers up to eight capture nodes per
+  CSI-2 port that all enumerate YUYV from a static table regardless of the
+  attached sensor, so every one of them classified as an RGB camera: scans
+  reported a fleet of phantom cameras and an authentication that selected one
+  failed at STREAMON. Classification now reads `VIDIOC_QUERYCAP` first and
+  refuses nodes whose `device_caps` carry `V4L2_CAP_IO_MC` (the uAPI defines
+  such nodes as MC-centric, where the format list describes the platform's
+  image pipeline, not a camera) or that capture only through the multi-planar
+  API (`ipu3-cio2`, `qcom-camss`, previously ignored by accident of the probe
+  shape). `doctor` names these nodes and the stack behind them instead of
+  listing them as cameras or omitting them. Source audit with the per-driver
+  capability words: `docs/research/2026-08-12-camera-handling-audit.md`
+  (#425).
+
 - **The IR eye-glint cue recorded the sensor's ceiling as the strongest possible
   reading.** `eye_glint` returned the window maximum with no notion of a
   ceiling, so a peak that railed at the negotiated format's white level was

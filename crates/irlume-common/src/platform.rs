@@ -135,6 +135,19 @@ fn session_is_active_user(session: &str) -> bool {
     val("Class=") == "user" && matches!(val("State="), "active" | "online")
 }
 
+/// Does this name resolve to a real account on this system (via NSS, so
+/// LDAP/SSSD/systemd-homed count, not just `/etc/passwd`)?
+///
+/// For the CLI's typed `--user`: a name that resolves to nothing is a typo, and
+/// every per-user command answers a typo with the same empty state a real but
+/// unenrolled user produces ("none enrolled", "not armed"), so the operator
+/// cannot tell the two apart. The daemon deliberately does NOT gate on this,
+/// because PAM authenticates as root and must keep working through an NSS
+/// outage; this is the human-input check, not an authorization one.
+pub fn user_exists(name: &str) -> bool {
+    uid_for_name(name).is_some()
+}
+
 /// Resolve a user name to its uid via NSS (`getpwnam_r`). `None` if absent.
 fn uid_for_name(name: &str) -> Option<u32> {
     let cname = std::ffi::CString::new(name).ok()?;
@@ -273,6 +286,20 @@ mod tests {
         assert_eq!(uid_for_name("no-such-user-irlume-test"), None);
         // Interior NUL cannot become a C string; must be None, not a panic.
         assert_eq!(uid_for_name("a\0b"), None);
+    }
+
+    #[test]
+    fn user_exists_separates_a_real_account_from_a_typo() {
+        // What the CLI's typed `--user` is checked against. Without it a
+        // mistyped name reads exactly like a real user with nothing set up, so
+        // the operator is told "none enrolled" about an account that does not
+        // exist. Root is the one name guaranteed present on every host.
+        assert!(user_exists("root"));
+        assert!(!user_exists("no-such-user-irlume-test"));
+        // Neither a name NSS cannot even be asked about (interior NUL) nor an
+        // empty name may pass as real.
+        assert!(!user_exists("a\0b"));
+        assert!(!user_exists(""));
     }
 
     #[test]

@@ -77,6 +77,26 @@ fn main() -> std::process::ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A TYPED `--user` that names nobody is a typo, and every per-user command
+    // answers a typo with the same empty state a real but unenrolled user
+    // produces ("none enrolled", "not armed"), so the operator cannot tell which
+    // they are looking at.
+    //
+    // A NOTE, deliberately, not a refusal. Refusing would contradict the machine
+    // API's own rule that a consumer calls the command and reads the daemon's
+    // error rather than pre-checking existence, and it would preempt the tested
+    // `--user requires a username` guard when the value is itself a flag
+    // (`--user --json`). The daemon keeps accepting unresolvable names for its
+    // own reason: PAM authenticates as root and must survive an NSS outage. So
+    // this only supplies the fact the operator is otherwise missing, on stderr,
+    // where it cannot disturb a consumer parsing stdout.
+    if let Some(named) = flag(&args, "--user").filter(|s| !s.is_empty()) {
+        if !irlume_common::platform::user_exists(named) {
+            eprintln!(
+                "irlume: note: no user '{named}' on this system, so its per-user state reads as empty"
+            );
+        }
+    }
     // Gate the developer tools unless IRLUME_DEV is set. Exception:
     // `selftest liveness` goes THROUGH the daemon (no direct camera open), so
     // it's a normal diagnostic the TUI's [l] uses, not a dev tool.

@@ -1566,6 +1566,13 @@ fn wire_service(
                 let bak_content = read(&bak.to_string_lossy())?;
                 if stripped == bak_content {
                     if apply {
+                        // The same refusal every other write path in this module
+                        // applies. A rename over a SYMLINK replaces the link with
+                        // a regular file, and a multiply-linked PAM file loses a
+                        // name irlume cannot put back; both are exactly what
+                        // `inspect_target` exists to stop, and this restore was
+                        // the one path that skipped it.
+                        inspect_target(etc)?;
                         std::fs::rename(&bak, etc)
                             .map_err(|e| format!("restore {}: {e}", s.etc))?;
                     }
@@ -4344,6 +4351,52 @@ auth required pam_fprintd.so\n\
         // Second identical enable is a recognised no-op (rebuilt from backup).
         let msg2 = wire_service(&svc, true, true, &wire).unwrap();
         assert!(msg2.message.contains("already correctly wired"), "{msg2}");
+    }
+
+    /// A disable that restores its backup must refuse a PAM path that is a
+    /// symlink, like every other write in this module.
+    ///
+    /// The restore was a bare `rename`, and renaming over a symlink REPLACES the
+    /// link with a regular file: a distro that symlinks a PAM service would have
+    /// had the link silently converted, with the target left behind holding
+    /// whatever it held.
+    #[test]
+    fn wire_service_disable_refuses_to_restore_over_a_symlink() {
+        let dir = TestDir::new("wsvc-symlink");
+        let (wired, _) = wire_greeter_impl(GDM, true, true, false);
+
+        // The real file lives elsewhere; the PAM path is a link to it.
+        let real = dir.0.join("real-gdm-password");
+        std::fs::write(&real, &wired).unwrap();
+        let etc = dir.0.join("gdm-password");
+        std::os::unix::fs::symlink(&real, &etc).unwrap();
+
+        // A backup that matches the stripped file, so the restore branch is the
+        // one taken.
+        let (stripped, _) = unwire_lines(&wired);
+        std::fs::write(dir.0.join(format!("gdm-password{BACKUP}")), &stripped).unwrap();
+
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+        let err = match wire_service(&svc, false, true, &wire) {
+            Err(e) => e,
+            Ok(msg) => panic!("restoring over a symlink must be refused, got: {msg}"),
+        };
+        assert!(
+            err.to_lowercase().contains("symlink"),
+            "the refusal must name why: {err}"
+        );
+        // The link is intact and still points at the real file.
+        assert!(
+            std::fs::symlink_metadata(&etc)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the PAM path must still be a symlink"
+        );
     }
 
     #[test]

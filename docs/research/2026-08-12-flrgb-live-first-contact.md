@@ -18,6 +18,10 @@ recognition-results precedent.
 - Attack: 100 frames, the #235/#237 vinyl graduation banner across five
   presentations (flat at login distance, close, tilted left, tilted right,
   shallow angle), 0 non-detections.
+- Genuine, low light: 75 frames in a closet with the door ajar (frame mean
+  luma 16-18, drift sd 0.5, no auto-exposure hunting). The RGB detector
+  found a face in only 18 of the 75; near-dark RGB detection is itself
+  marginal, which is why dark login runs on IR.
 
 ## pad96 is the variant; pad16 is not
 
@@ -32,9 +36,57 @@ false denials, and its attack median is lower; pad96 holds genuine under
 which agrees with the offline finding that pad16 fails far/small faces
 while pad96's weakness was low-light genuine (not tested today).
 
-## The finding that shapes the entry: the login-shaped attack is the weak point
+## The verdict: decline the candidate
 
-pad96 per attack presentation:
+pad96 per condition (frames where a face was detected):
+
+| condition | n | p_fake min / median / max |
+|---|---|---|
+| genuine, desk light | 75 | 0.001 / 0.010 / 0.079 |
+| genuine, low light | 18 | 0.166 / 0.785 / 0.977 |
+| attack, flat login-distance | 20 | 0.179 / 0.390 / 0.867 |
+| attack, all presentations | 100 | 0.179 / 0.917 / 0.999 |
+
+The two populations a PAD threshold must separate are the genuine user
+and the realistic (flat, head-on, login-distance) attack. In low light
+they OVERLAP completely: genuine-low-light detected frames span
+[0.166, 0.977], the head-on attack spans [0.179, 0.867], the shared band
+is [0.179, 0.867]. No threshold does both jobs:
+
+| threshold | genuine low-light denied (false denials) | head-on attack denied |
+|---|---|---|
+| 0.15 | 18 of 18 | 20 of 20 |
+| 0.40 | 16 of 18 | 9 of 20 |
+| 0.50 | 15 of 18 | 7 of 20 |
+| 0.80 | 9 of 18 | 1 of 20 |
+
+Any threshold low enough to deny the head-on print denies the genuine
+user in low light almost always; any threshold high enough to pass the
+low-light user passes the head-on print. flrgb is a deny-only cue, so
+its false denials cost the password rather than a grant, but the whole
+reason to add it is to cover the RGB attack the IR gate might miss, and
+on the one presentation an attacker uses it covers that attack only by
+denying the legitimate user in the dark. That is negative value in the
+exact regime it was added for.
+
+This reproduces and hardens the offline finding (pad96 fails low-light
+genuine, 9 of 9 there), now with the live head-on-attack overlap that
+makes it a decline rather than a tuning problem. The double-softmax and
+preprocessing-fork suspicions were real: pad16 is dead on overlap
+alone, and pad96 collapses on the condition that decides a PAD cue.
+
+## What would reopen this
+
+Not more sessions of the same instrument: two independent measurements
+agree. A candidate that fixes the low-light genuine collapse (a
+different model, or a preprocessing route that does not read a dark
+genuine face as fake) could be re-evaluated against this same corpus
+shape. flir remains the only clean PAD artifact that survives its
+measurements, and it covers IR where flrgb was meant to cover RGB; the
+RGB PAD slot stays empty on the evidence, not on the absence of a
+candidate.
+
+## Per-presentation attack detail (pad96), for the record
 
 | presentation | min | median | max | frames < 0.9 |
 |---|---|---|---|---|
@@ -45,38 +97,7 @@ pad96 per attack presentation:
 | shallow angle | 0.366 | 0.948 | 0.999 | 7 |
 
 The flat, square-on, login-distance presentation, the one an attacker
-actually uses, is the presentation flrgb scores LOWEST (median 0.390,
-every frame under 0.9). The tilted and angled presentations, which no
-attacker would choose, are the ones it catches hardest. This is the #239
-lesson exactly: the attack's easiest case for the defender is the one the
-attacker never presents.
-
-Two thresholds bound the reading, and they disagree:
-
-- A per-frame separator exists on THIS corpus: genuine tops out at 0.079,
-  the flat attack bottoms at 0.179, so a threshold near 0.13 denies every
-  attack frame and passes every genuine frame here.
-- But that margin is one session, one print, one subject, one light, and a
-  0.13 threshold has almost no genuine headroom; the offline low-light
-  genuine regime (untested today) is where pad96 was already weakest, and
-  a light that pushes a genuine frame from 0.08 toward 0.13 starts
-  false-denying. At the safe-margin threshold the buffalo work used for its
-  own operating points (0.5), pad96 denies 0/75 genuine and 85/100 attack,
-  but only 0 of 20 flat-attack frames clear 0.5 by median, so the realistic
-  attack mostly slips the deny.
-
-## Disposition for #441
-
-- Variant: pad96, settled.
-- The attack question is answered in shape, not in a shippable threshold:
-  flrgb catches the print strongly off-axis and weakly head-on, and the
-  head-on case is the one that matters. As a deny-only cue a slipped attack
-  frame is not a grant (the built-in IR gate still runs), but adding flrgb
-  is meant to cover the RGB attack the IR gate might miss, and on the
-  login-shaped presentation it covers it least.
-- Not enough to ship a catalog entry: one print, one subject, glasses, one
-  light, and the low-light genuine regime that decides the false-deny cost
-  is untested. The threshold cannot be fixed from margin this thin.
-- Next: repeat with the low-light genuine leg (screen-glow, side-lamp) and
-  at least a second attack medium (screen), and only then decide the
-  threshold and whether a deny-only `flrgb-rgb` entry ships at all.
+actually uses, is the presentation flrgb scores lowest; the tilted
+presentations no attacker chooses are the ones it catches hardest. The
+#239 lesson exactly: the attack's easiest case for the defender is the
+one the attacker never presents.

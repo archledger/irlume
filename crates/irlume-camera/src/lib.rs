@@ -254,6 +254,40 @@ pub const V4L2_CID_PRIVACY: u32 = 0x009a_0910;
 /// subject over a bright background, fixing the backlit-window case.
 pub const V4L2_CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
 
+/// The backlight-compensation value RGB sessions apply. 2 is the strongest
+/// setting on both cameras measured (NexiGo N930W face mean 49→124; ASUS
+/// FHD center mean 138.5→150.6, the 2026-08-12 session measurements).
+const BLC_WANTED: i64 = 2;
+
+/// Whether the backlight-compensation write should happen, and what it would
+/// displace. `None` skips the write: an unreadable control is not a license
+/// (the camera may not have one, EINVAL, or the observation failed, and
+/// writing blind would remember a displaced value nobody measured), and a
+/// control already at [`BLC_WANTED`] is another writer's state, which
+/// mirrors the emitter guard's active-but-not-armed rule. Pure, so the
+/// fail-safe directions are testable without a camera (#426).
+fn blc_write_decision(read: std::io::Result<v4l::control::Control>) -> Option<i64> {
+    match read.ok()?.value {
+        v4l::control::Value::Integer(now) if now != BLC_WANTED => Some(now),
+        _ => None,
+    }
+}
+
+/// What a dropping session should write back: the displaced value, but only
+/// while the control still holds what irlume applied. A control that moved
+/// carries somebody else's newer choice, and restoring over it is the exact
+/// harm #426 exists to remove. Pure for the same reason as the write
+/// decision.
+fn blc_restore_decision(
+    displaced: i64,
+    read: std::io::Result<v4l::control::Control>,
+) -> Option<i64> {
+    match read.ok()?.value {
+        v4l::control::Value::Integer(now) if now == BLC_WANTED => Some(displaced),
+        _ => None,
+    }
+}
+
 /// Frozen-stream recovery for burst captures: after this many consecutive
 /// identical frames the stream is torn down and re-opened, at most
 /// `FROZEN_RESTART_BUDGET` times per burst (a fully static feed therefore
@@ -1671,22 +1705,45 @@ impl RgbCamera {
         progress: &Progress,
     ) -> irlume_common::Result<RgbSession<'_>> {
         // Best-effort backlight/low-light correction: tell auto-exposure to
-        // expose for the face, not a bright window behind it. Harmless if
-        // unsupported (NexiGo N930W needs this; verified mean 49→124 + face
-        // detected). Written here rather than in `open` so that opening for a
-        // read-only purpose (doctor's stream report) changes nothing on the
-        // camera; AE settles during this session's warm-up either way, and the
-        // write is idempotent across repeated sessions.
-        let _ = self.dev.set_control(v4l::control::Control {
-            id: V4L2_CID_BACKLIGHT_COMPENSATION,
-            value: v4l::control::Value::Integer(2),
-        });
+        // expose for the face, not a bright window behind it (NexiGo N930W:
+        // verified face mean 49→124; this machine's ASUS: center mean
+        // 138.5→150.6, docs/research/2026-08-12-camera-deep-dive session).
+        // Written here rather than in `open` so that opening for a read-only
+        // purpose (doctor's stream report) changes nothing on the camera.
+        //
+        // Read first, remember what the write displaced, and put it back when
+        // the session drops (#426): control values persist across open/close
+        // by the V4L2 spec ("Control values are stored globally... do not
+        // change when the device is opened or closed"), so the old
+        // fire-and-forget write stayed on the camera for every later
+        // application; it was measured still applied on this machine hours
+        // after the session that wrote it. Same displaced-value rules as the
+        // emitter guard: a control already holding the wanted value is
+        // another writer's state and not irlume's to undo, and the restore
+        // only fires while the control still holds what irlume wrote.
+        let displaced_blc =
+            match blc_write_decision(self.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION)) {
+                Some(displaced) => {
+                    let wrote = self
+                        .dev
+                        .set_control(v4l::control::Control {
+                            id: V4L2_CID_BACKLIGHT_COMPENSATION,
+                            value: v4l::control::Value::Integer(BLC_WANTED),
+                        })
+                        .is_ok();
+                    // A refused write displaced nothing; remembering a value the
+                    // camera never lost would "restore" over its real state.
+                    wrote.then_some(displaced)
+                }
+                None => None,
+            };
         let stream = SafeStream::open(&self.device, &self.dev, &self.negotiated)?;
         Ok(RgbSession {
             cam: self,
             stream: Some(stream),
             warmed: false,
             progress: progress.clone(),
+            displaced_blc,
         })
     }
 
@@ -1866,6 +1923,38 @@ pub struct RgbSession<'a> {
     /// Per-window heartbeat for the lazy warm-up (#336); owned, not borrowed,
     /// so holding a session never freezes the caller's other borrows.
     progress: Progress,
+    /// What this session's backlight-compensation write displaced, `Some`
+    /// only when irlume actually CHANGED the control (#426); the drop puts
+    /// it back so the tuning never outlives the session onto another
+    /// application's picture.
+    displaced_blc: Option<i64>,
+}
+
+impl Drop for RgbSession<'_> {
+    fn drop(&mut self) {
+        let Some(displaced) = self.displaced_blc else {
+            return;
+        };
+        // Read back before restoring, the emitter guard's rule at standard-
+        // control scale: only a control still holding irlume's value carries
+        // a change of irlume's to undo. Best-effort like the write; a failed
+        // restore costs the next application a tuned picture, which is
+        // yesterday's behaviour on every session, and must not disturb the
+        // teardown of an authentication.
+        let read = self.cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION);
+        if let Some(put_back) = blc_restore_decision(displaced, read) {
+            let restored = self.cam.dev.set_control(v4l::control::Control {
+                id: V4L2_CID_BACKLIGHT_COMPENSATION,
+                value: v4l::control::Value::Integer(put_back),
+            });
+            if restored.is_err() {
+                irlume_common::dlog!(
+                    "{}: backlight compensation left at {BLC_WANTED}; restoring {put_back} failed",
+                    self.cam.device
+                );
+            }
+        }
+    }
 }
 
 impl<'a> RgbSession<'a> {
@@ -6282,6 +6371,60 @@ mod tests {
         assert!(unreadable.contains("could not read"), "{unreadable}");
         assert!(privacy_permits_setup(Ok(Some(false))).is_ok());
         assert!(privacy_permits_setup(Ok(None)).is_ok());
+    }
+
+    /// The two backlight-compensation decisions (#426), every arm. The write
+    /// only fires on an answered control holding something other than the
+    /// wanted value, so an unreadable or absent control is never written
+    /// blind and another writer's 2 is never adopted as irlume's to undo;
+    /// the restore only fires while the control still holds irlume's value,
+    /// so a mid-session change by someone else is left alone.
+    #[test]
+    fn backlight_compensation_decisions_cover_every_arm() {
+        let ctrl = |v: i64| {
+            Ok(v4l::control::Control {
+                id: V4L2_CID_BACKLIGHT_COMPENSATION,
+                value: v4l::control::Value::Integer(v),
+            })
+        };
+        let err = || Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+
+        assert_eq!(
+            blc_write_decision(ctrl(0)),
+            Some(0),
+            "a default control is written, displacing 0"
+        );
+        assert_eq!(
+            blc_write_decision(ctrl(1)),
+            Some(1),
+            "a user's 1 is displaced and remembered"
+        );
+        assert_eq!(
+            blc_write_decision(ctrl(BLC_WANTED)),
+            None,
+            "an already-wanted value is another writer's state"
+        );
+        assert_eq!(
+            blc_write_decision(err()),
+            None,
+            "an unreadable control is not a license to write"
+        );
+
+        assert_eq!(
+            blc_restore_decision(0, ctrl(BLC_WANTED)),
+            Some(0),
+            "our value still held: put the displaced one back"
+        );
+        assert_eq!(
+            blc_restore_decision(0, ctrl(1)),
+            None,
+            "the control moved: somebody else's newer choice stays"
+        );
+        assert_eq!(
+            blc_restore_decision(0, err()),
+            None,
+            "an unreadable control authorises nothing"
+        );
     }
 
     /// Only the errnos the V4L2 specification assigns to "this control does

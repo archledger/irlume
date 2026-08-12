@@ -7,6 +7,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **The backlight-compensation tuning no longer outlives the session onto
+  other applications' pictures.** RGB sessions write
+  `V4L2_CID_BACKLIGHT_COMPENSATION=2` so auto-exposure favors the face over
+  a bright window (NexiGo N930W: face mean 49→124; ASUS FHD: center mean
+  138.5→150.6), but control values persist across open and close by the
+  V4L2 specification, and the old fire-and-forget write was measured still
+  applied on a laptop hours after the session that wrote it, with the
+  driver default being 0. A session now reads the control first, writes
+  only when it holds something else, remembers what the write displaced,
+  and puts that value back when the session drops, under the emitter
+  guard's rules: a control already holding the wanted value is another
+  writer's state and is never adopted, and the restore fires only while
+  the control still holds what irlume wrote. Both directions validated on
+  hardware in the 2026-08-12 session measurements
+  (`docs/research/2026-08-12-camera-session-measurements.md`)
+  (#426).
+
 - **An emitter control that healed by power-cycle no longer stays blocked
   forever, and the advice now says what actually clears one.** When the
   restore-attempt budget for a leftover emitter control ran out, the refusal

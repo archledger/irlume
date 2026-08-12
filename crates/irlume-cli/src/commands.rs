@@ -1339,6 +1339,20 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                     "{TAG} global credential_release_challenge: root-only setting, re-run with sudo"
                 ),
             }
+            // A REQUIRED gesture that no gesture can satisfy is not a healthy
+            // state, and every line above reads as one. The mode decides WHICH
+            // gesture is accepted, so an unreadable `consent_gesture` leaves the
+            // requirement standing with nothing able to meet it, and every prompt
+            // falls to the password.
+            if irlume_common::config::consent_gesture_mode()
+                == irlume_common::config::ConsentGesture::Misconfigured
+            {
+                println!(
+                    "{TAG} WARNING: `consent_gesture` is set to a value irlume cannot read \
+                     (expected nod or closure), so NO gesture is accepted and every \
+                     REQUIRED line above falls back to the password until it is fixed."
+                );
+            }
             ExitCode::SUCCESS
         }
         // Service-specific toggle: irlume credential-release-challenge sudo on|off

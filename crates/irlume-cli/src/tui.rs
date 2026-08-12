@@ -5709,13 +5709,31 @@ impl App {
             "Wire app prompts",
             "opt-in; face approves Bitwarden and pkexec",
         ));
-        // Names the nod first, matching the prompts: it needs no calibration and
-        // is unaffected by lighting, while what [c] teaches is stored as absolute
-        // eye measurements that shift as the room changes.
+        // What [c] teaches is only USEFUL in the modes that accept it, so the row
+        // reads the configured mode instead of always calling the closure an
+        // optional extra. Under `closure` the nod is refused and this calibration
+        // is the only way any gesture passes; under `nod` the closure is refused
+        // and teaching it changes nothing. Naming the nod first in the default
+        // mode still matches the prompts: it needs no calibration and is
+        // unaffected by lighting, while this is stored as absolute eye
+        // measurements that shift as the room changes.
         lines.push(act(
             "[c]",
             "Calibrate gesture",
-            "optional eye-closure alternative; the head nod (the default) needs no calibration",
+            match irlume_common::config::consent_gesture_mode() {
+                irlume_common::config::ConsentGesture::Closure => {
+                    "REQUIRED: consent_gesture=closure accepts only the eye closure"
+                }
+                irlume_common::config::ConsentGesture::Nod => {
+                    "not accepted: consent_gesture=nod accepts only the head nod"
+                }
+                irlume_common::config::ConsentGesture::Either => {
+                    "optional eye-closure alternative; the head nod needs no calibration"
+                }
+                irlume_common::config::ConsentGesture::Misconfigured => {
+                    "no gesture is accepted until consent_gesture is fixed"
+                }
+            },
         ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
@@ -10870,6 +10888,49 @@ mod tests {
         );
         // "dark mode" reads as a UI theme, not an IR capability.
         assert!(!text.contains("dark mode"), "{text}");
+    }
+
+    /// The PAM tab's [c] row must describe the calibration the CONFIGURED mode
+    /// actually uses. It was one fixed string calling the eye closure an optional
+    /// alternative, which is true only in the default mode: under
+    /// `consent_gesture=closure` the nod is refused and this calibration is the
+    /// only way any gesture passes (the old text sent that user to nod at a gate
+    /// that would deny them), and under `consent_gesture=nod` the closure is
+    /// refused, so teaching it changes nothing.
+    #[test]
+    fn calibrate_row_describes_the_configured_gesture_mode() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-calibmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        for (conf, expect) in [
+            ("", "optional eye-closure alternative"),
+            ("consent_gesture=closure\n", "REQUIRED"),
+            ("consent_gesture=nod\n", "not accepted"),
+            ("consent_gesture=banana\n", "until consent_gesture is fixed"),
+        ] {
+            std::fs::write(dir.join("settings.conf"), conf).unwrap();
+            let text = draw_text(&app);
+            let row = row_with(&text, "Calibrate gesture");
+            assert!(
+                row.contains(expect),
+                "mode {conf:?} must say {expect:?}, got: {row}"
+            );
+        }
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The Settings tab must name BOTH halves of the gesture. A user told only

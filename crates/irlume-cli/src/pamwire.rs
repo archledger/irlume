@@ -954,6 +954,47 @@ pub(crate) fn prepare(enable: bool, with_sudo: bool, with_polkit: bool) -> Vec<A
 /// only moment it exists to be read; afterwards the file has already changed.
 /// Every surface is recorded even when a later one fails, since a partial apply
 /// is exactly the case a rollback has to be able to undo.
+/// The record for a surface irlume REFUSED to touch (a symlink, or a file with
+/// more than one name).
+///
+/// It reports what is on disk, not "absent". The rollback precheck compares each
+/// recorded after-digest against the live file, so claiming absence about a file
+/// that exists made the whole transaction read as drift and refuse to roll back,
+/// which is exactly when a partly applied enable needs undoing. `before: None`
+/// also means "remove it" to a restore, the opposite of leaving it alone.
+fn refused_surface_record(
+    svc: &Svc,
+    role: &'static str,
+    path: &Path,
+    message: String,
+) -> AppliedSurface {
+    let current = std::fs::read_to_string(path).ok();
+    let current_meta = std::fs::symlink_metadata(path).ok().as_ref().map(|m| {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        (m.permissions().mode() & 0o7777, m.uid(), m.gid())
+    });
+    AppliedSurface {
+        id: service_name(svc.etc),
+        role,
+        path: svc.etc.to_string(),
+        change: PlannedChange::NotInstalled,
+        before: current,
+        before_metadata: current_meta,
+        sidecar_before: None,
+        sidecar_metadata: None,
+        sidecar_existed: false,
+        // The digest shape the applied path records and the precheck compares:
+        // the live file alone, not the live+backup pair `surface_state` makes.
+        after_sha256: match std::fs::read(path) {
+            Ok(bytes) => crate::logintx::sha256_hex(&bytes),
+            Err(_) => crate::logintx::ABSENT.to_string(),
+        },
+        sidecar_after_sha256: None,
+        error: Some(message),
+    }
+}
+
 pub(crate) fn apply(
     enable: bool,
     with_sudo: bool,
@@ -987,20 +1028,7 @@ pub(crate) fn apply(
             // this check did not: a rename replaces one directory entry and
             // leaves every other name for the inode on the old content.
             if let Err(message) = inspect_target(path) {
-                out.push(AppliedSurface {
-                    id: service_name(svc.etc),
-                    role,
-                    path: svc.etc.to_string(),
-                    change: PlannedChange::NotInstalled,
-                    before: None,
-                    before_metadata: None,
-                    sidecar_before: None,
-                    sidecar_metadata: None,
-                    sidecar_existed: false,
-                    after_sha256: crate::logintx::ABSENT.to_string(),
-                    sidecar_after_sha256: None,
-                    error: Some(message),
-                });
+                out.push(refused_surface_record(svc, role, path, message));
                 return;
             }
             let planned_state = expected
@@ -4351,6 +4379,56 @@ auth required pam_fprintd.so\n\
         // Second identical enable is a recognised no-op (rebuilt from backup).
         let msg2 = wire_service(&svc, true, true, &wire).unwrap();
         assert!(msg2.message.contains("already correctly wired"), "{msg2}");
+    }
+
+    /// A surface irlume REFUSED to touch must be recorded as it is on disk, not
+    /// as absent.
+    ///
+    /// The rollback precheck compares each recorded after-digest with the file,
+    /// so "absent before, absent after" about a file that exists reads as drift
+    /// and refuses the WHOLE transaction: a partly applied enable could not be
+    /// undone at all. `before: None` also means "remove it" to a restore, which
+    /// is the opposite of leaving it alone.
+    #[test]
+    fn a_refused_surface_is_recorded_as_it_stands() {
+        let dir = TestDir::new("wsvc-refused-record");
+        // A symlinked PAM path: every write refuses it, so an apply records it
+        // with an error and touches nothing.
+        let real = dir.0.join("real-sudo");
+        std::fs::write(
+            &real,
+            "auth include system-auth
+",
+        )
+        .unwrap();
+        let etc = dir.0.join("sudo");
+        std::os::unix::fs::symlink(&real, &etc).unwrap();
+
+        let refusal = inspect_target(&etc).expect_err("a symlink is refused");
+        let rec = refused_surface_record(
+            &Svc {
+                etc: leak(&etc),
+                vendor: None,
+            },
+            ROLE_SUDO,
+            &etc,
+            refusal,
+        );
+        assert!(rec.error.is_some(), "with the reason it was refused");
+        assert_ne!(
+            rec.after_sha256,
+            crate::logintx::ABSENT,
+            "the file exists, so recording it as absent makes the rollback see drift"
+        );
+        assert_eq!(
+            rec.after_sha256,
+            crate::logintx::sha256_hex(&std::fs::read(&etc).unwrap()),
+            "the recorded digest is the file's own"
+        );
+        assert!(
+            rec.before.is_some(),
+            "before: None tells a restore to REMOVE a file irlume never touched"
+        );
     }
 
     /// A disable that restores its backup must refuse a PAM path that is a

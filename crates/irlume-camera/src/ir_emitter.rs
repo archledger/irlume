@@ -2851,9 +2851,9 @@ fn recover_pending_write_locked(
             // Not about this camera. Everything else is.
             Mismatch::DifferentCamera => RecoveryOutcome::ForAnotherCamera,
             Mismatch::OwnerStillRunning { pid } => RecoveryOutcome::OwnerStillRunning { pid },
-            Mismatch::OutOfAttempts { attempts } => RecoveryOutcome::Unresolved(format!(
-                "{attempts} attempts to put it back did not take, so no more will be made"
-            )),
+            Mismatch::OutOfAttempts { attempts } => {
+                return spent_record_recovery(fd, &record, &record_path, attempts)
+            }
             Mismatch::UnsupportedSchema { found, supported } => RecoveryOutcome::Unresolved(
                 format!("the record is schema {found} and this build implements {supported}"),
             ),
@@ -2866,38 +2866,9 @@ fn recover_pending_write_locked(
 
     // Read the control before deciding anything. A restore that is not needed is
     // still a write to firmware.
-    //
-    // Sequenced, not gathered into a tuple. A tuple evaluates every operand
-    // before the match runs, so an earlier version issued `GET_CUR` sized by the
-    // RECORD while `GET_LEN` was being fetched in the same expression: a record
-    // saying 64 against a camera reporting 3 sent a 64-byte control request to
-    // firmware, and only then was the mismatch noticed. The camera's own answer
-    // has to come first and gate the rest.
-    let len = match get_len(fd, record.unit, record.selector) {
-        Ok(len) => len,
-        Err(e) => return RecoveryOutcome::Unresolved(format!("query the control length: {e}")),
-    };
-    if len != record.len {
-        return RecoveryOutcome::Unresolved(format!(
-            "the control is {len} bytes and the record was written when it was {}, \
-             so the recorded bytes are not this control's value",
-            record.len
-        ));
-    }
-    let info = match get_info(fd, record.unit, record.selector) {
-        Ok(info) => info,
-        Err(e) => return RecoveryOutcome::Unresolved(format!("query the control: {e}")),
-    };
-    // Sized by what the camera just reported, which the check above has proved
-    // equal to the record's.
-    let current = match get_cur(fd, record.unit, record.selector, len) {
-        Ok(current) => current,
-        Err(e) => return RecoveryOutcome::Unresolved(format!("read the control: {e}")),
-    };
-    let now = journal::ControlNow {
-        len,
-        writable: info_allows_set(info),
-        current,
+    let now = match control_now(fd, &record) {
+        Ok(now) => now,
+        Err(why) => return RecoveryOutcome::Unresolved(why),
     };
 
     match journal::restore_decision(&record, &now) {
@@ -3008,13 +2979,93 @@ fn recover_pending_write_locked(
     }
 }
 
+/// What the record's control reports right now: `GET_LEN`, `GET_INFO`,
+/// `GET_CUR`, reads only, or the reason one of them could not be taken.
+///
+/// Sequenced, not gathered into a tuple. A tuple evaluates every operand
+/// before the match runs, so an earlier version issued `GET_CUR` sized by the
+/// RECORD while `GET_LEN` was being fetched in the same expression: a record
+/// saying 64 against a camera reporting 3 sent a 64-byte control request to
+/// firmware, and only then was the mismatch noticed. The camera's own answer
+/// has to come first and gate the rest.
+fn control_now(
+    fd: c_int,
+    record: &crate::emitter_journal::PendingWrite,
+) -> Result<crate::emitter_journal::ControlNow, String> {
+    use crate::emitter_journal as journal;
+    let len = get_len(fd, record.unit, record.selector)
+        .map_err(|e| format!("query the control length: {e}"))?;
+    if len != record.len {
+        return Err(format!(
+            "the control is {len} bytes and the record was written when it was {}, \
+             so the recorded bytes are not this control's value",
+            record.len
+        ));
+    }
+    let info = get_info(fd, record.unit, record.selector)
+        .map_err(|e| format!("query the control: {e}"))?;
+    // Sized by what the camera just reported, which the check above has proved
+    // equal to the record's.
+    let current = get_cur(fd, record.unit, record.selector, len)
+        .map_err(|e| format!("read the control: {e}"))?;
+    Ok(journal::ControlNow {
+        len,
+        writable: info_allows_set(info),
+        current,
+    })
+}
+
+/// A record out of restore attempts authorises no further write, but a read
+/// is not a write (#429). The recommended recovery for a stuck control is a
+/// full power-off (measured on the modules to hand: a replugged camera reads
+/// back at its `GET_DEF`; see the pt190 note in `stream_record.rs`), and
+/// before this pass a control that CAME BACK at its recorded original after
+/// one stayed blocked forever, because the out-of-attempts refusal ran ahead
+/// of every read. So the spent arm runs the same read-only half as an
+/// ordinary pass and acts on exactly one answer: `AlreadyRestored` retires
+/// the record. `Write` authorises nothing here, the budget being the whole
+/// point, and every other answer keeps the standing refusal plus the advice.
+fn spent_record_recovery(
+    fd: c_int,
+    record: &crate::emitter_journal::PendingWrite,
+    record_path: &std::path::Path,
+    attempts: u32,
+) -> RecoveryOutcome {
+    use crate::emitter_journal as journal;
+    let advice = |state: &str| -> RecoveryOutcome {
+        RecoveryOutcome::Unresolved(format!(
+            "{attempts} attempts to put it back did not take, so no more will be made \
+             ({state}). Shut the machine down fully and boot again; a reboot does not \
+             cut the camera's power, and a full power-off is what clears a stuck \
+             control on the hardware measured so far (an external camera can be \
+             unplugged instead). If the control comes back at its recorded original, \
+             this record retires on its own at the next authentication"
+        ))
+    };
+    let now = match control_now(fd, record) {
+        Ok(now) => now,
+        Err(why) => return advice(&why),
+    };
+    match journal::restore_decision(record, &now) {
+        journal::Restore::AlreadyRestored => match journal::clear(record_path) {
+            Ok(()) => RecoveryOutcome::AlreadyRestored,
+            // The control holds its original. Only the store is unhappy, and
+            // the store does not decide what the camera holds.
+            Err(why) => RecoveryOutcome::RestoredRecordKept(why),
+        },
+        journal::Restore::Refuse(why) => advice(&why),
+        journal::Restore::Write(_) => advice("the control still holds the interrupted value"),
+    }
+}
+
 /// Log a recovery outcome once per camera per process.
 ///
-/// `enable` runs at every stream open AND every eighth frame of a burst, so an
-/// outcome that repeats — a record that cannot be acted on stays on disk and is
-/// re-read every time — would otherwise put the same line into the journal
-/// several times a second. Keyed by the camera and the kind of outcome, so a
-/// later change of outcome on the same camera still prints.
+/// `enable` runs at every stream open (the per-frame re-apply is gone; see
+/// the removal notes in `lib.rs`), so an outcome that repeats — a record that
+/// cannot be acted on stays on disk and is re-read every time — would
+/// otherwise put the same line into the journal at every authentication.
+/// Keyed by the camera and the kind of outcome, so a later change of outcome
+/// on the same camera still prints.
 fn report_recovery(id: &crate::uvc_descriptor::CameraIdentity, outcome: RecoveryOutcome) {
     let Some(line) = outcome.message() else {
         return;
@@ -5096,6 +5147,125 @@ mod tests {
                 }
             )),
             "GET_LEN must have been issued, or this proves nothing: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record for one camera, `restore_attempts` already spent, planted the
+    /// way production writes it. Shared by the two spent-record tests below.
+    fn plant_spent_record(
+        id: &crate::uvc_descriptor::CameraIdentity,
+        original: &[u8],
+        attempted: &[u8],
+    ) {
+        let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
+        let selector = [
+            crate::uvc_descriptor::MSXU_IR_TORCH,
+            crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+        ]
+        .into_iter()
+        .find(|s| ms.advertises(*s))
+        .expect("fixture advertises an emitter selector");
+        let record = crate::emitter_journal::PendingWrite {
+            schema_version: crate::emitter_journal::SCHEMA_VERSION,
+            engine_version: "test".into(),
+            descriptor_sha256: crate::emitter_journal::fingerprint(id),
+            usb_id: id.usb_id(),
+            interface_number: id.interface_number,
+            unit: ms.unit_id,
+            selector,
+            len: original.len(),
+            original: crate::emitter_journal::to_hex(original),
+            attempted: crate::emitter_journal::to_hex(attempted),
+            restore_attempts: crate::emitter_journal::MAX_RESTORE_ATTEMPTS,
+            boot_id: None,
+            pid: None,
+            serial: id.serial.clone(),
+            usb_devpath: id.usb_devpath.clone(),
+        };
+        crate::emitter_journal::save(&record).expect("plant the record");
+    }
+
+    /// A record out of restore attempts used to be refused BEFORE any read, so
+    /// a control that a power cycle had already returned to its recorded
+    /// original stayed blocked forever: the one recovery the advice can
+    /// recommend led to an emitter that never lit again (#429). The spent arm
+    /// now runs the read-only half and retires the record it finds healed,
+    /// writing nothing.
+    #[test]
+    fn a_spent_record_whose_control_healed_retires_without_a_write() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-recovery-spent-healed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        // The camera answers [1,3,1]: exactly the recorded original, the state
+        // a full power-off returns (pt190 measurement).
+        plant_spent_record(&id, &[1, 3, 1], &[9, 9, 9]);
+
+        let _fake = fake_camera::install(a_working_camera());
+        let outcome = recover_pending_write(-1, &id);
+        let log = fake_camera::log();
+
+        assert!(
+            matches!(outcome, RecoveryOutcome::AlreadyRestored),
+            "a healed control retires its spent record: {outcome:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "a spent record authorises no write, healed or not: {log:?}"
+        );
+        // Retired means GONE: the next pass starts from nothing, so the
+        // emitter is irlume's to drive again.
+        let second = recover_pending_write(-1, &id);
+        assert!(
+            matches!(second, RecoveryOutcome::NothingPending),
+            "the record must not survive its own retirement: {second:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the spent arm: a control still holding the
+    /// interrupted value gets the standing refusal plus the power-off advice,
+    /// and the budget stays spent, so nothing is written now or later.
+    #[test]
+    fn a_spent_record_still_changed_keeps_refusing_and_advises_a_power_off() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join("irlume-recovery-spent-changed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let id = identity(0x3277, 0x0059);
+        // The camera still answers the interrupted run's value.
+        let mut cam = a_working_camera();
+        cam.current = vec![9, 9, 9];
+        plant_spent_record(&id, &[1, 3, 1], &[9, 9, 9]);
+
+        let _fake = fake_camera::install(cam);
+        let outcome = recover_pending_write(-1, &id);
+        let log = fake_camera::log();
+
+        match &outcome {
+            RecoveryOutcome::Unresolved(why) => assert!(
+                why.contains("Shut the machine down fully"),
+                "the refusal must carry the recovery a user can act on: {why}"
+            ),
+            other => panic!("a still-changed spent record stays unresolved: {other:?}"),
+        }
+        assert!(
+            !log.iter()
+                .any(|r| matches!(r, fake_camera::Request::Set(_))),
+            "out of attempts means out of writes, whatever the control holds: {log:?}"
+        );
+        assert!(
+            !outcome.permits_capture_write(),
+            "the standing refusal must keep gating every capture write"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

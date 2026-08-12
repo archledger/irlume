@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **An emitter control that healed by power-cycle no longer stays blocked
+  forever, and the advice now says what actually clears one.** When the
+  restore-attempt budget for a leftover emitter control ran out, the refusal
+  fired before any read, so a control that a full power-off had already
+  returned to its recorded original could never retire its record: the one
+  recovery the situation calls for led to an emitter that never lit again.
+  The spent arm now runs the read-only half of the recovery pass (never a
+  write; the budget still gates every write forever) and retires a record
+  whose control reads back at the recorded original. The out-of-attempts
+  message and both doctor checks now say the recovery out loud: shut the
+  machine down fully, since a reboot does not cut the camera's power.
+  `doctor` also gains `emitter-stream-pending`, a read-only view of the
+  per-stream emitter store, which could refuse new stream writes with no
+  surface anywhere saying why the emitter stayed dark (#429).
+
 - **The IR eye-glint cue recorded the sensor's ceiling as the strongest possible
   reading.** `eye_glint` returned the window maximum with no notion of a
   ceiling, so a peak that railed at the negotiated format's white level was

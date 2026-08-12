@@ -150,6 +150,57 @@ fn store_dir() -> PathBuf {
     irlume_common::state_dir().join("ir-emitter-stream")
 }
 
+/// What is left in the stream store, for doctor, opening no camera (#429).
+///
+/// This store had no reporting surface at all: a spent applied record blocks
+/// every NEW stream write through `SaveError::Outstanding`, silently, so a
+/// user whose emitter had gone dark had nothing anywhere saying why. Same
+/// three-way answer as the discovery journal's summary, and the same reading
+/// rule: a record that will not parse is still a record.
+pub fn pending_summary() -> crate::emitter_journal::PendingSummary {
+    use crate::emitter_journal::PendingSummary;
+    let dir = store_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PendingSummary::None,
+        Err(e) => return PendingSummary::Unreadable(format!("{}: {e}", dir.display())),
+    };
+    let mut pending = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return PendingSummary::Unreadable(format!("{}: {e}", dir.display())),
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        pending.push(match std::fs::read_to_string(&path) {
+            Ok(body) => match serde_json::from_str::<StreamWrite>(&body) {
+                Ok(record) => format!(
+                    "{} unit {} selector {} ({}, displaced {})",
+                    record.usb_id,
+                    record.unit,
+                    record.selector,
+                    match record.state {
+                        WriteState::Prepared => "write may not have reached the camera",
+                        WriteState::Applied => "applied",
+                    },
+                    record.displaced
+                ),
+                Err(e) => format!("{} (unparseable: {e})", path.display()),
+            },
+            Err(e) => format!("{} (unreadable: {e})", path.display()),
+        });
+    }
+    if pending.is_empty() {
+        PendingSummary::None
+    } else {
+        pending.sort();
+        PendingSummary::Pending(pending)
+    }
+}
+
 /// This camera's record path. One file per camera: a stream applies one
 /// control, and a second stream on the same camera replaces rather than
 /// accumulates.
@@ -792,6 +843,42 @@ mod tests {
             Err(ClaimRefusal::NotConfirmed),
             "an unconfirmed write may never have reached the camera"
         );
+    }
+
+    /// The store's doctor view (#429): absent store reads as nothing pending,
+    /// a published record is reported with its camera and state, and no
+    /// camera is opened for any of it (nothing here has a device to open).
+    #[test]
+    fn pending_summary_reports_the_store_without_a_camera() {
+        use crate::emitter_journal::PendingSummary;
+        let _guard = crate::testenv::env_lock();
+        let dir =
+            std::env::temp_dir().join(format!("irlume-stream-summary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = crate::testenv::EnvGuard::set("IRLUME_STATE_DIR", &dir);
+
+        assert_eq!(
+            pending_summary(),
+            PendingSummary::None,
+            "an absent store is nothing pending, not an error"
+        );
+
+        let id = identity();
+        let mut record = record_for(&id);
+        record.state = WriteState::Applied;
+        publish(&record_path(&id), &record).expect("publish the record");
+        match pending_summary() {
+            PendingSummary::Pending(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert!(
+                    entries[0].contains(&record.usb_id) && entries[0].contains("applied"),
+                    "the line names the camera and the state: {}",
+                    entries[0]
+                );
+            }
+            other => panic!("a published record must be reported: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

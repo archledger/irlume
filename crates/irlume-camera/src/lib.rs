@@ -26,7 +26,10 @@ pub mod emitter_journal;
 pub mod ir_dark;
 pub mod ir_emitter;
 mod ir_metadata;
-mod stream_record;
+// Public for exactly one item, `pending_summary`, doctor's read-only view of
+// the store (#429); every record type stays crate-private so no other code
+// path grows a reader of these files.
+pub mod stream_record;
 pub mod uvc_descriptor;
 
 /// Serializes unit tests that mutate process-global environment variables, and

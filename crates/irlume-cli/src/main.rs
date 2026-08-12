@@ -4088,7 +4088,10 @@ fn doctor_run(
                 report,
                 "[doctor] IR emitter: {} camera control(s) left changed by an interrupted \
                  setup ⚠ — {}. Reconnect the camera and authenticate, or run \
-                 `sudo irlume ir-setup`, to put them back",
+                 `sudo irlume ir-setup`, to put them back. If irlume has reported that \
+                 its attempts ran out, shut the machine down fully and boot again: a \
+                 reboot does not cut the camera's power, and a full power-off is what \
+                 clears a stuck control on the hardware measured so far",
                 entries.len(),
                 entries.join("; ")
             );
@@ -4098,6 +4101,31 @@ fn doctor_run(
             // Root-only by design, so an ordinary run lands here. Unknown, not
             // Pass: nobody checked.
             report.check_detail("emitter-undo-pending", State::Unknown, why);
+        }
+    }
+    // The stream store is the OTHER emitter ledger: per-stream writes whose
+    // restore did not finish. A spent applied record here refuses every new
+    // stream write, silently before #429, so a machine in that state had an
+    // emitter that never lit and no surface saying why.
+    match irlume_camera::stream_record::pending_summary() {
+        irlume_camera::emitter_journal::PendingSummary::None => {
+            report.check("emitter-stream-pending", State::Pass);
+        }
+        irlume_camera::emitter_journal::PendingSummary::Pending(entries) => {
+            dout!(
+                report,
+                "[doctor] IR emitter: {} stream-applied control(s) not yet put back ⚠ — {}. \
+                 Authenticating once with the camera attached restores them; if irlume \
+                 has reported its restore attempts ran out, shut the machine down fully \
+                 (not a reboot) or unplug an external camera",
+                entries.len(),
+                entries.join("; ")
+            );
+            report.check_detail("emitter-stream-pending", State::Warn, entries.join("; "));
+        }
+        irlume_camera::emitter_journal::PendingSummary::Unreadable(why) => {
+            // Root-only by design, same as the journal store above.
+            report.check_detail("emitter-stream-pending", State::Unknown, why);
         }
     }
     // Which capture strategy this camera pair runs, and whether it was measured

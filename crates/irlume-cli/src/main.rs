@@ -3537,7 +3537,13 @@ fn report_credential_release(
          password)",
         if gesture_is_closure {
             "close your eyes ~1s then open"
-        } else if closure_calibrated {
+        } else if closure_calibrated
+            && irlume_common::config::consent_gesture_mode()
+                == irlume_common::config::ConsentGesture::Either
+        {
+            // A stored calibration is not the same as an accepted gesture: under
+            // `consent_gesture=nod` the closure is refused however well calibrated
+            // it is, and offering it there costs the user the release window.
             "keep nodding, or close your eyes ~1s then open"
         } else {
             "keep nodding your head"
@@ -4512,11 +4518,32 @@ fn doctor_run(
         // "KEEP nodding", matching the prompt the user will actually see: a
         // single nod released 0 times out of 3 on hardware, because the detector
         // needs a run of frames showing the motion.
+        // The gesture can be turned off for polkit alone, and then no gesture is
+        // asked for at all; saying "KEEP NODDING" there describes a prompt the
+        // user will never see.
+        Some(true) if !irlume_common::config::service_gesture_required("polkit-1") => dout!(report,
+            "[doctor] polkit app prompts: wired ✓ (face alone approves Bitwarden unlock, pkexec, …;\n     \
+             the consent gesture is OFF for polkit: sudo irlume credential-release-challenge polkit-1 on)"
+        ),
+        // A misconfigured `consent_gesture` accepts NEITHER gesture, so the
+        // dedicated warning above is the whole story; repeating "keep nodding"
+        // here would contradict it on the same screen.
+        Some(true)
+            if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured =>
+        {
+            dout!(report,
+                "[doctor] polkit app prompts: wired ✓ but NO gesture is accepted while \n     \
+                 `consent_gesture` is unreadable (see above), so these prompts fall back to the password")
+        }
         Some(true) if !gesture_is_closure => dout!(report,
             "[doctor] polkit app prompts: wired ✓ (KEEP NODDING to approve Bitwarden unlock,\n     \
-             pkexec, …; no calibration needed{})",
-            if closure_calibrated {
+             pkexec, …; shake your head to decline; no calibration needed{})",
+            if closure_calibrated
+                && gesture_mode == irlume_common::config::ConsentGesture::Either
+            {
                 "; closing your eyes ~1s also works"
+            } else if closure_calibrated {
+                "" // calibrated but not accepted in this mode: do not offer it
             } else {
                 ", or run calibrate-closure to also allow the eye-closure gesture"
             }

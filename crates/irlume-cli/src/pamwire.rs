@@ -1263,10 +1263,15 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
             Ok(msg) => {
                 println!("  {msg}");
                 if enable && apply {
+                    // The nod is the default gesture and needs NO calibration;
+                    // `calibrate-closure` teaches the optional eye-closure
+                    // alternative. This line used to present the calibration as a
+                    // prerequisite and the closure as the way to approve, which
+                    // sent every new polkit user through a step they did not need.
                     println!(
-                        "    polkit prompts (Bitwarden unlock, pkexec) will accept your face once\n    \
-                         you calibrate the consent gesture:  sudo irlume calibrate-closure\n    \
-                         Then approve a prompt by closing your eyes for ~1s and opening them."
+                        "    polkit prompts (Bitwarden unlock, pkexec) now take your face.\n    \
+                         Keep nodding to approve; shake your head to decline.\n    \
+                         No calibration needed. Optional eye-closure alternative:  sudo irlume calibrate-closure"
                     );
                 }
             }

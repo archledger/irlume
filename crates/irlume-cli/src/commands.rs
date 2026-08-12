@@ -1310,9 +1310,11 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                             "credential_release" => {
                                 irlume_common::config::credential_release_challenge()
                             }
-                            // polkit (AppConsent) defaults ON, overridable.
-                            "polkit-1" => true,
-                            _ => irlume_common::config::service_gesture_default(svc),
+                            // Every PAM service through the shared helper, which
+                            // knows polkit (AppConsent) defaults ON and that
+                            // `polkit_gesture=0` turns that default off. The
+                            // hardcoded `true` here could not see the second half.
+                            _ => irlume_common::config::service_gesture_required(svc),
                         };
                         if required {
                             println!("{TAG} {svc}: REQUIRED {OK} (default)");
@@ -1417,9 +1419,10 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                 Ok(()) => {
                     if v == "on" {
                         println!(
-                            "{TAG} temporal challenge REQUIRED {OK}: releasing your keyring \
-                             password now needs continuous nodding (or a calibrated eye closure ~1s) after \
-                             the face match. Takes effect on the next face auth."
+                            "{TAG} consent gesture REQUIRED {OK}: releasing your keyring \
+                             password now needs {} after the face match. Takes effect on the \
+                             next face auth.",
+                            irlume_common::config::consent_gesture_mode().instruction("approve")
                         );
                     } else {
                         println!(
@@ -1846,7 +1849,9 @@ SETUP & STATUS
 
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
-  profiles [list|add-scan|rename|delete|forget-model|eyes-open <on|off>]   manage profiles
+  profiles [list|add-scan|rename|delete|forget-model|eyes-open off]   manage profiles
+                        (eyes-open can only be turned OFF: the gate refuses the
+                        users it exists to admit, see issue #386)
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
   calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
                         prompts; captures N rounds (default 3) and stores the median
@@ -1892,10 +1897,14 @@ SYSTEM INTEGRATION
                         measured threshold. Fetched or user-supplied, never shipped
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
-  credential-release-challenge <on|off|status>
-                        require continuous nodding (or a calibrated eye closure) before your
-                        keyring password is released. ON by default; turning it
-                        off lets an IR print that passes the face checks release it
+  credential-release-challenge [<service>] <on|off|status>
+                        the consent gesture: keep nodding to approve, shake your
+                        head to decline. Named with a service (sudo, su, doas,
+                        polkit-1) it sets that service's gesture; sudo-style
+                        elevation and polkit require one by default. Bare, it
+                        sets the gate on releasing your keyring password, which
+                        is OFF by default: a cold login and logout release it on
+                        the face match alone
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   uninstall [--keep-data] [--yes] un-wire PAM, stop the daemon, wipe enrolled

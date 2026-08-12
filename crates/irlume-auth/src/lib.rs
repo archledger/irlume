@@ -413,11 +413,10 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
 /// `IRLUME_POLKIT_GESTURE=0` or `polkit_gesture=0` in settings.conf. Verify
 /// stays face-gated either way; this only controls the extra blink.
 fn consent_gesture_enabled() -> bool {
-    let falsy = |v: &str| matches!(v.trim(), "0" | "false" | "no" | "off");
-    if let Ok(v) = std::env::var("IRLUME_POLKIT_GESTURE") {
-        return !falsy(&v);
-    }
-    !irlume_common::config::read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
+    // One definition, in irlume_common, because the TUI badge and the CLI status
+    // listing answer the same question and a private copy here is how they came
+    // to disagree with the engine about polkit.
+    irlume_common::config::polkit_gesture_enabled()
 }
 
 /// The consent verdict once the watch's stream has ended: what the in-loop

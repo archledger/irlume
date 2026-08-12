@@ -1060,7 +1060,8 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                // Settings holds user preferences (eyes-open, blink, biopolicy,
+                // Settings holds user preferences (eyes-open, per-service consent
+                // gesture, keyring gesture, biopolicy,
                 // third-party models), not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
@@ -3432,8 +3433,11 @@ impl App {
             // enabling only adds friction and goes straight through.
             (SC_SETTINGS, KeyCode::Char('c')) => {
                 let svc = SETTINGS_GESTURE_SERVICES[self.settings_svc_sel];
-                let current = irlume_common::config::service_gesture(svc)
-                    .unwrap_or_else(|| irlume_common::config::service_gesture_default(svc));
+                // Same effective read as the badge, so [c] flips what the user
+                // sees. Reading the elevation-only default here meant the first
+                // press on polkit wrote `on` (already the behaviour) and skipped
+                // the confirmation that disabling is supposed to require.
+                let current = irlume_common::config::service_gesture_required(svc);
                 let target = !current;
                 let sus = Suspend::ServiceGesture {
                     service: svc.to_string(),
@@ -4301,8 +4305,10 @@ impl App {
     /// off on a security setting.
     fn service_gesture_lines(&self) -> Vec<Line<'static>> {
         let picked = SETTINGS_GESTURE_SERVICES[self.settings_svc_sel];
-        let required = irlume_common::config::service_gesture(picked)
-            .unwrap_or_else(|| irlume_common::config::service_gesture_default(picked));
+        // The EFFECTIVE state the engine enforces, not the elevation-only default:
+        // polkit is AppConsent and defaults ON, so the old computation rendered
+        // `polkit-1: no` on a default install while the daemon required a gesture.
+        let required = irlume_common::config::service_gesture_required(picked);
         let mut row: Vec<Span> = vec![Span::raw("  ")];
         for (i, &svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
             let style = if i == self.settings_svc_sel {
@@ -4317,6 +4323,13 @@ impl App {
         vec![
             section("Per-service consent gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
             Line::from(row),
+            // The decline half, stated once where the gesture is configured. A
+            // user told only how to approve does not know a shake is a
+            // deliberate "no" the daemon acts on.
+            Line::from(Span::styled(
+                "  Keep nodding to approve; shake your head to decline.",
+                Style::new().dim(),
+            )),
             Line::raw(""),
         ]
     }
@@ -5689,7 +5702,7 @@ impl App {
         lines.push(act(
             "[u]",
             "Wire face-sudo",
-            "opt-in; face approves sudo prompts",
+            "opt-in; face + a consent gesture approve sudo prompts",
         ));
         lines.push(act(
             "[p]",
@@ -5702,7 +5715,7 @@ impl App {
         lines.push(act(
             "[c]",
             "Calibrate gesture",
-            "optional eye-closure alternative; the head nod needs no calibration",
+            "optional eye-closure alternative; the head nod (the default) needs no calibration",
         ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
@@ -7044,6 +7057,39 @@ mod tests {
         assert_eq!(app.settings_svc_sel, 1, "Down picks the next service");
         app.on_key(KeyCode::Up);
         assert_eq!(app.settings_svc_sel, 0);
+
+        // polkit-1 with no override. It is AppConsent, which the ENGINE defaults
+        // to gesture-ON, so the first [c] must offer to DISABLE it. Only sudo
+        // (index 0) was ever driven here, so the elevation-only default read
+        // polkit as already-off and the first press wrote an `on` that changed
+        // nothing, with no confirmation, and every test still passed.
+        std::fs::write(dir.join("settings.conf"), "").unwrap();
+        let polkit_i = SETTINGS_GESTURE_SERVICES
+            .iter()
+            .position(|&s| s == "polkit-1")
+            .expect("polkit-1 is in the list");
+        app.settings_svc_sel = polkit_i;
+        let text = draw_text(&app);
+        assert!(
+            text.contains("polkit-1: ● yes"),
+            "polkit must render as REQUIRED, matching the daemon: {text}"
+        );
+        app.on_key(KeyCode::Char('c'));
+        assert!(
+            app.suspend.is_none(),
+            "disabling polkit must not act on the keypress alone"
+        );
+        match app.confirm.take() {
+            Some((q, verb, ConfirmAct::Sus(Suspend::ServiceGesture { service, on }))) => {
+                assert_eq!(service, "polkit-1");
+                assert!(!on, "the first press on a default-ON polkit must DISABLE");
+                assert_eq!(verb, "Disable");
+                assert!(q.contains("polkit-1"), "the confirm must name it: {q}");
+            }
+            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
+            None => panic!("disabling polkit must raise a confirm"),
+        }
+        app.settings_svc_sel = 0;
 
         // A service explicitly OFF: [c] ENABLES it and goes straight through
         // (turning a gesture ON only adds friction, so no confirm).
@@ -10824,6 +10870,22 @@ mod tests {
         );
         // "dark mode" reads as a UI theme, not an IR capability.
         assert!(!text.contains("dark mode"), "{text}");
+    }
+
+    /// The Settings tab must name BOTH halves of the gesture. A user told only
+    /// how to approve does not know a head shake is a deliberate decline the
+    /// daemon acts on (it cancels the request, and on a polkit prompt it ends the
+    /// attempt). Before this, no user-visible string in the CLI or TUI mentioned
+    /// the shake at all.
+    #[test]
+    fn settings_names_the_shake_decline() {
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        assert!(
+            text.contains("shake your head to decline"),
+            "the gesture section must name the decline: {text}"
+        );
     }
 
     #[test]

@@ -161,8 +161,12 @@ fn debug(action: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
+            // 2, not 1: this is a usage error, the convention the rest of the CLI
+            // follows (and that `logs`'s own option handler a few lines above
+            // already returns). FAILURE here told a script the command had run
+            // and failed, when it had not run at all.
             eprintln!("[logs] unknown: 'debug {other}' (use: debug [on|off])");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }

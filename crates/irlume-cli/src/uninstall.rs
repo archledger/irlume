@@ -46,7 +46,26 @@ pub struct TeardownReport {
     pub data_left: Vec<String>,
 }
 
+/// The first argument `uninstall` does not accept, if any.
+///
+/// Extracted so the refusal is testable without running a teardown: the check
+/// itself must never need a machine to prove.
+fn unknown_arg(args: &[String]) -> Option<&String> {
+    const KNOWN: &[&str] = &["--yes", "-y", "--keep-data", "uninstall"];
+    args.iter().find(|a| !KNOWN.contains(&a.as_str()))
+}
+
 pub fn run(args: &[String]) -> ExitCode {
+    // Refuse anything this command does not know, BEFORE it can delete a thing.
+    // `--keep-data` mistyped as `--keep-dat` used to be ignored in silence, and
+    // with `--yes` beside it the run wiped every enrolled face, sealed secret and
+    // recovery envelope that the flag was there to protect. A destructive verb is
+    // the last place to guess what the operator meant.
+    if let Some(bad) = unknown_arg(args) {
+        eprintln!("[uninstall] unknown argument '{bad}' (accepts: --yes/-y, --keep-data)");
+        eprintln!("[uninstall] nothing was removed.");
+        return ExitCode::from(2);
+    }
     let assume_yes = args.iter().any(|a| a == "--yes" || a == "-y");
     let keep_data = args.iter().any(|a| a == "--keep-data");
 
@@ -191,6 +210,7 @@ pub fn run(args: &[String]) -> ExitCode {
     } else {
         SnapshotEvidence::default()
     };
+    let removal_failed = removed.is_err();
     match removed {
         Ok(what) => {
             println!("[uninstall] {what}");
@@ -202,7 +222,16 @@ pub fn run(args: &[String]) -> ExitCode {
             println!("  {}", removal_hint(&origin));
         }
     }
-    ExitCode::SUCCESS
+    // The exit code has to carry what the text already says. Returning success
+    // after "the data wipe was incomplete" or "could not finish removal" told
+    // every script, and every operator who checks `$?`, that a machine had been
+    // cleaned when enrolled templates and sealed envelopes were still on disk.
+    let wipe_incomplete = report.data_wipe_requested && !report.data_wiped;
+    if removal_failed || wipe_incomplete {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Remove irlume itself. Package installs go through the package manager (so the
@@ -615,6 +644,34 @@ fn stdin_is_tty() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A destructive verb must not guess. `--keep-data` mistyped is the whole
+    /// reason this exists: it used to be ignored, and with `--yes` beside it the
+    /// run wiped every enrolled face, sealed secret and recovery envelope the
+    /// flag was there to keep.
+    #[test]
+    fn uninstall_refuses_an_argument_it_does_not_know() {
+        let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            unknown_arg(&argv(&["uninstall", "--keep-dat", "--yes"])).map(String::as_str),
+            Some("--keep-dat"),
+            "a mistyped --keep-data must be caught, not ignored"
+        );
+        assert_eq!(
+            unknown_arg(&argv(&["uninstall", "--purge"])).map(String::as_str),
+            Some("--purge")
+        );
+        // Every accepted spelling passes, alone and together.
+        for ok in [
+            vec!["uninstall"],
+            vec!["uninstall", "--yes"],
+            vec!["uninstall", "-y"],
+            vec!["uninstall", "--keep-data"],
+            vec!["uninstall", "--keep-data", "--yes"],
+        ] {
+            assert!(unknown_arg(&argv(&ok)).is_none(), "{ok:?} must be accepted");
+        }
+    }
     use super::*;
 
     #[test]

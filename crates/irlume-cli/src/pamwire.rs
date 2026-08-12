@@ -1298,7 +1298,23 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         // after a distro update rewrites a greeter's PAM file out from under us
         // (authselect, pam-auth-update, or a package upgrade shipping a fresh
         // vendor copy). On disable we clear the marker so reconcile stays quiet.
-        write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+        // Record what is WIRED, not what this invocation asked for. The scopes are
+        // opt-in and independent: `login enable --with-polkit --apply` followed by
+        // `login enable --with-sudo --apply` leaves polkit's stack wired (the
+        // second run does not touch it, `polkit_in_scope` is false without the
+        // flag) while the marker from that run said `with_polkit=false`. Reconcile
+        // reads the marker, so the surface silently dropped out of the self-heal
+        // and a later distro PAM rewrite would strip irlume from it for good.
+        // Observed the same way `reconcile`'s adopt path already does it.
+        if enable {
+            let obs_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+            let obs_polkit = polkit_wired() == Some(true);
+            let obs_lock =
+                Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc));
+            write_wired_marker(enable, obs_sudo, obs_polkit, obs_lock);
+        } else {
+            write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+        }
         // Say it at the moment the user wired it, not only when they next run
         // `login status`: a wallet that still prompts after `enable --apply`
         // otherwise reads as irlume having failed.

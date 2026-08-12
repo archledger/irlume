@@ -861,8 +861,12 @@ fn logs_debug_status_and_root_guards() {
         }
     }
 
+    // 2, the usage-error code the rest of the CLI uses and that this command's
+    // own option handler already returned for a bad option. It answered 1 here,
+    // which tells a wrapper the command ran and failed rather than that it was
+    // never a valid invocation.
     let (code, _, err) = run(&mut sb.cmd(&["logs", "debug", "bogus"]));
-    assert_eq!(code, 1);
+    assert_eq!(code, 2);
     assert!(err.contains("unknown: 'debug bogus'"), "{err}");
 }
 

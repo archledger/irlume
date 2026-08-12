@@ -630,6 +630,27 @@ fn daemon_up() -> bool {
 
 /// `irlume status`: one-shot health dashboard. Always exits 0 (it reports state,
 /// it doesn't gate anything); use `irlume detect` for script-friendly exit codes.
+/// How many enrolled scans the CURRENTLY LOADED recognizer could match, summed
+/// over every profile, or `None` when the daemon did not say.
+///
+/// A template only matches the recognizer that produced it. Reporting the raw
+/// scan count as health lets a profile whose templates all belong to a model
+/// that is no longer loaded read as ready while no face can authenticate.
+/// `None` is deliberately not zero: a daemon older than the per-recognizer
+/// counts sends an empty map, and treating that as "nothing usable" would tell
+/// a healthy install to re-enroll.
+fn usable_scans(profiles: &[irlume_common::ProfileSummary]) -> Option<usize> {
+    profiles
+        .iter()
+        .map(
+            |p| match (&p.live_recognizer, p.scans_by_recognizer.is_empty()) {
+                (Some(live), false) => Some(p.scans_by_recognizer.get(live).copied().unwrap_or(0)),
+                _ => None,
+            },
+        )
+        .try_fold(0usize, |acc, n| n.map(|n| acc + n))
+}
+
 pub fn status(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     println!("irlume status for '{user}'");
@@ -681,6 +702,23 @@ pub fn status(args: &[String]) -> ExitCode {
             );
             for p in &profiles {
                 println!("                  - {} ({} scan(s))", p.name, p.scans.len());
+            }
+            // A scan can only match the recognizer it was captured with, which is
+            // what `scans_by_recognizer`'s own doc says: "how many scans" has no
+            // single answer worth reporting on its own. The line above reports
+            // exactly that number with a tick, so a profile whose templates all
+            // belong to a recognizer that is no longer loaded (a third-party model
+            // disabled, or swapped) read as healthy while no face could match.
+            //
+            // Silent when the daemon sent no counts at all: that is an older
+            // daemon, and unknown is not zero.
+            let usable = usable_scans(&profiles);
+            if let Some(0) = usable {
+                if scans > 0 {
+                    println!(
+                        "                  {WARN} none of those scans belong to the recognizer                          that is loaded now, so no face can match: re-enable the model it was                          enrolled with, or run `irlume enroll` again"
+                    );
+                }
             }
         }
         Ok(Response::Enrollment { .. }) => {
@@ -2293,4 +2331,50 @@ mod setup_offer_tests {
             "the fixture name must be absent from the catalog for this to discriminate"
         );
     }
+}
+
+/// The scan count irlume prints as health must be the count that can
+/// actually match, and "the daemon did not say" must not read as zero.
+#[test]
+fn usable_scans_counts_only_the_loaded_recognizer() {
+    let prof = |live: Option<&str>, counts: &[(&str, usize)], scans: usize| {
+        irlume_common::ProfileSummary {
+            name: "P".into(),
+            scans: (0..scans).map(|i| format!("scan{i}")).collect(),
+            scans_by_recognizer: counts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            live_recognizer: live.map(str::to_string),
+        }
+    };
+
+    // Every template belongs to the loaded space.
+    assert_eq!(
+        usable_scans(&[prof(Some("embed:a"), &[("embed:a", 11)], 11)]),
+        Some(11)
+    );
+    // The templates belong to a recognizer that is no longer loaded: the
+    // profile looks full and can match nothing. This is the case that used to
+    // print "11 scan(s) ✅".
+    assert_eq!(
+        usable_scans(&[prof(Some("embed:b"), &[("embed:a", 11)], 11)]),
+        Some(0)
+    );
+    // Summed across profiles, only the loaded space counting.
+    assert_eq!(
+        usable_scans(&[
+            prof(Some("embed:a"), &[("embed:a", 3)], 3),
+            prof(Some("embed:a"), &[("embed:a", 4), ("embed:b", 9)], 13),
+        ]),
+        Some(7)
+    );
+    // An older daemon sends no counts: unknown, not zero.
+    assert_eq!(usable_scans(&[prof(Some("embed:a"), &[], 11)]), None);
+    assert_eq!(usable_scans(&[prof(None, &[("embed:a", 11)], 11)]), None);
+    // One silent profile makes the total unknown rather than an undercount.
+    assert_eq!(
+        usable_scans(&[
+            prof(Some("embed:a"), &[("embed:a", 3)], 3),
+            prof(None, &[], 5),
+        ]),
+        None
+    );
 }

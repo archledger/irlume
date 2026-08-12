@@ -39,10 +39,31 @@ mod tui;
 mod uninstall;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    // BOTH standard spellings. `--name=value` used to be invisible here, and the
+    // silence was the danger: `profiles delete --user=alice` parsed as no --user
+    // at all, so the fallback named the INVOKING user and the command deleted
+    // their enrollment instead of alice's. Every guard that asks "was --user
+    // given" reads `flag_present`, which knows the same two spellings.
+    for (i, a) in args.iter().enumerate() {
+        if a == name {
+            return args.get(i + 1).map(String::as_str);
+        }
+        // `--username=x` must NOT satisfy `--user`: the '=' has to come directly
+        // after the flag name.
+        if let Some(rest) = a.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Was `name` given at all, in either spelling (`--name v` or `--name=v`)?
+///
+/// Separate from [`flag`] because a dangling flag has no value but is still
+/// PRESENT, and that difference is what the `--user` guards act on.
+pub(crate) fn flag_present(args: &[String], name: &str) -> bool {
     args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
+        .any(|a| a == name || a.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
 }
 
 /// Developer / benchmark / research subcommands: hidden from `help` and gated
@@ -352,7 +373,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
     // a destructive subcommand (forget-model, delete) at the invoking user's
     // own enrollment. Checked here, not in `user_arg`: the fallback semantics
     // of an absent flag belong to every caller, this omission does not.
-    if args.iter().any(|a| a == "--user")
+    if flag_present(args, "--user")
         && !matches!(flag(args, "--user"), Some(u) if !u.is_empty() && !u.starts_with("--"))
     {
         eprintln!("[profiles] --user requires a username");
@@ -1631,7 +1652,12 @@ pub(crate) fn user_arg(args: &[String]) -> String {
     // and the one thing a resolver must not do is quietly resolve to the wrong
     // subject. Exiting rather than returning an error keeps every caller's
     // signature, and there is no sensible way to continue.
-    if args.iter().any(|a| a == "--user") && flag(args, "--user").is_none() {
+    if flag_present(args, "--user") && flag(args, "--user").is_none() {
+        // A DANGLING flag only. An empty value (`--user ""`, and now `--user=`)
+        // keeps its documented meaning, which
+        // `user_arg_falls_back_to_env_user_when_flag_is_empty_or_absent` pins:
+        // it falls back like an absent flag. The subcommands that must not
+        // tolerate that, `profiles` above all, carry their own stricter guard.
         eprintln!("irlume: --user requires a username");
         std::process::exit(2);
     }
@@ -5087,6 +5113,38 @@ mod tests {
     fn flag_with_the_name_in_last_position_has_no_value() {
         let a = argv(&["enroll", "--reset"]);
         assert_eq!(flag(&a, "--reset"), None);
+    }
+
+    /// `--name=value` is as standard a spelling as `--name value`, and it used to
+    /// parse as ABSENT. That silence is what made it dangerous: `--user=alice`
+    /// left the flag looking unset, so the fallback named the invoking user and a
+    /// destructive per-user command acted on the wrong enrollment without a word.
+    #[test]
+    fn flag_reads_the_equals_spelling_and_only_for_an_exact_name() {
+        let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        assert_eq!(flag(&argv(&["--user=alice"]), "--user"), Some("alice"));
+        assert_eq!(flag(&argv(&["--user", "alice"]), "--user"), Some("alice"));
+        // A value that itself contains '=' survives intact.
+        assert_eq!(flag(&argv(&["--user=a=b"]), "--user"), Some("a=b"));
+        // Empty after the '=' is a value that is present and empty, which the
+        // caller's guard turns into a usage error rather than a silent fallback.
+        assert_eq!(flag(&argv(&["--user="]), "--user"), Some(""));
+        // A longer flag that merely STARTS with the name must not satisfy it.
+        assert_eq!(flag(&argv(&["--username=alice"]), "--user"), None);
+        assert_eq!(flag(&argv(&["--users=alice"]), "--user"), None);
+        // Whichever spelling comes first wins, as with the repeated-flag rule.
+        assert_eq!(
+            flag(&argv(&["--user=first", "--user", "second"]), "--user"),
+            Some("first")
+        );
+
+        // `flag_present` answers the question the guards ask: given at all?
+        assert!(flag_present(&argv(&["--user=alice"]), "--user"));
+        assert!(flag_present(&argv(&["--user="]), "--user"));
+        assert!(flag_present(&argv(&["--user"]), "--user"));
+        assert!(!flag_present(&argv(&["--username=alice"]), "--user"));
+        assert!(!flag_present(&argv(&["list"]), "--user"));
     }
 
     #[test]

@@ -2659,9 +2659,20 @@ impl App {
     /// (no-echo passphrase / fprintd prompts), then wait for the user to return.
     fn run_suspended(&mut self, s: Suspend) {
         let none: [String; 0] = [];
+        // The account this TUI is managing, for the steps that act on ONE user.
+        // `irlume tui --user bob` shows bob everywhere and sends bob in every
+        // daemon request, but a step that shells out re-resolves its own subject
+        // from SUDO_USER/$USER, which names whoever launched the TUI: an admin
+        // setting bob up calibrated the gesture onto their own enrollment, and
+        // "delete ALL enrolled fingerprints" deleted their own. Built here so
+        // every per-user arm passes the same thing.
+        let for_user: [String; 2] = ["--user".to_string(), self.user.clone()];
+        // A local copy for the shell-out slices: `sudo_step` takes `&mut self`,
+        // so they cannot hold a borrow of `self.user` across the call.
+        let target = self.user.clone();
         match s {
             Suspend::FingerprintAdd => {
-                crate::fingerprint::run(Some("add"), &none);
+                crate::fingerprint::run(Some("add"), &for_user);
             }
             Suspend::LoginStatus => {
                 crate::pamwire::run(Some("status"), &none);
@@ -2703,7 +2714,7 @@ impl App {
             ),
             Suspend::CalibrateClosure => self.sudo_step(
                 "calibrate the eye-closure gesture",
-                &["irlume", "calibrate-closure"],
+                &["irlume", "calibrate-closure", "--user", &target],
             ),
             Suspend::LogsDebug(on) => self.sudo_step(
                 if on {
@@ -2714,19 +2725,19 @@ impl App {
                 &["irlume", "logs", "debug", if on { "on" } else { "off" }],
             ),
             Suspend::FingerprintVerify => {
-                crate::fingerprint::run(Some("verify"), &none);
+                crate::fingerprint::run(Some("verify"), &for_user);
             }
             Suspend::FingerprintEnable => self.sudo_step(
                 "enable fingerprint (face OR finger)",
-                &["irlume", "fingerprint", "enable"],
+                &["irlume", "fingerprint", "enable", "--user", &target],
             ),
             Suspend::FingerprintDisable => self.sudo_step(
                 "disable fingerprint for login",
-                &["irlume", "fingerprint", "disable"],
+                &["irlume", "fingerprint", "disable", "--user", &target],
             ),
             Suspend::FingerprintReset => self.sudo_step(
                 "delete ALL enrolled fingerprints",
-                &["irlume", "fingerprint", "reset"],
+                &["irlume", "fingerprint", "reset", "--user", &target],
             ),
             Suspend::ModelsEnable(name) => self.sudo_step(
                 "enable a third-party model (license confirm follows)",
@@ -3472,7 +3483,23 @@ impl App {
                 // sees. Reading the elevation-only default here meant the first
                 // press on polkit wrote `on` (already the behaviour) and skipped
                 // the confirmation that disabling is supposed to require.
-                let current = irlume_common::config::service_gesture_required(svc);
+                //
+                // And it must be the read that can say "I do not know".
+                // settings.conf is 0600 root-owned, so an unprivileged TUI cannot
+                // see an override at all and every service defaulted to ON: the
+                // key could then only ever DISABLE, and pressing it again after a
+                // disable wrote `off` a second time while the row still claimed
+                // the gesture was required. Say so instead of guessing.
+                let Some(current) = irlume_common::config::service_gesture_required_visible(svc)
+                else {
+                    self.log(
+                        '·',
+                        format!(
+                            "the consent gesture for '{svc}' is a root-only setting;                              run the TUI with sudo, or check it with:                              sudo irlume credential-release-challenge {svc} status"
+                        ),
+                    );
+                    return;
+                };
                 let target = !current;
                 let sus = Suspend::ServiceGesture {
                     service: svc.to_string(),
@@ -4358,7 +4385,10 @@ impl App {
         // The EFFECTIVE state the engine enforces, not the elevation-only default:
         // polkit is AppConsent and defaults ON, so the old computation rendered
         // `polkit-1: no` on a default install while the daemon required a gesture.
-        let required = irlume_common::config::service_gesture_required(picked);
+        // Tri-state, like the two panels below it: an unprivileged TUI cannot read
+        // the root-only settings.conf, and a definite badge there is a guess
+        // dressed as a fact.
+        let required = irlume_common::config::service_gesture_required_visible(picked);
         let mut row: Vec<Span> = vec![Span::raw("  ")];
         for (i, &svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
             let style = if i == self.settings_svc_sel {
@@ -4369,7 +4399,7 @@ impl App {
             row.push(Span::styled(format!("{svc}   "), style));
         }
         row.push(Span::raw(format!("   {picked}: ")));
-        row.push(onoff(required));
+        row.push(onoff_opt(required));
         vec![
             section("Per-service consent gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
             Line::from(row),
@@ -11100,6 +11130,63 @@ mod tests {
             Some(v) => std::env::set_var("IRLUME_SOCKET", v),
             None => std::env::remove_var("IRLUME_SOCKET"),
         }
+    }
+
+    /// When settings.conf cannot be read, the gesture row must say so rather than
+    /// render a default as a fact, and [c] must refuse to pick a direction.
+    ///
+    /// The file ships 0600 root-owned, so this is what an ordinary `irlume tui`
+    /// sees. Guessing made the key one-way: every service read as required, so
+    /// the only move [c] offered was DISABLE, and pressing it after a disable
+    /// wrote `off` again while the row still claimed the gesture was in place.
+    #[test]
+    fn an_unreadable_settings_file_shows_unknown_and_refuses_to_toggle() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-noread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("settings.conf");
+        std::fs::write(&conf, "service_gesture.sudo=0\n").unwrap();
+        // Unreadable, the way the shipped file is to a non-root TUI.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        // Root can read a 0000 file, so this test only means anything unprivileged.
+        // SAFETY: geteuid reads our own credentials and cannot fail.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if !is_root {
+            let mut app = test_app();
+            app.screen = SC_SETTINGS;
+            let text = draw_text(&app);
+            assert!(
+                text.contains("◐ unknown"),
+                "an unreadable config must render as unknown, not as a default: {text}"
+            );
+
+            let before = app.suspend.is_none() && app.confirm.is_none();
+            assert!(before);
+            app.on_key(KeyCode::Char('c'));
+            assert!(
+                app.suspend.is_none() && app.confirm.is_none(),
+                "[c] must not pick a direction from a state it cannot read"
+            );
+            assert!(
+                app.activity.iter().any(|l| l.1.contains("root-only")),
+                "and it must say why: {:?}",
+                app.activity
+            );
+        }
+
+        let _ = std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600));
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A privileged step must not re-`sudo` when the TUI is already root: the

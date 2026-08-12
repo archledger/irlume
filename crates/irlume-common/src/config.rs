@@ -429,6 +429,43 @@ pub fn polkit_gesture_enabled() -> bool {
     !read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
 }
 
+/// [`service_gesture_required`] when the answer can be KNOWN, `None` when the
+/// config cannot be read.
+///
+/// settings.conf ships 0600 root-owned, so an unprivileged reader gets EACCES,
+/// and [`read_kv`] reports that as "absent" like any other miss. Every caller
+/// that REPORTS state to a person needs the third answer instead: a TUI running
+/// without sudo was rendering the elevation/polkit defaults as a definite
+/// "required" for a file it had never read, and deriving its toggle direction
+/// from the same guess, so the key could only ever turn a gesture off and the row
+/// went on asserting a gate the user had just removed through it.
+pub fn service_gesture_required_visible(service: &str) -> Option<bool> {
+    match observe_kv("settings.conf", &format!("{SERVICE_GESTURE_KEY}.{service}")) {
+        KvObservation::Value(v) => Some(!falsy(&v)),
+        KvObservation::Unknown(_) => None,
+        // No override: the default applies, and for an app-consent service that
+        // default is itself conditional on `polkit_gesture`, which lives in the
+        // same unreadable file. Ask about that key the same honest way.
+        KvObservation::Absent => {
+            if matches!(
+                crate::pam_service::classify(service),
+                Some(crate::pam_service::ServiceKind::AppConsent)
+            ) {
+                if std::env::var_os("IRLUME_POLKIT_GESTURE").is_some() {
+                    return Some(polkit_gesture_enabled() || service_gesture_default(service));
+                }
+                match observe_kv("settings.conf", "polkit_gesture") {
+                    KvObservation::Value(v) => Some(!falsy(&v) || service_gesture_default(service)),
+                    KvObservation::Absent => Some(true),
+                    KvObservation::Unknown(_) => None,
+                }
+            } else {
+                Some(service_gesture_default(service))
+            }
+        }
+    }
+}
+
 /// The EFFECTIVE consent-gesture state for a PAM service: what the engine will
 /// actually do, not what one config key says.
 ///

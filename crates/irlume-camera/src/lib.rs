@@ -213,10 +213,14 @@ pub struct IrCaptureStats {
     /// correction the second draft of this comment needed.
     /// `Quantization::Default` is not itself an effective range: V4L2 resolves
     /// it with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`,
-    /// which needs the COLORSPACE, and `IrCamera` keeps only the quantization
-    /// out of the negotiated `Format`. A `Default` YUV stream therefore cannot
-    /// be told apart from a JPEG-colorspace one, and answering 235 for all of
-    /// them is wrong for the second while 255 is wrong for the first.
+    /// which needs the COLORSPACE. Since #427 `IrCamera` retains the whole
+    /// negotiated `Format`, colorspace included, so the resolution has
+    /// become COMPUTABLE; a third draft of this comment must not claim
+    /// otherwise. What has not changed is that nobody has computed and
+    /// validated it: a `Default` YUV stream resolves limited unless the
+    /// colorspace is JPEG, 235 is wrong for the JPEG case and 255 for the
+    /// rest, and no NV12 or YUYV IR camera exists in this project's record
+    /// to validate either arm against.
     ///
     /// The `None` is also load-bearing, which matters more than either.
     /// `role_from_formats` calls any node advertising either fourcc

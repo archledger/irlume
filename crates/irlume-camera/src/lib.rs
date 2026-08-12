@@ -209,14 +209,20 @@ pub struct IrCaptureStats {
     /// irlume does: `IrCamera::open` stores `fmt.quantization` and
     /// `clipping_white_level` already takes it.
     ///
-    /// Carrying it is still not enough to compute their ceiling, which is the
-    /// correction the second draft of this comment needed.
-    /// `Quantization::Default` is not itself an effective range: V4L2 resolves
-    /// it with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`,
-    /// which needs the COLORSPACE, and `IrCamera` keeps only the quantization
-    /// out of the negotiated `Format`. A `Default` YUV stream therefore cannot
-    /// be told apart from a JPEG-colorspace one, and answering 235 for all of
-    /// them is wrong for the second while 255 is wrong for the first.
+    /// Carrying it is still not enough to compute their ceiling, and each
+    /// draft of this comment has mislocated why, which is itself the lesson:
+    /// `Quantization::Default` is not an effective range, V4L2 resolves it
+    /// with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`.
+    /// Since #427 `IrCamera` retains the negotiated `v4l::Format` with its
+    /// colorspace, but the pinned v4l 0.14 `Format` drops the driver-echoed
+    /// Y'CbCr ENCODING on conversion, and the encoding is a live input:
+    /// default YUV is full range for JPEG colorspace AND for XV601/XV709
+    /// encodings, limited otherwise (the Codex round on this PR caught the
+    /// second draft classifying every non-JPEG case as limited, a
+    /// 235-ceiling that would falsely refuse legitimate frames). The
+    /// resolution is therefore still not generally computable here, and no
+    /// NV12 or YUYV IR camera exists in this project's record to validate
+    /// either arm against.
     ///
     /// The `None` is also load-bearing, which matters more than either.
     /// `role_from_formats` calls any node advertising either fourcc

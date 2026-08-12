@@ -128,8 +128,10 @@ pub struct Signals {
     /// path, or a negotiated format the camera crate declines to give a ceiling
     /// for (the Y16 family is rescaled per frame, so its 255 is the frame's own
     /// maximum; NV12 and YUYV are declined so that a colour stream placed in
-    /// the IR slot is refused rather than judged, and because resolving their
-    /// `Default` quantization needs a colorspace irlume does not retain, see
+    /// the IR slot is refused rather than judged; resolving their `Default`
+    /// quantization needs the colorspace AND the Y'CbCr encoding, and the
+    /// pinned v4l crate drops the encoding, so it stays uncomputable; the
+    /// refusal is the load-bearing part either way, see
     /// `clipping_white_level` and #385). `None` is NOT zero clipping.
     ///
     /// GATED since #237, at [`IR_SATURATED_FRAC_MAX`]. Saturation compresses

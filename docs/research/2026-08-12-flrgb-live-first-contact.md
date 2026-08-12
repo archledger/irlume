@@ -1,15 +1,24 @@
 # flrgb live first contact, RGB genuine + vinyl-print attack
 
-Date: 2026-08-12, Zenbook /dev/video0 (RGB), enrolled user, glasses on,
-normal desk light. Model `cv_manual_face-liveness_flrgb` model.onnx
-sha256 e13b5543520b7770..., scored through the 2026-08-07 harness's
-detect/align/infer unchanged (score.py imports its definitions). `p_fake`
-is out[0] of the model's own softmax pair, avoiding the ModelScope
-double-softmax. Both preprocessing variants scored: pad96 (the card's
-96/112 expansion) and pad16 (the config's 16/112 route). Raw per-frame
-scores in `2026-08-12-flrgb-live-scores.csv` beside this file; the frames
-themselves are biometric and stay out of the repository, per the
-recognition-results precedent.
+Date: 2026-08-12, Zenbook /dev/video0 (RGB), enrolled user, glasses on.
+Model `cv_manual_face-liveness_flrgb` `model.onnx` sha256
+`e13b5543520b7770cd844266a939aedeaeab57811e26c0e57754c654f8bb7419`,
+detection by irlume's shipped YuNet sha256
+`8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`.
+
+Scores were produced by `benchmarks/pad-candidates/flrgb_live_score.py`
+using `benchmarks/pad-candidates/flrgb_eval.py` for detection, cropping
+and inference; both are committed with the hashes above pinned in the
+scorer's header, and re-running the scorer reproduces
+`2026-08-12-flrgb-live-scores.csv` byte for byte (verified after
+deleting it). The weights are not committed and are resolved through
+`FLRGB_MODEL` / `IRLUME_YUNET`. The captured frames are biometric and
+stay in the local research store, per the recognition-results precedent.
+
+`p_fake` is element zero of the model's own probability pair, without the
+extra softmax the ModelScope pipeline applies. Both preprocessing
+variants were scored: pad96, the model card's 96/112 expansion, and
+pad16, the configured pipeline's 16/112 route.
 
 ## Captures
 
@@ -65,7 +74,7 @@ user in low light almost always; any threshold high enough to pass the
 low-light user passes the head-on print. flrgb is a deny-only cue, so
 its false denials cost the password rather than a grant, but the whole
 reason to add it is to cover the RGB attack the IR gate might miss, and
-on the one presentation an attacker uses it covers that attack only by
+on the baseline square-on presentation it covers that attack only by
 denying the legitimate user in the dark. That is negative value in the
 exact regime it was added for.
 
@@ -96,8 +105,11 @@ candidate.
 | tilt right | 0.841 | 0.975 | 0.996 | 1 |
 | shallow angle | 0.366 | 0.948 | 0.999 | 7 |
 
-The flat, square-on, login-distance presentation, the one an attacker
-actually uses, is the presentation flrgb scores lowest; the tilted
-presentations no attacker chooses are the ones it catches hardest. The
-#239 lesson exactly: the attack's easiest case for the defender is the
-one the attacker never presents.
+flrgb scores the flat, square-on, login-distance presentation lowest and
+the tilted presentations highest, on this print and this session. The
+square-on presentation is the one this project's own threat model treats
+as the baseline print attack (#235, #237), and it is the presentation a
+camera-facing attacker can hold most easily; that makes the ordering the
+unfavourable one, whatever an individual attacker would in fact choose.
+Kin to the #239 lesson: an attack corpus that varies only the defender's
+favourite axis measures the instrument, not the attacker.

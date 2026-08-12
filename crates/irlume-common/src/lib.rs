@@ -755,6 +755,16 @@ pub enum Response {
         /// Liveness verdict; auth is granted only if `live` AND score>=threshold.
         live: bool,
         reason: String,
+        /// True when the refusal came from POLICY rather than from looking at a
+        /// face: the configured method is fingerprint, the RGB-only convenience
+        /// tier does not allow this service, the opt-in biopolicy gate refuses
+        /// it, or the user is rate-limited. Every one of those answers
+        /// `granted: false, live: false`, which a reader cannot tell apart from
+        /// a spoof verdict, so `auth test` reported them all as "not-live" and a
+        /// desktop told the user their face looked fake. `#[serde(default)]` so
+        /// an older daemon decodes as false.
+        #[serde(default)]
+        refused_by_policy: bool,
         /// True only when this refusal is a DELIBERATE head-shake decline (the
         /// daemon's consent watch saw a shake and cancelled), never for a timeout,
         /// a no-match, or a pre-camera policy denial. pam_irlume maps a polkit
@@ -1094,6 +1104,7 @@ mod tests {
             live: true,
             reason: "no match".into(),
             declined_by_gesture: true,
+            refused_by_policy: false,
         };
         let mut v = serde_json::to_value(&full).expect("serialize");
         let obj = v

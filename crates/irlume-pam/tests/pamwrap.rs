@@ -318,6 +318,7 @@ fn grant() -> Response {
         live: true,
         reason: "match".into(),
         declined_by_gesture: false,
+        refused_by_policy: false,
     }
 }
 
@@ -506,6 +507,7 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
         live: false,
         reason: "face not granted".into(),
         declined_by_gesture: false,
+        refused_by_policy: false,
     });
 
     // A plain verify (no `unseal`) on the polkit service.
@@ -595,6 +597,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
         live: false,
         reason: "denied".into(),
         declined_by_gesture: d.load(Ordering::SeqCst),
+        refused_by_policy: false,
     });
 
     // pam_irlume under a control line, then pam_permit as the distro
@@ -813,6 +816,7 @@ fn pamwrap_wait_mode_retries_until_a_match() {
                     live: true,
                     reason: "below threshold".into(),
                     declined_by_gesture: false,
+                    refused_by_policy: false,
                 }
             } else {
                 grant()

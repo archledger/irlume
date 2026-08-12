@@ -444,6 +444,22 @@ Three properties a consumer may rely on:
 and `live`. It is never derived from daemon wording, so a reworded message is not
 a breaking change.
 
+`reason` cannot express a refusal that never looked at a face. The configured
+method being fingerprint, the RGB-only convenience tier, the opt-in biopolicy
+gate and the rate limiter all answer `granted: false, live: false`, and `reason`
+reports every one of them as `not-live`: a face looked fake when none was
+examined. `refusal` carries that distinction and is absent when granted:
+
+| `refusal` | what happened |
+| --- | --- |
+| `policy` | refused before any capture: the configured method, the tier, the biopolicy gate, or the rate limiter |
+| `declined` | a deliberate head shake during the consent watch |
+| `no-match` | a live face that did not match the enrolment |
+| `not-live` | the liveness gate refused the capture |
+
+`reason` keeps its three values and its meaning, so a consumer written before
+`refusal` existed reads exactly what it read before.
+
 **The match score is not reported.** A caller that can read a continuous score
 can hill-climb against it, adjusting a presentation until it crosses the
 threshold, which would turn a diagnostic into an oracle. `granted` and `live`

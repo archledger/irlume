@@ -795,7 +795,16 @@
             "not-live",
             "no-match"
           ],
-          "description": "Derived from granted and live, never from daemon prose."
+          "description": "Derived from granted and live, never from daemon prose. It cannot express a policy refusal: the configured method, the RGB-only tier, the biopolicy gate and the rate limiter all answer granted=false live=false and land here as not-live. Read `refusal` to tell those apart."
+        },
+        "refusal": {
+          "enum": [
+            "policy",
+            "declined",
+            "no-match",
+            "not-live"
+          ],
+          "description": "Why the refusal happened, at a granularity `reason` cannot express. `policy` means nothing looked at a face: the configured method is fingerprint, the RGB-only convenience tier does not allow this service, the opt-in biopolicy gate refuses it, or the caller is rate-limited. `declined` is a deliberate head shake. Absent when granted."
         }
       }
     },

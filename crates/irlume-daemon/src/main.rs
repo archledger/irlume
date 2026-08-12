@@ -3057,6 +3057,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     live: false,
                     reason: "face auth disabled: the configured method is fingerprint".into(),
                     declined_by_gesture: false,
+                    refused_by_policy: true,
                 };
             }
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
@@ -3092,6 +3093,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                             "RGB-only convenience: face limited to screen unlock (not {class:?})"
                         ),
                         declined_by_gesture: false,
+                        refused_by_policy: true,
                     };
                 }
             }
@@ -3110,6 +3112,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         live: false,
                         reason: format!("biopolicy: face may not satisfy '{svc}'"),
                         declined_by_gesture: false,
+                        refused_by_policy: true,
                     };
                 }
             }
@@ -3121,6 +3124,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     live: false,
                     reason: "too many recent face attempts; use your password".into(),
                     declined_by_gesture: false,
+                    refused_by_policy: true,
                 };
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
@@ -3157,6 +3161,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         // handoff's coverage gap). Evaluated before the `reason` move: it
                         // borrows `o`, the move does not.
                         declined_by_gesture: irlume_auth::is_gesture_decline(&o),
+                        // This arm carries an ENGINE verdict: a face was looked
+                        // at (or looked for). The policy refusals return above,
+                        // before the camera.
+                        refused_by_policy: false,
                         reason: o.reason,
                     }
                 }
@@ -7186,11 +7194,15 @@ mod tests {
                 live,
                 reason,
                 declined_by_gesture,
+                refused_by_policy,
             } => {
                 assert!(!granted && !live);
                 assert_eq!(score, 0.0);
                 // A policy refusal is never a gesture decline: only a shake sets it.
                 assert!(!declined_by_gesture);
+                // …and it IS a policy refusal, which is what tells `auth test`
+                // to stop reporting it as a liveness verdict.
+                assert!(refused_by_policy);
                 assert_eq!(
                     reason,
                     "face auth disabled: the configured method is fingerprint"

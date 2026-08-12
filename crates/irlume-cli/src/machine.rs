@@ -1783,12 +1783,19 @@ pub fn auth_test(args: &[String]) -> ExitCode {
         // surface, so it must not inherit any surface's tier allowances.
         service: None,
     }) {
-        Ok(Response::AuthResult { granted, live, .. }) => stream.finish(
+        Ok(Response::AuthResult {
+            granted,
+            live,
+            declined_by_gesture,
+            refused_by_policy,
+            ..
+        }) => stream.finish(
             "result",
             json!({
                 "granted": granted,
                 "live": live,
                 "reason": auth_reason(granted, live),
+                "refusal": auth_refusal(granted, live, declined_by_gesture, refused_by_policy),
             }),
             // A refusal is a successful test that answered "no". The command
             // failing and the face not matching are different things, and a
@@ -1810,6 +1817,37 @@ pub fn auth_test(args: &[String]) -> ExitCode {
 /// Derived from the two booleans the daemon already returns, never from its
 /// prose. That keeps a reworded daemon message from becoming a breaking API
 /// change, which is the same rule the single-document commands follow.
+/// Why a refusal happened, at a granularity `reason` cannot express.
+///
+/// `reason` has three published values and a schema that pins them, so it cannot
+/// learn a fourth inside this contract. It also cannot tell the truth about a
+/// POLICY refusal: the configured method being fingerprint, the RGB-only
+/// convenience tier, the opt-in biopolicy gate and the rate limiter all answer
+/// `granted: false, live: false`, which `reason` reports as `not-live`, telling a
+/// desktop the user's face looked fake when no face was ever examined. A head
+/// shake had the same problem: a deliberate decline read as a spoof verdict.
+///
+/// Added as a NEW field rather than a new `reason` value, which is what the
+/// contract allows: a consumer written against contract 1 keeps reading `reason`
+/// exactly as before, and one that wants the distinction reads this.
+fn auth_refusal(
+    granted: bool,
+    live: bool,
+    declined_by_gesture: bool,
+    refused_by_policy: bool,
+) -> Option<&'static str> {
+    if granted {
+        return None;
+    }
+    if refused_by_policy {
+        return Some("policy");
+    }
+    if declined_by_gesture {
+        return Some("declined");
+    }
+    Some(if live { "no-match" } else { "not-live" })
+}
+
 fn auth_reason(granted: bool, live: bool) -> &'static str {
     match (granted, live) {
         (true, _) => "granted",
@@ -2123,6 +2161,35 @@ fn profiles_data(profiles: Vec<ProfileSummary>, require_eyes_open: bool) -> Valu
 
 #[cfg(test)]
 mod tests {
+
+    /// A refusal that never looked at a face must not be reported as a liveness
+    /// verdict.
+    ///
+    /// The configured method, the RGB-only tier, the biopolicy gate and the rate
+    /// limiter all answer `granted: false, live: false`, and `reason` has three
+    /// published values with no room for a fourth, so every one of them read as
+    /// `not-live`: a desktop told the user their face looked fake when nothing
+    /// had examined it. `reason` keeps its meaning; `refusal` carries the truth.
+    #[test]
+    fn a_policy_refusal_is_not_reported_as_a_liveness_verdict() {
+        // Granted: no refusal at all.
+        assert_eq!(auth_refusal(true, true, false, false), None);
+
+        // Policy, which the daemon flags before any capture. `reason` still says
+        // not-live, because its values are published and fixed.
+        assert_eq!(auth_refusal(false, false, false, true), Some("policy"));
+        assert_eq!(auth_reason(false, false), "not-live");
+
+        // A deliberate decline is its own thing, not a spoof verdict.
+        assert_eq!(auth_refusal(false, false, true, false), Some("declined"));
+
+        // The two verdicts that DID look at a face keep their meaning.
+        assert_eq!(auth_refusal(false, true, false, false), Some("no-match"));
+        assert_eq!(auth_refusal(false, false, false, false), Some("not-live"));
+
+        // Policy wins over a gesture flag: it refused before the watch could run.
+        assert_eq!(auth_refusal(false, false, true, true), Some("policy"));
+    }
     use super::*;
 
     #[test]

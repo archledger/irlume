@@ -209,18 +209,20 @@ pub struct IrCaptureStats {
     /// irlume does: `IrCamera::open` stores `fmt.quantization` and
     /// `clipping_white_level` already takes it.
     ///
-    /// Carrying it is still not enough to compute their ceiling, which is the
-    /// correction the second draft of this comment needed.
-    /// `Quantization::Default` is not itself an effective range: V4L2 resolves
-    /// it with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`,
-    /// which needs the COLORSPACE. Since #427 `IrCamera` retains the whole
-    /// negotiated `Format`, colorspace included, so the resolution has
-    /// become COMPUTABLE; a third draft of this comment must not claim
-    /// otherwise. What has not changed is that nobody has computed and
-    /// validated it: a `Default` YUV stream resolves limited unless the
-    /// colorspace is JPEG, 235 is wrong for the JPEG case and 255 for the
-    /// rest, and no NV12 or YUYV IR camera exists in this project's record
-    /// to validate either arm against.
+    /// Carrying it is still not enough to compute their ceiling, and each
+    /// draft of this comment has mislocated why, which is itself the lesson:
+    /// `Quantization::Default` is not an effective range, V4L2 resolves it
+    /// with `V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb_or_hsv, colsp, ycbcr_enc)`.
+    /// Since #427 `IrCamera` retains the negotiated `v4l::Format` with its
+    /// colorspace, but the pinned v4l 0.14 `Format` drops the driver-echoed
+    /// Y'CbCr ENCODING on conversion, and the encoding is a live input:
+    /// default YUV is full range for JPEG colorspace AND for XV601/XV709
+    /// encodings, limited otherwise (the Codex round on this PR caught the
+    /// second draft classifying every non-JPEG case as limited, a
+    /// 235-ceiling that would falsely refuse legitimate frames). The
+    /// resolution is therefore still not generally computable here, and no
+    /// NV12 or YUYV IR camera exists in this project's record to validate
+    /// either arm against.
     ///
     /// The `None` is also load-bearing, which matters more than either.
     /// `role_from_formats` calls any node advertising either fourcc

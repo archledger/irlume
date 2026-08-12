@@ -1529,7 +1529,24 @@ impl App {
                 .iter()
                 .any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
             let priv_on = self.pairs.iter().any(|p| p.privacy);
-            let (csev, cdetail, cfix) = if !rgb && !ir {
+            let (csev, cdetail, cfix) = if self.nodes.is_empty() {
+                // NOTHING was probed, which is not the same as nothing being
+                // there. `nodes` is only ever filled by a classifying scan, and
+                // this screen deliberately does not run one: classifying opens
+                // every node, which is the device contention #187 is about, so
+                // the daemon's Health is where camera facts normally come from
+                // and the daemon is what is down in this branch. The old text
+                // read the empty list as proof and told everyone with a working
+                // camera that face auth was unavailable, on the one screen they
+                // opened to find out what was wrong.
+                (
+                    Sev::Warn,
+                    "cannot check the cameras while the daemon is down (start it with: \
+                     sudo systemctl start irlumed)"
+                        .to_string(),
+                    Fix::Manual("sudo systemctl start irlumed".into()),
+                )
+            } else if !rgb && !ir {
                 (
                     Sev::Warn,
                     "no camera: face auth unavailable (password/fingerprint only)".to_string(),
@@ -2029,7 +2046,13 @@ impl App {
     fn apply_fix(&mut self, idx: usize) {
         let fix = match self.repair.get(idx) {
             Some(c) => c.fix.clone(),
-            None => return,
+            // Empty list, or a selection left behind by a list that shrank. The
+            // footer advertises [f], so pressing it has to answer: a silent
+            // return reads as a broken key.
+            None => {
+                self.log('·', "no check is selected to fix");
+                return;
+            }
         };
         match fix {
             Fix::None => self.log('·', "nothing to fix on this row"),
@@ -3752,7 +3775,9 @@ impl App {
                     Pending::RenameScan(p, s),
                 ));
             }
-            None => {}
+            // Nothing selected (an empty profile list, or a selection left by
+            // a list that shrank). [r] is advertised, so say why it did nothing.
+            None => self.log('·', "select a profile or scan to rename"),
         }
     }
 
@@ -3784,7 +3809,8 @@ impl App {
                     }),
                 ));
             }
-            None => {}
+            // Same as the rename above: an advertised key must answer.
+            None => self.log('·', "select a profile or scan to delete"),
         }
     }
 
@@ -6098,12 +6124,30 @@ impl App {
                 ("d", "delete"),
             ],
             SC_IDENTIFY => &[("i", "identify")],
-            SC_KEYRING => &[
-                ("a", "arm"),
-                ("r", "reseal"),
-                ("f", "forget"),
-                ("p", "refresh pcrlock policy"),
-            ],
+            // Both [r] and [p] are guarded in the handler: [r] reseals a seal that
+            // must already exist, and [p] refreshes the boot-measurement policy a
+            // Tier 2 seal is bound to. Advertising either where its guard cannot
+            // pass offered a key that did nothing and said nothing.
+            SC_KEYRING => match (
+                self.keyring_armed == Some(true),
+                self.keyring_policy
+                    .as_deref()
+                    .is_some_and(|p| p.contains("Tier 2")),
+            ) {
+                (true, true) => &[
+                    ("a", "arm"),
+                    ("r", "reseal"),
+                    ("f", "forget"),
+                    ("p", "refresh pcrlock policy"),
+                ],
+                (true, false) => &[("a", "arm"), ("r", "reseal"), ("f", "forget")],
+                (false, true) => &[
+                    ("a", "arm"),
+                    ("f", "forget"),
+                    ("p", "refresh pcrlock policy"),
+                ],
+                (false, false) => &[("a", "arm"), ("f", "forget")],
+            },
             SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
             SC_FINGERPRINT => &[
                 ("a", "enroll finger"),
@@ -6168,7 +6212,14 @@ impl App {
         if self.op.is_some() {
             let spans = vec![
                 key("q / esc"),
-                Span::styled(" cancel · working…", Style::new().dim()),
+                // "quit", not "cancel": these keys leave the TUI. The op keeps
+                // running in the daemon and its result is dropped; nothing here
+                // can call it back. Esc means "back out and stay" on every other
+                // screen, so promising a cancel here read as the safe choice.
+                Span::styled(
+                    " quit (the op keeps running) · working…",
+                    Style::new().dim(),
+                ),
             ];
             let blk = Block::bordered()
                 .border_type(BorderType::Rounded)
@@ -8629,10 +8680,18 @@ mod tests {
             suspended_by(&mut app, 7),
             Some(Suspend::SelinuxLoad)
         ));
-        // Out of range: a no-op, not a panic.
+        // Out of range: no panic, and no silent nothing either. [f] is
+        // advertised, so a stale selection has to say why it did not act.
         let before = app.activity.len();
         app.apply_fix(99);
-        assert_eq!(app.activity.len(), before);
+        assert_eq!(app.activity.len(), before + 1);
+        assert!(
+            app.activity
+                .last()
+                .is_some_and(|l| l.1.contains("no check is selected")),
+            "{:?}",
+            app.activity.last()
+        );
     }
 
     // ---- text entry & submit ----------------------------------------------
@@ -11182,6 +11241,114 @@ mod tests {
         }
     }
 
+    /// Every key a screen advertises must do something on that screen.
+    ///
+    /// The footer is the disclosure ladder: a key listed there is a promise. The
+    /// Keyring tab listed [r] reseal in every state while its handler required an
+    /// armed seal, so on a fresh machine the key did nothing and said nothing.
+    /// This drives each advertised key on its own screen and asserts the app
+    /// changed in some observable way, which is the weakest honest definition of
+    /// "did something" that does not need to know what each key means.
+    #[test]
+    fn every_advertised_key_does_something_on_its_screen() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dead =
+            std::env::temp_dir().join(format!("irlume-footer-nothing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dead);
+        let old_sock = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &dead);
+
+        for (screen, screen_name) in SCREENS.iter().enumerate() {
+            let probe = {
+                let mut a = test_app();
+                a.screen = screen;
+                a
+            };
+            for (key, label) in probe.screen_actions() {
+                // Only single-character keys are drivable here; "enter"/"esc" and
+                // the arrow hints are covered by the key-fuzz test.
+                let mut chars = key.chars();
+                let (Some(c), None) = (chars.next(), chars.next()) else {
+                    continue;
+                };
+                let mut app = test_app();
+                app.screen = screen;
+                let before = draw_text(&app);
+                let before_state = (
+                    app.quit,
+                    app.screen,
+                    app.show_help,
+                    app.confirm.is_some(),
+                    app.input.is_some(),
+                    app.suspend.is_some(),
+                    app.op.is_some(),
+                    app.activity.len(),
+                    app.error.is_some(),
+                );
+                app.on_key(KeyCode::Char(c));
+                let after_state = (
+                    app.quit,
+                    app.screen,
+                    app.show_help,
+                    app.confirm.is_some(),
+                    app.input.is_some(),
+                    app.suspend.is_some(),
+                    app.op.is_some(),
+                    app.activity.len(),
+                    app.error.is_some(),
+                );
+                let moved = before_state != after_state || draw_text(&app) != before;
+                assert!(
+                    moved,
+                    "screen {screen_name} ({screen}) advertises [{key}] {label}, \
+                     and pressing it changed nothing"
+                );
+            }
+        }
+
+        match old_sock {
+            Some(v) => std::env::set_var("IRLUME_SOCKET", v),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+    }
+
+    /// With the daemon down and nothing probed, the Repair tab must say it cannot
+    /// check the cameras, not that there are none.
+    ///
+    /// `nodes` is filled only by a classifying scan, and this screen deliberately
+    /// never runs one (classifying opens every node, the contention #187 is
+    /// about). The empty list was being read as proof of absence, so every user
+    /// whose daemon was down was told face auth was unavailable on the very
+    /// screen they opened to fix it.
+    #[test]
+    fn a_daemon_down_repair_tab_does_not_claim_the_cameras_are_missing() {
+        let mut app = test_app();
+        app.daemon_up = false;
+        app.nodes.clear();
+        app.screen = SC_REPAIR;
+        app.run_checks();
+        let text = draw_text(&app);
+        assert!(
+            !text.contains("no camera: face auth unavailable"),
+            "an unprobed list is not an absent camera: {text}"
+        );
+        assert!(
+            text.contains("cannot check the cameras while the daemon is down"),
+            "it must say what it actually knows: {text}"
+        );
+
+        // When a scan HAS classified nodes, the real verdicts still apply.
+        app.nodes = vec![("/dev/video0".into(), irlume_camera::Role::Rgb)];
+        app.run_checks();
+        let text = draw_text(&app);
+        assert!(
+            text.contains("RGB-only") || text.contains("convenience"),
+            "a classified RGB-only machine keeps its verdict: {text}"
+        );
+    }
+
     /// The biopolicy row must agree with the daemon about what counts as ON.
     ///
     /// The daemon accepts `1`, `true`, `yes` and `on`. The TUI had its own reader
@@ -11410,8 +11577,27 @@ mod tests {
             "{}",
             app.help_body()
         );
-        // Keyring: [p] refreshes the pcrlock policy on a Tier-2 seal.
+        // Keyring: [p] refreshes the pcrlock policy on a Tier-2 seal, and its
+        // handler is guarded on exactly that, so the disclosure follows the guard.
+        // Listing it on a seal that has no such policy offered a key that did
+        // nothing and said nothing.
         app.screen = SC_KEYRING;
+        app.keyring_armed = Some(true);
+        app.keyring_policy = Some("pcrlock NV 0x18fb7a2 (Tier 2)".into());
         assert!(app.help_body().contains("pcrlock"), "{}", app.help_body());
+        app.keyring_policy = None;
+        assert!(
+            !app.help_body().contains("pcrlock"),
+            "no Tier-2 policy, so no [p]: {}",
+            app.help_body()
+        );
+        // And [r] follows the armed state the same way.
+        assert!(app.help_body().contains("reseal"), "{}", app.help_body());
+        app.keyring_armed = Some(false);
+        assert!(
+            !app.help_body().contains("reseal"),
+            "nothing to reseal on an unarmed keyring: {}",
+            app.help_body()
+        );
     }
 }

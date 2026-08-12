@@ -198,9 +198,14 @@ pub struct ThirdPartyModel {
     /// Catalog name, what the user types to enable (`irlume models enable X`).
     pub name: &'static str,
     /// The pipeline stage this model plugs into. Only entries whose stage is
-    /// [`Stage::open`] can be installed or wired; the field exists on every
-    /// entry so a future measured-but-not-yet-wirable model can be documented
-    /// in the catalog without becoming loadable by accident.
+    /// [`Stage::open`] can be installed or wired, and `catalog_entries_are_
+    /// well_formed` REFUSES a closed-stage entry outright: listing a model
+    /// nobody can enable would be documentation pretending to be a catalog.
+    /// A measured candidate whose stage is still closed is written up in
+    /// `docs/THIRD-PARTY-MODELS.md` instead (full-range BlazeFace and
+    /// InsightFace SCRFD-10G are both there), and moves into this catalog on
+    /// the day its stage opens. The field is still per-entry because the
+    /// installer, the daemon and the reporting all branch on it.
     pub stage: Stage,
     /// On-disk file name under the state subdir.
     pub file: &'static str,

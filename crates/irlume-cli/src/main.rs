@@ -4112,12 +4112,21 @@ fn doctor_run(
             report.check("emitter-stream-pending", State::Pass);
         }
         irlume_camera::emitter_journal::PendingSummary::Pending(entries) => {
+            // The advice splits by record state, because the recovery paths
+            // differ in kind (Codex round on #429): an APPLIED record is
+            // claimed and restored by a later authentication, while a
+            // PREPARED or unparseable one is never claimed (irlume cannot
+            // prove its write reached the camera) and only an administrator
+            // removing the named file resolves it.
             dout!(
                 report,
-                "[doctor] IR emitter: {} stream-applied control(s) not yet put back ⚠ — {}. \
-                 Authenticating once with the camera attached restores them; if irlume \
-                 has reported its restore attempts ran out, shut the machine down fully \
-                 (not a reboot) or unplug an external camera",
+                "[doctor] IR emitter: {} stream control record(s) still pending ⚠ — {}. \
+                 A record marked 'applied' is put back by authenticating while the \
+                 control still holds irlume's value; if its restore attempts ran out, \
+                 shut the machine down fully (not a reboot) or unplug an external \
+                 camera first. A record marked 'write may not have reached the camera', \
+                 or one that will not parse, is never restored automatically: after \
+                 the camera has fully lost power, remove that record file",
                 entries.len(),
                 entries.join("; ")
             );

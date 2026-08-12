@@ -175,10 +175,16 @@ pub fn pending_summary() -> crate::emitter_journal::PendingSummary {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
+        // The path leads every line: a prepared or unparseable record is
+        // resolved by an administrator removing the file (the Codex round on
+        // #429: authentication never claims a prepared record, so advice
+        // that says "authenticate" loops forever on one), and naming the
+        // file is what makes that advice actionable.
         pending.push(match std::fs::read_to_string(&path) {
             Ok(body) => match serde_json::from_str::<StreamWrite>(&body) {
                 Ok(record) => format!(
-                    "{} unit {} selector {} ({}, displaced {})",
+                    "{}: {} unit {} selector {} ({}, displaced {})",
+                    path.display(),
                     record.usb_id,
                     record.unit,
                     record.selector,
@@ -875,8 +881,34 @@ mod tests {
                     "the line names the camera and the state: {}",
                     entries[0]
                 );
+                assert!(
+                    entries[0].contains(&record_path(&id).display().to_string()),
+                    "the line names the file, because removing it is the only \
+                     resolution for the states below: {}",
+                    entries[0]
+                );
             }
             other => panic!("a published record must be reported: {other:?}"),
+        }
+
+        // A PREPARED record must not be described as applied: authentication
+        // never claims one (record_claims answers NotConfirmed), so a reader
+        // told "authenticate to restore it" would loop forever. The label is
+        // what doctor's split advice keys on.
+        let mut prepared = record_for(&id);
+        prepared.state = WriteState::Prepared;
+        publish(&record_path(&id), &prepared).expect("replace with a prepared record");
+        match pending_summary() {
+            PendingSummary::Pending(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert!(
+                    entries[0].contains("write may not have reached the camera")
+                        && !entries[0].contains("(applied"),
+                    "a prepared record must say its write is unproven: {}",
+                    entries[0]
+                );
+            }
+            other => panic!("a prepared record is still pending: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

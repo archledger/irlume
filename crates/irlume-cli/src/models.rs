@@ -690,12 +690,14 @@ fn stdin_is_tty() -> bool {
 /// One enabled catalog entry, STRUCTURED: consumers decide wording per stage
 /// and per weight state, so a joined display string cannot smear one entry's
 /// checksum failure across every enabled model (#285 review).
+#[derive(Clone)]
 pub(crate) struct TuiEntry {
     pub name: &'static str,
     pub stage: irlume_common::thirdparty::Stage,
     pub weight_state: irlume_common::thirdparty::WeightState,
 }
 
+#[derive(Clone)]
 pub(crate) enum TuiState {
     /// One or more catalog models are enabled in settings.conf.
     Enabled { entries: Vec<TuiEntry> },

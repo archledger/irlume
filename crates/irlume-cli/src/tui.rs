@@ -543,6 +543,19 @@ struct App {
     /// Settings-tab per-service consent-gesture selection (index into
     /// [`SETTINGS_GESTURE_SERVICES`]).
     settings_svc_sel: usize,
+    /// Cached third-party-model and Bitwarden state for the DRAW path, with the
+    /// moment they were taken.
+    ///
+    /// Both were computed per frame. `models::tui_state` reads and SHA-256s every
+    /// enabled weight file (1.3 MiB for the shipped PAD cue here), and
+    /// `bitwarden::tui_state` forks `getent` to resolve the invoking user's home,
+    /// measured at ~37ms a call and called twice in one draw of the login-wiring
+    /// tab. A redraw happens on every keypress and every tick, so the interface
+    /// was hashing megabytes and forking processes to paint two rows. The key
+    /// HANDLERS still read fresh: an action must act on the current state, and it
+    /// runs once per press rather than once per frame.
+    heavy: (crate::models::TuiState, Option<crate::bitwarden::TuiState>),
+    heavy_at: std::time::Instant,
     /// A prominent, dismissible error banner (e.g. "camera busy") so failures
     /// are never silently buried in the Activity log.
     error: Option<String>,
@@ -1007,6 +1020,8 @@ impl App {
             repair_sel: 0,
             cam_sel: 0,
             settings_svc_sel: 0,
+            heavy: (crate::models::tui_state(), crate::bitwarden::tui_state()),
+            heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
             enroll_error: None,
@@ -1913,7 +1928,7 @@ impl App {
         // daemon will not start with it selected. Only flag a stage the
         // daemon did not actually load (Health proves loaded weights fine).
         if self.daemon_up {
-            if let crate::models::TuiState::Enabled { entries } = crate::models::tui_state() {
+            if let crate::models::TuiState::Enabled { entries } = &self.heavy.0 {
                 use irlume_common::thirdparty::{Stage, WeightState};
                 for entry in entries {
                     if entry.weight_state != WeightState::ChecksumMismatch {
@@ -2226,7 +2241,24 @@ impl App {
         }
     }
 
+    /// How long the cached model/Bitwarden state may be reused before the poll
+    /// takes it again. Long enough that a redraw storm costs nothing, short
+    /// enough that a change made outside the TUI shows up while the user is
+    /// still looking at the screen.
+    const HEAVY_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Re-read the state the draw path caches. Called on the poll's TTL, and
+    /// immediately after any step that can change it, so a model the user just
+    /// enabled does not sit invisible for up to the TTL.
+    fn refresh_heavy(&mut self) {
+        self.heavy = (crate::models::tui_state(), crate::bitwarden::tui_state());
+        self.heavy_at = std::time::Instant::now();
+    }
+
     fn poll(&mut self) {
+        if self.heavy_at.elapsed() >= Self::HEAVY_TTL {
+            self.refresh_heavy();
+        }
         if let Some(rx) = &self.light_load {
             if let Ok(l) = rx.try_recv() {
                 self.light_load = None;
@@ -2633,7 +2665,13 @@ impl App {
             libc::signal(libc::SIGINT, old_int)
         };
         match status {
-            Ok(st) if st.success() => self.log('✓', format!("{what}: done")),
+            Ok(st) if st.success() => {
+                // A step can enable a model or install the Bitwarden policy, and
+                // the draw path reads a cache: take it again now rather than let
+                // the screen show the pre-action state until the TTL expires.
+                self.refresh_heavy();
+                self.log('✓', format!("{what}: done"));
+            }
             Ok(st) => {
                 // A failed/cancelled sudo can't have started the daemon; drop
                 // any parked enrollment so the resume path doesn't sit through
@@ -4568,7 +4606,7 @@ impl App {
                         // trust the filesystem probe rather than claim "off":
                         // an older daemon with flir loaded must not read as
                         // ○ none.
-                        match crate::models::tui_state() {
+                        match &self.heavy.0 {
                             crate::models::TuiState::Enabled { entries } => (
                                 "●",
                                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
@@ -5818,7 +5856,7 @@ impl App {
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
         if matches!(
-            crate::bitwarden::tui_state(),
+            self.heavy.1.clone(),
             Some(crate::bitwarden::TuiState::NeedsSetup)
         ) {
             lines.push(act(
@@ -5839,7 +5877,7 @@ impl App {
         ));
         // Bitwarden status line (not an action): only when installed and the
         // action is present or snapd owns it. Set apart by a blank line.
-        match crate::bitwarden::tui_state() {
+        match &self.heavy.1 {
             Some(crate::bitwarden::TuiState::Ready) => {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
@@ -6809,6 +6847,8 @@ mod tests {
             repair_sel: 0,
             cam_sel: 0,
             settings_svc_sel: 0,
+            heavy: (crate::models::tui_state(), crate::bitwarden::tui_state()),
+            heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
             enroll_error: None,
@@ -9869,6 +9909,11 @@ mod tests {
         let old = std::env::var_os("IRLUME_STATE_DIR");
         std::env::set_var("IRLUME_STATE_DIR", &empty);
         app.health.as_mut().unwrap().third_party_pad = None;
+        // The draw path reads a cache taken at construction (hashing every
+        // enabled weight file on each frame was costing megabytes of I/O per
+        // keypress). The running TUI re-takes it on its poll; a test that moves
+        // the state dir under it has to do the same.
+        app.refresh_heavy();
         let text = draw_text(&app);
         assert!(text.contains("none (default)"), "empty state dir -> ○ none");
         match old {

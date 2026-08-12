@@ -116,6 +116,7 @@ pub(crate) fn app_detected() -> bool {
 /// Condensed state for the TUI's app-unlock row. `None` when Bitwarden is not
 /// installed at all, so the row disappears entirely for everyone else (the
 /// feature stays invisible until it is relevant: opt-in by presence).
+#[derive(Clone)]
 pub(crate) enum TuiState {
     /// Action file present (ours, Bitwarden's own, or snapd's). Ready.
     Ready,

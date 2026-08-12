@@ -767,7 +767,24 @@ fn main() {
                         let mut engine = WorkerEngine::attach(engine, &arbiter);
                         while let Some(job) = arbiter.take() {
                             note_worker_progress();
-                            let Queued { req, peer, reply } = job.payload;
+                            let Queued {
+                                req,
+                                peer,
+                                reply,
+                                link,
+                            } = job.payload;
+                            // The client left while this sat in the queue: never open
+                            // the camera for an answer nobody is waiting for. Release
+                            // the slot first, exactly as the normal path does, so the
+                            // uid is not locked out of the camera.
+                            if !link.claim() {
+                                arbiter.finish(job.class, job.uid);
+                                irlume_common::dlog!(
+                                    "queued request dropped: its client disconnected first"
+                                );
+                                note_worker_idle();
+                                continue;
+                            }
                             // Isolate each request behind catch_unwind. A panic deep in
                             // frame decode or inference (e.g. a V4L2 driver echoing back
                             // a 0-dimension or short-buffered frame) must deny THIS one
@@ -779,7 +796,10 @@ fn main() {
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
-                            // until the daemon restarts.
+                            // until the daemon restarts. The link is released in the
+                            // same breath: once this job no longer holds the camera, a
+                            // late disconnect on it must not cancel the next job.
+                            link.released();
                             arbiter.finish(job.class, job.uid);
                             let resp = match outcome {
                                 Ok(resp) => resp,
@@ -1273,6 +1293,100 @@ struct Queued {
     req: Request,
     peer: Peer,
     reply: std::sync::mpsc::Sender<Response>,
+    /// Lets the worker learn that this request's client has gone away.
+    link: std::sync::Arc<ClientLink>,
+}
+
+/// The handshake between one connection thread and the camera worker, so work a
+/// client no longer wants stops instead of running to completion.
+///
+/// Without it the worker only discovers a departed client when it tries to send
+/// the reply, so closing a polkit dialog left the IR emitter lit and the camera
+/// capturing for the rest of the budget (observed 2026-08-11). The arbiter's
+/// [`arbiter::CancelToken`] is SHARED by every job, so "the client left, stop the
+/// capture" is only correct for the job that actually holds the camera; this pairs
+/// each connection with its own job so a departing client can never cancel someone
+/// else's authentication.
+#[derive(Default)]
+struct ClientLink {
+    /// Set by the worker when this job starts and owns the camera.
+    running: std::sync::atomic::AtomicBool,
+    /// Set by the connection thread when its peer disconnects.
+    abandoned: std::sync::atomic::AtomicBool,
+}
+
+impl ClientLink {
+    /// Worker side: take ownership of this job. `false` means the client already
+    /// left while the job sat in the queue, so the camera must never open for it.
+    fn claim(&self) -> bool {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if self.abandoned.load(Acquire) {
+            return false;
+        }
+        self.running.store(true, Release);
+        true
+    }
+
+    /// Worker side: this job is done and no longer owns the camera. Keeps a late
+    /// disconnect on a finished job from cancelling whatever runs next.
+    fn released(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Connection side: the peer is gone. `true` means this job is RUNNING and the
+    /// capture should be cancelled; `false` means it is still queued and `claim`
+    /// will drop it, so nothing needs cancelling.
+    ///
+    /// Ordered abandoned-then-running against `claim`'s running-after-abandoned, so
+    /// the two cannot both decide to skip: whichever runs first, the job either
+    /// gets dropped by `claim` or cancelled here. The one interleaving that falls
+    /// through both (claim reads `abandoned` false, then this reads `running`
+    /// false, then claim stores `running`) lets the capture finish uncancelled,
+    /// which wastes the remaining budget but can never cancel a different job or
+    /// grant anything. Fail-safe by construction.
+    fn abandon(&self) -> bool {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        self.abandoned.store(true, Release);
+        self.running.load(Acquire)
+    }
+}
+
+/// Has the peer closed its end?
+///
+/// `MSG_PEEK` so a byte that IS there stays there, `MSG_DONTWAIT` so a waiting
+/// connection thread never blocks here. Only a clean `0` (orderly shutdown) and a
+/// reset connection count as gone; every other answer, including an unexpected
+/// error, reads as still-connected, because the cost of being wrong in that
+/// direction is a few wasted seconds of camera while being wrong the other way
+/// cancels a live authentication.
+fn peer_gone(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut byte = 0u8;
+    // SAFETY: `stream` owns the fd for the whole call, and the buffer is one byte
+    // of stack we hold exclusively. MSG_DONTWAIT means no blocking, MSG_PEEK means
+    // nothing is consumed from the socket.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            std::ptr::addr_of_mut!(byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n == 0 {
+        return true; // orderly shutdown: the client closed
+    }
+    if n < 0 {
+        // ECONNRESET/ENOTCONN are also "gone"; EAGAIN is the normal "still here,
+        // nothing pending" answer while the worker works.
+        let err = std::io::Error::last_os_error();
+        return matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected
+        );
+    }
+    false // a byte is pending (pipelined or stray): the peer is still there
 }
 
 /// How long a connection thread waits for the worker before giving up.
@@ -1281,6 +1395,12 @@ struct Queued {
 /// retries is minutes of legitimate work. This is a backstop against a wedged
 /// worker leaving connection threads parked forever, not a latency control.
 const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a waiting connection thread checks whether its client is still
+/// there. Short enough that a cancelled polkit dialog stops the camera while the
+/// user is still looking at the screen, long enough that a parked thread costs
+/// four wakeups a second. The check itself is one non-blocking `recv`.
+const CLIENT_ALIVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// True the first time this uid is refused an unseal for not being root.
 ///
@@ -1870,10 +1990,12 @@ fn serve(
                 }
             }
             let (reply, answer) = std::sync::mpsc::channel();
+            let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
                 req,
                 peer: peer.clone(),
                 reply,
+                link: std::sync::Arc::clone(&link),
             };
             if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
                 // Refused, not queued: answer now so the client can retry rather
@@ -1883,13 +2005,41 @@ fn serve(
                 record_refusal(peer.uid);
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
-            let resp = match answer.recv_timeout(WORKER_REPLY_TIMEOUT) {
-                Ok(resp) => resp,
-                // The worker dropped the sender (it panicked and the reply never
-                // came) or took longer than the backstop. Either way this
-                // request has no answer, and a client that gets an error falls
-                // back to the password.
-                Err(_) => Response::Error("request did not complete".into()),
+            // Wait for the worker, checking between slices whether the client is
+            // still there. A polkit dialog the user dismissed (or that closed on a
+            // head-shake) takes its helper process with it, and nothing else tells
+            // the worker to stop: it would hold the camera and the IR emitter for
+            // the rest of the budget for an answer nobody will read.
+            let deadline = std::time::Instant::now() + WORKER_REPLY_TIMEOUT;
+            let resp = loop {
+                match answer.recv_timeout(CLIENT_ALIVE_POLL) {
+                    Ok(resp) => break resp,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if std::time::Instant::now() >= deadline {
+                            break Response::Error("request did not complete".into());
+                        }
+                        if peer_gone(&stream) {
+                            // Cancel ONLY if this connection's own job holds the
+                            // camera; a job still queued is dropped by `claim`
+                            // instead, so another user's authentication is never
+                            // cancelled by someone else hanging up.
+                            if link.abandon() {
+                                arbiter.cancel_token().request_stop();
+                                irlume_common::dlog!(
+                                    "client disconnected mid-request; asked the capture to stop"
+                                );
+                            }
+                            // Nothing to answer: the socket is gone.
+                            return Ok(());
+                        }
+                    }
+                    // The worker dropped the sender (it panicked and the reply never
+                    // came). This request has no answer, and a client that gets an
+                    // error falls back to the password.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Response::Error("request did not complete".into())
+                    }
+                }
             };
             respond(stream, &resp)
         }
@@ -5637,6 +5787,7 @@ mod tests {
                         pid: 0,
                     },
                     reply: dead_reply,
+                    link: std::sync::Arc::new(ClientLink::default()),
                 },
             )
             .unwrap();
@@ -5675,6 +5826,67 @@ mod tests {
             });
             assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
         }
+    }
+
+    #[test]
+    fn peer_gone_reads_a_closed_peer_and_only_a_closed_peer() {
+        // The primitive the disconnect check rests on, against a real socket pair
+        // rather than an assumption about what `recv` returns. Being wrong in the
+        // "gone" direction cancels a live authentication, so both states are pinned.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        assert!(
+            !peer_gone(&ours),
+            "an open peer must never read as gone (that would cancel a live auth)"
+        );
+        // Pending data is not a disconnect either: MSG_PEEK must leave it alone.
+        (&theirs).write_all(b"x").expect("write");
+        assert!(
+            !peer_gone(&ours),
+            "a peer that sent a byte is still connected"
+        );
+        drop(theirs);
+        // The byte is still buffered, so the socket only reports EOF once it is
+        // drained; drain it, then the orderly shutdown must be visible.
+        let mut buf = [0u8; 1];
+        let _ = (&ours).read(&mut buf);
+        assert!(peer_gone(&ours), "a closed peer must be detected");
+    }
+
+    #[test]
+    fn a_departing_client_cancels_only_its_own_running_job() {
+        // The cancellation token is shared by every job, so "the client left" may
+        // only stop the capture when THIS connection's job is the one holding the
+        // camera. Both orderings are pinned because the wrong one cancels a
+        // different user's authentication.
+        //
+        // Queued, then abandoned: nothing to cancel, and the worker must drop it.
+        let queued = ClientLink::default();
+        assert!(
+            !queued.abandon(),
+            "a job that never started must not cancel the running capture"
+        );
+        assert!(
+            !queued.claim(),
+            "the worker must skip a job whose client already left"
+        );
+
+        // Running, then abandoned: this IS the camera holder, so cancel it.
+        let running = ClientLink::default();
+        assert!(running.claim(), "a fresh job is claimable");
+        assert!(
+            running.abandon(),
+            "a running job's client leaving must cancel the capture"
+        );
+
+        // Finished, then a late disconnect: the job no longer owns the camera, so it
+        // must not cancel whatever the worker started next.
+        let finished = ClientLink::default();
+        assert!(finished.claim());
+        finished.released();
+        assert!(
+            !finished.abandon(),
+            "a finished job must not cancel the job that followed it"
+        );
     }
 
     #[test]
@@ -5948,6 +6160,7 @@ mod tests {
                         pid: 0,
                     },
                     reply: _dead_reply,
+                    link: std::sync::Arc::new(ClientLink::default()),
                 },
             )
             .unwrap();

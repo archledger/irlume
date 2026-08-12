@@ -2644,6 +2644,25 @@ impl Engine {
         let mut ears: Vec<irlume_liveness::EarSample> = Vec::new();
         let mut err: Option<irlume_common::Error> = None;
         let hit = irlume_camera::capture_ir_streaming(&ir_dev, max_frames, |sf| {
+            // Stop the moment the work is no longer wanted: the client that asked
+            // for it has gone (its polkit dialog closed, so the daemon's connection
+            // thread asked us to stop), or a new authentication needs the camera.
+            //
+            // Checked HERE, per frame, because this loop is where an authentication
+            // spends its seconds: the watch runs for the whole consent budget, and
+            // the only other stop checks sit between whole captures on the ENROLMENT
+            // path, so nothing was watching during the one phase a user actually
+            // waits through. Measured 2026-08-11: cancelling a polkit prompt left
+            // the IR emitter lit and this loop streaming for the rest of the budget.
+            // A frame boundary is safe: nothing is written mid-stream, and setting
+            // `err` makes the whole request end rather than reporting a false
+            // "no gesture" that a caller might treat as a real refusal.
+            if self.should_stop() {
+                err = Some(irlume_common::Error::Preempted(
+                    "the request was cancelled before a consent gesture arrived".into(),
+                ));
+                return std::ops::ControlFlow::Break(true);
+            }
             let idx = poses.len();
             match self.frame_to_consent_samples(&sf.frame, idx) {
                 Ok((pose, ear)) => {

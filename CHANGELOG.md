@@ -16,11 +16,15 @@ All notable changes to irlume are documented here. This project adheres to
   applied on a laptop hours after the session that wrote it, with the
   driver default being 0. A session now reads the control first, writes
   only when it holds something else, remembers what the write displaced,
-  and puts that value back when the session drops, under the emitter
-  guard's rules: a control already holding the wanted value is another
-  writer's state and is never adopted, and the restore fires only while
-  the control still holds what irlume wrote. Both directions validated on
-  hardware in the 2026-08-12 session measurements
+  and puts that value back through a guard armed before the stream opens,
+  so a failed open restores too. The emitter guard's rules apply: a
+  control already holding the wanted value is another writer's state and
+  is never adopted; the write is confirmed by read-back (drivers may
+  clamp a set to the nearest valid value, and an unconfirmed write is
+  undone on the spot); and the restore fires only while the control still
+  reads as irlume's value at the restore's own read, V4L2 offering no
+  compare-and-set to close the race beyond that. Both directions
+  validated on hardware in the 2026-08-12 session measurements
   (`docs/research/2026-08-12-camera-session-measurements.md`)
   (#426).
 

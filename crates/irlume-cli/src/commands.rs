@@ -851,6 +851,17 @@ pub fn status(args: &[String]) -> ExitCode {
 /// only when the socket says nothing: a reachable daemon has already answered
 /// the question.
 fn irlumed_binary_present() -> bool {
+    irlumed_binary_in(std::env::var_os("PATH").as_deref())
+}
+
+/// [`irlumed_binary_present`] with the search path passed in.
+///
+/// Split out so a test can hand it a directory instead of setting `PATH` for the
+/// whole process. The harness runs tests in parallel, and a process-wide `PATH`
+/// change breaks any concurrent test that spawns a program: this reached CI as a
+/// package-origin test unwrapping a NotFound under the sanitizer's slower
+/// interleaving, having passed locally on timing alone.
+fn irlumed_binary_in(path: Option<&std::ffi::OsStr>) -> bool {
     const FHS: &[&str] = &[
         "/usr/local/bin/irlumed",
         "/usr/bin/irlumed",
@@ -859,8 +870,7 @@ fn irlumed_binary_present() -> bool {
     if FHS.iter().any(|p| std::path::Path::new(p).exists()) {
         return true;
     }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("irlumed").exists()))
+    path.is_some_and(|paths| std::env::split_paths(paths).any(|d| d.join("irlumed").exists()))
 }
 
 pub fn detect(args: &[String]) -> ExitCode {
@@ -2427,37 +2437,32 @@ fn usable_scans_counts_only_the_loaded_recognizer() {
 /// reads as "irlume is not on this machine".
 #[test]
 fn the_daemon_binary_is_found_wherever_the_distro_keeps_it() {
-    let _g = crate::testenv::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    // The search path is passed IN, never set on the process: the harness runs
+    // tests in parallel, and a global PATH change breaks any concurrent test that
+    // spawns a program. That is how this first failed in CI, as a package-origin
+    // test unwrapping a NotFound under the sanitizer's slower interleaving.
     let dir = std::env::temp_dir().join(format!("irlume-detect-path-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let old_path = std::env::var_os("PATH");
 
-    // A PATH with no irlumed in it: only the FHS paths can answer, and on a
-    // machine that has one this stays true, so assert the negative form on a
-    // PATH we fully control instead.
-    std::env::set_var("PATH", &dir);
-    let fhs_present = ["/usr/local/bin/irlumed", "/usr/bin/irlumed"]
-        .iter()
-        .any(|p| std::path::Path::new(p).exists());
-    assert_eq!(
-        irlumed_binary_present(),
-        fhs_present,
-        "with an empty PATH only the FHS paths may answer"
-    );
+    // An empty search path leaves only the FHS answer, and this machine may
+    // legitimately have one, so compare against that fact rather than assume.
+    let fhs_present = [
+        "/usr/local/bin/irlumed",
+        "/usr/bin/irlumed",
+        "/run/current-system/sw/bin/irlumed",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists());
+    assert_eq!(irlumed_binary_in(Some(dir.as_os_str())), fhs_present);
+    assert_eq!(irlumed_binary_in(None), fhs_present);
 
-    // The Nix-shaped case: not in any FHS path, but on PATH.
+    // The Nix-shaped case: nowhere in FHS, but on the search path.
     std::fs::write(dir.join("irlumed"), b"#!/bin/sh\n").unwrap();
     assert!(
-        irlumed_binary_present(),
+        irlumed_binary_in(Some(dir.as_os_str())),
         "a daemon on PATH (a Nix profile link) is installed"
     );
 
-    match old_path {
-        Some(v) => std::env::set_var("PATH", v),
-        None => std::env::remove_var("PATH"),
-    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -363,6 +363,40 @@ pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
     (format!("{}\n", out.join("\n")), true)
 }
 
+/// Wire the polkit consent dialog. Identical to [`wire_verify_service`] except it
+/// installs [`POLKIT_VERIFY_STANZA`] (the `abort=die` control) so a head-shake
+/// closes the dialog rather than falling through to the password. Migration of an
+/// older plain-`sufficient` install to the abort=die control is handled UPSTREAM by
+/// [`super::wire_service`], which strips every irlume line with [`unwire_lines`] and
+/// then calls this on the clean base, so this only ever INSERTS. There is
+/// deliberately no in-place upgrade branch: with the pre-strip it would be dead
+/// code (the base never carries an irlume line), and a `.position`-based rewrite
+/// would miss a second stray irlume line and leave a plain-`sufficient` control
+/// under which a shake is silently `default=ignore`d.
+pub(super) fn wire_polkit_service(content: &str) -> (String, bool) {
+    if has_line_continuation(content) {
+        return (content.to_string(), false);
+    }
+    if content_has_module(content) {
+        return (content.to_string(), false);
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(anchor) = lines
+        .iter()
+        .position(|l| is_include_auth_layout(l) || is_auth_directive(l))
+    else {
+        return (content.to_string(), false);
+    };
+    let mut out = Vec::with_capacity(lines.len() + 1);
+    for (i, l) in lines.iter().enumerate() {
+        if i == anchor {
+            out.push(POLKIT_VERIFY_STANZA.to_string());
+        }
+        out.push((*l).to_string());
+    }
+    (format!("{}\n", out.join("\n")), true)
+}
+
 /// Remove every irlume line AND the pam_permit landing we added (used only when
 /// no backup exists; the backup-restore path is preferred).
 pub(super) fn unwire_lines(content: &str) -> (String, bool) {

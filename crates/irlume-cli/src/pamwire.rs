@@ -822,7 +822,7 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         );
     }
     if polkit_in_scope(enable, with_polkit) {
-        visit(&POLKIT, ROLE_POLKIT, &wire_verify_service, true);
+        visit(&POLKIT, ROLE_POLKIT, &wire_polkit_service, true);
     }
 }
 
@@ -1259,7 +1259,7 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         }
     }
     if polkit_in_scope(enable, with_polkit) {
-        match wire_service(&POLKIT, enable, apply, &wire_verify_service) {
+        match wire_service(&POLKIT, enable, apply, &wire_polkit_service) {
             Ok(msg) => {
                 println!("  {msg}");
                 if enable && apply {
@@ -2419,6 +2419,84 @@ mod tests {
         let (out, changed) = wire_verify_service(stock);
         assert!(!changed);
         assert_eq!(out, stock);
+    }
+
+    #[test]
+    fn polkit_service_inserts_the_abort_die_stanza() {
+        // A shake must be able to CLOSE the polkit dialog, which needs the control
+        // to `die` on PAM_ABORT; a plain `sufficient` `default=ignore`s it (pam.conf
+        // (5)). So the polkit stanza carries `abort=die`, unlike sudo's `sufficient`.
+        for stock in [
+            "#%PAM-1.0\nauth       include      system-auth\naccount    include      system-auth\n",
+            "#%PAM-1.0\n@include common-auth\n@include common-account\n",
+        ] {
+            let (wired, changed) = wire_polkit_service(stock);
+            assert!(changed, "{stock:?}");
+            let face = wired
+                .lines()
+                .find(|l| l.contains(MODULE))
+                .expect("stanza present");
+            assert!(
+                face.contains("abort=die"),
+                "polkit line must die on abort: {face}"
+            );
+            assert!(!face.contains("unseal"), "polkit is verify-only: {face}");
+            // Above the first non-irlume auth anchor, like the sudo verify stanza.
+            let face_i = wired.lines().position(|l| l.contains(MODULE)).unwrap();
+            let anchor_i = wired
+                .lines()
+                .position(|l| {
+                    !l.contains(MODULE) && (l.starts_with("auth") || l.starts_with("@include"))
+                })
+                .unwrap();
+            assert!(face_i < anchor_i, "{wired}");
+            // Idempotent and fully reversible.
+            assert!(
+                !wire_polkit_service(&wired).1,
+                "second wire is a no-op: {wired}"
+            );
+            let (back, undone) = unwire_lines(&wired);
+            assert!(undone && !content_has_module(&back));
+        }
+    }
+
+    #[test]
+    fn migrating_an_old_polkit_line_yields_the_abort_die_control() {
+        // An older irlume wired polkit-1 with a plain `sufficient` line, under which
+        // a shake's PAM_ABORT is `default=ignore`d and the dialog never closes.
+        // `login reconcile`/`enable` must migrate it to the abort=die control. In
+        // production that happens in `wire_service`, which strips every irlume line
+        // with `unwire_lines` and THEN calls `wire_polkit_service` on the clean base.
+        // Test that exact composition (not `wire_polkit_service` alone, which by
+        // design refuses a file that still has the module), so the migration the doc
+        // promises is the migration a real re-wire performs.
+        let old = format!(
+            "#%PAM-1.0\nauth       sufficient                   {MODULE}\n\
+             auth       include      system-auth\naccount    include      system-auth\n"
+        );
+        let (base, stripped) = unwire_lines(&old);
+        assert!(stripped, "the old irlume line must be stripped first");
+        assert!(
+            !content_has_module(&base),
+            "no irlume line survives the strip: {base}"
+        );
+        let (wired, changed) = wire_polkit_service(&base);
+        assert!(
+            changed && wired.contains("abort=die"),
+            "migrated line must die on abort: {wired}"
+        );
+        // Exactly ONE irlume line, and no plain-`sufficient` control survives.
+        assert_eq!(
+            wired.lines().filter(|l| l.contains(MODULE)).count(),
+            1,
+            "migration must not duplicate the irlume line: {wired}"
+        );
+        assert!(
+            !wired
+                .lines()
+                .any(|l| l.contains(MODULE) && l.contains(" sufficient ")),
+            "the plain sufficient control must be gone: {wired}"
+        );
     }
 
     #[test]

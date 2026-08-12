@@ -2901,6 +2901,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     score: 0.0,
                     live: false,
                     reason: "face auth disabled: the configured method is fingerprint".into(),
+                    declined_by_gesture: false,
                 };
             }
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
@@ -2935,6 +2936,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         reason: format!(
                             "RGB-only convenience: face limited to screen unlock (not {class:?})"
                         ),
+                        declined_by_gesture: false,
                     };
                 }
             }
@@ -2952,6 +2954,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         score: 0.0,
                         live: false,
                         reason: format!("biopolicy: face may not satisfy '{svc}'"),
+                        declined_by_gesture: false,
                     };
                 }
             }
@@ -2962,6 +2965,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                     score: 0.0,
                     live: false,
                     reason: "too many recent face attempts; use your password".into(),
+                    declined_by_gesture: false,
                 };
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
@@ -2985,6 +2989,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         granted: o.granted,
                         score: o.score,
                         live: o.live,
+                        // The ONE site that carries the engine outcome onto the wire:
+                        // a deliberate head-shake becomes the flag pam_irlume aborts a
+                        // polkit dialog on, and only it. Every other outcome kind, and
+                        // every policy early-return above, is false. `is_gesture_decline`
+                        // and the shared `gesture_declined` constructor are unit-tested
+                        // (a revert of the shake kind to OtherDeny fails there), but this
+                        // call site itself, and the live detection path shake ->
+                        // gesture_declined, are covered ONLY by the hardware gesture test:
+                        // nothing camera-less forces a GestureDeclined outcome through
+                        // dispatch, so a `false` slip here would pass the suite (see the
+                        // handoff's coverage gap). Evaluated before the `reason` move: it
+                        // borrows `o`, the move does not.
+                        declined_by_gesture: irlume_auth::is_gesture_decline(&o),
                         reason: o.reason,
                     }
                 }
@@ -6940,9 +6957,12 @@ mod tests {
                 score,
                 live,
                 reason,
+                declined_by_gesture,
             } => {
                 assert!(!granted && !live);
                 assert_eq!(score, 0.0);
+                // A policy refusal is never a gesture decline: only a shake sets it.
+                assert!(!declined_by_gesture);
                 assert_eq!(
                     reason,
                     "face auth disabled: the configured method is fingerprint"

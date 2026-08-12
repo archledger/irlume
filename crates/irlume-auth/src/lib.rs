@@ -213,6 +213,12 @@ pub enum OutcomeKind {
     /// Every other refusal: pre-camera policy/state denials, camera-binding
     /// mismatches, challenge-gate failures.
     OtherDeny,
+    /// A DELIBERATE head-shake decline during the consent watch (pre- or
+    /// post-match). Kept distinct from `OtherDeny` so the daemon can report it as
+    /// `declined_by_gesture` and pam_irlume can abort a polkit dialog on it, and
+    /// only it. Non-retryable: a decline is final, so it stays OUT of
+    /// [`presence_retryable`] (the same as `OtherDeny`).
+    GestureDeclined,
 }
 
 impl Outcome {
@@ -246,6 +252,24 @@ impl Outcome {
             score,
             reason: reason.into(),
             kind: OutcomeKind::Granted,
+        }
+    }
+
+    /// A DELIBERATE head-shake decline: kind [`OutcomeKind::GestureDeclined`], the
+    /// class the daemon maps to `declined_by_gesture` and pam_irlume aborts a polkit
+    /// dialog on. Built HERE, used by BOTH the pre- and post-match shake sites, so
+    /// "a shake is GestureDeclined" is one tested contract, not a class repeated at
+    /// two sites where a revert to `OtherDeny` would pass every camera-less test
+    /// (pinned by `a_shake_decline_reads_as_a_gesture_decline`). `live`/`score`
+    /// carry through from the take (`0.0`/`false` when the shake came before any
+    /// match), so the reason is uniform but the evidence is not fabricated.
+    fn gesture_declined(live: bool, score: f32) -> Self {
+        Self {
+            granted: false,
+            live,
+            score,
+            reason: "head shake cancelled the request".into(),
+            kind: OutcomeKind::GestureDeclined,
         }
     }
 }
@@ -567,6 +591,19 @@ pub fn presence_retryable(o: &Outcome) -> bool {
         o.kind,
         OutcomeKind::NoFace | OutcomeKind::Uncertain | OutcomeKind::SpoofNoIrFace
     )
+}
+
+/// Was this refusal a DELIBERATE head-shake decline?
+///
+/// The daemon maps this onto the wire `AuthResult.declined_by_gesture` field, and
+/// pam_irlume aborts a polkit dialog on it (and only it), so this is a
+/// security-relevant boundary and lives as a tested pure function rather than an
+/// inline `matches!` at the wire site. Only [`OutcomeKind::GestureDeclined`]
+/// qualifies: a timeout, a no-match, a caught spoof, or any policy denial is NOT a
+/// deliberate decline and must never close a dialog. Pinned by
+/// `only_a_gesture_decline_is_a_gesture_decline`.
+pub fn is_gesture_decline(o: &Outcome) -> bool {
+    matches!(o.kind, OutcomeKind::GestureDeclined)
 }
 
 /// Start of the reason irlume-liveness produces when the IR format defines no
@@ -2835,7 +2872,11 @@ impl Engine {
             Ok(outcome)
         } else if self.gesture_cancelled {
             irlume_common::dlog!("consent: head shake cancelled the request");
-            Ok(deny("head shake cancelled the request"))
+            // GestureDeclined via the shared constructor, not the local `deny`
+            // (which is OtherDeny): a deliberate shake is reported distinctly so
+            // pam_irlume can abort a polkit dialog on it, and only it. Carries the
+            // take's live/score, as the local `deny` would.
+            Ok(Outcome::gesture_declined(live, score))
         } else {
             Ok(deny(match mode {
                 ConsentGesture::Nod => "keep nodding your head to approve",
@@ -2956,10 +2997,8 @@ impl Engine {
             // via `consent_watch` when the shake fires.
             if self.gesture_cancelled {
                 irlume_common::dlog!("consent: head shake before the match cancelled the request");
-                return Ok(Outcome::deny(
-                    OutcomeKind::OtherDeny,
-                    "head shake cancelled the request",
-                ));
+                // A pre-match shake never reached matching: no live face, no score.
+                return Ok(Outcome::gesture_declined(false, 0.0));
             }
         }
         // Hold the camera sessions across the grace window's retries. Every retry
@@ -5619,6 +5658,53 @@ mod tests {
             "the deny sites that route through liveness_deny_kind are gone; \
              the rule this test pins has nothing left to hold"
         );
+    }
+
+    #[test]
+    fn only_a_gesture_decline_is_a_gesture_decline() {
+        // The wire boundary: pam_irlume aborts a polkit dialog on `declined_by_gesture`
+        // and nothing else, so `is_gesture_decline` must read true for a deliberate
+        // shake and false for every other refusal (a timeout, a no-match, a caught
+        // spoof, a policy denial). A mutant that matched OtherDeny (the class the
+        // shake used before this feature) would abort a dialog on an ordinary denial.
+        assert!(is_gesture_decline(&Outcome::deny(
+            OutcomeKind::GestureDeclined,
+            "head shake cancelled the request"
+        )));
+        for kind in [
+            OutcomeKind::NoFace,
+            OutcomeKind::Uncertain,
+            OutcomeKind::SpoofNoIrFace,
+            OutcomeKind::Spoof,
+            OutcomeKind::BelowThreshold,
+            OutcomeKind::OtherDeny,
+        ] {
+            assert!(
+                !is_gesture_decline(&Outcome::deny(kind, "x")),
+                "{kind:?} must not read as a gesture decline"
+            );
+        }
+        assert!(!is_gesture_decline(&Outcome::grant(0.9, "match")));
+    }
+
+    #[test]
+    fn a_shake_decline_reads_as_a_gesture_decline() {
+        // Pins the shared shake-outcome constructor: BOTH shake sites build their
+        // Outcome here, so a revert of this kind to OtherDeny would stop the daemon
+        // setting declined_by_gesture and silently kill the feature, yet every other
+        // camera-less test would stay green. Also pins the reason and that a
+        // pre-match shake carries no live face and no score.
+        let pre = Outcome::gesture_declined(false, 0.0);
+        assert!(
+            is_gesture_decline(&pre),
+            "a shake decline is a gesture decline"
+        );
+        assert_eq!(pre.reason, "head shake cancelled the request");
+        assert!(!pre.granted && !pre.live && pre.score == 0.0);
+        // The post-match variant carries the take's live/score but is still a decline.
+        let post = Outcome::gesture_declined(true, 0.42);
+        assert!(is_gesture_decline(&post));
+        assert!(!post.granted && post.live && post.score == 0.42);
     }
 
     #[test]

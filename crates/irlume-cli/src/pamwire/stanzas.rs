@@ -89,6 +89,32 @@ pub(super) const RESEAL_SESSION: &str =
 /// the daemon adds the forced consent gesture on top).
 pub(super) const VERIFY_STANZA: &str = "auth       sufficient                   pam_irlume.so";
 
+/// The polkit consent-dialog verify stanza. Identical to [`VERIFY_STANZA`] EXCEPT
+/// the control is the explicit expansion of `sufficient` PLUS `abort=die`:
+/// `[success=done new_authtok_reqd=done abort=die default=ignore]`. A deliberate
+/// head-shake makes pam_irlume return `PAM_ABORT` (the module scopes that to polkit
+/// consent dialogs); under plain `sufficient` that code is `default=ignore`d and the
+/// stack falls through to the password, so the dialog never closes. `abort=die`
+/// terminates the stack on that ABORT, which polkit reports as one failed attempt.
+/// SUCCESS still grants and every other result (IGNORE on a timeout, no-match, or a
+/// panicked module) still cascades to the password, so ONLY a shake changes
+/// behaviour. Confirmed against pam.conf(5) on this platform, which defines
+/// `sufficient` as `[success=done new_authtok_reqd=done default=ignore]` and `die` as
+/// terminating the stack. sudo keeps the plain [`VERIFY_STANZA`]: pam_irlume never
+/// returns ABORT for it, so an abort=die there would be an inert claim on a
+/// higher-privilege surface.
+///
+/// What the USER sees is the desktop agent's call, not ours. polkit's helper runs
+/// `pam_authenticate` once and reports a single FAILURE (polkitagenthelper-pam.c),
+/// and the agent decides whether to open a fresh session. Measured on Plasma 6
+/// (2026-08-11): polkit-kde re-prompts and closes the window after roughly three
+/// failed attempts, so a shake reliably DECLINES every time but does not close the
+/// dialog on the first one. Escape and the window's close button stay the immediate
+/// manual close. One-shake closing would need a change in polkit-kde, a separate
+/// upstream project, so the instruction irlume prints says "decline", not "closes".
+pub(super) const POLKIT_VERIFY_STANZA: &str =
+    "auth       [success=done new_authtok_reqd=done abort=die default=ignore]   pam_irlume.so";
+
 /// Login-keyring modules that CONSUME the password an `unseal` line releases.
 /// KDE's kwallet-pam still installs `pam_kwallet5.so` under Plasma 6 (the
 /// running provider process is `ksecretd`, but the PAM module kept the 5 in its

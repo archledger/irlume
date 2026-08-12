@@ -293,11 +293,34 @@ impl PamServiceModule for IrlumePam {
                 .and_then(|s| irlume_common::pam_service::classify(&s))
                 .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
             if is_polkit && !unseal {
-                let how = irlume_common::config::consent_gesture_mode().instruction("approve");
-                let _ = pamh.conv(
-                    Some(&format!("irlume: {how}")),
-                    pamsm::PamMsgStyle::TEXT_INFO,
-                );
+                let mode = irlume_common::config::consent_gesture_mode();
+                let how = mode.instruction("approve");
+                // Name how to approve, and, ONLY in the modes where a shake is
+                // actually detected, that a head shake declines and closes the
+                // window. The shake-cancel is NOT mode-independent: the daemon's
+                // consent watch reads a Shake only inside `if allow_nod`
+                // (irlume-auth consent_watch), and `gestures_permitted_by` grants
+                // `allow_nod` to Nod and Either only. In Closure mode a shake is
+                // never seen, so the clause is suppressed rather than promising a
+                // gesture that does nothing. Misconfigured already returns a full
+                // diagnostic sentence, so it gets no clause either.
+                let msg = match mode {
+                    irlume_common::config::ConsentGesture::Nod
+                    | irlume_common::config::ConsentGesture::Either => {
+                        // "decline", NOT "closes the window". A shake ends THIS
+                        // attempt; polkit-kde then decides whether to re-prompt, and
+                        // measured on Plasma 6 (2026-08-11) it closes only after its
+                        // own retry count, about three failed attempts. Promising an
+                        // immediate close would be the same false instruction the
+                        // closure-mode clause was corrected for.
+                        format!("irlume: {how}; shake your head to decline")
+                    }
+                    irlume_common::config::ConsentGesture::Closure
+                    | irlume_common::config::ConsentGesture::Misconfigured => {
+                        format!("irlume: {how}")
+                    }
+                };
+                let _ = pamh.conv(Some(&msg), pamsm::PamMsgStyle::TEXT_INFO);
             }
 
             // Same discoverability problem on the credential-release path: by
@@ -330,7 +353,11 @@ impl PamServiceModule for IrlumePam {
 
             // In `wait` mode, retry until a match or the budget runs out; otherwise
             // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
-            // stack always cascades to the password (NIST: a fallback must exist).
+            // stack cascades to the password (NIST: a fallback must exist), with ONE
+            // deliberate exception handled just below: a polkit shake-decline returns
+            // ABORT to close the dialog, because the user explicitly declined and no
+            // fallback is wanted for THAT attempt (a timeout or no-match still
+            // IGNOREs, so the password box still appears when the user did not shake).
             let deadline = Instant::now() + WAIT_BUDGET;
             loop {
                 let (mut attempt, mut delivered) = if unseal {
@@ -348,6 +375,16 @@ impl PamServiceModule for IrlumePam {
                 if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
                     attempt = try_verify(&pamh, &user);
                     delivered = Released::Failed; // identity only, nothing released
+                }
+                // A polkit shake-decline is terminal: try_verify returned ABORT, so
+                // abort the whole PAM stack instead of cascading to the password. The
+                // attempt then fails with no password prompt, and the polkit agent
+                // decides what to show (polkit-kde re-prompts and closes after its own
+                // retry count; see POLKIT_VERIFY_STANZA in irlume-cli). Never retried,
+                // even in `wait` mode: the user said no. Only a shake on a polkit
+                // dialog reaches this; every other non-SUCCESS falls to IGNORE below.
+                if attempt == PamError::ABORT {
+                    return PamError::ABORT;
                 }
                 if attempt == PamError::SUCCESS {
                     // `kr` + a COLD login that put the login PASSWORD in
@@ -703,9 +740,11 @@ fn read_stdout_bounded(
     }
 }
 
-/// One verify attempt (sudo / in-session unlock): no password released.
-/// Returns `SUCCESS` on a live match, `IGNORE` on anything else. Passes the PAM
-/// service so the daemon can apply tier×operation-class gating (an RGB-only
+/// One verify attempt (sudo / polkit / in-session unlock): no password released.
+/// Returns `SUCCESS` on a live match; `ABORT` on a DELIBERATE head-shake decline
+/// at a polkit consent dialog, so the whole stack aborts and the agent closes its
+/// window; and `IGNORE` on anything else so the password fallback survives. Passes
+/// the PAM service so the daemon can apply tier×operation-class gating (an RGB-only
 /// convenience device honours only a screen-unlock service).
 fn try_verify(pamh: &Pam, user: &str) -> PamError {
     let service = pamh
@@ -713,6 +752,17 @@ fn try_verify(pamh: &Pam, user: &str) -> PamError {
         .ok()
         .flatten()
         .map(|s| s.to_string_lossy().into_owned());
+    // A shake aborts the stack ONLY on a polkit consent dialog. Scoped HERE, not
+    // in the daemon: the daemon reports the shake as a fact (`declined_by_gesture`);
+    // the PAM layer decides what each surface does with it. This is the SAME
+    // predicate the shake hint keys on (`wants_consent_instruction`, both = the
+    // AppConsent class), so the dialog only tells the user "shake to decline
+    // (closes the window)" where a shake actually closes it. On the greeter, lock
+    // screen, and sudo a shake stays a soft IGNORE and the password fallback lives.
+    let is_polkit_consent = service
+        .as_deref()
+        .and_then(irlume_common::pam_service::classify)
+        .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
     match request(&Request::Authenticate {
         user: user.to_string(),
         service,
@@ -722,6 +772,16 @@ fn try_verify(pamh: &Pam, user: &str) -> PamError {
             live: true,
             ..
         }) => PamError::SUCCESS,
+        // A deliberate head-shake on a polkit dialog. Abort so the password module
+        // never prompts and the agent, seeing a total auth failure, closes its
+        // window (polkit ends the attempt on any non-success and hands one
+        // completed(FALSE) to the desktop agent; on this machine polkit-kde closes
+        // rather than re-prompts). Fail-safe: this branch can only DENY, never grant.
+        Ok(Response::AuthResult {
+            granted: false,
+            declined_by_gesture: true,
+            ..
+        }) if is_polkit_consent => PamError::ABORT,
         _ => PamError::IGNORE,
     }
 }

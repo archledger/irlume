@@ -26,9 +26,32 @@ pieces:
 
 Both the KDE and GNOME agents start the PAM conversation the moment the dialog
 appears, so the camera fires immediately. The dialog shows "irlume: keep
-nodding your head to approve"; do that and it approves, no typing or clicking.
-The eye closure is accepted too when calibrated, but the prompt names only the
-nod, because the nod is the gesture that works with no setup.
+nodding your head to approve; shake your head to decline"; do that and it
+approves, no typing or clicking. The eye closure is accepted too when
+calibrated, but the prompt names only the nod, because the nod is the gesture
+that works with no setup.
+
+### Declining with a head shake
+
+A head shake is a deliberate "no". It cancels the face authentication at once,
+and irlume's PAM line for `polkit-1` carries the control
+`[success=done new_authtok_reqd=done abort=die default=ignore]`, so a shake ends
+the whole attempt instead of dropping you to the password box.
+
+What happens to the dialog after that is the desktop agent's decision, not
+irlume's. polkit runs the PAM conversation once per attempt and reports one
+failure; the agent chooses whether to ask again. Measured on Plasma 6: the KDE
+agent re-prompts and closes its window after about three failed attempts, so a
+shake declines every time but does not close the dialog on the first one. Press
+Escape or the window's close button to dismiss it immediately.
+
+A shake only ends the attempt on polkit prompts. On the login screen, the lock
+screen and `sudo`, and whenever no gesture is made at all, the password prompt
+still follows as usual, so a misread gesture can never lock you out.
+
+The shake is read only when the nod is an accepted gesture (the default, and
+`consent_gesture=nod`). Under `consent_gesture=closure` no shake is detected,
+and the dialog does not mention one.
 
 ## Enabling
 

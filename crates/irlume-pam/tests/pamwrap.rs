@@ -317,6 +317,7 @@ fn grant() -> Response {
         score: 0.93,
         live: true,
         reason: "match".into(),
+        declined_by_gesture: false,
     }
 }
 
@@ -481,6 +482,183 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
     assert!(!out.contains(HINT), "verify must stay silent: {out}");
 }
 
+/// The polkit dialog names BOTH halves of the consent gesture: how to approve,
+/// AND that a head shake declines. A user told only to nod does not know a shake
+/// is a deliberate "no"; the decline is the half this change added. The
+/// shake-cancel is mode-independent in the daemon, so the decline clause is
+/// truthful in every real mode, and it is suppressed only for `Misconfigured`,
+/// whose instruction is already a full diagnostic sentence naming the bad
+/// setting. The service is named `polkit-1` on purpose: pam_irlume classifies
+/// the service NAME, and only AppConsent (polkit-1) is a consent dialog.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_polkit_prompt_names_approve_and_decline() {
+    const APPROVE: &str = "keep nodding your head to approve";
+    const DECLINE: &str = "shake your head to decline";
+    let Some(h) = Harness::try_new("polkit-consent") else {
+        return;
+    };
+    // The instruction is emitted before the verdict, so a deny still shows it;
+    // the message is what we pin, not the outcome.
+    serve(&h.socket, |_| Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: "face not granted".into(),
+        declined_by_gesture: false,
+    });
+
+    // A plain verify (no `unseal`) on the polkit service.
+    h.write_service("polkit-1", &[h.auth_line("required", "")]);
+
+    // Default settings (Either mode): the prompt names the nod AND the shake.
+    h.write_settings(None);
+    let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
+    assert!(
+        out.contains(APPROVE),
+        "the polkit prompt must say how to approve: {out}"
+    );
+    assert!(
+        out.contains(DECLINE),
+        "the polkit prompt must name the shake decline: {out}"
+    );
+
+    // Misconfigured mode: the instruction is a diagnostic sentence naming the bad
+    // setting; the decline clause is suppressed so it does not bury the fix.
+    h.write_settings(Some("consent_gesture=banana\n"));
+    let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
+    assert!(
+        out.contains("consent_gesture is set to a value irlume does not recognise"),
+        "a misconfigured mode must name the bad setting: {out}"
+    );
+    assert!(
+        !out.contains(DECLINE),
+        "a misconfigured diagnostic must not carry a decline clause: {out}"
+    );
+
+    // Closure mode: a head-shake is never detected (the consent watch reads a Shake
+    // only in nod-capable modes), so the decline clause is suppressed rather than
+    // promising a gesture that does nothing. The approve instruction is the closure
+    // one. This is the case the review flagged as a false instruction.
+    h.write_settings(Some("consent_gesture=closure\n"));
+    let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
+    assert!(
+        out.contains("close your eyes"),
+        "closure mode must name the closure approve gesture: {out}"
+    );
+    assert!(
+        !out.contains(DECLINE),
+        "closure mode must NOT promise a shake decline it cannot detect: {out}"
+    );
+
+    // Scoping: a plain elevation service (sudo) is not a consent dialog, so it
+    // gets neither half of the gesture instruction.
+    h.write_settings(None);
+    h.write_service("sudo", &[h.auth_line("required", "")]);
+    let (_, out) = h.run("sudo", &["authenticate"], "", None);
+    assert!(
+        !out.contains(APPROVE) && !out.contains(DECLINE),
+        "a non-polkit service must show no gesture instruction: {out}"
+    );
+}
+
+/// A head-shake on a polkit dialog ABORTS the PAM stack, so the password module
+/// after the abort=die control is never reached (and the agent closes its window).
+/// The SAME shake on a NON-polkit service, and a plain no-match on polkit, must
+/// instead IGNORE and fall through to the password module: the fallback survives
+/// unless the user deliberately declined a POLKIT dialog. `pam_permit` stands in
+/// for the distro password module and grants ONLY if the stack reaches it, so
+/// `ok == false` means "aborted before the password".
+///
+/// This is the fail-safe boundary; three mutations die here. Case (1): folding
+/// ABORT into IGNORE, or try_verify not returning ABORT, makes it fall through and
+/// grant. Case (2): dropping the `is_polkit_consent` guard makes try_verify ABORT
+/// for the non-polkit service too. Case (2) wires that service under the SAME
+/// abort=die control ON PURPOSE, as a test instrument, so the module's ABORT is
+/// observable: under plain `sufficient` an ABORT is `default=ignore`d and IGNORE
+/// vs ABORT would be indistinguishable, leaving the guard unpinned. Case (3):
+/// matching a non-shake decline makes a plain no-match abort.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(h) = Harness::try_new("polkit-abort") else {
+        return;
+    };
+    // The daemon reports a denial; `declined_by_gesture` is flipped per case to
+    // model "deliberate shake" (true) vs "plain no-match" (false).
+    let declined = Arc::new(AtomicBool::new(true));
+    let d = declined.clone();
+    let log = serve(&h.socket, move |_| Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: "denied".into(),
+        declined_by_gesture: d.load(Ordering::SeqCst),
+    });
+
+    // pam_irlume under a control line, then pam_permit as the distro
+    // password-module stand-in: reached only if pam_irlume did NOT abort. BOTH
+    // services here carry the abort=die control (POLKIT_CONTROL), as a test
+    // instrument, so the module's ABORT-vs-IGNORE is observable on each; under
+    // plain `sufficient` an ABORT is `default=ignore`d and the scoping guard could
+    // not be tested. In production only the polkit stanza carries abort=die and
+    // sudo keeps plain `sufficient`, but pam_irlume never returns ABORT for sudo
+    // (the is_polkit_consent guard), so sudo's real control cannot change the outcome.
+    const POLKIT_CONTROL: &str = "[success=done new_authtok_reqd=done abort=die default=ignore]";
+    let permit_after = |service: &str, control: &str| {
+        h.write_service(
+            service,
+            &[
+                h.auth_line(control, ""),
+                "auth required pam_permit.so".into(),
+            ],
+        );
+    };
+
+    // (1) polkit + deliberate shake: ABORT under abort=die, so pam_permit is never reached.
+    declined.store(true, Ordering::SeqCst);
+    permit_after("polkit-1", POLKIT_CONTROL);
+    let (ok, out) = h.run("polkit-1", &["authenticate"], "", None);
+    assert!(
+        !ok,
+        "a polkit shake must abort before the password module: {out}"
+    );
+
+    // (2) sudo + shake: NOT a polkit dialog, so try_verify must IGNORE, never ABORT.
+    // Under the abort=die instrument, IGNORE -> default=ignore -> pam_permit grants
+    // (ok); a dropped is_polkit_consent guard would ABORT -> die -> no grant, failing
+    // this assertion. That is the mutation this case exists to kill.
+    declined.store(true, Ordering::SeqCst);
+    permit_after("sudo", POLKIT_CONTROL);
+    let (ok, out) = h.run("sudo", &["authenticate"], "", None);
+    assert!(
+        ok,
+        "a non-polkit shake must IGNORE (keep the password), not ABORT: {out}"
+    );
+
+    // (3) polkit + plain no-match (not a shake): IGNORE, so it falls through to
+    // permit even under abort=die (only a PAM_ABORT dies; IGNORE does not).
+    declined.store(false, Ordering::SeqCst);
+    permit_after("polkit-1", POLKIT_CONTROL);
+    let (ok, out) = h.run("polkit-1", &["authenticate"], "", None);
+    assert!(
+        ok,
+        "a non-shake polkit denial must keep the password fallback: {out}"
+    );
+
+    // The daemon really was asked each time (defect #26: absent vs broken), so the
+    // aborts and fall-throughs are real verdicts, not "pam_irlume never ran".
+    let reqs = log.lock().unwrap();
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| matches!(r, Request::Authenticate { .. }))
+            .count(),
+        3,
+        "each case must reach the daemon: {reqs:?}"
+    );
+}
+
 /// THE fail-safe that makes the challenge acceptable when it is on: when the
 /// gesture is not performed, the daemon refuses to release the password, and the
 /// PAM stack must carry on to the password module rather than fail the
@@ -634,6 +812,7 @@ fn pamwrap_wait_mode_retries_until_a_match() {
                     score: 0.10,
                     live: true,
                     reason: "below threshold".into(),
+                    declined_by_gesture: false,
                 }
             } else {
                 grant()

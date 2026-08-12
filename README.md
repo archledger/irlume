@@ -111,6 +111,10 @@ useful contribution right now:
 [Issues](https://github.com/archledger/irlume/issues) ·
 [Security](SECURITY.md)
 
+If irlume is useful to you and you feel like it, there is a
+[Ko-fi](https://ko-fi.com/archledger). No obligation; the project stays free
+and GPL either way.
+
 ---
 
 <div align="center">

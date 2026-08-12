@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **A capture now verifies the device still holds the negotiated format once
+  it claims the buffers.** The V4L2 format is per-device state gated only on
+  buffer ownership, and ownership begins at REQBUFS, so between irlume's
+  open-time S_FMT and a session's buffer claim another application could
+  retarget the device and the capture would decode frames against stale
+  width, height and fourcc assumptions. Every stream open (sessions, their
+  recovery paths, the frozen-stream restarts, probes and emitter setup) now
+  reads G_FMT back after claiming the queue, at which point the format can
+  no longer move, and refuses the capture naming what changed and, when
+  visible, who holds the camera. Source audit:
+  `docs/research/2026-08-12-camera-handling-audit.md`, Q3 (#427).
+
 - **The IR eye-glint cue recorded the sensor's ceiling as the strongest possible
   reading.** `eye_glint` returned the window maximum with no notion of a
   ceiling, so a peak that railed at the negotiated format's white level was

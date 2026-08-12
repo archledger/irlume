@@ -302,6 +302,16 @@ fn reconcile() -> ExitCode {
 /// active DM actually consults, so reconcile repairs the login that matters. An
 /// absent active-greeter file counts as not-wired too (a deleted /etc override).
 /// Falls back to `login_wired()` when the active DM is unknown/absent.
+/// Does the KDE lock-screen override actually carry the module right now?
+///
+/// The self-heal marker records this so a later absence is only a regression
+/// when the line was ours to maintain. Both apply paths must record what is
+/// WIRED rather than what was asked for: writing `with_lock=true` on a host that
+/// wires no lock screen makes reconcile chase a surface that was never there.
+pub(crate) fn lock_wired() -> bool {
+    Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc))
+}
+
 pub(crate) fn active_login_wired() -> bool {
     let Some(dm) = active_display_manager() else {
         return login_wired();
@@ -1309,8 +1319,7 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         if enable {
             let obs_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
             let obs_polkit = polkit_wired() == Some(true);
-            let obs_lock =
-                Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc));
+            let obs_lock = lock_wired();
             write_wired_marker(enable, obs_sudo, obs_polkit, obs_lock);
         } else {
             write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);

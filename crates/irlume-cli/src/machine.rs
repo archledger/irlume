@@ -1318,7 +1318,16 @@ pub fn login_apply(args: &[String]) -> ExitCode {
         // On disable the marker goes entirely, because a disable unwires every
         // surface including those two.
         let (with_sudo, with_polkit, _) = crate::pamwire::read_wired_marker().unwrap_or_default();
-        crate::pamwire::write_wired_marker(enable, with_sudo, with_polkit, enable);
+        // `with_lock` records whether the lock screen IS wired, not whether this
+        // was an enable. Passing `enable` claimed one on every host, including
+        // those that wire no lock screen at all, and reconcile then reads a
+        // surface that was never ours as a regression to repair.
+        crate::pamwire::write_wired_marker(
+            enable,
+            with_sudo,
+            with_polkit,
+            enable && crate::pamwire::lock_wired(),
+        );
     }
     let changes: Vec<Value> = applied
         .iter()
@@ -1741,18 +1750,23 @@ pub fn auth_test(args: &[String]) -> ExitCode {
     }
     let user = crate::user_arg(args);
 
+    // Both of these happen BEFORE the stream begins, and the contract is explicit
+    // about that boundary: a refusal before the stream is a single document with
+    // exit 2, while exit 1 means the stream started and then failed. Returning 1
+    // here told a consumer a capture had begun and died when nothing had run, and
+    // `session-busy` is precisely the case a caller retries on.
     let session = match SessionGuard::acquire() {
         Ok(session) => session,
         Err(SessionRefusal::Busy) => {
             return emit(
                 &failure(COMMAND, "session-busy", true, contract),
-                ExitCode::FAILURE,
+                ExitCode::from(2),
             )
         }
         Err(SessionRefusal::Unavailable) => {
             return emit(
                 &failure(COMMAND, "operation-failed", false, contract),
-                ExitCode::FAILURE,
+                ExitCode::from(2),
             )
         }
     };

@@ -1100,6 +1100,12 @@ impl App {
     /// Re-derive tab visibility from live state; keeps the current screen when
     /// it survives, else snaps to the nearest visible step.
     fn recompute_visible(&mut self) {
+        // The hub lists the VISIBLE screens, so this is where its list can
+        // shrink ([v] leaves advanced view, a probe lands, the daemon goes
+        // away). `move_sel` wraps modulo the current length, so a stale index
+        // fixes itself on the next arrow, but until then no row is highlighted
+        // and Enter silently opens nothing: an advertised key doing nothing,
+        // which is the shape this pass keeps finding.
         self.visible = Self::compute_visible(
             &self.caps,
             VisibilityInputs {
@@ -1117,6 +1123,11 @@ impl App {
                 .copied()
                 .min_by_key(|&s| s.abs_diff(cur))
                 .unwrap_or(0);
+        }
+        // Clamp the hub selection into the list it now has.
+        let rows = self.hub_rows().len();
+        if rows > 0 && self.hub_sel >= rows {
+            self.hub_sel = rows - 1;
         }
     }
 
@@ -11373,6 +11384,44 @@ mod tests {
             Some(v) => std::env::set_var("IRLUME_SOCKET", v),
             None => std::env::remove_var("IRLUME_SOCKET"),
         }
+    }
+
+    /// A hub selection must stay inside the list when the list shrinks.
+    ///
+    /// The hub shows only visible screens, and [v] leaving advanced view removes
+    /// several. `move_sel` wraps modulo the current length, so a stale index
+    /// recovers on the next arrow, but until then nothing is highlighted and
+    /// Enter opens nothing at all.
+    #[test]
+    fn the_hub_selection_survives_the_list_shrinking() {
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        app.advanced = true;
+        app.daemon_up = true;
+        app.fp_present = true;
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.recompute_visible();
+        let wide = app.hub_rows().len();
+        assert!(wide > 1, "premise: advanced view lists several sections");
+        app.hub_sel = wide - 1;
+
+        // Leaving advanced view removes screens, so the list gets shorter.
+        app.advanced = false;
+        app.recompute_visible();
+        let narrow = app.hub_rows().len();
+        assert!(narrow > 0, "the hub always has rows");
+        assert!(
+            app.hub_sel < narrow,
+            "selection {} must be inside the {narrow} remaining rows",
+            app.hub_sel
+        );
+        // And Enter opens the row it is on rather than nothing.
+        let target = app.hub_rows()[app.hub_sel].2;
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, target, "Enter opens the highlighted section");
     }
 
     /// An encrypted enrollment whose template key is gone must not read as a

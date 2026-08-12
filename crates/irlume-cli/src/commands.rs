@@ -844,16 +844,39 @@ pub fn status(args: &[String]) -> ExitCode {
 ///   0  = ready    (daemon reachable AND the user is enrolled)
 ///   10 = partial  (installed but not ready: daemon down or not enrolled)
 ///   20 = absent   (irlumed is not installed)
+/// Is the daemon binary on this machine, wherever the distro keeps it?
+///
+/// The FHS paths first, then `PATH`, which is how a Nix profile
+/// (/run/current-system/sw/bin) and a home-manager install are found. Checked
+/// only when the socket says nothing: a reachable daemon has already answered
+/// the question.
+fn irlumed_binary_present() -> bool {
+    const FHS: &[&str] = &[
+        "/usr/local/bin/irlumed",
+        "/usr/bin/irlumed",
+        "/run/current-system/sw/bin/irlumed",
+    ];
+    if FHS.iter().any(|p| std::path::Path::new(p).exists()) {
+        return true;
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("irlumed").exists()))
+}
+
 pub fn detect(args: &[String]) -> ExitCode {
     let user = user_arg(args);
-    let installed = ["/usr/local/bin/irlumed", "/usr/bin/irlumed"]
-        .iter()
-        .any(|p| std::path::Path::new(p).exists());
+    // A REACHABLE daemon is the strongest possible evidence of an install, so ask
+    // that before looking for files. Two hardcoded paths decided this before, and
+    // NixOS puts the binary in /nix/store with a link from
+    // /run/current-system/sw/bin: a packaged, documented, fully working install
+    // reported "absent: irlumed is not installed" and exit 20, the code that
+    // tells an installer irlume is not on the machine at all.
+    let reach = daemon_reach();
+    let installed = reach != DaemonReach::Down || irlumed_binary_present();
     if !installed {
         println!("absent: irlumed is not installed");
         return ExitCode::from(20);
     }
-    let reach = daemon_reach();
     // Without socket access neither readiness nor enrollment is knowable, and
     // claiming "not enrolled" would be a guess. Report the real obstacle and
     // stay at 10 (partial): 0 would assert a readiness we cannot see.
@@ -2394,4 +2417,47 @@ fn usable_scans_counts_only_the_loaded_recognizer() {
         ]),
         None
     );
+}
+
+/// `detect` must not decide "not installed" from a list of FHS paths.
+///
+/// NixOS keeps the binary in /nix/store and links it from
+/// /run/current-system/sw/bin, so a packaged and documented install reported
+/// `absent: irlumed is not installed` and exit 20, the code an installer
+/// reads as "irlume is not on this machine".
+#[test]
+fn the_daemon_binary_is_found_wherever_the_distro_keeps_it() {
+    let _g = crate::testenv::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("irlume-detect-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let old_path = std::env::var_os("PATH");
+
+    // A PATH with no irlumed in it: only the FHS paths can answer, and on a
+    // machine that has one this stays true, so assert the negative form on a
+    // PATH we fully control instead.
+    std::env::set_var("PATH", &dir);
+    let fhs_present = ["/usr/local/bin/irlumed", "/usr/bin/irlumed"]
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
+    assert_eq!(
+        irlumed_binary_present(),
+        fhs_present,
+        "with an empty PATH only the FHS paths may answer"
+    );
+
+    // The Nix-shaped case: not in any FHS path, but on PATH.
+    std::fs::write(dir.join("irlumed"), b"#!/bin/sh\n").unwrap();
+    assert!(
+        irlumed_binary_present(),
+        "a daemon on PATH (a Nix profile link) is installed"
+    );
+
+    match old_path {
+        Some(v) => std::env::set_var("PATH", v),
+        None => std::env::remove_var("PATH"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -18,11 +18,21 @@ close away from being unfindable. This ADR is that text's home.
 
 ## Decision
 
-- **The pin is the whole safety property.** Every stage that opens keeps
-  the catalog discipline: an entry names its stage, its license, its
-  provenance, its measured threshold and its sha256, and the daemon runs
-  exactly the pinned artifact or refuses to start. There will never be a
-  directory where an ONNX file is dropped and silently used.
+- **The artifact pin is mandatory, and it is not the whole safety
+  property.** Every open stage keeps the catalog discipline: an entry
+  names its stage, license, provenance, measured threshold and sha256.
+  The digest identifies the exact measured weights and nothing else;
+  stage gating, preprocessing, threshold selection, template-space
+  separation and stage-specific failure behaviour are independent parts
+  of the policy, and a catalog-only edit can change the threshold without
+  touching the digest, which is why threshold changes get the same
+  scrutiny as new artifacts (the Codex round on this ADR's PR caught the
+  first draft claiming the digest covered all of it). Failure behaviour
+  differs by stage on purpose: recognition refuses daemon startup when an
+  explicitly selected artifact cannot be verified, while a missing,
+  unreadable or mismatched PAD artifact disables that optional deny-only
+  cue and leaves the built-in gate running. There is no directory from
+  which an arbitrary ONNX file is silently selected.
 - **Liveness (PAD): open.** Its wiring is deny-only: a hostile, broken or
   mismatched model can refuse a presentation the built-in gate accepted,
   never approve one it rejected. Every false denial falls back to the
@@ -36,10 +46,18 @@ close away from being unfindable. This ADR is that text's home.
      irlume's own pipeline, never taken from publisher numbers: at minimum
      the full LFW protocol, all seven FairFace groups individually, and one
      synthetic set named down to the part and selection rule.
-  3. The false-reject side is measured on this project's cameras as a live
-     genuine floor, confirmed per user at enrollment. A floor that does not
-     clear the threshold means re-enroll or decline the model, never lower
-     the threshold.
+  3. The false-reject side is measured on this project's cameras as a
+     live genuine floor before an artifact enters the catalog, and the
+     measurement record names the subjects, cameras, conditions and the
+     observed margin above the proposed threshold. Enrollment tags
+     templates with the artifact digest but does NOT validate a per-user
+     genuine floor (the Codex round caught the first draft promising an
+     enrollment-time check that no code performs); a user whose captures
+     do not clear the fixed threshold re-enrolls, disables the model or
+     uses the password. A floor that does not clear the threshold means
+     re-enroll or decline the model, never lower the threshold; per-user
+     enrollment validation is a separate prerequisite if this ADR is
+     later amended to promise it.
   4. The candidate's worst FairFace group FAR must not exceed the shipped
      stack's worst group at its own operating point, and any residual above
      1e-4 is published in the `FAIRNESS.md` style.

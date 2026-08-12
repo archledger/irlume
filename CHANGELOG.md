@@ -7,24 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
-- **Camera nodes classify without being opened.** Scanning used to open
-  every `/dev/video*` node and enumerate its formats; on kernels before
-  6.16 each such open powers the camera up (uvcvideo moved power-up into
-  the ioctl dispatcher in 6.16), which is a privacy-LED blink per scan, and
-  the #187 workaround existed because those probe opens were believed to
-  contend. On UVC hardware the role is now read from sysfs and the media
-  graph alone: the media controller says which node is the function's
-  capture node (its entity owns pads; the metadata sibling is padless), and
-  the USB descriptors blob names the function's formats, translated through
-  the kernel's own GUID table, including the whole L8 greyscale family
-  (Y8, Y800, D3DFMT_L8, KSMEDIA_L8_IR, the Windows Hello IR format this
-  project's own reference camera advertises), and fed to the same
-  classifier the open probe uses, so the two paths cannot disagree.
-  Everything the no-open path cannot decide falls back to the open probe
-  unchanged: loopback nodes, MC-centric platform stacks (the #425 QUERYCAP
-  gate still names them), vendor-only format lists. On-hardware
-  verification of every source is in
-  `docs/research/2026-08-12-camera-session-measurements.md` (#428).
+- **Metadata camera nodes classify without being opened.** Scanning used
+  to open every `/dev/video*` node to enumerate formats; on kernels before
+  6.16 each open powers the camera up (uvcvideo moved power-up into the
+  ioctl dispatcher in 6.16), a privacy-LED blink per node per scan. The
+  media graph now answers the capture-or-metadata question first, with no
+  video-node open: `/dev/media*` opens are documented side-effect free, a
+  capture entity owns pads, and the metadata sibling is registered
+  padless, so half of a UVC camera's nodes never open at all. Capture
+  nodes keep the ENUM_FMT probe on purpose: a descriptor-derived format
+  route was built and removed in review, because the blob cannot be
+  attributed to one of a function's possibly several streaming
+  interfaces, a userspace GUID table is a subset whose omissions change
+  the answer, and uvcvideo's per-device quirks rewrite the list the node
+  actually reports. On-hardware verification of the media-graph facts is
+  in `docs/research/2026-08-12-camera-session-measurements.md` (#428).
 
 ### Fixed
 

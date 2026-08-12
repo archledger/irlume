@@ -943,36 +943,35 @@ impl Unreadable {
     }
 }
 
-/// Classify a UVC node from sysfs and the media graph alone, opening no
-/// video device (#428).
+/// The no-open half of classification (#428): the media graph says whether
+/// this is a UVC function's CAPTURE node or its metadata sibling, and
+/// opening `/dev/media*` is documented side-effect free where a video-node
+/// open on pre-6.16 kernels powers the camera up. A metadata node answers
+/// `Other` here, the same answer the open probe's EINVAL-at-ENUM_FMT arm
+/// gives it, without the open.
 ///
-/// Two questions, both answerable without a video-node open: is this the
-/// function's CAPTURE node or its metadata sibling (the media graph knows;
-/// opening `/dev/media*` is documented side-effect free), and which formats
-/// does the function advertise (the sysfs descriptors blob, translated to
-/// fourccs by the kernel's own GUID table and fed to the same
-/// [`role_from_formats`] the open probe uses, so the two paths cannot answer
-/// differently). The capture question gates the format question, because
-/// the descriptors describe the FUNCTION and would classify the metadata
-/// node as a camera.
+/// A CAPTURE node deliberately answers `None` and takes the open probe. A
+/// descriptor-derived format route was built and REMOVED in review: a video
+/// node's sysfs parent names the UVC control function, not which of that
+/// function's possibly several streaming interfaces backs this node, so the
+/// blob cannot be attributed per node; the kernel skips formats with GUIDs
+/// it does not know, so any userspace table is a subset whose omissions
+/// change the enumerated set; and uvcvideo applies per-device quirks
+/// (`UVC_QUIRK_FORCE_Y8` and kin) that rewrite the list the node actually
+/// reports. Until all three can be reproduced faithfully, ENUM_FMT on the
+/// node is the only sound format authority (Codex round on this PR).
 ///
-/// `None` is the honest answer for everything else, and it always falls
-/// back to the open probe: loopback nodes (no USB parent), MC-centric
-/// platform stacks (media graph present but no USB descriptors, so the
-/// #425 QUERYCAP gate still names them), vendor-only format lists, and any
-/// sysfs read that fails. This path can only remove opens, never change
-/// what a node classifies as. One asymmetry is accepted: a PADLESS node on
-/// a non-UVC media stack answers `Other` here without reaching the
-/// MC-centric gate, which ignores it exactly as the gate would, minus
-/// doctor naming it.
+/// Every other `None` is the same honest fall-through: loopback nodes have
+/// no USB parent, MC-centric platform stacks keep meeting the #425
+/// QUERYCAP gate, and a failed sysfs read proves nothing. One asymmetry is
+/// accepted: a PADLESS node on a non-UVC media stack answers `Other` here
+/// without reaching the MC-centric gate, which ignores it exactly as the
+/// gate would, minus doctor naming it.
 fn classify_without_open(device: &str) -> Option<NodeKind> {
     if !media_graph::node_is_capture(device)? {
-        // The metadata sibling: correctly ignored, the same answer the open
-        // probe's EINVAL-at-ENUM_FMT arm gives it.
         return Some(NodeKind::Camera(Role::Other));
     }
-    let fourccs = uvc_descriptor::streaming_fourccs(device)?;
-    Some(NodeKind::Camera(role_from_formats(&fourccs)))
+    None
 }
 
 /// Classify a single `/dev/videoN` node, keeping a failure to read the node

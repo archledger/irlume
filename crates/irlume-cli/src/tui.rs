@@ -3560,8 +3560,14 @@ impl App {
                 // CLI go through; this only avoids offering the user an action
                 // whose only outcome is an error modal.
                 if on {
-                    self.set_error(
-                        "require-eyes-open cannot be enabled: it refuses the user it exists                          to admit (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12                          with glasses). See issue #386.",
+                    // The row no longer advertises enter while off, so this is
+                    // a bare keypress: a log line, not a modal. The wording
+                    // matches the daemon's own refusal at its choke point.
+                    self.log(
+                        '·',
+                        "require-eyes-open cannot be enabled: it refuses the user it \
+                         exists to admit (measured 1 of 12 bare-eyed frames with eyes \
+                         open, 0 of 12 with glasses). See issue #386.",
                     );
                     return;
                 }
@@ -4565,10 +4571,22 @@ impl App {
                     "  Never unlock unless both eyes read open (IR-glint heuristic).",
                     Style::new().dim(),
                 )),
-                Line::from(vec![
-                    Span::styled("  [enter]", Style::new().fg(th().accent)),
-                    Span::styled(" toggle", Style::new().dim()),
-                ]),
+                // OFF is this setting's terminal state: the daemon refuses to
+                // enable it (#386, it admits 1 of 12 bare-eyed eyes-open
+                // frames), so advertising "[enter] toggle" offered an action
+                // whose only outcome was an error modal. The hint appears only
+                // while there is something to do: turn a legacy ON back off.
+                if self.eyes_open {
+                    Line::from(vec![
+                        Span::styled("  [enter]", Style::new().fg(th().accent)),
+                        Span::styled(" turn off", Style::new().dim()),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        "  Cannot be enabled: the gate refuses eyes-open users (#386).",
+                        Style::new().dim(),
+                    ))
+                },
                 Line::raw(""),
                 ];
                 v.extend(self.service_gesture_lines());
@@ -8689,11 +8707,23 @@ mod tests {
             app.op.is_none(),
             "no request may be sent for an enable the daemon refuses"
         );
-        let err = app.error.as_deref().unwrap_or_default();
-        assert!(err.contains("cannot be enabled"), "{err}");
+        // The row no longer advertises Enter while off, so a bare keypress
+        // logs quietly instead of raising a modal about a hint nobody saw.
         assert!(
-            err.contains("#386"),
-            "the refusal must name the issue: {err}"
+            app.error.is_none(),
+            "no modal for an action the screen does not offer"
+        );
+        let logged = app.activity.last().map(|e| e.1.as_str()).unwrap_or("");
+        assert!(logged.contains("cannot be enabled"), "{logged}");
+        assert!(
+            logged.contains("#386"),
+            "the refusal must name the issue: {logged}"
+        );
+        // The old literal spanned continuation lines without `\`, burying
+        // 26-space runs mid-sentence in the rendered message.
+        assert!(
+            !logged.contains("  "),
+            "the message must not carry embedded space runs: {logged:?}"
         );
     }
 
@@ -9974,6 +10004,16 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("Require eyes open"));
         assert!(text.contains("○ no"), "eyes-open starts off");
+        // OFF is terminal (#386): the section must say why instead of
+        // advertising a toggle whose only outcome used to be an error modal.
+        assert!(
+            text.contains("Cannot be enabled"),
+            "the off state must explain itself"
+        );
+        assert!(
+            !text.contains("turn off"),
+            "no turn-off hint while already off"
+        );
         assert!(text.contains("Biopolicy operation-class gate"));
         assert!(text.contains("Third-party models"));
         assert!(
@@ -9984,6 +10024,14 @@ mod tests {
         app.eyes_open = true;
         let text = draw_text(&app);
         assert!(text.contains("● yes"), "the toggled state must show");
+        assert!(
+            text.contains("turn off"),
+            "a legacy ON must offer the one action that works"
+        );
+        assert!(
+            !text.contains("Cannot be enabled"),
+            "the refusal note belongs to the off state only"
+        );
     }
 
     #[test]

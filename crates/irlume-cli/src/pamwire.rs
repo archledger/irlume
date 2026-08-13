@@ -275,6 +275,25 @@ fn reconcile() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
+    // The marker records what `login enable` wired, and it can drift: a real
+    // install was found with an irlume-created /etc/pam.d/polkit-1 while its
+    // marker said with_polkit=false, so reconcile never maintained polkit and
+    // the pre-abort=die stanza would have survived every upgrade unmigrated.
+    // The FILE is the ground truth for "is this surface ours": adopt a wired
+    // surface the marker missed, the same reasoning as the no-marker adoption
+    // above, and record it so the next run agrees.
+    let file_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
+    let file_polkit = polkit_wired() == Some(true);
+    let adopted = (file_sudo && !with_sudo) || (file_polkit && !with_polkit);
+    let with_sudo = with_sudo || file_sudo;
+    let with_polkit = with_polkit || file_polkit;
+    if adopted && effective_uid() == 0 {
+        write_wired_marker(true, with_sudo, with_polkit, with_lock);
+        eprintln!(
+            "[login] adopted wired surfaces the marker missed \
+             (sudo={with_sudo}, polkit={with_polkit})"
+        );
+    }
     if active_login_wired()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)

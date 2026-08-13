@@ -246,7 +246,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
-* Tue Aug 12 2026 archledger <archledger236@gmail.com> - 0.10.0-1
+* Wed Aug 12 2026 archledger <archledger236@gmail.com> - 0.10.0-1
 - Per-service consent gestures with a head-shake decline; elevation and polkit prompts require a nod by default
 - The keyring-release gesture default changed from ON to OFF; opt back in with irlume credential-release-challenge credential_release on
 - The landmark mesh is now the published .tflite on a bundled TFLite runtime; a runtime that fails to load degrades to nod-only instead of stopping the daemon

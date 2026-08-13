@@ -1179,9 +1179,43 @@ fn act(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCod
 /// The hung process is root and holds the lock exclusively, so every other
 /// irlume PAM operation blocked behind it too, and the unit's `Type=oneshot`
 /// default of `TimeoutStartUSec=infinity` meant systemd never killed it.
+/// Whether a wiring run may proceed on this capability reading.
+///
+/// Pure, so both directions are tested without a daemon. See the comment at
+/// the call site for why an unestablished reading must stop an ENABLE.
+fn enable_permitted(enable: bool, caps_established: bool) -> Result<(), &'static str> {
+    if enable && !caps_established {
+        return Err(
+            "[login] refusing: this machine's camera capabilities could not be \
+             established (the daemon did not answer and the failure does not \
+             prove it is absent), and enabling UNWIRES the surfaces that read \
+             as unsupported. Nothing was changed.",
+        );
+    }
+    Ok(())
+}
+
 fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: bool) -> ExitCode {
     if !apply {
         println!("[login] DRY RUN: showing what `--apply` would change (nothing is written):");
+    }
+    // An enable UNWIRES what the hardware does not support, so it must not run
+    // on a capability answer nothing established. `caps()` falls back to
+    // `{ir_pair: false, rgb: false}` when the daemon cannot be reached and the
+    // failure does not prove it absent, which on a packaged install is the
+    // ORDINARY shape of a dead daemon: socket activation keeps the socket
+    // present, so the request times out rather than being refused. Acting on
+    // that guess removed the face line from every greeter and the lock screen
+    // and reported success, and the Repair row offering the fix sits on the
+    // screen the TUI drops you on when the daemon is down. A disable is the
+    // user asking for exactly that removal, so it needs no capabilities.
+    if let Err(why) = enable_permitted(enable, crate::caps_established()) {
+        eprintln!("{why}");
+        eprintln!(
+            "        start the daemon and retry: sudo systemctl start irlumed   \
+             (or, if it will not start, `irlume doctor` says why)"
+        );
+        return ExitCode::FAILURE;
     }
     // Method + tier aware plan: wire exactly what the chosen method needs on
     // this hardware, and (on enable) UNWIRE what it doesn't, so switching method
@@ -1827,6 +1861,32 @@ mod tests {
     }
 
     use super::*;
+
+    /// A wiring ENABLE must refuse a capability reading nothing established,
+    /// because enabling unwires whatever reads unsupported. Demonstrated on
+    /// the shipped 0.9.0 binary against an unanswering socket with no
+    /// configured pair: it planned `face login: off  face lock: off` and
+    /// exited 0, which with --apply strips the face line from every greeter.
+    /// A DISABLE needs no capabilities: removal is what the user asked for.
+    #[test]
+    fn enable_refuses_an_unestablished_capability_reading_and_disable_does_not() {
+        assert!(enable_permitted(true, true).is_ok(), "established: proceed");
+        assert!(
+            enable_permitted(false, false).is_ok(),
+            "a disable removes wiring on purpose and needs no capabilities"
+        );
+        assert!(
+            enable_permitted(false, true).is_ok(),
+            "a disable is unaffected by an established reading too"
+        );
+        let refused = enable_permitted(true, false)
+            .expect_err("an enable on a guessed capability must refuse");
+        assert!(
+            refused.contains("could not be") && refused.contains("Nothing was changed"),
+            "the refusal must say what was not established and that nothing changed: {refused}"
+        );
+    }
+
     // Reached through the submodule because the parent has no production use
     // for it; `use super::*` only carries what the parent itself imports.
     use super::report::label_of;

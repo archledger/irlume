@@ -1711,29 +1711,77 @@ pub(crate) fn user_arg(args: &[String]) -> String {
 /// call. Long-running surfaces that must notice a camera being plugged in
 /// (the TUI) refresh from Health on their own poll rather than from here.
 pub(crate) fn caps() -> irlume_camera::Caps {
-    static CAPS: std::sync::OnceLock<irlume_camera::Caps> = std::sync::OnceLock::new();
+    caps_reading().caps
+}
+
+/// Whether [`caps`] is an OBSERVATION or a fallback guess.
+///
+/// The two are not interchangeable and one caller must not confuse them:
+/// `pamwire` UNWIRES a surface whose capability reads false, so a guessed
+/// `false` removes face authentication from every greeter. See
+/// [`CapsReading`].
+pub(crate) fn caps_established() -> bool {
+    caps_reading().established
+}
+
+/// A capability answer and whether anything actually established it.
+///
+/// The third state is the one that matters. A daemon that ANSWERS gives an
+/// observation; a daemon PROVEN absent licenses the one permitted probe,
+/// which also observes. Everything else (a timeout, EACCES, a daemon busy
+/// mid-capture) establishes nothing, and on a packaged install that is the
+/// ORDINARY shape of a dead daemon rather than an exotic one: socket
+/// activation keeps `/run/irlume.sock` present from sockets.target onward,
+/// so a failed daemon answers with a timeout and never ECONNREFUSED.
+///
+/// Collapsing that into `{ir_pair: false, rgb: false}` made "could not ask"
+/// indistinguishable from "this machine has no camera", which is the same
+/// absence-versus-failure-to-observe collapse `control_read_failure_means_
+/// absent` and `NodeScan::listing_error` exist to prevent elsewhere.
+#[derive(Clone, Copy)]
+pub(crate) struct CapsReading {
+    pub(crate) caps: irlume_camera::Caps,
+    /// False when the fields above are a fallback guess. A caller that acts
+    /// DESTRUCTIVELY on a false capability must refuse instead.
+    pub(crate) established: bool,
+}
+
+fn caps_reading() -> CapsReading {
+    static CAPS: std::sync::OnceLock<CapsReading> = std::sync::OnceLock::new();
     *CAPS.get_or_init(|| {
         match irlume_common::client::request_poll(&irlume_common::Request::Health) {
-            Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => irlume_camera::Caps {
-                ir_pair: tier == "secure",
-                rgb: rgb_dev.is_some() || tier == "secure",
+            Ok(irlume_common::Response::Health { tier, rgb_dev, .. }) => CapsReading {
+                caps: irlume_camera::Caps {
+                    ir_pair: tier == "secure",
+                    rgb: rgb_dev.is_some() || tier == "secure",
+                },
+                established: true,
             },
             // Enumerating opens every node, so it needs POSITIVE evidence that no
             // daemon holds them. Only a failure that proves nobody is listening is
             // that evidence; a timeout is what a daemon busy mid-capture looks
             // like, which is the worst moment to probe.
-            Err(e) if daemon_proven_absent(&e) => irlume_camera::capabilities(), // the one permitted probe
+            Err(e) if daemon_proven_absent(&e) => CapsReading {
+                caps: irlume_camera::capabilities(), // the one permitted probe
+                established: true,
+            },
             // Ambiguous: answer from the configured pair's mere existence, which
-            // never opens anything, and assume the shipped shape when there is no
-            // configuration to read.
+            // never opens anything. A configured pair on disk IS evidence about
+            // the hardware; the shipped-shape fallback below is not.
             _ => match irlume_camera::configured_pair_no_probe() {
-                Some((rgb, ir)) => irlume_camera::Caps {
-                    ir_pair: std::path::Path::new(&ir).exists(),
-                    rgb: std::path::Path::new(&rgb).exists(),
+                Some((rgb, ir)) => CapsReading {
+                    caps: irlume_camera::Caps {
+                        ir_pair: std::path::Path::new(&ir).exists(),
+                        rgb: std::path::Path::new(&rgb).exists(),
+                    },
+                    established: true,
                 },
-                None => irlume_camera::Caps {
-                    ir_pair: false,
-                    rgb: false,
+                None => CapsReading {
+                    caps: irlume_camera::Caps {
+                        ir_pair: false,
+                        rgb: false,
+                    },
+                    established: false,
                 },
             },
         }

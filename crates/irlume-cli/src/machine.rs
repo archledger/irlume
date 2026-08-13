@@ -369,6 +369,7 @@ pub fn status(args: &[String]) -> ExitCode {
     // the fields that do not need the daemon are still worth having.
     let daemon = match crate::commands::daemon_reach() {
         crate::commands::DaemonReach::Running => "running",
+        crate::commands::DaemonReach::Starting => "starting",
         crate::commands::DaemonReach::AccessDenied => "access-denied",
         crate::commands::DaemonReach::Down => "unreachable",
     };

@@ -151,9 +151,11 @@ asked about.
 }
 ```
 
-`daemon` is one of `running`, `access-denied` or `unreachable`. An unreachable
-daemon is reported, not raised as an error, because the fields that do not need
-it are still worth having.
+`daemon` is one of `running`, `starting`, `access-denied` or `unreachable`.
+`starting` means the socket answered but the engine is still loading models,
+which lasts a few seconds after every daemon (re)start; retry shortly rather
+than restarting. An unreachable daemon is reported, not raised as an error,
+because the fields that do not need it are still worth having.
 
 Anything derived from the daemon carries `known`. **Unknown is not zero**: when
 `known` is false the counts are absent entirely rather than reported as `0`, so a

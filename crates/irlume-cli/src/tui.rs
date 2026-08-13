@@ -562,6 +562,8 @@ struct App {
     /// Live daemon reachability (a real Ping, refreshed each tick), not a
     /// hardcoded socket-path check.
     daemon_up: bool,
+    /// The four-way classification behind `daemon_up`; see `LightState::reach`.
+    daemon_reach: crate::commands::DaemonReach,
     /// Last ListProfiles error (corrupt enrollment / missing template key);
     /// distinguishes "file broken" from "no profiles" on the Repair tab.
     enroll_error: Option<String>,
@@ -807,6 +809,11 @@ impl Probes {
 /// what made the whole TUI feel wedged whenever the daemon was.
 struct LightState {
     daemon_up: bool,
+    /// The classified Ping outcome behind `daemon_up`. Kept alongside the
+    /// bool because Repair needs four answers where the gating logic needs
+    /// one: "starting" must not be offered a restart (it kills a daemon
+    /// seconds from ready) and EACCES must not read as "not reachable".
+    reach: crate::commands::DaemonReach,
     health: Option<HealthInfo>,
     keyring_armed: Option<bool>,
     keyring_policy: Option<String>,
@@ -820,7 +827,11 @@ impl LightState {
     /// it no longer enumerates cameras at all: the daemon answers Health for
     /// capabilities and ListCameras for the picker (#187).
     fn gather(user: &str, prev_armed: Option<bool>) -> Self {
-        let daemon_up = matches!(crate::daemon_poll(&Request::Ping), Ok(Response::Pong));
+        // The raw client call, not `daemon_poll`: classification needs the
+        // errno kind and daemon_poll flattens errors to String.
+        let reach =
+            crate::commands::classify_reach(irlume_common::client::request_poll(&Request::Ping));
+        let daemon_up = reach == crate::commands::DaemonReach::Running;
         // Classifying a node OPENS it. While the daemon is reachable it may
         // be streaming those same nodes, and a second opener is EBUSY on
         // strict UVC modules (#187). Gating on "is the daemon up" was not
@@ -831,6 +842,7 @@ impl LightState {
         // are serialized against captures on the daemon's side.
         let mut out = LightState {
             daemon_up,
+            reach,
             health: None,
             keyring_armed: prev_armed,
             keyring_policy: None,
@@ -1024,6 +1036,7 @@ impl App {
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
+            daemon_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
             act_scroll: 0,
@@ -1243,6 +1256,7 @@ impl App {
     /// clamps the inline version used to apply.
     fn apply_light(&mut self, l: LightState) {
         self.daemon_up = l.daemon_up;
+        self.daemon_reach = l.reach;
         // Daemon down/unresponsive: show the down state; the local probes
         // still land via the heavy sweep so Repair can diagnose.
         self.health = l.health;
@@ -1422,26 +1436,43 @@ impl App {
         // 120s budget meant every heavy tick blocked the UI for the whole
         // arbiter queue whenever the daemon was busy (measured: ~9s per tab
         // press on a ThinkPad while a TPM-bound ListProfiles was in flight).
-        let up = self.daemon_up;
-        v.push(mk(
-            "Daemon (irlumed)",
-            if up { Sev::Ok } else { Sev::Fail },
-            if up {
-                "running, socket reachable".into()
-            } else {
+        {
+            use crate::commands::DaemonReach as R;
+            // Four answers, not two. "Starting" got told "not reachable" about
+            // a socket that had just answered, and its [f] restarted a daemon
+            // seconds from ready, reopening the same window. EACCES is the
+            // socket refusing THIS user (mode is 0666, so in practice a
+            // SELinux denial), which a restart does not change either.
+            let (sev, detail, fix) = match self.daemon_reach {
+                R::Running => (Sev::Ok, "running, socket reachable".into(), Fix::None),
+                R::Starting => (
+                    Sev::Warn,
+                    "starting (loading models); re-run checks with [r] in a few seconds".into(),
+                    Fix::None,
+                ),
+                R::AccessDenied => (
+                    Sev::Fail,
+                    format!(
+                        "running, but this user may not connect (EACCES on {})",
+                        irlume_common::client::socket_path().display()
+                    ),
+                    Fix::Manual(
+                        "see the SELinux policy row below; sudo irlume selinux status".into(),
+                    ),
+                ),
                 // Name the socket the ping actually used: with IRLUME_SOCKET
                 // set, "/run/irlume.sock" described a path nobody probed.
-                format!(
-                    "not reachable on {}",
-                    irlume_common::client::socket_path().display()
-                )
-            },
-            if up {
-                Fix::None
-            } else {
-                Fix::Root(RootFix::RestartDaemon)
-            },
-        ));
+                R::Down => (
+                    Sev::Fail,
+                    format!(
+                        "not reachable on {}",
+                        irlume_common::client::socket_path().display()
+                    ),
+                    Fix::Root(RootFix::RestartDaemon),
+                ),
+            };
+            v.push(mk("Daemon (irlumed)", sev, detail, fix));
+        }
 
         // ONNX Runtime + Models: the daemon is the ground truth: if it answers
         // Health it loaded both at startup (it exits otherwise). Static path
@@ -6955,6 +6986,7 @@ mod tests {
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
+            daemon_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
             act_scroll: 0,
@@ -9587,6 +9619,7 @@ mod tests {
         assert!(app.profiles_load.is_none());
         app.apply_light(LightState {
             daemon_up: true,
+            reach: crate::commands::DaemonReach::Running,
             health: None,
             keyring_armed: None,
             keyring_policy: None,
@@ -10607,6 +10640,7 @@ mod tests {
         app.cam_sel = 9;
         app.apply_light(LightState {
             daemon_up: false,
+            reach: crate::commands::DaemonReach::Down,
             health: None,
             keyring_armed: None,
             keyring_policy: None,

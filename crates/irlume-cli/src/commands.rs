@@ -605,6 +605,13 @@ const NO: &str = "\u{2717}";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonReach {
     Running,
+    /// Answering, but the engine is still loading models. The accept loop
+    /// runs from the moment systemd hands over the socket and Ping gets
+    /// `Response::Ok("starting")` until the engine is ready, so for a few
+    /// seconds after every (re)start the daemon is neither up nor down.
+    /// Reporting this as "down" sent users to restart a daemon that was
+    /// seconds from ready, reopening the same window.
+    Starting,
     /// The socket is there but this uid may not connect. Carries no information
     /// about whether the daemon is healthy, so never report it as "down".
     AccessDenied,
@@ -612,16 +619,27 @@ pub(crate) enum DaemonReach {
     Down,
 }
 
-/// Probe the daemon. Goes through the shared client directly rather than
-/// `daemon_request`, because the errno kind is the point here and the string
-/// conversion throws it away.
-pub(crate) fn daemon_reach() -> DaemonReach {
-    match irlume_common::client::request(&Request::Ping) {
+/// Classify one Ping outcome. Split from [`daemon_reach`] so the TUI can feed
+/// it the short-budget `request_poll` its refresh thread requires while the
+/// CLI keeps the full-budget `request`; both must read the answer the same
+/// way or the two surfaces disagree about the same daemon.
+pub(crate) fn classify_reach(r: std::io::Result<Response>) -> DaemonReach {
+    match r {
         Ok(Response::Pong) => DaemonReach::Running,
+        // Any non-Pong Ok means something speaking our protocol answered but
+        // is not ready; today that is only the startup accept loop.
+        Ok(Response::Ok(_)) => DaemonReach::Starting,
         Ok(_) => DaemonReach::Down,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => DaemonReach::AccessDenied,
         Err(_) => DaemonReach::Down,
     }
+}
+
+/// Probe the daemon. Goes through the shared client directly rather than
+/// `daemon_request`, because the errno kind is the point here and the string
+/// conversion throws it away.
+pub(crate) fn daemon_reach() -> DaemonReach {
+    classify_reach(irlume_common::client::request(&Request::Ping))
 }
 
 fn daemon_up() -> bool {
@@ -661,6 +679,7 @@ pub fn status(args: &[String]) -> ExitCode {
         "  daemon        : {}",
         match reach {
             DaemonReach::Running => format!("running {OK}"),
+            DaemonReach::Starting => format!("starting (loading models) {WARN}; retry shortly"),
             DaemonReach::AccessDenied => format!(
                 "running, but this user may not connect {WARN} (EACCES on {})",
                 irlume_common::client::socket_path().display()
@@ -2040,6 +2059,42 @@ MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
 "
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::{classify_reach, DaemonReach};
+    use irlume_common::Response;
+
+    /// The four Ping outcomes, each to its own state. The two that were
+    /// collapsed before: `Ok("starting")` (the accept loop answers while
+    /// models load) read as Down and earned a restart that reopened the
+    /// window, and EACCES read as "not reachable" about a daemon that was
+    /// running fine.
+    #[test]
+    fn ping_outcomes_classify_to_four_distinct_states() {
+        assert_eq!(classify_reach(Ok(Response::Pong)), DaemonReach::Running);
+        assert_eq!(
+            classify_reach(Ok(Response::Ok("starting".into()))),
+            DaemonReach::Starting
+        );
+        assert_eq!(
+            classify_reach(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            DaemonReach::AccessDenied
+        );
+        assert_eq!(
+            classify_reach(Err(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+            DaemonReach::Down
+        );
+        // A reply that is neither Pong nor Ok is an unusable answer, not a
+        // starting daemon.
+        assert_eq!(
+            classify_reach(Ok(Response::Error("x".into()))),
+            DaemonReach::Down
+        );
+    }
 }
 
 #[cfg(test)]

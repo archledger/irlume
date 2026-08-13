@@ -31,8 +31,10 @@ use edgefirst_tflite::{Delegate, Interpreter, Library, Model, TensorType};
 pub const TFLITE_LIB_ENV: &str = "IRLUME_TFLITE_LIB";
 
 /// Locations probed in order when the env override is absent. First the
-/// path where irlume's packages WILL install the bundled copy once the
-/// #295 packaging lane lands (none does yet), then the distro-conventional
+/// path irlume's packages install the bundled copy to (the Fedora spec, the
+/// Arch PKGBUILD and the Debian lane all ship it under
+/// `/usr/share/irlume/tflite`, built from the pinned tensorflow tag by
+/// `scripts/build-tflite-runtime.sh`), then the distro-conventional
 /// locations an operator might install a system copy to.
 pub const PACKAGED_TFLITE_LIBS: &[&str] = &[
     "/usr/share/irlume/tflite/libtensorflowlite_c.so",

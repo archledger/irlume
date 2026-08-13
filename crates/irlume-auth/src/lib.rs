@@ -504,12 +504,16 @@ pub enum AuthenticationPurpose {
     /// a password into.
     AppConsent,
     /// Release a stored credential: the TPM-sealed login-keyring password. A spoof
-    /// here yields a reusable secret rather than one session, so by default it
-    /// requires the same deliberate gesture as [`Self::AppConsent`].
+    /// here yields a reusable secret rather than one session, so the same
+    /// deliberate gesture as [`Self::AppConsent`] can be REQUIRED, but it is
+    /// an opt-in: the default is OFF (#424 relaxed it), because a greeter
+    /// cold login and logout release the keyring after the face match and
+    /// the gesture is intent, not the anti-print layer.
     ///
     /// `temporal_challenge` carries the live `credential_release_challenge`
-    /// setting (default on; see
-    /// [`irlume_common::config::credential_release_challenge`]). The daemon reads
+    /// setting (default off; an absent key reads as off, see
+    /// [`irlume_common::config::credential_release_challenge`], overridable
+    /// per service via `service_gesture.credential_release`). The daemon reads
     /// it per request so a toggle needs no restart, and the engine stays free of
     /// policy lookups it cannot test in isolation.
     CredentialRelease { temporal_challenge: bool },

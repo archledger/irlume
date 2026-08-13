@@ -7,8 +7,14 @@
 //! the daemon authenticates each peer with `SO_PEERCRED` before honoring
 //! privileged operations (enroll/delete).
 //!
-//! Single-threaded by design: the camera is a single shared resource, so
-//! requests are served one at a time.
+//! One WORKER owns the camera and the engine, because two threads driving
+//! V4L2 and ONNX over one device is not something to attempt on an
+//! authentication path. The process itself is not single-threaded:
+//! connections are read and parsed off the worker, what they parse into is
+//! queued through the `arbiter` (authentication first, other camera work
+//! refused rather than queued), and side tasks (the watchdog, journal
+//! flushes) run on their own threads. The serialization guarantee lives at
+//! the worker, not the process.
 
 use irlume_common::{Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};

@@ -180,6 +180,7 @@ or bbox jitter can override them on the daemon unit without a rebuild:
 | Variable | Cue | Default |
 |---|---|---|
 | `IRLUME_RGB_MOIRE_MAX` | screen-replay moiré ceiling (also listed in [SETUP.md](SETUP.md)) | 28 |
+| `IRLUME_NO_ILLUM_META=1` | disable the IR illumination-metadata reader entirely, for isolating whether the metadata node itself is what a camera trips over | off |
 
 `IRLUME_BLINK_MOTION_MAX`, `IRLUME_BLINK_CONTRAST_DROP` and
 `IRLUME_BLINK_CONTRAST_MOTION_FLOOR` tune `detect_blink`, which since the

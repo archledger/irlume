@@ -4193,9 +4193,11 @@ fn doctor_run(
                  A record marked 'applied' is put back by authenticating while the \
                  control still holds irlume's value; if its restore attempts ran out, \
                  shut the machine down fully (not a reboot) or unplug an external \
-                 camera first. A record marked 'write may not have reached the camera', \
-                 or one that will not parse, is never restored automatically: after \
-                 the camera has fully lost power, remove that record file",
+                 camera first. A record marked 'write may not have reached the camera' \
+                 is never restored automatically, but stops blocking on its own once \
+                 the control no longer holds its bytes: shut down fully, then \
+                 authenticate once. A record that will not parse is the one case that \
+                 needs an administrator to remove the named file",
                 entries.len(),
                 entries.join("; ")
             );

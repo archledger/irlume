@@ -153,8 +153,9 @@ fn store_dir() -> PathBuf {
 /// What is left in the stream store, for doctor, opening no camera (#429).
 ///
 /// This store had no reporting surface at all: a spent applied record blocks
-/// every NEW stream write through `SaveError::Outstanding`, silently, so a
-/// user whose emitter had gone dark had nothing anywhere saying why. Same
+/// every NEW stream write through `SaveError::Outstanding`. `write_if_different`
+/// says so in the journal, but nothing summarised the store, so a user whose
+/// emitter had gone dark had to read the journal to find out why. Same
 /// three-way answer as the discovery journal's summary, and the same reading
 /// rule: a record that will not parse is still a record.
 pub fn pending_summary() -> crate::emitter_journal::PendingSummary {
@@ -175,11 +176,12 @@ pub fn pending_summary() -> crate::emitter_journal::PendingSummary {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        // The path leads every line: a prepared or unparseable record is
-        // resolved by an administrator removing the file (the Codex round on
-        // #429: authentication never claims a prepared record, so advice
-        // that says "authenticate" loops forever on one), and naming the
-        // file is what makes that advice actionable.
+        // The path leads every line: an UNPARSEABLE record is resolved only
+        // by an administrator removing the file, and naming the file is what
+        // makes that advice actionable. A prepared record is never CLAIMED by
+        // authentication (the Codex round on #429), but `save` supersedes it
+        // once the control no longer holds its bytes, so after a full
+        // power-off the next capture clears it on its own.
         pending.push(match std::fs::read_to_string(&path) {
             Ok(body) => match serde_json::from_str::<StreamWrite>(&body) {
                 Ok(record) => format!(

@@ -195,9 +195,13 @@ pub(crate) fn node_is_capture_in(
 ///
 /// `None` whenever the answer cannot be established without guessing: no
 /// media device beside the node's USB interface in sysfs, an unreadable
-/// `dev` file, or a topology that will not settle. Every `None` falls back
-/// to the caller's open probe, so this path can only ever REMOVE opens,
-/// never change a classification.
+/// `dev` file, or a topology that will not settle. A `None` falls back to
+/// the caller's open probe, so it only removes opens. A `Some(false)` IS a
+/// classification made here: the caller files the node as `Role::Other`
+/// with no ENUM_FMT probe. It can never produce `Rgb` or `Ir`, so the worst
+/// it can do is hide a capture node whose entity registered without pads,
+/// and there is no cross-check for that; validated on the ASUS pair only
+/// (docs/research/2026-08-12-camera-session-measurements.md).
 pub(crate) fn node_is_capture(video_device: &str) -> Option<bool> {
     let node = Path::new(video_device).file_name()?.to_str()?;
     // "81:2" from sysfs; no /dev stat, no open.

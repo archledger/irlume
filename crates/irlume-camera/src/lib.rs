@@ -7,19 +7,26 @@
 //! and one greyscale IR sensor (`/dev/video2`), plus an 850/940nm emitter fired
 //! via a UVC Extension-Unit control write (cf. linux-enable-ir-emitter).
 //!
-//! The auth path overlaps the RGB and IR captures on two threads: measured on
-//! the ASUS built-in and the NexiGo N930W (examples/concurrency_probe.rs),
-//! both deliver frames concurrently, ~0.7 s (ASUS) to ~1.3 s (NexiGo) faster
-//! than back-to-back. A shared-USB module that HARD-fails a starved stream
-//! shows up as a capture error and the caller retries that side alone; a
-//! module that instead degrades the RGB frame silently (the NexiGo dims it
-//! from mean ~120 to ~71, below YuNet's detection floor) is recovered by the
-//! cross-spectrum self-heal in irlume-auth (IR-has-a-face while RGB-does-not
-//! triggers an RGB-alone recapture). `IRLUME_SEQUENTIAL_CAPTURE=1` forces
-//! back-to-back capture if a module misbehaves.
+//! The auth path captures RGB and IR one at a time unless a measurement says
+//! the module can sustain both: `capture_mode_decision` in irlume-auth answers
+//! sequential for a pair with no stored verdict (#340), because a wrong
+//! concurrent default broke an enrollment outright on the Logitech Brio
+//! (#308) and dims the NexiGo N930W's RGB from mean ~120 to ~71 (below
+//! YuNet's detection floor) with no error, while a wrong sequential default
+//! costs ~0.7 s (ASUS) to ~1.3 s (NexiGo) per capture. Concurrent runs when
+//! `camera-tune` or the enrollment probe stored
+//! `capture_mode.<rgb-id>+<ir-id> = concurrent` for the pairing; both modules
+//! measured deliver frames concurrently (examples/concurrency_probe.rs).
+//! `IRLUME_SEQUENTIAL_CAPTURE` overrides BOTH directions: `1` forces
+//! back-to-back, any other value forces concurrent. A shared-USB module that
+//! HARD-fails a starved stream shows up as a capture error and the caller
+//! retries that side alone; one that degrades the RGB frame silently is
+//! recovered by the cross-spectrum self-heal in irlume-auth (IR-has-a-face
+//! while RGB-does-not triggers an RGB-alone recapture).
 //!
-//! Implementation: the `v4l` crate (V4L2). RGB capture requests YUYV and converts
-//! to RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
+//! Implementation: the `v4l` crate (V4L2). RGB capture requests the first
+//! uncompressed format the camera offers (YUYV, then NV12) and converts to
+//! RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
 pub mod emitter_journal;
@@ -847,12 +854,22 @@ impl McCentric {
     /// caller can state one cause once over several nodes that share it. Pure
     /// over the struct so the wording is testable without MIPI hardware.
     pub fn cause(&self) -> String {
-        let stack = if self.io_mc {
-            "behind a media-controller stack; its advertised formats describe \
-             the platform's image pipeline, not a camera"
-        } else {
-            "captures only through the multi-planar V4L2 API, which irlume's \
-             capture path does not use"
+        // Both facts named when both flags are set: qcom-camss nodes carry
+        // IO_MC and MPLANE together, and the message dropped the second.
+        let stack = match (self.io_mc, self.mplane_only) {
+            (true, true) => {
+                "behind a media-controller stack (and multi-planar only); its \
+                 advertised formats describe the platform's image pipeline, \
+                 not a camera"
+            }
+            (true, false) => {
+                "behind a media-controller stack; its advertised formats \
+                 describe the platform's image pipeline, not a camera"
+            }
+            _ => {
+                "captures only through the multi-planar V4L2 API, which \
+                 irlume's capture path does not use"
+            }
         };
         format!(
             "driver '{}', {stack}. irlume needs a UVC camera; the RGB side of \
@@ -3391,9 +3408,9 @@ pub struct IrStreamFrame {
 /// This is the rolling-capture core the burst helpers and the live consumers
 /// share: it owns the device, the V4L2 mmap stream, the emitter re-fire, and the
 /// frozen-stream restart, so a consumer only decides what to do with each frame
-/// and when to stop. A blink watch can therefore return the instant it sees a
-/// blink instead of always draining a fixed window, and a preview can pull
-/// frames continuously; both get the same black/blown/frozen filtering.
+/// and when to stop. The consent watch can therefore return the instant it
+/// sees an accepted gesture instead of always draining a fixed window, and a
+/// preview can pull frames continuously; both get the same black/blown/frozen filtering.
 ///
 /// Usable = the same set [`capture_ir_sequence`] historically kept: emitter-off
 /// (dark) frames ARE delivered, because a consumer classifying the strobe needs
@@ -3440,7 +3457,9 @@ pub fn capture_ir_streaming<B>(
     // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
     let (mut dead_run, mut restarts) = (0usize, 0usize);
     let mut last_sig: Option<Vec<u8>> = None;
-    // Set once above, before the stream started, and not again inside the loop.
+    // Set once per stream, before it starts, and not per frame; the
+    // frozen-stream restart below opens a new stream and applies it again,
+    // which is the only re-apply left.
     //
     // This used to re-apply the control every eighth frame on the theory that
     // "some controls self-clear". At the default consent budget that is ten more
@@ -3522,16 +3541,17 @@ pub fn capture_ir_streaming<B>(
 }
 
 /// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for
-/// temporal liveness (the blink challenge). Unlike [`capture_ir`], the eyes-closed
-/// dip of a blink must survive, so this returns every sample rather than only the
-/// brightest. Each of `samples` frames is the brightest of a `burst`-frame
+/// temporal liveness cues (per-frame head pose for the nod gesture, per-frame
+/// EAR for the eye-closure calibration). Unlike [`capture_ir`], the eyes-closed
+/// dip of a closure must survive, so this returns every sample rather than only
+/// the brightest. Each of `samples` frames is the brightest of a `burst`-frame
 /// mini-burst: `burst=1` yields raw frames (to reveal whether the emitter
 /// strobes); `burst>=2` de-strobes locally while keeping enough temporal
 /// resolution for a blink (the IR node is ~15 fps, so a mini-burst of 2 ≈ 133 ms).
 ///
 /// This keeps its own burst/de-strobe loop rather than delegating to
-/// [`capture_ir_streaming`], which delivers raw single frames; the blink watch
-/// uses the streaming core, this stays for the `burst>=2` diagnostic path.
+/// [`capture_ir_streaming`], which delivers raw single frames; the consent
+/// watch uses the streaming core, this stays for the `burst>=2` diagnostic path.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 #[expect(
     clippy::missing_panics_doc,
@@ -3572,7 +3592,8 @@ pub fn capture_ir_sequence(
     let mut mode;
     let mut stream = Some(SafeStream::open(device, &dev, &fmt)?);
     mode = ir_emitter::enable(dev.handle(), &card, device);
-    // Set once above and not re-applied inside the loop. This path also carried
+    // Set once per stream, before it starts, and not per frame (the
+    // frozen-stream restart below re-applies on its new stream). This path also carried
     // an every-eighth-frame re-fire; it went for the same reason, and with the
     // same caveat: the justification is the MEASURED record in
     // `IrCamera::session` that the control survives streaming, not the
@@ -4881,7 +4902,7 @@ mod tests {
     /// before format enumeration (ENOTTY on a non-v4l2 character device), so
     /// this needs no camera, no privilege, and no hardware in CI.
     #[test]
-    fn a_node_that_opens_then_refuses_to_enumerate_is_reported_not_dropped() {
+    fn a_node_that_answers_no_v4l2_ioctl_is_reported_not_dropped() {
         let u = classify_node("/dev/null")
             .expect_err("a device that answers no V4L2 ioctl must not classify as a role");
         assert_eq!(u.at, FailedAt::QueryCaps);

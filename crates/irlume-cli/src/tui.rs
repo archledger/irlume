@@ -3671,7 +3671,9 @@ impl App {
                     self.log(
                         '·',
                         format!(
-                            "the consent gesture for '{svc}' is a root-only setting;                              run the TUI with sudo, or check it with:                              sudo irlume credential-release-challenge {svc} status"
+                            "the consent gesture for '{svc}' is a root-only setting; \
+                             run the TUI with sudo, or check it with: \
+                             sudo irlume credential-release-challenge {svc} status"
                         ),
                     );
                     return;

@@ -275,6 +275,21 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     assert_eq!(code, 0);
     assert!(out.contains("sudo:"), "{out}");
 
+    // The per-service status form, still with no settings.conf. The usage
+    // line has always promised `[<service>] <on|off|status>`, and the TUI,
+    // setup and doctor all teach it, but the parser accepted only
+    // `<svc> on|off`: the exact command four surfaces recommended exited 2.
+    let (code, out, _) = run(&mut sb.cmd(&[cmd, "sudo", "status"]), cmd);
+    assert_eq!(code, 0, "the taught per-service form must work: {out}");
+    assert!(out.contains("sudo: REQUIRED"), "{out}");
+    assert!(
+        !out.contains("polkit-1:"),
+        "one service asked, one service answered: {out}"
+    );
+    // A service without a verb is still a usage error, not a guess.
+    let (code, _, err) = run(&mut sb.cmd(&[cmd, "sudo"]), cmd);
+    assert_eq!(code, 2, "{err}");
+
     // Opted IN globally: the global state and the keyring line show REQUIRED.
     std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);

@@ -735,7 +735,9 @@ pub fn status(args: &[String]) -> ExitCode {
             if let Some(0) = usable {
                 if scans > 0 {
                     println!(
-                        "                  {WARN} none of those scans belong to the recognizer                          that is loaded now, so no face can match: re-enable the model it was                          enrolled with, or run `irlume enroll` again"
+                        "                  {WARN} none of those scans belong to the recognizer \
+                         that is loaded now, so no face can match: re-enable the model it was \
+                         enrolled with, or run `irlume enroll` again"
                     );
                 }
             }
@@ -1384,6 +1386,44 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// fallback). Turning any gesture on adds a deliberate step; disabling it for a
 /// high-privilege escalation service (sudo, su, doas, polkit) asks for
 /// confirmation first.
+/// One service's effective consent-gesture line, shared by the all-services
+/// `status` and the per-service `<svc> status` so the two can never disagree.
+fn print_service_gesture_status(tag: &str, svc: &str) {
+    let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
+    match irlume_common::config::observe_kv("settings.conf", &key) {
+        // Per-service keys use `!falsy` (the daemon's `service_gesture`
+        // reading), NOT the global `truthy`, so the display agrees with
+        // what the engine does for this key.
+        irlume_common::config::KvObservation::Value(v) => {
+            if !irlume_common::config::falsy(&v) {
+                println!("{tag} {svc}: REQUIRED {OK} (explicit)");
+            } else {
+                println!("{tag} {svc}: off (explicit)");
+            }
+        }
+        irlume_common::config::KvObservation::Absent => {
+            let required = match svc {
+                // The keyring release falls back to the global gate,
+                // which now defaults OFF.
+                "credential_release" => irlume_common::config::credential_release_challenge(),
+                // Every PAM service through the shared helper, which
+                // knows polkit (AppConsent) defaults ON and that
+                // `polkit_gesture=0` turns that default off. The
+                // hardcoded `true` here could not see the second half.
+                _ => irlume_common::config::service_gesture_required(svc),
+            };
+            if required {
+                println!("{tag} {svc}: REQUIRED {OK} (default)");
+            } else {
+                println!("{tag} {svc}: off (default)");
+            }
+        }
+        irlume_common::config::KvObservation::Unknown(_) => {
+            println!("{tag} {svc}: root-only setting, re-run with sudo");
+        }
+    }
+}
+
 pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
     const TAG: &str = "[credential-release-challenge]";
     match sub {
@@ -1395,41 +1435,7 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             // sees Unknown, not the value).
             let services = ["sudo", "su", "doas", "polkit-1", "credential_release"];
             for svc in services {
-                let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
-                match irlume_common::config::observe_kv("settings.conf", &key) {
-                    // Per-service keys use `!falsy` (the daemon's `service_gesture`
-                    // reading), NOT the global `truthy`, so the display agrees with
-                    // what the engine does for this key.
-                    irlume_common::config::KvObservation::Value(v) => {
-                        if !irlume_common::config::falsy(&v) {
-                            println!("{TAG} {svc}: REQUIRED {OK} (explicit)");
-                        } else {
-                            println!("{TAG} {svc}: off (explicit)");
-                        }
-                    }
-                    irlume_common::config::KvObservation::Absent => {
-                        let required = match svc {
-                            // The keyring release falls back to the global gate,
-                            // which now defaults OFF.
-                            "credential_release" => {
-                                irlume_common::config::credential_release_challenge()
-                            }
-                            // Every PAM service through the shared helper, which
-                            // knows polkit (AppConsent) defaults ON and that
-                            // `polkit_gesture=0` turns that default off. The
-                            // hardcoded `true` here could not see the second half.
-                            _ => irlume_common::config::service_gesture_required(svc),
-                        };
-                        if required {
-                            println!("{TAG} {svc}: REQUIRED {OK} (default)");
-                        } else {
-                            println!("{TAG} {svc}: off (default)");
-                        }
-                    }
-                    irlume_common::config::KvObservation::Unknown(_) => {
-                        println!("{TAG} {svc}: root-only setting, re-run with sudo");
-                    }
-                }
+                print_service_gesture_status(TAG, svc);
             }
             // Global credential-release-challenge fallback (DEFAULT OFF).
             match irlume_common::config::credential_release_challenge_visible() {
@@ -1530,6 +1536,14 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                             ExitCode::FAILURE
                         }
                     }
+                }
+                // The usage line has always promised `[<service>] <on|off|
+                // status>`, and the TUI, setup and doctor all teach the
+                // per-service status form, but this arm accepted only on/off:
+                // the exact command four surfaces recommended exited 2.
+                Some("status") => {
+                    print_service_gesture_status(TAG, svc);
+                    ExitCode::SUCCESS
                 }
                 _ => {
                     eprintln!("{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>");

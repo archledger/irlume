@@ -164,6 +164,13 @@ pub enum Refusal {
     AuthenticationPending,
     /// This uid already has a camera operation queued or running.
     AlreadyHoldsSlot,
+    /// The arbiter is closed: the worker has drained and exited, so a queued
+    /// job would never be taken. Unreachable while the accept loop lives
+    /// (close() runs after it ends), but the doc above promises a refusal is
+    /// the only way a submit is not served, and without this arm a post-close
+    /// submit reported Ok and its caller waited out the full 300s reply
+    /// timeout instead of getting an answer.
+    ShuttingDown,
 }
 
 impl Refusal {
@@ -175,6 +182,7 @@ impl Refusal {
             Refusal::AlreadyHoldsSlot => {
                 "camera busy: this account already has a camera operation in flight"
             }
+            Refusal::ShuttingDown => "the daemon is shutting down; retry after it restarts",
         }
     }
 }
@@ -276,6 +284,9 @@ impl<T> Arbiter<T> {
     /// job was not queued and holds nothing.
     pub fn submit(&self, class: Class, uid: u32, payload: T) -> Result<(), Refusal> {
         let mut inner = self.lock();
+        if inner.closed {
+            return Err(Refusal::ShuttingDown);
+        }
         match class {
             Class::Auth => {
                 // An authentication never waits behind preview work, and the
@@ -484,6 +495,26 @@ mod tests {
         a.close();
         assert_eq!(a.take().unwrap().payload, "last");
         assert!(a.take().is_none());
+    }
+
+    /// A submit after close must REFUSE, not queue. The worker has drained
+    /// and exited, so a queued job is never taken and its caller sat out the
+    /// 300s reply timeout; the submit doc promises a refusal is the only way
+    /// a job is not served.
+    #[test]
+    fn a_submit_after_close_refuses_instead_of_queueing_forever() {
+        let a = arb();
+        a.close();
+        assert_eq!(
+            a.submit(Class::Plain, 1000, "late"),
+            Err(Refusal::ShuttingDown)
+        );
+        assert_eq!(
+            a.submit(Class::Auth, 0, "auth-late"),
+            Err(Refusal::ShuttingDown),
+            "even an authentication cannot be served by an exited worker"
+        );
+        assert!(a.take().is_none(), "nothing may have been queued");
     }
 
     #[test]

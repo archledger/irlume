@@ -1471,7 +1471,9 @@ impl StreamMode {
     /// The ordinary outcome for hardware irlume does not drive, and the only
     /// safe representation of it. An `Option<StreamMode>` would let a caller
     /// write `let _ = ...` and silently discard a guard that DID hold a control.
-    fn inert() -> Self {
+    /// Crate-visible so `IrSession::recover` can park an already-restored guard
+    /// before its reopen.
+    pub(crate) fn inert() -> Self {
         StreamMode {
             handle: None,
             record: None,

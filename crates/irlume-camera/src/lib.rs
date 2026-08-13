@@ -2790,20 +2790,23 @@ impl IrSession<'_> {
     /// a blown frame both flattens the liveness cues and blinds the PAD model
     /// (#221).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "expect on a logically impossible state"
-    )]
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
         let white_level = self.dec.white_level();
+        // The state is NOT impossible, which is why this is an error and not
+        // the expect it used to be: a failed `recover` (its reopen can lose a
+        // format race with another application, #427, or hit transient
+        // EBUSY/ENODEV) leaves the slot None for good, and the grace loop
+        // retries the held session. The RGB twin already answers hardware
+        // trouble here for the same reason; on the sequential branch the old
+        // panic unwound out of the daemon worker.
         let stream = self
             .stream
             .as_mut()
-            .expect("stream is None only transiently inside recover");
+            .ok_or_else(|| Error::Hardware("IR stream missing after a failed recovery".into()))?;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
         // frame, the lit strobe phase (linhello lesson). Keep every frame so the
@@ -3127,14 +3130,35 @@ impl IrSession<'_> {
 
     /// Recover a broken stream in place, on the fd this session already holds.
     ///
-    /// Drops the failed stream (STREAMOFF + buffer release), then opens a fresh
-    /// one on the same device fd. The metadata queue is reopened and the emitter
-    /// control is re-enabled. The decoder is reset to its initial state.
-    /// No new device open, so no EBUSY from a double-open-rejecting camera.
+    /// Drops the failed stream (STREAMOFF + buffer release), restores and
+    /// releases the old emitter guard, then opens a fresh stream on the same
+    /// device fd and re-enables the emitter. The metadata queue is reopened
+    /// and the decoder is reset to its initial state. No new device open, so
+    /// no EBUSY from a double-open-rejecting camera.
+    ///
+    /// The old guard MUST go before the fresh `enable`, the same order the
+    /// frozen-stream restarts in `capture_ir_streaming` and
+    /// `capture_ir_sequence` use: while it lives it holds the per-camera
+    /// stream lock, and `flock` excludes per open file description, so the
+    /// fresh enable in this same process answered Busy, refused to drive the
+    /// emitter, and the assignment below then dropped the old guard, whose
+    /// Drop wrote the displaced value back UNDER the stream that had just
+    /// reopened. Recovery reported success while every later capture in the
+    /// grace window returned dark IR frames.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.stream = None; // drop first: STREAMOFF + buffer release
         self.meta = None; // drop the metadata queue
+                          // A restore failure PROPAGATES, mirroring the frozen-stream restart:
+                          // the guard is spent after one attempt, and an unrecorded write whose
+                          // restore failed would otherwise become permanently unowned.
+        self._mode.restore().map_err(|e| {
+            Error::Hardware(format!(
+                "{}: could not restore the emitter before recovering the stream: {e}",
+                self.cam.device
+            ))
+        })?;
+        self._mode = ir_emitter::StreamMode::inert();
         let stream = SafeStream::open(&self.cam.device, &self.cam.dev, &self.cam.negotiated)?;
         let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
         let mode = ir_emitter::enable(self.cam.dev.handle(), &self.cam.card, &self.cam.device);
@@ -6670,6 +6694,44 @@ mod tests {
                 .fold((u8::MAX, u8::MIN), |(lo, hi), &b| (lo.min(b), hi.max(b)));
             assert!(max > min, "a test pattern must not convert to a flat frame");
         }
+    }
+
+    /// `IrSession::recover` must hand back a session as capable as the one it
+    /// replaced: stream working AND the emitter still driven. The old order
+    /// ran the fresh `ir_emitter::enable` while the OLD guard still held the
+    /// per-camera stream lock (`flock` excludes per open file description, so
+    /// the same process refuses itself), the enable answered Busy and stayed
+    /// inert, and the assignment then dropped the old guard whose Drop wrote
+    /// the displaced value back under the just-reopened stream: recovery
+    /// reported Ok while every later capture returned dark IR frames.
+    ///
+    /// On hardware whose emitter irlume drives, `lit` is the discriminator:
+    /// true before, and it must still be true after. A rig that does not
+    /// drive its emitter cannot discriminate, so the test insists on lit.
+    #[test]
+    #[ignore = "needs a REAL IR camera whose emitter irlume drives; set IRLUME_TEST_IR_DEVICE"]
+    fn recover_keeps_the_emitter_driven() {
+        let (_, ir) = loopback_pair();
+        let cam = IrCamera::open(&ir).expect("open the IR camera");
+        let mut s = cam.session().expect("open a session");
+        assert!(
+            s.lit,
+            "this rig does not drive its emitter, so it cannot discriminate the \
+             self-refusal this test exists for; run it on the ASUS/NexiGo hardware"
+        );
+        let (frame_before, _) = s.capture_with_stats().expect("capture before recover");
+        s.recover().expect("recover on a healthy device");
+        assert!(
+            s.lit,
+            "the emitter went dark across recover: the fresh enable refused \
+             against its predecessor's lock"
+        );
+        let (frame_after, _) = s.capture_with_stats().expect("capture after recover");
+        assert_eq!(
+            (frame_before.width, frame_before.height),
+            (frame_after.width, frame_after.height),
+            "the recovered stream must carry the same negotiated geometry"
+        );
     }
 
     #[test]

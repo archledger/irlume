@@ -1280,6 +1280,22 @@ mod capture_mode_switch_tests {
     }
 }
 
+/// Hand the camera back before anything opens it again.
+///
+/// Dropping the sessions is the release: an `IrSession` owns the device's
+/// buffer queue, and uvcvideo grants stream privileges to one file handle at
+/// a time, so a consent watch that opens its own stream while one is alive
+/// gets EBUSY from this same process. Named rather than inlined so all seven
+/// release sites are one greppable thing, and so the next reader sees that
+/// the release is a DROP and not a flag.
+fn release_held(
+    rgb: &mut Option<irlume_camera::RgbSession<'_>>,
+    ir: &mut Option<irlume_camera::IrSession<'_>>,
+) {
+    *rgb = None;
+    *ir = None;
+}
+
 impl Engine {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
@@ -3035,17 +3051,21 @@ impl Engine {
         // attached.
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let (sequential, _mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
-        // Declared in reverse drop order: `held` borrows from `_rs`/`_is` which
-        // borrow from `cams`. Rust drops locals in reverse declaration order, so
-        // `held` drops first (releasing the borrow), then the sessions, then the
-        // cameras.
+        // Declared in reverse drop order: the sessions borrow from `_cams`, so
+        // Rust drops the sessions first and the cameras after.
+        //
+        // The sessions are passed to `authenticate_once` AS THE OWNING OPTIONS,
+        // not as borrows of them. That is the whole point: the match path
+        // releases the camera before the consent watch opens its own IR stream,
+        // and it can only do that by dropping the session itself. Handing down
+        // `&mut Option<(&mut RgbSession, &mut IrSession)>` made every release
+        // site drop a pair of REFERENCES while these two kept the buffer queue,
+        // so the watch's S_FMT and REQBUFS hit EBUSY against this very process:
+        // the self-collision #187 diagnosed, reintroduced by #346 and caught by
+        // the release audit before it shipped.
         let mut _cams: Option<(irlume_camera::RgbCamera, irlume_camera::IrCamera)> = None;
-        let mut _rs: Option<irlume_camera::RgbSession<'_>> = None;
-        let mut _is: Option<irlume_camera::IrSession<'_>> = None;
-        let mut held: Option<(
-            &mut irlume_camera::RgbSession<'_>,
-            &mut irlume_camera::IrSession<'_>,
-        )> = None;
+        let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
+        let mut held_ir: Option<irlume_camera::IrSession<'_>> = None;
         if !sequential && self.ir_available {
             if let (Ok(r), Ok(i)) = (
                 irlume_camera::RgbCamera::open(&rgb_dev),
@@ -3060,16 +3080,16 @@ impl Engine {
                     cam_r.session_with_progress(&progress),
                     cam_i.session_with_progress(&progress),
                 ) {
-                    _rs = Some(rs);
-                    _is = Some(is);
-                    held = Some((_rs.as_mut().unwrap(), _is.as_mut().unwrap()));
+                    held_rgb = Some(rs);
+                    held_ir = Some(is);
                 }
             }
         }
         let mut attempt = 0u32;
         let out = loop {
             attempt += 1;
-            let out = self.authenticate_once(&enr, purpose, service, &mut held)?;
+            let out =
+                self.authenticate_once(&enr, purpose, service, &mut held_rgb, &mut held_ir)?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -3098,13 +3118,14 @@ impl Engine {
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
         service: Option<&str>,
-        held: &mut Option<(
-            &mut irlume_camera::RgbSession<'_>,
-            &mut irlume_camera::IrSession<'_>,
-        )>,
+        // The OWNING options, so a release site can actually drop the sessions
+        // and hand the camera back; see the declaration comment in
+        // `authenticate_for`.
+        held_rgb: &mut Option<irlume_camera::RgbSession<'_>>,
+        held_ir: &mut Option<irlume_camera::IrSession<'_>>,
     ) -> irlume_common::Result<Outcome> {
-        let a = if let Some((ref mut rs, ref mut is)) = held {
-            self.assess_full_with(Some((*rs, *is)), None)?
+        let a = if let (Some(rs), Some(is)) = (held_rgb.as_mut(), held_ir.as_mut()) {
+            self.assess_full_with(Some((rs, is)), None)?
         } else {
             self.assess()?
         };
@@ -3202,7 +3223,7 @@ impl Engine {
                 scans.len()
             );
             if score >= thr {
-                *held = None;
+                release_held(held_rgb, held_ir);
                 return self.challenge_if_required(
                     enr,
                     purpose,
@@ -3235,7 +3256,7 @@ impl Engine {
                         f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
                     if f.grant {
                         let who = if ir_score >= score { ir_who } else { who };
-                        *held = None;
+                        release_held(held_rgb, held_ir);
                         return self.challenge_if_required(
                     enr,
                     purpose,
@@ -3258,7 +3279,7 @@ impl Engine {
                         self.ir_adapter.is_some()
                     );
                     if ir_score >= ir_thr {
-                        *held = None;
+                        release_held(held_rgb, held_ir);
                         return self.challenge_if_required(
                     enr,
                     purpose,
@@ -3274,7 +3295,7 @@ impl Engine {
                             + irlume_core::IR_FALLBACK_MARGIN;
                         irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
                         if *cs >= cthr {
-                            *held = None;
+                            release_held(held_rgb, held_ir);
                             return self.challenge_if_required(
                     enr,
                     purpose,
@@ -3410,7 +3431,7 @@ impl Engine {
             // calibrated centroid at the base threshold (no best-of-N FAR
             // inflation; the prototype-validated mean-template protocol).
             if score >= ir_thr {
-                *held = None;
+                release_held(held_rgb, held_ir);
                 return self.challenge_if_required(
                     enr,
                     purpose,
@@ -3422,7 +3443,7 @@ impl Engine {
                 let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len());
                 irlume_common::dlog!("match(ir/dark centroid): {cs:.3} vs thr {cthr:.3}");
                 if *cs >= cthr {
-                    *held = None;
+                    release_held(held_rgb, held_ir);
                     return self.challenge_if_required(
                         enr,
                         purpose,
@@ -3434,7 +3455,7 @@ impl Engine {
                     );
                 }
             }
-            *held = None;
+            release_held(held_rgb, held_ir);
             return self.challenge_if_required(
                 enr,
                 purpose,
@@ -8675,6 +8696,54 @@ mod engine_tests {
             })
         };
         (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"))
+    }
+
+    /// `release_held` must HAND THE CAMERA BACK, which is the whole reason the
+    /// grant paths call it before `challenge_if_required` opens its own IR
+    /// stream for the consent watch.
+    ///
+    /// The bug this pins: `held` used to be `&mut Option<(&mut RgbSession,
+    /// &mut IrSession)>`, so every release site dropped a pair of REFERENCES
+    /// while the sessions themselves stayed alive in `authenticate_for`. The
+    /// watch's `S_FMT` and `REQBUFS` then hit EBUSY against this same process,
+    /// the self-collision #187 diagnosed, and a successful match was thrown
+    /// away for a password prompt. Introduced by #346, so it never shipped.
+    ///
+    /// The CONTROL is the point: a second stream must FAIL while the session
+    /// is alive, or this test cannot tell a working release from a camera that
+    /// was never held in the first place.
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_release_held_hands_the_camera_back() {
+        let (_rgb, ir) = loopback_pair();
+        let _g = env_guard();
+        let cam = irlume_camera::IrCamera::open(&ir).expect("open the IR node");
+        let mut held_ir = Some(cam.session().expect("hold an IR session"));
+        let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
+
+        // Control: with the session alive, a second stream on the same node
+        // must be refused. If this passes, the rest proves nothing.
+        let busy =
+            irlume_camera::capture_ir_streaming(&ir, 2, |_| std::ops::ControlFlow::Break::<()>(()));
+        assert!(
+            busy.is_err(),
+            "control failed: a live IrSession must block a second stream, or this \
+             test cannot distinguish a real release from a camera nobody held"
+        );
+
+        release_held(&mut held_rgb, &mut held_ir);
+        assert!(held_ir.is_none(), "the release must clear the session slot");
+
+        // The observation: the same call now succeeds, because the buffer queue
+        // went back when the session dropped.
+        let after =
+            irlume_camera::capture_ir_streaming(&ir, 2, |_| std::ops::ControlFlow::Break::<()>(()));
+        assert!(
+            after.is_ok(),
+            "after release the consent watch must be able to open its own \
+             stream, got {:?}",
+            after.err()
+        );
     }
 
     /// Full `authenticate()` through the LIVE capture pipeline, against the

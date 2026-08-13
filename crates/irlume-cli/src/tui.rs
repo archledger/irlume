@@ -5110,17 +5110,28 @@ impl App {
         // Only claim a node as "active" if it exists; select_pair's fixed
         // fallback names devices that may be absent on this hardware.
         let ex = |d: &str| std::path::Path::new(d).exists();
-        let active = match (ex(&argb), ex(&air)) {
-            (true, true) => format!("{argb} + {air}"),
-            (true, false) => format!("{argb} (RGB only)"),
-            _ => "none (no camera hardware)".into(),
+        // "No camera hardware" is a claim about the MACHINE, so it needs an
+        // answer from the daemon to stand on. With health absent the paths
+        // above default to "", `ex("")` is false, and this line asserted no
+        // hardware on machines with four video nodes, contradicting the
+        // daemon row rendered above it. Unknown is not none.
+        let (active, active_style) = if self.health.is_none() {
+            (
+                "unknown (daemon not answering; see the Repair tab)".to_string(),
+                Style::new().dim(),
+            )
+        } else {
+            let ok = Style::new().fg(th().ok).add_modifier(Modifier::BOLD);
+            match (ex(&argb), ex(&air)) {
+                (true, true) => (format!("{argb} + {air}"), ok),
+                (true, false) => (format!("{argb} (RGB only)"), ok),
+                (false, true) => (format!("{air} (IR only)"), ok),
+                (false, false) => ("none (no camera hardware)".to_string(), Style::new().dim()),
+            }
         };
         let mut lines = vec![Line::from(vec![
             Span::styled("  active   ", Style::new().dim()),
-            Span::styled(
-                active,
-                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(active, active_style),
         ])];
         if let Some(p) = pairs.get(self.cam_sel) {
             if p.rgb != argb || p.ir != air {
@@ -10025,6 +10036,27 @@ mod tests {
         let text = draw_text(&app);
         assert!(!text.contains("no camera found"), "{text}");
         assert!(text.contains("camera list is unknown"), "{text}");
+        // The ACTIVE line has the same rule: with health unanswered it used
+        // to default the paths to "" and assert "no camera hardware" from
+        // Path::new("").exists(), contradicting the list line above it.
+        assert!(!text.contains("no camera hardware"), "{text}");
+        assert!(text.contains("unknown (daemon not answering"), "{text}");
+        // The daemon answered but named no devices: now none IS the fact.
+        app.health = Some(HealthInfo {
+            tier: "none".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            adapter: false,
+            mesh: false,
+            version: env!("CARGO_PKG_VERSION").into(),
+            apparmor: None,
+            third_party_pad: None,
+            third_party_recognizer: None,
+            third_party_detector: None,
+        });
+        let text = draw_text(&app);
+        assert!(text.contains("no camera hardware"), "{text}");
+        app.health = None;
         // The daemon ANSWERED with an empty list: now "none" is a fact.
         app.pairs_known = true;
         let text = draw_text(&app);

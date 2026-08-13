@@ -1249,6 +1249,26 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
     // and reported success, and the Repair row offering the fix sits on the
     // screen the TUI drops you on when the daemon is down. A disable is the
     // user asking for exactly that removal, so it needs no capabilities.
+    // The packaging scriptlets run reconcile right after `try-restart`, which
+    // lands inside the daemon's model-loading window (Ping answers
+    // Ok("starting"); 21s measured exec-to-serving on a ThinkPad X13). In that
+    // window capabilities cannot be established on a machine with no
+    // configured pair, and the guard below would refuse the very migration
+    // the scriptlet exists to run. A starting daemon is worth waiting for;
+    // a dead or unreachable one is not, so the wait watches the
+    // classification and stops the moment it is anything but Starting.
+    if enable {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::commands::classify_reach(irlume_common::client::request_poll(
+            &irlume_common::Request::Ping,
+        )) == crate::commands::DaemonReach::Starting
+        {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
     if let Err(why) = enable_permitted(enable, crate::caps_established()) {
         eprintln!("{why}");
         eprintln!(

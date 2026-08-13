@@ -4542,7 +4542,7 @@ fn doctor_run(
             ),
             None => (
                 State::Warn,
-                format!("{file} — not found; mesh-dependent gates (passive blink liveness, consent gesture) are disabled"),
+                format!("{file} — not found; the eye-closure consent gesture, its calibration, and the detection-rescue alignment are disabled"),
             ),
         };
         dout!(report, "  {}: {line}", s.stage);

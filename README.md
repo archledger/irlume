@@ -2,7 +2,7 @@
 
 <img src="docs/assets/banner.svg" alt="irlume: face authentication for Linux" width="640">
 
-### Your face unlocks Linux
+### Your face or fingerprint unlocks Linux
 
 Login, lock screen, `sudo`, and app prompts like Bitwarden. In the dark, with an
 IR camera. Stored as an embedding, never an image. Password always works.

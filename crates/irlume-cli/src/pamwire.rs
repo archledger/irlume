@@ -1711,6 +1711,25 @@ fn selinux_pp() -> Option<String> {
     None
 }
 
+/// Settle `/run/irlume.sock`'s label after the policy module changes.
+///
+/// The already-bound socket keeps its pre-policy label; the greeter stays
+/// blocked until the daemon rebinds. Restart it now so face login works at
+/// the very next lock/login, not the next reboot. The restart alone is not
+/// enough under socket activation, where systemd owns the socket file and a
+/// service restart never recreates it, so the boot-time label survives;
+/// `restorecon` (backed by the irlume.fc entry) settles the label in that
+/// case and whenever the bind raced the policy commit. This lived only on
+/// the `login enable` path while the TUI Repair fix and `selinux load` each
+/// carried half of it, and the halves reported done for a relabel that had
+/// not happened; one function so the sequence cannot drift apart again.
+pub(crate) fn relabel_daemon_socket() {
+    let _ = Command::new("systemctl")
+        .args(["try-restart", "irlumed.service"])
+        .status();
+    let _ = Command::new("restorecon").arg("/run/irlume.sock").status();
+}
+
 fn selinux(enable: bool, apply: bool) -> Result<String, String> {
     if enable {
         if selinux_loaded() == Some(true) {
@@ -1730,15 +1749,7 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             if !ok {
                 return Err("semodule -i irlume.pp failed".into());
             }
-            // The already-bound socket keeps its pre-policy label; the greeter
-            // stays blocked until the daemon rebinds. Restart it now so face
-            // login works at the very next lock/login, not the next reboot;
-            // restorecon (backed by the irlume.fc entry) settles the label even
-            // if the bind raced the policy commit.
-            let _ = Command::new("systemctl")
-                .args(["try-restart", "irlumed.service"])
-                .status();
-            let _ = Command::new("restorecon").arg("/run/irlume.sock").status();
+            relabel_daemon_socket();
             Ok("✓ SELinux module loaded (daemon restarted to relabel its socket)".into())
         } else {
             Ok("→ would load the SELinux module (greeter→daemon socket)".into())

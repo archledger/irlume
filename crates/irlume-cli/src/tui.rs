@@ -2915,22 +2915,19 @@ impl App {
                     "systemctl restart fprintd 2>/dev/null || pkill fprintd",
                 ],
             ),
-            // Load the policy AND restart the daemon so the socket relabels to
-            // irlume_runtime_t; otherwise the existing socket keeps its old label
-            // and the check would still fail.
+            // `selinux load` does the whole job: semodule -i, try-restart, and
+            // the restorecon that actually settles the label. The old command
+            // here appended its own `systemctl restart irlumed`, which under
+            // socket activation relabels nothing (systemd owns the socket file
+            // and a service restart never recreates it), so the step reported
+            // done while the row stayed red.
             Suspend::SelinuxLoad => {
-                // args[0] is "sh", so sudo_step's self-exe rewrite can't reach
-                // the embedded `irlume`; splice the running binary into the
-                // command ourselves so the rpm-path .pp lookup this build ships
-                // is the one that runs, not an older PATH `irlume`.
-                let exe = Self::self_exe();
+                // sudo_step resolves the leading "irlume" to the running
+                // binary, so the rpm-path .pp lookup this build ships is the
+                // one that runs, not an older PATH `irlume`.
                 self.sudo_step(
                     "load the SELinux module + relabel the socket",
-                    &[
-                        "sh",
-                        "-c",
-                        &format!("'{exe}' selinux load && systemctl restart irlumed"),
-                    ],
+                    &["irlume", "selinux", "load"],
                 );
             }
         }

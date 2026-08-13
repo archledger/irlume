@@ -1089,11 +1089,19 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             let pp = match std::env::var("IRLUME_SELINUX_PP") {
                 Ok(p) => std::path::Path::new(&p).exists().then_some(p),
                 Err(_) => [
-                    "packaging/selinux/irlume.pp",
                     // The irlume-selinux rpm's install location; without it a
                     // packaged install could not re-load after `login disable`.
                     "/usr/share/selinux/packages/irlume.pp",
                     "/usr/share/irlume/selinux/irlume.pp",
+                    // Dev builds: the repo's own build output, resolved at
+                    // COMPILE time. The old entry was the bare relative path
+                    // "packaging/selinux/irlume.pp", which made `sudo irlume
+                    // selinux load` install whatever .pp sat under the CALLER'S
+                    // working directory as system policy.
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../packaging/selinux/irlume.pp"
+                    ),
                 ]
                 .into_iter()
                 .find(|p| std::path::Path::new(p).exists())
@@ -1109,7 +1117,13 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
                 .status();
             match st {
                 Ok(s) if s.success() => {
-                    println!("[selinux] loaded {OK}; restart irlumed so the socket relabels");
+                    // Loading the module is half the job: the bound socket
+                    // keeps its old label until the daemon rebinds, and under
+                    // socket activation not even a restart relabels it. The
+                    // shared sequence restarts and restorecons so the check
+                    // that sent the user here passes afterwards.
+                    crate::pamwire::relabel_daemon_socket();
+                    println!("[selinux] loaded {OK}; irlumed restarted and the socket relabeled");
                     ExitCode::SUCCESS
                 }
                 Ok(s) => {

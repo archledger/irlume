@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-12
+
 ### Added
 
 - **Per-service consent gestures, and a head shake that declines.** Each

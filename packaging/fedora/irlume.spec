@@ -2,7 +2,7 @@
 %global ort_ver 1.24.4
 
 Name:           irlume
-Version:        0.9.0
+Version:        0.10.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -246,6 +246,14 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Aug 12 2026 archledger <archledger236@gmail.com> - 0.10.0-1
+- Per-service consent gestures with a head-shake decline; elevation and polkit prompts require a nod by default
+- The keyring-release gesture default changed from ON to OFF; opt back in with irlume credential-release-challenge credential_release on
+- The landmark mesh is now the published .tflite on a bundled TFLite runtime; a runtime that fails to load degrades to nod-only instead of stopping the daemon
+- The polkit PAM stanza migrates to the abort=die control on upgrade so the shake decline works
+- login enable refuses to act on an unestablished camera reading, closing a path that could unwire face auth from every greeter
+- Camera fixes: session recovery keeps the emitter lit, scanning opens fewer nodes, capture verifies the negotiated format, backlight compensation is restored after sessions
+- Repair and doctor report the TFLite runtime, a starting daemon, and per-service gesture state accurately
 * Wed Aug 05 2026 archledger <archledger236@gmail.com> - 0.9.0-1
 - A sandboxed run could delete live template keys and recovery envelopes, because those paths ignored IRLUME_STATE_DIR; all state paths now honor the override
 - recovery setup accepted an empty passphrase when stdin was a pipe; the 12-character floor now applies to both paths

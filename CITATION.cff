@@ -18,8 +18,8 @@ authors:
 repository-code: "https://github.com/archledger/irlume"
 url: "https://github.com/archledger/irlume"
 license: GPL-3.0-or-later
-version: 0.9.0
-date-released: 2026-08-05
+version: 0.10.0
+date-released: 2026-08-12
 keywords:
   - face-authentication
   - infrared

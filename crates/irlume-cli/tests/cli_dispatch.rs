@@ -446,8 +446,15 @@ fn diag_reports_sealed_state_from_daemon_when_envelope_unreadable() {
 // ---------------------------------------------------------------- selinux load
 
 // cli.rs covers `selinux status` + a bogus sub; this covers the `load` arm:
-// the module file missing, and (with a fake .pp under cwd) a semodule that
-// succeeds and one that fails.
+// the module file missing, the full success sequence, a failed semodule, and
+// a failed relabel. The .pp is pinned through IRLUME_SELINUX_PP: the
+// cwd-relative lookup is GONE (running `sudo irlume selinux load` from a
+// directory holding a packaging/selinux/irlume.pp used to install the
+// caller's file as system policy), and every tool the sequence runs is a
+// fake on PATH. The first version of this test faked only semodule, so on a
+// host with the packaged .pp installed it found the REAL module and drove
+// the REAL systemctl through a try-restart of the host's daemon: a test
+// that touches the machine it runs on is the bug, not the coverage.
 #[test]
 fn selinux_load_handles_missing_module_and_semodule_outcomes() {
     let sb = Sandbox::new("selinuxload");
@@ -460,20 +467,36 @@ fn selinux_load_handles_missing_module_and_semodule_outcomes() {
     assert_eq!(code, 1);
     assert!(err.contains("irlume.pp not found"), "{err}");
 
-    // A .pp relative to the working dir makes the module resolvable; the fake
-    // semodule then decides success vs failure.
-    std::fs::create_dir_all(sb.path("work/packaging/selinux")).unwrap();
-    std::fs::write(sb.path("work/packaging/selinux/irlume.pp"), b"\x00").unwrap();
+    let pp = sb.path("irlume.pp");
+    std::fs::write(&pp, b"\x00").unwrap();
+    let with_pp = |sb: &Sandbox| {
+        let mut c = sb.cmd_with_fakes(&["selinux", "load"]);
+        c.env("IRLUME_SELINUX_PP", &pp);
+        c
+    };
 
+    // The whole sequence succeeds: load, restart, relabel.
     sb.fake_tool("semodule", "exit 0");
-    let (code, out, _) = run(&mut sb.cmd_with_fakes(&["selinux", "load"]), "selinux load");
+    sb.fake_tool("systemctl", "exit 0");
+    sb.fake_tool("restorecon", "exit 0");
+    let (code, out, _) = run(&mut with_pp(&sb), "selinux load");
     assert_eq!(code, 0);
     assert!(out.contains("loaded"), "{out}");
 
+    // semodule fails: no success claim, and no relabel attempt behind it.
     sb.fake_tool("semodule", "exit 5");
-    let (code, _, err) = run(&mut sb.cmd_with_fakes(&["selinux", "load"]), "selinux load");
+    let (code, _, err) = run(&mut with_pp(&sb), "selinux load");
     assert_eq!(code, 1);
     assert!(err.contains("semodule exited"), "{err}");
+
+    // The module loads but the relabel half fails: the old code claimed
+    // success here (both statuses were discarded), which is the same false
+    // done-report the shared sequence exists to prevent.
+    sb.fake_tool("semodule", "exit 0");
+    sb.fake_tool("restorecon", "exit 1");
+    let (code, _, err) = run(&mut with_pp(&sb), "selinux load");
+    assert_eq!(code, 1, "a failed relabel must not exit success: {err}");
+    assert!(err.contains("relabel FAILED"), "{err}");
 }
 
 // ----------------------------------------------------------------- reseal arms

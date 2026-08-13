@@ -360,6 +360,40 @@ All notable changes to irlume are documented here. This project adheres to
   runs, so a concurrent read misses rather than reading something stale
   (#349).
 
+### Upgrading from 0.9.0
+
+- **Elevation prompts now expect a nod.** `sudo`, `su`, `doas` (and their
+  `-i`/`-l`/`runuser` variants) demand the consent gesture by default. Turn
+  one off with `sudo irlume credential-release-challenge sudo off` (it asks
+  for confirmation).
+- **The keyring-release gesture default flipped from ON to OFF.** A greeter
+  cold login and a logout now release the TPM-sealed keyring password on the
+  face match alone. Opt back in with
+  `sudo irlume credential-release-challenge credential_release on`.
+- **Anyone who enabled require-eyes-open should run
+  `irlume profiles eyes-open off`.** Enabling is refused now (#386), but an
+  existing `true` is still enforced by a gate measured to deny nearly every
+  genuine frame.
+- **`irlume profiles challenge on|off` is gone** with the retired blink gate
+  (ADR-0002); a script calling it exits 2.
+- **Check `grep consent_gesture /etc/irlume/settings.conf`.** A misspelled
+  value now disables every gesture (loudly) instead of accepting either, and
+  an unrecognized truthy spelling of `credential_release_challenge` (for
+  example `enabled`) now reads as OFF where 0.9.0 read it as ON.
+- **Machine-API consumers: re-pull the schema from the package.**
+  `require_challenge` in `profiles.list` is frozen at `false` for contract 1
+  and leaves with contract 2.
+- **Close any running `irlume tui` before upgrading.** A 0.9.0 TUI cannot
+  parse the new daemon's Enrollment reply (its `require_challenge` field had
+  no serde default at 0.9.0) until it is restarted.
+- **`/etc/irlume` is enforced to mode 0755 on every daemon start** by
+  `ConfigurationDirectory=`; a directory tightened to 0700 is reset. The
+  files inside stay 0600.
+- The polkit PAM stanza migrates to the head-shake-capable `abort=die`
+  control automatically: the packaging scriptlets run
+  `irlume login reconcile`, which now treats the old `sufficient` shape as a
+  regression and rewires it.
+
 ## [0.9.0] - 2026-08-05
 
 ### Security

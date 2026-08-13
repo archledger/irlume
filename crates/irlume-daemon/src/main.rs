@@ -545,7 +545,39 @@ fn main() {
                 }
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
-                    .and_then(|e| e.with_mesh(&mesh))
+                    // A mesh that fails to LOAD degrades, it does not kill the
+                    // daemon. The mesh became a .tflite on a bundled runtime
+                    // (#295/#315), so every start now dlopens
+                    // libtensorflowlite_c.so, and treating that failure as
+                    // fatal turned "mesh-dependent gates off" into "face auth
+                    // entirely dead" on any host where the bundled runtime
+                    // does not load (a GLIBCXX below the .deb build's 3.4.30
+                    // floor, a failed unpack); 0.9.0 pointed the unit at the
+                    // ONNX mesh and started fine on the same host. The nod
+                    // path needs no mesh; the eye-closure gesture and the
+                    // rescue alignment are off and every consent prompt still
+                    // works by nod. IRLUME_MODELS_STRICT keeps the refusal
+                    // for operators who asked for it. An ABSENT mesh file was
+                    // already a silent no-op inside with_mesh.
+                    .and_then(|e| {
+                        if strict_requested(
+                            std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+                            std::io::stderr(),
+                        ) {
+                            return e.with_mesh(&mesh);
+                        }
+                        let (e, err) = e.with_mesh_degraded(&mesh);
+                        if let Some(err) = err {
+                            eprintln!(
+                                "irlumed: FaceMesh did not load ({err}); continuing WITHOUT \
+                                 the mesh: the eye-closure consent gesture and the \
+                                 detection-rescue alignment are off, the head nod still \
+                                 works. Fix the TFLite runtime (doctor: tflite-runtime) or \
+                                 set IRLUME_MESH_MODEL to the ONNX mesh."
+                            );
+                        }
+                        Ok(e)
+                    })
                     .and_then(|e| match &tp_det {
                         Some((bytes, thr, name)) => {
                             eprintln!(

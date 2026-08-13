@@ -1613,15 +1613,32 @@ impl Engine {
         )
     }
 
-    /// Load MediaPipe FaceMesh for the passive EAR blink liveness (ADR-0002). If
-    /// the file is absent this is a no-op; the opt-in passive gate then can't run
-    /// and is skipped (logged), so face auth keeps working.
+    /// Load MediaPipe FaceMesh, which drives the eye-closure consent gesture,
+    /// its calibration, and the detection-rescue alignment. If the file is
+    /// absent this is a no-op; the mesh-dependent paths then can't run and are
+    /// skipped (logged), so face auth keeps working.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_mesh(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
             self.mesh = Some(irlume_vision::FaceMesh::load_from_file(path)?);
         }
         Ok(self)
+    }
+
+    /// [`Self::with_mesh`], except a LOAD failure leaves the mesh off and
+    /// hands the error back beside the engine instead of consuming it, so the
+    /// caller can apply its own policy (the daemon degrades outside strict
+    /// mode: the nod path needs no mesh, and killing the daemon over the
+    /// eye-closure gesture turned "mesh gates off" into "face auth dead").
+    #[must_use]
+    pub fn with_mesh_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
+        if std::path::Path::new(path).exists() {
+            match irlume_vision::FaceMesh::load_from_file(path) {
+                Ok(m) => self.mesh = Some(m),
+                Err(e) => return (self, Some(e)),
+            }
+        }
+        (self, None)
     }
 
     /// Load the BlazeFace short-range rescue detector (improves detection on
@@ -2931,7 +2948,8 @@ impl Engine {
                 // none is worth suggesting. Name the setting: the person who can
                 // clear this is whoever typed it (#365).
                 ConsentGesture::Misconfigured => {
-                    "consent_gesture is set to a value irlume does not recognise                      (expected nod or closure); use your password"
+                    "consent_gesture is set to a value irlume does not recognise \
+                     (expected nod or closure); use your password"
                 }
             }))
         }
@@ -7663,6 +7681,21 @@ mod engine_tests {
                     && !e.has_thirdparty_pad(),
                 "absent model files must leave the engine bare"
             );
+            // A mesh file that EXISTS but will not load must hand the engine
+            // back beside the error, not consume it: the daemon degrades on
+            // this (nod still works) where a fatal treatment turned "mesh
+            // gates off" into "face auth dead" on hosts whose bundled TFLite
+            // runtime does not load.
+            let bogus = std::env::temp_dir()
+                .join(format!("irlume-bogus-mesh-{}.tflite", std::process::id()));
+            std::fs::write(&bogus, b"TFL3 this is not a model").unwrap();
+            let (e, err) = e.with_mesh_degraded(&bogus.to_string_lossy());
+            assert!(
+                err.is_some(),
+                "an unloadable mesh must report its error to the caller"
+            );
+            assert!(!e.has_mesh(), "the engine must come back mesh-less");
+            let _ = std::fs::remove_file(&bogus);
             assert_eq!(e.ir_space(), "raw");
             // A present adapter file flips the IR space to its digest name. Any
             // valid ONNX serves; `apply` is never called (BlazeFace here).

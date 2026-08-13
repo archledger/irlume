@@ -372,6 +372,19 @@ fn path_regressed(etc: &Path) -> bool {
 ///
 /// Each surface is only maintained if the marker says we wired it, so a file
 /// that was never ours cannot make reconcile loop forever.
+/// Whether the polkit file carries the module on an OLD control that ignores
+/// PAM_ABORT. The current stanza is `[success=done new_authtok_reqd=done
+/// abort=die default=ignore]`; anything else with the module is a pre-#424
+/// wiring whose head-shake decline silently does nothing.
+fn polkit_stanza_stale(etc: &Path) -> bool {
+    std::fs::read_to_string(etc).is_ok_and(|c| {
+        c.lines().any(|l| {
+            let d = grammar::directive(l);
+            d.contains(stanzas::MODULE) && !d.contains("abort=die")
+        })
+    })
+}
+
 fn wired_surface_regressed(with_sudo: bool, with_polkit: bool) -> bool {
     let fp: Vec<&Path> = FP_GREETERS.iter().map(|s| Path::new(s.etc)).collect();
     surfaces_regressed(
@@ -394,7 +407,15 @@ fn surfaces_regressed(
     }
     // polkit is materialized from a vendor copy on Fedora, so a DELETED /etc
     // override is a regression there exactly as it is for the lock screen.
-    if polkit.is_some_and(|(etc, vendor)| lock_regressed(etc, vendor)) {
+    // A STALE stanza shape counts as regressed too: an older irlume wired
+    // polkit with a plain `sufficient` line, under which a head shake's
+    // PAM_ABORT is `default=ignore`d and the decline does nothing, while the
+    // line still contains the module so the presence test alone said "not
+    // regressed" and every packaging lane's post-upgrade `login reconcile`
+    // no-opped. Treating the old shape as a regression is what makes the
+    // upgrade migrate it automatically (wire_service strips first, then
+    // rewires with the abort=die control).
+    if polkit.is_some_and(|(etc, vendor)| lock_regressed(etc, vendor) || polkit_stanza_stale(etc)) {
         return true;
     }
     // The fingerprint-keyring line rides on a service the display manager owns;
@@ -4126,9 +4147,20 @@ auth required pam_fprintd.so\n\
     fn every_wired_surface_counts_as_a_regression_not_just_the_greeter() {
         let dir = TestDir::new("surfaces");
         let wired = dir.0.join("wired");
+        let polkit_ok = dir.0.join("polkit_ok");
         let stripped = dir.0.join("stripped");
         let vendor = dir.0.join("vendor");
         std::fs::write(&wired, "auth sufficient pam_irlume.so\n").unwrap();
+        // polkit's INTACT shape is the abort=die stanza; a plain `sufficient`
+        // there is the pre-#424 wiring whose shake-decline does nothing.
+        std::fs::write(
+            &polkit_ok,
+            format!(
+                "{}\nauth include system-auth\n",
+                stanzas::POLKIT_VERIFY_STANZA
+            ),
+        )
+        .unwrap();
         std::fs::write(&stripped, "auth include system-auth\n").unwrap();
         std::fs::write(&vendor, "auth include system-auth\n").unwrap();
         let gone = dir.0.join("gone");
@@ -4138,12 +4170,21 @@ auth required pam_fprintd.so\n\
         // Intact surfaces are not regressions.
         assert!(!surfaces_regressed(
             Some(&wired),
-            Some((&wired, None)),
+            Some((&polkit_ok, None)),
             &[&wired]
         ));
         // Each surface on its own must trigger a repair.
         assert!(surfaces_regressed(Some(&stripped), None, &[]));
         assert!(surfaces_regressed(None, Some((&stripped, None)), &[]));
+        // The 0.9.0 polkit shape: module present on a plain `sufficient`.
+        // Presence alone said "not regressed", every packaging lane's
+        // post-upgrade reconcile no-opped, and the head-shake decline
+        // silently did nothing while doctor claimed it worked.
+        assert!(
+            surfaces_regressed(None, Some((&wired, None)), &[]),
+            "a pre-abort=die polkit stanza must count as regressed so the \
+             upgrade migrates it"
+        );
         assert!(surfaces_regressed(None, None, &[&stripped]));
         // polkit deleted while a vendor copy remains is re-materializable, so it
         // IS a regression; deleted with no vendor is not ours to restore.

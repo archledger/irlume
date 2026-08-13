@@ -8758,11 +8758,14 @@ mod engine_tests {
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_release_held_hands_the_camera_back() {
-        let (_rgb, ir) = loopback_pair();
+        let (rgb, ir) = loopback_pair();
         let _g = env_guard();
         let cam = irlume_camera::IrCamera::open(&ir).expect("open the IR node");
+        let rgb_cam = irlume_camera::RgbCamera::open(&rgb).expect("open the RGB node");
         let mut held_ir = Some(cam.session().expect("hold an IR session"));
-        let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
+        // BOTH halves must release: the review round noted the test proved
+        // only the IR side, and release_held drops two owners.
+        let mut held_rgb = Some(rgb_cam.session().expect("hold an RGB session"));
 
         // Control: with the session alive, a second stream on the same node
         // must be refused. If this passes, the rest proves nothing.
@@ -8775,7 +8778,10 @@ mod engine_tests {
         );
 
         release_held(&mut held_rgb, &mut held_ir);
-        assert!(held_ir.is_none(), "the release must clear the session slot");
+        assert!(
+            held_ir.is_none() && held_rgb.is_none(),
+            "the release must clear BOTH session slots"
+        );
 
         // The observation: the same call now succeeds, because the buffer queue
         // went back when the session dropped.
@@ -8786,6 +8792,11 @@ mod engine_tests {
             "after release the consent watch must be able to open its own \
              stream, got {:?}",
             after.err()
+        );
+        // The RGB half too: a fresh capture on the released node must work.
+        assert!(
+            irlume_camera::capture_rgb(&rgb).is_ok(),
+            "after release an RGB capture must be able to open the node"
         );
     }
 

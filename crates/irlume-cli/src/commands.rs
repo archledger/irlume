@@ -1146,10 +1146,23 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
                     // keeps its old label until the daemon rebinds, and under
                     // socket activation not even a restart relabels it. The
                     // shared sequence restarts and restorecons so the check
-                    // that sent the user here passes afterwards.
-                    crate::pamwire::relabel_daemon_socket();
-                    println!("[selinux] loaded {OK}; irlumed restarted and the socket relabeled");
-                    ExitCode::SUCCESS
+                    // that sent the user here passes afterwards; a failed
+                    // half is reported as exactly that, not as done.
+                    match crate::pamwire::relabel_daemon_socket() {
+                        Ok(()) => {
+                            println!(
+                                "[selinux] loaded {OK}; irlumed restarted and the socket relabeled"
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[selinux] module loaded, but the socket relabel FAILED: {e}; \
+                                 the greeter stays blocked until it succeeds"
+                            );
+                            ExitCode::FAILURE
+                        }
+                    }
                 }
                 Ok(s) => {
                     eprintln!("[selinux] semodule exited {s}");

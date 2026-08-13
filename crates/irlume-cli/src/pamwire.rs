@@ -1783,11 +1783,24 @@ fn selinux_pp() -> Option<String> {
 /// the `login enable` path while the TUI Repair fix and `selinux load` each
 /// carried half of it, and the halves reported done for a relabel that had
 /// not happened; one function so the sequence cannot drift apart again.
-pub(crate) fn relabel_daemon_socket() {
-    let _ = Command::new("systemctl")
-        .args(["try-restart", "irlumed.service"])
-        .status();
-    let _ = Command::new("restorecon").arg("/run/irlume.sock").status();
+pub(crate) fn relabel_daemon_socket() -> Result<(), String> {
+    // Statuses are CHECKED, not discarded: this function exists because two
+    // surfaces reported a relabel they had not performed, and swallowing a
+    // missing restorecon or a failed restart would be the same false success
+    // one level down.
+    let run = |what: &str, cmd: &mut Command| match cmd.status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("{what} exited {st}")),
+        Err(e) => Err(format!("could not run {what}: {e}")),
+    };
+    run(
+        "systemctl try-restart irlumed.service",
+        Command::new("systemctl").args(["try-restart", "irlumed.service"]),
+    )?;
+    run(
+        "restorecon /run/irlume.sock",
+        Command::new("restorecon").arg("/run/irlume.sock"),
+    )
 }
 
 fn selinux(enable: bool, apply: bool) -> Result<String, String> {
@@ -1809,7 +1822,9 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             if !ok {
                 return Err("semodule -i irlume.pp failed".into());
             }
-            relabel_daemon_socket();
+            relabel_daemon_socket().map_err(|e| {
+                format!("SELinux module loaded, but the socket relabel FAILED: {e}")
+            })?;
             Ok("✓ SELinux module loaded (daemon restarted to relabel its socket)".into())
         } else {
             Ok("→ would load the SELinux module (greeter→daemon socket)".into())

@@ -1765,17 +1765,30 @@ fn caps_reading() -> CapsReading {
                 caps: irlume_camera::capabilities(), // the one permitted probe
                 established: true,
             },
-            // Ambiguous: answer from the configured pair's mere existence, which
-            // never opens anything. A configured pair on disk IS evidence about
-            // the hardware; the shipped-shape fallback below is not.
+            // Ambiguous: answer from the configured pair's mere existence,
+            // which never opens anything. The rule is ASYMMETRIC on purpose:
+            // existence of both paths may establish a POSITIVE reading (a
+            // positive only ever WIRES, and wiring is non-destructive since
+            // the password stays the fallback even if a path turned into the
+            // wrong node), but a missing path must not establish a NEGATIVE
+            // one. Path-absence during a timeout is what a suspended,
+            // renumbered, or unplugged camera looks like on a machine that
+            // HAS one, and an established-false reading is precisely what
+            // authorizes the unwire this type exists to prevent. The first
+            // cut set established=true here unconditionally, which covered
+            // the no-config machine and left the configured one, the common
+            // upgrade case, unprotected (found in the PR review).
             _ => match irlume_camera::configured_pair_no_probe() {
-                Some((rgb, ir)) => CapsReading {
-                    caps: irlume_camera::Caps {
+                Some((rgb, ir)) => {
+                    let caps = irlume_camera::Caps {
                         ir_pair: std::path::Path::new(&ir).exists(),
                         rgb: std::path::Path::new(&rgb).exists(),
-                    },
-                    established: true,
-                },
+                    };
+                    CapsReading {
+                        established: caps.ir_pair && caps.rgb,
+                        caps,
+                    }
+                }
                 None => CapsReading {
                     caps: irlume_camera::Caps {
                         ir_pair: false,

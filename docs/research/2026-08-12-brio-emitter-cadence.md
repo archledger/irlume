@@ -1,7 +1,7 @@
 # Brio emitter output against capture cadence
 
 Date: 2026-08-12, 14:43-14:46 EDT. Instrument: `ir_strobe_probe` (36-frame
-raw bursts on /dev/video2, GREY) at repo `5f7eb6b`, the archhost Logitech
+raw bursts on /dev/video2, GREY) with the `ir_strobe_probe` example, unchanged since v0.9.0, the archhost Logitech
 BRIO (046d:085e) on USB3. Room lighting uncontrolled and LIT (ambient-phase
 mean near 30; the 2026-08-07 dark-room runs read 0.6 to 1.7), so absolute
 levels are not comparable with the dark-room decay observation this

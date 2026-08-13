@@ -2849,8 +2849,10 @@ impl Engine {
         // nothing to warn about on every release). The blink `require_challenge`
         // gate is gone; the consent gesture gate above covers the AppConsent and
         // CredentialRelease paths when their policy asks for it, and the Verify
-        // path is gated per service. run_passive_liveness / capture_ear_samples
-        // stay for require_eyes_open.
+        // path is gated per service. require_eyes_open gates on the per-frame
+        // `eyes_open` flag; `capture_ear_samples` stays for the closure
+        // calibration and `run_passive_liveness` is production-dead (its own
+        // doc says why it is kept).
         Ok(outcome)
     }
 
@@ -4895,36 +4897,6 @@ fn colliding_profile(
 /// corneal glint from the 850nm emitter.
 const EYE_OPEN_PEAK_MIN: f32 = 200.0;
 
-/// Per-eye open check (IR corneal-glint heuristic): an open eye reflects the
-/// 850nm emitter as a bright specular point near the eye landmark; a closed
-/// eyelid does not. Conservative: requires the glint, so an unverifiable eye
-/// reads closed (auth falls back to password). Heuristic; used only when a
-/// profile opts into the require-eyes-open gate.
-///
-/// `white` is the negotiated format's ceiling, and passing it is what stops
-/// this gate reading a lens instead of an eye. [`eye_glint_of`] next door
-/// already refuses a railed peak, and its doc records why: the repo's own
-/// measurements pin the peak at 255 in all 30 frames with glasses on, where it
-/// reads the lens specular rather than the cornea. This function sampled the
-/// same statistic and never got the same treatment, so on 2026-08-08 it
-/// GRANTED 3/3 with the eyes CLOSED behind glasses while denying 5/5 bare-eyed
-/// with them open (#386). A maximum is exactly the statistic clipping
-/// destroys: a railed window says the true value was at least the ceiling and
-/// never what it was, so no eyelid state can be read out of it.
-///
-/// Unlike `eye_glint_of`, which answers `None` for "not established", this gate
-/// is deny-only and returns a bool, so unreadable collapses to `false`. That is
-/// the fail-safe direction for a gate whose whole purpose is refusing a
-/// sleeping or unconscious user.
-///
-/// `white` of `None` means the format named no ceiling (`Grey16`, `Nv12Luma`,
-/// `YuyvLuma`) and the peak passes through unchanged, which is #237's settled
-/// precedent and the same choice `eye_glint_of` makes.
-///
-/// Pass the RAW frame. Ambient subtraction moves a railed 255 to 254, so a
-/// subtracted frame stops reading as railed and this refusal would not fire;
-/// the callers of `eye_glint_of` and `saturated_frac_of` already pass
-/// `saturation_frame` for that reason (#238 review) and this one now does too.
 /// Which buffer the eyes-open gate measures, as a value a test can observe.
 ///
 /// This exists because the ceiling refusal and the choice of frame are two
@@ -4950,6 +4922,37 @@ fn eyes_open_from_capture(
     both_eyes_open(saturation_frame.unwrap_or(returned), w, h, lm, white)
 }
 
+/// Per-eye open check (IR corneal-glint heuristic): an open eye reflects the
+/// 850nm emitter as a bright specular point near the eye landmark; a closed
+/// eyelid does not. Conservative: requires the glint, so an unverifiable eye
+/// reads closed (auth falls back to password). Heuristic; used only when a
+/// profile opts into the require-eyes-open gate.
+///
+/// `white` is the negotiated format's ceiling, and passing it is what stops
+/// this gate reading a lens instead of an eye. [`eye_glint_of`] next door
+/// already refuses a railed peak, and its doc records why: the repo's own
+/// measurements pin the peak at 255 in all 30 frames with glasses on, where it
+/// reads the lens specular rather than the cornea. This function sampled the
+/// same statistic and never got the same treatment, so on 2026-08-08 it
+/// GRANTED 3/3 with the eyes CLOSED behind glasses while denying 5/5 bare-eyed
+/// with them open (#386). A maximum is exactly the statistic clipping
+/// destroys: a railed window says the true value was at least the ceiling and
+/// never what it was, so no eyelid state can be read out of it.
+///
+/// Unlike `eye_glint_of`, which answers `None` for "not established", this gate
+/// is deny-only and returns a bool, so unreadable collapses to `false`. That is
+/// the fail-safe direction for a gate whose whole purpose is refusing a
+/// sleeping or unconscious user.
+///
+/// `white` of `None` means the format named no ceiling (`Grey16`, `Nv12Luma`,
+/// `YuyvLuma`) and the peak passes through unchanged, the same choice
+/// `eye_glint_of` makes; on the authentication path #358's exposure refusal
+/// rejects such formats before this gate runs.
+///
+/// Pass the RAW frame. Ambient subtraction moves a railed 255 to 254, so a
+/// subtracted frame stops reading as railed and this refusal would not fire;
+/// the callers of `eye_glint_of` and `saturated_frac_of` already pass
+/// `saturation_frame` for that reason (#238 review) and this one now does too.
 pub fn both_eyes_open(
     grey: &[u8],
     w: u32,
@@ -5249,9 +5252,12 @@ pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
 ///   set, so the cue records the sensor's limit rather than the eye.
 ///
 /// `white` of `None` means the format could not name a ceiling (`Grey16`,
-/// `Nv12Luma`, `YuyvLuma`), and there the peak passes through unchanged. That
-/// is #237's settled precedent, not a fresh judgement: refusing on a number
-/// nobody produced would deny every module that does not negotiate GREY8.
+/// `Nv12Luma`, `YuyvLuma`), and there the peak passes through unchanged,
+/// matching the choice `eye_glint_of` and `both_eyes_open` make. On the
+/// authentication path this arm is unreachable: #358's exposure refusal
+/// (`exposure_refusal` in irlume-liveness) rejects a format that names no
+/// ceiling before any cue below it runs. It stays live for the PAD corpus
+/// tool and the dev probe, which feed frames with no negotiation step.
 ///
 /// Note the ceiling test wants the RAW frame. Ambient subtraction moves a
 /// railed 255 to 254, so a subtracted frame would quietly stop reading as

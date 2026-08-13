@@ -126,7 +126,11 @@ IR captures run in parallel, which cuts the capture stage by about a third;
 own hardware.
 
 Some operations add a deliberate **consent gesture** after the face match: a
-head nod approves, a head shake declines and closes the prompt. It gates
+head nod approves, a head shake declines. What the dialog does afterwards is
+the desktop agent's call: on Plasma 6 the KDE agent re-prompts and closes its
+window after about three declined attempts, so a shake declines every time
+without closing the dialog on the first one
+([details](APP-INTEGRATION.md)). It gates
 app-consent prompts (polkit) and terminal elevation (sudo, su, doas) by default,
 and the keyring-release path only if you opt in with `irlume
 credential-release-challenge on`. A greeter cold login, logout and lock-screen

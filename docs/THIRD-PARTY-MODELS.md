@@ -180,7 +180,7 @@ through irlume's own pipeline, buffalo_l beat the shipped AuraFace only
 marginally (LFW EER 3.9% against 4.2%), was WORSE on one demographic
 group (Middle Eastern FAR 5.63e-4 against 4.50e-4), and the single
 threshold bounding every FairFace group at FMR 1e-4 came out no better
-(0.700 against 0.685). Benchmark leadership did not become a security
+(0.700 against AuraFace's 0.69, [FAIRNESS.md](FAIRNESS.md)). Benchmark leadership did not become a security
 improvement here. The attack that defeats irlume today is a print of the
 enrolled face, which a better recognizer matches better, not worse; the
 ceiling is set by presentation-attack detection.
@@ -205,8 +205,7 @@ screens or other faces on the frames where a rescue fires. That corpus is
 issue #440.
 
 **Landmarks: not directly swappable, and the migration is narrower than
-it first looks.** The InsightFace 106-point model (`2d106det.onnx`,
-sha256 `f001b856...`) emits a single `fc1[1,212]` tensor: 106
+it first looks.** The InsightFace 106-point model (`2d106det.onnx`) emits a single `fc1[1,212]` tensor: 106
 two-dimensional points. irlume's eye-aspect-ratio and deliberate-closure
 cues index the MediaPipe mesh topology by number (`EAR_LEFT` and
 `EAR_RIGHT`), so adopting a 106-point model means defining a new eye

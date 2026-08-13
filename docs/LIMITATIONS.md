@@ -19,8 +19,17 @@ summary lives on the [README](../README.md); this is the detail.
   430-sample field session it was reliable below ambient ~120 on the 0-255 IR
   scale and rejected 129 of 129 genuine samples above ~170. The rejection names
   the condition and the fix.
-- **Passive blink liveness misses glasses-wearers**, because IR lens reflections
-  hide the eyelid.
+- **The eye-closure consent gesture needs per-user calibration, and glasses
+  move it.** On the same subject, glasses lifted the held-closure IR EAR
+  median from 0.048 to 0.090
+  ([blink corpus](pad-results/2026-08-07-blink-corpus.md)), so a calibration
+  captured bare-eyed can refuse closures made with glasses on. Run
+  `sudo irlume calibrate-closure` in the state you normally sit in. The head
+  nod is the default and needs no calibration.
+- **The require-eyes-open gate cannot be turned on.** Measured on its own
+  subject, it read 1 of 12 bare-eyed eyes-open frames as open and 0 of 12
+  with glasses, while a live session demonstrated it granting with the eyes
+  closed, so the daemon declines to enable it (#386).
 - **RGB-only laptops get screen unlock only**, never `sudo`, login, or the
   keyring. By design.
 - **Not lab-certified.** Self-tested against ISO/IEC 30107-3, with no iBeta pass.

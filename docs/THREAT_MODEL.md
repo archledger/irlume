@@ -162,10 +162,9 @@ here is a claim about those.
 
 ## Liveness: algorithmic single-frame gate (no trained weights)
 
-The default gate uses no trained weights. (The opt-in passive-blink stage
-below, [ADR-0002](adr/0002-challenge-response-liveness.md), does run a trained
-model, MediaPipe FaceMesh, for eye landmarks; it is a landmarker, not a spoof
-classifier, and is Apache-2.0, so the clean-BOM claim holds.)
+The default gate uses no trained weights. (The consent-gesture stage does run
+a trained model, MediaPipe FaceMesh, for eye landmarks; it is a landmarker,
+not a spoof classifier, and is Apache-2.0, so the clean-BOM claim holds.)
 
 Physically-grounded cues, hard gate (any failure rejects):
 
@@ -201,16 +200,17 @@ brightness-ratio cue (banner center/edge 1.02–1.58 *overlaps and exceeds* genu
 were still fully rejected. This is a demonstrated instance of the accepted
 IR-approximating-spoof residual risk.
 
-Two mitigations exist and neither is automatic. The **passive-blink
-challenge-response** (a static print cannot blink) is implemented and validated
-([ADR-0002](adr/0002-challenge-response-liveness.md); measured APCER 0% / BPCER
-0%) and ships opt-in. The **trained `flir` cue** has refused this print in every
-measured session, including one enhanced with an infrared-absorbing patch that
-carries the centre/edge ratio into the genuine range while the built-in gate
-still returns `Live`; since 2026-08-04 `irlume setup` offers it as a recommended
-step with the license and provenance on screen
-([ADR-0001](adr/0001-liveness-pad-strategy.md)), though the weights are neither
-shipped nor fetched without consent. Measurements:
+One mitigation exists and it is not automatic. The **trained `flir` cue** has
+refused this print in every measured session, including one enhanced with an
+infrared-absorbing patch that carries the centre/edge ratio into the genuine
+range while the built-in gate still returns `Live`; since 2026-08-04
+`irlume setup` offers it as a recommended step with the license and provenance
+on screen ([ADR-0001](adr/0001-liveness-pad-strategy.md)), though the weights
+are neither shipped nor fetched without consent. The passive-blink gate that
+once closed this breach in validation was retired for field non-response
+([ADR-0002](adr/0002-challenge-response-liveness.md), superseded); the nod and
+head-shake gestures that replaced it prove intent, not liveness, and do not
+stand between a print and a grant. Measurements:
 [docs/pad-results/](pad-results/).
 
 A user who declines both, or who never runs setup, still carries this gap in

@@ -82,7 +82,7 @@ irlume tui       # guided enrollment and wiring
 ```
 
 **You need** x86-64 Linux with systemd and PAM. A TPM 2.0 is strongly recommended.
-Any camera works and sets your tier: **IR** → secure login · **RGB** → screen
+Most cameras work and set your tier (an IR node must offer an 8-bit grey format; see [Platforms](docs/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
 unlock · **fingerprint** → companion factor.
 
 ## Documentation

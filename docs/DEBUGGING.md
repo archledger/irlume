@@ -180,9 +180,12 @@ or bbox jitter can override them on the daemon unit without a rebuild:
 | Variable | Cue | Default |
 |---|---|---|
 | `IRLUME_RGB_MOIRE_MAX` | screen-replay moiré ceiling (also listed in [SETUP.md](SETUP.md)) | 28 |
-| `IRLUME_BLINK_MOTION_MAX` | median head-motion ceiling above which no EAR dip is trusted as a blink | 0.02 |
-| `IRLUME_BLINK_CONTRAST_DROP` | minimum eye-region contrast drop for a dip to count | 1.15 |
-| `IRLUME_BLINK_CONTRAST_MOTION_FLOOR` | motion level above which the contrast check engages | 0.015 |
+
+`IRLUME_BLINK_MOTION_MAX`, `IRLUME_BLINK_CONTRAST_DROP` and
+`IRLUME_BLINK_CONTRAST_MOTION_FLOOR` tune `detect_blink`, which since the
+blink gate was retired ([ADR-0002](adr/0002-challenge-response-liveness.md))
+is reached only by the `IRLUME_DEV=1` tools `blinkcap` and `meshprobe`.
+Setting them on the daemon unit changes nothing an authentication does.
 
 A value that does not parse, is not finite, or sits outside the range its
 setting accepts is ignored: the default above stays in force and irlumed prints

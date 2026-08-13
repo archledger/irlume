@@ -7,7 +7,8 @@ abstract: >-
   login secret in the TPM under a measured-boot policy and releases it only on
   a live infrared face match. Templates are stored as 512-D embeddings,
   encrypted at rest under a TPM-sealed key; anti-spoofing is algorithmic
-  (infrared face detection, reflectance, relief ratio, and glint) with no third-party
+  (infrared face detection, reflectance, and centre/edge relief ratio, with
+  corneal glint recorded as a supporting cue) with no third-party
   anti-spoof weights in the default stack.
 type: software
 authors:
@@ -17,8 +18,8 @@ authors:
 repository-code: "https://github.com/archledger/irlume"
 url: "https://github.com/archledger/irlume"
 license: GPL-3.0-or-later
-version: 0.7.0
-date-released: 2026-07-28
+version: 0.9.0
+date-released: 2026-08-05
 keywords:
   - face-authentication
   - infrared

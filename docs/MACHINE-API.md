@@ -224,7 +224,7 @@ reused for a different meaning. The registry as of this contract:
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
 | `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
-| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: mesh-dependent gates (passive blink liveness, consent gesture) are disabled |
+| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: the mesh-dependent eye-closure consent gesture, its calibration, and the detection-rescue alignment are disabled |
 | `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
@@ -326,8 +326,11 @@ needs root, so an ordinary caller gets `unknown`, which is not a synonym for
 
 Capability: `profiles-list-json`.
 
-Returns display names, scan display names, and the two per-user liveness policy
-flags. The current enrollment store identifies these records by mutable names,
+Returns display names, scan display names, and the per-user eyes-open policy
+flag. `require_challenge` was emitted by contract 1 up to 0.9.0 and is gone:
+the blink gate it reported was retired
+([ADR-0002](adr/0002-challenge-response-liveness.md)). A consumer reading it
+must treat its absence as `false`. The current enrollment store identifies these records by mutable names,
 so this first read-only contract intentionally does not invent opaque IDs or
 advertise profile mutations. Mutation-safe IDs must originate in the engine
 store before a later capability can expose them.

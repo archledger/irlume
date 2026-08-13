@@ -5,6 +5,31 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Per-service consent gestures, and a head shake that declines.** Each
+  gated operation class now has its own `service_gesture.<service>` key in
+  `settings.conf` (`sudo`, `su`, `doas`, `polkit-1`, and the special token
+  `credential_release`), set from the TUI Settings tab or with
+  `sudo irlume credential-release-challenge <service> <on|off|status>`.
+  Elevation and polkit prompts require the gesture by default; turning one
+  of those off asks for confirmation first. During the gesture window a
+  head shake DECLINES the prompt instead of letting it time out; what the
+  dialog does next is the desktop agent's call (the KDE agent re-prompts
+  and closes after about three declined attempts) (#424).
+- **The Repair tab reports the TFLite runtime** the way it reports ONNX:
+  from the daemon's Health when it answers, and from a local path probe
+  when it does not, with a set-but-missing `IRLUME_TFLITE_LIB` called out
+  as its own failure. The mesh has run on this runtime since it became the
+  production default, and its absence had no row anywhere.
+- **`doctor` reports the capture mode a camera pair uses and why**
+  (`capture-mode`), and the emitter's pending per-stream restore records
+  (`emitter-stream-pending`) (#100, #429).
+- **`status --json` reports a starting daemon as `"starting"`** instead of
+  folding the model-loading window into `"unreachable"`.
+- **A contention probe example** (`cargo run -p irlume-camera --example
+  contention_probe`) measures two-opener behaviour on real hardware (#341).
+
 ### Changed
 
 - **Metadata camera nodes classify without being opened.** Scanning used
@@ -14,7 +39,8 @@ All notable changes to irlume are documented here. This project adheres to
   media graph now answers the capture-or-metadata question first, with no
   video-node open: `/dev/media*` opens are documented side-effect free, a
   capture entity owns pads, and the metadata sibling is registered
-  padless, so half of a UVC camera's nodes never open at all. Capture
+  padless, so scanning never opens half of a UVC camera's nodes (a
+  session still opens the IR metadata node for the illumination log). Capture
   nodes keep the ENUM_FMT probe on purpose: a descriptor-derived format
   route was built and removed in review, because the blob cannot be
   attributed to one of a function's possibly several streaming
@@ -23,8 +49,113 @@ All notable changes to irlume are documented here. This project adheres to
   actually reports. On-hardware verification of the media-graph facts is
   in `docs/research/2026-08-12-camera-session-measurements.md` (#428).
 
+- **The daemon reads and hashes the 260MB recognizer once per start instead
+  of twice.** Startup checksummed it against the release manifest and then
+  handed the loader a path, which read and sha256'd the same file again. The
+  verified weights now travel to the engine with the digest they were checked
+  under, so nothing is read or hashed twice, and the artifact that reaches the
+  ONNX session is provably the one the checksum accepted. Measured on a
+  Zenbook S 14 over 15 interleaved pairs of exec-to-serving: median 1284 ms
+  before against 1044 ms after, 14 of 15 pairs faster; with the model files
+  evicted from the page cache first, 1287 ms against 1015 ms over another 15
+  pairs. Bytes read before the socket serves fall from 527.8 MB to 267.2 MB,
+  which is one recognizer. Resident memory is unchanged, because the buffer is
+  released as soon as the session owns its copy (#346).
+- **An unmeasured camera pair now captures one stream at a time, and the
+  first enrollment measures the real answer.** The old fallback assumed
+  concurrent capture, which broke an enrollment outright on a module whose
+  firmware refuses a second stream (#308) and dims others without any error;
+  a wrong sequential fallback costs 0.7 to 1.3 seconds per capture and
+  nothing else. Enrollment on a pair with no stored verdict now runs the
+  `camera-tune` contention probe once, before the scans, and persists the
+  result only when every requested round completed in both arms and the
+  scene was bright enough to trust; anything thinner or dimmer leaves the
+  pair unmeasured and says why. The automatic write re-checks under a
+  cameras.conf writer lock, so it can only fill an empty verdict; explicit
+  `camera-tune` keeps its overwrite semantics. Stored verdicts are
+  untouched, in both directions, and keep deciding every capture (#340).
+- **Capture-mode verdicts are keyed by the RGB+IR pairing, not the RGB
+  camera alone.** Contention belongs to the pairing (the same RGB module
+  that starves against its own IR sibling holds 99% of its brightness
+  against another camera's IR), so swapping the IR camera now re-measures
+  instead of reusing a stale verdict. A verdict stored by an earlier release
+  carries only the RGB identity; it keeps deciding while both nodes belong
+  to that one physical module and counts as unmeasured for any other
+  pairing.
+- **Capture errors treat the errno as a search key, not a verdict.** The
+  kernel reuses EINVAL, EIO, and ENOSPC across negotiation, bandwidth, and
+  descriptor paths, so the messages now say what each errno covers and point
+  at the matching kernel log line instead of naming a culprit.
+
+- **The daemon switches a failing concurrent pairing to sequential capture
+  by itself.** When concurrent captures keep failing on a pair, the daemon
+  records the verdict in `cameras.conf` under
+  `capture_mode_origin.<rgb>+<ir>` (`auto-switch <unix-seconds>`) and stops
+  asking the hardware for what it cannot do; any explicit `camera-tune`
+  write clears the origin record. Captures on the affected pair become
+  0.7 to 1.3 s slower and stop failing; `doctor`'s `capture-mode` row says
+  which mode is active and why (#100).
+- **The production landmark mesh is Google's published
+  `face_landmarks_detector.tflite`**, run on a TFLite C runtime the FHS
+  packages bundle at `/usr/share/irlume/tflite`, built from a pinned
+  tensorflow tag. The ONNX conversion stays as a fallback artifact, and
+  NixOS keeps it as production until a packaged runtime exists (#315).
+
 ### Fixed
 
+- **The IR metadata queue pairs by stream order, not lowest node number.**
+  On single-interface cameras (Logitech Brio: video0 RGB, video1 its
+  metadata, video2 IR, video3 its metadata) the IR node was handed the RGB
+  stream's metadata queue and classified nothing; measured 0/20 to 20/20
+  frames classified on the Brio (#310).
+- **An unusable ONNX Runtime is refused at load instead of parking the
+  daemon forever** (#304).
+- **One table decides what a PAM service name is.** The elevation set
+  (`sudo`, `su`, `doas`, `sudo-i`, `su-l`, `runuser`, `runuser-l`) lives in
+  `pam_service::classify`, and the surfaces that carried their own shorter
+  lists now read it (#362).
+- **Four places where an unrecognised or new value chose the permissive
+  answer now choose the restrictive one** (#365).
+- **The camera pin is published and read as one value**, so the writer and
+  the reader can no longer disagree about what is pinned (#374).
+- **`irlume login enable` refuses to run when nothing established the
+  camera capabilities.** On a packaged install a dead daemon leaves the
+  socket-activated `/run/irlume.sock` in place, so the capability query
+  times out instead of being refused, and the wiring path read that as "no
+  camera" and removed face auth from every greeter and the lock screen
+  while reporting success. An enable now requires an established reading;
+  a disable never needed one.
+- **A face match no longer collides with its own consent watch.** The
+  held-session rework passed session references down, so the release
+  before the gesture capture dropped references while the sessions kept
+  the buffer queue, and the watch's stream open failed with EBUSY against
+  the daemon's own process: a successful match became a password prompt.
+  The owning sessions are now released where the decision is made,
+  verified against the camera by holding, colliding, releasing, and
+  reopening (#346 follow-up).
+- **The Repair tab's SELinux fix relabels the socket it claims to
+  relabel.** Under socket activation a service restart never recreates
+  `/run/irlume.sock`, so the old fix reported done while the label stayed
+  wrong; `irlume selinux load` now runs the module load, the try-restart,
+  and the `restorecon` as one sequence, and no longer prefers an
+  `irlume.pp` from the caller's working directory over the packaged one.
+- **A starting daemon is no longer reported as dead.** For the seconds
+  models take to load, `status` said "NOT reachable" about a socket that
+  had just answered and the Repair tab offered a restart that reopened the
+  same window; both now say the daemon is starting and to retry, and
+  EACCES renders as a permission problem instead of "not reachable".
+- **The Settings tab no longer offers the require-eyes-open toggle the
+  daemon refuses.** Enabling is declined by design (#386), so the row
+  advertised an action whose only outcome was an error modal; the hint now
+  appears only for a legacy ON, and three multi-line messages that
+  rendered with embedded 20-plus-space runs are formed correctly.
+- **The Cameras tab no longer claims "no camera hardware" when the daemon
+  has not answered**; unknown renders as unknown, and "none" is reserved
+  for a daemon that answered with no devices.
+- **`irlume credential-release-challenge <service> status` works.** The
+  usage line and three other surfaces taught the per-service status form
+  while the parser accepted only `on|off`, so the exact command they
+  recommended exited 2.
 - **The backlight-compensation tuning no longer outlives the session onto
   other applications' pictures.** RGB sessions write
   `V4L2_CID_BACKLIGHT_COMPENSATION=2` so auto-exposure favors the face over
@@ -120,7 +251,10 @@ All notable changes to irlume are documented here. This project adheres to
   No threshold moved: `GLINT_MIN` stays 180, and the ceiling comes from
   `clipping_white_level`, which was already plumbed to both call sites. A format
   that cannot name its ceiling (Grey16, NV12, YUYV) passes the peak through
-  unchanged, which is #237's own settled precedent.
+  unchanged, matching the choice `eye_glint_of` and `both_eyes_open` make; on
+  the authentication path that arm is unreachable, because #358's exposure
+  refusal rejects a format naming no ceiling before any cue below it runs. It
+  stays live for the PAD corpus tool and the dev probe.
 
   No authentication verdict changes: the cue reaches the PAD corpus and a dev
   probe print, and nothing else. Records written BEFORE this change keep the old
@@ -129,6 +263,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- **The credential-release gesture default changed from ON to OFF.** Up to
+  0.9.0, `credential_release_challenge` documented itself as fail-secure:
+  an absent key, an empty value, or an unreadable file all left the gate
+  ON, and releasing the TPM-sealed login-keyring password required the
+  deliberate gesture. The default is now OFF: a greeter cold login and a
+  logout release the keyring on the face match alone, on the reasoning
+  that the gesture proves intent rather than being the anti-print layer.
+  An operator who relied on the documented fail-secure default must now
+  opt back in with `sudo irlume credential-release-challenge on` or the
+  per-service key `service_gesture.credential_release=1`; nothing in the
+  upgrade restores the old behaviour (#424).
 - **The require-eyes-open gate granted with the eyes closed, behind glasses.**
   `both_eyes_open` took the maximum grey level in a window around each eye
   landmark and compared it against a fixed 200, with no notion of the sensor's
@@ -150,7 +295,8 @@ All notable changes to irlume are documented here. This project adheres to
   RAW frame and the negotiated ceiling, the pair its two siblings already take:
   ambient subtraction moves a railed 255 to 254, so on a subtracted frame the
   refusal would never fire. A format that names no ceiling passes the peak
-  through unchanged, which is #237's settled precedent.
+  through unchanged; on the authentication path #358's exposure refusal
+  rejects such formats before this gate runs.
 
   This DENIES more than before, for profiles that opted in; the gate defaults
   off. The other half of #386 is not fixed here. A peak of 170 to 226 still fails
@@ -213,46 +359,6 @@ All notable changes to irlume are documented here. This project adheres to
   dropped after the authorization decision and still before the mutation
   runs, so a concurrent read misses rather than reading something stale
   (#349).
-
-### Changed
-
-- **The daemon reads and hashes the 260MB recognizer once per start instead
-  of twice.** Startup checksummed it against the release manifest and then
-  handed the loader a path, which read and sha256'd the same file again. The
-  verified weights now travel to the engine with the digest they were checked
-  under, so nothing is read or hashed twice, and the artifact that reaches the
-  ONNX session is provably the one the checksum accepted. Measured on a
-  Zenbook S 14 over 15 interleaved pairs of exec-to-serving: median 1284 ms
-  before against 1044 ms after, 14 of 15 pairs faster; with the model files
-  evicted from the page cache first, 1287 ms against 1015 ms over another 15
-  pairs. Bytes read before the socket serves fall from 527.8 MB to 267.2 MB,
-  which is one recognizer. Resident memory is unchanged, because the buffer is
-  released as soon as the session owns its copy (#346).
-- **An unmeasured camera pair now captures one stream at a time, and the
-  first enrollment measures the real answer.** The old fallback assumed
-  concurrent capture, which broke an enrollment outright on a module whose
-  firmware refuses a second stream (#308) and dims others without any error;
-  a wrong sequential fallback costs 0.7 to 1.3 seconds per capture and
-  nothing else. Enrollment on a pair with no stored verdict now runs the
-  `camera-tune` contention probe once, before the scans, and persists the
-  result only when every requested round completed in both arms and the
-  scene was bright enough to trust; anything thinner or dimmer leaves the
-  pair unmeasured and says why. The automatic write re-checks under a
-  cameras.conf writer lock, so it can only fill an empty verdict; explicit
-  `camera-tune` keeps its overwrite semantics. Stored verdicts are
-  untouched, in both directions, and keep deciding every capture (#340).
-- **Capture-mode verdicts are keyed by the RGB+IR pairing, not the RGB
-  camera alone.** Contention belongs to the pairing (the same RGB module
-  that starves against its own IR sibling holds 99% of its brightness
-  against another camera's IR), so swapping the IR camera now re-measures
-  instead of reusing a stale verdict. A verdict stored by an earlier release
-  carries only the RGB identity; it keeps deciding while both nodes belong
-  to that one physical module and counts as unmeasured for any other
-  pairing.
-- **Capture errors treat the errno as a search key, not a verdict.** The
-  kernel reuses EINVAL, EIO, and ENOSPC across negotiation, bandwidth, and
-  descriptor paths, so the messages now say what each errno covers and point
-  at the matching kernel log line instead of naming a culprit.
 
 ## [0.9.0] - 2026-08-05
 

@@ -3568,15 +3568,16 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 fn report_credential_release(
     report: &mut crate::doctor_report::Report,
     user: &str,
-    gesture_is_closure: bool,
+    gesture_mode: irlume_common::config::ConsentGesture,
     closure_calibrated: bool,
 ) {
     use crate::doctor_report::State;
+    let gesture_is_closure = gesture_mode == irlume_common::config::ConsentGesture::Closure;
     // Recorded from the same visibility the block below prints from, so the
     // machine answer cannot disagree with the human one.
     report.check(
         "credential-release-challenge",
-        match irlume_common::config::credential_release_challenge_visible() {
+        match irlume_common::config::credential_release_gesture_required_visible() {
             // Off is the DEFAULT (the keyring releases with no nod); on is an
             // opt-in extra. Neither is a problem, so neither warns.
             Some(_) => State::Pass,
@@ -3592,15 +3593,21 @@ fn report_credential_release(
     if !armed {
         return;
     }
-    match irlume_common::config::credential_release_challenge_visible() {
+    // The EFFECTIVE rule: the per-service `service_gesture.credential_release`
+    // override first, then the global gate, exactly as the daemon reads it.
+    // Reading only the global key told a user with the per-service key set
+    // that the gate was off, and asserted a gate the daemon does not apply
+    // when the per-service key disables it over a global on.
+    match irlume_common::config::credential_release_gesture_required_visible() {
         // The opt-in gate is on: fall through and check it can actually run.
         Some(true) => {}
         Some(false) => {
             dout!(
                 report,
-                "[doctor] credential-release challenge: off (default); the keyring \
-                 releases after the face match with no nod. Enable the extra step \
-                 with: sudo irlume credential-release-challenge on"
+                "[doctor] credential-release challenge: off; the keyring releases \
+                 after the face match with no nod. Enable the extra step with: sudo \
+                 irlume credential-release-challenge credential_release on (the \
+                 per-service key, which outranks the global gate in either state)"
             );
             return;
         }
@@ -3612,6 +3619,20 @@ fn report_credential_release(
             );
             return;
         }
+    }
+    // The dedicated consent-gesture warning above is the whole story for a
+    // Misconfigured mode; hand-writing "keep nodding" here contradicted it on
+    // the same screen while NO gesture was accepted and the keyring quietly
+    // fell back to the password. Mirrors the polkit block's arm.
+    if gesture_mode == irlume_common::config::ConsentGesture::Misconfigured {
+        dout!(
+            report,
+            "[doctor] credential-release challenge: required, but NO gesture is accepted \
+             while
+     `consent_gesture` is unreadable (see above); your keyring falls \
+             back to the typed password"
+        );
+        return;
     }
     // The gate is on. Whether it can RUN needs the mesh model (every consent frame
     // goes through FaceMesh) and, in closure-only mode, this user's EAR calibration.
@@ -4670,7 +4691,7 @@ fn doctor_run(
     // Reported before the polkit block because it shares the gesture-readiness
     // facts above: this is the same nod/closure gate, applied to the one operation
     // where a spoof yields a REUSABLE secret instead of one session.
-    report_credential_release(report, &user, gesture_is_closure, closure_calibrated);
+    report_credential_release(report, &user, gesture_mode, closure_calibrated);
 
     report.check(
         "polkit-app-prompts",
@@ -4687,10 +4708,20 @@ fn doctor_run(
         // The gesture can be turned off for polkit alone, and then no gesture is
         // asked for at all; saying "KEEP NODDING" there describes a prompt the
         // user will never see.
-        Some(true) if !irlume_common::config::service_gesture_required("polkit-1") => dout!(report,
+        // The VISIBLE read: settings.conf is 0600, and the plain read collapses
+        // "could not read" into the permissive default, so an unprivileged
+        // doctor asserted face-alone-approves about a policy it never saw.
+        // Unknown falls through to the gesture arms below, which describe the
+        // default-on behaviour that holds unless someone turned it off.
+        Some(true)
+            if irlume_common::config::service_gesture_required_visible("polkit-1")
+                == Some(false) =>
+        {
+            dout!(report,
             "[doctor] polkit app prompts: wired ✓ (face alone approves Bitwarden unlock, pkexec, …;\n     \
              the consent gesture is OFF for polkit: sudo irlume credential-release-challenge polkit-1 on)"
-        ),
+            )
+        }
         // A misconfigured `consent_gesture` accepts NEITHER gesture, so the
         // dedicated warning above is the whole story; repeating "keep nodding"
         // here would contradict it on the same screen.

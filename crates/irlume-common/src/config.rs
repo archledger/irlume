@@ -836,6 +836,31 @@ pub fn credential_release_challenge_visible() -> Option<bool> {
     }
 }
 
+/// The EFFECTIVE keyring-release gesture rule as an unprivileged display can
+/// honestly see it: the per-service `service_gesture.credential_release`
+/// override first (the key `credential-release-challenge credential_release
+/// on|off` writes), then the global gate, `None` when the root-only file is
+/// unreadable.
+///
+/// `status` and `doctor` used to read only the global key through
+/// [`credential_release_challenge_visible`], so with the per-service key set
+/// to 1 they reported "off (default)" and doctor told the user to enable a
+/// gate already enabled, and with the global on but the per-service key 0
+/// (the daemon releases ungated) doctor asserted a consent gate that does
+/// not exist and told the user to nod for it. The daemon's own rule is
+/// [`credential_release_gesture_required`]; this is its observe_kv twin.
+pub fn credential_release_gesture_required_visible() -> Option<bool> {
+    match observe_kv(
+        "settings.conf",
+        &format!("{SERVICE_GESTURE_KEY}.credential_release"),
+    ) {
+        // Per-service keys use the daemon's `!falsy` reading, not `truthy`.
+        KvObservation::Value(v) => Some(!falsy(&v)),
+        KvObservation::Absent => credential_release_challenge_visible(),
+        KvObservation::Unknown(_) => None,
+    }
+}
+
 /// Whether the operation-class gate (`enforce_biopolicy`) is on, or `None` when
 /// settings.conf exists and this process may not read it.
 ///
@@ -1415,6 +1440,50 @@ mod tests {
         assert_eq!(
             read_kv("settings.conf", "consent_gesture").as_deref(),
             Some("nod")
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The VISIBLE twin must apply the same order the daemon does: per-service
+    /// override first, then the global gate. `status` and `doctor` used to read
+    /// only the global key, so with `service_gesture.credential_release=1` and
+    /// no global key they said "off (default)" while the daemon required the
+    /// gesture, and with the global on but the per-service key 0 doctor told
+    /// the user to nod for a gate the daemon does not apply.
+    #[test]
+    fn credential_release_gesture_required_visible_reads_the_effective_rule() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-crgv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
+
+        // Nothing set: the global default (off).
+        assert_eq!(credential_release_gesture_required_visible(), Some(false));
+
+        // Scenario A: per-service 1, no global. The daemon requires the
+        // gesture, so the display must say required.
+        let svc_key = format!("{SERVICE_GESTURE_KEY}.credential_release");
+        write_kv("settings.conf", &svc_key, "1").unwrap();
+        assert_eq!(credential_release_gesture_required_visible(), Some(true));
+        assert_eq!(
+            credential_release_gesture_required_visible(),
+            Some(credential_release_gesture_required()),
+            "the display must agree with the daemon's rule"
+        );
+
+        // Scenario B: global 1, per-service 0. The daemon releases ungated,
+        // so asserting a gate here told the user to nod for nothing.
+        write_kv("settings.conf", CREDENTIAL_RELEASE_CHALLENGE_KEY, "1").unwrap();
+        write_kv("settings.conf", &svc_key, "0").unwrap();
+        assert_eq!(credential_release_gesture_required_visible(), Some(false));
+        assert_eq!(
+            credential_release_gesture_required_visible(),
+            Some(credential_release_gesture_required()),
+            "the display must agree with the daemon's rule"
         );
 
         std::env::remove_var("IRLUME_CONFIG_DIR");

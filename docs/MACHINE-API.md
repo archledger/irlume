@@ -327,10 +327,10 @@ needs root, so an ordinary caller gets `unknown`, which is not a synonym for
 Capability: `profiles-list-json`.
 
 Returns display names, scan display names, and the per-user eyes-open policy
-flag. `require_challenge` was emitted by contract 1 up to 0.9.0 and is gone:
-the blink gate it reported was retired
-([ADR-0002](adr/0002-challenge-response-liveness.md)). A consumer reading it
-must treat its absence as `false`. The current enrollment store identifies these records by mutable names,
+flag. `require_challenge` is FROZEN at `false` for contract 1: the blink gate
+it reported was retired ([ADR-0002](adr/0002-challenge-response-liveness.md)),
+but the field was published in the contract-1 schema as required, so it keeps
+being emitted and leaves with contract 2. The current enrollment store identifies these records by mutable names,
 so this first read-only contract intentionally does not invent opaque IDs or
 advertise profile mutations. Mutation-safe IDs must originate in the engine
 store before a later capability can expose them.

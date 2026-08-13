@@ -2156,7 +2156,14 @@ fn profiles_data(profiles: Vec<ProfileSummary>, require_eyes_open: bool) -> Valu
         .collect::<Vec<_>>();
     json!({
         "profiles": profiles,
-        "require_eyes_open": require_eyes_open
+        "require_eyes_open": require_eyes_open,
+        // FROZEN at false for contract 1. The blink gate this reported was
+        // retired (ADR-0002), but the field was published in the contract-1
+        // schema as REQUIRED, and MACHINE-API.md promises no documented field
+        // is removed within a contract version: a consumer deserialising with
+        // the pinned schema rejects a document that drops it. It leaves with
+        // contract 2.
+        "require_challenge": false
     })
 }
 

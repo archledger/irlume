@@ -826,7 +826,11 @@ pub fn status(args: &[String]) -> ExitCode {
     // for the current state. Off is the default, not a warning.
     println!(
         "  keyring gate  : {}",
-        match irlume_common::config::credential_release_challenge_visible() {
+        // The EFFECTIVE rule (per-service override first, then the global
+        // gate), the same order the daemon applies; reading only the global
+        // key said "off (default)" to a user whose per-service key required
+        // the gesture.
+        match irlume_common::config::credential_release_gesture_required_visible() {
             Some(true) => format!("gesture required {OK} (opt-in)"),
             Some(false) =>
                 "off (default): the keyring releases after the face match with no nod".into(),
@@ -1466,6 +1470,16 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             ExitCode::SUCCESS
         }
         // Service-specific toggle: irlume credential-release-challenge sudo on|off
+        // A flag mistyped before the verb is not a service: under root,
+        // `--yes off` used to write `service_gesture.--yes=0` into the
+        // root-only settings file, a junk key nothing reads. At 0.9.0 the
+        // same argv was a clean usage error; keep it one.
+        Some(svc) if svc.starts_with('-') => {
+            eprintln!(
+                "{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>"
+            );
+            ExitCode::from(2)
+        }
         Some(svc) if svc != "on" && svc != "off" => {
             // `args` is the whole argv minus the program name (main.rs skips 1
             // and passes the full vector), so args[0] is the subcommand name,

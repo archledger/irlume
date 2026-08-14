@@ -516,6 +516,11 @@ pub fn profile_path(user: &str) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 struct EncEnvelope {
     version: u32,
+    /// Public identifier of the random template key. It is not a password
+    /// verifier: template keys have 256 bits of entropy. This distinguishes a
+    /// mismatched persisted key from damaged GCM data without logging a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
     /// base64 of `crypto`'s `nonce ‖ ciphertext+tag`.
     enc: String,
 }
@@ -523,7 +528,7 @@ struct EncEnvelope {
 /// Version written into new [`EncEnvelope`]s. Informational only: the load
 /// path detects the encrypted format by the `enc` field and never checks this
 /// number.
-const ENC_ENVELOPE_VERSION: u32 = 2;
+const ENC_ENVELOPE_VERSION: u32 = 3;
 
 /// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
 /// host) or emitting pretty plaintext when not (dev / no-TPM). Pure; tested
@@ -540,6 +545,7 @@ fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Re
             let blob = crypto::encrypt(k, &json)?;
             let env = EncEnvelope {
                 version: ENC_ENVELOPE_VERSION,
+                key_id: Some(irlume_common::sha256_hex(k)),
                 enc: STANDARD.encode(blob),
             };
             serde_json::to_vec_pretty(&env)
@@ -564,6 +570,16 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
                 "enrollment is encrypted but no template key is available".into(),
             )
         })?;
+        if env
+            .key_id
+            .as_deref()
+            .is_some_and(|expected| expected != irlume_common::sha256_hex(key))
+        {
+            return Err(irlume_common::Error::Policy(
+                "template key does not match enrollment; preserve state and try recovery restore"
+                    .into(),
+            ));
+        }
         let blob = STANDARD
             .decode(env.enc.as_bytes())
             .map_err(|e| irlume_common::Error::Protocol(format!("bad enc blob: {e}")))?;
@@ -583,27 +599,26 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
 /// (plaintext fallback so dev boxes still work).
 fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
     if template_key::tpm_available() {
-        Ok(Some(template_key::ensure_key(user)?))
+        Ok(Some(template_key::ensure_key_unlocked(user)?))
     } else {
         Ok(None)
     }
 }
 
+fn persist_enrollment(path: &std::path::Path, bytes: &[u8]) -> irlume_common::Result<()> {
+    irlume_common::write_0600_atomic(path, bytes)
+        .map_err(|error| irlume_common::Error::Io(error.to_string()))
+}
+
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
+    let _state = template_key::UserStateLock::acquire(&e.user)?;
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
     let key = save_key(&e.user)?;
     let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
-    // Atomic + never world-readable: 0600 temp file in the same dir, then
-    // rename over the target: a crash mid-write can't leave a truncated
-    // profile, and there is no umask window on the real path.
-    let tmp = path.with_extension("json.tmp");
-    irlume_common::write_0600(&tmp, &bytes)
-        .map_err(|er| irlume_common::Error::Io(er.to_string()))?;
-    fs::rename(&tmp, &path).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
-    Ok(())
+    persist_enrollment(&path, &bytes)
 }
 
 /// Load an enrollment, transparently decrypting (v2) and migrating the legacy
@@ -612,6 +627,7 @@ pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
 /// falling back to the password, if the seal can no longer be satisfied).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
+    let _state = template_key::UserStateLock::acquire(user)?;
     let path = profile_path(user);
     if !path.exists() {
         return Ok(None);
@@ -622,7 +638,7 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
         .map(|v| v.get("enc").is_some())
         .unwrap_or(false);
     let key = if is_enc {
-        Some(template_key::load_key(user)?)
+        Some(template_key::load_key_unlocked(user)?)
     } else {
         None
     };
@@ -650,6 +666,7 @@ pub fn store_is_encrypted(user: &str) -> Option<bool> {
 
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn delete(user: &str) -> irlume_common::Result<bool> {
+    let _state = template_key::UserStateLock::acquire(user)?;
     let path = profile_path(user);
     let existed = path.exists();
     if existed {
@@ -657,8 +674,8 @@ pub fn delete(user: &str) -> irlume_common::Result<bool> {
     }
     // Deleting all face data also retires the now-orphaned template key and its
     // recovery envelope (a fresh enrollment mints a new key).
-    let _ = template_key::forget_key(user);
-    let _ = template_key::forget_recovery(user);
+    template_key::forget_key_unlocked(user)?;
+    template_key::forget_recovery_unlocked(user)?;
     Ok(existed)
 }
 
@@ -1051,6 +1068,19 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_envelope_binds_itself_to_the_template_key() {
+        let key = crypto::generate_key();
+        let bytes = serialize_enrollment(&sample(), Some(&key)).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"], 3);
+        assert_eq!(
+            value["key_id"],
+            irlume_common::sha256_hex(key.as_slice()),
+            "the public key identifier lets load distinguish key divergence from ciphertext damage"
+        );
+    }
+
+    #[test]
     fn plaintext_round_trip_without_key() {
         let e = sample();
         let bytes = serialize_enrollment(&e, None).unwrap();
@@ -1064,7 +1094,12 @@ mod tests {
         let key = crypto::generate_key();
         let bytes = serialize_enrollment(&sample(), Some(&key)).unwrap();
         assert!(deserialize_enrollment(&bytes, None).is_err());
-        assert!(deserialize_enrollment(&bytes, Some(&crypto::generate_key())).is_err());
+        let err = deserialize_enrollment(&bytes, Some(&crypto::generate_key())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template key does not match enrollment"),
+            "a known key mismatch must be diagnosed before the generic GCM check: {err}"
+        );
     }
 
     fn scan_with_ir(ratio: f32, bright: f32) -> FaceScan {
@@ -1266,6 +1301,27 @@ mod tests {
         let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "profile files must never be world-readable");
         assert_eq!(fs::read(&p).unwrap(), b"secret bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // A fixed `<user>.json.tmp` pathname lets a stale directory or planted
+    // entry block every future save. The save primitive must use create-new,
+    // call-unique temporary names and publish with one durable rename.
+    #[test]
+    #[cfg(unix)]
+    fn enrollment_publication_ignores_a_stale_fixed_temp_path() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-core-unique-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alice.json");
+        fs::write(&path, b"old").unwrap();
+        fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        persist_enrollment(&path, b"new").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(path.with_extension("json.tmp").is_dir());
         let _ = fs::remove_dir_all(&dir);
     }
 

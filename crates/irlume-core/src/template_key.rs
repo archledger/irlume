@@ -22,6 +22,10 @@ use crate::recovery::RecoveryEnvelope;
 use crate::tpm;
 use crate::{crypto, envelope::SealedEnvelope};
 use irlume_common::{Error, Result};
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -42,6 +46,73 @@ fn recovery_dir() -> PathBuf {
     std::env::var("IRLUME_RECOVERY_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| irlume_common::state_dir().join("recovery"))
+}
+
+/// Cross-process serialization for one user's enrollment, sealed key, and
+/// recovery envelope. The lock pathname is stable and is never replaced or
+/// removed; every acquisition opens it independently so Linux `flock` also
+/// excludes sibling threads in this process.
+pub(crate) struct UserStateLock(std::fs::File);
+
+impl UserStateLock {
+    pub(crate) fn acquire(user: &str) -> Result<Self> {
+        let dir = key_dir().join(".locks");
+        let dir_existed = dir.try_exists().unwrap_or(false);
+        std::fs::create_dir_all(&dir).map_err(|error| Error::Io(error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !dir_existed {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| Error::Io(error.to_string()))?;
+            }
+        }
+        let path = dir.join(format!(
+            "{}.lock",
+            irlume_common::sha256_hex(user.as_bytes())
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let file = options
+            .open(&path)
+            .map_err(|error| Error::Io(format!("open state lock {}: {error}", path.display())))?;
+        if !file
+            .metadata()
+            .map_err(|error| Error::Io(error.to_string()))?
+            .file_type()
+            .is_file()
+        {
+            return Err(Error::Io(format!(
+                "state lock is not a regular file: {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        // SAFETY: `file` owns this live descriptor and the returned guard keeps
+        // it open for the whole state transaction.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(Error::Io(format!(
+                "lock state transaction {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for UserStateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: the guard still owns a valid descriptor throughout Drop.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 pub fn key_path(user: &str) -> PathBuf {
@@ -72,18 +143,34 @@ pub fn has_recovery(user: &str) -> bool {
 /// exists. Used on the write path ([`crate::storage::save`]).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn ensure_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let _state = UserStateLock::acquire(user)?;
+    ensure_key_unlocked(user)
+}
+
+pub(crate) fn ensure_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     if has_key(user) {
-        return load_key(user);
+        return load_key_unlocked(user);
     }
     let key = crypto::generate_key();
-    reseal_key(user, &key)?;
-    Ok(key)
+    reseal_key_unlocked(user, &key)?;
+    let persisted = load_key_unlocked(user)?;
+    if persisted.as_slice() != key.as_slice() {
+        return Err(Error::Policy(
+            "new template key failed persisted TPM round-trip; enrollment was not written".into(),
+        ));
+    }
+    Ok(persisted)
 }
 
 /// Unseal the existing template key for `user`. Errors if none is sealed (the
 /// caller must NOT generate one here; that would orphan already-encrypted data).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let _state = UserStateLock::acquire(user)?;
+    load_key_unlocked(user)
+}
+
+pub(crate) fn load_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
@@ -115,6 +202,11 @@ pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
 /// Used at first enrollment and by recovery-restore to re-bind after a PCR move.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn reseal_key(user: &str, key: &[u8]) -> Result<()> {
+    let _state = UserStateLock::acquire(user)?;
+    reseal_key_unlocked(user, key)
+}
+
+fn reseal_key_unlocked(user: &str, key: &[u8]) -> Result<()> {
     if key.len() != crypto::KEY_LEN {
         return Err(Error::Policy(format!(
             "template key must be {} bytes",
@@ -133,6 +225,11 @@ pub fn reseal_key(user: &str, key: &[u8]) -> Result<()> {
 /// Idempotent. Does NOT touch the recovery envelope.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn forget_key(user: &str) -> Result<()> {
+    let _state = UserStateLock::acquire(user)?;
+    forget_key_unlocked(user)
+}
+
+pub(crate) fn forget_key_unlocked(user: &str) -> Result<()> {
     let path = key_path(user);
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
@@ -146,7 +243,8 @@ pub fn forget_key(user: &str) -> Result<()> {
 /// under `passphrase`. Requires a sealed template key to already exist.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
-    let key = load_key(user)?;
+    let _state = UserStateLock::acquire(user)?;
+    let key = load_key_unlocked(user)?;
     let env = crate::recovery::wrap(passphrase, &key)?;
     save_recovery(user, &env)
 }
@@ -156,6 +254,11 @@ pub fn setup_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
 /// clear / disk move). Errors on a wrong passphrase or a missing envelope.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
+    let _state = UserStateLock::acquire(user)?;
+    restore_from_recovery_unlocked(user, passphrase)
+}
+
+pub(crate) fn restore_from_recovery_unlocked(user: &str, passphrase: &[u8]) -> Result<()> {
     let path = recovery_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
@@ -164,12 +267,36 @@ pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     }
     let env = load_recovery(user)?;
     let key = crate::recovery::unwrap(passphrase, &env)?;
-    reseal_key(user, &key)
+    reseal_key_unlocked(user, &key)
 }
 
 /// Erase `user`'s recovery envelope. Idempotent.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn forget_recovery(user: &str) -> Result<()> {
+    let _state = UserStateLock::acquire(user)?;
+    forget_recovery_unlocked(user)
+}
+
+pub(crate) fn forget_recovery_unlocked(user: &str) -> Result<()> {
+    let path = recovery_path(user);
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[expect(dead_code, reason = "test helper used by template_key tests")]
+fn forget_key_unlocked_no_lock(user: &str) -> Result<()> {
+    let path = key_path(user);
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn forget_recovery_unlocked_no_lock(user: &str) -> Result<()> {
     let path = recovery_path(user);
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
@@ -238,6 +365,67 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn independent_user_state_locks_serialize_threads() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("template-state-lock"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+
+        let first = UserStateLock::acquire("alice").unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second = UserStateLock::acquire("alice").unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a second independent open must block on the same stable lock inode"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter must acquire after the first guard drops");
+        waiter.join().unwrap();
+
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lock directory must exist with owner-only permissions when we
+    /// create it; if it already existed we leave its mode alone.
+    #[test]
+    fn state_lock_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("template-state-lock-mode"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+
+        let _guard = UserStateLock::acquire("alice").unwrap();
+        let lock_dir = dir.join(".locks");
+        let mode = std::fs::metadata(&lock_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "lock directory must be owner-only");
+
+        drop(_guard);
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The override env vars are process-global; the crate-wide lock stops
     // cross-module races too (keyring tests mutate their own override).
     use crate::testenv::ENV_LOCK;
@@ -275,7 +463,7 @@ mod tests {
         let loaded = load_recovery("rt").unwrap();
         let got = crate::recovery::unwrap(b"pass-phrase-here", &loaded).unwrap();
         assert_eq!(&*got, &*key);
-        forget_recovery("rt").unwrap();
+        forget_recovery_unlocked_no_lock("rt").unwrap();
         assert!(!has_recovery("rt"));
         std::env::remove_var("IRLUME_RECOVERY_DIR");
     }
@@ -357,7 +545,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rec);
         std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
 
-        let err = restore_from_recovery("nobody", b"whatever").unwrap_err();
+        let err = restore_from_recovery_unlocked("nobody", b"whatever").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no recovery passphrase set"), "got: {msg}");
 
@@ -376,7 +564,7 @@ mod tests {
         std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
 
         std::fs::write(recovery_path("rt"), b"{ not valid json ").unwrap();
-        let err = restore_from_recovery("rt", b"x").unwrap_err();
+        let err = restore_from_recovery_unlocked("rt", b"x").unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
 
         std::env::remove_var("IRLUME_RECOVERY_DIR");

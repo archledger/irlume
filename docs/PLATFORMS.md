@@ -58,10 +58,13 @@ wide as those measurements.
 
 ### Buying an external camera: what the model name does not tell you
 
-**The NexiGo N930W name covers two different products.** The one measured above
-is the HelloCam, `3443:c803`, which carries an IR sensor. NexiGo also sells a
-60fps N930W with no IR sensor and no Hello support, enumerating as `3443:930d`.
-Check the USB id with `lsusb`, not the box.
+**The NexiGo N930W name does not identify one camera design.** The HelloCam
+measured by this project is `3443:c803` and carries an IR sensor. A prior survey
+identified `3443:930d` as an RGB-only 60fps N930W, but #449 reports another
+`3443:930d` unit that exposes a 640x360 GREY IR stream and works with Windows
+Hello. Do not infer the sensor or emitter capability from the box or USB ID
+alone. Check the nodes with `irlume doctor`, and inspect an unrecognised emitter
+with `sudo irlume ir-setup --dry-run` before allowing any write.
 
 More generally, a camera advertised as "Windows Hello compatible" is not
 evidence of anything irlume can use. Microsoft's own implementation guide

@@ -35,6 +35,7 @@ RGB="${3:-/dev/video0}"
 B="$TREE/target/release/irlume"
 D="$TREE/target/release/irlumed"
 XU_SET="$TREE/target/release/examples/xu_set"
+READY_WAIT="$TREE/scripts/hardware/wait-camera-ready.sh"
 OUT=/tmp/emitter-stream-record-hw
 SOCK=/run/irlume-srtest.sock
 STATE=/var/lib/irlume-srtest
@@ -76,6 +77,12 @@ skip() {
     echo "  cargo build --release -p irlume-camera --example xu_set"
     exit 2
 }
+[ -r "$READY_WAIT" ] || {
+    echo "refusing: readiness helper missing: $READY_WAIT"
+    exit 2
+}
+# shellcheck source=wait-camera-ready.sh
+source "$READY_WAIT"
 [ -e "$IR" ] || {
     echo "refusing: $IR does not exist"
     exit 2
@@ -121,16 +128,23 @@ start_daemon() {
         ${ORT:+ORT_DYLIB_PATH="$ORT"} \
         "$D" >"$OUT/daemon-$tag.log" 2>&1 &
     daemon_pid=$!
-    for _ in $(seq 1 1800); do
-        [ -S "$SOCK" ] && return 0
-        kill -0 "$daemon_pid" 2>/dev/null || {
-            echo "  the daemon exited during startup:"
-            tail -4 "$OUT/daemon-$tag.log" | sed 's/^/    /'
-            return 1
-        }
-        sleep 0.1
-    done
-    echo "  the daemon never listened; last lines:"
+    # v0.10 binds and serves the socket before model loading finishes so early
+    # login attempts can fail open to a password instead of finding no daemon.
+    # A socket (or even the accept-loop log line) therefore does not mean the
+    # engine has been published yet. Poll the same read-only camera-bearing
+    # request section 0 needs; success proves the request reached the engine,
+    # while the startup response remains a retry rather than becoming a false
+    # "no Microsoft XU" verdict (#449).
+    if wait_for_camera_ready "$SOCK" "$B" "$daemon_pid"; then
+        return 0
+    else
+        ready_status=$?
+    fi
+    if [ "$ready_status" -eq 2 ]; then
+        echo "  the daemon exited during startup:"
+    else
+        echo "  the daemon never became camera-ready; last lines:"
+    fi
     tail -4 "$OUT/daemon-$tag.log" | sed 's/^/    /'
     return 1
 }

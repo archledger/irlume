@@ -120,12 +120,12 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
         }),
         // NexiGo HelloCam N930W; MS-XU is unit 4.
         //
-        // The product NAME is ambiguous and the identity here is not. NexiGo
-        // also sells a 60fps N930W with no IR sensor and no Hello support,
-        // which enumerates as 3443:930d and is known to the kernel through an
-        // unrelated audio quirk. Only c803 is the HelloCam this payload was
-        // validated against, so do not "correct" this entry to the other id on
-        // the strength of a matching model number (#341 survey).
+        // The product name is ambiguous, and a USB identity still does not
+        // establish payload compatibility. A prior survey classified 3443:930d
+        // as RGB-only, while #449 reports that ID with an IR stream and Windows
+        // Hello. Only c803 is the hardware this payload was validated against,
+        // so do not add 930d without its descriptor and on-device write,
+        // read-back, optical-output, and restoration evidence.
         (0x3443, 0xc803) => Some(EmitterControl {
             unit: 4,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
@@ -7624,11 +7624,11 @@ mod tests {
             crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
         );
 
-        // The SAME model name, a different product. NexiGo sells a 60fps N930W
-        // with no IR sensor that enumerates as 3443:930d. It must get nothing,
-        // because the payload above was validated against the HelloCam and a
-        // model-number match is not an identity match. This is the assertion
-        // that fails if someone reconciles the table to the other id (#341).
+        // The same model name and a different, unvalidated USB identity. #449
+        // reports 3443:930d with an IR stream, contradicting the earlier
+        // RGB-only survey, but provides no descriptor or write contract. It
+        // must remain fail-closed until that exact hardware validates the
+        // control coordinates, payload, optical effect, and restoration.
         assert_eq!(known_control(0x3443, 0x930d), None);
 
         // A different camera gets nothing, however it names itself. The old

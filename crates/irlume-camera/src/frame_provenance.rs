@@ -675,8 +675,10 @@ impl DequeuedBufferFacts {
     ///
     /// # Errors
     ///
-    /// Returns [`DequeuedBufferError`] when the driver reports corruption,
-    /// malformed timestamp semantics, or a payload outside the mmap boundary.
+    /// Returns [`DequeuedBufferError`] for malformed timestamp semantics or a
+    /// payload outside the mmap boundary. Driver-reported payload corruption is
+    /// retained as metadata so continuity can observe the dequeue while the
+    /// trusted payload boundary rejects delivery.
     pub(crate) fn from_v4l(
         metadata: &v4l::buffer::Metadata,
         mapped_len: usize,
@@ -688,9 +690,6 @@ impl DequeuedBufferFacts {
                 bytes_used,
                 mapped_len,
             });
-        }
-        if metadata.flags.contains(v4l::buffer::Flags::ERROR) {
-            return Err(DequeuedBufferError::DriverReportedCorruption);
         }
         let timestamp_seconds = widen_timestamp_component(metadata.timestamp.sec);
         let timestamp_microseconds = widen_timestamp_component(metadata.timestamp.usec);
@@ -749,6 +748,12 @@ impl DequeuedBufferFacts {
     #[must_use]
     pub const fn known_flags(&self) -> u32 {
         self.known_flags
+    }
+
+    /// Whether V4L2 marked this successfully dequeued payload as corrupt.
+    #[must_use]
+    pub const fn driver_reported_corruption(&self) -> bool {
+        self.known_flags & v4l::buffer::Flags::ERROR.bits() != 0
     }
 
     /// Raw wrapping V4L2 sequence number.
@@ -1230,17 +1235,20 @@ mod tests {
     }
 
     #[test]
-    fn dequeue_rejects_driver_error_status() {
+    fn dequeue_retains_driver_error_status_with_valid_continuity_facts() {
         let metadata = v4l::buffer::Metadata {
             bytesused: 4,
-            flags: v4l::buffer::Flags::ERROR,
-            ..v4l::buffer::Metadata::default()
+            flags: v4l::buffer::Flags::ERROR | v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            sequence: 7,
+            timestamp: v4l::timestamp::Timestamp::new(3, 4),
+            ..Default::default()
         };
 
-        assert_eq!(
-            DequeuedBufferFacts::from_v4l(&metadata, 4),
-            Err(DequeuedBufferError::DriverReportedCorruption)
-        );
+        let facts = DequeuedBufferFacts::from_v4l(&metadata, 4)
+            .expect("corruption does not erase valid continuity metadata");
+        assert!(facts.driver_reported_corruption());
+        assert_eq!(facts.sequence_raw(), 7);
+        assert_eq!(facts.timestamp_micros(), 3_000_004);
     }
 
     #[test]

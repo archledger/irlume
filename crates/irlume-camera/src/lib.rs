@@ -416,6 +416,7 @@ impl CaptureDequeue for v4l::io::mmap::Stream<'_> {
 enum ValidatedDequeueError {
     Io(std::io::Error),
     Facts(frame_provenance::DequeuedBufferError),
+    Corrupt(frame_provenance::DequeuedBufferFacts),
 }
 
 impl ValidatedDequeueError {
@@ -426,8 +427,27 @@ impl ValidatedDequeueError {
         match self {
             Self::Io(error) => error,
             Self::Facts(error) => std::io::Error::other(error),
+            Self::Corrupt(_) => std::io::Error::other(
+                frame_provenance::DequeuedBufferError::DriverReportedCorruption,
+            ),
         }
     }
+}
+
+fn validate_dequeued<'a>(
+    mapped: &'a [u8],
+    metadata: &v4l::buffer::Metadata,
+    layout: frame_provenance::PayloadLayout,
+) -> Result<(&'a [u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+    let facts = frame_provenance::DequeuedBufferFacts::from_v4l(metadata, mapped.len())
+        .map_err(ValidatedDequeueError::Facts)?;
+    layout
+        .validate(&facts)
+        .map_err(ValidatedDequeueError::Facts)?;
+    if facts.driver_reported_corruption() {
+        return Err(ValidatedDequeueError::Corrupt(facts));
+    }
+    Ok((&mapped[..facts.bytes_used()], facts))
 }
 
 #[cfg(test)]
@@ -443,10 +463,7 @@ where
     require_endpoint()?;
     let (mapped, metadata) = stream.dequeue()?;
     require_endpoint()?;
-    let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, mapped.len())
-        .map_err(std::io::Error::other)?;
-    layout.validate(&facts).map_err(std::io::Error::other)?;
-    Ok((&mapped[..facts.bytes_used()], facts))
+    validate_dequeued(mapped, &metadata, layout).map_err(ValidatedDequeueError::into_io)
 }
 
 fn dequeue_validated_typed<S, R>(
@@ -461,12 +478,7 @@ where
     require_endpoint().map_err(ValidatedDequeueError::Io)?;
     let (mapped, metadata) = stream.dequeue().map_err(ValidatedDequeueError::Io)?;
     require_endpoint().map_err(ValidatedDequeueError::Io)?;
-    let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, mapped.len())
-        .map_err(ValidatedDequeueError::Facts)?;
-    layout
-        .validate(&facts)
-        .map_err(ValidatedDequeueError::Facts)?;
-    Ok((&mapped[..facts.bytes_used()], facts))
+    validate_dequeued(mapped, &metadata, layout)
 }
 
 /// A capture stream whose teardown cannot take the process down.
@@ -843,6 +855,64 @@ fn ensure_continuity_alignment(
     Ok(())
 }
 
+fn observe_continuity_facts(
+    sequence: &mut frame_provenance::SequenceTracker,
+    timestamp: &mut frame_provenance::TimestampTracker,
+    observations: &mut u64,
+    discarded_observations: &mut u64,
+    sequence_span_sum: &mut u64,
+    facts: &frame_provenance::DequeuedBufferFacts,
+    discarded: bool,
+) -> std::io::Result<(
+    frame_provenance::SequenceObservation,
+    frame_provenance::TimestampObservation,
+)> {
+    let mut next_timestamp = timestamp.clone();
+    let timestamp_observation = match if discarded {
+        next_timestamp.observe_discarded(
+            facts.timestamp_micros(),
+            facts.timestamp_clock(),
+            facts.timestamp_source(),
+        )
+    } else {
+        next_timestamp.observe(
+            facts.timestamp_micros(),
+            facts.timestamp_clock(),
+            facts.timestamp_source(),
+        )
+    } {
+        Ok(observation) => observation,
+        Err(error) => {
+            *timestamp = next_timestamp;
+            return Err(std::io::Error::other(error));
+        }
+    };
+    let mut next_sequence = sequence.clone();
+    let sequence_observation = match if discarded {
+        next_sequence.observe_discarded(facts.sequence_raw())
+    } else {
+        next_sequence.observe(facts.sequence_raw())
+    } {
+        Ok(observation) => observation,
+        Err(error) => {
+            *sequence = next_sequence;
+            return Err(std::io::Error::other(error));
+        }
+    };
+    ensure_continuity_alignment(&sequence_observation, &timestamp_observation, timestamp)?;
+    account_continuity_observation(
+        observations,
+        discarded_observations,
+        sequence_span_sum,
+        &sequence_observation,
+        discarded,
+        timestamp,
+    )?;
+    *timestamp = next_timestamp;
+    *sequence = next_sequence;
+    Ok((sequence_observation, timestamp_observation))
+}
+
 impl<S: ValidatedStream> TrackedStream<S> {
     fn next_discarded(&mut self) -> std::io::Result<()> {
         let Self {
@@ -857,8 +927,8 @@ impl<S: ValidatedStream> TrackedStream<S> {
             .as_mut()
             .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
             .next_validated();
-        let (_, facts) = match dequeued {
-            Ok(frame) => frame,
+        let facts = match dequeued {
+            Ok((_, facts)) | Err(ValidatedDequeueError::Corrupt(facts)) => facts,
             Err(error) => {
                 if error.invalidates_timestamp_epoch() {
                     timestamp.fail_current_epoch();
@@ -866,37 +936,15 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 return Err(error.into_io());
             }
         };
-        let mut next_timestamp = timestamp.clone();
-        let timestamp_observation = match next_timestamp.observe_discarded(
-            facts.timestamp_micros(),
-            facts.timestamp_clock(),
-            facts.timestamp_source(),
-        ) {
-            Ok(observation) => observation,
-            Err(error) => {
-                *timestamp = next_timestamp;
-                return Err(std::io::Error::other(error));
-            }
-        };
-        let mut next_sequence = sequence.clone();
-        let sequence_observation = match next_sequence.observe_discarded(facts.sequence_raw()) {
-            Ok(observation) => observation,
-            Err(error) => {
-                *sequence = next_sequence;
-                return Err(std::io::Error::other(error));
-            }
-        };
-        ensure_continuity_alignment(&sequence_observation, &timestamp_observation, timestamp)?;
-        account_continuity_observation(
+        observe_continuity_facts(
+            sequence,
+            timestamp,
             observations,
             discarded_observations,
             sequence_span_sum,
-            &sequence_observation,
+            &facts,
             true,
-            timestamp,
         )?;
-        *timestamp = next_timestamp;
-        *sequence = next_sequence;
         Ok(())
     }
 
@@ -922,6 +970,18 @@ impl<S: ValidatedStream> TrackedStream<S> {
             .next_validated();
         let (payload, facts) = match dequeued {
             Ok(frame) => frame,
+            Err(ValidatedDequeueError::Corrupt(facts)) => {
+                observe_continuity_facts(
+                    sequence,
+                    timestamp,
+                    observations,
+                    discarded_observations,
+                    sequence_span_sum,
+                    &facts,
+                    true,
+                )?;
+                return Err(ValidatedDequeueError::Corrupt(facts).into_io());
+            }
             Err(error) => {
                 if error.invalidates_timestamp_epoch() {
                     timestamp.fail_current_epoch();
@@ -929,37 +989,15 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 return Err(error.into_io());
             }
         };
-        let mut next_timestamp = timestamp.clone();
-        let timestamp_observation = match next_timestamp.observe(
-            facts.timestamp_micros(),
-            facts.timestamp_clock(),
-            facts.timestamp_source(),
-        ) {
-            Ok(observation) => observation,
-            Err(error) => {
-                *timestamp = next_timestamp;
-                return Err(std::io::Error::other(error));
-            }
-        };
-        let mut next_sequence = sequence.clone();
-        let sequence_observation = match next_sequence.observe(facts.sequence_raw()) {
-            Ok(observation) => observation,
-            Err(error) => {
-                *sequence = next_sequence;
-                return Err(std::io::Error::other(error));
-            }
-        };
-        ensure_continuity_alignment(&sequence_observation, &timestamp_observation, timestamp)?;
-        account_continuity_observation(
+        let (sequence_observation, timestamp_observation) = observe_continuity_facts(
+            sequence,
+            timestamp,
             observations,
             discarded_observations,
             sequence_span_sum,
-            &sequence_observation,
+            &facts,
             false,
-            timestamp,
         )?;
-        *timestamp = next_timestamp;
-        *sequence = next_sequence;
         Ok((payload, facts, sequence_observation, timestamp_observation))
     }
 }
@@ -5614,13 +5652,12 @@ mod tests {
     }
 
     #[test]
-    fn every_dequeued_facts_error_invalidates_timestamp_epoch() {
+    fn facts_errors_invalidate_but_metadata_valid_corruption_does_not() {
         let errors = [
             frame_provenance::DequeuedBufferError::PayloadTooShort {
                 bytes_used: 1,
                 minimum: 2,
             },
-            frame_provenance::DequeuedBufferError::DriverReportedCorruption,
             frame_provenance::DequeuedBufferError::PayloadExceedsMapping {
                 bytes_used: 2,
                 mapped_len: 1,
@@ -5636,6 +5673,19 @@ mod tests {
             !ValidatedDequeueError::Io(std::io::Error::other("no metadata"))
                 .invalidates_timestamp_epoch(),
             "an I/O failure before metadata exists must remain retryable"
+        );
+        let corrupt = frame_provenance::DequeuedBufferFacts::from_v4l(
+            &continuity_metadata(
+                1,
+                1,
+                v4l::buffer::Flags::TIMESTAMP_MONOTONIC | v4l::buffer::Flags::ERROR,
+            ),
+            1,
+        )
+        .expect("valid continuity facts");
+        assert!(
+            !ValidatedDequeueError::Corrupt(corrupt).invalidates_timestamp_epoch(),
+            "metadata-valid corruption is observed as discarded, not epoch-fatal"
         );
     }
 
@@ -5681,6 +5731,159 @@ mod tests {
             let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&self.metadata, 1)
                 .map_err(ValidatedDequeueError::Facts)?;
             Ok((&self.payload, facts))
+        }
+    }
+
+    struct QueuedContinuityFixture {
+        payload: [u8; 1],
+        metadata: std::collections::VecDeque<v4l::buffer::Metadata>,
+    }
+
+    impl ValidatedStream for QueuedContinuityFixture {
+        fn next_validated(
+            &mut self,
+        ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+            let metadata = self.metadata.pop_front().ok_or_else(|| {
+                ValidatedDequeueError::Io(std::io::Error::other("fixture exhausted"))
+            })?;
+            let layout =
+                frame_provenance::PayloadLayout::new(*b"GREY", 1, 1, 1).expect("fixture layout");
+            validate_dequeued(&self.payload, &metadata, layout)
+        }
+    }
+
+    fn continuity_metadata(
+        sequence: u32,
+        seconds: i64,
+        flags: v4l::buffer::Flags,
+    ) -> v4l::buffer::Metadata {
+        v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence,
+            flags,
+            timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
+            ..v4l::buffer::Metadata::default()
+        }
+    }
+
+    #[test]
+    fn warmup_discards_metadata_valid_driver_corruption_without_failing_epoch() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let corrupt = continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR);
+        let valid = continuity_metadata(2, 2, monotonic);
+        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+            payload: [7],
+            metadata: [corrupt, valid].into(),
+        });
+
+        warm_up_with(
+            "fixture",
+            || tracked.next_discarded(),
+            |_| {},
+            &no_progress(),
+        )
+        .expect("metadata-valid corruption is a discarded warm-up observation");
+        assert_eq!(tracked.accounting(), (1, 1, 0));
+
+        let (payload, _, sequence, timestamp) =
+            tracked.next().expect("next payload remains usable");
+        assert_eq!(payload, &[7]);
+        assert_eq!(sequence.raw(), 2);
+        assert_eq!(sequence.gap(), 0);
+        assert_eq!(timestamp.micros(), 2_000_000);
+        assert_eq!(tracked.accounting(), (2, 1, 1));
+    }
+
+    #[test]
+    fn delivered_driver_corruption_is_discarded_but_next_payload_remains_usable() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let corrupt = continuity_metadata(10, 10, monotonic | v4l::buffer::Flags::ERROR);
+        let valid = continuity_metadata(11, 11, monotonic);
+        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+            payload: [9],
+            metadata: [corrupt, valid].into(),
+        });
+
+        let error = tracked
+            .next()
+            .expect_err("a corrupt payload must never be delivered");
+        assert!(error.to_string().contains("corrupt"));
+        assert_eq!(tracked.accounting(), (1, 1, 0));
+
+        let (payload, _, sequence, timestamp) =
+            tracked.next().expect("next payload remains usable");
+        assert_eq!(payload, &[9]);
+        assert_eq!(sequence.raw(), 11);
+        assert_eq!(sequence.gap(), 0);
+        assert_eq!(timestamp.micros(), 11_000_000);
+        assert_eq!(tracked.accounting(), (2, 1, 1));
+    }
+
+    #[test]
+    fn driver_corruption_cannot_mask_invalid_timestamp_metadata() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let corrupt_invalid = v4l::buffer::Metadata {
+            timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+            ..continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR)
+        };
+        let valid = continuity_metadata(2, 2, monotonic);
+        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+            payload: [3],
+            metadata: [corrupt_invalid, valid].into(),
+        });
+
+        assert!(tracked.next_discarded().is_err());
+        assert_eq!(tracked.accounting(), (0, 0, 0));
+        assert!(
+            tracked.next().is_err(),
+            "invalid metadata on a corrupt payload must leave the epoch failed closed"
+        );
+    }
+
+    #[test]
+    fn corrupt_discarded_continuity_discontinuities_poison_the_epoch() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let error = v4l::buffer::Flags::ERROR;
+        let cases = [
+            (
+                "clock change",
+                2,
+                2,
+                v4l::buffer::Flags::TIMESTAMP_UNKNOWN | error,
+            ),
+            (
+                "source change",
+                2,
+                2,
+                monotonic | v4l::buffer::Flags::TSTAMP_SRC_SOE | error,
+            ),
+            ("timestamp regression", 2, 1, monotonic | error),
+            ("sequence regression", 1, 2, monotonic | error),
+        ];
+
+        for (case, sequence, seconds, flags) in cases {
+            let baseline = continuity_metadata(1, 1, monotonic);
+            let corrupt = continuity_metadata(sequence, seconds, flags);
+            let valid = continuity_metadata(3, 3, monotonic);
+            let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+                payload: [5],
+                metadata: [baseline, corrupt, valid].into(),
+            });
+
+            tracked.next().expect("baseline delivery");
+            assert!(
+                tracked.next_discarded().is_err(),
+                "corrupt payload concealed {case}"
+            );
+            assert_eq!(
+                tracked.accounting(),
+                (1, 0, 0),
+                "contradictory corrupt dequeue was accounted: {case}"
+            );
+            assert!(
+                tracked.next().is_err(),
+                "failed epoch healed after corrupt {case}"
+            );
         }
     }
 

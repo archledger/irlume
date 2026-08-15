@@ -207,6 +207,19 @@ impl CameraInventory {
         &mut self,
         observations: Vec<CameraObservation>,
     ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+        let (events, committed) = self.reconcile_guarded(observations, || true)?;
+        debug_assert!(committed);
+        Ok(events)
+    }
+
+    pub(crate) fn reconcile_guarded<F>(
+        &mut self,
+        observations: Vec<CameraObservation>,
+        quiet: F,
+    ) -> Result<(Vec<CameraInventoryEvent>, bool), CameraInventoryError>
+    where
+        F: FnOnce() -> bool,
+    {
         let mut incoming = BTreeMap::new();
         for observation in observations {
             let key = observation.physical_id().topology_path().to_owned();
@@ -245,7 +258,11 @@ impl CameraInventory {
                     );
                     events.push(CameraInventoryEvent::Added(descriptor));
                 }
-                (Some(previous), Some(observation)) if previous.observation == observation => {}
+                (Some(previous), Some(observation))
+                    if previous.observation == observation
+                        && !self
+                            .invalidated_instance_ids
+                            .contains(previous.descriptor.camera_instance_id()) => {}
                 (Some(previous), Some(observation)) => {
                     let (instance_id, generation) = match previous.descriptor.generation().next() {
                         Ok(generation) => {
@@ -286,11 +303,15 @@ impl CameraInventory {
                 .then_with(|| left.topology_path().cmp(right.topology_path()))
         });
 
+        if !quiet() {
+            return Ok((Vec::new(), false));
+        }
+
         self.active = next_active;
         self.tombstones = next_tombstones;
         self.retired_instance_ids = next_retired_instance_ids;
         self.invalidated_instance_ids.clear();
-        Ok(events)
+        Ok((events, true))
     }
 
     pub(crate) fn invalidate_all(&mut self) {
@@ -299,6 +320,34 @@ impl CameraInventory {
             .values()
             .map(|entry| entry.descriptor.camera_instance_id().clone())
             .collect();
+    }
+
+    pub(crate) fn invalidate_topologies(&mut self, topologies: &BTreeSet<String>) {
+        self.invalidated_instance_ids.extend(
+            topologies
+                .iter()
+                .filter_map(|topology| self.active.get(topology))
+                .map(|entry| entry.descriptor.camera_instance_id().clone()),
+        );
+    }
+
+    pub(crate) fn retire_topologies(
+        &mut self,
+        topologies: &BTreeSet<String>,
+    ) -> Vec<CameraInventoryEvent> {
+        let mut events = Vec::new();
+        for topology in topologies {
+            let Some(entry) = self.active.remove(topology) else {
+                continue;
+            };
+            self.invalidated_instance_ids
+                .remove(entry.descriptor.camera_instance_id());
+            self.retired_instance_ids
+                .insert(entry.descriptor.camera_instance_id().clone());
+            self.tombstones.insert(topology.clone());
+            events.push(CameraInventoryEvent::Removed(entry.descriptor));
+        }
+        events
     }
 
     pub(crate) fn active_descriptors(&self) -> Vec<CameraDescriptor> {
@@ -459,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_blocks_old_descriptor_until_authoritative_reconcile() {
+    fn invalidation_blocks_old_descriptor_across_authoritative_reconcile() {
         let mut inventory = CameraInventory::new();
         let camera = observation("/devices/pci/a", Some("A"), &[StreamRole::Rgb]);
         let descriptor = inventory.reconcile(vec![camera.clone()]).unwrap()[0]
@@ -472,8 +521,14 @@ mod tests {
             Err(CameraInventoryError::ContinuityLost)
         );
 
-        assert!(inventory.reconcile(vec![camera]).unwrap().is_empty());
-        assert_eq!(inventory.validate(&descriptor), Ok(()));
+        let refreshed = inventory.reconcile(vec![camera]).unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert!(refreshed[0].is_changed());
+        assert_eq!(
+            inventory.validate(&descriptor),
+            Err(CameraInventoryError::StaleGeneration)
+        );
+        assert_eq!(inventory.validate(refreshed[0].descriptor()), Ok(()));
     }
 
     #[test]

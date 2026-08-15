@@ -4,14 +4,15 @@
 //! Persistent udev lifecycle invalidation for the supervisor inventory.
 //!
 //! Udev messages are deliberately treated only as hints. Every published state
-//! comes from a complete sysfs/udev snapshot taken after the monitor is already
+//! comes from a complete sysfs/media snapshot taken after the monitor is already
 //! listening. Neither enumeration nor monitoring opens a video node.
 
-use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::os::fd::AsRawFd as _;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -22,6 +23,8 @@ use crate::contracts::{BackendKind, CameraCapabilities, PhysicalCameraId};
 use crate::inventory::{CameraInventoryError, CameraInventoryEvent, CameraObservation};
 
 const MAX_QUIET_SNAPSHOT_ATTEMPTS: usize = 4;
+const MAX_COALESCE_POLLS: usize = 16;
+const MAX_EVENTS_PER_POLL: usize = 4096;
 const COALESCE_QUIET: Duration = Duration::from_millis(50);
 const MONITOR_WAIT: Duration = Duration::from_secs(60 * 60);
 
@@ -35,6 +38,7 @@ pub(crate) enum DeviceEventKind {
 pub(crate) struct DeviceEventHint {
     kind: DeviceEventKind,
     devpath: String,
+    affected_topologies: BTreeSet<String>,
 }
 
 impl DeviceEventHint {
@@ -43,14 +47,36 @@ impl DeviceEventHint {
         Self {
             kind,
             devpath: devpath.into(),
+            affected_topologies: BTreeSet::new(),
         }
     }
 
-    fn from_udev(kind: DeviceEventKind, devpath: impl Into<String>) -> Self {
+    fn from_udev(
+        kind: DeviceEventKind,
+        devpath: impl Into<String>,
+        tracked_topologies: &BTreeSet<String>,
+    ) -> Self {
+        let devpath = devpath.into();
+        let affected_topologies = tracked_topologies
+            .iter()
+            .filter(|topology| {
+                devpath == topology.as_str()
+                    || devpath.starts_with(&format!("{topology}/"))
+                    || topology.starts_with(&format!("{devpath}/"))
+            })
+            .cloned()
+            .collect();
         Self {
             kind,
-            devpath: devpath.into(),
+            devpath,
+            affected_topologies,
         }
+    }
+
+    #[cfg(test)]
+    fn with_affected_topology(mut self, topology: impl Into<String>) -> Self {
+        self.affected_topologies.insert(topology.into());
+        self
     }
 
     fn kind(&self) -> DeviceEventKind {
@@ -64,11 +90,15 @@ impl DeviceEventHint {
     fn requires_retirement(&self) -> bool {
         self.kind == DeviceEventKind::ContinuityLost
     }
+
+    fn affected_topologies(&self) -> &BTreeSet<String> {
+        &self.affected_topologies
+    }
 }
 
 fn consume_hints(hints: &[DeviceEventHint]) {
     for hint in hints {
-        let _ = (hint.kind(), hint.devpath());
+        let _ = (hint.kind(), hint.devpath(), hint.affected_topologies());
     }
 }
 
@@ -77,6 +107,7 @@ pub(crate) enum LifecycleError {
     Monitor(String),
     Snapshot(String),
     UnstableSnapshot,
+    EventStorm,
     Inventory(CameraInventoryError),
 }
 
@@ -86,6 +117,7 @@ impl fmt::Display for LifecycleError {
             Self::Monitor(message) => write!(f, "udev monitor failed: {message}"),
             Self::Snapshot(message) => write!(f, "camera snapshot failed: {message}"),
             Self::UnstableSnapshot => f.write_str("camera snapshot never became quiet"),
+            Self::EventStorm => f.write_str("camera lifecycle event storm exceeded bounds"),
             Self::Inventory(error) => write!(f, "camera inventory failed: {error:?}"),
         }
     }
@@ -93,6 +125,10 @@ impl fmt::Display for LifecycleError {
 
 trait DeviceEventSource {
     fn poll(&mut self, timeout: Duration) -> Result<Vec<DeviceEventHint>, LifecycleError>;
+
+    fn add_tracked_topologies(&mut self, _topologies: &[String]) {}
+
+    fn commit_tracked_topologies(&mut self, _topologies: &[String]) {}
 }
 
 trait SnapshotSource {
@@ -102,10 +138,28 @@ trait SnapshotSource {
 trait InventorySink {
     fn invalidate_all(&self) -> Result<(), CameraInventoryError>;
 
+    fn invalidate_topologies(
+        &self,
+        topologies: &BTreeSet<String>,
+    ) -> Result<(), CameraInventoryError>;
+
+    fn retire_topologies(
+        &self,
+        topologies: &BTreeSet<String>,
+    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError>;
+
     fn reconcile(
         &self,
         observations: Vec<CameraObservation>,
     ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError>;
+
+    fn reconcile_guarded<F>(
+        &self,
+        observations: Vec<CameraObservation>,
+        quiet: F,
+    ) -> Result<(Vec<CameraInventoryEvent>, bool), CameraInventoryError>
+    where
+        F: FnMut() -> bool;
 }
 
 impl InventorySink for CameraSupervisor {
@@ -113,11 +167,36 @@ impl InventorySink for CameraSupervisor {
         self.invalidate_inventory()
     }
 
+    fn invalidate_topologies(
+        &self,
+        topologies: &BTreeSet<String>,
+    ) -> Result<(), CameraInventoryError> {
+        self.invalidate_inventory_topologies(topologies)
+    }
+
+    fn retire_topologies(
+        &self,
+        topologies: &BTreeSet<String>,
+    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+        self.retire_inventory_topologies(topologies)
+    }
+
     fn reconcile(
         &self,
         observations: Vec<CameraObservation>,
     ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
         self.reconcile_inventory(observations)
+    }
+
+    fn reconcile_guarded<F>(
+        &self,
+        observations: Vec<CameraObservation>,
+        quiet: F,
+    ) -> Result<(Vec<CameraInventoryEvent>, bool), CameraInventoryError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.reconcile_inventory_guarded(observations, quiet)
     }
 }
 
@@ -155,15 +234,22 @@ impl<S: SnapshotSource, E: DeviceEventSource> LifecycleCoordinator<S, E> {
 
         // A message only invalidates the old view. Drain the burst, then rebuild
         // from one authoritative snapshot; event payloads never mutate inventory.
-        loop {
+        let mut quiet = false;
+        for _ in 0..MAX_COALESCE_POLLS {
             match self.events.poll(COALESCE_QUIET) {
-                Ok(events) if events.is_empty() => break,
+                Ok(events) if events.is_empty() => {
+                    quiet = true;
+                    break;
+                }
                 Ok(events) => {
                     consume_hints(&events);
                     pending.extend(self.prepare_rescan(inventory, &events)?);
                 }
                 Err(error) => return Err(fail_closed(inventory, error)),
             }
+        }
+        if !quiet {
+            return Err(fail_closed(inventory, LifecycleError::EventStorm));
         }
         self.publish_quiet_snapshot(inventory, pending)
     }
@@ -178,11 +264,39 @@ impl<S: SnapshotSource, E: DeviceEventSource> LifecycleCoordinator<S, E> {
                 Ok(observations) => observations,
                 Err(error) => return Err(fail_closed(inventory, error)),
             };
-            match self.events.poll(Duration::ZERO) {
+            let topologies: Vec<String> = observations
+                .iter()
+                .map(|observation| observation.physical_id().topology_path().to_owned())
+                .collect();
+            self.events.add_tracked_topologies(&topologies);
+            match self.events.poll(COALESCE_QUIET) {
                 Ok(events) if events.is_empty() => {
-                    let mut published = inventory
-                        .reconcile(observations)
+                    let mut boundary_events = Vec::new();
+                    let mut boundary_error = None;
+                    let (mut published, committed) = inventory
+                        .reconcile_guarded(observations, || {
+                            match self.events.poll(Duration::ZERO) {
+                                Ok(events) if events.is_empty() => true,
+                                Ok(events) => {
+                                    boundary_events.extend(events);
+                                    false
+                                }
+                                Err(error) => {
+                                    boundary_error = Some(error);
+                                    false
+                                }
+                            }
+                        })
                         .map_err(LifecycleError::Inventory)?;
+                    if let Some(error) = boundary_error {
+                        return Err(fail_closed(inventory, error));
+                    }
+                    if !committed {
+                        consume_hints(&boundary_events);
+                        pending.extend(self.prepare_rescan(inventory, &boundary_events)?);
+                        continue;
+                    }
+                    self.events.commit_tracked_topologies(&topologies);
                     pending.append(&mut published);
                     return Ok(pending);
                 }
@@ -202,15 +316,21 @@ impl<S: SnapshotSource, E: DeviceEventSource> LifecycleCoordinator<S, E> {
         inventory: &impl InventorySink,
         hints: &[DeviceEventHint],
     ) -> Result<Vec<CameraInventoryEvent>, LifecycleError> {
+        let affected: BTreeSet<String> = hints
+            .iter()
+            .flat_map(|hint| hint.affected_topologies().iter().cloned())
+            .collect();
         inventory
-            .invalidate_all()
+            .invalidate_topologies(&affected)
             .map_err(LifecycleError::Inventory)?;
-        if hints.iter().any(DeviceEventHint::requires_retirement) {
-            return inventory
-                .reconcile(Vec::new())
-                .map_err(LifecycleError::Inventory);
-        }
-        Ok(Vec::new())
+        let retired: BTreeSet<String> = hints
+            .iter()
+            .filter(|hint| hint.requires_retirement())
+            .flat_map(|hint| hint.affected_topologies().iter().cloned())
+            .collect();
+        inventory
+            .retire_topologies(&retired)
+            .map_err(LifecycleError::Inventory)
     }
 }
 
@@ -223,17 +343,53 @@ fn fail_closed(inventory: &impl InventorySink, error: LifecycleError) -> Lifecyc
 
 struct UdevEventSource {
     socket: udev::MonitorSocket,
+    tracked_topologies: BTreeSet<String>,
 }
 
 impl UdevEventSource {
     fn new() -> Result<Self, LifecycleError> {
         // Do not filter to video4linux: USB parent/interface bind, unbind and
         // reset events are continuity evidence even when no child event exists.
-        let socket = udev::MonitorBuilder::new()
+        // SEQNUM is deliberately not used as loss evidence: it is global across
+        // namespace-targeted uevents and assigned before kernel broadcast order.
+        // Observable socket loss (ENOBUFS/errors/hangup) is the fail-closed signal.
+        let socket = udev::MonitorBuilder::new_kernel()
             .and_then(udev::MonitorBuilder::listen)
             .map_err(|error| LifecycleError::Monitor(error.to_string()))?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            tracked_topologies: BTreeSet::new(),
+        })
     }
+}
+
+fn classify_kernel_event(
+    subsystem: Option<&str>,
+    interface: Option<&str>,
+    modalias: Option<&str>,
+    devtype: Option<&str>,
+    tracked_usb_parent: bool,
+    event_type: udev::EventType,
+) -> Option<DeviceEventKind> {
+    if subsystem == Some("video4linux") {
+        return Some(if event_type == udev::EventType::Change {
+            DeviceEventKind::DirtyUvc
+        } else {
+            DeviceEventKind::ContinuityLost
+        });
+    }
+    if subsystem != Some("usb") {
+        return None;
+    }
+    let uvc_interface = interface.is_some_and(|value| {
+        value.starts_with("14/") || value.to_ascii_lowercase().starts_with("0e/")
+    }) || modalias
+        .is_some_and(|value| value.to_ascii_lowercase().contains("ic0e"));
+    let usb_parent = devtype == Some("usb_device") && tracked_usb_parent;
+    if !uvc_interface && !usb_parent {
+        return None;
+    }
+    Some(DeviceEventKind::ContinuityLost)
 }
 
 impl DeviceEventSource for UdevEventSource {
@@ -258,32 +414,58 @@ impl DeviceEventSource for UdevEventSource {
         }
 
         let mut hints = Vec::new();
-        for event in self.socket.iter() {
-            let subsystem = event.subsystem().and_then(std::ffi::OsStr::to_str);
-            let is_uvc_usb = subsystem == Some("usb")
-                && (event.driver().and_then(std::ffi::OsStr::to_str) == Some("uvcvideo")
-                    || event
-                        .property_value("ID_USB_DRIVER")
-                        .and_then(std::ffi::OsStr::to_str)
-                        == Some("uvcvideo")
-                    || event
-                        .property_value("ID_USB_INTERFACES")
-                        .and_then(std::ffi::OsStr::to_str)
-                        .is_some_and(|interfaces| interfaces.contains(":0e")));
-            if subsystem != Some("video4linux") && !is_uvc_usb {
-                continue;
+        let mut received = 0;
+        let mut events = self.socket.iter();
+        while let Some(event) = next_monitor_event(&mut events)? {
+            received += 1;
+            if received > MAX_EVENTS_PER_POLL {
+                return Err(LifecycleError::EventStorm);
             }
-            let kind = match event.event_type() {
-                udev::EventType::Change => DeviceEventKind::DirtyUvc,
-                _ => DeviceEventKind::ContinuityLost,
+            let devpath = event.devpath().to_string_lossy();
+            let tracked_usb_parent = self.tracked_topologies.contains(devpath.as_ref());
+            let text = |name| event.property_value(name).and_then(std::ffi::OsStr::to_str);
+            let Some(kind) = classify_kernel_event(
+                event.subsystem().and_then(std::ffi::OsStr::to_str),
+                text("INTERFACE"),
+                text("MODALIAS"),
+                text("DEVTYPE"),
+                tracked_usb_parent,
+                event.event_type(),
+            ) else {
+                continue;
             };
             hints.push(DeviceEventHint::from_udev(
                 kind,
                 event.devpath().to_string_lossy(),
+                &self.tracked_topologies,
             ));
         }
-        ensure_receive_drained(std::io::Error::last_os_error().raw_os_error())?;
         Ok(hints)
+    }
+
+    fn add_tracked_topologies(&mut self, topologies: &[String]) {
+        self.tracked_topologies.extend(topologies.iter().cloned());
+    }
+
+    fn commit_tracked_topologies(&mut self, topologies: &[String]) {
+        self.tracked_topologies = topologies.iter().cloned().collect();
+    }
+}
+
+fn set_errno(errno: i32) {
+    // SAFETY: Linux exposes one thread-local errno cell per calling thread.
+    unsafe { *libc::__errno_location() = errno };
+}
+
+fn next_monitor_event<I: Iterator>(iterator: &mut I) -> Result<Option<I::Item>, LifecycleError> {
+    set_errno(0);
+    match iterator.next() {
+        Some(event) => Ok(Some(event)),
+        None => {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            ensure_receive_drained(errno)?;
+            Ok(None)
+        }
     }
 }
 
@@ -314,61 +496,81 @@ fn ensure_receive_drained(errno: Option<i32>) -> Result<(), LifecycleError> {
     }
 }
 
-#[derive(Default)]
-struct UdevSnapshotSource;
+struct SysfsSnapshotSource {
+    root: PathBuf,
+}
+
+impl Default for SysfsSnapshotSource {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("/sys/class/video4linux"),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct UdevNodeRecord {
     usb_devpath: String,
     serial: Option<String>,
     node_devpath: String,
-    devnode: Option<String>,
+    devnode: String,
     interface_number: Option<String>,
-    v4l_capabilities: Option<String>,
+    capture_node: Option<bool>,
 }
 
-impl SnapshotSource for UdevSnapshotSource {
-    fn snapshot(&mut self) -> Result<Vec<CameraObservation>, LifecycleError> {
-        let mut enumerator =
-            udev::Enumerator::new().map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
-        enumerator
-            .match_subsystem("video4linux")
-            .and_then(|()| enumerator.match_is_initialized())
-            .map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
-        let devices = enumerator
-            .scan_devices()
-            .map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
+fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
 
+fn devpath(path: &Path) -> String {
+    match path.strip_prefix("/sys") {
+        Ok(relative) => format!("/{}", relative.to_string_lossy()),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
+fn usb_device_parent(interface: &Path) -> Option<&Path> {
+    interface
+        .ancestors()
+        .find(|path| path.join("idVendor").is_file() && path.join("idProduct").is_file())
+}
+
+impl SnapshotSource for SysfsSnapshotSource {
+    fn snapshot(&mut self) -> Result<Vec<CameraObservation>, LifecycleError> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(LifecycleError::Snapshot(error.to_string())),
+        };
         let mut records = Vec::new();
-        for device in devices {
-            if device.property_value("ID_USB_DRIVER") != Some(std::ffi::OsStr::new("uvcvideo")) {
+        for entry in entries {
+            let entry = entry.map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
+            let interface = std::fs::canonicalize(entry.path().join("device"))
+                .map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
+            let driver = std::fs::canonicalize(interface.join("driver")).ok();
+            if driver.as_deref().and_then(Path::file_name) != Some(std::ffi::OsStr::new("uvcvideo"))
+            {
                 continue;
             }
-            let usb = device
-                .parent_with_subsystem_devtype("usb", "usb_device")
-                .map_err(|error| LifecycleError::Snapshot(error.to_string()))?
-                .ok_or_else(|| {
-                    LifecycleError::Snapshot(format!(
-                        "{} has uvcvideo but no USB-device parent",
-                        device.devpath().to_string_lossy()
-                    ))
-                })?;
+            let usb = usb_device_parent(&interface).ok_or_else(|| {
+                LifecycleError::Snapshot(format!(
+                    "{} has uvcvideo but no USB-device parent",
+                    interface.display()
+                ))
+            })?;
+            let name = entry.file_name();
+            let devnode = PathBuf::from("/dev").join(&name);
+            let devnode_text = devnode.to_string_lossy().into_owned();
             records.push(UdevNodeRecord {
-                usb_devpath: usb.devpath().to_string_lossy().into_owned(),
-                serial: usb
-                    .attribute_value("serial")
-                    .map(|value| value.to_string_lossy().trim().to_owned())
-                    .filter(|value| !value.is_empty()),
-                node_devpath: device.devpath().to_string_lossy().into_owned(),
-                devnode: device
-                    .devnode()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                interface_number: device
-                    .property_value("ID_USB_INTERFACE_NUM")
-                    .map(|value| value.to_string_lossy().into_owned()),
-                v4l_capabilities: device
-                    .property_value("ID_V4L_CAPABILITIES")
-                    .map(|value| value.to_string_lossy().into_owned()),
+                usb_devpath: devpath(usb),
+                serial: read_trimmed(usb.join("serial")),
+                node_devpath: devpath(&interface),
+                interface_number: read_trimmed(interface.join("bInterfaceNumber")),
+                capture_node: crate::media_graph::node_is_capture(&devnode_text),
+                devnode: devnode_text,
             });
         }
         observations_from_records(records)
@@ -383,9 +585,13 @@ fn observations_from_records(
         let evidence = format!(
             "{}|{}|{}|{}",
             record.node_devpath,
-            record.devnode.as_deref().unwrap_or(""),
+            record.devnode,
             record.interface_number.as_deref().unwrap_or(""),
-            record.v4l_capabilities.as_deref().unwrap_or("")
+            match record.capture_node {
+                Some(true) => "capture",
+                Some(false) => "metadata",
+                None => "unknown",
+            }
         );
         let group = groups
             .entry(record.usb_devpath.clone())
@@ -422,18 +628,33 @@ fn bind_monitor_before_snapshot<S: SnapshotSource, E: DeviceEventSource>(
     Ok(LifecycleCoordinator::new(snapshots(), events))
 }
 
+struct WorkerExitGuard<'a, I: InventorySink>(&'a I);
+
+impl<'a, I: InventorySink> WorkerExitGuard<'a, I> {
+    fn new(inventory: &'a I) -> Self {
+        Self(inventory)
+    }
+}
+
+impl<I: InventorySink> Drop for WorkerExitGuard<'_, I> {
+    fn drop(&mut self) {
+        let _ = self.0.invalidate_all();
+    }
+}
+
 /// Start the production monitor before the first authoritative scan. The thread
 /// owns the monitor socket for the supervisor lifetime; dropping the process is
 /// the only normal shutdown path for this process-scoped inventory.
 pub(crate) fn spawn(supervisor: Weak<CameraSupervisor>) -> Result<(), LifecycleError> {
     let mut coordinator =
-        bind_monitor_before_snapshot(UdevEventSource::new, || UdevSnapshotSource)?;
+        bind_monitor_before_snapshot(UdevEventSource::new, SysfsSnapshotSource::default)?;
     std::thread::Builder::new()
         .name("irlume-camera-udev".into())
         .spawn(move || {
             let Some(supervisor) = supervisor.upgrade() else {
                 return;
             };
+            let _exit_guard = WorkerExitGuard::new(supervisor.as_ref());
             if let Err(error) = coordinator.initialize(supervisor.as_ref()) {
                 eprintln!("irlume: camera lifecycle monitor stopped: {error}");
                 return;
@@ -476,11 +697,40 @@ mod tests {
             Ok(())
         }
 
+        fn invalidate_topologies(
+            &self,
+            topologies: &BTreeSet<String>,
+        ) -> Result<(), CameraInventoryError> {
+            self.0.lock().unwrap().invalidate_topologies(topologies);
+            Ok(())
+        }
+
+        fn retire_topologies(
+            &self,
+            topologies: &BTreeSet<String>,
+        ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+            Ok(self.0.lock().unwrap().retire_topologies(topologies))
+        }
+
         fn reconcile(
             &self,
             observations: Vec<CameraObservation>,
         ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
             self.0.lock().unwrap().reconcile(observations)
+        }
+
+        fn reconcile_guarded<F>(
+            &self,
+            observations: Vec<CameraObservation>,
+            quiet: F,
+        ) -> Result<(Vec<CameraInventoryEvent>, bool), CameraInventoryError>
+        where
+            F: FnMut() -> bool,
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .reconcile_guarded(observations, quiet)
         }
     }
 
@@ -501,16 +751,311 @@ mod tests {
     }
 
     fn observation(evidence: &str) -> CameraObservation {
+        observation_at("/devices/pci/usb1/camera", evidence)
+    }
+
+    fn observation_at(topology: &str, evidence: &str) -> CameraObservation {
         CameraObservation::with_lifecycle_evidence(
             BackendKind::UvcV4l2,
-            PhysicalCameraId::new("/devices/pci/usb1/camera", None).unwrap(),
+            PhysicalCameraId::new(topology, None).unwrap(),
             CameraCapabilities::new(vec![StreamRole::Rgb], Default::default(), Vec::new()).unwrap(),
             vec![evidence.into()],
         )
     }
 
     fn hint(kind: DeviceEventKind) -> DeviceEventHint {
-        DeviceEventHint::new(kind, "/devices/pci/usb1/video4linux/video0")
+        DeviceEventHint::new(kind, "/devices/pci/usb1/camera/video4linux/video0")
+            .with_affected_topology("/devices/pci/usb1/camera")
+    }
+
+    #[test]
+    fn iterator_null_preserves_real_receive_error() {
+        let result = next_monitor_event(&mut std::iter::from_fn(|| {
+            set_errno(libc::ENOBUFS);
+            None::<()>
+        }));
+        assert!(matches!(
+            result,
+            Err(LifecycleError::Monitor(message)) if message.contains("overflow")
+        ));
+    }
+
+    #[test]
+    fn usb_uvc_change_and_property_sparse_remove_retire_continuity() {
+        let change = classify_kernel_event(
+            Some("usb"),
+            Some("14/1/0"),
+            None,
+            Some("usb_interface"),
+            false,
+            udev::EventType::Change,
+        );
+        assert_eq!(change, Some(DeviceEventKind::ContinuityLost));
+
+        let remove = classify_kernel_event(
+            Some("usb"),
+            None,
+            Some("usb:v3277p0059d0001dcEFdsc02dp01ic0Eisc01ip00in00"),
+            Some("usb_interface"),
+            false,
+            udev::EventType::Remove,
+        );
+        assert_eq!(remove, Some(DeviceEventKind::ContinuityLost));
+        assert_eq!(
+            classify_kernel_event(
+                Some("video4linux"),
+                None,
+                None,
+                None,
+                false,
+                udev::EventType::Change,
+            ),
+            Some(DeviceEventKind::DirtyUvc)
+        );
+        assert_eq!(
+            classify_kernel_event(
+                Some("usb"),
+                None,
+                None,
+                Some("usb_device"),
+                false,
+                udev::EventType::Remove,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_kernel_event(
+                Some("usb"),
+                None,
+                None,
+                Some("usb_device"),
+                true,
+                udev::EventType::Remove,
+            ),
+            Some(DeviceEventKind::ContinuityLost)
+        );
+    }
+
+    #[test]
+    fn commit_boundary_event_discards_provisional_snapshot_before_unlock() {
+        let inventory = TestInventory::new();
+        let mut coordinator = LifecycleCoordinator::new(
+            FakeSnapshots(VecDeque::from([
+                Ok(vec![observation("provisional")]),
+                Ok(vec![observation("committed")]),
+            ])),
+            FakeEvents(VecDeque::from([
+                Ok(Vec::new()),
+                Ok(vec![hint(DeviceEventKind::ContinuityLost)]),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+            ])),
+        );
+        coordinator.initialize(&inventory).unwrap();
+        assert!(
+            coordinator.snapshots.0.is_empty(),
+            "event at the guarded post-commit drain must force a fresh snapshot"
+        );
+    }
+
+    #[test]
+    fn sustained_event_storm_is_bounded_and_fail_closed() {
+        let inventory = TestInventory::new();
+        let descriptor = inventory
+            .reconcile(vec![observation("published")])
+            .unwrap()
+            .remove(0)
+            .descriptor()
+            .clone();
+        let mut polls = VecDeque::from([Ok(vec![hint(DeviceEventKind::DirtyUvc)])]);
+        polls.extend((0..MAX_COALESCE_POLLS).map(|_| Ok(vec![hint(DeviceEventKind::DirtyUvc)])));
+        let mut coordinator =
+            LifecycleCoordinator::new(FakeSnapshots(VecDeque::new()), FakeEvents(polls));
+        assert_eq!(
+            coordinator.process_next(&inventory, Duration::ZERO),
+            Err(LifecycleError::EventStorm)
+        );
+        assert!(inventory.validate(&descriptor).is_err());
+    }
+
+    #[test]
+    fn boundary_event_preserves_unaffected_camera_identity_and_events() {
+        let inventory = TestInventory::new();
+        let camera_a = "/devices/pci/usb1/camera-a";
+        let camera_b = "/devices/pci/usb2/camera-b";
+        let seeded = inventory
+            .reconcile(vec![
+                observation_at(camera_a, "a-old"),
+                observation_at(camera_b, "b-stable"),
+            ])
+            .unwrap();
+        let old_a = seeded
+            .iter()
+            .find(|event| event.topology_path() == camera_a)
+            .unwrap()
+            .descriptor()
+            .clone();
+        let old_b = seeded
+            .iter()
+            .find(|event| event.topology_path() == camera_b)
+            .unwrap()
+            .descriptor()
+            .clone();
+        let dirty_a = DeviceEventHint::new(
+            DeviceEventKind::DirtyUvc,
+            format!("{camera_a}/video4linux/video0"),
+        )
+        .with_affected_topology(camera_a);
+        let loss_a = DeviceEventHint::new(
+            DeviceEventKind::ContinuityLost,
+            format!("{camera_a}/camera-a:1.0"),
+        )
+        .with_affected_topology(camera_a);
+        let mut coordinator = LifecycleCoordinator::new(
+            FakeSnapshots(VecDeque::from([
+                Ok(vec![
+                    observation_at(camera_a, "a-old"),
+                    observation_at(camera_b, "b-stable"),
+                ]),
+                Ok(vec![
+                    observation_at(camera_a, "a-new"),
+                    observation_at(camera_b, "b-stable"),
+                ]),
+            ])),
+            FakeEvents(VecDeque::from([
+                Ok(vec![dirty_a]),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(vec![loss_a]),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+            ])),
+        );
+        let events = coordinator
+            .process_next(&inventory, Duration::ZERO)
+            .unwrap();
+        assert!(inventory.validate(&old_a).is_err());
+        assert_eq!(inventory.validate(&old_b), Ok(()));
+        assert!(events.iter().all(|event| event.topology_path() == camera_a));
+        assert_eq!(events.iter().filter(|event| event.is_removed()).count(), 1);
+        assert_eq!(events.iter().filter(|event| event.is_added()).count(), 1);
+    }
+
+    #[test]
+    fn one_camera_continuity_loss_does_not_retire_another_camera() {
+        let inventory = TestInventory::new();
+        let camera_a = "/devices/pci/usb1/camera-a";
+        let camera_b = "/devices/pci/usb2/camera-b";
+        let seeded = inventory
+            .reconcile(vec![
+                observation_at(camera_a, "a-old"),
+                observation_at(camera_b, "b-stable"),
+            ])
+            .unwrap();
+        let old_a = seeded
+            .iter()
+            .find(|event| event.topology_path() == camera_a)
+            .unwrap()
+            .descriptor()
+            .clone();
+        let old_b = seeded
+            .iter()
+            .find(|event| event.topology_path() == camera_b)
+            .unwrap()
+            .descriptor()
+            .clone();
+        let loss_a = DeviceEventHint::new(
+            DeviceEventKind::ContinuityLost,
+            format!("{camera_a}/camera-a:1.0"),
+        )
+        .with_affected_topology(camera_a);
+        let mut coordinator = LifecycleCoordinator::new(
+            FakeSnapshots(VecDeque::from([Ok(vec![
+                observation_at(camera_a, "a-new"),
+                observation_at(camera_b, "b-stable"),
+            ])])),
+            FakeEvents(VecDeque::from([
+                Ok(vec![loss_a]),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+            ])),
+        );
+        coordinator
+            .process_next(&inventory, Duration::ZERO)
+            .unwrap();
+        assert!(inventory.validate(&old_a).is_err());
+        assert_eq!(inventory.validate(&old_b), Ok(()));
+    }
+
+    #[test]
+    fn empty_startup_inventory_can_discover_a_later_hotplug() {
+        let inventory = TestInventory::new();
+        let mut coordinator = LifecycleCoordinator::new(
+            FakeSnapshots(VecDeque::from([
+                Ok(Vec::new()),
+                Ok(vec![observation("hotplugged")]),
+            ])),
+            FakeEvents(VecDeque::from([
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(vec![DeviceEventHint::new(
+                    DeviceEventKind::DirtyUvc,
+                    "/devices/pci/usb1/camera/video4linux/video0",
+                )]),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+            ])),
+        );
+        assert!(coordinator.initialize(&inventory).unwrap().is_empty());
+        let events = coordinator
+            .process_next(&inventory, Duration::ZERO)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_added());
+    }
+
+    #[test]
+    fn missing_video4linux_class_is_an_authoritative_empty_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("irlume-missing-video4linux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut source = SysfsSnapshotSource { root };
+        assert_eq!(source.snapshot(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn worker_exit_guard_retires_published_inventory() {
+        let inventory = TestInventory::new();
+        let descriptor = inventory
+            .reconcile(vec![observation("published")])
+            .unwrap()
+            .remove(0)
+            .descriptor()
+            .clone();
+        {
+            let _guard = WorkerExitGuard::new(&inventory);
+        }
+        assert!(inventory.validate(&descriptor).is_err());
+    }
+
+    #[test]
+    fn snapshot_requires_a_real_quiet_interval_before_publish() {
+        struct RecordingEvents(std::sync::Arc<Mutex<Vec<Duration>>>);
+        impl DeviceEventSource for RecordingEvents {
+            fn poll(&mut self, timeout: Duration) -> Result<Vec<DeviceEventHint>, LifecycleError> {
+                self.0.lock().unwrap().push(timeout);
+                Ok(Vec::new())
+            }
+        }
+        let waits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut coordinator = LifecycleCoordinator::new(
+            FakeSnapshots(VecDeque::from([Ok(vec![observation("quiet")])])),
+            RecordingEvents(waits.clone()),
+        );
+        coordinator.initialize(&TestInventory::new()).unwrap();
+        assert_eq!(*waits.lock().unwrap(), [COALESCE_QUIET, Duration::ZERO]);
     }
 
     #[test]
@@ -559,6 +1104,7 @@ mod tests {
             FakeEvents(VecDeque::from([
                 Ok(vec![hint(DeviceEventKind::DirtyUvc)]),
                 Ok(Vec::new()),
+                Ok(Vec::new()),
             ])),
         );
 
@@ -581,8 +1127,10 @@ mod tests {
             ])),
             FakeEvents(VecDeque::from([
                 Ok(Vec::new()),
+                Ok(Vec::new()),
                 Ok(vec![hint(DeviceEventKind::ContinuityLost)]),
                 Ok(vec![hint(DeviceEventKind::ContinuityLost)]),
+                Ok(Vec::new()),
                 Ok(Vec::new()),
                 Ok(Vec::new()),
             ])),
@@ -641,7 +1189,9 @@ mod tests {
             },
             FakeEvents(VecDeque::from([
                 Ok(Vec::new()),
+                Ok(Vec::new()),
                 Ok(vec![hint(DeviceEventKind::DirtyUvc)]),
+                Ok(Vec::new()),
                 Ok(Vec::new()),
                 Ok(Vec::new()),
             ])),
@@ -665,8 +1215,10 @@ mod tests {
             ])),
             FakeEvents(VecDeque::from([
                 Ok(Vec::new()),
+                Ok(Vec::new()),
                 Ok(vec![hint(DeviceEventKind::DirtyUvc)]),
                 Ok(vec![hint(DeviceEventKind::DirtyUvc)]),
+                Ok(Vec::new()),
                 Ok(Vec::new()),
                 Ok(Vec::new()),
             ])),
@@ -706,6 +1258,7 @@ mod tests {
             FakeSnapshots(VecDeque::from([Ok(vec![observation("video0")])])),
             FakeEvents(VecDeque::from([
                 Ok(Vec::new()),
+                Ok(Vec::new()),
                 Err(LifecycleError::Monitor(message.into())),
             ])),
         );
@@ -729,6 +1282,7 @@ mod tests {
                 Err(LifecycleError::Snapshot("sysfs race".into())),
             ])),
             FakeEvents(VecDeque::from([
+                Ok(Vec::new()),
                 Ok(Vec::new()),
                 Ok(vec![hint(DeviceEventKind::DirtyUvc)]),
                 Ok(Vec::new()),
@@ -803,7 +1357,8 @@ mod tests {
 
         let inventory = TestInventory::new();
         let mut coordinator =
-            bind_monitor_before_snapshot(UdevEventSource::new, || UdevSnapshotSource).unwrap();
+            bind_monitor_before_snapshot(UdevEventSource::new, SysfsSnapshotSource::default)
+                .unwrap();
         let initial = coordinator.initialize(&inventory).unwrap();
         let original = initial
             .iter()
@@ -861,7 +1416,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real initialized UVC camera in udev"]
     fn production_snapshot_matches_shinetech_four_node_topology_without_capture() {
-        let observations = UdevSnapshotSource.snapshot().unwrap();
+        let observations = SysfsSnapshotSource::default().snapshot().unwrap();
         let camera = observations
             .iter()
             .find(|observation| observation.physical_id().serial() == Some("200901010001"))
@@ -871,11 +1426,11 @@ mod tests {
         assert!(camera
             .lifecycle_evidence()
             .iter()
-            .any(|evidence| evidence.contains("video0") && evidence.ends_with(":capture:")));
+            .any(|evidence| evidence.contains("/dev/video0") && evidence.ends_with("|capture")));
         assert!(camera
             .lifecycle_evidence()
             .iter()
-            .any(|evidence| evidence.contains("video3") && evidence.ends_with("|:")));
+            .any(|evidence| evidence.contains("/dev/video3") && evidence.ends_with("|metadata")));
     }
 
     #[test]
@@ -885,17 +1440,17 @@ mod tests {
                 usb_devpath: "/devices/pci/usb1/camera".into(),
                 serial: Some("serial".into()),
                 node_devpath: "/devices/pci/usb1/camera/1.2/video2".into(),
-                devnode: Some("/dev/video2".into()),
+                devnode: "/dev/video2".into(),
                 interface_number: Some("02".into()),
-                v4l_capabilities: Some(":capture:".into()),
+                capture_node: Some(true),
             },
             UdevNodeRecord {
                 usb_devpath: "/devices/pci/usb1/camera".into(),
                 serial: Some("serial".into()),
                 node_devpath: "/devices/pci/usb1/camera/1.0/video0".into(),
-                devnode: Some("/dev/video0".into()),
+                devnode: "/dev/video0".into(),
                 interface_number: Some("00".into()),
-                v4l_capabilities: Some(":capture:".into()),
+                capture_node: Some(true),
             },
         ];
         let observations = observations_from_records(records).unwrap();

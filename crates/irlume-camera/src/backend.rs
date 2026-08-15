@@ -56,12 +56,48 @@ impl CameraSupervisor {
             .reconcile(observations)
     }
 
+    pub(crate) fn reconcile_inventory_guarded<F>(
+        &self,
+        observations: Vec<CameraObservation>,
+        quiet: F,
+    ) -> Result<(Vec<CameraInventoryEvent>, bool), CameraInventoryError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .reconcile_guarded(observations, quiet)
+    }
+
     pub(crate) fn invalidate_inventory(&self) -> Result<(), CameraInventoryError> {
         self.inventory
             .lock()
             .map_err(|_| CameraInventoryError::Poisoned)?
             .invalidate_all();
         Ok(())
+    }
+
+    pub(crate) fn invalidate_inventory_topologies(
+        &self,
+        topologies: &std::collections::BTreeSet<String>,
+    ) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .invalidate_topologies(topologies);
+        Ok(())
+    }
+
+    pub(crate) fn retire_inventory_topologies(
+        &self,
+        topologies: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+        Ok(self
+            .inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .retire_topologies(topologies))
     }
 
     #[cfg_attr(

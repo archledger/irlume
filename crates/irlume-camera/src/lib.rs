@@ -29,6 +29,9 @@
 //! RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
+mod backend;
+/// Versioned, backend-neutral camera data contracts.
+pub mod contracts;
 pub mod emitter_journal;
 pub mod ir_dark;
 pub mod ir_emitter;
@@ -1283,7 +1286,7 @@ fn file_node(scan: &mut NodeScan, path: String, outcome: Result<NodeKind, Unread
 /// `with_holders` walks /proc for each busy node to name what holds it. That
 /// is worth a report a person reads and not worth it for the camera-picking
 /// callers, which run on the TUI's refresh path.
-fn scan(with_holders: bool) -> NodeScan {
+fn uvc_scan(with_holders: bool) -> NodeScan {
     let mut scan = NodeScan::default();
     let listing = video_node_paths();
     scan.listing_error = listing.error;
@@ -1299,15 +1302,19 @@ fn scan(with_holders: bool) -> NodeScan {
     scan
 }
 
+fn uvc_discover_nodes() -> Vec<(String, Role)> {
+    uvc_scan(false).classified
+}
+
 /// Classify every video node, keeping the failures and naming what holds a
 /// busy one. For reports; use `discover_nodes` to pick a camera.
 pub fn scan_nodes() -> NodeScan {
-    scan(true)
+    backend::scan_nodes()
 }
 
 /// Scan for each readable capture node, returning (path, role).
 pub fn discover_nodes() -> Vec<(String, Role)> {
-    scan(false).classified
+    backend::discover_nodes()
 }
 
 /// Whether a failed privacy-control read means the camera does not HAVE the
@@ -1724,9 +1731,13 @@ pub struct CameraPair {
 /// Every physical camera that exposes both an RGB and an IR node (a Hello pair),
 /// sorted built-in first. Drives the TUI camera picker.
 pub fn list_pairs() -> Vec<CameraPair> {
+    backend::list_pairs()
+}
+
+fn uvc_list_pairs() -> Vec<CameraPair> {
     let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
         Default::default();
-    for (path, role) in discover_nodes() {
+    for (path, role) in uvc_discover_nodes() {
         if let Some(id) = physical_device_id(&path) {
             let e = groups.entry(id).or_default();
             match role {
@@ -1789,6 +1800,10 @@ impl RgbCamera {
     /// allocated and the capture LED stays off until a session is opened.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
+        backend::open_rgb(device)
+    }
+
+    fn open_uvc(device: &str) -> irlume_common::Result<Self> {
         verify_pinned(device)?;
         if privacy_engaged(device) {
             return Err(Error::Hardware(format!(
@@ -2666,6 +2681,10 @@ pub struct IrCamera {
 impl IrCamera {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
+        backend::open_ir(device)
+    }
+
+    fn open_uvc(device: &str) -> irlume_common::Result<Self> {
         verify_pinned(device)?;
         if privacy_engaged(device) {
             return Err(Error::Hardware(format!(

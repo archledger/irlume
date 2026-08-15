@@ -5,6 +5,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Camera discovery and opens now cross one process-owned backend boundary.**
+  The initial backend remains the existing direct V4L2/UVC implementation, so
+  probing, pairing, negotiation, privacy, emitter, and capture behavior remain
+  unchanged. A v1 evidence schema now fails closed on unknown versions and
+  fields (#452).
+
 ## [0.10.0] - 2026-08-12
 
 ### Added

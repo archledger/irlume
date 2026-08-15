@@ -33,6 +33,7 @@ mod backend;
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;
+pub mod frame_provenance;
 mod inventory;
 pub mod ir_dark;
 pub mod ir_emitter;

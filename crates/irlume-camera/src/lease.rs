@@ -14,7 +14,8 @@ use std::{
 };
 
 use crate::{
-    contracts::CameraInstanceId,
+    contracts::{CameraInstanceId, StreamRole},
+    frame_provenance::FrameBinding,
     inventory::{CameraInventory, CameraInventoryRef},
 };
 
@@ -55,6 +56,7 @@ pub enum CameraLeaseError {
     },
     EmptyKey,
     EndpointNotCovered,
+    AmbiguousEndpointBinding,
     InvalidEndpoint(String),
 }
 
@@ -85,6 +87,9 @@ impl std::fmt::Display for CameraLeaseError {
             }
             Self::EndpointNotCovered => {
                 formatter.write_str("camera endpoint is not covered by this operation lease")
+            }
+            Self::AmbiguousEndpointBinding => {
+                formatter.write_str("camera endpoint is covered by multiple lease references")
             }
             Self::InvalidEndpoint(message) => formatter.write_str(message),
         }
@@ -394,6 +399,38 @@ impl CameraLease {
         }
     }
 
+    /// Copy immutable frame identity from the one lease reference covering an endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lifecycle validation error for stale inventory, refuses an
+    /// uncovered endpoint, and fails closed if malformed lease state contains
+    /// more than one reference covering the path.
+    pub fn frame_binding(
+        &self,
+        path: &str,
+        stream_role: StreamRole,
+    ) -> Result<FrameBinding, CameraLeaseError> {
+        self.validate()?;
+        let mut matching = self
+            .inner
+            .references
+            .iter()
+            .filter(|reference| reference.endpoint_paths().iter().any(|known| known == path));
+        let reference = matching
+            .next()
+            .ok_or(CameraLeaseError::EndpointNotCovered)?;
+        if matching.next().is_some() {
+            return Err(CameraLeaseError::AmbiguousEndpointBinding);
+        }
+        let descriptor = reference.descriptor();
+        Ok(FrameBinding::new(
+            descriptor.camera_instance_id().clone(),
+            descriptor.generation(),
+            stream_role,
+        ))
+    }
+
     pub fn state(&self) -> CameraSessionState {
         self.inner
             .state
@@ -687,6 +724,52 @@ mod tests {
         )
         .unwrap();
         (authority, inventory, lease)
+    }
+
+    #[test]
+    fn frame_binding_owns_exact_identity_and_rejects_uncovered_or_stale_endpoints() {
+        let (_authority, inventory, lease) = lease_fixture();
+
+        let binding = lease
+            .frame_binding("/dev/video2", crate::contracts::StreamRole::Ir)
+            .expect("covered current endpoint binds to its immutable descriptor");
+        assert_eq!(binding.camera_instance_id(), &instance('1'));
+        assert_eq!(
+            binding.generation(),
+            crate::contracts::CameraGeneration::INITIAL
+        );
+        assert_eq!(binding.stream_role(), crate::contracts::StreamRole::Ir);
+        assert_eq!(
+            lease.frame_binding("/dev/video9", crate::contracts::StreamRole::Rgb),
+            Err(CameraLeaseError::EndpointNotCovered)
+        );
+
+        inventory.lock().unwrap().invalidate_all();
+        assert_eq!(
+            lease.frame_binding("/dev/video2", crate::contracts::StreamRole::Ir),
+            Err(CameraLeaseError::Stale)
+        );
+    }
+
+    #[test]
+    fn frame_binding_refuses_ambiguous_duplicate_endpoint_coverage() {
+        let (_authority, inventory, lease) = lease_fixture();
+        let reference = lease.inner.references[0].clone();
+        drop(lease);
+        let authority = Arc::new(LeaseAuthority::default());
+        let duplicate = CameraLease::acquire(
+            &authority,
+            inventory,
+            vec![reference.clone(), reference],
+            CameraOperationKind::Authentication,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            duplicate.frame_binding("/dev/video0", crate::contracts::StreamRole::Rgb),
+            Err(CameraLeaseError::AmbiguousEndpointBinding)
+        );
     }
 
     #[test]

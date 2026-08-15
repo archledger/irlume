@@ -114,7 +114,6 @@ pub(crate) mod testenv {
 use irlume_common::Error;
 use v4l::buffer::Type;
 use v4l::format::Quantization;
-use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::{Device, Format, FourCC};
 
@@ -398,6 +397,39 @@ const FROZEN_RESTART_BUDGET: usize = 4;
 /// 30fps, small enough to be granted by every UVC camera we have seen.
 const MMAP_BUFFERS: u32 = 4;
 
+/// The capture adapter used by the trusted dequeue boundary.
+///
+/// Returning owned metadata is deliberate: v4l reuses its metadata ring, so no
+/// reference may survive another dequeue.
+trait CaptureDequeue {
+    fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)>;
+}
+
+impl CaptureDequeue for v4l::io::mmap::Stream<'_> {
+    fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)> {
+        let (mapped, metadata) = v4l::io::traits::CaptureStream::next(self)?;
+        Ok((mapped, *metadata))
+    }
+}
+
+fn dequeue_validated<S, R>(
+    stream: &mut S,
+    layout: frame_provenance::PayloadLayout,
+    mut require_endpoint: R,
+) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)>
+where
+    S: CaptureDequeue,
+    R: FnMut() -> std::io::Result<()>,
+{
+    require_endpoint()?;
+    let (mapped, metadata) = stream.dequeue()?;
+    require_endpoint()?;
+    let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, mapped.len())
+        .map_err(std::io::Error::other)?;
+    layout.validate(&facts).map_err(std::io::Error::other)?;
+    Ok((&mapped[..facts.bytes_used()], facts))
+}
+
 /// A capture stream whose teardown cannot take the process down.
 ///
 /// v4l 0.14's `Stream::drop` calls `stop()` and PANICS on any failure except
@@ -415,6 +447,7 @@ struct SafeStream<'a> {
     inner: Option<v4l::io::mmap::Stream<'a>>,
     device: String,
     lease: lease::CameraLease,
+    layout: frame_provenance::PayloadLayout,
     lease_started: bool,
 }
 
@@ -579,6 +612,13 @@ impl<'a> SafeStream<'a> {
         lease
             .require_endpoint(device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        let layout = frame_provenance::PayloadLayout::new(
+            expect.fourcc.repr,
+            expect.width,
+            expect.height,
+            expect.stride,
+        )
+        .map_err(|error| Error::Hardware(format!("{device}: {error}")))?;
         let mut inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
             .map_err(|e| map_io(device, e))?;
         inner.set_timeout(STREAM_DEQUEUE_TIMEOUT);
@@ -589,6 +629,7 @@ impl<'a> SafeStream<'a> {
             inner: Some(inner),
             device: device.to_string(),
             lease,
+            layout,
             lease_started: false,
         };
         let now = Capture::format(dev).map_err(|e| map_io(device, e))?;
@@ -621,36 +662,23 @@ impl<'a> SafeStream<'a> {
         Ok(stream)
     }
 
-    fn next(&mut self) -> std::io::Result<(&[u8], &v4l::buffer::Metadata)> {
+    fn next(&mut self) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)> {
         let Self {
             inner,
             device,
             lease,
+            layout,
             ..
         } = self;
-        lease
-            .require_endpoint(device)
-            .map_err(std::io::Error::other)?;
-        let frame = v4l::io::traits::CaptureStream::next(
+        dequeue_validated(
             inner.as_mut().expect("stream taken only in Drop"),
-        )?;
-        lease
-            .require_endpoint(device)
-            .map_err(std::io::Error::other)?;
-        Ok(frame)
-    }
-}
-
-impl<'a> std::ops::Deref for SafeStream<'a> {
-    type Target = v4l::io::mmap::Stream<'a>;
-    fn deref(&self) -> &Self::Target {
-        self.inner.as_ref().expect("stream taken only in Drop")
-    }
-}
-
-impl std::ops::DerefMut for SafeStream<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner.as_mut().expect("stream taken only in Drop")
+            *layout,
+            || {
+                lease
+                    .require_endpoint(device)
+                    .map_err(std::io::Error::other)
+            },
+        )
     }
 }
 
@@ -3120,7 +3148,7 @@ impl IrSession<'_> {
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            stamps.push(bmeta.timestamp.sec * 1_000_000 + bmeta.timestamp.usec);
+            stamps.push(bmeta.timestamp_micros());
             taken.push(std::time::Instant::now());
             // Drain every iteration, not once at the end. The metadata ring is
             // smaller than a burst, so a single drain afterwards silently loses
@@ -5047,7 +5075,7 @@ pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// (#141) only starves when a driver call genuinely never returns.
 fn warm_up_stream(
     device: &str,
-    stream: &mut v4l::io::mmap::Stream<'_>,
+    stream: &mut SafeStream<'_>,
     progress: &Progress,
 ) -> irlume_common::Result<()> {
     warm_up_with(
@@ -5107,6 +5135,76 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SabotagingDequeue {
+        payload: [u8; 4],
+        stale: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl CaptureDequeue for SabotagingDequeue {
+        fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)> {
+            self.stale.set(true);
+            Ok((
+                &self.payload,
+                v4l::buffer::Metadata {
+                    bytesused: 4,
+                    ..v4l::buffer::Metadata::default()
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn dequeue_refuses_lifecycle_sabotage_after_the_blocking_call() {
+        let stale = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut stream = SabotagingDequeue {
+            payload: [1, 2, 3, 4],
+            stale: stale.clone(),
+        };
+        let layout =
+            frame_provenance::PayloadLayout::new(*b"GREY", 2, 2, 2).expect("tight GREY layout");
+
+        let error = dequeue_validated(&mut stream, layout, || {
+            if stale.get() {
+                Err(std::io::Error::other("stale camera generation"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("post-dequeue lifecycle sabotage must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "stale camera generation");
+    }
+
+    #[test]
+    fn dequeue_returns_only_driver_initialized_payload() {
+        struct FixedDequeue {
+            payload: [u8; 5],
+        }
+
+        impl CaptureDequeue for FixedDequeue {
+            fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)> {
+                Ok((
+                    &self.payload,
+                    v4l::buffer::Metadata {
+                        bytesused: 4,
+                        ..v4l::buffer::Metadata::default()
+                    },
+                ))
+            }
+        }
+
+        let mut stream = FixedDequeue {
+            payload: [1, 2, 3, 4, 99],
+        };
+        let layout = frame_provenance::PayloadLayout::new(*b"GREY", 2, 2, 2).expect("tight layout");
+        let (payload, facts) =
+            dequeue_validated(&mut stream, layout, || Ok(())).expect("valid dequeue");
+
+        assert_eq!(payload, &[1, 2, 3, 4]);
+        assert_eq!(facts.bytes_used(), 4);
+    }
 
     #[test]
     fn session_slot_is_exclusive_and_reopens_after_drop() {

@@ -20,6 +20,286 @@ pub enum TimestampSource {
     StartOfExposure,
 }
 
+/// Derived continuity facts for one trusted V4L2 timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimestampObservation {
+    micros: i64,
+    delta_micros: Option<u64>,
+    clock: TimestampClock,
+    source: TimestampSource,
+    discontinuity: bool,
+    stream_epoch: u64,
+}
+
+impl TimestampObservation {
+    #[must_use]
+    pub const fn micros(&self) -> i64 {
+        self.micros
+    }
+    #[must_use]
+    pub const fn delta_micros(&self) -> Option<u64> {
+        self.delta_micros
+    }
+    #[must_use]
+    pub const fn clock(&self) -> TimestampClock {
+        self.clock
+    }
+    #[must_use]
+    pub const fn source(&self) -> TimestampSource {
+        self.source
+    }
+    #[must_use]
+    pub const fn discontinuity(&self) -> bool {
+        self.discontinuity
+    }
+    #[must_use]
+    pub const fn stream_epoch(&self) -> u64 {
+        self.stream_epoch
+    }
+}
+
+/// Why trusted timestamp continuity cannot advance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimestampTrackerError {
+    /// The first timestamp did not name the monotonic clock.
+    UntrustedClock(TimestampClock),
+    /// Zero cannot identify a valid frame instant.
+    ZeroTimestamp,
+    /// Negative keys are outside the normalized dequeue domain.
+    NegativeTimestamp(i64),
+    /// The timestamp clock changed inside a live stream epoch.
+    ClockChanged {
+        expected: TimestampClock,
+        actual: TimestampClock,
+    },
+    /// The driver-selected timestamp event changed inside a live stream epoch.
+    SourceChanged {
+        expected: TimestampSource,
+        actual: TimestampSource,
+    },
+    /// The timestamp repeated or moved backward inside an epoch.
+    NonIncreasing { previous: i64, current: i64 },
+    /// The epoch counter cannot advance without wrapping.
+    StreamEpochOverflow,
+    /// This epoch saw invalid evidence and requires explicit recovery.
+    EpochFailed,
+    /// Checked arithmetic previously exhausted and permanently poisoned the tracker.
+    TrackerFailed,
+}
+
+impl std::fmt::Display for TimestampTrackerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UntrustedClock(clock) => write!(f, "untrusted timestamp clock {clock:?}"),
+            Self::ZeroTimestamp => f.write_str("zero timestamp cannot identify a frame instant"),
+            Self::NegativeTimestamp(value) => write!(f, "negative timestamp {value}us"),
+            Self::ClockChanged { expected, actual } => {
+                write!(f, "timestamp clock changed from {expected:?} to {actual:?}")
+            }
+            Self::SourceChanged { expected, actual } => {
+                write!(
+                    f,
+                    "timestamp source changed from {expected:?} to {actual:?}"
+                )
+            }
+            Self::NonIncreasing { previous, current } => write!(
+                f,
+                "timestamp did not increase: previous {previous}us, current {current}us"
+            ),
+            Self::StreamEpochOverflow => f.write_str("timestamp stream epoch overflow"),
+            Self::EpochFailed => f.write_str("timestamp epoch is failed; recovery is required"),
+            Self::TrackerFailed => f.write_str("timestamp tracker is permanently failed"),
+        }
+    }
+}
+
+impl std::error::Error for TimestampTrackerError {}
+
+/// Timestamp continuity state for one logical capture stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimestampTracker {
+    previous: Option<i64>,
+    domain: Option<(TimestampClock, TimestampSource)>,
+    stream_epoch: u64,
+    pending_discontinuity: bool,
+    epoch_failed: bool,
+    failed: bool,
+}
+
+impl TimestampTracker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            previous: None,
+            domain: None,
+            stream_epoch: 0,
+            pending_discontinuity: false,
+            epoch_failed: false,
+            failed: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_stream_epoch_overflow_on_recovery(&mut self) {
+        self.stream_epoch = u64::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn stream_epoch_for_test(&self) -> u64 {
+        self.stream_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn failed_for_test(&self) -> bool {
+        self.failed
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn previous_for_test(&self) -> Option<i64> {
+        self.previous
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn continuity_state_for_test(
+        &self,
+    ) -> (
+        Option<i64>,
+        Option<(TimestampClock, TimestampSource)>,
+        u64,
+        bool,
+    ) {
+        (
+            self.previous,
+            self.domain,
+            self.stream_epoch,
+            self.pending_discontinuity,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn epoch_failed_for_test(&self) -> bool {
+        self.epoch_failed
+    }
+
+    pub(crate) fn fail_current_epoch(&mut self) {
+        if !self.failed {
+            self.epoch_failed = true;
+        }
+    }
+
+    pub(crate) fn observe_discarded(
+        &mut self,
+        micros: i64,
+        clock: TimestampClock,
+        source: TimestampSource,
+    ) -> Result<TimestampObservation, TimestampTrackerError> {
+        let observation = self.observe(micros, clock, source)?;
+        if observation.discontinuity() {
+            self.pending_discontinuity = true;
+        }
+        Ok(observation)
+    }
+
+    /// Starts a recovered stream epoch and resets its timestamp domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimestampTrackerError::StreamEpochOverflow`] when the epoch
+    /// counter is exhausted, permanently poisoning the tracker, or
+    /// [`TimestampTrackerError::TrackerFailed`] when it was already poisoned.
+    pub fn begin_new_epoch(&mut self) -> Result<(), TimestampTrackerError> {
+        if self.failed {
+            return Err(TimestampTrackerError::TrackerFailed);
+        }
+        let Some(next_epoch) = self.stream_epoch.checked_add(1) else {
+            self.failed = true;
+            return Err(TimestampTrackerError::StreamEpochOverflow);
+        };
+        self.stream_epoch = next_epoch;
+        self.previous = None;
+        self.domain = None;
+        self.pending_discontinuity = true;
+        self.epoch_failed = false;
+        Ok(())
+    }
+
+    /// Validates and records one timestamp in the current stream epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TimestampTrackerError`] for an untrusted or changed domain,
+    /// a non-positive or non-increasing timestamp, or a previously failed
+    /// timestamp epoch. A continuity error keeps the epoch failed until
+    /// [`Self::begin_new_epoch`] succeeds.
+    pub fn observe(
+        &mut self,
+        micros: i64,
+        clock: TimestampClock,
+        source: TimestampSource,
+    ) -> Result<TimestampObservation, TimestampTrackerError> {
+        if self.failed {
+            return Err(TimestampTrackerError::TrackerFailed);
+        }
+        if self.epoch_failed {
+            return Err(TimestampTrackerError::EpochFailed);
+        }
+        if let Some((expected_clock, expected_source)) = self.domain {
+            if clock != expected_clock {
+                self.epoch_failed = true;
+                return Err(TimestampTrackerError::ClockChanged {
+                    expected: expected_clock,
+                    actual: clock,
+                });
+            }
+            if source != expected_source {
+                self.epoch_failed = true;
+                return Err(TimestampTrackerError::SourceChanged {
+                    expected: expected_source,
+                    actual: source,
+                });
+            }
+        }
+        if clock != TimestampClock::Monotonic {
+            self.epoch_failed = true;
+            return Err(TimestampTrackerError::UntrustedClock(clock));
+        }
+        if micros < 0 {
+            self.epoch_failed = true;
+            return Err(TimestampTrackerError::NegativeTimestamp(micros));
+        }
+        if micros == 0 {
+            self.epoch_failed = true;
+            return Err(TimestampTrackerError::ZeroTimestamp);
+        }
+        if let Some(previous) = self.previous {
+            if micros <= previous {
+                self.epoch_failed = true;
+                return Err(TimestampTrackerError::NonIncreasing {
+                    previous,
+                    current: micros,
+                });
+            }
+        }
+        let delta_micros = self
+            .previous
+            .and_then(|previous| micros.checked_sub(previous))
+            .and_then(|delta| u64::try_from(delta).ok());
+        self.previous = Some(micros);
+        self.domain = Some((clock, source));
+        let discontinuity = self.pending_discontinuity;
+        self.pending_discontinuity = false;
+        Ok(TimestampObservation {
+            micros,
+            delta_micros,
+            clock,
+            source,
+            discontinuity,
+            stream_epoch: self.stream_epoch,
+        })
+    }
+}
+
 /// Why sequence continuity can no longer be represented safely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -45,6 +325,7 @@ impl std::error::Error for SequenceTrackerError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SequenceObservation {
     raw: u32,
+    advance: Option<u32>,
     gap: u32,
     cumulative_drops: u64,
     discontinuity: bool,
@@ -55,6 +336,11 @@ impl SequenceObservation {
     #[must_use]
     pub const fn raw(&self) -> u32 {
         self.raw
+    }
+
+    #[must_use]
+    pub const fn advance(&self) -> Option<u32> {
+        self.advance
     }
 
     #[must_use]
@@ -100,6 +386,43 @@ impl SequenceTracker {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn previous_for_test(&self) -> Option<u32> {
+        self.previous
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn continuity_state_for_test(&self) -> (Option<u32>, u64, u64, bool, bool) {
+        (
+            self.previous,
+            self.cumulative_drops,
+            self.stream_epoch,
+            self.pending_discontinuity,
+            self.failed,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_stream_epoch_overflow_on_recovery(&mut self) {
+        self.stream_epoch = u64::MAX;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn stream_epoch_for_test(&self) -> u64 {
+        self.stream_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn failed_for_test(&self) -> bool {
+        self.failed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_drop_overflow_on_next_gap(&mut self) {
+        self.previous = Some(1);
+        self.cumulative_drops = u64::MAX;
+    }
+
     /// Mark a successfully replaced stream as a new discontinuous epoch.
     ///
     /// The marker remains pending until the next observed (delivered) frame, so
@@ -123,6 +446,17 @@ impl SequenceTracker {
         Ok(())
     }
 
+    pub(crate) fn observe_discarded(
+        &mut self,
+        raw: u32,
+    ) -> Result<SequenceObservation, SequenceTrackerError> {
+        let observation = self.observe(raw)?;
+        if observation.discontinuity() {
+            self.pending_discontinuity = true;
+        }
+        Ok(observation)
+    }
+
     /// Observe one raw sequence value.
     ///
     /// # Errors
@@ -132,14 +466,15 @@ impl SequenceTracker {
         if self.failed {
             return Err(SequenceTrackerError::TrackerFailed);
         }
-        let (gap, transition_discontinuity) = self.previous.map_or((0, false), |previous| {
-            let delta = raw.wrapping_sub(previous);
-            if (1..(1_u32 << 31)).contains(&delta) {
-                (delta - 1, false)
-            } else {
-                (0, true)
-            }
-        });
+        let (gap, transition_discontinuity, advance) =
+            self.previous.map_or((0, false, None), |previous| {
+                let delta = raw.wrapping_sub(previous);
+                if (1..(1_u32 << 31)).contains(&delta) {
+                    (delta - 1, false, Some(delta))
+                } else {
+                    (0, true, None)
+                }
+            });
         if transition_discontinuity {
             let Some(stream_epoch) = self.stream_epoch.checked_add(1) else {
                 self.failed = true;
@@ -159,6 +494,7 @@ impl SequenceTracker {
         self.pending_discontinuity = false;
         Ok(SequenceObservation {
             raw,
+            advance,
             gap,
             cumulative_drops: self.cumulative_drops,
             discontinuity,
@@ -499,8 +835,211 @@ impl FrameBinding {
 mod tests {
     use super::{
         DequeuedBufferError, DequeuedBufferFacts, PayloadLayout, SequenceTracker,
-        SequenceTrackerError, TimestampClock, TimestampSource,
+        SequenceTrackerError, TimestampClock, TimestampSource, TimestampTracker,
+        TimestampTrackerError,
     };
+
+    #[test]
+    fn first_monotonic_timestamp_establishes_a_clean_epoch() {
+        let mut tracker = TimestampTracker::new();
+        let observation = tracker
+            .observe(
+                1_000_000,
+                TimestampClock::Monotonic,
+                TimestampSource::EndOfFrame,
+            )
+            .expect("first timestamp is valid");
+
+        assert_eq!(observation.micros(), 1_000_000);
+        assert_eq!(observation.delta_micros(), None);
+        assert_eq!(observation.clock(), TimestampClock::Monotonic);
+        assert_eq!(observation.source(), TimestampSource::EndOfFrame);
+        assert!(!observation.discontinuity());
+        assert_eq!(observation.stream_epoch(), 0);
+    }
+
+    #[test]
+    fn monotonic_timestamps_report_positive_deltas() {
+        let mut tracker = TimestampTracker::new();
+        tracker
+            .observe(
+                1_000_000,
+                TimestampClock::Monotonic,
+                TimestampSource::StartOfExposure,
+            )
+            .expect("baseline");
+        let observation = tracker
+            .observe(
+                1_033_333,
+                TimestampClock::Monotonic,
+                TimestampSource::StartOfExposure,
+            )
+            .expect("increasing timestamp");
+
+        assert_eq!(observation.delta_micros(), Some(33_333));
+        assert!(!observation.discontinuity());
+        assert_eq!(observation.stream_epoch(), 0);
+    }
+
+    #[test]
+    fn untrusted_timestamp_clocks_fail_the_current_epoch() {
+        for clock in [TimestampClock::Unknown, TimestampClock::Copy] {
+            let mut tracker = TimestampTracker::new();
+            assert_eq!(
+                tracker.observe(1, clock, TimestampSource::EndOfFrame),
+                Err(TimestampTrackerError::UntrustedClock(clock))
+            );
+            assert_eq!(
+                tracker.observe(2, TimestampClock::Monotonic, TimestampSource::EndOfFrame),
+                Err(TimestampTrackerError::EpochFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_timestamp_ordering_stays_failed_until_recovery() {
+        let mut zero = TimestampTracker::new();
+        assert_eq!(
+            zero.observe(0, TimestampClock::Monotonic, TimestampSource::EndOfFrame),
+            Err(TimestampTrackerError::ZeroTimestamp)
+        );
+
+        for current in [100, 99] {
+            let mut tracker = TimestampTracker::new();
+            tracker
+                .observe(100, TimestampClock::Monotonic, TimestampSource::EndOfFrame)
+                .expect("baseline");
+            assert_eq!(
+                tracker.observe(
+                    current,
+                    TimestampClock::Monotonic,
+                    TimestampSource::EndOfFrame
+                ),
+                Err(TimestampTrackerError::NonIncreasing {
+                    previous: 100,
+                    current
+                })
+            );
+            assert_eq!(
+                tracker.observe(101, TimestampClock::Monotonic, TimestampSource::EndOfFrame),
+                Err(TimestampTrackerError::EpochFailed)
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_domain_changes_fail_the_current_epoch() {
+        let mut source = TimestampTracker::new();
+        source
+            .observe(10, TimestampClock::Monotonic, TimestampSource::EndOfFrame)
+            .expect("baseline");
+        assert_eq!(
+            source.observe(
+                11,
+                TimestampClock::Monotonic,
+                TimestampSource::StartOfExposure
+            ),
+            Err(TimestampTrackerError::SourceChanged {
+                expected: TimestampSource::EndOfFrame,
+                actual: TimestampSource::StartOfExposure,
+            })
+        );
+
+        let mut clock = TimestampTracker::new();
+        clock
+            .observe(10, TimestampClock::Monotonic, TimestampSource::EndOfFrame)
+            .expect("baseline");
+        assert_eq!(
+            clock.observe(11, TimestampClock::Copy, TimestampSource::EndOfFrame),
+            Err(TimestampTrackerError::ClockChanged {
+                expected: TimestampClock::Monotonic,
+                actual: TimestampClock::Copy,
+            })
+        );
+    }
+
+    #[test]
+    fn recovered_timestamp_epoch_marks_only_its_first_observation() {
+        let mut tracker = TimestampTracker::new();
+        tracker
+            .observe(100, TimestampClock::Monotonic, TimestampSource::EndOfFrame)
+            .expect("baseline");
+        assert!(tracker
+            .observe(99, TimestampClock::Monotonic, TimestampSource::EndOfFrame)
+            .is_err());
+
+        tracker.begin_new_epoch().expect("recovery epoch");
+        let first = tracker
+            .observe(
+                1,
+                TimestampClock::Monotonic,
+                TimestampSource::StartOfExposure,
+            )
+            .expect("new baseline");
+        assert!(first.discontinuity());
+        assert_eq!(first.stream_epoch(), 1);
+        assert_eq!(first.delta_micros(), None);
+
+        let second = tracker
+            .observe(
+                2,
+                TimestampClock::Monotonic,
+                TimestampSource::StartOfExposure,
+            )
+            .expect("same epoch");
+        assert!(!second.discontinuity());
+    }
+
+    #[test]
+    fn timestamp_epoch_overflow_permanently_poisons_tracker() {
+        let mut tracker = TimestampTracker::new();
+        tracker.stream_epoch = u64::MAX;
+
+        assert_eq!(
+            tracker.begin_new_epoch(),
+            Err(TimestampTrackerError::StreamEpochOverflow)
+        );
+        assert_eq!(
+            tracker.begin_new_epoch(),
+            Err(TimestampTrackerError::TrackerFailed)
+        );
+        assert_eq!(
+            tracker.observe(1, TimestampClock::Monotonic, TimestampSource::EndOfFrame),
+            Err(TimestampTrackerError::TrackerFailed)
+        );
+    }
+
+    #[test]
+    fn negative_timestamp_fails_the_current_epoch() {
+        let mut tracker = TimestampTracker::new();
+        assert_eq!(
+            tracker.observe(-1, TimestampClock::Monotonic, TimestampSource::EndOfFrame),
+            Err(TimestampTrackerError::NegativeTimestamp(-1))
+        );
+        assert_eq!(
+            tracker.observe(1, TimestampClock::Monotonic, TimestampSource::EndOfFrame),
+            Err(TimestampTrackerError::EpochFailed)
+        );
+    }
+
+    #[test]
+    fn sequence_observation_reports_only_same_epoch_forward_advance() {
+        let mut tracker = SequenceTracker::new();
+        assert_eq!(tracker.observe(41).expect("baseline").advance(), None);
+        assert_eq!(tracker.observe(45).expect("forward gap").advance(), Some(4));
+        tracker.begin_new_epoch().expect("recovery epoch");
+        assert_eq!(
+            tracker
+                .observe_discarded(u32::MAX)
+                .expect("recovery baseline")
+                .advance(),
+            None
+        );
+        assert_eq!(
+            tracker.observe(0).expect("wrapped advance").advance(),
+            Some(1)
+        );
+    }
 
     #[test]
     fn first_sequence_establishes_a_clean_baseline() {

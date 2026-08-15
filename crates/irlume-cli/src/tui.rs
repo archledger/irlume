@@ -151,6 +151,16 @@ const CHECK_PITCH_MAX: f32 = irlume_liveness::PITCH_FRAC_MAX;
 const CHECK_LUMA_MIN: f32 = 55.0;
 const CHECK_LUMA_MAX: f32 = 235.0;
 
+/// One line of the sidebar rail. `sidebar_rows` builds the list, `draw_sidebar`
+/// renders it, and `on_click` maps a clicked inner row back to its `Nav(screen)`
+/// so a click always lands on the row the eye sees.
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarRow {
+    Group(&'static str),
+    Nav(usize),
+    Blank,
+}
+
 #[derive(Clone, Copy)]
 enum Row {
     Profile(usize),
@@ -2565,13 +2575,23 @@ impl App {
                             self.on_key(k.code)
                         }
                     }
-                    // Mouse wheel scrolls the Activity history.
+                    // Wheel scrolls the Activity history; a left click (or a
+                    // touchscreen tap, delivered as the same event) on a sidebar
+                    // row jumps to that section.
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => {
                             self.act_scroll = (self.act_scroll + 1).min(self.act_max())
                         }
                         MouseEventKind::ScrollDown => {
                             self.act_scroll = self.act_scroll.saturating_sub(1)
+                        }
+                        MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
+                            let size = terminal.size()?;
+                            self.on_click(
+                                m.column,
+                                m.row,
+                                Rect::new(0, 0, size.width, size.height),
+                            );
                         }
                         _ => {}
                     },
@@ -3185,7 +3205,13 @@ impl App {
             .position(|&s| s == self.screen)
             .unwrap_or(0) as i32;
         let new_pos = (((pos + d) % n + n) % n) as usize;
-        self.screen = self.visible[new_pos];
+        self.enter_screen(self.visible[new_pos]);
+    }
+
+    /// Land on a screen, from Tab/arrows OR a sidebar click, and run the same
+    /// per-screen refresh the step-walk did.
+    fn enter_screen(&mut self, screen: usize) {
+        self.screen = screen;
         self.sel = 0;
         // Fast diagnostics on entering Repair/Fingerprint (no slow profile
         // poll, so the switch is instant); a fresh profile poll only when
@@ -4096,36 +4122,26 @@ impl App {
     // ---- rendering --------------------------------------------------------
 
     fn draw(&self, f: &mut Frame) {
-        let [header, hint, body, activity, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(6),
-            Constraint::Length(7),
-            Constraint::Length(3),
-        ])
-        .areas(f.area());
+        let [header, hint, body, activity, footer] = tui_rows(f.area());
         self.draw_header(f, header);
         self.draw_hint(f, hint);
-        // Redesign: on a roomy terminal the body splits into a settings-app
-        // sidebar (the visible screens, grouped) and the content pane.
-        // `step()`/arrows still drive `self.screen`; the sidebar renders that
-        // selection vertically instead of the old horizontal step-walk. Below
-        // SIDEBAR_MIN_COLS (login greeters / TTYs / SSH at 80) the sidebar
-        // would starve the content, so it collapses back to full-width content
-        // and the header's "step N/N" carries position instead.
+        // Redesign: the body splits into a settings-app sidebar and the content
+        // pane on a roomy terminal, collapsing to full-width content below
+        // SIDEBAR_MIN_COLS (login greeters / TTYs / SSH at 80). Arrows/Tab and
+        // sidebar clicks both drive `self.screen`; `body_split` is shared with
+        // `on_click` so a click lands on exactly the row the eye sees.
         if self.is_first_run() {
             // A not-yet-enrolled user gets a focused front door: one screen, one
             // action, no 12-item sidebar to parse. Tab or [v] leaves it.
             self.draw_firstrun(f, body);
-        } else if body.width >= SIDEBAR_MIN_COLS {
-            let [sidebar, content] =
-                Layout::horizontal([Constraint::Length(22), Constraint::Min(20)]).areas(body);
-            self.draw_sidebar(f, sidebar);
+        } else {
+            let (sidebar, content) = self.body_split(body);
+            if let Some(sb) = sidebar {
+                self.draw_sidebar(f, sb);
+            }
             // `draw_content` already frames each screen in its own titled card,
             // so the content pane needs no extra border here.
             self.draw_content(f, content);
-        } else {
-            self.draw_content(f, body);
         }
         self.draw_activity(f, activity);
         self.draw_footer(f, footer);
@@ -4286,7 +4302,9 @@ impl App {
     /// System, current screen marked with an accent bar. This renders the same
     /// `self.visible` / `self.screen` model the horizontal step-walk used, so
     /// Tab and the arrows keep working unchanged.
-    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+    /// The grouped rail as a flat row list. Shared by `draw_sidebar` (render)
+    /// and `on_click` (hit-testing) so the two never drift.
+    fn sidebar_rows(&self) -> Vec<SidebarRow> {
         let groups: [(&str, &[usize]); 3] = [
             (
                 "Setup",
@@ -4295,44 +4313,93 @@ impl App {
             ("Security", &[SC_KEYRING, SC_RECOVERY, SC_FINGERPRINT]),
             ("System", &[SC_PAM, SC_SETTINGS, SC_MODELS, SC_DONE]),
         ];
-        let mut lines: Vec<Line> = Vec::new();
-        for (gi, (name, members)) in groups.iter().enumerate() {
-            let shown: Vec<usize> = members
-                .iter()
-                .copied()
-                .filter(|s| self.visible.contains(s))
-                .collect();
-            if shown.is_empty() {
-                continue;
-            }
-            if gi > 0 {
-                lines.push(Line::raw(""));
-            }
-            lines.push(Line::from(Span::styled(
-                format!(" {name}"),
-                Style::new().dim().add_modifier(Modifier::BOLD),
-            )));
+        let mut rows: Vec<SidebarRow> = Vec::new();
+        for (name, members) in groups {
+            let shown = members.iter().copied().filter(|s| self.visible.contains(s));
+            let mut any = false;
             for s in shown {
-                if s == self.screen {
-                    lines.push(Line::from(vec![
-                        Span::styled("▎", Style::new().fg(th().accent)),
-                        Span::styled(
-                            format!(" {}", SCREENS[s]),
-                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", SCREENS[s]),
-                        Style::new().dim(),
-                    )));
+                if !any {
+                    if !rows.is_empty() {
+                        rows.push(SidebarRow::Blank);
+                    }
+                    rows.push(SidebarRow::Group(name));
+                    any = true;
                 }
+                rows.push(SidebarRow::Nav(s));
             }
         }
+        rows
+    }
+
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = self
+            .sidebar_rows()
+            .into_iter()
+            .map(|r| match r {
+                SidebarRow::Blank => Line::raw(""),
+                SidebarRow::Group(name) => Line::from(Span::styled(
+                    format!(" {name}"),
+                    Style::new().dim().add_modifier(Modifier::BOLD),
+                )),
+                SidebarRow::Nav(s) if s == self.screen => Line::from(vec![
+                    Span::styled("▎", Style::new().fg(th().accent)),
+                    Span::styled(
+                        format!(" {}", SCREENS[s]),
+                        Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                SidebarRow::Nav(s) => Line::from(Span::styled(
+                    format!("  {}", SCREENS[s]),
+                    Style::new().dim(),
+                )),
+            })
+            .collect();
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
         f.render_widget(Paragraph::new(lines).block(blk), area);
+    }
+
+    /// Split the body area into (optional sidebar, content). Shared by `draw`
+    /// and `on_click`. Returns no sidebar on the first-run front door or a
+    /// narrow terminal, where the content takes the whole body.
+    fn body_split(&self, body: Rect) -> (Option<Rect>, Rect) {
+        if self.is_first_run() || body.width < SIDEBAR_MIN_COLS {
+            return (None, body);
+        }
+        let [sidebar, content] =
+            Layout::horizontal([Constraint::Length(22), Constraint::Min(20)]).areas(body);
+        (Some(sidebar), content)
+    }
+
+    /// Map a mouse click to a navigation. A click on a sidebar row jumps to that
+    /// screen (touchscreens deliver the same left-click). Clicks elsewhere, or
+    /// while a modal/flow owns the screen, are ignored.
+    fn on_click(&mut self, col: u16, row: u16, area: Rect) {
+        if self.show_help
+            || self.error.is_some()
+            || self.input.is_some()
+            || self.confirm.is_some()
+            || self.enroll_merge.is_some()
+            || self.enroll.is_some()
+        {
+            return;
+        }
+        let [_, _, body, _, _] = tui_rows(area);
+        let (sidebar, _content) = self.body_split(body);
+        let Some(sb) = sidebar else { return };
+        let inner = Block::bordered().inner(sb);
+        let in_inner = col >= inner.x
+            && col < inner.x + inner.width
+            && row >= inner.y
+            && row < inner.y + inner.height;
+        if !in_inner {
+            return;
+        }
+        let idx = (row - inner.y) as usize;
+        if let Some(SidebarRow::Nav(s)) = self.sidebar_rows().get(idx).copied() {
+            self.enter_screen(s);
+        }
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
@@ -6564,7 +6631,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               h  home (the Welcome tab)\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
+            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               h  home (the Welcome tab)\n           click  a sidebar row jumps to it\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -6647,6 +6714,20 @@ fn quality_bar(q: u8) -> String {
 // ---- rich-render helpers --------------------------------------------------
 
 /// A bold accent section header line.
+/// The five stacked regions of the screen: header, hint, body, activity,
+/// footer. A free fn so `draw` (render) and `on_click` (hit-testing) split the
+/// terminal identically.
+fn tui_rows(area: Rect) -> [Rect; 5] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(6),
+        Constraint::Length(7),
+        Constraint::Length(3),
+    ])
+    .areas(area)
+}
+
 fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         title.to_string(),
@@ -7312,6 +7393,50 @@ mod tests {
             narrow_hdr.contains("step "),
             "narrow header must show the step counter, got: {narrow_hdr}"
         );
+    }
+
+    #[test]
+    fn clicking_a_sidebar_row_navigates_to_it() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        let area = Rect::new(0, 0, 120, 40);
+        // Pick a navigable row that isn't already current.
+        let (idx, target) = app
+            .sidebar_rows()
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| match r {
+                SidebarRow::Nav(s) if *s != app.screen => Some((i, *s)),
+                _ => None,
+            })
+            .expect("a navigable sidebar row");
+        let [_, _, body, _, _] = tui_rows(area);
+        let inner = Block::bordered().inner(app.body_split(body).0.unwrap());
+        app.on_click(inner.x, inner.y + idx as u16, area);
+        assert_eq!(app.screen, target, "clicking a row jumps to its screen");
+    }
+
+    #[test]
+    fn clicking_the_content_pane_does_not_navigate() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        // Deep in the content pane, well right of the 22-col sidebar.
+        app.on_click(90, 10, Rect::new(0, 0, 120, 40));
+        assert_eq!(app.screen, SC_WELCOME, "content clicks must not navigate");
     }
 
     fn app_with_user(user: &str) -> App {

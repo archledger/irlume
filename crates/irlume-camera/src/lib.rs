@@ -8359,16 +8359,28 @@ mod tests {
         let actual_host = String::from_utf8(hostname.stdout).expect("host name is UTF-8");
         assert_eq!(actual_host.trim(), host, "evidence host mismatch");
         let rgb_path = required("IRLUME_TEST_PHYSICAL_RGB_DEVICE");
-        let rgb = RgbCamera::open(&rgb_path).expect("open physical RGB camera");
-        let mut rgb_session = rgb.session().expect("open RGB session");
         let ir_path = std::env::var("IRLUME_TEST_PHYSICAL_IR_DEVICE").ok();
         assert!(
             ir_path.is_some() || std::env::var("IRLUME_TEST_EXPECT_RGB_ONLY").as_deref() == Ok("1"),
             "an IR path or an explicit RGB-only assertion is required"
         );
+        let mut endpoints = vec![rgb_path.as_str()];
+        if let Some(ir_path) = ir_path.as_deref() {
+            endpoints.push(ir_path);
+        }
+        let operation = lease::acquire_camera_operation(
+            &endpoints,
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire physical camera operation");
+        let rgb = operation
+            .open_rgb(&rgb_path)
+            .expect("open physical RGB camera");
+        let mut rgb_session = rgb.session().expect("open RGB session");
         let ir = ir_path
             .as_deref()
-            .map(IrCamera::open)
+            .map(|path| operation.open_ir(path))
             .transpose()
             .expect("open physical IR camera");
         let mut ir_session = ir

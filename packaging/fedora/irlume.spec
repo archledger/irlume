@@ -38,6 +38,7 @@ BuildRequires:  rust
 BuildRequires:  gcc
 BuildRequires:  pam-devel
 BuildRequires:  tpm2-tss-devel
+BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
 # v4l2-sys-mit generates bindings at build time: bindgen dlopens libclang
 # and parses the kernel's videodev2.h; tss-esapi locates tss2 via pkg-config.

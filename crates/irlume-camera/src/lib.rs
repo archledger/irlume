@@ -37,6 +37,7 @@ mod inventory;
 pub mod ir_dark;
 pub mod ir_emitter;
 mod ir_metadata;
+mod lifecycle;
 mod media_graph;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code

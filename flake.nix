@@ -142,6 +142,7 @@
           buildInputs = [
             pkgs.tpm2-tss     # TPM 2.0 stack; the tss-esapi crate links tss2-*
             pkgs.linux-pam    # libpam; the pamsm crate links it
+            pkgs.systemd      # libudev for the camera lifecycle adapter
           ];
 
           # bindgen (pulled in transitively by v4l2-sys-mit) dlopens libclang

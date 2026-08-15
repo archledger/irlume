@@ -87,7 +87,7 @@ jobs:
           command -v apt-get >/dev/null || { echo "deps preinstalled on the self-hosted runner"; exit 0; }
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev llvm
+            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev llvm
 
       # A leak suppression matches the SYMBOL NAMES in an allocation stack, so
       # without a symbolizer it matches nothing and the deliberate test leak

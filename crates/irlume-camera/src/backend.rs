@@ -29,7 +29,7 @@ trait CameraBackend: Send + Sync + 'static {
 ///
 /// Inventory mutation is isolated from capture routing. Leases and hotplug event
 /// subscription remain later slices and therefore cannot alter behavior here.
-struct CameraSupervisor {
+pub(crate) struct CameraSupervisor {
     backend: Arc<dyn CameraBackend>,
     inventory: Mutex<CameraInventory>,
 }
@@ -46,14 +46,7 @@ impl CameraSupervisor {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the udev adapter will feed inventory observations"
-        )
-    )]
-    fn reconcile_inventory(
+    pub(crate) fn reconcile_inventory(
         &self,
         observations: Vec<CameraObservation>,
     ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
@@ -63,6 +56,14 @@ impl CameraSupervisor {
             .reconcile(observations)
     }
 
+    pub(crate) fn invalidate_inventory(&self) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .invalidate_all();
+        Ok(())
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -70,7 +71,7 @@ impl CameraSupervisor {
             reason = "later frame and session slices validate descriptors"
         )
     )]
-    fn validate_descriptor(
+    pub(crate) fn validate_descriptor(
         &self,
         descriptor: &CameraDescriptor,
     ) -> Result<(), CameraInventoryError> {
@@ -186,10 +187,18 @@ impl CameraBackend for UvcV4l2Backend {
     }
 }
 
-static DEFAULT_CAMERA_SUPERVISOR: OnceLock<CameraSupervisor> = OnceLock::new();
+static DEFAULT_CAMERA_SUPERVISOR: OnceLock<Arc<CameraSupervisor>> = OnceLock::new();
 
 fn default_camera_supervisor() -> &'static CameraSupervisor {
-    DEFAULT_CAMERA_SUPERVISOR.get_or_init(|| CameraSupervisor::new(UvcV4l2Backend::default()))
+    DEFAULT_CAMERA_SUPERVISOR
+        .get_or_init(|| {
+            let supervisor = Arc::new(CameraSupervisor::new(UvcV4l2Backend::default()));
+            if let Err(error) = crate::lifecycle::spawn(Arc::downgrade(&supervisor)) {
+                eprintln!("irlume: camera lifecycle monitor unavailable: {error}");
+            }
+            supervisor
+        })
+        .as_ref()
 }
 
 #[cfg(test)]

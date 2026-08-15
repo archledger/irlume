@@ -10,6 +10,7 @@ Build-Depends: debhelper-compat (= 13),
                pkg-config,
                libpam0g-dev,
                libtss2-dev,
+               libudev-dev,
                linux-libc-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/archledger/irlume

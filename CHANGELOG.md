@@ -18,6 +18,12 @@ All notable changes to irlume are documented here. This project adheres to
   permanently, and rediscovery starts a fresh identifier at generation one. Stale,
   forged, foreign-instance, duplicate, exhausted, and poisoned states fail closed.
   Capture and hardware-control behavior remain unchanged (#455).
+- **Linux camera lifecycle changes now invalidate stale inventory tokens.**
+  A monitor-before-scan libudev adapter coalesces UVC and USB-parent events, detects
+  monitor socket errors, and rebuilds one authoritative sysfs snapshot without opening video
+  nodes. Monitor loss, overflow, unstable scans, and continuity loss retire stale
+  references before replacements become visible; capture and hardware-control behavior
+  remain unchanged (#456).
 
 ## [0.10.0] - 2026-08-12
 

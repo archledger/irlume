@@ -83,7 +83,7 @@ Install the build dependencies, then use `cargo` as usual.
 
 ```sh
 sudo dnf install cargo rust clang-devel pkgconf-pkg-config gcc \
-    pam-devel tpm2-tss-devel kernel-headers curl
+    pam-devel tpm2-tss-devel systemd-devel kernel-headers curl
 ```
 
 **Ubuntu / Debian**: the archive's `rustc` is usually too old (the `ort`
@@ -92,14 +92,14 @@ binding needs Rust ≥ 1.88), so install the toolchain with
 
 ```sh
 sudo apt install build-essential pkg-config clang libclang-dev \
-    libpam0g-dev libtss2-dev curl
+    libpam0g-dev libtss2-dev libudev-dev curl
 rustup toolchain install 1.88.0   # or newer stable
 ```
 
 **Arch**
 
 ```sh
-sudo pacman -S --needed base-devel rust clang tpm2-tss pam onnxruntime-cpu curl
+sudo pacman -S --needed base-devel rust clang tpm2-tss pam systemd onnxruntime-cpu curl
 ```
 
 ### ONNX runtime (non-Nix)

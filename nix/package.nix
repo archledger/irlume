@@ -17,6 +17,7 @@
   clang,
   tpm2-tss,
   linux-pam,
+  systemd,
   libxcrypt,
   linuxHeaders,
   fetchurl,
@@ -90,6 +91,7 @@ rustPlatform.buildRustPackage {
   buildInputs = [
     tpm2-tss # tss-esapi links tss2-*
     linux-pam # the PAM cdylib links libpam
+    systemd # the udev adapter links libudev
     # irlumed declares #[link(name = "crypt")] for its /etc/shadow fallback.
     # nixpkgs stopped providing libcrypt transitively, and `nix build` failed
     # with "cannot find -lcrypt" at the irlumed link step. CI could not see it:

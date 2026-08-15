@@ -75,6 +75,7 @@ argon2     = "0.5"      # Argon2id KDF for the recovery passphrase
 pbkdf2     = { version = "0.13", default-features = false, features = ["hmac"] }  # PBKDF2-HMAC-SHA512: the KDE wallet key ksecretd expects
 rand       = "0.10"      # CSPRNG for template keys, nonces, recovery salts
 libc       = "0.2"      # mlock/madvise (memlock), NSS getpwnam_r, SO_PEERCRED
+udev       = { version = "0.9.3", features = ["send"] } # persistent V4L2 hotplug monitor + sysfs snapshots
 rustfft    = "6"        # 2D FFT for the RGB-only moiré/screen-replay PAD cue
 
 # ONNX inference. `load-dynamic` => libonnxruntime.so is dlopened at runtime, so

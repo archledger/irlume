@@ -23,6 +23,7 @@ pub(crate) struct CameraObservation {
     backend: BackendKind,
     physical_id: PhysicalCameraId,
     capabilities: CameraCapabilities,
+    lifecycle_evidence: Vec<String>,
 }
 
 impl CameraObservation {
@@ -35,11 +36,32 @@ impl CameraObservation {
             backend,
             physical_id,
             capabilities,
+            lifecycle_evidence: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_lifecycle_evidence(
+        backend: BackendKind,
+        physical_id: PhysicalCameraId,
+        capabilities: CameraCapabilities,
+        mut lifecycle_evidence: Vec<String>,
+    ) -> Self {
+        lifecycle_evidence.sort();
+        lifecycle_evidence.dedup();
+        Self {
+            backend,
+            physical_id,
+            capabilities,
+            lifecycle_evidence,
         }
     }
 
     pub(crate) fn physical_id(&self) -> &PhysicalCameraId {
         &self.physical_id
+    }
+
+    pub(crate) fn lifecycle_evidence(&self) -> &[String] {
+        &self.lifecycle_evidence
     }
 
     fn descriptor(
@@ -115,9 +137,26 @@ pub(crate) enum CameraInventoryError {
     UnknownCamera,
     Removed,
     StaleGeneration,
+    ContinuityLost,
     DescriptorMismatch,
     InstanceIdExhausted,
     Poisoned,
+}
+
+/// Descriptor-bound handle for a currently observed backend object.
+///
+/// Endpoint evidence remains private: callers must validate the whole token
+/// rather than treating a `/dev/videoN` path as proof of freshness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CameraInventoryRef {
+    descriptor: CameraDescriptor,
+    lifecycle_evidence: Vec<String>,
+}
+
+impl CameraInventoryRef {
+    pub(crate) fn descriptor(&self) -> &CameraDescriptor {
+        &self.descriptor
+    }
 }
 
 /// Process-scoped physical-camera lifecycle state.
@@ -128,6 +167,7 @@ pub(crate) struct CameraInventory {
     active: BTreeMap<String, InventoryEntry>,
     tombstones: BTreeSet<String>,
     retired_instance_ids: BTreeSet<CameraInstanceId>,
+    invalidated_instance_ids: BTreeSet<CameraInstanceId>,
     instance_id_source: InstanceIdSource,
 }
 
@@ -141,6 +181,7 @@ impl CameraInventory {
             active: BTreeMap::new(),
             tombstones: BTreeSet::new(),
             retired_instance_ids: BTreeSet::new(),
+            invalidated_instance_ids: BTreeSet::new(),
             instance_id_source,
         }
     }
@@ -248,7 +289,16 @@ impl CameraInventory {
         self.active = next_active;
         self.tombstones = next_tombstones;
         self.retired_instance_ids = next_retired_instance_ids;
+        self.invalidated_instance_ids.clear();
         Ok(events)
+    }
+
+    pub(crate) fn invalidate_all(&mut self) {
+        self.invalidated_instance_ids = self
+            .active
+            .values()
+            .map(|entry| entry.descriptor.camera_instance_id().clone())
+            .collect();
     }
 
     pub(crate) fn active_descriptors(&self) -> Vec<CameraDescriptor> {
@@ -256,6 +306,36 @@ impl CameraInventory {
             .values()
             .map(|entry| entry.descriptor.clone())
             .collect()
+    }
+
+    pub(crate) fn active_references(&self) -> Vec<CameraInventoryRef> {
+        self.active
+            .values()
+            .filter(|entry| {
+                !self
+                    .invalidated_instance_ids
+                    .contains(entry.descriptor.camera_instance_id())
+            })
+            .map(|entry| CameraInventoryRef {
+                descriptor: entry.descriptor.clone(),
+                lifecycle_evidence: entry.observation.lifecycle_evidence.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn validate_reference(
+        &self,
+        reference: &CameraInventoryRef,
+    ) -> Result<(), CameraInventoryError> {
+        self.validate(reference.descriptor())?;
+        let active = self
+            .active
+            .get(reference.descriptor().physical_id().topology_path())
+            .ok_or(CameraInventoryError::UnknownCamera)?;
+        if active.observation.lifecycle_evidence != reference.lifecycle_evidence {
+            return Err(CameraInventoryError::DescriptorMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn validate(
@@ -272,6 +352,12 @@ impl CameraInventory {
         };
         if descriptor.camera_instance_id() != active.descriptor.camera_instance_id() {
             return Err(CameraInventoryError::ForeignInstance);
+        }
+        if self
+            .invalidated_instance_ids
+            .contains(descriptor.camera_instance_id())
+        {
+            return Err(CameraInventoryError::ContinuityLost);
         }
         if descriptor.generation() != active.descriptor.generation() {
             return Err(CameraInventoryError::StaleGeneration);
@@ -301,6 +387,7 @@ impl CameraInventory {
             )]),
             tombstones: BTreeSet::new(),
             retired_instance_ids: BTreeSet::new(),
+            invalidated_instance_ids: BTreeSet::new(),
             instance_id_source: Box::new(move || replacement_id.clone()),
         }
     }
@@ -348,6 +435,45 @@ mod tests {
 
     fn generation(event: &CameraInventoryEvent) -> u64 {
         event.descriptor().generation().get()
+    }
+
+    #[test]
+    fn references_are_descriptor_bound_and_hidden_while_invalidated() {
+        let mut inventory = CameraInventory::new();
+        let camera = CameraObservation::with_lifecycle_evidence(
+            BackendKind::UvcV4l2,
+            PhysicalCameraId::new("/devices/pci/a", Some("A".into())).unwrap(),
+            CameraCapabilities::new(vec![StreamRole::Rgb], Default::default(), Vec::new()).unwrap(),
+            vec!["/devices/pci/a/video4linux/video0".into()],
+        );
+        inventory.reconcile(vec![camera]).unwrap();
+        let reference = inventory.active_references().pop().unwrap();
+        assert_eq!(inventory.validate_reference(&reference), Ok(()));
+
+        inventory.invalidate_all();
+        assert!(inventory.active_references().is_empty());
+        assert_eq!(
+            inventory.validate_reference(&reference),
+            Err(CameraInventoryError::ContinuityLost)
+        );
+    }
+
+    #[test]
+    fn invalidation_blocks_old_descriptor_until_authoritative_reconcile() {
+        let mut inventory = CameraInventory::new();
+        let camera = observation("/devices/pci/a", Some("A"), &[StreamRole::Rgb]);
+        let descriptor = inventory.reconcile(vec![camera.clone()]).unwrap()[0]
+            .descriptor()
+            .clone();
+
+        inventory.invalidate_all();
+        assert_eq!(
+            inventory.validate(&descriptor),
+            Err(CameraInventoryError::ContinuityLost)
+        );
+
+        assert!(inventory.reconcile(vec![camera]).unwrap().is_empty());
+        assert_eq!(inventory.validate(&descriptor), Ok(()));
     }
 
     #[test]

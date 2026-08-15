@@ -558,6 +558,32 @@ impl SnapshotSource for SysfsSnapshotSource {
             let name = entry.file_name();
             let devnode = PathBuf::from("/dev").join(&name);
             let devnode_text = devnode.to_string_lossy().into_owned();
+            // v4l2loopback class entries are themselves symlinks into this virtual
+            // subtree and have no UVC-style `videoN/device` child. Both checks are
+            // required: the root-controlled exact-path escape and canonical virtual
+            // ancestry. Production physical/non-UVC nodes still take the path below.
+            let class_target = match std::fs::canonicalize(entry.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(LifecycleError::Snapshot(error.to_string())),
+            };
+            if crate::virtual_camera_allowed(&devnode_text)
+                && class_target.parent().is_some_and(|parent| {
+                    parent.ends_with(Path::new("devices/virtual/video4linux"))
+                })
+            {
+                let virtual_devpath =
+                    format!("/devices/virtual/video4linux/{}", name.to_string_lossy());
+                records.push(UdevNodeRecord {
+                    usb_devpath: "/devices/virtual/video4linux/irlume-test-camera".to_string(),
+                    serial: None,
+                    node_devpath: virtual_devpath,
+                    interface_number: None,
+                    capture_node: None,
+                    devnode: devnode_text,
+                });
+                continue;
+            }
             let interface = match std::fs::canonicalize(entry.path().join("device")) {
                 Ok(interface) => interface,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -567,18 +593,6 @@ impl SnapshotSource for SysfsSnapshotSource {
             let is_uvc = driver.as_deref().and_then(Path::file_name)
                 == Some(std::ffi::OsStr::new("uvcvideo"));
             if !is_uvc {
-                if crate::virtual_camera_allowed(&devnode_text) {
-                    let virtual_devpath =
-                        format!("/devices/virtual/video4linux/{}", name.to_string_lossy());
-                    records.push(UdevNodeRecord {
-                        usb_devpath: "/devices/virtual/video4linux/irlume-test-camera".to_string(),
-                        serial: None,
-                        node_devpath: virtual_devpath,
-                        interface_number: None,
-                        capture_node: crate::media_graph::node_is_capture(&devnode_text),
-                        devnode: devnode_text,
-                    });
-                }
                 continue;
             }
             let usb = usb_device_parent(&interface).ok_or_else(|| {
@@ -1093,20 +1107,13 @@ mod tests {
         let rgb = root.join("devices/virtual/video4linux/video8");
         let ir = root.join("devices/virtual/video4linux/video9");
         let excluded = root.join("devices/virtual/video4linux/video10");
-        let driver = root.join("drivers/v4l2loopback");
-        std::fs::create_dir_all(root.join("class/video4linux/video8")).unwrap();
-        std::fs::create_dir_all(root.join("class/video4linux/video9")).unwrap();
-        std::fs::create_dir_all(root.join("class/video4linux/video10")).unwrap();
+        std::fs::create_dir_all(root.join("class/video4linux")).unwrap();
         std::fs::create_dir_all(&rgb).unwrap();
         std::fs::create_dir_all(&ir).unwrap();
         std::fs::create_dir_all(&excluded).unwrap();
-        std::fs::create_dir_all(&driver).unwrap();
-        symlink(&rgb, root.join("class/video4linux/video8/device")).unwrap();
-        symlink(&ir, root.join("class/video4linux/video9/device")).unwrap();
-        symlink(&excluded, root.join("class/video4linux/video10/device")).unwrap();
-        symlink(&driver, rgb.join("driver")).unwrap();
-        symlink(&driver, ir.join("driver")).unwrap();
-        symlink(&driver, excluded.join("driver")).unwrap();
+        symlink(&rgb, root.join("class/video4linux/video8")).unwrap();
+        symlink(&ir, root.join("class/video4linux/video9")).unwrap();
+        symlink(&excluded, root.join("class/video4linux/video10")).unwrap();
         let _allow = crate::testenv::EnvGuard::set(
             "IRLUME_TEST_ALLOW_VIRTUAL_CAMERA",
             "/dev/video8,/dev/video9",

@@ -682,6 +682,95 @@ impl<'a> SafeStream<'a> {
     }
 }
 
+trait ValidatedStream {
+    fn next_validated(&mut self)
+        -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)>;
+}
+
+impl ValidatedStream for SafeStream<'_> {
+    fn next_validated(
+        &mut self,
+    ) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)> {
+        self.next()
+    }
+}
+
+/// Sequence state whose lifetime is independent of its replaceable mmap stream.
+struct TrackedStream<S> {
+    stream: Option<S>,
+    sequence: frame_provenance::SequenceTracker,
+}
+
+impl<S> TrackedStream<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: Some(stream),
+            sequence: frame_provenance::SequenceTracker::new(),
+        }
+    }
+
+    fn stream_mut(&mut self) -> Option<&mut S> {
+        self.stream.as_mut()
+    }
+
+    fn take(&mut self) -> Option<S> {
+        self.stream.take()
+    }
+
+    fn install_recovered(
+        &mut self,
+        stream: S,
+    ) -> Result<(), frame_provenance::SequenceTrackerError> {
+        self.sequence.begin_new_epoch()?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+}
+
+impl<S: ValidatedStream> TrackedStream<S> {
+    fn next(
+        &mut self,
+    ) -> std::io::Result<(
+        &[u8],
+        frame_provenance::DequeuedBufferFacts,
+        frame_provenance::SequenceObservation,
+    )> {
+        let Self { stream, sequence } = self;
+        let (payload, facts) = stream
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
+            .next_validated()?;
+        let observation = sequence
+            .observe(facts.sequence_raw())
+            .map_err(std::io::Error::other)?;
+        Ok((payload, facts, observation))
+    }
+}
+
+fn install_recovered_resources<S, M, G, E>(
+    replacement: S,
+    metadata: M,
+    emitter_guard: G,
+    install: impl FnOnce(S) -> Result<(), E>,
+) -> Result<(M, G), E> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(replacement))) {
+        Ok(Ok(())) => Ok((metadata, emitter_guard)),
+        Ok(Err(error)) => {
+            // The replacement is dropped before `install` returns. Stop any
+            // separately-owned metadata queue before restoring the emitter.
+            drop(metadata);
+            drop(emitter_guard);
+            Err(error)
+        }
+        Err(payload) => {
+            // Preserve panic semantics after enforcing the same teardown order.
+            drop(metadata);
+            drop(emitter_guard);
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 impl Drop for SafeStream<'_> {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else {
@@ -2044,7 +2133,7 @@ impl RgbCamera {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(RgbSession {
             cam: self,
-            stream: Some(stream),
+            stream: TrackedStream::new(stream),
             warmed: false,
             progress: progress.clone(),
             _blc_restore: blc_restore,
@@ -2229,7 +2318,7 @@ pub struct RgbSession<'a> {
     /// `None` only transiently inside [`Self::recover`]: the broken stream
     /// must be DROPPED (STREAMOFF + buffer release) before its replacement
     /// negotiates, and a plain re-assignment builds the new value first.
-    stream: Option<SafeStream<'a>>,
+    stream: TrackedStream<SafeStream<'a>>,
     warmed: bool,
     /// Per-window heartbeat for the lazy warm-up (#336); owned, not borrowed,
     /// so holding a session never freezes the caller's other borrows.
@@ -2251,7 +2340,7 @@ impl<'a> RgbSession<'a> {
     /// than a panic because this sits in the authentication path.
     fn stream(&mut self) -> irlume_common::Result<&mut SafeStream<'a>> {
         self.stream
-            .as_mut()
+            .stream_mut()
             .ok_or_else(|| Error::Hardware("RGB stream missing after a failed recovery".into()))
     }
 
@@ -2274,17 +2363,23 @@ impl<'a> RgbSession<'a> {
             .lease
             .require_endpoint(&self.cam.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        self.stream = None; // drop first: STREAMOFF + buffer release
-        self.stream = Some(SafeStream::open(
+        drop(self.stream.take()); // STREAMOFF + buffer release before replacement
+        let stream = SafeStream::open(
             &self.cam.device,
             &self.cam.dev,
             &self.cam.negotiated,
             self.cam.lease.clone(),
-        )?);
+        )?;
         self.cam
             .lease
             .require_endpoint(&self.cam.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        self.stream.install_recovered(stream).map_err(|error| {
+            Error::Hardware(format!(
+                "{}: could not begin the recovered sequence epoch: {error}",
+                self.cam.device
+            ))
+        })?;
         // The fresh stream's auto-exposure starts unsettled, like any new
         // session's.
         self.warmed = false;
@@ -2333,7 +2428,8 @@ impl<'a> RgbSession<'a> {
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, _meta) = self.stream()?.next().map_err(|e| map_io(&device, e))?;
+            let (buf, _meta, _sequence) =
+                self.stream.next().map_err(|error| map_io(&device, error))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
@@ -3044,7 +3140,7 @@ impl IrCamera {
         warm_up_stream(&self.device, &mut stream, progress)?;
         Ok(IrSession {
             cam: self,
-            stream: Some(stream),
+            stream: TrackedStream::new(stream),
             dec: IrDecoder::new(self.pix, self.quantization),
             lit: mode.lit(),
             _mode: mode,
@@ -3060,7 +3156,7 @@ pub struct IrSession<'a> {
     /// `None` only transiently inside [`Self::recover`]: the broken stream
     /// must be DROPPED (STREAMOFF + buffer release) before its replacement
     /// negotiates, and a plain re-assignment builds the new value first.
-    stream: Option<SafeStream<'a>>,
+    stream: TrackedStream<SafeStream<'a>>,
     dec: IrDecoder,
     lit: bool,
     /// The camera's own per-frame illumination reporting, when it has any.
@@ -3106,10 +3202,12 @@ impl IrSession<'_> {
         // retries the held session. The RGB twin already answers hardware
         // trouble here for the same reason; on the sequential branch the old
         // panic unwound out of the daemon worker.
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| Error::Hardware("IR stream missing after a failed recovery".into()))?;
+        if self.stream.stream_mut().is_none() {
+            return Err(Error::Hardware(
+                "IR stream missing after a failed recovery".into(),
+            ));
+        }
+        let stream = &mut self.stream;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
         // frame, the lit strobe phase (linhello lesson). Keep every frame so the
@@ -3144,7 +3242,7 @@ impl IrSession<'_> {
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, bmeta) = stream.next().map_err(|e| map_io(device, e))?;
+            let (buf, bmeta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -3460,7 +3558,7 @@ impl IrSession<'_> {
             .lease
             .require_endpoint(&self.cam.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        self.stream = None; // drop first: STREAMOFF + buffer release
+        drop(self.stream.take()); // STREAMOFF + buffer release before replacement
         self.meta = None; // drop the metadata queue
                           // A restore failure PROPAGATES, mirroring the frozen-stream restart:
                           // the guard is spent after one attempt, and an unrecorded write whose
@@ -3490,15 +3588,22 @@ impl IrSession<'_> {
             self.cam.lease.clone(),
         );
         let lit = mode.lit();
-        self.stream = Some(stream);
+        let (meta, mode) = install_recovered_resources(stream, meta, mode, |stream| {
+            self.cam
+                .lease
+                .require_endpoint(&self.cam.device)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
+            self.stream.install_recovered(stream).map_err(|error| {
+                Error::Hardware(format!(
+                    "{}: could not begin the recovered sequence epoch: {error}",
+                    self.cam.device
+                ))
+            })
+        })?;
         self.meta = meta;
         self._mode = mode;
         self.dec = IrDecoder::new(self.cam.pix, self.cam.quantization);
         self.lit = lit;
-        self.cam
-            .lease
-            .require_endpoint(&self.cam.device)
-            .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(())
     }
 }
@@ -3666,14 +3771,15 @@ pub mod ir_probe {
         // buffers; STREAMON happens on the first dequeue, so the set still
         // lands before streaming starts.
         let mode;
-        let mut stream = super::SafeStream::open(device, &dev, &fmt, permit.clone())?;
+        let stream = super::SafeStream::open(device, &dev, &fmt, permit.clone())?;
+        let mut stream = super::TrackedStream::new(stream);
         mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+            let (buf, _meta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
             let taken = std::time::Instant::now();
             out.push((
                 Frame {
@@ -3774,7 +3880,8 @@ pub fn capture_ir_streaming<B>(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    let stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    let mut stream = TrackedStream::new(stream);
     mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
     // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
@@ -3807,7 +3914,7 @@ pub fn capture_ir_streaming<B>(
     // user a password fallback. Reading the metadata queue here is how that gets
     // closed, and it is not done.
     for _ in 0..max_frames {
-        let (buf, _meta) = stream.next().map_err(|e| map_io(device, e))?;
+        let (buf, _meta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
         let taken = std::time::Instant::now();
         let data = dec.decode(buf, w, h);
         let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
@@ -3820,33 +3927,44 @@ pub fn capture_ir_streaming<B>(
                 restarts += 1;
                 dead_run = 0;
                 last_sig = None;
-                drop(stream); // stop + release buffers before re-arming
-                              // The OLD guard restores BEFORE the reopen. Its stream is
-                              // already gone, and while the guard lives it holds the
-                              // per-camera stream lock, which would make the fresh `enable`
-                              // refuse to drive the emitter at all — the lock refuses
-                              // contested writes rather than allowing an unrecorded one
-                              // (#188, review round 4). Restoring here cannot write under
-                              // the new stream either, because it happens before the fresh
-                              // apply. Earlier versions kept the old guard armed across the
-                              // reopen and negotiated ownership afterwards; the cost of
-                              // this simpler shape is one restore/apply pair per restart,
-                              // and restarts are the exception, not the path.
-                              // A restore failure PROPAGATES rather than being logged
-                              // over: the guard is spent after one attempt, and an
-                              // UNRECORDED write whose restore failed here would otherwise
-                              // become permanently unowned — the fresh enable finds the
-                              // wanted bytes with no record to claim and leaves them
-                              // forever (review round 12). Surfacing hardware trouble
-                              // beats continuing to authenticate through it.
+                drop(stream.take()); // stop + release buffers before re-arming
+                                     // The OLD guard restores BEFORE the reopen. Its stream is
+                                     // already gone, and while the guard lives it holds the
+                                     // per-camera stream lock, which would make the fresh `enable`
+                                     // refuse to drive the emitter at all — the lock refuses
+                                     // contested writes rather than allowing an unrecorded one
+                                     // (#188, review round 4). Restoring here cannot write under
+                                     // the new stream either, because it happens before the fresh
+                                     // apply. Earlier versions kept the old guard armed across the
+                                     // reopen and negotiated ownership afterwards; the cost of
+                                     // this simpler shape is one restore/apply pair per restart,
+                                     // and restarts are the exception, not the path.
+                                     // A restore failure PROPAGATES rather than being logged
+                                     // over: the guard is spent after one attempt, and an
+                                     // UNRECORDED write whose restore failed here would otherwise
+                                     // become permanently unowned — the fresh enable finds the
+                                     // wanted bytes with no record to claim and leaves them
+                                     // forever (review round 12). Surfacing hardware trouble
+                                     // beats continuing to authenticate through it.
                 mode.restore().map_err(|e| {
                     Error::Hardware(format!(
                         "{device}: could not restore the emitter before restarting \
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
-                mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
+                let replacement = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+                let replacement_mode =
+                    ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
+                let ((), replacement_mode) =
+                    install_recovered_resources(replacement, (), replacement_mode, |replacement| {
+                        stream.install_recovered(replacement)
+                    })
+                    .map_err(|error| {
+                        Error::Hardware(format!(
+                            "{device}: could not begin the recovered sequence epoch: {error}"
+                        ))
+                    })?;
+                mode = replacement_mode;
             }
             continue;
         }
@@ -3881,12 +3999,6 @@ pub fn capture_ir_streaming<B>(
 /// [`capture_ir_streaming`], which delivers raw single frames; the consent
 /// watch uses the streaming core, this stays for the `burst>=2` diagnostic path.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-#[expect(
-    clippy::missing_panics_doc,
-    reason = "cannot panic: `stream` is Some from its initialisation, and the one \
-              `take()` on the frozen-restart path reopens it in the same branch; \
-              both failure paths in between return early with `?`"
-)]
 pub fn capture_ir_sequence(
     device: &str,
     samples: usize,
@@ -3924,7 +4036,8 @@ pub fn capture_ir_sequence(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let mut stream = Some(SafeStream::open(device, &dev, &fmt, permit.clone())?);
+    let stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    let mut stream = TrackedStream::new(stream);
     mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Set once per stream, before it starts, and not per frame (the
     // frozen-stream restart below re-applies on its new stream). This path also carried
@@ -3946,11 +4059,7 @@ pub fn capture_ir_sequence(
         // instant it came from rather than stamping the end of the burst.
         let mut taken = std::time::Instant::now();
         for _ in 0..burst {
-            let (buf, _meta) = stream
-                .as_mut()
-                .expect("IR stream present")
-                .next()
-                .map_err(|e| map_io(device, e))?;
+            let (buf, _meta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
             let at = std::time::Instant::now();
             let data = dec.decode(buf, w, h);
             let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
@@ -3995,8 +4104,19 @@ pub fn capture_ir_sequence(
                          a frozen stream: {e}"
                     ))
                 })?;
-                stream = Some(SafeStream::open(device, &dev, &fmt, permit.clone())?);
-                mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
+                let replacement = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+                let replacement_mode =
+                    ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
+                let ((), replacement_mode) =
+                    install_recovered_resources(replacement, (), replacement_mode, |replacement| {
+                        stream.install_recovered(replacement)
+                    })
+                    .map_err(|error| {
+                        Error::Hardware(format!(
+                            "{device}: could not begin the recovered sequence epoch: {error}"
+                        ))
+                    })?;
+                mode = replacement_mode;
             }
             continue;
         }
@@ -5204,6 +5324,131 @@ mod tests {
 
         assert_eq!(payload, &[1, 2, 3, 4]);
         assert_eq!(facts.bytes_used(), 4);
+    }
+
+    #[test]
+    fn recovery_failure_stops_streams_before_restoring_emitter() {
+        #[derive(Debug)]
+        struct DropMark {
+            name: &'static str,
+            drops: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.drops.borrow_mut().push(self.name);
+            }
+        }
+
+        let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mark = |name| DropMark {
+            name,
+            drops: std::rc::Rc::clone(&drops),
+        };
+        let result = install_recovered_resources(
+            mark("image-stream"),
+            mark("metadata-stream"),
+            mark("emitter-restore"),
+            |stream| {
+                drop(stream);
+                Err::<(), _>("install failed")
+            },
+        );
+
+        assert!(matches!(result, Err("install failed")));
+        assert_eq!(
+            drops.borrow().as_slice(),
+            ["image-stream", "metadata-stream", "emitter-restore"]
+        );
+    }
+
+    #[test]
+    fn recovery_panic_stops_streams_before_restoring_emitter() {
+        #[derive(Debug)]
+        struct DropMark {
+            name: &'static str,
+            drops: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.drops.borrow_mut().push(self.name);
+            }
+        }
+
+        let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mark = |name| DropMark {
+            name,
+            drops: std::rc::Rc::clone(&drops),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = install_recovered_resources(
+                mark("image-stream"),
+                mark("metadata-stream"),
+                mark("emitter-restore"),
+                |stream| -> Result<(), ()> {
+                    drop(stream);
+                    panic!("injected install panic");
+                },
+            );
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            drops.borrow().as_slice(),
+            ["image-stream", "metadata-stream", "emitter-restore"]
+        );
+    }
+
+    #[test]
+    fn recovery_epoch_survives_untracked_warmup_dequeues() {
+        struct SequenceFixture {
+            payload: [u8; 1],
+            sequences: std::collections::VecDeque<u32>,
+        }
+
+        impl ValidatedStream for SequenceFixture {
+            fn next_validated(
+                &mut self,
+            ) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)> {
+                let sequence = self
+                    .sequences
+                    .pop_front()
+                    .ok_or_else(|| std::io::Error::other("fixture exhausted"))?;
+                let metadata = v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence,
+                    ..v4l::buffer::Metadata::default()
+                };
+                let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, 1)
+                    .map_err(std::io::Error::other)?;
+                Ok((&self.payload, facts))
+            }
+        }
+
+        let fixture = |sequences: &[u32]| SequenceFixture {
+            payload: [7],
+            sequences: sequences.iter().copied().collect(),
+        };
+        let mut capture = TrackedStream::new(fixture(&[41]));
+        let (_, _, baseline) = capture.next().expect("baseline delivery");
+        assert!(!baseline.discontinuity());
+
+        capture.take();
+        capture
+            .install_recovered(fixture(&[500, 7]))
+            .expect("representable recovery epoch");
+        capture
+            .stream_mut()
+            .expect("replacement stream")
+            .next_validated()
+            .expect("discarded warm-up dequeue");
+
+        let (_, _, restarted) = capture.next().expect("first delivered recovery frame");
+        assert_eq!(restarted.raw(), 7);
+        assert_eq!(restarted.gap(), 0);
+        assert!(restarted.discontinuity());
+        assert_eq!(restarted.stream_epoch(), 1);
     }
 
     #[test]

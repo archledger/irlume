@@ -20,6 +20,153 @@ pub enum TimestampSource {
     StartOfExposure,
 }
 
+/// Why sequence continuity can no longer be represented safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SequenceTrackerError {
+    DropCounterOverflow,
+    StreamEpochOverflow,
+    TrackerFailed,
+}
+
+impl std::fmt::Display for SequenceTrackerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DropCounterOverflow => f.write_str("V4L2 sequence drop counter overflowed"),
+            Self::StreamEpochOverflow => f.write_str("V4L2 sequence stream epoch overflowed"),
+            Self::TrackerFailed => f.write_str("V4L2 sequence tracker is permanently failed"),
+        }
+    }
+}
+
+impl std::error::Error for SequenceTrackerError {}
+
+/// Derived continuity facts for one dequeued V4L2 sequence number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceObservation {
+    raw: u32,
+    gap: u32,
+    cumulative_drops: u64,
+    discontinuity: bool,
+    stream_epoch: u64,
+}
+
+impl SequenceObservation {
+    #[must_use]
+    pub const fn raw(&self) -> u32 {
+        self.raw
+    }
+
+    #[must_use]
+    pub const fn gap(&self) -> u32 {
+        self.gap
+    }
+
+    #[must_use]
+    pub const fn cumulative_drops(&self) -> u64 {
+        self.cumulative_drops
+    }
+
+    #[must_use]
+    pub const fn discontinuity(&self) -> bool {
+        self.discontinuity
+    }
+
+    #[must_use]
+    pub const fn stream_epoch(&self) -> u64 {
+        self.stream_epoch
+    }
+}
+
+/// Stateful RFC-1982 sequence continuity tracker for one logical stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SequenceTracker {
+    previous: Option<u32>,
+    cumulative_drops: u64,
+    stream_epoch: u64,
+    pending_discontinuity: bool,
+    failed: bool,
+}
+
+impl SequenceTracker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            previous: None,
+            cumulative_drops: 0,
+            stream_epoch: 0,
+            pending_discontinuity: false,
+            failed: false,
+        }
+    }
+
+    /// Mark a successfully replaced stream as a new discontinuous epoch.
+    ///
+    /// The marker remains pending until the next observed (delivered) frame, so
+    /// discarded warm-up dequeues cannot consume the recovery evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequenceTrackerError::StreamEpochOverflow`] and permanently
+    /// fails the tracker when the epoch cannot be represented.
+    pub fn begin_new_epoch(&mut self) -> Result<(), SequenceTrackerError> {
+        if self.failed {
+            return Err(SequenceTrackerError::TrackerFailed);
+        }
+        let Some(stream_epoch) = self.stream_epoch.checked_add(1) else {
+            self.failed = true;
+            return Err(SequenceTrackerError::StreamEpochOverflow);
+        };
+        self.stream_epoch = stream_epoch;
+        self.previous = None;
+        self.pending_discontinuity = true;
+        Ok(())
+    }
+
+    /// Observe one raw sequence value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SequenceTrackerError`] after an unrepresentable counter state.
+    pub fn observe(&mut self, raw: u32) -> Result<SequenceObservation, SequenceTrackerError> {
+        if self.failed {
+            return Err(SequenceTrackerError::TrackerFailed);
+        }
+        let (gap, transition_discontinuity) = self.previous.map_or((0, false), |previous| {
+            let delta = raw.wrapping_sub(previous);
+            if (1..(1_u32 << 31)).contains(&delta) {
+                (delta - 1, false)
+            } else {
+                (0, true)
+            }
+        });
+        if transition_discontinuity {
+            let Some(stream_epoch) = self.stream_epoch.checked_add(1) else {
+                self.failed = true;
+                return Err(SequenceTrackerError::StreamEpochOverflow);
+            };
+            self.stream_epoch = stream_epoch;
+        }
+        if gap != 0 {
+            let Some(cumulative_drops) = self.cumulative_drops.checked_add(u64::from(gap)) else {
+                self.failed = true;
+                return Err(SequenceTrackerError::DropCounterOverflow);
+            };
+            self.cumulative_drops = cumulative_drops;
+        }
+        let discontinuity = transition_discontinuity || self.pending_discontinuity;
+        self.previous = Some(raw);
+        self.pending_discontinuity = false;
+        Ok(SequenceObservation {
+            raw,
+            gap,
+            cumulative_drops: self.cumulative_drops,
+            discontinuity,
+            stream_epoch: self.stream_epoch,
+        })
+    }
+}
+
 /// Why a dequeued buffer cannot enter the trusted decode boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -351,8 +498,181 @@ impl FrameBinding {
 #[cfg(test)]
 mod tests {
     use super::{
-        DequeuedBufferError, DequeuedBufferFacts, PayloadLayout, TimestampClock, TimestampSource,
+        DequeuedBufferError, DequeuedBufferFacts, PayloadLayout, SequenceTracker,
+        SequenceTrackerError, TimestampClock, TimestampSource,
     };
+
+    #[test]
+    fn first_sequence_establishes_a_clean_baseline() {
+        let mut tracker = SequenceTracker::new();
+
+        let observation = tracker.observe(41).expect("first sequence is valid");
+
+        assert_eq!(observation.raw(), 41);
+        assert_eq!(observation.gap(), 0);
+        assert_eq!(observation.cumulative_drops(), 0);
+        assert!(!observation.discontinuity());
+        assert_eq!(observation.stream_epoch(), 0);
+    }
+
+    #[test]
+    fn forward_sequences_count_only_missing_frames() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(41).expect("baseline");
+
+        let contiguous = tracker.observe(42).expect("contiguous sequence");
+        assert_eq!(contiguous.gap(), 0);
+        assert_eq!(contiguous.cumulative_drops(), 0);
+        assert!(!contiguous.discontinuity());
+
+        let gap = tracker.observe(45).expect("small forward gap");
+        assert_eq!(gap.gap(), 2);
+        assert_eq!(gap.cumulative_drops(), 2);
+        assert!(!gap.discontinuity());
+        assert_eq!(gap.stream_epoch(), 0);
+    }
+
+    #[test]
+    fn sequence_wrap_is_contiguous() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(u32::MAX).expect("baseline");
+
+        let wrapped = tracker.observe(0).expect("serial wrap");
+
+        assert_eq!(wrapped.gap(), 0);
+        assert_eq!(wrapped.cumulative_drops(), 0);
+        assert!(!wrapped.discontinuity());
+        assert_eq!(wrapped.stream_epoch(), 0);
+    }
+
+    #[test]
+    fn non_forward_sequences_start_bounded_discontinuous_epochs() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(10).expect("baseline");
+
+        let duplicate = tracker.observe(10).expect("duplicate is represented");
+        assert_eq!(duplicate.gap(), 0);
+        assert_eq!(duplicate.cumulative_drops(), 0);
+        assert!(duplicate.discontinuity());
+        assert_eq!(duplicate.stream_epoch(), 1);
+
+        let backward = tracker.observe(9).expect("backward reset is represented");
+        assert_eq!(backward.gap(), 0);
+        assert_eq!(backward.cumulative_drops(), 0);
+        assert!(backward.discontinuity());
+        assert_eq!(backward.stream_epoch(), 2);
+
+        let ambiguous = tracker
+            .observe(9_u32.wrapping_add(1_u32 << 31))
+            .expect("half-range delta is represented");
+        assert_eq!(ambiguous.gap(), 0);
+        assert_eq!(ambiguous.cumulative_drops(), 0);
+        assert!(ambiguous.discontinuity());
+        assert_eq!(ambiguous.stream_epoch(), 3);
+    }
+
+    #[test]
+    fn explicit_restart_is_sticky_until_the_next_observation() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(100).expect("baseline");
+        tracker.begin_new_epoch().expect("representable epoch");
+
+        let restarted = tracker.observe(3).expect("first restarted frame");
+        assert_eq!(restarted.gap(), 0);
+        assert_eq!(restarted.cumulative_drops(), 0);
+        assert!(restarted.discontinuity());
+        assert_eq!(restarted.stream_epoch(), 1);
+
+        let next = tracker.observe(4).expect("new epoch continues");
+        assert!(!next.discontinuity());
+        assert_eq!(next.stream_epoch(), 1);
+    }
+
+    #[test]
+    fn drop_counter_overflow_permanently_fails_the_tracker() {
+        let mut tracker = SequenceTracker {
+            previous: Some(10),
+            cumulative_drops: u64::MAX,
+            stream_epoch: 0,
+            pending_discontinuity: false,
+            failed: false,
+        };
+
+        assert_eq!(
+            tracker.observe(12),
+            Err(SequenceTrackerError::DropCounterOverflow)
+        );
+        assert_eq!(
+            tracker.observe(13),
+            Err(SequenceTrackerError::TrackerFailed)
+        );
+    }
+
+    #[test]
+    fn stream_epoch_overflow_permanently_fails_the_tracker() {
+        let mut tracker = SequenceTracker {
+            previous: Some(10),
+            cumulative_drops: 0,
+            stream_epoch: u64::MAX,
+            pending_discontinuity: false,
+            failed: false,
+        };
+
+        assert_eq!(
+            tracker.observe(10),
+            Err(SequenceTrackerError::StreamEpochOverflow)
+        );
+        assert_eq!(
+            tracker.observe(11),
+            Err(SequenceTrackerError::TrackerFailed)
+        );
+    }
+
+    #[test]
+    fn largest_defined_forward_delta_is_counted_not_ambiguous() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(0).expect("baseline");
+
+        let observation = tracker
+            .observe(0x7fff_ffff)
+            .expect("largest RFC-1982 forward delta");
+
+        assert_eq!(observation.gap(), 0x7fff_fffe);
+        assert_eq!(observation.cumulative_drops(), u64::from(0x7fff_fffe_u32));
+        assert!(!observation.discontinuity());
+    }
+
+    #[test]
+    fn wrapped_forward_gap_counts_only_missing_frames() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(u32::MAX - 1).expect("baseline");
+
+        let observation = tracker.observe(1).expect("wrapped forward gap");
+
+        assert_eq!(observation.gap(), 2);
+        assert_eq!(observation.cumulative_drops(), 2);
+        assert!(!observation.discontinuity());
+    }
+
+    #[test]
+    fn explicit_epoch_overflow_permanently_fails_the_tracker() {
+        let mut tracker = SequenceTracker {
+            previous: Some(10),
+            cumulative_drops: 0,
+            stream_epoch: u64::MAX,
+            pending_discontinuity: false,
+            failed: false,
+        };
+
+        assert_eq!(
+            tracker.begin_new_epoch(),
+            Err(SequenceTrackerError::StreamEpochOverflow)
+        );
+        assert_eq!(
+            tracker.begin_new_epoch(),
+            Err(SequenceTrackerError::TrackerFailed)
+        );
+    }
 
     #[test]
     fn dequeue_rejects_bytes_used_beyond_the_mapping() {

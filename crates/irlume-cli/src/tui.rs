@@ -107,6 +107,10 @@ const SC_SETTINGS: usize = 9;
 const SC_MODELS: usize = 10;
 const SC_DONE: usize = 11;
 const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
+/// Below this body width the sidebar would starve the content, so the layout
+/// collapses to full-width content and the header carries the step position
+/// (login greeters / TTYs / SSH at 80 columns).
+const SIDEBAR_MIN_COLS: u16 = 90;
 
 /// The services the Settings tab lets the user toggle the consent gesture for,
 /// with arrow keys + `c`. All four are high-privilege (elevation or app-consent),
@@ -4093,7 +4097,7 @@ impl App {
 
     fn draw(&self, f: &mut Frame) {
         let [header, hint, body, activity, footer] = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(6),
             Constraint::Length(7),
@@ -4102,7 +4106,27 @@ impl App {
         .areas(f.area());
         self.draw_header(f, header);
         self.draw_hint(f, hint);
-        self.draw_content(f, body);
+        // Redesign: on a roomy terminal the body splits into a settings-app
+        // sidebar (the visible screens, grouped) and the content pane.
+        // `step()`/arrows still drive `self.screen`; the sidebar renders that
+        // selection vertically instead of the old horizontal step-walk. Below
+        // SIDEBAR_MIN_COLS (login greeters / TTYs / SSH at 80) the sidebar
+        // would starve the content, so it collapses back to full-width content
+        // and the header's "step N/N" carries position instead.
+        if self.is_first_run() {
+            // A not-yet-enrolled user gets a focused front door: one screen, one
+            // action, no 12-item sidebar to parse. Tab or [v] leaves it.
+            self.draw_firstrun(f, body);
+        } else if body.width >= SIDEBAR_MIN_COLS {
+            let [sidebar, content] =
+                Layout::horizontal([Constraint::Length(22), Constraint::Min(20)]).areas(body);
+            self.draw_sidebar(f, sidebar);
+            // `draw_content` already frames each screen in its own titled card,
+            // so the content pane needs no extra border here.
+            self.draw_content(f, content);
+        } else {
+            self.draw_content(f, body);
+        }
         self.draw_activity(f, activity);
         self.draw_footer(f, footer);
         if let Some(err) = &self.error {
@@ -4178,11 +4202,144 @@ impl App {
         );
     }
 
-    fn draw_header(&self, f: &mut Frame, area: Rect) {
+    /// A brand-new user (face camera present, nothing enrolled yet, sitting on
+    /// Welcome, no capture in flight) gets one focused screen with one action
+    /// instead of the full sidebar. Tab or [v] moves off Welcome and restores
+    /// the sidebar. Fingerprint-only / no-camera hosts keep the classic Welcome
+    /// (its wording already adapts to their hardware).
+    fn is_first_run(&self) -> bool {
+        self.enroll.is_none()
+            && self.screen == SC_WELCOME
+            && self.caps.rgb
+            && self.enrolled_known() == Some(false)
+    }
+
+    /// The first-run front door: a single "scan your face" call to action, the
+    /// three steps of what happens, and the reassurance that the password never
+    /// stops working. Deliberately no sidebar — nothing to parse on run one.
+    fn draw_firstrun(&self, f: &mut Frame, area: Rect) {
+        let a = th().accent;
+        let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
+        let lines = vec![
+            Line::raw(""),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Set up face unlock",
+                Style::new().fg(a).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Look at your IR camera once and irlume learns your face — then it",
+                Style::new().dim(),
+            )),
+            Line::from(Span::styled(
+                "unlocks login, sudo, and the lock screen. Even in the dark.",
+                Style::new().dim(),
+            )),
+            Line::from(Span::styled(
+                "No images are ever stored.",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(
+                    "  ▶  Scan my face  ",
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(a)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                key("e"),
+            ]),
+            Line::raw(""),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "1  Look at the camera      2  Hold still a moment      3  Face unlock is on",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Tab", Style::new().fg(a)),
+                Span::styled(" walks every step   ", Style::new().dim()),
+                Span::styled("[v]", Style::new().fg(a)),
+                Span::styled(" shows all sections", Style::new().dim()),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Your password always works. Typing never starts a scan.",
+                Style::new().dim(),
+            )),
+        ];
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
-        let left = Line::from(vec![
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(blk)
+                .alignment(ratatui::layout::Alignment::Center),
+            area,
+        );
+    }
+
+    /// The left navigation rail: the visible screens grouped Setup / Security /
+    /// System, current screen marked with an accent bar. This renders the same
+    /// `self.visible` / `self.screen` model the horizontal step-walk used, so
+    /// Tab and the arrows keep working unchanged.
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let groups: [(&str, &[usize]); 3] = [
+            (
+                "Setup",
+                &[SC_WELCOME, SC_REPAIR, SC_CAMERAS, SC_PROFILES, SC_IDENTIFY],
+            ),
+            ("Security", &[SC_KEYRING, SC_RECOVERY, SC_FINGERPRINT]),
+            ("System", &[SC_PAM, SC_SETTINGS, SC_MODELS, SC_DONE]),
+        ];
+        let mut lines: Vec<Line> = Vec::new();
+        for (gi, (name, members)) in groups.iter().enumerate() {
+            let shown: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|s| self.visible.contains(s))
+                .collect();
+            if shown.is_empty() {
+                continue;
+            }
+            if gi > 0 {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::from(Span::styled(
+                format!(" {name}"),
+                Style::new().dim().add_modifier(Modifier::BOLD),
+            )));
+            for s in shown {
+                if s == self.screen {
+                    lines.push(Line::from(vec![
+                        Span::styled("▎", Style::new().fg(th().accent)),
+                        Span::styled(
+                            format!(" {}", SCREENS[s]),
+                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", SCREENS[s]),
+                        Style::new().dim(),
+                    )));
+                }
+            }
+        }
+        let blk = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().dim());
+        f.render_widget(Paragraph::new(lines).block(blk), area);
+    }
+
+    fn draw_header(&self, f: &mut Frame, area: Rect) {
+        // Slim one-line title bar. On a wide terminal the sidebar shows position
+        // (the highlighted row), so the header just names the section; on a
+        // narrow terminal the sidebar is gone, so the header carries "step N/N".
+        let mut left = vec![
             Span::styled(
                 " irlume ",
                 Style::new()
@@ -4191,7 +4348,9 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
+        ];
+        if area.width < SIDEBAR_MIN_COLS {
+            left.push(Span::styled(
                 format!(
                     "step {}/{}: ",
                     self.visible
@@ -4201,16 +4360,16 @@ impl App {
                     self.visible.len()
                 ),
                 Style::new().dim(),
-            ),
-            Span::styled(
-                SCREENS[self.screen],
-                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-            ),
-        ]);
+            ));
+        }
+        left.push(Span::styled(
+            SCREENS[self.screen],
+            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+        ));
         let right =
             Line::from(Span::styled(format!("{} ", self.user), Style::new().dim())).right_aligned();
-        f.render_widget(Paragraph::new(left).block(blk.clone()), area);
-        f.render_widget(Paragraph::new(right).block(blk), area);
+        f.render_widget(Paragraph::new(Line::from(left)), area);
+        f.render_widget(Paragraph::new(right), area);
     }
 
     /// A single plain-language line under the header: what THIS tab is for and
@@ -7059,6 +7218,102 @@ mod tests {
     /// A bare App for tests: no hardware probes, no daemon socket, no terminal.
     /// Mirrors `App::new()` but every probe-derived field is inert.
     /// `test_app` with a chosen account, for the user-resolution test.
+    #[test]
+    fn first_run_shows_focused_front_door() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.profiles_loaded = true; // loaded + empty profiles => not enrolled
+        app.screen = SC_WELCOME;
+        assert!(
+            app.is_first_run(),
+            "unenrolled + camera + Welcome is first-run"
+        );
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Set up face unlock"),
+            "front-door title missing:\n{text}"
+        );
+        assert!(text.contains("Scan my face"), "primary action missing");
+        assert!(
+            !text.contains("At a glance"),
+            "the focused front door must replace the Welcome hub"
+        );
+    }
+
+    #[test]
+    fn first_run_suppressed_once_enrolled_or_without_camera() {
+        // Enrolled => classic Welcome, never the front door.
+        let mut enrolled = test_app();
+        enrolled.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        enrolled.profiles = vec![profile("me", &["s1"])];
+        enrolled.profiles_loaded = true;
+        enrolled.screen = SC_WELCOME;
+        assert!(!enrolled.is_first_run());
+        // No camera => the face-worded front door would be wrong; classic Welcome.
+        let mut headless = test_app(); // caps.rgb = false
+        headless.profiles_loaded = true;
+        headless.screen = SC_WELCOME;
+        assert!(!headless.is_first_run());
+        // Off Welcome (e.g. user pressed Tab) => sidebar returns, no front door.
+        let mut elsewhere = test_app();
+        elsewhere.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        elsewhere.profiles_loaded = true;
+        elsewhere.screen = SC_SETTINGS;
+        assert!(!elsewhere.is_first_run());
+    }
+
+    #[test]
+    fn sidebar_groups_the_visible_screens_and_marks_the_current() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_PROFILES;
+        let text = draw_text(&app); // 120 wide => sidebar shown
+        assert!(text.contains("Setup"), "sidebar group missing:\n{text}");
+        assert!(text.contains("Security"), "sidebar group missing");
+        assert!(text.contains("System"), "sidebar group missing");
+        assert!(
+            text.contains('▎'),
+            "the current screen must carry the accent selection bar"
+        );
+    }
+
+    #[test]
+    fn header_step_counter_is_narrow_only() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        // Wide: the sidebar carries position, so the header omits "step N/N".
+        let wide = draw_text(&app);
+        let wide_hdr = row_with(&wide, "irlume");
+        assert!(
+            !wide_hdr.contains("step "),
+            "wide header must not show the step counter, got: {wide_hdr}"
+        );
+        // Narrow: sidebar collapsed, so the header carries position.
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let narrow = rendered(&term);
+        let narrow_hdr = row_with(&narrow, "irlume");
+        assert!(
+            narrow_hdr.contains("step "),
+            "narrow header must show the step counter, got: {narrow_hdr}"
+        );
+    }
+
     fn app_with_user(user: &str) -> App {
         let mut a = test_app();
         a.user = user.into();
@@ -9580,7 +9835,13 @@ mod tests {
             text.contains("You're enrolled"),
             "the Welcome hint line is missing:\n{text}"
         );
-        assert!(text.contains("step 1/"), "the wizard position is missing");
+        // Wide render: position is shown by the sidebar (grouped nav), not a
+        // "step N/N" counter — the header only carries that when the sidebar is
+        // collapsed on a narrow terminal.
+        assert!(
+            text.contains("Setup"),
+            "the sidebar nav is missing:\n{text}"
+        );
         // No-camera tier: the recommendation flips to password-only.
         let app2 = test_app();
         let text = draw_text(&app2);
@@ -10659,7 +10920,11 @@ mod tests {
     fn header_counts_steps_over_visible_screens_only() {
         let mut app = test_app(); // visible: Welcome, Login wiring, Settings, Models, Done
         app.screen = SC_PAM;
-        let text = draw_text(&app);
+        // The step counter only appears on a narrow terminal (sidebar collapsed);
+        // there it must track VISIBLE tabs, so Login wiring is 2 of 5.
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
         assert!(
             text.contains("step 2/5: Login wiring"),
             "the step counter must track visible tabs, got:\n{text}"

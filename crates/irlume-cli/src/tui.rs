@@ -161,6 +161,13 @@ enum SidebarRow {
     Blank,
 }
 
+/// A clickable content region, recorded during render and consulted by
+/// `on_click`. `Key` replays a keypress from a footer chip or button.
+#[derive(Clone, Copy)]
+enum Click {
+    Key(KeyCode),
+}
+
 #[derive(Clone, Copy)]
 enum Row {
     Profile(usize),
@@ -532,6 +539,9 @@ struct App {
     /// True while mouse capture is released so the terminal's own selection
     /// works (the `[M]` toggle); wheel scroll is unavailable meanwhile.
     mouse_select: bool,
+    /// Clickable content regions recorded each frame by `draw`, consulted by
+    /// `on_click`. Interior mutability because `draw` takes `&self`.
+    click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
     /// Selected row of the Welcome hub (Enter jumps to its screen).
@@ -1032,6 +1042,7 @@ impl App {
             input: None,
             confirm: None,
             mouse_select: false,
+            click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
             hub_sel: 0,
             op: None,
@@ -4122,6 +4133,7 @@ impl App {
     // ---- rendering --------------------------------------------------------
 
     fn draw(&self, f: &mut Frame) {
+        self.click_targets.borrow_mut().clear();
         let [header, hint, body, activity, footer] = tui_rows(f.area());
         self.draw_header(f, header);
         self.draw_hint(f, hint);
@@ -4290,6 +4302,20 @@ impl App {
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
+        let inner = blk.inner(area);
+        // Register the "Scan my face" row as a click target (→ enroll).
+        if let Some(i) = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("Scan my face")))
+        {
+            let y = inner.y.saturating_add(i as u16);
+            if y < inner.y.saturating_add(inner.height) {
+                self.hit(
+                    Rect::new(inner.x, y, inner.width, 1),
+                    Click::Key(KeyCode::Char('e')),
+                );
+            }
+        }
         f.render_widget(
             Paragraph::new(lines)
                 .block(blk)
@@ -4372,9 +4398,15 @@ impl App {
         (Some(sidebar), content)
     }
 
-    /// Map a mouse click to a navigation. A click on a sidebar row jumps to that
-    /// screen (touchscreens deliver the same left-click). Clicks elsewhere, or
-    /// while a modal/flow owns the screen, are ignored.
+    /// Record a clickable content region for this frame.
+    fn hit(&self, rect: Rect, c: Click) {
+        self.click_targets.borrow_mut().push((rect, c));
+    }
+
+    /// Map a mouse click (or touchscreen tap, delivered as the same left-click)
+    /// to an action: a sidebar row jumps to that screen, a footer chip or the
+    /// first-run button replays its key. Clicks while a modal/flow owns the
+    /// screen are ignored.
     fn on_click(&mut self, col: u16, row: u16, area: Rect) {
         if self.show_help
             || self.error.is_some()
@@ -4385,6 +4417,21 @@ impl App {
         {
             return;
         }
+        // Content regions registered during render (footer chips, first-run
+        // button). Copy out before acting so the RefCell borrow is released.
+        let hit = self
+            .click_targets
+            .borrow()
+            .iter()
+            .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+            .map(|(_, c)| *c);
+        if let Some(c) = hit {
+            match c {
+                Click::Key(kc) => self.on_key(kc),
+            }
+            return;
+        }
+        // Sidebar rail.
         let [_, _, body, _, _] = tui_rows(area);
         let (sidebar, _content) = self.body_split(body);
         let Some(sb) = sidebar else { return };
@@ -6605,21 +6652,47 @@ impl App {
         // action plus at most two more; [?] opens the full keymap overlay;
         // docs hold the rest. The first action is THE action for the screen,
         // so it alone gets the emphasized label.
-        let mut spans = vec![key("Tab"), Span::styled(" tabs  ", Style::new().dim())];
+        // Build the chip row while tracking x so each key chip becomes a click
+        // target (border eats one column, so content starts at area.x + 1).
+        let inner_y = area.y + 1;
+        let mut x = area.x + 1;
+        let mut spans: Vec<Span> = Vec::new();
+        let s = key("Tab");
+        let w = s.content.chars().count() as u16;
+        self.hit(Rect::new(x, inner_y, w, 1), Click::Key(KeyCode::Tab));
+        x = x.saturating_add(w);
+        spans.push(s);
+        let s = Span::styled(" tabs  ", Style::new().dim());
+        x = x.saturating_add(s.content.chars().count() as u16);
+        spans.push(s);
         for (i, (k, d)) in actions.iter().take(3).enumerate() {
-            spans.push(key(k));
-            if i == 0 {
-                spans.push(Span::styled(
-                    format!(" {d}  "),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(format!(" {d}  "), Style::new().dim()));
+            let s = key(k);
+            let w = s.content.chars().count() as u16;
+            if let Some(kc) = footer_keycode(k) {
+                self.hit(Rect::new(x, inner_y, w, 1), Click::Key(kc));
             }
+            x = x.saturating_add(w);
+            spans.push(s);
+            let ds = if i == 0 {
+                Span::styled(format!(" {d}  "), Style::new().add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(format!(" {d}  "), Style::new().dim())
+            };
+            x = x.saturating_add(ds.content.chars().count() as u16);
+            spans.push(ds);
         }
-        spans.push(key("?"));
-        spans.push(Span::styled(" all keys  ", Style::new().dim()));
-        spans.push(key("q"));
+        let s = key("?");
+        let w = s.content.chars().count() as u16;
+        self.hit(Rect::new(x, inner_y, w, 1), Click::Key(KeyCode::Char('?')));
+        x = x.saturating_add(w);
+        spans.push(s);
+        let s = Span::styled(" all keys  ", Style::new().dim());
+        x = x.saturating_add(s.content.chars().count() as u16);
+        spans.push(s);
+        let s = key("q");
+        let w = s.content.chars().count() as u16;
+        self.hit(Rect::new(x, inner_y, w, 1), Click::Key(KeyCode::Char('q')));
+        spans.push(s);
         spans.push(Span::styled(" quit", Style::new().dim()));
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -6726,6 +6799,22 @@ fn tui_rows(area: Rect) -> [Rect; 5] {
         Constraint::Length(3),
     ])
     .areas(area)
+}
+
+/// Map a footer chip's label to the key it fires when clicked.
+fn footer_keycode(k: &str) -> Option<KeyCode> {
+    match k {
+        "Tab" => Some(KeyCode::Tab),
+        "enter" => Some(KeyCode::Enter),
+        "esc" => Some(KeyCode::Esc),
+        _ => {
+            let mut ch = k.chars();
+            match (ch.next(), ch.next()) {
+                (Some(c), None) => Some(KeyCode::Char(c)),
+                _ => None,
+            }
+        }
+    }
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -7439,6 +7528,57 @@ mod tests {
         assert_eq!(app.screen, SC_WELCOME, "content clicks must not navigate");
     }
 
+    #[test]
+    fn clicking_a_footer_chip_fires_its_key() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+
+        let [_, _, _, _, footer] = tui_rows(area);
+        let inner = Block::bordered().inner(footer);
+        let enroll_chip_x =
+            inner.x + " Tab ".chars().count() as u16 + " tabs  ".chars().count() as u16;
+        app.on_click(enroll_chip_x, inner.y, area);
+
+        assert_eq!(app.screen, SC_PROFILES, "the [e] chip starts enrollment");
+        assert!(
+            matches!(app.input, Some((_, _, Pending::EnrollName))),
+            "the clicked chip must fire the same enrollment prompt as [e]"
+        );
+    }
+
+    #[test]
+    fn clicking_the_first_run_button_starts_enrollment() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.profiles_loaded = true;
+        assert!(app.is_first_run());
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let [_, _, body, _, _] = tui_rows(area);
+        let inner = Block::bordered().inner(body);
+        let button_y = inner.y + 8;
+        app.on_click(inner.x, button_y, area);
+
+        assert_eq!(app.screen, SC_PROFILES, "the button starts enrollment");
+        assert!(
+            matches!(app.input, Some((_, _, Pending::EnrollName))),
+            "the clicked button must open the enrollment name prompt"
+        );
+    }
+
     fn app_with_user(user: &str) -> App {
         let mut a = test_app();
         a.user = user.into();
@@ -7467,6 +7607,7 @@ mod tests {
             input: None,
             confirm: None,
             mouse_select: false,
+            click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
             hub_sel: 0,
             op: None,

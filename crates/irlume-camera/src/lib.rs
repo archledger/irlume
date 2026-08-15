@@ -1848,6 +1848,31 @@ fn uvc_list_pairs() -> Vec<CameraPair> {
 /// that one blurry / over-exposed / transiently corrupt frame is outvoted.
 const RGB_BURST: usize = 5;
 
+struct SessionSlot<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> SessionSlot<'a> {
+    fn acquire(
+        active: &'a std::sync::atomic::AtomicBool,
+        device: &str,
+    ) -> irlume_common::Result<Self> {
+        active
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| Error::Hardware(format!("{device}: camera session already active")))?;
+        Ok(Self(active))
+    }
+}
+
+impl Drop for SessionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// An opened, format-negotiated RGB camera.
 ///
 /// Exists so a caller that captures REPEATEDLY can pay the open, control write,
@@ -1862,6 +1887,7 @@ const RGB_BURST: usize = 5;
 /// long-lived half and the session is the streaming half.
 pub struct RgbCamera {
     lease: lease::CameraLease,
+    session_active: std::sync::atomic::AtomicBool,
     device: String,
     dev: Device,
     chosen: [u8; 4],
@@ -1930,6 +1956,7 @@ impl RgbCamera {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
             lease,
+            session_active: std::sync::atomic::AtomicBool::new(false),
             device: device.to_string(),
             dev,
             chosen,
@@ -1959,6 +1986,7 @@ impl RgbCamera {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        let session_slot = SessionSlot::acquire(&self.session_active, &self.device)?;
         // Best-effort backlight/low-light correction: tell auto-exposure to
         // expose for the face, not a bright window behind it (NexiGo N930W:
         // verified face mean 49→124; this machine's ASUS: center mean
@@ -1991,6 +2019,7 @@ impl RgbCamera {
             warmed: false,
             progress: progress.clone(),
             _blc_restore: blc_restore,
+            _session_slot: session_slot,
         })
     }
 
@@ -2182,6 +2211,8 @@ pub struct RgbSession<'a> {
     /// drop order tears the stream down (STREAMOFF) before the control is
     /// put back.
     _blc_restore: Option<BlcRestore<'a>>,
+    /// Reset last, after STREAMOFF and control restoration have completed.
+    _session_slot: SessionSlot<'a>,
 }
 
 impl<'a> RgbSession<'a> {
@@ -2816,6 +2847,7 @@ pub fn capture_ir_with_stats_and_progress(
 /// there for why a device and a session are separate types.
 pub struct IrCamera {
     lease: lease::CameraLease,
+    session_active: std::sync::atomic::AtomicBool,
     device: String,
     dev: Device,
     pix: IrPixel,
@@ -2876,6 +2908,7 @@ impl IrCamera {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
             lease,
+            session_active: std::sync::atomic::AtomicBool::new(false),
             device: device.to_string(),
             dev,
             pix,
@@ -2928,6 +2961,7 @@ impl IrCamera {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        let session_slot = SessionSlot::acquire(&self.session_active, &self.device)?;
         // DECLARED before the stream so it drops AFTER it. Locals drop in
         // reverse declaration order, and `warm_up_stream` below can fail: with
         // the guard declared second, that `?` dropped it first and sent the
@@ -2986,6 +3020,7 @@ impl IrCamera {
             lit: mode.lit(),
             _mode: mode,
             meta,
+            _session_slot: session_slot,
         })
     }
 }
@@ -3013,6 +3048,8 @@ pub struct IrSession<'a> {
     /// Never read. It is held for its `Drop`, which is the whole point, and the
     /// dead-code lint cannot see that.
     _mode: ir_emitter::StreamMode,
+    /// Reset last, after image/metadata STREAMOFF and emitter restoration.
+    _session_slot: SessionSlot<'a>,
 }
 
 impl IrSession<'_> {
@@ -5069,6 +5106,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_slot_is_exclusive_and_reopens_after_drop() {
+        let active = std::sync::atomic::AtomicBool::new(false);
+        let first = SessionSlot::acquire(&active, "/dev/test-camera").unwrap();
+        assert!(SessionSlot::acquire(&active, "/dev/test-camera").is_err());
+        drop(first);
+        assert!(SessionSlot::acquire(&active, "/dev/test-camera").is_ok());
+
+        let active = std::sync::atomic::AtomicBool::new(false);
+        let _ = std::panic::catch_unwind(|| {
+            let _slot = SessionSlot::acquire(&active, "/dev/test-camera").unwrap();
+            panic!("synthetic session panic");
+        });
+        assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn a_rate_without_the_timeperframe_capability_is_unknown() {

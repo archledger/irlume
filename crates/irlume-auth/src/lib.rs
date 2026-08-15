@@ -8868,10 +8868,9 @@ mod engine_tests {
             "the release must clear BOTH session slots"
         );
 
-        // The observation: fresh camera handles and sessions now succeed because
-        // both buffer queues went back when the held sessions dropped.
-        let after_cam = operation.open_ir(&ir).expect("reopen IR after release");
-        let mut after = after_cam.session().expect("open IR session after release");
+        // The observation: the original cameras accept fresh sessions after
+        // release_held drops both owners and their per-camera slots reset.
+        let mut after = cam.session().expect("open IR session after release");
         let after_capture = after.capture_with_stats();
         assert!(
             after_capture.is_ok(),
@@ -8880,11 +8879,8 @@ mod engine_tests {
             after_capture.err()
         );
         drop(after);
-        // The RGB half too: a fresh handle and session on the released node must work.
-        let rgb_after_cam = operation.open_rgb(&rgb).expect("reopen RGB after release");
-        let mut rgb_after = rgb_after_cam
-            .session()
-            .expect("open RGB session after release");
+        // The RGB half too: the original camera's session slot must reopen.
+        let mut rgb_after = rgb_cam.session().expect("open RGB session after release");
         assert!(
             rgb_after.frame().is_ok(),
             "after release an RGB session must be able to capture a frame"

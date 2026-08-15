@@ -161,6 +161,20 @@ pub enum IlluminationProvenance {
 pub struct CameraInstanceId(String);
 
 impl CameraInstanceId {
+    /// Mint a nonzero physical-camera instance identifier for this process.
+    pub(crate) fn generate() -> Self {
+        use rand::Rng;
+
+        loop {
+            let mut bytes = [0_u8; 16];
+            rand::rng().fill_bytes(&mut bytes);
+            if bytes.iter().any(|byte| *byte != 0) {
+                let value = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                return Self(value);
+            }
+        }
+    }
+
     /// Validate a lowercase nonzero 128-bit hexadecimal identifier.
     ///
     /// # Errors

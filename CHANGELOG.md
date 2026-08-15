@@ -12,6 +12,12 @@ All notable changes to irlume are documented here. This project adheres to
   probing, pairing, negotiation, privacy, emitter, and capture behavior remain
   unchanged. A v1 evidence schema now fails closed on unknown versions and
   fields (#452).
+- **The camera supervisor now owns process-scoped lifecycle identity.**
+  Distinct CSPRNG physical-camera identifiers and a transactional inventory keep
+  generations monotonic while continuity is proven; removal retires an incarnation
+  permanently, and rediscovery starts a fresh identifier at generation one. Stale,
+  forged, foreign-instance, duplicate, exhausted, and poisoned states fail closed.
+  Capture and hardware-control behavior remain unchanged (#455).
 
 ## [0.10.0] - 2026-08-12
 

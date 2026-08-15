@@ -12,6 +12,7 @@ serde_json.workspace = true
 # Hello-class hardware, and builds from cache. nokhwa wraps this crate anyway.
 v4l = "0.14"
 libc = "0.2"
+rand.workspace = true
 
 [lints]
 workspace = true

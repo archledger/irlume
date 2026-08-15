@@ -999,6 +999,7 @@ version = "0.10.0"
 dependencies = [
  "irlume-common",
  "libc",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "v4l",

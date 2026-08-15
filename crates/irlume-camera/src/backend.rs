@@ -3,8 +3,12 @@
 
 //! Crate-private capture-backend ownership and operation routing.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::contracts::CameraDescriptor;
+use crate::inventory::{
+    CameraInventory, CameraInventoryError, CameraInventoryEvent, CameraObservation,
+};
 use crate::{CameraPair, IrCamera, NodeScan, RgbCamera, Role};
 
 /// One capture implementation owned by the process camera supervisor.
@@ -23,22 +27,57 @@ trait CameraBackend: Send + Sync + 'static {
 
 /// Process component that owns camera backend instances and routes operations.
 ///
-/// This foundation deliberately has no mutex, mutable inventory, cache, lease,
-/// or lifecycle generation. Those would alter contention or hotplug behavior.
+/// Inventory mutation is isolated from capture routing. Leases and hotplug event
+/// subscription remain later slices and therefore cannot alter behavior here.
 struct CameraSupervisor {
     backend: Arc<dyn CameraBackend>,
+    inventory: Mutex<CameraInventory>,
 }
 
 impl CameraSupervisor {
     fn new(backend: impl CameraBackend) -> Self {
+        Self::from_arc(Arc::new(backend))
+    }
+
+    fn from_arc(backend: Arc<dyn CameraBackend>) -> Self {
         Self {
-            backend: Arc::new(backend),
+            backend,
+            inventory: Mutex::new(CameraInventory::new()),
         }
     }
 
-    #[cfg(test)]
-    fn from_arc(backend: Arc<dyn CameraBackend>) -> Self {
-        Self { backend }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the udev adapter will feed inventory observations"
+        )
+    )]
+    fn reconcile_inventory(
+        &self,
+        observations: Vec<CameraObservation>,
+    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .reconcile(observations)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "later frame and session slices validate descriptors"
+        )
+    )]
+    fn validate_descriptor(
+        &self,
+        descriptor: &CameraDescriptor,
+    ) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .validate(descriptor)
     }
 
     fn scan_nodes(&self) -> NodeScan {
@@ -155,15 +194,15 @@ fn default_camera_supervisor() -> &'static CameraSupervisor {
 
 #[cfg(test)]
 thread_local! {
-    static TEST_BACKEND: std::cell::RefCell<Option<Arc<dyn CameraBackend>>> =
+    static TEST_SUPERVISOR: std::cell::RefCell<Option<Arc<CameraSupervisor>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Route one compatibility operation through the process supervisor.
 fn with_camera_supervisor<T>(operation: impl FnOnce(&CameraSupervisor) -> T) -> T {
     #[cfg(test)]
-    if let Some(backend) = TEST_BACKEND.with(|slot| slot.borrow().clone()) {
-        return operation(&CameraSupervisor::from_arc(backend));
+    if let Some(supervisor) = TEST_SUPERVISOR.with(|slot| slot.borrow().clone()) {
+        return operation(&supervisor);
     }
 
     operation(default_camera_supervisor())
@@ -194,19 +233,20 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::contracts::CameraInstanceId;
     use crate::{FailedAt, McCentric, Unreadable};
 
-    struct TestBackendGuard(Option<Arc<dyn CameraBackend>>);
+    struct TestBackendGuard(Option<Arc<CameraSupervisor>>);
 
     impl Drop for TestBackendGuard {
         fn drop(&mut self) {
             let previous = self.0.take();
-            TEST_BACKEND.with(|slot| *slot.borrow_mut() = previous);
+            TEST_SUPERVISOR.with(|slot| *slot.borrow_mut() = previous);
         }
     }
 
-    fn install_test_backend(backend: Arc<dyn CameraBackend>) -> TestBackendGuard {
-        let previous = TEST_BACKEND.with(|slot| slot.borrow_mut().replace(backend));
+    fn install_test_supervisor(supervisor: Arc<CameraSupervisor>) -> TestBackendGuard {
+        let previous = TEST_SUPERVISOR.with(|slot| slot.borrow_mut().replace(supervisor));
         TestBackendGuard(previous)
     }
 
@@ -321,9 +361,11 @@ mod tests {
     #[test]
     fn public_camera_entrypoints_route_through_one_supervisor_backend() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let _guard = install_test_backend(Arc::new(RecordingBackend {
+        let supervisor = Arc::new(CameraSupervisor::from_arc(Arc::new(RecordingBackend {
             calls: Arc::clone(&calls),
-        }));
+        })));
+        let _guard = install_test_supervisor(Arc::clone(&supervisor));
+        with_camera_supervisor(|routed| assert!(std::ptr::eq(routed, supervisor.as_ref())));
 
         assert_eq!(crate::scan_nodes().classified[0].0, "/dev/spy-scan");
         assert_eq!(
@@ -425,6 +467,48 @@ mod tests {
             .expect("fixture IR open must refuse")
             .to_string()
             .contains("fixture IR"));
+    }
+
+    #[test]
+    fn supervisor_owns_and_validates_one_inventory_instance() {
+        let backend = Arc::new(RecordingBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let supervisor = CameraSupervisor::from_arc(backend);
+        let observation = CameraObservation::new(
+            crate::contracts::BackendKind::UvcV4l2,
+            crate::contracts::PhysicalCameraId::new("/devices/pci/camera", None).unwrap(),
+            crate::contracts::CameraCapabilities::new(
+                vec![crate::contracts::StreamRole::Rgb],
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let added = supervisor.reconcile_inventory(vec![observation]).unwrap();
+        assert_eq!(added.len(), 1);
+        assert!(CameraInstanceId::new(added[0].descriptor().camera_instance_id().as_str()).is_ok());
+        assert!(supervisor
+            .validate_descriptor(added[0].descriptor())
+            .is_ok());
+    }
+
+    #[test]
+    fn supervisor_inventory_poison_fails_closed() {
+        let backend = Arc::new(RecordingBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let supervisor = CameraSupervisor::from_arc(backend);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = supervisor.inventory.lock().unwrap();
+            panic!("poison inventory fixture");
+        }));
+
+        assert_eq!(
+            supervisor.reconcile_inventory(Vec::new()),
+            Err(CameraInventoryError::Poisoned)
+        );
     }
 
     #[test]

@@ -32,6 +32,38 @@ fn capabilities() -> CameraCapabilities {
 }
 
 #[test]
+fn safe_stream_validates_both_sides_of_blocking_dequeue() {
+    let source = include_str!("../src/lib.rs");
+    let start = source
+        .find("    fn next(&mut self) -> std::io::Result<(&[u8], &v4l::buffer::Metadata)> {")
+        .expect("SafeStream::next exists");
+    let body = &source[start
+        ..source[start..]
+            .find(
+                "
+    }
+}
+
+impl<'a> std::ops::Deref",
+            )
+            .map(|end| start + end)
+            .expect("SafeStream::next body ends before Deref")];
+    let dequeue = body
+        .find("CaptureStream::next")
+        .expect("blocking dequeue exists");
+    let checks: Vec<_> = body
+        .match_indices("require_endpoint")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        2,
+        "SafeStream must validate before and after dequeue"
+    );
+    assert!(checks[0] < dequeue && dequeue < checks[1]);
+}
+
+#[test]
 fn camera_descriptor_v1_has_a_stable_wire_shape() {
     let descriptor = CameraDescriptor::new(
         BackendKind::UvcV4l2,

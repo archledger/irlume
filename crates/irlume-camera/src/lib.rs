@@ -621,12 +621,22 @@ impl<'a> SafeStream<'a> {
     }
 
     fn next(&mut self) -> std::io::Result<(&[u8], &v4l::buffer::Metadata)> {
-        self.lease
-            .require_endpoint(&self.device)
+        let Self {
+            inner,
+            device,
+            lease,
+            ..
+        } = self;
+        lease
+            .require_endpoint(device)
             .map_err(std::io::Error::other)?;
-        v4l::io::traits::CaptureStream::next(
-            self.inner.as_mut().expect("stream taken only in Drop"),
-        )
+        let frame = v4l::io::traits::CaptureStream::next(
+            inner.as_mut().expect("stream taken only in Drop"),
+        )?;
+        lease
+            .require_endpoint(device)
+            .map_err(std::io::Error::other)?;
+        Ok(frame)
     }
 }
 

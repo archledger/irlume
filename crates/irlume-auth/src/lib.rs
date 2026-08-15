@@ -8839,8 +8839,14 @@ mod engine_tests {
     fn loopback_release_held_hands_the_camera_back() {
         let (rgb, ir) = loopback_pair();
         let _g = env_guard();
-        let cam = irlume_camera::IrCamera::open(&ir).expect("open the IR node");
-        let rgb_cam = irlume_camera::RgbCamera::open(&rgb).expect("open the RGB node");
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &[rgb.as_str(), ir.as_str()],
+            irlume_camera::lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire one RGB+IR operation");
+        let cam = operation.open_ir(&ir).expect("open the IR node");
+        let rgb_cam = operation.open_rgb(&rgb).expect("open the RGB node");
         let mut held_ir = Some(cam.session().expect("hold an IR session"));
         // BOTH halves must release: the review round noted the test proved
         // only the IR side, and release_held drops two owners.
@@ -8848,11 +8854,11 @@ mod engine_tests {
 
         // Control: with the session alive, a second stream on the same node
         // must be refused. If this passes, the rest proves nothing.
-        let busy =
-            irlume_camera::capture_ir_streaming(&ir, 2, |_| std::ops::ControlFlow::Break::<()>(()));
+        let busy_ir = cam.session();
+        let busy_rgb = rgb_cam.session();
         assert!(
-            busy.is_err(),
-            "control failed: a live IrSession must block a second stream, or this \
+            busy_ir.is_err() && busy_rgb.is_err(),
+            "control failed: live IR and RGB sessions must each block a second stream, or this \
              test cannot distinguish a real release from a camera nobody held"
         );
 
@@ -8862,20 +8868,26 @@ mod engine_tests {
             "the release must clear BOTH session slots"
         );
 
-        // The observation: the same call now succeeds, because the buffer queue
-        // went back when the session dropped.
-        let after =
-            irlume_camera::capture_ir_streaming(&ir, 2, |_| std::ops::ControlFlow::Break::<()>(()));
+        // The observation: fresh camera handles and sessions now succeed because
+        // both buffer queues went back when the held sessions dropped.
+        let after_cam = operation.open_ir(&ir).expect("reopen IR after release");
+        let mut after = after_cam.session().expect("open IR session after release");
+        let after_capture = after.capture_with_stats();
         assert!(
-            after.is_ok(),
-            "after release the consent watch must be able to open its own \
+            after_capture.is_ok(),
+            "after release the consent watch must be able to capture from its own \
              stream, got {:?}",
-            after.err()
+            after_capture.err()
         );
-        // The RGB half too: a fresh capture on the released node must work.
+        drop(after);
+        // The RGB half too: a fresh handle and session on the released node must work.
+        let rgb_after_cam = operation.open_rgb(&rgb).expect("reopen RGB after release");
+        let mut rgb_after = rgb_after_cam
+            .session()
+            .expect("open RGB session after release");
         assert!(
-            irlume_camera::capture_rgb(&rgb).is_ok(),
-            "after release an RGB capture must be able to open the node"
+            rgb_after.frame().is_ok(),
+            "after release an RGB session must be able to capture a frame"
         );
     }
 

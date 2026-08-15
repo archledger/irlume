@@ -78,8 +78,101 @@ verify_physical_uvc_node() {
     fi
 }
 
+unit_active_state() {
+    local unit=$1
+    local state
+    state=$(systemctl show --property=ActiveState --value "$unit") || {
+        echo "hardware-run: could not read $unit ActiveState" >&2
+        return 1
+    }
+    case "$state" in
+        active | activating | deactivating | reloading | refreshing | inactive | failed)
+            printf '%s\n' "$state"
+            ;;
+        *)
+            echo "hardware-run: unexpected $unit ActiveState=$state" >&2
+            return 1
+            ;;
+    esac
+}
+
+snapshot_unit_active() {
+    local unit=$1
+    local state
+    state=$(unit_active_state "$unit") || return 1
+    case "$state" in
+        active)
+            printf '1\n'
+            ;;
+        inactive | failed)
+            printf '0\n'
+            ;;
+        *)
+            echo "hardware-run: refusing transitional $unit ActiveState=$state" >&2
+            return 1
+            ;;
+    esac
+}
+
+unit_is_quiescent() {
+    local state
+    state=$(unit_active_state "$1") || return 1
+    case "$state" in
+        inactive | failed)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+require_restored_state() {
+    local unit=$1
+    local expected_active=$2
+    local state
+    state=$(unit_active_state "$unit") || return 1
+    if [ "$expected_active" -eq 1 ] && [ "$state" = active ]; then
+        return 0
+    fi
+    if [ "$expected_active" -eq 0 ]; then
+        case "$state" in
+            inactive | failed)
+                return 0
+                ;;
+        esac
+    fi
+    echo "hardware-run: could not restore $unit expected_active=$expected_active state=$state" >&2
+    return 1
+}
+
 verify_tree "$source_worktree"
-was_active=0
+umask 077
+runtime_dir="/run/user/$(id -u)"
+if [ -L "$runtime_dir" ] || [ ! -d "$runtime_dir" ] \
+    || [ "$(realpath "$runtime_dir")" != "$runtime_dir" ] \
+    || [ "$(stat -c %u "$runtime_dir")" != "$(id -u)" ] \
+    || [ "$(stat -c %a "$runtime_dir")" != 700 ]; then
+    echo "hardware-run: trusted per-user runtime directory unavailable: $runtime_dir" >&2
+    exit 1
+fi
+lock_dir="$runtime_dir/irlume-slice4-hardware.lock"
+if ! mkdir -m 700 "$lock_dir" 2>/dev/null; then
+    if [ -L "$lock_dir" ] || [ ! -d "$lock_dir" ] \
+        || [ "$(realpath "$lock_dir")" != "$lock_dir" ] \
+        || [ "$(stat -c %u "$lock_dir")" != "$(id -u)" ] \
+        || [ "$(stat -c %a "$lock_dir")" != 700 ]; then
+        echo "hardware-run: unsafe hardware lock directory: $lock_dir" >&2
+        exit 1
+    fi
+fi
+if [ "${IRLUME_SLICE4_LOCK_HELD:-}" != 1 ]; then
+    exec env IRLUME_SLICE4_LOCK_HELD=1 python3 \
+        "$script_dir/slice4-runner-support.py" hold-lock "$lock_dir" "$0" "$@"
+fi
+unset IRLUME_SLICE4_LOCK_HELD
+service_was_active=$(snapshot_unit_active irlumed.service)
+socket_was_active=$(snapshot_unit_active irlumed.socket)
 users_file=$(mktemp)
 fuser_errors=$(mktemp)
 snapshot_parent=$(mktemp -d)
@@ -87,37 +180,70 @@ snapshot="$snapshot_parent/source"
 build_dir=$(mktemp -d)
 hardware_pid=""
 evidence_tmp=""
+evidence=""
+evidence_published=0
+units_restored=0
+log=""
 
-restore_service() {
-    if [ "$was_active" -eq 1 ]; then
-        if ! systemctl is-active --quiet irlumed.service; then
-            sudo -n systemctl start irlumed.service
-        fi
-        systemctl is-active --quiet irlumed.service || {
-            echo "hardware-run: could not restore irlumed" >&2
-            return 1
-        }
-        was_active=0
+restore_one_unit() {
+    local unit=$1
+    local expected_active=$2
+    local state
+    state=$(unit_active_state "$unit") || return 1
+    if [ "$expected_active" -eq 1 ] && [ "$state" != active ]; then
+        sudo -n systemctl start "$unit" || return 1
     fi
+    if [ "$expected_active" -eq 0 ] && ! unit_is_quiescent "$unit"; then
+        sudo -n systemctl stop "$unit" || return 1
+    fi
+    require_restored_state "$unit" "$expected_active" || return 1
+}
+
+restore_units() {
+    # Restore the service before its socket so an arriving client cannot race
+    # socket activation ahead of the service state we observed.
+    restore_one_unit irlumed.service "$service_was_active" || return 1
+    restore_one_unit irlumed.socket "$socket_was_active" || return 1
+    # Starting an originally-active socket may activate an originally-quiescent
+    # service. Enforce the service's observed state once more before publication.
+    restore_one_unit irlumed.service "$service_was_active" || return 1
+    units_restored=1
 }
 
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
-    if ! restore_service; then
+    if [ "$units_restored" -ne 1 ] && ! restore_units; then
         status=1
     fi
-    cd "$source_worktree" || status=1
+    if ! cd "$source_worktree"; then
+        status=1
+    fi
     if [ -e "$snapshot/.git" ]; then
         if ! git -C "$source_worktree" worktree remove --force "$snapshot"; then
             status=1
         fi
     fi
-    rm -f "$users_file" "$fuser_errors"
-    if [ -n "$evidence_tmp" ]; then
-        rm -f "$evidence_tmp"
+    if ! rm -f "$users_file" "$fuser_errors"; then
+        status=1
     fi
-    rm -rf "$snapshot_parent" "$build_dir"
+    if [ -n "$evidence_tmp" ] && ! rm -f "$evidence_tmp"; then
+        status=1
+    fi
+    if ! rm -rf "$snapshot_parent" "$build_dir"; then
+        status=1
+    fi
+    if [ "$status" -ne 0 ] && [ "$evidence_published" -eq 1 ]; then
+        if rm -f -- "$evidence"; then
+            evidence_published=0
+        else
+            status=1
+        fi
+    fi
+    if [ "$status" -eq 0 ] && [ "$evidence_published" -eq 1 ]; then
+        printf 'hardware-run: PASS host=%s sha=%s log=%s evidence=%s\n' \
+            "$host" "$sha" "$log" "$evidence"
+    fi
     exit "$status"
 }
 
@@ -150,9 +276,15 @@ verify_physical_uvc_node "$rgb"
 if [ "$ir" != "-" ]; then
     verify_physical_uvc_node "$ir"
 fi
-if systemctl is-active --quiet irlumed.service; then
-    was_active=1
+if ! unit_is_quiescent irlumed.socket; then
+    sudo -n systemctl stop irlumed.socket
+fi
+if ! unit_is_quiescent irlumed.service; then
     sudo -n systemctl stop irlumed.service
+fi
+if ! unit_is_quiescent irlumed.socket || ! unit_is_quiescent irlumed.service; then
+    echo "hardware-run: irlume units did not quiesce" >&2
+    exit 1
 fi
 
 nodes=("$rgb")
@@ -197,8 +329,23 @@ else
 fi
 
 output_dir="$source_worktree/target"
-log="$output_dir/slice4-hardware-${host}-${sha}.log"
-mkdir -p "$output_dir"
+if [ -L "$output_dir" ]; then
+    echo "hardware-run: artifact directory must not be a symlink: $output_dir" >&2
+    exit 1
+fi
+if [ ! -e "$output_dir" ]; then
+    mkdir "$output_dir"
+fi
+output_mode=$(stat -c %a "$output_dir")
+if [ ! -d "$output_dir" ] || [ "$(realpath "$output_dir")" != "$output_dir" ] \
+    || [ "$(stat -c %u "$output_dir")" != "$(id -u)" ] \
+    || (( (8#$output_mode & 0022) != 0 )); then
+    echo "hardware-run: unsafe artifact directory: $output_dir" >&2
+    exit 1
+fi
+run_dir=$(mktemp -d "$output_dir/slice4-${host}-${sha}.XXXXXX")
+log="$run_dir/run.log"
+evidence="$run_dir/evidence.json"
 set +e
 timeout --signal=TERM --kill-after=10s 240s \
     env -u IRLUME_TEST_ALLOW_VIRTUAL_CAMERA "${env_args[@]}" \
@@ -213,13 +360,6 @@ set -e
 
 verify_tree "$snapshot"
 verify_tree "$source_worktree"
-if [ "$was_active" -eq 1 ]; then
-    restore_service
-    systemctl is-active --quiet irlumed.service || {
-        echo "hardware-run: irlumed did not restart" >&2
-        exit 1
-    }
-fi
 if [ "$status" -ne 0 ]; then
     echo "hardware-run: test failed with status $status; log=$log" >&2
     exit "$status"
@@ -228,8 +368,7 @@ expected_streams=2
 if [ "$mode" = "rgb-only" ]; then
     expected_streams=1
 fi
-evidence="$output_dir/slice4-hardware-${host}-${sha}.json"
-evidence_tmp=$(mktemp "$output_dir/.slice4-evidence.XXXXXX")
+evidence_tmp=$(mktemp "$run_dir/.evidence.XXXXXX")
 chmod 600 "$evidence_tmp"
 verify_tree "$snapshot"
 verify_tree "$source_worktree"
@@ -238,5 +377,6 @@ verify_tree "$snapshot"
 verify_tree "$source_worktree"
 mv -f -- "$evidence_tmp" "$evidence"
 evidence_tmp=""
-printf 'hardware-run: PASS host=%s sha=%s log=%s evidence=%s\n' \
-    "$host" "$sha" "$log" "$evidence"
+evidence_published=1
+python3 "$script_dir/slice4-runner-support.py" durable-evidence \
+    "$evidence" "$run_dir" "$output_dir" "$source_worktree"

@@ -154,6 +154,15 @@ jobs:
       - name: test
         run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
 
+      # These pure harness contracts are intentionally separate from the ignored
+      # physical-camera test: CI can prove evidence parsing and service/socket
+      # quiescence without claiming physical-device coverage.
+      - name: camera hardware evidence harness contracts
+        run: |
+          python3 scripts/hardware/test-run-slice4-hardware.py
+          python3 scripts/hardware/test-validate-slice4-hardware.py
+          bash -n scripts/hardware/run-slice4-hardware.sh
+
       # The machine API is a promise to other people's software, so it is
       # checked the way a consumer would check it: run the release binary and
       # validate what it actually writes against the published schema, rather

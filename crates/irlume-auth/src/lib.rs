@@ -3069,6 +3069,23 @@ impl Engine {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
         }
+        let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
+        let endpoints: Vec<&str> = if self.ir_available {
+            vec![rgb_dev.as_str(), ir_dev.as_str()]
+        } else {
+            vec![rgb_dev.as_str()]
+        };
+        // One authentication owns its physical camera set from the first
+        // consent frame through the final grace-window retry.  Keeping this
+        // lease across sequential fallbacks is deliberate: otherwise another
+        // operation can interleave between consent and matching.
+        let camera_operation = irlume_camera::lease::acquire_camera_operation(
+            &endpoints,
+            irlume_camera::lease::CameraOperationKind::Authentication,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+
         // Watch for the consent gesture BEFORE the first capture, so a user who
         // nods when the greeter asks is not ignored for the seconds it takes to
         // capture and match a face. Once per authentication, never per retry: a
@@ -3077,7 +3094,8 @@ impl Engine {
         self.gesture_seen_before_match = false;
         self.gesture_cancelled = false;
         if purpose.demands_gesture(service) {
-            self.gesture_seen_before_match = self.early_consent_watch(&enr)?;
+            self.gesture_seen_before_match =
+                Self::run_camera_operation(&camera_operation, || self.early_consent_watch(&enr))?;
             // A head-shake during the pre-match watch is an explicit decline.
             // Close the request now: do not spend the capture and match only to
             // deny after a second post-match watch, and do not let a later cue
@@ -3103,7 +3121,6 @@ impl Engine {
         // below tries to open the same device again, which is EBUSY on a
         // single-consumer camera and on any v4l2loopback node with a producer
         // attached.
-        let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let (sequential, _mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
         // Declared in reverse drop order: the sessions borrow from `_cams`, so
         // Rust drops the sessions first and the cameras after.
@@ -3117,50 +3134,41 @@ impl Engine {
         // so the watch's S_FMT and REQBUFS hit EBUSY against this very process:
         // the self-collision #187 diagnosed, reintroduced by #346 and caught by
         // the release audit before it shipped.
-        let mut camera_operation: Option<irlume_camera::lease::CameraOperationSession> = None;
         let mut _cams: Option<(irlume_camera::RgbCamera, irlume_camera::IrCamera)> = None;
         let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
         let mut held_ir: Option<irlume_camera::IrSession<'_>> = None;
         if !sequential && self.ir_available {
-            if let Ok(operation) = irlume_camera::lease::acquire_camera_operation(
-                &[rgb_dev.as_str(), ir_dev.as_str()],
-                irlume_camera::lease::CameraOperationKind::Authentication,
-                std::time::Duration::from_secs(2),
+            if let (Ok(r), Ok(i)) = (
+                camera_operation.open_rgb(&rgb_dev),
+                camera_operation.open_ir(&ir_dev),
             ) {
-                if let (Ok(r), Ok(i)) = (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
-                    camera_operation = Some(operation);
-                    _cams = Some((r, i));
-                    let progress = self.capture_progress();
-                    // SAFETY: _cams is Some, and _rs/_is borrow from it. _cams is
-                    // declared before _rs/_is so it outlives them.
-                    let (ref cam_r, ref cam_i) = _cams.as_ref().unwrap();
-                    if let (Ok(rs), Ok(is)) = (
-                        cam_r.session_with_progress(&progress),
-                        cam_i.session_with_progress(&progress),
-                    ) {
-                        held_rgb = Some(rs);
-                        held_ir = Some(is);
-                    }
+                _cams = Some((r, i));
+                let progress = self.capture_progress();
+                // SAFETY: _cams is Some, and _rs/_is borrow from it. _cams is
+                // declared before _rs/_is so it outlives them.
+                let (ref cam_r, ref cam_i) = _cams.as_ref().unwrap();
+                if let (Ok(rs), Ok(is)) = (
+                    cam_r.session_with_progress(&progress),
+                    cam_i.session_with_progress(&progress),
+                ) {
+                    held_rgb = Some(rs);
+                    held_ir = Some(is);
                 }
             }
         }
         let mut attempt = 0u32;
         let out = loop {
             attempt += 1;
-            let out = if let Some(operation) = camera_operation.as_ref() {
-                Self::run_camera_operation(operation, || {
-                    self.authenticate_once(
-                        &enr,
-                        purpose,
-                        service,
-                        &mut held_rgb,
-                        &mut held_ir,
-                        Some(operation),
-                    )
-                })?
-            } else {
-                self.authenticate_once(&enr, purpose, service, &mut held_rgb, &mut held_ir, None)?
-            };
+            let out = Self::run_camera_operation(&camera_operation, || {
+                self.authenticate_once(
+                    &enr,
+                    purpose,
+                    service,
+                    &mut held_rgb,
+                    &mut held_ir,
+                    Some(&camera_operation),
+                )
+            })?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
                 if attempt > 1 {
                     irlume_common::dlog!(
@@ -3196,7 +3204,9 @@ impl Engine {
         held_ir: &mut Option<irlume_camera::IrSession<'_>>,
         operation: Option<&irlume_camera::lease::CameraOperationSession>,
     ) -> irlume_common::Result<Outcome> {
-        let a = if let (Some(rs), Some(is), Some(operation)) =
+        let a = if !self.ir_available {
+            self.assess_rgb_only()?
+        } else if let (Some(rs), Some(is), Some(operation)) =
             (held_rgb.as_mut(), held_ir.as_mut(), operation)
         {
             self.assess_full_with(Some((rs, is)), None, operation)?

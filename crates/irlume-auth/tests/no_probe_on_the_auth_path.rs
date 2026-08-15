@@ -82,3 +82,48 @@ fn the_authentication_path_never_runs_the_capture_mode_probe() {
         offenders.join("\n")
     );
 }
+
+#[test]
+fn one_camera_operation_spans_consent_and_every_authentication_retry() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("read irlume-auth/src/lib.rs");
+    let start = text
+        .find("    pub fn authenticate_for(")
+        .expect("authenticate_for exists");
+    let end = text[start..]
+        .find("\n    fn authenticate_once(")
+        .map(|offset| start + offset)
+        .expect("authenticate_once follows authenticate_for");
+    let body = &text[start..end];
+
+    let acquire = body
+        .find("acquire_camera_operation(")
+        .expect("authentication acquires a camera operation");
+    let consent = body
+        .find("self.early_consent_watch")
+        .expect("pre-match consent watch exists");
+    let retries = body
+        .find("let out = loop {")
+        .expect("grace retry loop exists");
+
+    assert_eq!(
+        body.matches("acquire_camera_operation(").count(),
+        1,
+        "authenticate_for must acquire exactly one operation"
+    );
+    assert!(acquire < consent && consent < retries);
+    assert!(body.contains("Self::run_camera_operation(&camera_operation"));
+    assert!(body.contains("Some(&camera_operation)"));
+
+    let once_start = text[end..]
+        .find("    fn authenticate_once(")
+        .map(|offset| end + offset)
+        .expect("authenticate_once exists");
+    let once_end = text[once_start..]
+        .find("\n    fn ")
+        .map(|offset| once_start + offset)
+        .expect("another method follows authenticate_once");
+    let once = &text[once_start..once_end];
+    assert!(once.contains("if !self.ir_available"));
+    assert!(once.contains("self.assess_rgb_only()?"));
+}

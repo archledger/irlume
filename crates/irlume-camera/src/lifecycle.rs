@@ -525,6 +525,13 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Default)]
+struct UdevCameraGroup {
+    serial: Option<String>,
+    evidence: Vec<String>,
+    endpoints: Vec<String>,
+}
+
 fn devpath(path: &Path) -> String {
     match path.strip_prefix("/sys") {
         Ok(relative) => format!("/{}", relative.to_string_lossy()),
@@ -580,8 +587,9 @@ impl SnapshotSource for SysfsSnapshotSource {
 fn observations_from_records(
     records: Vec<UdevNodeRecord>,
 ) -> Result<Vec<CameraObservation>, LifecycleError> {
-    let mut groups: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, UdevCameraGroup> = BTreeMap::new();
     for record in records {
+        let endpoint = record.devnode.clone();
         let evidence = format!(
             "{}|{}|{}|{}",
             record.node_devpath,
@@ -595,26 +603,31 @@ fn observations_from_records(
         );
         let group = groups
             .entry(record.usb_devpath.clone())
-            .or_insert_with(|| (record.serial.clone(), Vec::new()));
-        if group.0 != record.serial {
+            .or_insert_with(|| UdevCameraGroup {
+                serial: record.serial.clone(),
+                ..UdevCameraGroup::default()
+            });
+        if group.serial != record.serial {
             return Err(LifecycleError::Snapshot(format!(
                 "conflicting serial evidence for {}",
                 record.usb_devpath
             )));
         }
-        group.1.push(evidence);
+        group.evidence.push(evidence);
+        group.endpoints.push(endpoint);
     }
 
     groups
         .into_iter()
-        .map(|(topology_path, (serial, evidence))| {
-            let physical_id = PhysicalCameraId::new(topology_path, serial)
+        .map(|(topology_path, group)| {
+            let physical_id = PhysicalCameraId::new(topology_path, group.serial)
                 .map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
-            Ok(CameraObservation::with_lifecycle_evidence(
+            Ok(CameraObservation::with_lifecycle_evidence_and_endpoints(
                 BackendKind::UvcV4l2,
                 physical_id,
                 CameraCapabilities::default(),
-                evidence,
+                group.evidence,
+                group.endpoints,
             ))
         })
         .collect()
@@ -648,26 +661,40 @@ impl<I: InventorySink> Drop for WorkerExitGuard<'_, I> {
 pub(crate) fn spawn(supervisor: Weak<CameraSupervisor>) -> Result<(), LifecycleError> {
     let mut coordinator =
         bind_monitor_before_snapshot(UdevEventSource::new, SysfsSnapshotSource::default)?;
-    std::thread::Builder::new()
+    let Some(supervisor) = supervisor.upgrade() else {
+        return Ok(());
+    };
+    coordinator.initialize(supervisor.as_ref())?;
+    let worker_supervisor = supervisor.clone();
+    let spawned = std::thread::Builder::new()
         .name("irlume-camera-udev".into())
         .spawn(move || {
-            let Some(supervisor) = supervisor.upgrade() else {
-                return;
-            };
-            let _exit_guard = WorkerExitGuard::new(supervisor.as_ref());
-            if let Err(error) = coordinator.initialize(supervisor.as_ref()) {
-                eprintln!("irlume: camera lifecycle monitor stopped: {error}");
-                return;
-            }
+            let _exit_guard = WorkerExitGuard::new(worker_supervisor.as_ref());
             loop {
-                if let Err(error) = coordinator.process_next(supervisor.as_ref(), MONITOR_WAIT) {
+                if let Err(error) =
+                    coordinator.process_next(worker_supervisor.as_ref(), MONITOR_WAIT)
+                {
                     eprintln!("irlume: camera lifecycle monitor stopped: {error}");
                     return;
                 }
             }
-        })
-        .map_err(|error| LifecycleError::Monitor(error.to_string()))?;
-    Ok(())
+        });
+    finish_spawn(supervisor.as_ref(), spawned)
+}
+
+fn finish_spawn<I: InventorySink>(
+    inventory: &I,
+    spawned: std::io::Result<std::thread::JoinHandle<()>>,
+) -> Result<(), LifecycleError> {
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            inventory
+                .invalidate_all()
+                .map_err(LifecycleError::Inventory)?;
+            Err(LifecycleError::Monitor(error.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1023,6 +1050,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut source = SysfsSnapshotSource { root };
         assert_eq!(source.snapshot(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn thread_spawn_failure_invalidates_published_inventory() {
+        let inventory = TestInventory::new();
+        let descriptor = inventory
+            .reconcile(vec![observation("published")])
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event {
+                CameraInventoryEvent::Added(descriptor) => Some(descriptor),
+                _ => None,
+            })
+            .unwrap();
+        let spawned: std::io::Result<std::thread::JoinHandle<()>> =
+            Err(std::io::Error::other("synthetic spawn failure"));
+
+        assert!(matches!(
+            finish_spawn(&inventory, spawned),
+            Err(LifecycleError::Monitor(_))
+        ));
+        assert!(matches!(
+            inventory.validate(&descriptor),
+            Err(CameraInventoryError::ContinuityLost)
+        ));
     }
 
     #[test]

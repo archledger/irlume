@@ -24,6 +24,12 @@ All notable changes to irlume are documented here. This project adheres to
   nodes. Monitor loss, overflow, unstable scans, and continuity loss retire stale
   references before replacements become visible; capture and hardware-control behavior
   remain unchanged (#456).
+- **Camera operations now share one descriptor-bound cooperative lease.**
+  Authentication and enrollment acquire RGB+IR atomically by physical camera identity;
+  diagnostics, preview, setup, raw controls, and legacy single-node opens use the same
+  authority. Lifecycle invalidation makes held permits stale before the next dequeue or
+  control, explicit operation scopes cross only opted-in worker threads, and drop/panic
+  paths release leases without path-only identity fallbacks (#461).
 
 ## [0.10.0] - 2026-08-12
 

@@ -10,8 +10,6 @@
 //!
 //! Usage: cargo run --release -p irlume-camera --example session_bench -- [rgb_dev] [ir_dev] [pairs]
 
-use irlume_camera::{IrCamera, RgbCamera};
-
 fn main() {
     let mut a = std::env::args().skip(1);
     let rgb_dev = a.next().unwrap_or_else(|| "/dev/video0".into());
@@ -30,14 +28,23 @@ fn main() {
     }
     let per_call = t0.elapsed();
 
-    let rgb_cam = match RgbCamera::open(&rgb_dev) {
+    let operation = irlume_camera::lease::acquire_camera_operation(
+        &[rgb_dev.as_str(), ir_dev.as_str()],
+        irlume_camera::lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("pair lease failed: {error}");
+        std::process::exit(1);
+    });
+    let rgb_cam = match operation.open_rgb(&rgb_dev) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("rgb open failed: {e}");
             std::process::exit(1);
         }
     };
-    let ir_cam = match IrCamera::open(&ir_dev) {
+    let ir_cam = match operation.open_ir(&ir_dev) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ir open failed: {e}");

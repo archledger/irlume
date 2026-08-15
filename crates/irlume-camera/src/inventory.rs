@@ -24,6 +24,7 @@ pub(crate) struct CameraObservation {
     physical_id: PhysicalCameraId,
     capabilities: CameraCapabilities,
     lifecycle_evidence: Vec<String>,
+    endpoint_paths: Vec<String>,
 }
 
 impl CameraObservation {
@@ -37,6 +38,7 @@ impl CameraObservation {
             physical_id,
             capabilities,
             lifecycle_evidence: Vec::new(),
+            endpoint_paths: Vec::new(),
         }
     }
 
@@ -44,15 +46,34 @@ impl CameraObservation {
         backend: BackendKind,
         physical_id: PhysicalCameraId,
         capabilities: CameraCapabilities,
+        lifecycle_evidence: Vec<String>,
+    ) -> Self {
+        Self::with_lifecycle_evidence_and_endpoints(
+            backend,
+            physical_id,
+            capabilities,
+            lifecycle_evidence,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn with_lifecycle_evidence_and_endpoints(
+        backend: BackendKind,
+        physical_id: PhysicalCameraId,
+        capabilities: CameraCapabilities,
         mut lifecycle_evidence: Vec<String>,
+        mut endpoint_paths: Vec<String>,
     ) -> Self {
         lifecycle_evidence.sort();
         lifecycle_evidence.dedup();
+        endpoint_paths.sort();
+        endpoint_paths.dedup();
         Self {
             backend,
             physical_id,
             capabilities,
             lifecycle_evidence,
+            endpoint_paths,
         }
     }
 
@@ -151,11 +172,16 @@ pub(crate) enum CameraInventoryError {
 pub(crate) struct CameraInventoryRef {
     descriptor: CameraDescriptor,
     lifecycle_evidence: Vec<String>,
+    endpoint_paths: Vec<String>,
 }
 
 impl CameraInventoryRef {
     pub(crate) fn descriptor(&self) -> &CameraDescriptor {
         &self.descriptor
+    }
+
+    pub(crate) fn endpoint_paths(&self) -> &[String] {
+        &self.endpoint_paths
     }
 }
 
@@ -368,8 +394,43 @@ impl CameraInventory {
             .map(|entry| CameraInventoryRef {
                 descriptor: entry.descriptor.clone(),
                 lifecycle_evidence: entry.observation.lifecycle_evidence.clone(),
+                endpoint_paths: entry.observation.endpoint_paths.clone(),
             })
             .collect()
+    }
+
+    pub(crate) fn reference_for_endpoints(
+        &self,
+        endpoint_paths: &[&str],
+    ) -> Result<CameraInventoryRef, CameraInventoryError> {
+        if endpoint_paths.is_empty() {
+            return Err(CameraInventoryError::UnknownCamera);
+        }
+        let requested: BTreeSet<_> = endpoint_paths.iter().copied().collect();
+        let mut matches = self.active.values().filter(|entry| {
+            requested.iter().all(|path| {
+                entry
+                    .observation
+                    .endpoint_paths
+                    .iter()
+                    .any(|known| known == path)
+            })
+        });
+        let entry = matches.next().ok_or(CameraInventoryError::UnknownCamera)?;
+        if matches.next().is_some() {
+            return Err(CameraInventoryError::DescriptorMismatch);
+        }
+        if self
+            .invalidated_instance_ids
+            .contains(entry.descriptor.camera_instance_id())
+        {
+            return Err(CameraInventoryError::ContinuityLost);
+        }
+        Ok(CameraInventoryRef {
+            descriptor: entry.descriptor.clone(),
+            lifecycle_evidence: entry.observation.lifecycle_evidence.clone(),
+            endpoint_paths: entry.observation.endpoint_paths.clone(),
+        })
     }
 
     pub(crate) fn validate_reference(
@@ -382,6 +443,9 @@ impl CameraInventory {
             .get(reference.descriptor().physical_id().topology_path())
             .ok_or(CameraInventoryError::UnknownCamera)?;
         if active.observation.lifecycle_evidence != reference.lifecycle_evidence {
+            return Err(CameraInventoryError::DescriptorMismatch);
+        }
+        if active.observation.endpoint_paths != reference.endpoint_paths {
             return Err(CameraInventoryError::DescriptorMismatch);
         }
         Ok(())
@@ -442,7 +506,7 @@ impl CameraInventory {
     }
 
     #[cfg(test)]
-    fn with_instance_ids_for_test(ids: Vec<CameraInstanceId>) -> Self {
+    pub(crate) fn with_instance_ids_for_test(ids: Vec<CameraInstanceId>) -> Self {
         let fallback = ids.last().cloned().expect("at least one fixture ID");
         let mut ids = ids.into_iter();
         Self::with_instance_id_source(Box::new(move || {
@@ -480,6 +544,49 @@ mod tests {
             CameraCapabilities::new(roles.to_vec(), Default::default(), Vec::new())
                 .expect("valid capabilities"),
         )
+    }
+
+    fn observation_with_endpoints(path: &str, endpoints: &[&str]) -> CameraObservation {
+        CameraObservation::with_lifecycle_evidence_and_endpoints(
+            BackendKind::UvcV4l2,
+            PhysicalCameraId::new(path, None).expect("valid physical id"),
+            CameraCapabilities::default(),
+            endpoints
+                .iter()
+                .map(|endpoint| format!("evidence:{endpoint}"))
+                .collect(),
+            endpoints
+                .iter()
+                .map(|endpoint| (*endpoint).to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn endpoint_lookup_binds_pair_to_one_descriptor_and_rejects_invalidation() {
+        let mut inventory = CameraInventory::with_instance_ids_for_test(vec![instance('1')]);
+        inventory
+            .reconcile(vec![observation_with_endpoints(
+                "/devices/pci/usb1/camera",
+                &["/dev/video0", "/dev/video2"],
+            )])
+            .unwrap();
+
+        let reference = inventory
+            .reference_for_endpoints(&["/dev/video2", "/dev/video0"])
+            .expect("both paths belong to one live camera");
+        assert_eq!(reference.endpoint_paths(), ["/dev/video0", "/dev/video2"]);
+        inventory.validate_reference(&reference).unwrap();
+
+        inventory.invalidate_all();
+        assert_eq!(
+            inventory.reference_for_endpoints(&["/dev/video0"]),
+            Err(CameraInventoryError::ContinuityLost)
+        );
+        assert_eq!(
+            inventory.validate_reference(&reference),
+            Err(CameraInventoryError::ContinuityLost)
+        );
     }
 
     fn generation(event: &CameraInventoryEvent) -> u64 {

@@ -52,6 +52,12 @@ fn run() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("selector {selector}: {e}"))?;
 
+    let operation = irlume_camera::lease::acquire_camera_operation(
+        &[device.as_str()],
+        irlume_camera::lease::CameraOperationKind::Setup,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| error.to_string())?;
     let dev = v4l::Device::with_path(device).map_err(|e| format!("open {device}: {e}"))?;
     let handle = dev.handle();
     let fd = handle.fd();
@@ -99,6 +105,10 @@ fn run() -> Result<(), String> {
         ));
     }
     eprintln!("xu_set: unit{unit}/sel{selector} before: {before:02x?}");
+    operation
+        .lease()
+        .validate()
+        .map_err(|error| error.to_string())?;
     raw::set_cur(fd, unit, selector, &payload)?;
     let after = raw::get_cur(fd, unit, selector, len)?;
     eprintln!("xu_set: unit{unit}/sel{selector} wrote:  {payload:02x?}");

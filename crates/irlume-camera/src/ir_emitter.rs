@@ -538,6 +538,10 @@ pub(crate) mod fake_camera {
         static CAMERA: RefCell<Option<Camera>> = const { RefCell::new(None) };
     }
 
+    pub(crate) fn installed() -> bool {
+        CAMERA.with(|camera| camera.borrow().is_some())
+    }
+
     /// Install a fake for the rest of this test, and take it back at the end.
     pub(crate) struct Installed;
 
@@ -736,7 +740,24 @@ fn get_cur(fd: c_int, unit: u8, selector: u8, size: usize) -> XuResult<Vec<u8>> 
 /// including restores. That claim was made once while the logging sat on a
 /// single path and missed the one actually in use, which is exactly the sort of
 /// thing this project can no longer afford to be casual about.
+fn validate_write_lease(fd: c_int) -> XuResult<()> {
+    #[cfg(test)]
+    if fake_camera::installed() {
+        return Ok(());
+    }
+    let endpoint = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map_err(|_| XuError::Unresponsive(libc::ESTALE))?;
+    let endpoint = endpoint
+        .to_str()
+        .ok_or(XuError::Unresponsive(libc::ESTALE))?;
+    match crate::lease::active_permit(endpoint) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) | Err(_) => Err(XuError::Unresponsive(libc::ESTALE)),
+    }
+}
+
 fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
+    validate_write_lease(fd)?;
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}");
     }
@@ -1364,7 +1385,10 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         None => (None, None, None),
     };
     StreamMode {
-        handle: Some(handle),
+        handle: Some(EmitterHandle {
+            handle,
+            lease: None,
+        }),
         unit,
         selector,
         armed: restore.is_some(),
@@ -1374,6 +1398,19 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         record,
         _lock: lock,
     }
+}
+
+pub(crate) fn enable_with_lease(
+    handle: std::sync::Arc<v4l::device::Handle>,
+    card: &str,
+    device: &str,
+    lease: crate::lease::CameraLease,
+) -> StreamMode {
+    let mut mode = lease.run_active(|| enable(handle, card, device));
+    if let Some(handle) = mode.handle.as_mut() {
+        handle.lease = Some(lease);
+    }
+    mode
 }
 
 /// The face-auth mode held for the lifetime of ONE stream, put back when the
@@ -1398,6 +1435,11 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
 /// `Drop` does the restoring, because the paths that need it most are the ones
 /// no statement covers: an error taken by `?`, a panic in the decoder, a
 /// cancelled request. Same reason the undo record in #183 restores from `Drop`.
+struct EmitterHandle {
+    handle: std::sync::Arc<v4l::device::Handle>,
+    lease: Option<crate::lease::CameraLease>,
+}
+
 #[must_use = "dropping this immediately puts the control back and leaves the stream unlit"]
 pub struct StreamMode {
     /// The open camera the mode was applied through, kept alive for as long as
@@ -1405,7 +1447,7 @@ pub struct StreamMode {
     /// never writes. A raw `c_int` here let a caller drop the `v4l::Device`
     /// first and have the restore land on whatever `open` handed the recycled
     /// number to next (#189); the `Arc` removes that state from the API.
-    handle: Option<std::sync::Arc<v4l::device::Handle>>,
+    handle: Option<EmitterHandle>,
     unit: u8,
     selector: u8,
     /// What the control HELD before irlume touched it, captured before the first
@@ -1492,7 +1534,7 @@ impl StreamMode {
     /// -1 is unreachable from an armed guard: `enable` is the only place that
     /// arms one, and it always installs the handle it wrote through.
     fn fd(&self) -> c_int {
-        self.handle.as_ref().map_or(-1, |h| h.fd())
+        self.handle.as_ref().map_or(-1, |h| h.handle.fd())
     }
 
     /// Whether the emitter control is active for this stream, whoever set it.
@@ -1535,6 +1577,14 @@ impl StreamMode {
     /// all — the mode is still applied, on purpose.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        let lease = self.handle.as_ref().and_then(|handle| handle.lease.clone());
+        if let Some(lease) = lease {
+            return lease.run_active(|| self.restore_inner());
+        }
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> std::result::Result<(), RestoreError> {
         if !self.armed {
             return Ok(());
         }
@@ -4028,6 +4078,17 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn set_cur_refuses_without_a_current_descriptor_bound_lease() {
+        use std::os::fd::AsRawFd;
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(
+            super::set_cur(file.as_raw_fd(), 1, 1, &[0]),
+            Err(super::XuError::Unresponsive(libc::ESTALE))
+        );
+    }
+
     /// The nightly hardware suite greps for this line EXACTLY
     /// (`grep -Fxq` in .github/workflows/hardware-suite.yml), so a reword here
     /// silently turns that gate into one that can never pass, and the camera

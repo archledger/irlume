@@ -5,6 +5,7 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Added
 
 - **Camera discovery and opens now cross one process-owned backend boundary.**
@@ -29,7 +30,15 @@ All notable changes to irlume are documented here. This project adheres to
   diagnostics, preview, setup, raw controls, and legacy single-node opens use the same
   authority. Lifecycle invalidation makes held permits stale before the next dequeue or
   control, explicit operation scopes cross only opted-in worker threads, and drop/panic
-  paths release leases without path-only identity fallbacks (#461).
+ paths release leases without path-only identity fallbacks (#461).
+
+### Fixed
+
+- **CUDA and OpenVINO feature builds compile against pinned `ort` rc.13 again.**
+  The dependency update removed deprecated execution-provider aliases while these
+  two optional paths still referenced them. CI now compiles every supported ONNX
+  execution provider independently and together so future API drift is caught
+  before release (#454).
 
 ## [0.10.0] - 2026-08-12
 

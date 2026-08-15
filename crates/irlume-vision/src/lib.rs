@@ -514,17 +514,13 @@ mod onnx {
         #[cfg(feature = "cuda")]
         {
             b = b
-                .with_execution_providers([
-                    ort::execution_providers::CUDAExecutionProvider::default().build(),
-                ])
+                .with_execution_providers([ort::ep::CUDA::default().build()])
                 .map_err(err)?;
         }
         #[cfg(feature = "openvino")]
         {
             b = b
-                .with_execution_providers([
-                    ort::execution_providers::OpenVINOExecutionProvider::default().build(),
-                ])
+                .with_execution_providers([ort::ep::OpenVINO::default().build()])
                 .map_err(err)?;
         }
         b.with_optimization_level(GraphOptimizationLevel::Level3)

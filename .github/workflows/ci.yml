@@ -142,6 +142,17 @@ jobs:
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets -- -D warnings
 
+      # Optional ONNX Runtime execution providers are compile-time APIs. The
+      # default CPU build cannot catch an upstream rename in one of these paths
+      # (issue #454), so compile every supported provider independently and in
+      # combination whenever dependencies are updated.
+      - name: optional ONNX execution providers compile
+        run: |
+          for feature in cuda openvino coreml tensorrt; do
+            cargo check -p irlume-vision --features "$feature" --locked
+          done
+          cargo check -p irlume-vision --all-features --locked
+
       - name: doc (broken intra-doc links are errors)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 

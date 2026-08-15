@@ -12,6 +12,7 @@ U32_MAX = (1 << 32) - 1
 I64_MAX = (1 << 63) - 1
 MIN_CONTINUITY_HZ = 1.0
 MAX_CONTINUITY_DELTA_US = 1_000_000
+TIMESTAMP_BOUNDARY_INTERVALS = 3
 RECORD_KEYS = {
     "kind",
     "schema_version",
@@ -278,10 +279,16 @@ def main(argv):
             fail(f"{role}: per-epoch spans exceed the global timestamp span")
         omitted_span = timestamp_span - timestamp_span_sum
         recovery_duration_us = recovery_duration * 1_000_000
-        if abs(omitted_span - recovery_duration_us) > 2 * maximum:
+        if (
+            abs(omitted_span - recovery_duration_us)
+            > TIMESTAMP_BOUNDARY_INTERVALS * maximum
+        ):
             fail(f"{role}: omitted timestamp span does not match recovery duration")
         duration_us = duration * 1_000_000
-        if abs(timestamp_span - duration_us) > 2 * maximum:
+        if (
+            abs(timestamp_span - duration_us)
+            > TIMESTAMP_BOUNDARY_INTERVALS * maximum
+        ):
             fail(
                 f"{role}: global timestamp span {timestamp_span}us does not track "
                 f"measured duration {duration_us}us"

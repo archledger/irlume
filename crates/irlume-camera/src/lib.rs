@@ -8459,7 +8459,7 @@ mod tests {
             streams.push(ir_stats.as_json("ir", elapsed, accounting));
         }
         eprintln!(
-            "{}",
+            "\n{}",
             serde_json::json!({
                 "kind": "irlume.slice4.hardware",
                 "schema_version": 1,

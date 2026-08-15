@@ -310,6 +310,25 @@ class ValidatorTests(unittest.TestCase):
 
         self.assert_rejected(tiny_epoch_spans)
 
+    def test_timestamp_boundary_budget_is_three_observed_intervals(self):
+        accepted = valid_record()
+        rgb = accepted["streams"][0]
+        rgb["last_timestamp_us"] = rgb["first_timestamp_us"] + 61_500_000
+        accepted["rgb_ir_skew_us"] = abs(
+            rgb["last_timestamp_us"] - accepted["streams"][1]["last_timestamp_us"]
+        )
+        result = self.run_validator(accepted)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        rejected = valid_record()
+        rgb = rejected["streams"][0]
+        rgb["last_timestamp_us"] = rgb["first_timestamp_us"] + 62_200_000
+        rejected["rgb_ir_skew_us"] = abs(
+            rgb["last_timestamp_us"] - rejected["streams"][1]["last_timestamp_us"]
+        )
+        result = self.run_validator(rejected)
+        self.assertNotEqual(result.returncode, 0, result)
+
     def test_gap_total_must_be_a_bounded_nonnegative_integer(self):
         for invalid in ["2", -1, True, U64_MAX + 1]:
             with self.subTest(invalid=invalid):

@@ -1499,6 +1499,12 @@ fn find_attr_dir(start: &std::path::Path, attr: &str) -> Option<std::path::PathB
     }
 }
 
+pub(crate) fn virtual_camera_allowed(device: &str) -> bool {
+    std::env::var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA")
+        .map(|allow| allow.split(',').any(|allowed| allowed.trim() == device))
+        .unwrap_or(false)
+}
+
 /// Camera device-pinning: verify `/dev/videoN` is a real, physically-attached
 /// camera before any frame is read, defeating unprivileged software frame
 /// injection (v4l2loopback / OBS virtual camera). See docs/THREAT_MODEL.md.
@@ -1525,14 +1531,12 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     // daemon's environment is root-controlled via its systemd unit, so an
     // unprivileged local user cannot set this for the auth path; every use is
     // logged loudly. See docs/THREAT_MODEL.md (camera injection).
-    if let Ok(allow) = std::env::var("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA") {
-        if allow.split(',').any(|d| d.trim() == device) {
-            eprintln!(
-                "irlume: WARNING: {device} accepted without a physical-device pin \
-                 (IRLUME_TEST_ALLOW_VIRTUAL_CAMERA)"
-            );
-            return Ok(());
-        }
+    if virtual_camera_allowed(device) {
+        eprintln!(
+            "irlume: WARNING: {device} accepted without a physical-device pin \
+             (IRLUME_TEST_ALLOW_VIRTUAL_CAMERA)"
+        );
+        return Ok(());
     }
     let node = device.strip_prefix("/dev/").unwrap_or(device);
     let link = format!("/sys/class/video4linux/{node}/device");

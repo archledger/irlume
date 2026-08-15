@@ -293,8 +293,9 @@ jobs:
           IRLUME_TEST_IR_DEVICE: /dev/video9
           IRLUME_TEST_SPARE_DEVICE: /dev/video10
           # Loopback nodes have no physical bus; the exact-path escape lets
-          # verify_pinned accept just these (see THREAT_MODEL.md).
-          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9
+          # verify_pinned and the lifecycle inventory accept just these three
+          # harness-owned nodes (see THREAT_MODEL.md).
+          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9,/dev/video10
         run: |
           ./scripts/run-tests-guarded.sh --min 15 -- cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 7 -- cargo test -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1

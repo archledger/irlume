@@ -555,11 +555,30 @@ impl SnapshotSource for SysfsSnapshotSource {
         let mut records = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
-            let interface = std::fs::canonicalize(entry.path().join("device"))
-                .map_err(|error| LifecycleError::Snapshot(error.to_string()))?;
+            let name = entry.file_name();
+            let devnode = PathBuf::from("/dev").join(&name);
+            let devnode_text = devnode.to_string_lossy().into_owned();
+            let interface = match std::fs::canonicalize(entry.path().join("device")) {
+                Ok(interface) => interface,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(LifecycleError::Snapshot(error.to_string())),
+            };
             let driver = std::fs::canonicalize(interface.join("driver")).ok();
-            if driver.as_deref().and_then(Path::file_name) != Some(std::ffi::OsStr::new("uvcvideo"))
-            {
+            let is_uvc = driver.as_deref().and_then(Path::file_name)
+                == Some(std::ffi::OsStr::new("uvcvideo"));
+            if !is_uvc {
+                if crate::virtual_camera_allowed(&devnode_text) {
+                    let virtual_devpath =
+                        format!("/devices/virtual/video4linux/{}", name.to_string_lossy());
+                    records.push(UdevNodeRecord {
+                        usb_devpath: "/devices/virtual/video4linux/irlume-test-camera".to_string(),
+                        serial: None,
+                        node_devpath: virtual_devpath,
+                        interface_number: None,
+                        capture_node: crate::media_graph::node_is_capture(&devnode_text),
+                        devnode: devnode_text,
+                    });
+                }
                 continue;
             }
             let usb = usb_device_parent(&interface).ok_or_else(|| {
@@ -568,9 +587,6 @@ impl SnapshotSource for SysfsSnapshotSource {
                     interface.display()
                 ))
             })?;
-            let name = entry.file_name();
-            let devnode = PathBuf::from("/dev").join(&name);
-            let devnode_text = devnode.to_string_lossy().into_owned();
             records.push(UdevNodeRecord {
                 usb_devpath: devpath(usb),
                 serial: read_trimmed(usb.join("serial")),
@@ -1050,6 +1066,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut source = SysfsSnapshotSource { root };
         assert_eq!(source.snapshot(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn vanished_video_class_entry_does_not_abort_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-vanished-video4linux-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("video10")).unwrap();
+        let mut source = SysfsSnapshotSource { root: root.clone() };
+        assert_eq!(source.snapshot(), Ok(Vec::new()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_allowlisted_virtual_camera_is_present_in_test_inventory() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = crate::testenv::env_lock();
+        let root =
+            std::env::temp_dir().join(format!("irlume-virtual-video4linux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let rgb = root.join("devices/virtual/video4linux/video8");
+        let ir = root.join("devices/virtual/video4linux/video9");
+        let excluded = root.join("devices/virtual/video4linux/video10");
+        let driver = root.join("drivers/v4l2loopback");
+        std::fs::create_dir_all(root.join("class/video4linux/video8")).unwrap();
+        std::fs::create_dir_all(root.join("class/video4linux/video9")).unwrap();
+        std::fs::create_dir_all(root.join("class/video4linux/video10")).unwrap();
+        std::fs::create_dir_all(&rgb).unwrap();
+        std::fs::create_dir_all(&ir).unwrap();
+        std::fs::create_dir_all(&excluded).unwrap();
+        std::fs::create_dir_all(&driver).unwrap();
+        symlink(&rgb, root.join("class/video4linux/video8/device")).unwrap();
+        symlink(&ir, root.join("class/video4linux/video9/device")).unwrap();
+        symlink(&excluded, root.join("class/video4linux/video10/device")).unwrap();
+        symlink(&driver, rgb.join("driver")).unwrap();
+        symlink(&driver, ir.join("driver")).unwrap();
+        symlink(&driver, excluded.join("driver")).unwrap();
+        let _allow = crate::testenv::EnvGuard::set(
+            "IRLUME_TEST_ALLOW_VIRTUAL_CAMERA",
+            "/dev/video8,/dev/video9",
+        );
+
+        let mut source = SysfsSnapshotSource {
+            root: root.join("class/video4linux"),
+        };
+        let observations = source.snapshot().unwrap();
+        assert_eq!(observations.len(), 1);
+        let evidence = observations[0].lifecycle_evidence();
+        assert!(evidence.iter().any(|item| item.contains("/dev/video8")));
+        assert!(evidence.iter().any(|item| item.contains("/dev/video9")));
+        assert!(!evidence.iter().any(|item| item.contains("/dev/video10")));
+
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(observations).unwrap();
+        assert!(inventory
+            .reference_for_endpoints(&["/dev/video8", "/dev/video9"])
+            .is_ok());
+        assert!(matches!(
+            inventory.reference_for_endpoints(&["/dev/video10"]),
+            Err(CameraInventoryError::UnknownCamera)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

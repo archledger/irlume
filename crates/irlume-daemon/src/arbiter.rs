@@ -100,6 +100,7 @@ pub fn classify(req: &Request) -> Class {
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
         | SelfTest { .. }
+        | CameraDiagnostics
         // Enumeration OPENS every node, so it belongs to the camera class
         // even though it captures nothing (#187).
         | ListCameras => Class::Camera,

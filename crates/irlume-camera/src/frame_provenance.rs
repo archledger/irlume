@@ -1544,6 +1544,14 @@ impl RuntimeFrameProvenance {
             Self::Aggregate(aggregate) => aggregate.contributors[0].format(),
         }
     }
+
+    #[must_use]
+    pub fn rate_evidence(&self) -> DeliveredRateEvidence {
+        match self {
+            Self::Single(single) => single.rate_evidence(),
+            Self::Aggregate(aggregate) => aggregate.rate_evidence(),
+        }
+    }
 }
 
 #[cfg(test)]

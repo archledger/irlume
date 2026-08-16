@@ -27,7 +27,7 @@ pub use irlume_camera::{capabilities, device_identity, select_pair};
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
 /// (#187), so this is the only path to a listing.
-pub use irlume_camera::{list_pairs, privacy_engaged, CameraPair};
+pub use irlume_camera::{camera_rate_diagnostics, list_pairs, privacy_engaged, CameraPair};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {

@@ -1642,13 +1642,8 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 return Err(DeliveryError::Io(error.into_io()));
             }
         };
-        begin_recovered_continuity_epoch(
-            recovery_epoch_pending,
-            sequence,
-            timestamp,
-            rate_window,
-        )
-        .map_err(DeliveryError::Io)?;
+        begin_recovered_continuity_epoch(recovery_epoch_pending, sequence, timestamp, rate_window)
+            .map_err(DeliveryError::Io)?;
         let (sequence_observation, timestamp_observation) = observe_continuity_facts(
             sequence,
             timestamp,
@@ -2883,6 +2878,90 @@ pub fn list_pairs() -> Vec<CameraPair> {
     backend::list_pairs()
 }
 
+/// Run one bounded, gated diagnostic capture on an RGB node and return the
+/// exact delivered-rate evidence. The gated session fills its rolling window
+/// before the first delivery, so a single requested frame carries a complete
+/// 30-delta measurement; a stream that cannot fill it fails closed.
+fn diagnose_rgb_rate(
+    device: &str,
+) -> irlume_common::Result<irlume_common::CameraStreamRateEvidence> {
+    let camera = RgbCamera::open(device)?;
+    let mut session = camera.session()?;
+    let frames = session.burst(1)?;
+    let frame = frames
+        .first()
+        .ok_or_else(|| Error::Hardware("diagnostic captured no frame".into()))?;
+    let evidence = frame.provenance().rate_evidence();
+    Ok(rate_evidence_to_common(&evidence))
+}
+
+/// One bounded, gated diagnostic capture on an IR node.
+fn diagnose_ir_rate(
+    device: &str,
+) -> irlume_common::Result<irlume_common::CameraStreamRateEvidence> {
+    let camera = IrCamera::open(device)?;
+    let mut session = camera.session()?;
+    let (frame, _stats) = session.capture_with_stats()?;
+    let evidence = frame.provenance().rate_evidence();
+    Ok(rate_evidence_to_common(&evidence))
+}
+
+fn role_diagnostic(
+    known: bool,
+    result: irlume_common::Result<irlume_common::CameraStreamRateEvidence>,
+) -> irlume_common::CameraRoleDiagnostic {
+    match result {
+        Ok(evidence) => irlume_common::CameraRoleDiagnostic {
+            known,
+            state: if evidence.meets_floor {
+                "measured"
+            } else {
+                "fail"
+            }
+            .into(),
+            evidence: Some(evidence),
+        },
+        Err(_) => irlume_common::CameraRoleDiagnostic {
+            known,
+            state: "unknown".into(),
+            evidence: None,
+        },
+    }
+}
+
+/// Machine-readable delivered-rate diagnostics for a camera pair (issue #462).
+///
+/// Runs the ordinary gated capture session per present role and reports the
+/// measured evidence: an under-rate stream is a measured `fail`, never
+/// degraded to prose. `ir` is `None` on an RGB-only device. No device path,
+/// account identity, or template data is exposed.
+pub fn camera_rate_diagnostics(
+    rgb: &str,
+    ir: Option<&str>,
+) -> irlume_common::Result<irlume_common::CameraDiagnosticsReport> {
+    let rgb_diag = role_diagnostic(true, diagnose_rgb_rate(rgb));
+    let ir_diag = match ir {
+        Some(node) => role_diagnostic(true, diagnose_ir_rate(node)),
+        None => irlume_common::CameraRoleDiagnostic {
+            known: false,
+            state: "missing".into(),
+            evidence: None,
+        },
+    };
+    let skew_us = match (&rgb_diag.evidence, &ir_diag.evidence) {
+        (Some(r), Some(i)) if r.clock == i.clock && r.source == i.source => {
+            Some(i.latest_timestamp_us - r.latest_timestamp_us)
+        }
+        _ => None,
+    };
+    Ok(irlume_common::CameraDiagnosticsReport {
+        rgb: rgb_diag,
+        ir: ir_diag,
+        skew_us,
+        capture_strategy: "burst".into(),
+    })
+}
+
 fn uvc_list_pairs() -> Vec<CameraPair> {
     let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
         Default::default();
@@ -3401,8 +3480,10 @@ impl<'a> RgbSession<'a> {
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, facts, sequence, timestamp, rate_evidence) =
-                self.stream.next().map_err(|error| map_delivery(&device, error))?;
+            let (buf, facts, sequence, timestamp, rate_evidence) = self
+                .stream
+                .next()
+                .map_err(|error| map_delivery(&device, error))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
@@ -7353,10 +7434,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(2, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata,
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata,
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.observations = u64::MAX;
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7449,10 +7533,13 @@ mod tests {
         let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
         let corrupt = continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR);
         let valid = continuity_metadata(2, 2, monotonic);
-        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-            payload: [7],
-            metadata: [corrupt, valid].into(),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut tracked = TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [7],
+                metadata: [corrupt, valid].into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
 
         warm_up_with(
             "fixture",
@@ -7477,10 +7564,13 @@ mod tests {
         let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
         let corrupt = continuity_metadata(10, 10, monotonic | v4l::buffer::Flags::ERROR);
         let valid = continuity_metadata(11, 11, monotonic);
-        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-            payload: [9],
-            metadata: [corrupt, valid].into(),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut tracked = TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [9],
+                metadata: [corrupt, valid].into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
 
         let error = tracked
             .next()
@@ -7505,10 +7595,13 @@ mod tests {
             ..continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR)
         };
         let valid = continuity_metadata(2, 2, monotonic);
-        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-            payload: [3],
-            metadata: [corrupt_invalid, valid].into(),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut tracked = TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [3],
+                metadata: [corrupt_invalid, valid].into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
 
         assert!(tracked.next_discarded().is_err());
         assert_eq!(tracked.accounting(), (0, 0, 0));
@@ -7543,10 +7636,13 @@ mod tests {
             let baseline = continuity_metadata(1, 1, monotonic);
             let corrupt = continuity_metadata(sequence, seconds, flags);
             let valid = continuity_metadata(3, 3, monotonic);
-            let mut tracked = TrackedStream::new(QueuedContinuityFixture {
-                payload: [5],
-                metadata: [baseline, corrupt, valid].into(),
-            }, test_rate_config(contracts::StreamRole::Ir));
+            let mut tracked = TrackedStream::new(
+                QueuedContinuityFixture {
+                    payload: [5],
+                    metadata: [baseline, corrupt, valid].into(),
+                },
+                test_rate_config(contracts::StreamRole::Ir),
+            );
 
             tracked.next().expect("baseline delivery");
             assert!(
@@ -7574,13 +7670,16 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(1, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
-                ..valid
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+                    ..valid
+                },
             },
-        }, test_rate_config(contracts::StreamRole::Ir));
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         assert!(capture.next_discarded().is_err());
         capture.stream_mut().expect("stream").metadata = valid;
         assert!(capture.next().is_err(), "discarded invalid evidence healed");
@@ -7612,18 +7711,21 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(2, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut tracked = TrackedStream::new(WarmupFixture {
-            payload: [1],
-            metadata: [
-                v4l::buffer::Metadata {
-                    sequence: 1,
-                    timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
-                    ..valid
-                },
-                valid,
-            ]
-            .into(),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut tracked = TrackedStream::new(
+            WarmupFixture {
+                payload: [1],
+                metadata: [
+                    v4l::buffer::Metadata {
+                        sequence: 1,
+                        timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+                        ..valid
+                    },
+                    valid,
+                ]
+                .into(),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         let result = warm_up_with(
             "fixture",
             || tracked.next_discarded(),
@@ -7650,10 +7752,13 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
                 ..v4l::buffer::Metadata::default()
             };
-            let mut capture = TrackedStream::new(ContinuityFixture {
-                payload: [1],
-                metadata: metadata(1, 1, monotonic),
-            }, test_rate_config(contracts::StreamRole::Ir));
+            let mut capture = TrackedStream::new(
+                ContinuityFixture {
+                    payload: [1],
+                    metadata: metadata(1, 1, monotonic),
+                },
+                test_rate_config(contracts::StreamRole::Ir),
+            );
             capture.next().expect("baseline");
             capture.stream_mut().expect("stream").metadata = metadata(2, seconds, flags);
             assert!(capture.next_discarded().is_err());
@@ -7697,7 +7802,8 @@ mod tests {
             payload: [7],
             sequences: sequences.iter().copied().collect(),
         };
-        let mut capture = TrackedStream::new(fixture(&[41]), test_rate_config(contracts::StreamRole::Ir));
+        let mut capture =
+            TrackedStream::new(fixture(&[41]), test_rate_config(contracts::StreamRole::Ir));
         let (_, _, baseline_sequence, baseline_timestamp, _) =
             capture.next().expect("baseline delivery");
         assert!(!baseline_sequence.discontinuity());
@@ -7732,10 +7838,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: metadata(1, 1),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7780,10 +7889,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: metadata(1, 1),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7827,10 +7939,13 @@ mod tests {
             ..v4l::buffer::Metadata::default()
         };
         let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: metadata(1, 1, monotonic),
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1, monotonic),
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         capture.stream_mut().expect("stream").metadata =
             metadata(5, 2, v4l::buffer::Flags::TIMESTAMP_UNKNOWN);
@@ -7858,7 +7973,8 @@ mod tests {
             calls: calls.clone(),
             fail_validation,
         };
-        let mut capture = TrackedStream::new(fixture(false), test_rate_config(contracts::StreamRole::Ir));
+        let mut capture =
+            TrackedStream::new(fixture(false), test_rate_config(contracts::StreamRole::Ir));
         capture.sequence.force_stream_epoch_overflow_on_recovery();
         assert!(capture.take().is_some());
         capture
@@ -7868,12 +7984,15 @@ mod tests {
         assert_eq!(calls.get(), 1, "replacement was not validated first");
 
         let failed_calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut validation_failure = TrackedStream::new(RecoveryValidationFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata::default(),
-            calls: failed_calls.clone(),
-            fail_validation: false,
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut validation_failure = TrackedStream::new(
+            RecoveryValidationFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata::default(),
+                calls: failed_calls.clone(),
+                fail_validation: false,
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         let sequence_state = validation_failure.sequence.continuity_state_for_test();
         let timestamp_state = validation_failure.timestamp.continuity_state_for_test();
         assert!(validation_failure.take().is_some());
@@ -7904,7 +8023,8 @@ mod tests {
             metadata: v4l::buffer::Metadata::default(),
         };
 
-        let mut sequence_failure = TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
+        let mut sequence_failure =
+            TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
         sequence_failure
             .sequence
             .force_stream_epoch_overflow_on_recovery();
@@ -7918,7 +8038,8 @@ mod tests {
         assert!(!sequence_failure.timestamp.failed_for_test());
         assert_eq!(sequence_failure.timestamp.stream_epoch_for_test(), 0);
 
-        let mut timestamp_failure = TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
+        let mut timestamp_failure =
+            TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
         timestamp_failure
             .timestamp
             .force_stream_epoch_overflow_on_recovery();
@@ -7935,16 +8056,19 @@ mod tests {
 
     #[test]
     fn discarded_timestamp_failure_does_not_advance_sequence_state() {
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                bytesused: 1,
-                sequence: 1,
-                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
-                timestamp: v4l::timestamp::Timestamp::new(1, 0),
-                ..v4l::buffer::Metadata::default()
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: 1,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                    ..v4l::buffer::Metadata::default()
+                },
             },
-        }, test_rate_config(contracts::StreamRole::Ir));
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let stream = capture.stream_mut().expect("stream");
         stream.metadata.sequence = 5;
@@ -7956,16 +8080,19 @@ mod tests {
 
     #[test]
     fn discarded_sequence_failure_does_not_advance_timestamp_state() {
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                bytesused: 1,
-                sequence: 1,
-                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
-                timestamp: v4l::timestamp::Timestamp::new(1, 0),
-                ..v4l::buffer::Metadata::default()
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: 1,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                    ..v4l::buffer::Metadata::default()
+                },
             },
-        }, test_rate_config(contracts::StreamRole::Ir));
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         capture.sequence.force_drop_overflow_on_next_gap();
         let stream = capture.stream_mut().expect("stream");
@@ -7977,16 +8104,19 @@ mod tests {
 
     #[test]
     fn sequence_failure_does_not_advance_timestamp_state() {
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: v4l::buffer::Metadata {
-                bytesused: 1,
-                sequence: 1,
-                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
-                timestamp: v4l::timestamp::Timestamp::new(1, 0),
-                ..v4l::buffer::Metadata::default()
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: 1,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                    ..v4l::buffer::Metadata::default()
+                },
             },
-        }, test_rate_config(contracts::StreamRole::Ir));
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         capture.sequence.force_drop_overflow_on_next_gap();
         let stream = capture.stream_mut().expect("stream");
@@ -8005,10 +8135,13 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(1, 0),
             ..v4l::buffer::Metadata::default()
         };
-        let mut capture = TrackedStream::new(ContinuityFixture {
-            payload: [1],
-            metadata: valid,
-        }, test_rate_config(contracts::StreamRole::Ir));
+        let mut capture = TrackedStream::new(
+            ContinuityFixture {
+                payload: [1],
+                metadata: valid,
+            },
+            test_rate_config(contracts::StreamRole::Ir),
+        );
         capture.next().expect("baseline");
         let stream = capture.stream_mut().expect("stream");
         stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 1_000_000);
@@ -8036,10 +8169,13 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(1, 0),
                 ..v4l::buffer::Metadata::default()
             };
-            let mut capture = TrackedStream::new(ContinuityFixture {
-                payload: [1],
-                metadata: valid,
-            }, test_rate_config(contracts::StreamRole::Ir));
+            let mut capture = TrackedStream::new(
+                ContinuityFixture {
+                    payload: [1],
+                    metadata: valid,
+                },
+                test_rate_config(contracts::StreamRole::Ir),
+            );
             capture.next().expect("baseline");
             let stream = capture.stream_mut().expect("stream");
             stream.metadata.flags = v4l::buffer::Flags::from_bits_truncate(bits);

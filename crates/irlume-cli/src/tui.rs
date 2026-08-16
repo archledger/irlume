@@ -3,10 +3,9 @@
 
 //! `irlume tui`: keyboard-driven setup/management over the `irlumed` socket.
 //!
-//! Layout & feel follow linhello: a step-wizard (Tab/⇧Tab between steps, a
-//! "step N/M" header), a blue Activity bar that shows in plain language exactly
-//! what irlume is doing to the system (transparency, inspired by linutil), and a
-//! static keybind footer. Enrollment uses linhello-style **guided cues**, a
+//! Layout & feel follow a system-settings app: stable, grouped navigation; a
+//! focused Overview that names the next useful action; contextual activity
+//! history; and a compact action footer. Enrollment uses **guided cues**, a
 //! live framing guide (quality + checklist + guidance) with a 3-2-1 countdown
 //! and auto-capture, instead of a live video preview (which a terminal can't
 //! show). A thin client: all work happens in the daemon.
@@ -78,20 +77,30 @@ fn th() -> &'static Theme {
         }
     })
 }
+
+/// Selection uses the terminal's own foreground/background relationship, so it
+/// remains legible on light, dark, ANSI-only, and NO_COLOR terminals.
+fn selected_style() -> Style {
+    Style::new()
+        .fg(th().accent)
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::REVERSED)
+}
+
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SCREENS: [&str; 12] = [
-    "Welcome",
-    "Repair",
+    "Overview",
+    "Diagnostics",
     "Cameras",
-    "Profiles",
-    "Identify",
-    "Keyring",
+    "Faces",
+    "Test Recognition",
+    "Password Wallet",
     "Recovery",
     "Fingerprint",
-    "Login wiring",
-    "Settings",
-    "Models",
-    "Done",
+    "Login & Apps",
+    "Preferences",
+    "Face Model",
+    "Setup Status",
 ];
 // Screen indices (keep in sync with SCREENS).
 const SC_WELCOME: usize = 0;
@@ -106,7 +115,28 @@ const SC_PAM: usize = 8;
 const SC_SETTINGS: usize = 9;
 const SC_MODELS: usize = 10;
 const SC_DONE: usize = 11;
-const ACT_H: usize = 5; // visible rows in the Activity panel (height 7 minus borders)
+/// User-facing navigation order. Group headings in the sidebar use this same
+/// order, so Tab never walks a different information architecture than the eye.
+const NAV_ORDER: [usize; 11] = [
+    SC_WELCOME,
+    SC_PROFILES,
+    SC_FINGERPRINT,
+    SC_KEYRING,
+    SC_RECOVERY,
+    SC_PAM,
+    SC_REPAIR,
+    SC_CAMERAS,
+    SC_IDENTIFY,
+    SC_SETTINGS,
+    SC_MODELS,
+];
+const ACT_H: usize = 5; // visible rows in the expanded Activity panel
+const ACTIVITY_COLLAPSED_ROWS: u16 = 3;
+const ACTIVITY_EXPANDED_ROWS: u16 = 7;
+/// Below this body width the sidebar would starve the content, so the layout
+/// collapses to full-width content and the header carries the step position
+/// (login greeters / TTYs / SSH at 80 columns).
+const SIDEBAR_MIN_COLS: u16 = 90;
 
 /// The services the Settings tab lets the user toggle the consent gesture for,
 /// with arrow keys + `c`. All four are high-privilege (elevation or app-consent),
@@ -146,6 +176,28 @@ const CHECK_PITCH_MAX: f32 = irlume_liveness::PITCH_FRAC_MAX;
 /// sync by name if either side changes.
 const CHECK_LUMA_MIN: f32 = 55.0;
 const CHECK_LUMA_MAX: f32 = 235.0;
+
+/// One line of the sidebar rail. `sidebar_rows` builds the list, `draw_sidebar`
+/// renders it, and `on_click` maps a clicked inner row back to its `Nav(screen)`
+/// so a click always lands on the row the eye sees.
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarRow {
+    Group(&'static str),
+    Nav(usize),
+    Blank,
+}
+
+/// A clickable content region, recorded during render and consulted by
+/// `on_click`. `Key` replays a keypress from a footer chip or button.
+#[derive(Clone, Copy)]
+enum Click {
+    Key(KeyCode),
+    Hub(usize),
+    /// Select a row in the current screen's list. The screen is intentionally
+    /// resolved when the click is handled: targets are cleared and rebuilt on
+    /// every frame, so this cannot address a stale list after navigation.
+    Select(usize),
+}
 
 #[derive(Clone, Copy)]
 enum Row {
@@ -337,16 +389,13 @@ struct Check {
 }
 
 /// Non-camera state that steers `compute_visible`, named so call sites read
-/// without counting positional bools. Defaults are all-false (no reader,
-/// basic view, daemon reachable).
+/// without counting positional bools. Defaults are all-false.
 #[derive(Clone, Copy, Default)]
 struct VisibilityInputs {
     /// A fingerprint reader is present.
     fp_present: bool,
     /// `[v]` advanced view is on.
     advanced: bool,
-    /// The daemon is not answering Ping.
-    daemon_down: bool,
 }
 
 /// Where an async op's result should land (besides the Activity log).
@@ -518,6 +567,9 @@ struct App {
     /// True while mouse capture is released so the terminal's own selection
     /// works (the `[M]` toggle); wheel scroll is unavailable meanwhile.
     mouse_select: bool,
+    /// Clickable content regions recorded each frame by `draw`, consulted by
+    /// `on_click`. Interior mutability because `draw` takes `&self`.
+    click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
     /// Selected row of the Welcome hub (Enter jumps to its screen).
@@ -573,6 +625,12 @@ struct App {
     health: Option<HealthInfo>,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
+    /// Whether the activity history is expanded. The default is a one-line
+    /// recent-status strip so content keeps the vertical space.
+    activity_open: bool,
+    /// Disable repeating motion while preserving static status/progress.
+    /// Set by `IRLUME_REDUCE_MOTION` for terminals or users that prefer it.
+    reduce_motion: bool,
     /// Models-tab catalog states, copied from the landed probe sweep; `None`
     /// until the first sweep lands (draw then says the state is loading
     /// instead of asserting either direction). See [`ModelsStatus`] for why
@@ -989,9 +1047,6 @@ impl App {
             &caps,
             VisibilityInputs {
                 fp_present,
-                // Assume the daemon is down until the first Ping answers, so
-                // Repair starts visible rather than flickering in later.
-                daemon_down: true,
                 ..VisibilityInputs::default()
             },
             &[],
@@ -1018,6 +1073,7 @@ impl App {
             input: None,
             confirm: None,
             mouse_select: false,
+            click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
             hub_sel: 0,
             op: None,
@@ -1040,6 +1096,9 @@ impl App {
             enroll_error: None,
             health: None,
             act_scroll: 0,
+            activity_open: false,
+            reduce_motion: std::env::var_os("IRLUME_REDUCE_MOTION")
+                .is_some_and(|v| !v.is_empty() && v != "0"),
             models_status: None,
             models_scroll: 0,
             visible,
@@ -1059,30 +1118,23 @@ impl App {
         }
     }
 
-    /// Which wizard steps to show. The DEFAULT view is the essential setup
-    /// path only: Welcome → Enroll → Keyring → Recovery → Login wiring →
-    /// Done. Diagnostic/advanced screens earn their place instead of always
-    /// claiming one: Repair appears only when something actually needs fixing
-    /// (daemon down or a failing check), and Cameras / Identify / Settings
-    /// live behind the `[v]` advanced toggle.
+    /// User-facing destinations in the same stable order as the sidebar.
+    /// Hardware-inapplicable views stay absent, while Diagnostics remains in
+    /// place as its checks change so fixing a problem never makes the current
+    /// destination disappear underneath the user. The legacy Setup Status view
+    /// is rendered by tests for compatibility but no longer lives in navigation;
+    /// Overview owns completion and next-step guidance.
     fn compute_visible(
         caps: &irlume_camera::Caps,
         state: VisibilityInputs,
-        checks: &[Check],
+        _checks: &[Check],
     ) -> Vec<usize> {
         let VisibilityInputs {
             fp_present,
             advanced,
-            daemon_down,
         } = state;
-        // Repair surfaces whenever there is ANYTHING to report (a failure OR an
-        // advisory), so the Welcome health summary's "→ see checks & repair"
-        // pointer is always reachable; a warning used to point at a hidden tab.
-        let needs_repair = daemon_down
-            || checks
-                .iter()
-                .any(|c| c.sev == Sev::Fail || c.sev == Sev::Warn);
-        (0..SCREENS.len())
+        NAV_ORDER
+            .into_iter()
             .filter(|&i| match i {
                 // Essential face path requires a camera.
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
@@ -1097,14 +1149,14 @@ impl App {
                 // catalog is the surface the issue exists to expose, and the
                 // Settings third-party section points at it.
                 SC_SETTINGS | SC_MODELS => true,
-                // Repair: only when something needs attention (or advanced view).
-                SC_REPAIR => advanced || needs_repair,
+                // Diagnostics is stable navigation; its badge carries live state.
+                SC_REPAIR => true,
                 // Keyring unlock: an IR camera (face releases the credential) OR a
                 // fingerprint reader (ADR-0003: a fingerprint login unseals it too).
                 SC_KEYRING => caps.ir_pair || fp_present,
                 // Fingerprint screen only if a reader exists.
                 SC_FINGERPRINT => fp_present,
-                // Welcome / Login-wiring / Done: always.
+                // Overview / Login & Apps / Preferences / Face Model: always.
                 _ => true,
             })
             .collect()
@@ -1124,7 +1176,6 @@ impl App {
             VisibilityInputs {
                 fp_present: self.fp_present,
                 advanced: self.advanced,
-                daemon_down: !self.daemon_up,
             },
             &self.repair,
         );
@@ -1676,7 +1727,7 @@ impl App {
                 } else if wired {
                     "module not loaded: greeter can't reach the daemon".into()
                 } else {
-                    "loads automatically when you wire login (Done tab → [w])".into()
+                    "loads automatically when you connect Login & Apps ([w])".into()
                 },
                 if labeled {
                     Fix::None
@@ -1725,7 +1776,7 @@ impl App {
                 if enrolled {
                     Fix::None
                 } else {
-                    Fix::Manual("Profiles tab → [e] enroll".into())
+                    Fix::Manual("Faces → [e] enroll".into())
                 },
             ));
         }
@@ -1809,7 +1860,7 @@ impl App {
                         "Method wiring",
                         Sev::Fail,
                         "method is fingerprint but pam_fprintd is not wired".into(),
-                        Fix::Manual("Fingerprint tab → [e] unlock with face OR fingerprint".into()),
+                        Fix::Manual("Fingerprint → [e] unlock with face OR fingerprint".into()),
                     ));
                 } else if self.fp.enrolled.is_empty() {
                     v.push(mk(
@@ -1843,7 +1894,9 @@ impl App {
                             "FP keyring unlock",
                             Sev::Warn,
                             "wallet won't auto-unlock on fingerprint login; arm the keyring".into(),
-                            Fix::Manual("Keyring tab → [a] arm (seal your login password)".into()),
+                            Fix::Manual(
+                                "Password Wallet → [a] connect (seal your login password)".into(),
+                            ),
                         ));
                     } else if self.keyring_armed == Some(true) && !wired {
                         v.push(mk(
@@ -1886,8 +1939,7 @@ impl App {
                     "method is face-only but a fingerprint reader is also wired; both will unlock"
                         .into(),
                     Fix::Manual(
-                        "[e] on the Fingerprint tab (face OR fingerprint), or [d] to disable"
-                            .into(),
+                        "[e] in Fingerprint (face OR fingerprint), or [d] to disable".into(),
                     ),
                 ));
             }
@@ -1898,7 +1950,7 @@ impl App {
         // PAM files). Face silently falls back to password until re-applied.
         if self.probes.reconcile_needed {
             v.push(mk(
-                "Login wiring",
+                "Login connection",
                 Sev::Fail,
                 "a distro PAM regeneration dropped the face-auth wiring; logins fall back to password".into(),
                 Fix::Root(RootFix::LoginReconcile),
@@ -2008,7 +2060,7 @@ impl App {
                 "Keyring seal",
                 Sev::Warn,
                 "PCRs drifted since sealing; the wallet won't auto-unlock until re-bound".into(),
-                Fix::Manual("Keyring tab → [r] reseal (re-bind to current PCRs)".into()),
+                Fix::Manual("Password Wallet → [r] reseal (re-bind to current PCRs)".into()),
             ));
         }
 
@@ -2073,7 +2125,7 @@ impl App {
                     "Recovery backstop",
                     Sev::Warn,
                     "templates encrypted but no recovery passphrase".into(),
-                    Fix::Manual("Recovery tab → [s] set a recovery passphrase".into()),
+                    Fix::Manual("Recovery → [s] set a recovery passphrase".into()),
                 ));
             } else if r.encrypted && !r.key_present {
                 // Encrypted with the key gone: no passphrase and no reseal opens
@@ -2086,7 +2138,7 @@ impl App {
                     "templates encrypted but the template key is MISSING: nothing can \
                      open them"
                         .into(),
-                    Fix::Manual("re-enroll: Profiles tab → [e]".into()),
+                    Fix::Manual("re-enroll: Faces → [e]".into()),
                 ));
             } else {
                 v.push(mk(
@@ -2561,13 +2613,24 @@ impl App {
                             self.on_key(k.code)
                         }
                     }
-                    // Mouse wheel scrolls the Activity history.
+                    // Wheel scrolls the Activity history; a left click (or a
+                    // touchscreen tap, delivered as the same event) on a sidebar
+                    // row jumps to that section.
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => {
+                            self.activity_open = true;
                             self.act_scroll = (self.act_scroll + 1).min(self.act_max())
                         }
                         MouseEventKind::ScrollDown => {
                             self.act_scroll = self.act_scroll.saturating_sub(1)
+                        }
+                        MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
+                            let size = terminal.size()?;
+                            self.on_click(
+                                m.column,
+                                m.row,
+                                Rect::new(0, 0, size.width, size.height),
+                            );
                         }
                         _ => {}
                     },
@@ -3018,7 +3081,15 @@ impl App {
         // so those can't swallow it.
         if self.input.is_none() {
             match code {
+                KeyCode::Char('A') => {
+                    self.activity_open = !self.activity_open;
+                    if !self.activity_open {
+                        self.act_scroll = 0;
+                    }
+                    return;
+                }
                 KeyCode::PageUp => {
+                    self.activity_open = true;
                     self.act_scroll = (self.act_scroll + 3).min(self.act_max());
                     return;
                 }
@@ -3145,9 +3216,9 @@ impl App {
                 self.log(
                     '·',
                     if self.advanced {
-                        "advanced view: all tabs shown ([v] to simplify)"
+                        "technical tools shown ([v] to simplify)"
                     } else {
-                        "essential view: setup steps only ([v] for all tabs)"
+                        "technical tools hidden ([v] to show)"
                     },
                 );
             }
@@ -3181,7 +3252,13 @@ impl App {
             .position(|&s| s == self.screen)
             .unwrap_or(0) as i32;
         let new_pos = (((pos + d) % n + n) % n) as usize;
-        self.screen = self.visible[new_pos];
+        self.enter_screen(self.visible[new_pos]);
+    }
+
+    /// Land on a screen, from Tab/arrows OR a sidebar click, and run the same
+    /// per-screen refresh the step-walk did.
+    fn enter_screen(&mut self, screen: usize) {
+        self.screen = screen;
         self.sel = 0;
         // Fast diagnostics on entering Repair/Fingerprint (no slow profile
         // poll, so the switch is instant); a fresh profile poll only when
@@ -3252,25 +3329,10 @@ impl App {
             // Hub: Enter opens the selected section (the summary IS the nav).
             (SC_WELCOME, KeyCode::Enter) => {
                 if let Some((_, _, target)) = self.hub_rows().get(self.hub_sel).copied() {
-                    self.screen = target;
-                    self.sel = 0;
-                    // Same fast paths as a Tab switch: diagnostics for
-                    // Repair/Fingerprint, a fresh profile poll for Profiles.
-                    if target == SC_CAMERAS || target == SC_REPAIR {
-                        self.refresh_camera_listing();
-                    }
-                    if target == SC_REPAIR || target == SC_FINGERPRINT {
-                        self.refresh_diagnostics();
-                    } else if target == SC_PROFILES {
-                        self.refresh_profiles();
-                    } else if target == SC_MODELS {
-                        // Same fresh-entry rule as a Tab switch: top of the
-                        // catalog (warning before commands) + a cache refresh.
-                        self.models_scroll = 0;
-                        self.request_probes();
-                    }
+                    self.enter_screen(target);
                 }
             }
+            (SC_WELCOME, KeyCode::Char('d')) => self.enter_screen(SC_REPAIR),
             // Welcome / Done: refresh the whole snapshot.
             (SC_WELCOME, KeyCode::Char('r')) | (SC_DONE, KeyCode::Char('r')) => {
                 self.log('·', "refreshing status…");
@@ -3541,7 +3603,9 @@ impl App {
             // Login wiring (PAM): [w] wires the login stack (root, suspends to
             // sudo) from either the wiring tab or the Done dashboard; the last
             // setup mile must not require leaving the TUI for a manual command.
-            (SC_PAM, KeyCode::Char('w')) | (SC_DONE, KeyCode::Char('w')) => {
+            (SC_WELCOME, KeyCode::Char('w'))
+            | (SC_PAM, KeyCode::Char('w'))
+            | (SC_DONE, KeyCode::Char('w')) => {
                 self.log('→', "sudo irlume login enable --apply: wires the greeter + lock screen for your method");
                 self.log('·', "leave the password empty and press Enter to use your face (login needs the IR/secure tier; an RGB-only camera unlocks the lock screen only)");
                 self.log('·', "face-sudo is opt-in; add it later with: sudo irlume login enable --with-sudo --apply");
@@ -4091,18 +4155,38 @@ impl App {
 
     // ---- rendering --------------------------------------------------------
 
+    fn frame_rows(&self, area: Rect) -> [Rect; 5] {
+        let expanded = self.activity_open || self.act_scroll > 0 || self.op.is_some();
+        if expanded {
+            tui_rows_with_activity(area, ACTIVITY_EXPANDED_ROWS)
+        } else {
+            tui_rows(area)
+        }
+    }
+
     fn draw(&self, f: &mut Frame) {
-        let [header, hint, body, activity, footer] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Min(6),
-            Constraint::Length(7),
-            Constraint::Length(3),
-        ])
-        .areas(f.area());
+        self.click_targets.borrow_mut().clear();
+        let [header, hint, body, activity, footer] = self.frame_rows(f.area());
         self.draw_header(f, header);
         self.draw_hint(f, hint);
-        self.draw_content(f, body);
+        // Redesign: the body splits into a settings-app sidebar and the content
+        // pane on a roomy terminal, collapsing to full-width content below
+        // SIDEBAR_MIN_COLS (login greeters / TTYs / SSH at 80). Arrows/Tab and
+        // sidebar clicks both drive `self.screen`; `body_split` is shared with
+        // `on_click` so a click lands on exactly the row the eye sees.
+        if self.is_first_run() {
+            // A not-yet-enrolled user gets a focused front door: one screen, one
+            // action, no 12-item sidebar to parse. Tab or [v] leaves it.
+            self.draw_firstrun(f, body);
+        } else {
+            let (sidebar, content) = self.body_split(body);
+            if let Some(sb) = sidebar {
+                self.draw_sidebar(f, sb);
+            }
+            // `draw_content` already frames each screen in its own titled card,
+            // so the content pane needs no extra border here.
+            self.draw_content(f, content);
+        }
         self.draw_activity(f, activity);
         self.draw_footer(f, footer);
         if let Some(err) = &self.error {
@@ -4178,11 +4262,282 @@ impl App {
         );
     }
 
-    fn draw_header(&self, f: &mut Frame, area: Rect) {
+    /// A brand-new user (face camera present, nothing enrolled yet, sitting on
+    /// Welcome, no capture in flight) gets one focused screen with one action
+    /// instead of the full sidebar. Tab moves off Welcome and restores the
+    /// sidebar; `[v]` changes which technical sections Tab can reach.
+    /// Fingerprint-only / no-camera hosts keep the classic Welcome, whose wording
+    /// already adapts to their hardware.
+    fn is_first_run(&self) -> bool {
+        self.enroll.is_none()
+            && self.screen == SC_WELCOME
+            && self.caps.rgb
+            && self.enrolled_known() == Some(false)
+    }
+
+    /// The first-run front door: a single "scan your face" call to action, the
+    /// three steps of what happens, and the reassurance that the password never
+    /// stops working. Deliberately no sidebar — nothing to parse on run one.
+    fn draw_firstrun(&self, f: &mut Frame, area: Rect) {
+        let a = th().accent;
+        let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
+        let lines = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Set up face unlock",
+                Style::new().fg(a).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Private, local enrollment using your infrared camera.",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Your password remains available during and after setup.",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(
+                    "  ▶  Scan my face  ",
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(a)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                key("e"),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "1  Look at the camera     2  Follow the cues     3  Finish login setup",
+                Style::new().dim(),
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Tab", Style::new().fg(a)),
+                Span::styled(" walks every step   ", Style::new().dim()),
+                Span::styled("[v]", Style::new().fg(a)),
+                Span::styled(" shows all sections", Style::new().dim()),
+            ]),
+        ];
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
-        let left = Line::from(vec![
+        let inner = blk.inner(area);
+        // Register the "Scan my face" row as a click target (→ enroll).
+        if let Some(i) = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("Scan my face")))
+        {
+            let y = inner.y.saturating_add(i as u16);
+            if y < inner.y.saturating_add(inner.height) {
+                self.hit(
+                    Rect::new(inner.x, y, inner.width, 1),
+                    Click::Key(KeyCode::Char('e')),
+                );
+            }
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(blk)
+                .alignment(ratatui::layout::Alignment::Center),
+            area,
+        );
+    }
+
+    /// The left navigation rail: the visible screens grouped Setup / System /
+    /// Advanced, current screen marked with an accent bar. This renders the same
+    /// `self.visible` / `self.screen` model the horizontal step-walk used, so
+    /// Tab and the arrows keep working unchanged.
+    /// The grouped rail as a flat row list. Shared by `draw_sidebar` (render)
+    /// and `on_click` (hit-testing) so the two never drift.
+    fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        let groups: [(&str, &[usize]); 3] = [
+            (
+                "Setup",
+                &[
+                    SC_WELCOME,
+                    SC_PROFILES,
+                    SC_FINGERPRINT,
+                    SC_KEYRING,
+                    SC_RECOVERY,
+                    SC_PAM,
+                ],
+            ),
+            ("System", &[SC_REPAIR, SC_CAMERAS]),
+            ("Advanced", &[SC_IDENTIFY, SC_SETTINGS, SC_MODELS]),
+        ];
+        let mut rows: Vec<SidebarRow> = Vec::new();
+        for (name, members) in groups {
+            let shown = members.iter().copied().filter(|s| self.visible.contains(s));
+            let mut any = false;
+            for s in shown {
+                if !any {
+                    if !rows.is_empty() {
+                        rows.push(SidebarRow::Blank);
+                    }
+                    rows.push(SidebarRow::Group(name));
+                    any = true;
+                }
+                rows.push(SidebarRow::Nav(s));
+            }
+        }
+        rows
+    }
+
+    fn sidebar_nav_label(&self, screen: usize) -> String {
+        if screen != SC_REPAIR {
+            return SCREENS[screen].to_string();
+        }
+        let mut issues = self
+            .repair
+            .iter()
+            .filter(|c| c.sev == Sev::Fail || c.sev == Sev::Warn)
+            .count();
+        if !self.daemon_up && issues == 0 {
+            issues = 1;
+        }
+        if issues == 0 {
+            SCREENS[screen].to_string()
+        } else {
+            format!("{}  {issues}", SCREENS[screen])
+        }
+    }
+
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = self
+            .sidebar_rows()
+            .into_iter()
+            .map(|r| match r {
+                SidebarRow::Blank => Line::raw(""),
+                SidebarRow::Group(name) => Line::from(Span::styled(
+                    format!(" {name}"),
+                    Style::new().dim().add_modifier(Modifier::BOLD),
+                )),
+                SidebarRow::Nav(s) if s == self.screen => Line::from(vec![
+                    Span::styled("▎", Style::new().fg(th().accent)),
+                    Span::styled(
+                        format!(" {}", self.sidebar_nav_label(s)),
+                        Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                SidebarRow::Nav(s) => Line::from(Span::styled(
+                    format!("  {}", self.sidebar_nav_label(s)),
+                    Style::new().dim(),
+                )),
+            })
+            .collect();
+        let blk = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().dim());
+        f.render_widget(Paragraph::new(lines).block(blk), area);
+    }
+
+    /// Split the body area into (optional sidebar, content). Shared by `draw`
+    /// and `on_click`. Returns no sidebar on the first-run front door or a
+    /// narrow terminal, where the content takes the whole body.
+    fn body_split(&self, body: Rect) -> (Option<Rect>, Rect) {
+        if self.is_first_run() || body.width < SIDEBAR_MIN_COLS {
+            return (None, body);
+        }
+        let [sidebar, content] =
+            Layout::horizontal([Constraint::Length(22), Constraint::Min(20)]).areas(body);
+        (Some(sidebar), content)
+    }
+
+    /// Record a clickable content region for this frame.
+    fn hit(&self, rect: Rect, c: Click) {
+        self.click_targets.borrow_mut().push((rect, c));
+    }
+
+    /// Map a mouse click (or touchscreen tap, delivered as the same left-click)
+    /// to an action: a sidebar row jumps to that screen, a footer chip or the
+    /// first-run button replays its key. Clicks while a modal/flow owns the
+    /// screen are ignored.
+    fn on_click(&mut self, col: u16, row: u16, area: Rect) {
+        // Activity remains usable while a camera/daemon operation owns normal
+        // input, matching PgUp and [A]. Resolve that one safe disclosure before
+        // the flow gate; it never starts, cancels, or confirms an operation.
+        let activity_hit = self.click_targets.borrow().iter().any(|(r, c)| {
+            col >= r.x
+                && col < r.x + r.width
+                && row >= r.y
+                && row < r.y + r.height
+                && matches!(c, Click::Key(KeyCode::Char('A')))
+        });
+        if activity_hit
+            && !self.show_help
+            && self.error.is_none()
+            && self.input.is_none()
+            && self.confirm.is_none()
+            && self.enroll_merge.is_none()
+        {
+            self.on_key(KeyCode::Char('A'));
+            return;
+        }
+        if self.show_help
+            || self.error.is_some()
+            || self.input.is_some()
+            || self.confirm.is_some()
+            || self.enroll_merge.is_some()
+            || self.enroll.is_some()
+            || self.op.is_some()
+        {
+            return;
+        }
+        // Content regions registered during render (footer chips, first-run
+        // button). Copy out before acting so the RefCell borrow is released.
+        let hit = self
+            .click_targets
+            .borrow()
+            .iter()
+            .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+            .map(|(_, c)| *c);
+        if let Some(c) = hit {
+            match c {
+                Click::Key(kc) => self.on_key(kc),
+                Click::Hub(i) => {
+                    if let Some((_, _, target)) = self.hub_rows().get(i).copied() {
+                        self.hub_sel = i;
+                        self.enter_screen(target);
+                    }
+                }
+                Click::Select(i) => match self.screen {
+                    SC_REPAIR if i < self.repair.len() => self.repair_sel = i,
+                    SC_CAMERAS if i < self.pairs.len() => self.cam_sel = i,
+                    SC_PROFILES if i < self.rows().len() => self.sel = i,
+                    SC_SETTINGS if i < SETTINGS_GESTURE_SERVICES.len() => {
+                        self.settings_svc_sel = i;
+                    }
+                    _ => {}
+                },
+            }
+            return;
+        }
+        // Sidebar rail.
+        let [_, _, body, _, _] = self.frame_rows(area);
+        let (sidebar, _content) = self.body_split(body);
+        let Some(sb) = sidebar else { return };
+        let inner = Block::bordered().inner(sb);
+        let in_inner = col >= inner.x
+            && col < inner.x + inner.width
+            && row >= inner.y
+            && row < inner.y + inner.height;
+        if !in_inner {
+            return;
+        }
+        let idx = (row - inner.y) as usize;
+        if let Some(SidebarRow::Nav(s)) = self.sidebar_rows().get(idx).copied() {
+            self.enter_screen(s);
+        }
+    }
+
+    fn draw_header(&self, f: &mut Frame, area: Rect) {
+        // Slim one-line title bar. On a wide terminal the sidebar shows position;
+        // on a narrow terminal a compact N/M location keeps orientation without
+        // presenting the persistent settings app as a wizard.
+        let mut left = vec![
             Span::styled(
                 " irlume ",
                 Style::new()
@@ -4191,9 +4546,11 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
+        ];
+        if area.width < SIDEBAR_MIN_COLS {
+            left.push(Span::styled(
                 format!(
-                    "step {}/{}: ",
+                    "{}/{} · ",
                     self.visible
                         .iter()
                         .position(|&s| s == self.screen)
@@ -4201,16 +4558,20 @@ impl App {
                     self.visible.len()
                 ),
                 Style::new().dim(),
-            ),
-            Span::styled(
-                SCREENS[self.screen],
-                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        let right =
-            Line::from(Span::styled(format!("{} ", self.user), Style::new().dim())).right_aligned();
-        f.render_widget(Paragraph::new(left).block(blk.clone()), area);
-        f.render_widget(Paragraph::new(right).block(blk), area);
+            ));
+        }
+        left.push(Span::styled(
+            SCREENS[self.screen],
+            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+        ));
+        let account = if self.advanced {
+            format!("advanced · {} ", self.user)
+        } else {
+            format!("{} ", self.user)
+        };
+        let right = Line::from(Span::styled(account, Style::new().dim())).right_aligned();
+        f.render_widget(Paragraph::new(Line::from(left)), area);
+        f.render_widget(Paragraph::new(right), area);
     }
 
     /// A single plain-language line under the header: what THIS tab is for and
@@ -4227,67 +4588,37 @@ impl App {
         // (daemon unreachable, sweep not landed) asserts neither direction;
         // the tri-state rule the rest of this file follows.
         let text = if self.enroll.is_some() {
-            "Look at the camera and hold still; the checklist turns green as you go."
+            "Follow one cue at a time; each scan captures automatically when framing is ready."
         } else {
             match self.screen {
                 SC_WELCOME => match self.enrolled_known() {
-                    Some(true) => {
-                        "You're enrolled; ↑↓ + Enter opens a section, [i] tests recognition."
-                    }
-                    Some(false) => {
-                        "New here? Press [e] to scan your face; your password still works too."
-                    }
-                    None => "Guided setup: Tab walks the steps; each screen names its keys.",
+                    Some(true) => "Live status and the next recommended action.",
+                    Some(false) => "Set up face unlock while keeping password access available.",
+                    None => "Checking face authentication and system status.",
                 },
-                SC_REPAIR => {
-                    "A red row is a problem: highlight it, press [f] to fix or [g] for logs."
-                }
-                SC_CAMERAS => "Wrong camera picked? Highlight a pair and press [enter] to use it.",
-                SC_PROFILES => {
-                    "Press [e] to add a face, or [a] to add scans so it knows you better."
-                }
-                SC_IDENTIFY => "A 'does it recognize me?' test. Press [i] and look at the camera.",
+                SC_REPAIR => "System health, clear explanations, and focused repairs.",
+                SC_CAMERAS => "Choose the RGB and infrared camera pair used for recognition.",
+                SC_PROFILES => "Manage enrolled faces and improve recognition over time.",
+                SC_IDENTIFY => "Test recognition without changing enrollment.",
                 SC_KEYRING => match self.keyring_armed {
-                    Some(true) => {
-                        "Armed: face login opens your wallet. New password? Re-arm with [a]."
-                    }
-                    Some(false) => {
-                        "Let your login open your password wallet: press [a], type your password."
-                    }
-                    None => {
-                        "Seals your login password in the TPM so face login opens your wallet."
-                    }
+                    Some(true) => "Face or fingerprint login can open the password wallet.",
+                    Some(false) => "Connect biometric login to the password wallet.",
+                    None => "Checking password-wallet integration.",
                 },
                 SC_RECOVERY => match self.recovery.map(|r| r.recovery_set) {
-                    Some(true) => {
-                        "Recovery passphrase set; [t] restores access if the TPM seal breaks."
-                    }
-                    Some(false) => {
-                        "Set a backup passphrase so a broken TPM seal can't force re-enroll: [s]."
-                    }
-                    None => {
-                        "A backup passphrase keeps your enrollment usable if the TPM seal breaks."
-                    }
+                    Some(true) => "A recovery passphrase protects access if the TPM seal changes.",
+                    Some(false) => "Add a recovery passphrase to protect the enrollment.",
+                    None => "Checking enrollment recovery.",
                 },
-                SC_FINGERPRINT => "Optional backup: press [a] to add a fingerprint too.",
+                SC_FINGERPRINT => "Manage fingerprint as an optional companion unlock method.",
                 SC_PAM => match self.login_wired_known() {
-                    Some(true) => {
-                        "Face login is wired in; [s] shows status, [x] un-wires a service."
-                    }
-                    Some(false) => {
-                        "Turn on face login for your screen: press [w] (asks for your password)."
-                    }
-                    None => "Wires face login into your greeter, lock screen and sudo.",
+                    Some(true) => "Face authentication is connected to system login surfaces.",
+                    Some(false) => "Connect face authentication to login and the lock screen.",
+                    None => "Checking login, lock-screen, and application integration.",
                 },
-                SC_SETTINGS => {
-                    "[enter] turns the eyes-open check OFF (it cannot be turned on, see #386); other settings are root or read-only."
-                }
-                SC_MODELS => {
-                    "Measured model options; switching the recognizer means re-enrolling."
-                }
-                SC_DONE => {
-                    "Green = done; anything left shows its key. Press [q] to close."
-                }
+                SC_SETTINGS => "Security preferences and per-service consent behavior.",
+                SC_MODELS => "Measured model options; changing recognition requires re-enrollment.",
+                SC_DONE => "Legacy setup summary; Overview now carries completion status.",
                 _ => "",
             }
         };
@@ -4303,7 +4634,6 @@ impl App {
 
     fn draw_content(&self, f: &mut Frame, area: Rect) {
         let blk = Block::bordered()
-            .title(format!(" {} ", SCREENS[self.screen]))
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(th().accent))
             // Breathing room (whitespace over chrome): content never touches
@@ -4334,7 +4664,15 @@ impl App {
     fn draw_enroll(&self, f: &mut Frame, area: Rect) {
         let e = self.enroll.as_ref().unwrap();
         let r = e.last.as_ref();
-        let q = r.map(|x| x.quality).unwrap_or(0);
+        let captured = e.captured + e.base;
+        let total = e.target + e.base;
+        let current = captured.saturating_add(1).min(total.max(1));
+        let filled = captured.saturating_mul(20) / total.max(1);
+        let progress = format!(
+            "[{}{}] {captured}/{total}",
+            "█".repeat(filled.min(20)),
+            "░".repeat(20usize.saturating_sub(filled.min(20)))
+        );
         let chk = |ok: bool, label: &str| {
             Line::from(vec![
                 Span::styled(
@@ -4354,14 +4692,16 @@ impl App {
         let face = r.map(|x| x.face).unwrap_or(false);
         let mut lines = vec![
             Line::from(Span::styled(
-                format!(
-                    "Enrolling '{}' (scan {}/{})",
-                    e.profile,
-                    e.captured + e.base,
-                    e.target + e.base
-                ),
+                format!("Enrolling '{}'", e.profile),
                 Style::new().add_modifier(Modifier::BOLD),
             )),
+            Line::from(vec![
+                Span::styled(
+                    format!("  Scan {current} of {total}  "),
+                    Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(progress, Style::new().fg(th().ok)),
+            ]),
             Line::raw(""),
         ];
         if let Some(err) = &e.stalled {
@@ -4389,14 +4729,6 @@ impl App {
             return;
         }
         lines.extend([
-            Line::from(vec![
-                Span::raw("  Quality  "),
-                Span::styled(
-                    quality_bar(q),
-                    Style::new().fg(if q >= 70 { th().ok } else { th().accent }),
-                ),
-            ]),
-            Line::raw(""),
             chk(face, "Face detected"),
             chk(r.map(|x| x.centered).unwrap_or(false), "Centered in frame"),
             chk(
@@ -4420,9 +4752,14 @@ impl App {
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             )));
         } else {
-            let g = r
-                .map(|x| x.guidance.clone())
-                .unwrap_or_else(|| "Starting camera…".into());
+            let g = r.map(|x| x.guidance.clone()).unwrap_or_else(|| {
+                let spinner = if self.reduce_motion {
+                    "·"
+                } else {
+                    SPIN[self.spin]
+                };
+                format!("{spinner} Starting camera…")
+            });
             lines.push(Line::from(vec![
                 Span::styled("  → ", Style::new().fg(th().accent)),
                 Span::styled(g, Style::new().add_modifier(Modifier::BOLD)),
@@ -4448,11 +4785,11 @@ impl App {
                 // The load FAILED (daemon up, enrollment unreadable). The [e]
                 // prompt here invited overwriting an enrollment that exists;
                 // Repair carries the recovery guidance.
-                format!("\nProfile list unreadable: {err}\n\nDo not re-enroll over it; see the Repair tab first.")
+                format!("\nProfile list unreadable: {err}\n\nDo not re-enroll over it; see Diagnostics first.")
             } else if !self.profiles_loaded {
                 // Never answered (daemon unreachable): the enrollment may
                 // exist and be fine, so no "none" and no enroll prompt.
-                "\nProfile list not read yet: irlumed is not reachable, so nothing is known about your enrollment.\n\nStart the daemon (Repair tab) and this list loads by itself."
+                "\nProfile list not read yet: irlumed is not reachable, so nothing is known about your enrollment.\n\nStart the daemon from Diagnostics and this list loads by itself."
                     .to_string()
             } else {
                 "\nNo face profiles yet.\n\nPress [e] to enroll; irlume will guide your framing and capture automatically."
@@ -4462,6 +4799,37 @@ impl App {
             return;
         }
         let rows = self.rows();
+        // Profile rows can occupy two terminal lines when a recognizer warning
+        // is present. Register their actual rendered height so a pointer lands
+        // on the same row the user sees, including that warning line.
+        let mut row_y = area.y;
+        for (i, row) in rows.iter().enumerate() {
+            let height = match row {
+                Row::Profile(pi) => {
+                    let p = &self.profiles[*pi];
+                    let live_count = p
+                        .live_recognizer
+                        .as_deref()
+                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
+                        .unwrap_or(0);
+                    let misleading = p.scans_by_recognizer.len() > 1
+                        || (p.live_recognizer.is_some() && live_count != p.scans.len());
+                    if misleading && live_count == 0 {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                Row::Scan(_, _) => 1,
+            };
+            if row_y < area.y.saturating_add(area.height) {
+                self.hit(
+                    Rect::new(area.x, row_y, area.width, height),
+                    Click::Select(i),
+                );
+            }
+            row_y = row_y.saturating_add(height);
+        }
         let items: Vec<ListItem> = rows
             .iter()
             .map(|r| match r {
@@ -4535,11 +4903,7 @@ impl App {
         let mut st =
             ListState::default().with_selected(Some(self.sel.min(rows.len().saturating_sub(1))));
         f.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::new()
-                    .bg(Color::Rgb(0x20, 0x30, 0x40))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            List::new(items).highlight_style(selected_style()),
             area,
             &mut st,
         );
@@ -4601,6 +4965,19 @@ impl App {
         // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
         // drew "turn it on" while the daemon was already enforcing.
         let bio = irlume_common::config::enforce_biopolicy_visible();
+        // The service picker is the second row of `service_gesture_lines`,
+        // after four rows in the eyes-open section. Make each label directly
+        // selectable; the click chooses only, while [c] remains the deliberate
+        // state-changing action.
+        let service_y = area.y.saturating_add(6);
+        let mut service_x = area.x.saturating_add(2);
+        for (i, svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
+            let width = svc.chars().count() as u16 + 3;
+            if service_y < area.y.saturating_add(area.height) {
+                self.hit(Rect::new(service_x, service_y, width, 1), Click::Select(i));
+            }
+            service_x = service_x.saturating_add(width);
+        }
         f.render_widget(
             Paragraph::new({
                 let mut v = vec![
@@ -4815,7 +5192,7 @@ impl App {
                 // Points at the Models tab (#331) so the full listing is one
                 // Tab away, not a CLI command the user has to know about.
                 Line::from(Span::styled(
-                    "  recognition replaces RGB matching. Licenses + measurements: the Models tab.",
+                    "  recognition replaces RGB matching. Licenses + measurements: Face Model.",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
@@ -5097,14 +5474,21 @@ impl App {
             hdr_area,
         );
         f.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::new()
-                    .bg(Color::Rgb(0x20, 0x30, 0x40))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            List::new(items).highlight_style(selected_style()),
             rows_area,
             &mut st,
         );
+        for i in 0..pairs.len().min(rows_area.height as usize) {
+            self.hit(
+                Rect::new(
+                    rows_area.x,
+                    rows_area.y.saturating_add(i as u16),
+                    rows_area.width,
+                    1,
+                ),
+                Click::Select(i),
+            );
+        }
 
         // ---- info: active pair, selected pair nodes, emitter ----
         // Only claim a node as "active" if it exists; select_pair's fixed
@@ -5117,7 +5501,7 @@ impl App {
         // daemon row rendered above it. Unknown is not none.
         let (active, active_style) = if self.health.is_none() {
             (
-                "unknown (daemon not answering; see the Repair tab)".to_string(),
+                "unknown (daemon not answering; see Diagnostics)".to_string(),
                 Style::new().dim(),
             )
         } else {
@@ -5303,7 +5687,7 @@ impl App {
             Some(_) => {}
             None => {
                 lines.push(Line::from(Span::styled(
-                    "  Nothing here has been read; start irlumed (Repair tab) to see it.",
+                    "  Nothing here has been read; start irlumed from Diagnostics to see it.",
                     Style::new().dim(),
                 )));
             }
@@ -5489,135 +5873,121 @@ impl App {
         )
     }
 
-    /// Hub rows for the Welcome screen: each visible section with its live
-    /// state, selectable and Enter-jumpable (hub-and-spoke: the summary IS
-    /// the navigation, the tab ribbon stays for direct access).
+    /// The few outcomes that matter on Overview. Advanced tools remain in the
+    /// sidebar instead of turning the summary into a second copy of navigation.
     fn hub_rows(&self) -> Vec<(&'static str, Option<bool>, usize)> {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
-        // None = never observed (the daemon has not answered); the badge
-        // renders it as unknown. `unwrap_or(false)` here turned every
-        // unanswered question into "○ no", two of them security claims.
-        let all: [(&'static str, Option<bool>, usize); 8] = [
-            ("checks & repair", Some(self.daemon_up), SC_REPAIR),
-            ("cameras", Some(self.caps.rgb), SC_CAMERAS),
+        let diagnostics = (!self.repair.is_empty() || self.probes_landed).then_some(
+            self.daemon_up
+                && !self
+                    .repair
+                    .iter()
+                    .any(|c| c.sev == Sev::Fail || c.sev == Sev::Warn),
+        );
+        // None means not observed yet, never "no". These rows express outcomes
+        // in user language and follow the setup order in the sidebar.
+        let all: [(&'static str, Option<bool>, usize); 6] = [
             (
-                "enrollment",
+                "Faces",
                 self.profiles_loaded.then_some(scans > 0),
                 SC_PROFILES,
             ),
-            ("keyring unlock", self.keyring_armed, SC_KEYRING),
+            ("Login & Apps", self.login_wired_known(), SC_PAM),
+            ("Password Wallet", self.keyring_armed, SC_KEYRING),
             (
-                "recovery + encryption",
-                // The key has to be there too: encrypted with no key is not a
-                // completed step, it is an enrollment nothing can read.
+                "Recovery",
                 self.recovery
                     .map(|r| r.encrypted && r.recovery_set && r.key_present),
                 SC_RECOVERY,
             ),
-            ("login wiring", self.login_wired_known(), SC_PAM),
-            ("settings", Some(true), SC_SETTINGS),
-            ("model options", Some(true), SC_MODELS),
+            (
+                "Fingerprint",
+                self.fp_present.then_some(!self.fp.enrolled.is_empty()),
+                SC_FINGERPRINT,
+            ),
+            ("Diagnostics", diagnostics, SC_REPAIR),
         ];
         all.into_iter()
             .filter(|(_, _, sc)| self.visible.contains(sc))
             .collect()
     }
 
+    fn overview_primary(&self) -> (&'static str, &'static str) {
+        let needs_attention = !self.daemon_up
+            || self
+                .repair
+                .iter()
+                .any(|c| c.sev == Sev::Fail || c.sev == Sev::Warn);
+        if needs_attention {
+            ("d", "Open Diagnostics")
+        } else if self.caps.rgb && self.enrolled_known() != Some(true) {
+            ("e", "Enroll Face")
+        } else if self.enrolled_known() == Some(true) && self.login_wired_known() == Some(false) {
+            ("w", "Connect Login")
+        } else if self.caps.rgb {
+            ("i", "Test Recognition")
+        } else {
+            ("r", "Refresh Status")
+        }
+    }
+
     fn draw_welcome(&self, f: &mut Frame, area: Rect) {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
-        let lines = vec![
+        let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
+        let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
+        let (headline, detail, color) = if !self.daemon_up {
+            (
+                "Irlume needs attention",
+                "The background service is not responding.",
+                th().err,
+            )
+        } else if fails > 0 {
+            (
+                "Irlume needs attention",
+                "Diagnostics explains what failed and how to repair it.",
+                th().err,
+            )
+        } else if self.caps.rgb && self.enrolled_known() == Some(false) {
+            (
+                "Set up face unlock",
+                "Your password remains available during and after setup.",
+                th().accent,
+            )
+        } else if self.enrolled_known() == Some(true) && self.login_wired_known() == Some(false) {
+            (
+                "Finish login setup",
+                "Your face is enrolled; connect it to login and the lock screen.",
+                th().warn,
+            )
+        } else if warns > 0 {
+            (
+                "Face unlock is available",
+                "Diagnostics has an advisory worth reviewing.",
+                th().warn,
+            )
+        } else if self.enrolled_known() == Some(true) {
+            (
+                "Face unlock is ready",
+                "Enrollment and system integration update automatically.",
+                th().ok,
+            )
+        } else {
+            (
+                "Checking your setup",
+                "Status fills in as the local service responds.",
+                th().accent,
+            )
+        };
+        let mut lines = vec![
             Line::from(Span::styled(
-                "  irlume - local face authentication",
-                Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+                format!("  {headline}"),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                "  IR + lume · clean-BOM · TPM-sealed · privacy by design",
-                Style::new().dim(),
-            )),
+            Line::from(Span::styled(format!("  {detail}"), Style::new().dim())),
             Line::raw(""),
-            Line::from(Span::styled(
-                "  This is a guided panel. Tab / ⇧Tab walk the steps left-to-right;",
-                Style::new().dim(),
-            )),
-            Line::from(Span::styled(
-                "  each step shows live state and its own action keys in the footer.",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-            {
-                // A one-line health summary from the same run_checks() the
-                // Repair tab uses, so a healthy user never needs to open Repair
-                // and an unhealthy one is pointed straight at it.
-                let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
-                let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
-                // needs_repair (compute_visible) surfaces the "checks & repair"
-                // hub row on any warn/fail, so this always points at a row that
-                // is right below and Enter-openable, no "switch to advanced" step.
-                if fails > 0 {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  ✗ {fails} issue(s) need attention"),
-                            Style::new().fg(th().err).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(" → open \"checks & repair\" below", Style::new().dim()),
-                    ])
-                } else if warns > 0 {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("  ⚠ {warns} advisory item(s)"),
-                            Style::new().fg(th().warn),
-                        ),
-                        Span::styled(" → open \"checks & repair\" below", Style::new().dim()),
-                    ])
-                } else {
-                    Line::from(Span::styled(
-                        "  ✓ all checks pass",
-                        Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                    ))
-                }
-            },
-            Line::raw(""),
-            section("At a glance  (↑↓ pick a section, Enter opens it)"),
-            Line::from(vec![
-                Span::styled("  Recommended  ", Style::new().add_modifier(Modifier::BOLD)),
-                Span::styled(self.recommended(), Style::new().fg(th().ok)),
-            ]),
-            Line::from(Span::styled(
-                "  (you can change the method any time; [v] shows every tab)",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-            if self.visible.contains(&SC_IDENTIFY) {
-                Line::from(vec![
-                    Span::styled("  [e]", Style::new().fg(th().accent)),
-                    Span::styled(" enroll now   ", Style::new().dim()),
-                    Span::styled("[i]", Style::new().fg(th().accent)),
-                    Span::styled(" identify   ", Style::new().dim()),
-                    Span::styled("Tab", Style::new().fg(th().accent)),
-                    Span::styled(" walk the steps", Style::new().dim()),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled("  [e]", Style::new().fg(th().accent)),
-                    Span::styled(" enroll now   ", Style::new().dim()),
-                    Span::styled("Tab", Style::new().fg(th().accent)),
-                    Span::styled(" walk the steps   ", Style::new().dim()),
-                    Span::styled("[v]", Style::new().fg(th().accent)),
-                    Span::styled(" all tabs", Style::new().dim()),
-                ])
-            },
-            Line::from(Span::styled(
-                "  Live panel: changes to irlume appear here automatically.",
-                Style::new().dim(),
-            )),
+            section("Status  (↑↓ select · Enter open)"),
         ];
-        let mut lines = lines;
-        // Splice the selectable hub rows just under the "At a glance" header.
-        let at = lines
-            .iter()
-            .position(|l| l.spans.iter().any(|sp| sp.content.contains("At a glance")))
-            .map(|i| i + 1)
-            .unwrap_or(lines.len());
+        let at = lines.len();
         let rows = self.hub_rows();
         let n = rows.len();
         for (i, (label, ok, _)) in rows.into_iter().enumerate() {
@@ -5626,7 +5996,7 @@ impl App {
             if selected {
                 style = style.fg(th().accent).add_modifier(Modifier::BOLD);
             }
-            let badge = if label == "enrollment" {
+            let badge = if label == "Faces" {
                 count_badge(
                     self.profiles_loaded,
                     self.profiles.len(),
@@ -5640,15 +6010,43 @@ impl App {
             lines.insert(
                 at + i,
                 Line::from(vec![
-                    Span::styled(format!("  {marker} {label:<24}"), style),
+                    Span::styled(format!("  {marker} {label:<20}"), style),
                     badge,
                 ]),
             );
+            let y = area.y.saturating_add((at + i) as u16);
+            if y < area.y.saturating_add(area.height) {
+                self.hit(Rect::new(area.x, y, area.width, 1), Click::Hub(i));
+            }
         }
         lines.insert(at + n, Line::raw(""));
-        // trim:false: leading spaces are the marker column of the hub rows;
-        // trim would collapse unselected rows against the ▸ rows.
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let (key, label) = self.overview_primary();
+        lines.insert(
+            at + n + 1,
+            Line::from(Span::styled("  Recommended method", Style::new().dim())),
+        );
+        lines.insert(
+            at + n + 2,
+            Line::from(Span::styled(
+                format!("  {}", self.recommended()),
+                Style::new().fg(th().ok),
+            )),
+        );
+        lines.insert(
+            at + n + 3,
+            Line::from(vec![
+                Span::styled(format!("  {key} "), th().chip),
+                Span::styled(label, Style::new().add_modifier(Modifier::BOLD)),
+            ]),
+        );
+        let action_y = area.y.saturating_add((at + n + 3) as u16);
+        if action_y < area.y.saturating_add(area.height) {
+            self.hit(
+                Rect::new(area.x, action_y, area.width, 1),
+                Click::Key(footer_keycode(key).expect("overview actions use one key")),
+            );
+        }
+        f.render_widget(Paragraph::new(lines), area);
     }
 
     /// Diagnostic + repair: a live checklist (✓/⚠/✗) of everything irlume needs
@@ -5700,14 +6098,21 @@ impl App {
             self.repair_sel.min(self.repair.len().saturating_sub(1)),
         ));
         f.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::new()
-                    .bg(Color::Rgb(0x20, 0x30, 0x40))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            List::new(items).highlight_style(selected_style()),
             list_area,
             &mut st,
         );
+        for i in 0..self.repair.len().min(list_area.height as usize) {
+            self.hit(
+                Rect::new(
+                    list_area.x,
+                    list_area.y.saturating_add(i as u16),
+                    list_area.width,
+                    1,
+                ),
+                Click::Select(i),
+            );
+        }
 
         // ---- info / platform / live test --------------------------------
         let (sb_present, sb_enabled, sb_setup) = self.probes.secureboot;
@@ -6155,19 +6560,19 @@ impl App {
                 Span::raw("  fingerprint       "),
                 onoff(self.fp.available),
             ]),
-            Line::from(vec![Span::raw("  login wiring      "), onoff_opt(wired)]),
+            Line::from(vec![Span::raw("  login connection  "), onoff_opt(wired)]),
             Line::raw(""),
             Line::from(Span::styled(
                 if !self.daemon_up {
-                    "  Daemon not running; see the Repair tab before quitting."
+                    "  Daemon not running; see Diagnostics before quitting."
                 } else if self.profiles.is_empty() && self.caps.rgb {
-                    "  Not set up yet; enroll a face (Welcome [e]) to begin."
+                    "  Not set up yet; enroll a face (Overview [e]) to begin."
                 } else if self.profiles.is_empty() {
                     "  No face hardware; fingerprint/password remain your methods."
                 } else if wired == Some(false) {
                     "  One step left: your login screen isn't wired yet; press [w] (sudo; password stays the fallback)."
                 } else if wired.is_none() {
-                    "  Checking login wiring; the row above fills in when the probe lands."
+                    "  Checking login connection; the row above fills in when the probe lands."
                 } else {
                     "  All set. irlume keeps running as a daemon; this panel is safe to quit."
                 },
@@ -6189,14 +6594,23 @@ impl App {
     }
 
     fn draw_activity(&self, f: &mut Frame, area: Rect) {
+        let expanded = area.height >= ACTIVITY_EXPANDED_ROWS;
         let scrolled = self.act_scroll > 0;
-        let title = match (&self.op, scrolled) {
-            (Some(op), _) => format!(" ● Activity   {} {}… ", SPIN[self.spin], op.label),
-            (None, true) => format!(
-                " ● Activity: ↑ history ({} up · PgDn/End to follow) ",
+        let spinner = if self.reduce_motion {
+            "·"
+        } else {
+            SPIN[self.spin]
+        };
+        let title = match (&self.op, expanded, scrolled) {
+            (Some(op), _, _) => format!(" Activity · {spinner} {}… ", op.label),
+            (None, true, true) => format!(
+                " Activity · ↑ history ({} up · PgDn/End to follow) ",
                 self.act_scroll
             ),
-            (None, false) => " ● Activity: newest last · PgUp to scroll back ".to_string(),
+            (None, true, false) => {
+                " Activity · newest last · [A] collapse · PgUp history ".to_string()
+            }
+            (None, false, _) => " Recent activity · [A] expand ".to_string(),
         };
         let blk = Block::bordered()
             .title(title)
@@ -6204,14 +6618,21 @@ impl App {
             .border_style(Style::new().fg(if scrolled { th().accent } else { th().blue }));
         let inner = blk.inner(area);
         f.render_widget(blk, area);
+        // The collapsed strip is one large disclosure target. Once expanded,
+        // only its title row collapses it, leaving log text easy to select/copy.
+        let activity_target = if expanded {
+            Rect::new(area.x, area.y, area.width, 1)
+        } else {
+            area
+        };
+        self.hit(activity_target, Click::Key(KeyCode::Char('A')));
         let h = inner.height as usize;
         // Window ends `act_scroll` lines up from the newest entry.
         // Designed empty state (HIG placeholders): say what will appear, not
         // nothing.
         if self.activity.is_empty() {
             f.render_widget(
-                Paragraph::new("Actions you take show up here, newest last.")
-                    .style(Style::new().dim()),
+                Paragraph::new("No activity yet.").style(Style::new().dim()),
                 inner,
             );
             return;
@@ -6237,40 +6658,68 @@ impl App {
     }
 
     /// Per-screen action keys, ordered primary-first: the footer shows
-    /// the first three, the [?] overlay shows them all. Every bound key of a
+    /// the first two, the [?] overlay shows them all. Every bound key of a
     /// screen belongs here; the overlay claims to be the full keymap, so a
     /// key documented only in body text is invisible once the body scrolls
     /// or the user reaches for [?].
     fn screen_actions(&self) -> &'static [(&'static str, &'static str)] {
         match self.screen {
-            SC_WELCOME => &[
-                ("e", "enroll"),
-                ("i", "identify"),
-                ("r", "refresh"),
-                ("enter", "open the selected section"),
-                ("U", "uninstall"),
-            ],
+            SC_WELCOME => match self.overview_primary().0 {
+                "d" => &[
+                    ("d", "Open Diagnostics"),
+                    ("e", "Enroll Face"),
+                    ("r", "Refresh Status"),
+                    ("enter", "Open Selected Section"),
+                    ("U", "Uninstall…"),
+                ],
+                "e" => &[
+                    ("e", "Enroll Face"),
+                    ("i", "Test Recognition"),
+                    ("r", "Refresh Status"),
+                    ("enter", "Open Selected Section"),
+                    ("U", "Uninstall…"),
+                ],
+                "w" => &[
+                    ("w", "Connect Login…"),
+                    ("i", "Test Recognition"),
+                    ("r", "Refresh Status"),
+                    ("enter", "Open Selected Section"),
+                    ("U", "Uninstall…"),
+                ],
+                "i" => &[
+                    ("i", "Test Recognition"),
+                    ("e", "Enroll Face"),
+                    ("r", "Refresh Status"),
+                    ("enter", "Open Selected Section"),
+                    ("U", "Uninstall…"),
+                ],
+                _ => &[
+                    ("r", "Refresh Status"),
+                    ("enter", "Open Selected Section"),
+                    ("U", "Uninstall…"),
+                ],
+            },
             SC_REPAIR => &[
-                ("f", "fix"),
-                ("r", "re-check"),
-                ("d", "full doctor"),
-                ("l", "IR test"),
-                ("g", "logs"),
-                ("t", "debug logs"),
+                ("f", "Fix Selected Issue…"),
+                ("r", "Recheck"),
+                ("d", "Full Diagnostics"),
+                ("l", "Test Infrared Camera"),
+                ("g", "Show Logs"),
+                ("t", "Toggle Debug Logs"),
             ],
             SC_CAMERAS => &[
-                ("enter", "use"),
-                ("s", "setup emitter"),
-                ("p", "list units"),
-                ("t", "tune capture"),
+                ("enter", "Use Selected Pair…"),
+                ("s", "Set Up Emitter…"),
+                ("p", "List Units"),
+                ("t", "Tune Capture…"),
             ],
             SC_PROFILES => &[
-                ("e", "enroll"),
-                ("a", "add scan"),
-                ("r", "rename"),
-                ("d", "delete"),
+                ("e", "Enroll Face…"),
+                ("a", "Improve Recognition"),
+                ("r", "Rename…"),
+                ("d", "Delete…"),
             ],
-            SC_IDENTIFY => &[("i", "identify")],
+            SC_IDENTIFY => &[("i", "Test Recognition")],
             // Both [r] and [p] are guarded in the handler: [r] reseals a seal that
             // must already exist, and [p] refreshes the boot-measurement policy a
             // Tier 2 seal is bound to. Advertising either where its guard cannot
@@ -6282,60 +6731,64 @@ impl App {
                     .is_some_and(|p| p.contains("Tier 2")),
             ) {
                 (true, true) => &[
-                    ("a", "arm"),
-                    ("r", "reseal"),
-                    ("f", "forget"),
-                    ("p", "refresh pcrlock policy"),
+                    ("a", "Connect Wallet…"),
+                    ("r", "Reseal…"),
+                    ("f", "Forget…"),
+                    ("p", "Refresh PCR Policy…"),
                 ],
-                (true, false) => &[("a", "arm"), ("r", "reseal"), ("f", "forget")],
+                (true, false) => &[("a", "Connect Wallet…"), ("r", "Reseal…"), ("f", "Forget…")],
                 (false, true) => &[
-                    ("a", "arm"),
-                    ("f", "forget"),
-                    ("p", "refresh pcrlock policy"),
+                    ("a", "Connect Wallet…"),
+                    ("f", "Forget…"),
+                    ("p", "Refresh PCR Policy…"),
                 ],
-                (false, false) => &[("a", "arm"), ("f", "forget")],
+                (false, false) => &[("a", "Connect Wallet…"), ("f", "Forget…")],
             },
-            SC_RECOVERY => &[("s", "set"), ("t", "restore"), ("f", "forget")],
+            SC_RECOVERY => &[("s", "Set Recovery…"), ("t", "Restore…"), ("f", "Forget…")],
             SC_FINGERPRINT => &[
-                ("a", "enroll finger"),
-                ("t", "test finger"),
-                ("e", "enable both"),
-                ("d", "disable"),
-                ("x", "reset"),
+                ("a", "Enroll Finger…"),
+                ("t", "Test Finger"),
+                ("e", "Enable Both…"),
+                ("d", "Disable…"),
+                ("x", "Reset…"),
             ],
             SC_PAM => &[
-                ("w", "wire login (sudo)"),
-                ("u", "face-sudo"),
-                ("p", "app prompts"),
-                ("c", "calibrate gesture"),
-                ("b", "app unlock"),
-                ("x", "un-wire"),
-                ("s", "show status"),
+                ("w", "Connect Login…"),
+                ("u", "Configure Sudo…"),
+                ("p", "Configure App Prompts…"),
+                ("c", "Calibrate Gesture…"),
+                ("b", "Configure App Unlock…"),
+                ("x", "Disconnect…"),
+                ("s", "Show Status"),
             ],
             SC_SETTINGS => &[
-                ("enter", "eyes-open off"),
-                ("↑/↓", "pick service"),
-                ("c", "toggle gesture"),
-                ("g", "keyring gesture"),
-                ("b", "biopolicy"),
-                ("m", "3rd-party model"),
+                ("enter", "Turn Eyes-Open Check Off…"),
+                ("↑/↓", "Select Service"),
+                ("c", "Toggle Gesture…"),
+                ("g", "Wallet Gesture…"),
+                ("b", "Biopolicy…"),
+                ("m", "Third-Party Model…"),
             ],
             // Read-only by design (#331): a model change goes through the
             // CLI's own sudo + license flow, and the screen prints the exact
             // command for it, so the only key to advertise is the scroll.
-            SC_MODELS => &[("↑/↓", "scroll catalog")],
+            SC_MODELS => &[("↑/↓", "Scroll Catalog")],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
             // a needless `sudo irlume login enable --apply` re-run. Unknown
             // state (no sweep yet) advertises nothing either way.
             SC_DONE => {
                 if self.login_wired_known() == Some(false) {
-                    &[("w", "wire login"), ("u", "update"), ("r", "refresh")]
+                    &[
+                        ("w", "Connect Login…"),
+                        ("u", "Update…"),
+                        ("r", "Refresh Status"),
+                    ]
                 } else {
-                    &[("u", "update"), ("r", "refresh")]
+                    &[("u", "Update…"), ("r", "Refresh Status")]
                 }
             }
-            _ => &[("r", "refresh")],
+            _ => &[("r", "Refresh Status")],
         }
     }
 
@@ -6375,26 +6828,60 @@ impl App {
             return;
         }
         let actions = self.screen_actions();
-        // Three-tier disclosure (GNOME HIG): the footer shows the primary
-        // action plus at most two more; [?] opens the full keymap overlay;
+        // Three-tier disclosure: the footer shows the primary action plus one
+        // secondary action; [?] opens the full keymap overlay;
         // docs hold the rest. The first action is THE action for the screen,
         // so it alone gets the emphasized label.
-        let mut spans = vec![key("Tab"), Span::styled(" tabs  ", Style::new().dim())];
-        for (i, (k, d)) in actions.iter().take(3).enumerate() {
-            spans.push(key(k));
-            if i == 0 {
-                spans.push(Span::styled(
-                    format!(" {d}  "),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ));
+        // Build the chip row while tracking x so each key chip becomes a click
+        // target (border eats one column, so content starts at area.x + 1).
+        let inner_y = area.y + 1;
+        let mut x = area.x + 1;
+        let mut spans: Vec<Span> = Vec::new();
+        let nav_x = x;
+        let s = key("Tab");
+        let w = s.content.chars().count() as u16;
+        x = x.saturating_add(w);
+        spans.push(s);
+        let s = Span::styled(" sections  ", Style::new().dim());
+        x = x.saturating_add(s.content.chars().count() as u16);
+        spans.push(s);
+        self.hit(
+            Rect::new(nav_x, inner_y, x.saturating_sub(nav_x), 1),
+            Click::Key(KeyCode::Tab),
+        );
+        let visible_actions = if area.width >= 100 { 2 } else { 1 };
+        for (i, (k, d)) in actions.iter().take(visible_actions).enumerate() {
+            let action_x = x;
+            let s = key(k);
+            let w = s.content.chars().count() as u16;
+            x = x.saturating_add(w);
+            spans.push(s);
+            let ds = if i == 0 {
+                Span::styled(format!(" {d}  "), Style::new().add_modifier(Modifier::BOLD))
             } else {
-                spans.push(Span::styled(format!(" {d}  "), Style::new().dim()));
+                Span::styled(format!(" {d}  "), Style::new().dim())
+            };
+            x = x.saturating_add(ds.content.chars().count() as u16);
+            spans.push(ds);
+            if let Some(kc) = footer_keycode(k) {
+                self.hit(
+                    Rect::new(action_x, inner_y, x.saturating_sub(action_x), 1),
+                    Click::Key(kc),
+                );
             }
         }
-        spans.push(key("?"));
-        spans.push(Span::styled(" all keys  ", Style::new().dim()));
-        spans.push(key("q"));
-        spans.push(Span::styled(" quit", Style::new().dim()));
+        let help_x = x;
+        let s = key("?");
+        let w = s.content.chars().count() as u16;
+        x = x.saturating_add(w);
+        spans.push(s);
+        let s = Span::styled(" shortcuts", Style::new().dim());
+        x = x.saturating_add(s.content.chars().count() as u16);
+        spans.push(s);
+        self.hit(
+            Rect::new(help_x, inner_y, x.saturating_sub(help_x), 1),
+            Click::Key(KeyCode::Char('?')),
+        );
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
@@ -6405,7 +6892,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n  Tab / \u{2190}\u{2192}  switch tab      \u{2191}\u{2193}  select\n               v  basic/all tabs       PgUp/Dn  activity log\n               h  home (the Welcome tab)\n               M  release mouse (highlight/copy)   q  quit\n\nThis screen\n",
+            "Global\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n         PgUp/Dn  scroll activity history\n               h  Overview              q  quit\n           click  rows and action chips\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -6476,18 +6963,43 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
         .sum()
 }
 
-fn quality_bar(q: u8) -> String {
-    let filled = (q as usize * 10 / 100).min(10);
-    format!(
-        "[{}{}] {q:>3}%",
-        "█".repeat(filled),
-        "░".repeat(10 - filled)
-    )
-}
-
 // ---- rich-render helpers --------------------------------------------------
 
 /// A bold accent section header line.
+/// The default five stacked regions of the screen. Tests and ordinary frames
+/// use the compact recent-activity strip; [`App::frame_rows`] selects the
+/// expanded history height when needed.
+fn tui_rows(area: Rect) -> [Rect; 5] {
+    tui_rows_with_activity(area, ACTIVITY_COLLAPSED_ROWS)
+}
+
+fn tui_rows_with_activity(area: Rect, activity_rows: u16) -> [Rect; 5] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(6),
+        Constraint::Length(activity_rows),
+        Constraint::Length(3),
+    ])
+    .areas(area)
+}
+
+/// Map a footer chip's label to the key it fires when clicked.
+fn footer_keycode(k: &str) -> Option<KeyCode> {
+    match k {
+        "Tab" => Some(KeyCode::Tab),
+        "enter" => Some(KeyCode::Enter),
+        "esc" => Some(KeyCode::Esc),
+        _ => {
+            let mut ch = k.chars();
+            match (ch.next(), ch.next()) {
+                (Some(c), None) => Some(KeyCode::Char(c)),
+                _ => None,
+            }
+        }
+    }
+}
+
 fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         title.to_string(),
@@ -7059,6 +7571,411 @@ mod tests {
     /// A bare App for tests: no hardware probes, no daemon socket, no terminal.
     /// Mirrors `App::new()` but every probe-derived field is inert.
     /// `test_app` with a chosen account, for the user-resolution test.
+    #[test]
+    fn first_run_shows_focused_front_door() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.profiles_loaded = true; // loaded + empty profiles => not enrolled
+        app.screen = SC_WELCOME;
+        assert!(
+            app.is_first_run(),
+            "unenrolled + camera + Welcome is first-run"
+        );
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Set up face unlock"),
+            "front-door title missing:\n{text}"
+        );
+        assert!(text.contains("Scan my face"), "primary action missing");
+        assert!(
+            !text.contains("At a glance"),
+            "the focused front door must replace the Welcome hub"
+        );
+    }
+
+    #[test]
+    fn first_run_suppressed_once_enrolled_or_without_camera() {
+        // Enrolled => classic Welcome, never the front door.
+        let mut enrolled = test_app();
+        enrolled.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        enrolled.profiles = vec![profile("me", &["s1"])];
+        enrolled.profiles_loaded = true;
+        enrolled.screen = SC_WELCOME;
+        assert!(!enrolled.is_first_run());
+        // No camera => the face-worded front door would be wrong; classic Welcome.
+        let mut headless = test_app(); // caps.rgb = false
+        headless.profiles_loaded = true;
+        headless.screen = SC_WELCOME;
+        assert!(!headless.is_first_run());
+        // Off Welcome (e.g. user pressed Tab) => sidebar returns, no front door.
+        let mut elsewhere = test_app();
+        elsewhere.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        elsewhere.profiles_loaded = true;
+        elsewhere.screen = SC_SETTINGS;
+        assert!(!elsewhere.is_first_run());
+    }
+
+    #[test]
+    fn sidebar_groups_the_visible_screens_and_marks_the_current() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_PROFILES;
+        let text = draw_text(&app); // 120 wide => sidebar shown
+        assert!(text.contains("Setup"), "sidebar group missing:\n{text}");
+        assert!(text.contains("System"), "sidebar group missing");
+        assert!(text.contains("Advanced"), "sidebar group missing");
+        assert!(
+            text.contains('▎'),
+            "the current screen must carry the accent selection bar"
+        );
+    }
+
+    #[test]
+    fn header_step_counter_is_narrow_only() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        // Wide: the sidebar carries position, so the header omits N/M.
+        let wide = draw_text(&app);
+        let wide_hdr = row_with(&wide, "irlume");
+        assert!(
+            !wide_hdr.contains("2/5"),
+            "wide header must not show the step counter, got: {wide_hdr}"
+        );
+        // Narrow: sidebar collapsed, so the header carries position.
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let narrow = rendered(&term);
+        let narrow_hdr = row_with(&narrow, "irlume");
+        assert!(
+            narrow_hdr.contains("2/5 · Login & Apps"),
+            "narrow header must show the step counter, got: {narrow_hdr}"
+        );
+    }
+
+    #[test]
+    fn first_run_tab_exits_but_advanced_toggle_only_changes_future_navigation() {
+        let mut advanced = test_app();
+        advanced.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        advanced.profiles_loaded = true;
+        assert!(advanced.is_first_run());
+        advanced.on_key(KeyCode::Char('v'));
+        assert!(advanced.advanced);
+        assert!(advanced.is_first_run());
+
+        let mut tabbed = test_app();
+        tabbed.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        tabbed.profiles_loaded = true;
+        assert!(tabbed.is_first_run());
+        tabbed.on_key(KeyCode::Tab);
+        assert!(!tabbed.is_first_run());
+        assert_ne!(tabbed.screen, SC_WELCOME);
+    }
+
+    #[test]
+    fn clicking_where_the_sidebar_would_be_does_nothing_when_narrow() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        let area = Rect::new(0, 0, 80, 30);
+        let [_, _, body, _, _] = tui_rows(area);
+        assert!(app.body_split(body).0.is_none());
+
+        app.on_click(1, body.y + 2, area);
+
+        assert_eq!(app.screen, SC_WELCOME);
+    }
+
+    #[test]
+    fn narrow_overview_keeps_the_full_recommended_method_visible() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.screen = SC_WELCOME;
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+
+        assert!(
+            text.contains(app.recommended()),
+            "the recommended method was clipped at 80 columns:\n{text}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_sidebar_row_navigates_to_it() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        let area = Rect::new(0, 0, 120, 40);
+        // Pick a navigable row that isn't already current.
+        let (idx, target) = app
+            .sidebar_rows()
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| match r {
+                SidebarRow::Nav(s) if *s != app.screen => Some((i, *s)),
+                _ => None,
+            })
+            .expect("a navigable sidebar row");
+        let [_, _, body, _, _] = tui_rows(area);
+        let inner = Block::bordered().inner(app.body_split(body).0.unwrap());
+        app.on_click(inner.x, inner.y + idx as u16, area);
+        assert_eq!(app.screen, target, "clicking a row jumps to its screen");
+    }
+
+    #[test]
+    fn clicking_the_content_pane_does_not_navigate() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        // Deep in the content pane, well right of the 22-col sidebar.
+        app.on_click(90, 10, Rect::new(0, 0, 120, 40));
+        assert_eq!(app.screen, SC_WELCOME, "content clicks must not navigate");
+    }
+
+    #[test]
+    fn clicking_a_footer_action_label_fires_its_key() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+
+        let [_, _, _, _, footer] = tui_rows(area);
+        let inner = Block::bordered().inner(footer);
+        let enroll_action_x =
+            inner.x + " Tab ".chars().count() as u16 + " sections  ".chars().count() as u16;
+        // Land inside the words "Enroll Face", not only the small [e] chip.
+        app.on_click(
+            enroll_action_x + " e  ".chars().count() as u16,
+            inner.y,
+            area,
+        );
+
+        assert_eq!(app.screen, SC_PROFILES, "the [e] chip starts enrollment");
+        assert!(
+            matches!(app.input, Some((_, _, Pending::EnrollName))),
+            "the clicked action must fire the same enrollment prompt as [e]"
+        );
+    }
+
+    #[test]
+    fn clicking_an_overview_status_row_opens_its_section() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.recompute_visible();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+
+        let (row, target) = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| match click {
+                Click::Hub(i) => app
+                    .hub_rows()
+                    .get(*i)
+                    .map(|(_, _, screen)| (*rect, *screen)),
+                _ => None,
+            })
+            .expect("Overview status rows are clickable");
+        app.on_click(row.x, row.y, area);
+        assert_eq!(app.screen, target);
+    }
+
+    #[test]
+    fn mouse_navigation_is_blocked_while_an_operation_owns_input() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let hub_row = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Hub(_)).then_some(*rect))
+            .expect("Overview has a clickable status row");
+        let (_tx, rx) = mpsc::channel();
+        app.op = Some(Op {
+            label: "busy".into(),
+            tag: OpTag::Generic,
+            rx,
+        });
+
+        app.on_click(hub_row.x, hub_row.y, area);
+
+        assert_eq!(app.screen, SC_WELCOME);
+        assert!(app.op.is_some(), "the click must not disturb the operation");
+    }
+
+    #[test]
+    fn clicking_a_profile_or_diagnostic_row_selects_it() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("one", &["scan-1"]), profile("two", &["scan-2"])];
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let profile_row = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Select(2)).then_some(*rect))
+            .expect("the second profile is clickable");
+        app.on_click(profile_row.x, profile_row.y, area);
+        assert_eq!(app.sel, 2, "profile row click updates selection");
+
+        app.screen = SC_REPAIR;
+        app.run_checks();
+        term.draw(|f| app.draw(f)).unwrap();
+        let diagnostic_row = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Select(1)).then_some(*rect))
+            .expect("diagnostic rows are clickable");
+        app.on_click(diagnostic_row.x, diagnostic_row.y, area);
+        assert_eq!(app.repair_sel, 1, "diagnostic row click updates selection");
+
+        app.screen = SC_SETTINGS;
+        term.draw(|f| app.draw(f)).unwrap();
+        let service = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Select(2)).then_some(*rect))
+            .expect("preference service labels are clickable");
+        app.on_click(service.x, service.y, area);
+        assert_eq!(
+            app.settings_svc_sel, 2,
+            "service label click updates selection"
+        );
+    }
+
+    #[test]
+    fn activity_disclosure_click_expands_and_collapses_history() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut app = test_app();
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let collapsed = app.frame_rows(area)[3];
+        assert_eq!(collapsed.height, ACTIVITY_COLLAPSED_ROWS);
+        app.on_click(collapsed.x, collapsed.y, area);
+        assert!(app.activity_open);
+
+        term.draw(|f| app.draw(f)).unwrap();
+        let expanded = app.frame_rows(area)[3];
+        assert_eq!(expanded.height, ACTIVITY_EXPANDED_ROWS);
+        app.on_click(expanded.x, expanded.y, area);
+        assert!(!app.activity_open);
+
+        let (_tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        term.draw(|f| app.draw(f)).unwrap();
+        let during_enrollment = app.frame_rows(area)[3];
+        app.on_click(during_enrollment.x, during_enrollment.y, area);
+        assert!(
+            app.activity_open,
+            "safe Activity disclosure remains clickable during enrollment"
+        );
+        assert!(
+            app.enroll.is_some(),
+            "the disclosure must not cancel capture"
+        );
+    }
+
+    #[test]
+    fn clicking_the_first_run_button_starts_enrollment() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.daemon_up = true;
+        app.profiles_loaded = true;
+        assert!(app.is_first_run());
+
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let [_, _, body, _, _] = tui_rows(area);
+        let button = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| {
+                (rect.y >= body.y
+                    && rect.y < body.y.saturating_add(body.height)
+                    && matches!(click, Click::Key(KeyCode::Char('e'))))
+                .then_some(*rect)
+            })
+            .expect("the rendered first-run button has a click target");
+        app.on_click(button.x, button.y, area);
+
+        assert_eq!(app.screen, SC_PROFILES, "the button starts enrollment");
+        assert!(
+            matches!(app.input, Some((_, _, Pending::EnrollName))),
+            "the clicked button must open the enrollment name prompt"
+        );
+    }
+
     fn app_with_user(user: &str) -> App {
         let mut a = test_app();
         a.user = user.into();
@@ -7087,6 +8004,7 @@ mod tests {
             input: None,
             confirm: None,
             mouse_select: false,
+            click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
             hub_sel: 0,
             op: None,
@@ -7109,6 +8027,8 @@ mod tests {
             enroll_error: None,
             health: None,
             act_scroll: 0,
+            activity_open: false,
+            reduce_motion: false,
             models_status: None,
             models_scroll: 0,
             visible: App::compute_visible(&caps, VisibilityInputs::default(), &[]),
@@ -7778,7 +8698,10 @@ mod tests {
         app.op = None;
         term.draw(|f| app.draw_footer(f, f.area())).unwrap();
         let text = rendered(&term);
-        assert!(text.contains("tabs") && text.contains("all keys"), "{text}");
+        assert!(
+            text.contains("sections") && text.contains("shortcuts"),
+            "{text}"
+        );
     }
 
     // Regression: cae2eea. caps/fp_present were captured once at startup, so a
@@ -8095,13 +9018,6 @@ mod tests {
     // ---- pure helpers -----------------------------------------------------
 
     #[test]
-    fn quality_bar_fills_proportionally() {
-        assert_eq!(quality_bar(0), "[░░░░░░░░░░]   0%");
-        assert_eq!(quality_bar(50), "[█████░░░░░]  50%");
-        assert_eq!(quality_bar(100), "[██████████] 100%");
-    }
-
-    #[test]
     fn map_ok_routes_ack_error_and_unexpected() {
         assert_eq!(map_ok(Response::Ok("done".into())), (true, "done".into()));
         assert_eq!(
@@ -8235,12 +9151,12 @@ mod tests {
             rgb: true,
         };
         let basic = VisibilityInputs::default();
-        // No biometric hardware: only the always-on steps.
+        // No biometric hardware: only stable system destinations.
         assert_eq!(
             App::compute_visible(&none, basic, &[]),
-            vec![SC_WELCOME, SC_PAM, SC_SETTINGS, SC_MODELS, SC_DONE]
+            vec![SC_WELCOME, SC_PAM, SC_REPAIR, SC_SETTINGS, SC_MODELS]
         );
-        // RGB-only adds the face path (Profiles + Recovery), not Keyring.
+        // RGB-only adds Faces + Recovery, not Password Wallet.
         assert_eq!(
             App::compute_visible(&rgb, basic, &[]),
             vec![
@@ -8248,12 +9164,12 @@ mod tests {
                 SC_PROFILES,
                 SC_RECOVERY,
                 SC_PAM,
+                SC_REPAIR,
                 SC_SETTINGS,
-                SC_MODELS,
-                SC_DONE
+                SC_MODELS
             ]
         );
-        // An IR pair earns the Keyring step.
+        // An IR pair earns Password Wallet.
         assert_eq!(
             App::compute_visible(&ir, basic, &[]),
             vec![
@@ -8262,12 +9178,12 @@ mod tests {
                 SC_KEYRING,
                 SC_RECOVERY,
                 SC_PAM,
+                SC_REPAIR,
                 SC_SETTINGS,
-                SC_MODELS,
-                SC_DONE
+                SC_MODELS
             ]
         );
-        // A fingerprint-only box gets Keyring + Fingerprint, no face tabs.
+        // A fingerprint-only box gets Fingerprint + Password Wallet, no face tabs.
         assert_eq!(
             App::compute_visible(
                 &none,
@@ -8279,55 +9195,34 @@ mod tests {
             ),
             vec![
                 SC_WELCOME,
-                SC_KEYRING,
                 SC_FINGERPRINT,
+                SC_KEYRING,
                 SC_PAM,
+                SC_REPAIR,
                 SC_SETTINGS,
-                SC_MODELS,
-                SC_DONE
+                SC_MODELS
             ]
         );
-        // Advanced view on full hardware shows every screen.
+        // Advanced view on full hardware shows every user-facing destination in
+        // the same order as the sidebar; legacy Setup Status stays out.
         assert_eq!(
             App::compute_visible(
                 &ir,
                 VisibilityInputs {
                     fp_present: true,
                     advanced: true,
-                    ..basic
                 },
                 &[]
             ),
-            (0..SCREENS.len()).collect::<Vec<_>>()
+            NAV_ORDER.to_vec()
         );
-        // Repair earns its tab when the daemon is down…
-        assert_eq!(
-            App::compute_visible(
-                &none,
-                VisibilityInputs {
-                    daemon_down: true,
-                    ..basic
-                },
-                &[]
-            ),
-            vec![
-                SC_WELCOME,
-                SC_REPAIR,
-                SC_PAM,
-                SC_SETTINGS,
-                SC_MODELS,
-                SC_DONE
-            ]
-        );
-        // …and when anything needs reporting (a failure OR an advisory), so the
-        // Welcome health summary's "→ open checks & repair" pointer is reachable.
+        // Diagnostics never disappears as its live checks change.
         let fail = [check_row("x", Sev::Fail, Fix::None)];
         assert!(App::compute_visible(&none, basic, &fail).contains(&SC_REPAIR));
         let warn = [check_row("x", Sev::Warn, Fix::None)];
         assert!(App::compute_visible(&none, basic, &warn).contains(&SC_REPAIR));
-        // But an all-clear basic view hides it.
         let ok = [check_row("x", Sev::Ok, Fix::None)];
-        assert!(!App::compute_visible(&none, basic, &ok).contains(&SC_REPAIR));
+        assert!(App::compute_visible(&none, basic, &ok).contains(&SC_REPAIR));
     }
 
     #[test]
@@ -8337,8 +9232,8 @@ mod tests {
             ir_pair: false,
             rgb: true,
         };
-        app.daemon_up = true; // healthy: Repair earns no tab
-        app.recompute_visible(); // Welcome, Profiles, Recovery, PAM, Done
+        app.daemon_up = true;
+        app.recompute_visible();
         assert_eq!(app.screen, SC_WELCOME);
         app.sel = 3;
         app.on_key(KeyCode::Tab);
@@ -8350,7 +9245,10 @@ mod tests {
         app.on_key(KeyCode::Left);
         assert_eq!(app.screen, SC_WELCOME);
         app.on_key(KeyCode::BackTab);
-        assert_eq!(app.screen, SC_DONE, "BackTab from the first step wraps");
+        assert_eq!(
+            app.screen, SC_MODELS,
+            "BackTab from Overview wraps to the final visible destination"
+        );
         app.on_key(KeyCode::Tab);
         assert_eq!(app.screen, SC_WELCOME, "Tab from the last step wraps");
     }
@@ -9557,7 +10455,7 @@ mod tests {
     // ---- rendering ---------------------------------------------------------
 
     #[test]
-    fn welcome_renders_glance_hint_and_tier_recommendation() {
+    fn overview_prioritizes_status_and_next_action() {
         let mut app = test_app();
         app.caps = irlume_camera::Caps {
             ir_pair: true,
@@ -9566,24 +10464,30 @@ mod tests {
         app.recompute_visible();
         app.daemon_up = true;
         app.profiles = vec![profile("a", &["s1", "s2"])];
+        app.profiles_loaded = true;
         let text = draw_text(&app);
-        assert!(text.contains("irlume - local face authentication"));
-        assert!(text.contains("At a glance"));
+        assert!(text.contains("Face unlock is ready"));
+        assert!(text.contains("Status"));
         assert!(text.contains("1 profile(s), 2 scan(s)"));
         assert!(
             text.contains("Face (IR)"),
             "the IR tier must be recommended on IR hardware"
         );
-        // Enrolled (a profile is present), so the hint must not read as a
-        // first-run greeting; the state-aware variants have their own test.
         assert!(
-            text.contains("You're enrolled"),
-            "the Welcome hint line is missing:\n{text}"
+            text.contains("Live status and the next recommended action."),
+            "the Overview hint line is missing:\n{text}"
         );
-        assert!(text.contains("step 1/"), "the wizard position is missing");
+        // Wide render: position is shown by the sidebar (grouped nav), not a
+        // "step N/N" counter — the header only carries that when the sidebar is
+        // collapsed on a narrow terminal.
+        assert!(
+            text.contains("Setup"),
+            "the sidebar nav is missing:\n{text}"
+        );
         // No-camera tier: the recommendation flips to password-only.
         let app2 = test_app();
         let text = draw_text(&app2);
+        assert!(text.contains("Irlume needs attention"));
         assert!(text.contains("Password only"), "got no fallback tier");
     }
 
@@ -10552,7 +11456,7 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("Setup dashboard"));
         assert!(
-            text.contains("Daemon not running; see the Repair tab"),
+            text.contains("Daemon not running; see Diagnostics"),
             "a down daemon is the first thing Done must flag"
         );
         app.daemon_up = true;
@@ -10562,7 +11466,7 @@ mod tests {
         };
         let text = draw_text(&app);
         assert!(
-            text.contains("enroll a face (Welcome [e])"),
+            text.contains("enroll a face (Overview [e])"),
             "an empty enrollment with a camera points at [e]"
         );
         app.caps = irlume_camera::Caps {
@@ -10583,10 +11487,17 @@ mod tests {
         app.enroll = Some(enroll);
         let text = draw_text(&app);
         assert!(
-            text.contains("Enrolling 'p' (scan 2/5)"),
+            text.contains("Enrolling 'p'") && text.contains("Scan 3 of 5"),
             "progress must include the merged base offset:\n{text}"
         );
-        assert!(text.contains("85%"), "the quality bar shows the percent");
+        assert!(
+            text.contains("2/5"),
+            "captured progress is explicit: {text}"
+        );
+        assert!(
+            !text.contains("85%"),
+            "raw quality scores are implementation detail: {text}"
+        );
         assert!(text.contains("Face detected"));
         assert!(text.contains("Well lit"));
         assert!(
@@ -10595,7 +11506,7 @@ mod tests {
         );
         assert!(text.contains("[esc] cancel"));
         assert!(
-            text.contains("Look at the camera and hold still"),
+            text.contains("Follow one cue at a time"),
             "the hint line switches to capture mode"
         );
         // Between countdowns the daemon's guidance cue shows instead.
@@ -10607,6 +11518,25 @@ mod tests {
         app.enroll.as_mut().unwrap().last = None;
         let text = draw_text(&app);
         assert!(text.contains("Starting camera…"));
+    }
+
+    #[test]
+    fn reduced_motion_replaces_indeterminate_animation_with_a_static_mark() {
+        let mut app = test_app();
+        let (_tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        app.spin = 3;
+        app.reduce_motion = true;
+        let text = draw_text(&app);
+        assert!(text.contains("· Starting camera…"), "{text}");
+        assert!(!text.contains(SPIN[app.spin]), "{text}");
+
+        app.enroll = None;
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        let text = draw_text(&app);
+        assert!(text.contains("· Identify…"), "{text}");
+        assert!(!text.contains(SPIN[app.spin]), "{text}");
     }
 
     #[test]
@@ -10657,11 +11587,15 @@ mod tests {
 
     #[test]
     fn header_counts_steps_over_visible_screens_only() {
-        let mut app = test_app(); // visible: Welcome, Login wiring, Settings, Models, Done
+        let mut app = test_app(); // Overview, Login & Apps, Diagnostics, Preferences, Face Model
         app.screen = SC_PAM;
-        let text = draw_text(&app);
+        // The step counter only appears on a narrow terminal (sidebar collapsed);
+        // there it must track VISIBLE tabs, so Login wiring is 2 of 5.
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
         assert!(
-            text.contains("step 2/5: Login wiring"),
+            text.contains("2/5 · Login & Apps"),
             "the step counter must track visible tabs, got:\n{text}"
         );
         assert!(text.contains("testuser"), "the managed user is shown");
@@ -10673,6 +11607,9 @@ mod tests {
         // The Done footer offers [w] only on OBSERVED-unwired state; give the
         // sweep so the case below exercises the offer, not the unknown state.
         app.probes_landed = true;
+        app.daemon_up = true;
+        app.caps.rgb = true;
+        app.profiles_loaded = true;
         let footer = |app: &App| {
             let mut term = Terminal::new(TestBackend::new(200, 3)).unwrap();
             term.draw(|f| app.draw_footer(f, f.area())).unwrap();
@@ -10681,17 +11618,17 @@ mod tests {
         // Footer = primary action only (trimmed, three-tier disclosure);
         // the [?] overlay must list EVERY action of the screen.
         let cases: [(usize, &str, &str); 11] = [
-            (SC_WELCOME, "enroll", "uninstall"),
-            (SC_REPAIR, "fix", "debug logs"),
-            (SC_CAMERAS, "use", "list units"),
-            (SC_PROFILES, "enroll", "delete"),
-            (SC_IDENTIFY, "identify", "identify"),
-            (SC_KEYRING, "arm", "forget"),
-            (SC_RECOVERY, "set", "forget"),
-            (SC_FINGERPRINT, "enroll finger", "reset"),
-            (SC_PAM, "wire login (sudo)", "un-wire"),
-            (SC_SETTINGS, "eyes-open", "3rd-party model"),
-            (SC_DONE, "wire login", "refresh"),
+            (SC_WELCOME, "Enroll Face", "Uninstall"),
+            (SC_REPAIR, "Fix Selected Issue", "Toggle Debug Logs"),
+            (SC_CAMERAS, "Use Selected Pair", "List Units"),
+            (SC_PROFILES, "Enroll Face", "Delete"),
+            (SC_IDENTIFY, "Test Recognition", "Test Recognition"),
+            (SC_KEYRING, "Connect Wallet", "Forget"),
+            (SC_RECOVERY, "Set Recovery", "Forget"),
+            (SC_FINGERPRINT, "Enroll Finger", "Reset"),
+            (SC_PAM, "Connect Login", "Disconnect"),
+            (SC_SETTINGS, "Turn Eyes-Open", "Third-Party Model"),
+            (SC_DONE, "Connect Login", "Refresh Status"),
         ];
         for (screen, primary, in_overlay) in cases {
             app.screen = screen;
@@ -10708,7 +11645,7 @@ mod tests {
                 SCREENS[screen]
             );
             assert!(
-                text.contains("all keys"),
+                text.contains("shortcuts"),
                 "the [?] disclosure chip always shows"
             );
         }
@@ -10997,22 +11934,13 @@ mod tests {
             enroll.detail
         );
 
-        // Welcome hub: the three unanswered rows carry the unknown badge.
+        // Overview: the three unanswered rows carry the unknown badge.
         app.screen = SC_WELCOME;
         app.visible = (0..SCREENS.len()).collect();
         let text = draw_text(&app);
-        assert!(
-            row_with(&text, "enrollment").contains("◐ unknown"),
-            "{text}"
-        );
-        assert!(
-            row_with(&text, "keyring unlock").contains("◐ unknown"),
-            "{text}"
-        );
-        assert!(
-            row_with(&text, "recovery + encryption").contains("◐ unknown"),
-            "{text}"
-        );
+        assert!(text.contains("Faces               ◐ unknown"), "{text}");
+        assert!(text.contains("Password Wallet     ◐ unknown"), "{text}");
+        assert!(text.contains("Recovery            ◐ unknown"), "{text}");
 
         // Done dashboard: same rule for its four claim rows.
         app.screen = SC_DONE;
@@ -11291,51 +12219,55 @@ mod tests {
         // (describe), never observed (assert neither). The fixed per-screen
         // instruction told a fully configured box to redo every step.
         let mut app = test_app();
+        app.daemon_up = true;
 
-        // Welcome: unknown until ListProfiles has answered.
-        assert!(!draw_text(&app).contains("New here?"));
+        // Overview: unknown until ListProfiles has answered.
+        assert!(draw_text(&app).contains("Checking your setup"));
         app.profiles_loaded = true;
-        assert!(draw_text(&app).contains("New here? Press [e]"));
+        assert!(draw_text(&app).contains("Set up face unlock while keeping password access"));
         app.profiles = vec![profile("a", &["s1"])];
-        assert!(draw_text(&app).contains("You're enrolled"));
+        assert!(draw_text(&app).contains("Face unlock is ready"));
 
         // Keyring: keyring_armed is already tri-state.
         app.screen = SC_KEYRING;
         let text = draw_text(&app);
-        assert!(!text.contains("press [a], type your password"), "{text}");
+        assert!(
+            text.contains("Checking password-wallet integration"),
+            "{text}"
+        );
         app.keyring_armed = Some(false);
-        assert!(draw_text(&app).contains("press [a], type your password"));
+        assert!(draw_text(&app).contains("Connect biometric login to the password wallet"));
         app.keyring_armed = Some(true);
-        assert!(draw_text(&app).contains("Armed: face login opens your wallet"));
+        assert!(draw_text(&app).contains("Face or fingerprint login can open the password wallet"));
 
         // Recovery: unknown until RecoveryStatus has answered.
         app.screen = SC_RECOVERY;
         let text = draw_text(&app);
-        assert!(!text.contains("Set a backup passphrase"), "{text}");
+        assert!(text.contains("Checking enrollment recovery"), "{text}");
         app.recovery = Some(RecoveryInfo {
             encrypted: true,
             recovery_set: false,
             tpm_present: true,
             key_present: true,
         });
-        assert!(draw_text(&app).contains("Set a backup passphrase"));
+        assert!(draw_text(&app).contains("Add a recovery passphrase"));
         app.recovery = Some(RecoveryInfo {
             encrypted: true,
             recovery_set: true,
             tpm_present: true,
             key_present: true,
         });
-        assert!(draw_text(&app).contains("Recovery passphrase set"));
+        assert!(draw_text(&app).contains("A recovery passphrase protects access"));
 
         // Login wiring: unknown until the first probe sweep lands.
         app.screen = SC_PAM;
         let text = draw_text(&app);
-        assert!(!text.contains("Turn on face login"), "{text}");
+        assert!(text.contains("Checking login, lock-screen"), "{text}");
         app.probes_landed = true;
         app.probes.login_wired = false;
-        assert!(draw_text(&app).contains("Turn on face login"));
+        assert!(draw_text(&app).contains("Connect face authentication to login"));
         app.probes.login_wired = true;
-        assert!(draw_text(&app).contains("Face login is wired in"));
+        assert!(draw_text(&app).contains("Face authentication is connected"));
     }
 
     #[test]
@@ -11370,25 +12302,28 @@ mod tests {
         };
         // No sweep yet: the probe default is not an observation, so neither
         // the footer, the overlay, nor the body may claim wiring is missing.
-        assert!(!footer(&app).contains("wire login"), "{}", footer(&app));
-        assert!(!app.help_body().contains("wire login"));
+        assert!(!footer(&app).contains("Connect Login"), "{}", footer(&app));
+        assert!(!app.help_body().contains("Connect Login"));
         let text = draw_text(&app);
         assert!(!text.contains("One step left"), "{text}");
         assert!(!text.contains("All set"), "{text}");
         // Observed unwired: the offer appears in body and footer.
         app.probes_landed = true;
         app.probes.login_wired = false;
-        assert!(footer(&app).contains("wire login"));
+        assert!(footer(&app).contains("Connect Login"));
         assert!(draw_text(&app).contains("One step left"));
         // Observed wired: the body says done and no chrome advertises [w],
         // which on a wired box would re-run `sudo irlume login enable`.
         app.probes.login_wired = true;
         let f = footer(&app);
-        assert!(!f.contains("wire login"), "{f}");
-        assert!(!app.help_body().contains("wire login"));
+        assert!(!f.contains("Connect Login"), "{f}");
+        assert!(!app.help_body().contains("Connect Login"));
         let text = draw_text(&app);
         assert!(text.contains("All set"), "{text}");
-        assert!(row_with(&text, "login wiring").contains("● yes"), "{text}");
+        assert!(
+            row_with(&text, "login connection").contains("● yes"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -11400,7 +12335,7 @@ mod tests {
         };
         let text = draw_text(&app);
         assert!(
-            row_with(&text, "Recommended").contains("in the dark"),
+            row_with(&text, "Face (IR)").contains("in the dark"),
             "{text}"
         );
         // "dark mode" reads as a UI theme, not an IR capability.
@@ -11714,7 +12649,7 @@ mod tests {
         let rows = app.hub_rows();
         let enc = rows
             .iter()
-            .find(|(label, _, _)| *label == "recovery + encryption")
+            .find(|(label, _, _)| *label == "Recovery")
             .expect("the hub lists the recovery step");
         assert_eq!(enc.1, Some(false), "an unopenable store is not done");
 
@@ -11736,7 +12671,7 @@ mod tests {
         let rows = app.hub_rows();
         let enc = rows
             .iter()
-            .find(|(label, _, _)| *label == "recovery + encryption")
+            .find(|(label, _, _)| *label == "Recovery")
             .unwrap();
         assert_eq!(enc.1, Some(true));
     }
@@ -12019,19 +12954,19 @@ mod tests {
     #[test]
     fn help_overlay_lists_every_bound_key_of_the_screen() {
         let mut app = test_app();
-        // Global: 'h' jumps home from any tab.
-        assert!(app.help_body().contains("home"), "{}", app.help_body());
-        // Welcome: Enter opens the selected hub section.
+        // Global: 'h' jumps to Overview from any section.
+        assert!(app.help_body().contains("Overview"), "{}", app.help_body());
+        // Overview: Enter opens the selected status section.
         app.screen = SC_WELCOME;
         assert!(
-            app.help_body().contains("open the selected section"),
+            app.help_body().contains("Open Selected Section"),
             "{}",
             app.help_body()
         );
         // Cameras: [t] tune capture is bound and documented in body text.
         app.screen = SC_CAMERAS;
         assert!(
-            app.help_body().contains("tune capture"),
+            app.help_body().contains("Tune Capture"),
             "{}",
             app.help_body()
         );
@@ -12042,18 +12977,22 @@ mod tests {
         app.screen = SC_KEYRING;
         app.keyring_armed = Some(true);
         app.keyring_policy = Some("pcrlock NV 0x18fb7a2 (Tier 2)".into());
-        assert!(app.help_body().contains("pcrlock"), "{}", app.help_body());
+        assert!(
+            app.help_body().contains("PCR Policy"),
+            "{}",
+            app.help_body()
+        );
         app.keyring_policy = None;
         assert!(
-            !app.help_body().contains("pcrlock"),
+            !app.help_body().contains("PCR Policy"),
             "no Tier-2 policy, so no [p]: {}",
             app.help_body()
         );
         // And [r] follows the armed state the same way.
-        assert!(app.help_body().contains("reseal"), "{}", app.help_body());
+        assert!(app.help_body().contains("Reseal"), "{}", app.help_body());
         app.keyring_armed = Some(false);
         assert!(
-            !app.help_body().contains("reseal"),
+            !app.help_body().contains("Reseal"),
             "nothing to reseal on an unarmed keyring: {}",
             app.help_body()
         );

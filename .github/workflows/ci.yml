@@ -111,7 +111,7 @@ jobs:
           fi
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           # Pinned to a SHA, the action can't read the version from the tag, so
           # name the toolchain explicitly (it is a required input then).
@@ -352,7 +352,7 @@ jobs:
       - name: Install stable Rust
         # @master (declares the `toolchain` input); the version tag branches
         # (e.g. @1.88.0) have no such input and ignore `with: toolchain:`.
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
 
@@ -604,7 +604,7 @@ jobs:
       - name: Install nightly Rust (cargo-fuzz needs it)
         # @master so `toolchain: nightly-...` is honored (the version-branch pin
         # ignored it; nightly only worked via the RUSTUP_TOOLCHAIN env fallback).
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-07-15
 

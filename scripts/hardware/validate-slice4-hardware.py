@@ -13,6 +13,14 @@ I64_MAX = (1 << 63) - 1
 MIN_CONTINUITY_HZ = 1.0
 MAX_CONTINUITY_DELTA_US = 1_000_000
 TIMESTAMP_BOUNDARY_INTERVALS = 3
+# The global timestamp span (first delivered frame to last) may legitimately
+# undershoot the measured duration by the capture loop's start and end slack:
+# the first frame lands up to ~one interval after the loop starts, and the last
+# frame of the slower stream in a concurrent pair lands up to ~three intervals
+# before the loop's deadline (measured ~201 ms of end lag on the ASUS IR at
+# 15 fps). A real stall collapses the span by whole seconds, so a separate,
+# wider budget here keeps that signal while not flaking on clean timing.
+GLOBAL_SPAN_BOUNDARY_INTERVALS = 6
 RECORD_KEYS = {
     "kind",
     "schema_version",
@@ -299,7 +307,7 @@ def main(argv):
         duration_us = duration * 1_000_000
         if (
             abs(timestamp_span - duration_us)
-            > TIMESTAMP_BOUNDARY_INTERVALS * maximum
+            > GLOBAL_SPAN_BOUNDARY_INTERVALS * maximum
         ):
             fail(
                 f"{role}: global timestamp span {timestamp_span}us does not track "

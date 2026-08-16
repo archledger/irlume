@@ -185,6 +185,10 @@ impl Frame {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one immutable runtime-evidence bundle; the args are never confused"
+)]
 fn checked_single_evidence(
     binding: frame_provenance::FrameBinding,
     format: frame_provenance::ValidatedFormatIdentity,
@@ -208,6 +212,10 @@ fn checked_single_evidence(
     .map_err(|error| Error::Hardware(format!("invalid runtime frame provenance: {error}")))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one immutable runtime-evidence bundle; the args are never confused"
+)]
 fn checked_single_provenance(
     binding: frame_provenance::FrameBinding,
     format: frame_provenance::ValidatedFormatIdentity,
@@ -2935,6 +2943,12 @@ fn role_diagnostic(
 /// measured evidence: an under-rate stream is a measured `fail`, never
 /// degraded to prose. `ir` is `None` on an RGB-only device. No device path,
 /// account identity, or template data is exposed.
+///
+/// # Errors
+///
+/// Returns [`Error::Hardware`] when a role cannot be opened or its bounded
+/// capture cannot establish delivered-rate evidence; the per-role `state` is
+/// then `unknown` rather than the whole request failing.
 pub fn camera_rate_diagnostics(
     rgb: &str,
     ir: Option<&str>,

@@ -1466,6 +1466,11 @@ impl AggregateFrameProvenance {
     /// The last contributor's delivered-rate evidence. Only reachable after the
     /// aggregate's binding/format/domain/epoch invariants all pass, so the
     /// evidence cannot be stale or cross-domain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the aggregate has no contributors, which is unreachable:
+    /// [`AggregateFrameProvenance::new`] requires at least two.
     #[must_use]
     pub fn rate_evidence(&self) -> DeliveredRateEvidence {
         self.contributors

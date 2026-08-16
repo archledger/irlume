@@ -86,6 +86,7 @@ pub(crate) struct RateWindow {
 }
 
 impl RateWindow {
+    #[cfg(test)]
     pub(crate) const fn new() -> Self {
         Self::with_capacity(RATE_WINDOW_CAPACITY)
     }
@@ -246,7 +247,6 @@ impl RatePolicy {
     }
 
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by tests"))]
     pub(crate) const fn window(&self) -> usize {
         self.window
     }

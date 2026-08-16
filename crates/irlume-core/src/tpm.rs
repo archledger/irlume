@@ -178,12 +178,23 @@ fn read_pcr_values(ctx: &mut Context, pcrs: &[u32]) -> Result<Vec<PcrValue>> {
 /// regardless of whether `body` succeeded.
 fn with_session<T>(
     ctx: &mut Context,
+    salt: Option<KeyHandle>,
     kind: SessionType,
     body: impl FnOnce(&mut Context, AuthSession) -> Result<T>,
 ) -> Result<T> {
+    // `salt` is load-bearing, not decoration. ESYS parameter encryption derives
+    // its key from the session key, and an UNSALTED, UNBOUND session has an
+    // EMPTY session key: the TPM then returns the response parameter in the
+    // clear while ESYS still "decrypts" it, so `unseal` hands back plausible
+    // garbage instead of the sealed secret. The sealed object is fine; only the
+    // response is mangled, which is why a tpm2-tools unseal of the very same
+    // object succeeds. Salting against the SRK gives both sides the same key,
+    // so the secret is genuinely protected on the bus AND comes back intact.
+    // Trial sessions pass `None`: they carry no secret, and turning encryption
+    // off there keeps them correct without a salt.
     let session = ctx
         .start_auth_session(
-            None,
+            salt,
             None,
             None,
             kind,
@@ -192,9 +203,10 @@ fn with_session<T>(
         )
         .map_err(tpm_err)?
         .ok_or_else(|| Error::Tpm("start_auth_session returned None".into()))?;
+    let encrypted = salt.is_some();
     let (attrs, mask) = SessionAttributesBuilder::new()
-        .with_decrypt(true)
-        .with_encrypt(true)
+        .with_decrypt(encrypted)
+        .with_encrypt(encrypted)
         .build();
     if let Err(e) = ctx.tr_sess_set_attributes(session, attrs, mask) {
         let _ = ctx.flush_context(SessionHandle::from(session).into());
@@ -209,7 +221,7 @@ fn with_session<T>(
 /// Compute the PolicyPCR digest for a given PCR selection using a trial session.
 /// The digest is what the sealed object commits to.
 fn compute_policy_digest(ctx: &mut Context, pcrs: Option<&PcrSelectionList>) -> Result<Digest> {
-    with_session(ctx, SessionType::Trial, |ctx, session| {
+    with_session(ctx, None, SessionType::Trial, |ctx, session| {
         if let Some(sel) = pcrs {
             let policy = PolicySession::try_from(session).map_err(tpm_err)?;
             ctx.policy_pcr(policy, Digest::default(), sel.clone())
@@ -624,7 +636,7 @@ fn unseal_literal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
 
         // Scoped fallible region so the loaded object is flushed on every exit.
         let result: Result<Zeroizing<Vec<u8>>> = (|| {
-            with_session(ctx, SessionType::Policy, |ctx, session| {
+            with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
                 if !env.pcrs.is_empty() {
                     let sel = pcr_selection(&env.pcrs)?;
                     let policy = PolicySession::try_from(session).map_err(tpm_err)?;
@@ -718,7 +730,7 @@ fn unseal_authorized(
             .map_err(tpm_err)?;
 
         let result: Result<Zeroizing<Vec<u8>>> = (|| {
-            with_session(ctx, SessionType::Policy, |ctx, session| {
+            with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
                 let policy_session = PolicySession::try_from(session).map_err(tpm_err)?;
 
                 // 1. Fold the current PCR state in and read the resulting policy
@@ -1103,7 +1115,7 @@ fn software_replay(steps: &[PolicyStep]) -> Result<Digest> {
 /// has to say so explicitly.
 #[cfg(test)]
 fn trial_replay(ctx: &mut Context, steps: &[PolicyStep]) -> Result<Digest> {
-    with_session(ctx, SessionType::Trial, |ctx, session| {
+    with_session(ctx, None, SessionType::Trial, |ctx, session| {
         let policy = PolicySession::try_from(session).map_err(tpm_err)?;
         for step in steps {
             match step {
@@ -1214,7 +1226,7 @@ fn build_super_pcr(plock: &PcrlockJson) -> Result<SuperPcr> {
 /// index) using a trial session. The index's Name (WRITTEN bit set once
 /// make-policy has written it) fully determines the digest; the TPM reads it.
 fn pcrlock_auth_policy(ctx: &mut Context, nv: NvIndexHandle) -> Result<Digest> {
-    with_session(ctx, SessionType::Trial, |ctx, session| {
+    with_session(ctx, None, SessionType::Trial, |ctx, session| {
         let policy = PolicySession::try_from(session).map_err(tpm_err)?;
         ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
             ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
@@ -1276,7 +1288,7 @@ fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u
             .map_err(tpm_err)?;
 
         let result: Result<Zeroizing<Vec<u8>>> = (|| {
-            with_session(ctx, SessionType::Policy, |ctx, session| {
+            with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
                 let policy = PolicySession::try_from(session).map_err(tpm_err)?;
 
                 // Super-PCR replay against LIVE PCRs (empty digest => the TPM
@@ -1765,7 +1777,7 @@ pub(crate) mod tests {
             // what the live unseal session presents when PolicyAuthorizeNV
             // compares it against the NV content.
             let composite: [u8; 32] = Sha256::digest(&pcr7.value).into();
-            let policy_digest = with_session(&mut ctx, SessionType::Trial, |ctx, session| {
+            let policy_digest = with_session(&mut ctx, None, SessionType::Trial, |ctx, session| {
                 let policy = PolicySession::try_from(session).map_err(tpm_err)?;
                 ctx.policy_pcr(
                     policy,

@@ -6409,6 +6409,14 @@ where
 mod tests {
     use super::*;
 
+    fn test_rate_config(role: contracts::StreamRole) -> rate_gate::StreamRateConfig {
+        rate_gate::StreamRateConfig::new(
+            role,
+            frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+            frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+        )
+    }
+
     type CallLog = std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>;
 
     struct FakeClaim {
@@ -7354,7 +7362,7 @@ mod tests {
         let mut capture = TrackedStream::new(ContinuityFixture {
             payload: [1],
             metadata,
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.observations = u64::MAX;
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7450,7 +7458,7 @@ mod tests {
         let mut tracked = TrackedStream::new(QueuedContinuityFixture {
             payload: [7],
             metadata: [corrupt, valid].into(),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
 
         warm_up_with(
             "fixture",
@@ -7461,7 +7469,7 @@ mod tests {
         .expect("metadata-valid corruption is a discarded warm-up observation");
         assert_eq!(tracked.accounting(), (1, 1, 0));
 
-        let (payload, _, sequence, timestamp) =
+        let (payload, _, sequence, timestamp, _) =
             tracked.next().expect("next payload remains usable");
         assert_eq!(payload, &[7]);
         assert_eq!(sequence.raw(), 2);
@@ -7478,7 +7486,7 @@ mod tests {
         let mut tracked = TrackedStream::new(QueuedContinuityFixture {
             payload: [9],
             metadata: [corrupt, valid].into(),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
 
         let error = tracked
             .next()
@@ -7486,7 +7494,7 @@ mod tests {
         assert!(error.to_string().contains("corrupt"));
         assert_eq!(tracked.accounting(), (1, 1, 0));
 
-        let (payload, _, sequence, timestamp) =
+        let (payload, _, sequence, timestamp, _) =
             tracked.next().expect("next payload remains usable");
         assert_eq!(payload, &[9]);
         assert_eq!(sequence.raw(), 11);
@@ -7506,7 +7514,7 @@ mod tests {
         let mut tracked = TrackedStream::new(QueuedContinuityFixture {
             payload: [3],
             metadata: [corrupt_invalid, valid].into(),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
 
         assert!(tracked.next_discarded().is_err());
         assert_eq!(tracked.accounting(), (0, 0, 0));
@@ -7544,7 +7552,7 @@ mod tests {
             let mut tracked = TrackedStream::new(QueuedContinuityFixture {
                 payload: [5],
                 metadata: [baseline, corrupt, valid].into(),
-            });
+            }, test_rate_config(contracts::StreamRole::Ir));
 
             tracked.next().expect("baseline delivery");
             assert!(
@@ -7578,7 +7586,7 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
                 ..valid
             },
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         assert!(capture.next_discarded().is_err());
         capture.stream_mut().expect("stream").metadata = valid;
         assert!(capture.next().is_err(), "discarded invalid evidence healed");
@@ -7621,7 +7629,7 @@ mod tests {
                 valid,
             ]
             .into(),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         let result = warm_up_with(
             "fixture",
             || tracked.next_discarded(),
@@ -7651,7 +7659,7 @@ mod tests {
             let mut capture = TrackedStream::new(ContinuityFixture {
                 payload: [1],
                 metadata: metadata(1, 1, monotonic),
-            });
+            }, test_rate_config(contracts::StreamRole::Ir));
             capture.next().expect("baseline");
             capture.stream_mut().expect("stream").metadata = metadata(2, seconds, flags);
             assert!(capture.next_discarded().is_err());
@@ -7695,8 +7703,8 @@ mod tests {
             payload: [7],
             sequences: sequences.iter().copied().collect(),
         };
-        let mut capture = TrackedStream::new(fixture(&[41]));
-        let (_, _, baseline_sequence, baseline_timestamp) =
+        let mut capture = TrackedStream::new(fixture(&[41]), test_rate_config(contracts::StreamRole::Ir));
+        let (_, _, baseline_sequence, baseline_timestamp, _) =
             capture.next().expect("baseline delivery");
         assert!(!baseline_sequence.discontinuity());
         assert!(!baseline_timestamp.discontinuity());
@@ -7708,7 +7716,7 @@ mod tests {
             .expect("representable recovery epoch");
         capture.next_discarded().expect("discarded warm-up dequeue");
 
-        let (_, _, restarted_sequence, restarted_timestamp) =
+        let (_, _, restarted_sequence, restarted_timestamp, _) =
             capture.next().expect("first delivered recovery frame");
         assert_eq!(restarted_sequence.raw(), 501);
         assert_eq!(restarted_sequence.gap(), 0);
@@ -7733,7 +7741,7 @@ mod tests {
         let mut capture = TrackedStream::new(ContinuityFixture {
             payload: [1],
             metadata: metadata(1, 1),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7763,7 +7771,7 @@ mod tests {
             .expect("recovery");
         capture.next_discarded().expect("recovered warm-up frame");
         capture.stream_mut().expect("stream").metadata = metadata(11, 11);
-        let (_, _, sequence, timestamp) = capture.next().expect("recovered delivered frame");
+        let (_, _, sequence, timestamp, _) = capture.next().expect("recovered delivered frame");
         assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
         assert!(sequence.discontinuity());
         assert!(timestamp.discontinuity());
@@ -7781,7 +7789,7 @@ mod tests {
         let mut capture = TrackedStream::new(ContinuityFixture {
             payload: [1],
             metadata: metadata(1, 1),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         let sequence_state = capture.sequence.continuity_state_for_test();
         let timestamp_state = capture.timestamp.continuity_state_for_test();
@@ -7809,7 +7817,7 @@ mod tests {
                 metadata: metadata(10, 10),
             })
             .expect("recovery");
-        let (_, _, sequence, timestamp) = capture.next().expect("recovered frame");
+        let (_, _, sequence, timestamp, _) = capture.next().expect("recovered frame");
         assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
         assert!(sequence.discontinuity());
         assert!(timestamp.discontinuity());
@@ -7828,7 +7836,7 @@ mod tests {
         let mut capture = TrackedStream::new(ContinuityFixture {
             payload: [1],
             metadata: metadata(1, 1, monotonic),
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         capture.stream_mut().expect("stream").metadata =
             metadata(5, 2, v4l::buffer::Flags::TIMESTAMP_UNKNOWN);
@@ -7841,7 +7849,7 @@ mod tests {
                 metadata: metadata(10, 1, monotonic),
             })
             .expect("recovery");
-        let (_, _, sequence, timestamp) = capture.next().expect("recovered frame");
+        let (_, _, sequence, timestamp, _) = capture.next().expect("recovered frame");
         assert_eq!(sequence.cumulative_drops(), 0);
         assert!(sequence.discontinuity());
         assert!(timestamp.discontinuity());
@@ -7856,7 +7864,7 @@ mod tests {
             calls: calls.clone(),
             fail_validation,
         };
-        let mut capture = TrackedStream::new(fixture(false));
+        let mut capture = TrackedStream::new(fixture(false), test_rate_config(contracts::StreamRole::Ir));
         capture.sequence.force_stream_epoch_overflow_on_recovery();
         assert!(capture.take().is_some());
         capture
@@ -7871,7 +7879,7 @@ mod tests {
             metadata: v4l::buffer::Metadata::default(),
             calls: failed_calls.clone(),
             fail_validation: false,
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         let sequence_state = validation_failure.sequence.continuity_state_for_test();
         let timestamp_state = validation_failure.timestamp.continuity_state_for_test();
         assert!(validation_failure.take().is_some());
@@ -7902,7 +7910,7 @@ mod tests {
             metadata: v4l::buffer::Metadata::default(),
         };
 
-        let mut sequence_failure = TrackedStream::new(fixture());
+        let mut sequence_failure = TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
         sequence_failure
             .sequence
             .force_stream_epoch_overflow_on_recovery();
@@ -7916,7 +7924,7 @@ mod tests {
         assert!(!sequence_failure.timestamp.failed_for_test());
         assert_eq!(sequence_failure.timestamp.stream_epoch_for_test(), 0);
 
-        let mut timestamp_failure = TrackedStream::new(fixture());
+        let mut timestamp_failure = TrackedStream::new(fixture(), test_rate_config(contracts::StreamRole::Ir));
         timestamp_failure
             .timestamp
             .force_stream_epoch_overflow_on_recovery();
@@ -7942,7 +7950,7 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(1, 0),
                 ..v4l::buffer::Metadata::default()
             },
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         let stream = capture.stream_mut().expect("stream");
         stream.metadata.sequence = 5;
@@ -7963,7 +7971,7 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(1, 0),
                 ..v4l::buffer::Metadata::default()
             },
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         capture.sequence.force_drop_overflow_on_next_gap();
         let stream = capture.stream_mut().expect("stream");
@@ -7984,7 +7992,7 @@ mod tests {
                 timestamp: v4l::timestamp::Timestamp::new(1, 0),
                 ..v4l::buffer::Metadata::default()
             },
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         capture.sequence.force_drop_overflow_on_next_gap();
         let stream = capture.stream_mut().expect("stream");
@@ -8006,7 +8014,7 @@ mod tests {
         let mut capture = TrackedStream::new(ContinuityFixture {
             payload: [1],
             metadata: valid,
-        });
+        }, test_rate_config(contracts::StreamRole::Ir));
         capture.next().expect("baseline");
         let stream = capture.stream_mut().expect("stream");
         stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 1_000_000);
@@ -8037,7 +8045,7 @@ mod tests {
             let mut capture = TrackedStream::new(ContinuityFixture {
                 payload: [1],
                 metadata: valid,
-            });
+            }, test_rate_config(contracts::StreamRole::Ir));
             capture.next().expect("baseline");
             let stream = capture.stream_mut().expect("stream");
             stream.metadata.flags = v4l::buffer::Flags::from_bits_truncate(bits);
@@ -8452,6 +8460,19 @@ mod tests {
             timestamp,
             at,
             contracts::IlluminationProvenance::Unknown,
+            frame_provenance::DeliveredRateEvidence::new(
+                contracts::StreamRole::Rgb,
+                (15, 2),
+                (15, 2),
+                (15, 2),
+                98,
+                30,
+                2_000_000,
+                (15, 2),
+                true,
+                &sequence,
+                &timestamp,
+            ),
         )
         .expect("test runtime provenance");
         Frame::from_provenance(
@@ -10426,7 +10447,7 @@ mod tests {
         let mut expect_rgb_discontinuity = false;
         let mut expect_ir_discontinuity = false;
         while std::time::Instant::now() < deadline {
-            let (_, _, sequence, timestamp) =
+            let (_, _, sequence, timestamp, _) =
                 rgb_session.stream.next().expect("RGB tracked dequeue");
             if expect_rgb_discontinuity {
                 assert!(sequence.discontinuity(), "RGB recovery marker missing");
@@ -10434,7 +10455,7 @@ mod tests {
             }
             rgb_stats.record(sequence, timestamp);
             if let Some(session) = &mut ir_session {
-                let (_, _, sequence, timestamp) =
+                let (_, _, sequence, timestamp, _) =
                     session.stream.next().expect("IR tracked dequeue");
                 if let Some(log) = session.meta.as_mut() {
                     log.begin_burst();

@@ -2163,6 +2163,7 @@ mod tests {
             )
             .expect("valid timestamp");
         let at = std::time::Instant::now();
+        let rate_evidence = test_rate_evidence(&sequence, &timestamp);
 
         let provenance = super::SingleFrameProvenance::begin(
             binding.clone(),
@@ -2171,6 +2172,7 @@ mod tests {
             sequence,
             timestamp,
             CaptureWindow::at(at),
+            rate_evidence,
         )
         .expect("coherent evidence")
         .finalize_illumination(IlluminationProvenance::ActiveIr)
@@ -2234,6 +2236,7 @@ mod tests {
                     )
                     .expect("valid test timestamp");
                 let at = base + Duration::from_micros(micros.unsigned_abs());
+                let rate_evidence = test_rate_evidence(&sequence, &timestamp);
                 super::SingleFrameProvenance::begin(
                     binding.clone(),
                     format.clone(),
@@ -2241,12 +2244,34 @@ mod tests {
                     sequence,
                     timestamp,
                     CaptureWindow::at(at),
+                    rate_evidence,
                 )
                 .expect("coherent test evidence")
                 .finalize_illumination(illumination)
                 .expect("coherent test illumination")
             })
             .collect()
+    }
+
+    /// A fixed, exact rate-evidence value for provenance tests that only assert
+    /// binding/format/domain invariants; the rate fields are irrelevant to them.
+    fn test_rate_evidence(
+        sequence: &super::SequenceObservation,
+        timestamp: &super::TimestampObservation,
+    ) -> super::DeliveredRateEvidence {
+        super::DeliveredRateEvidence::new(
+            crate::contracts::StreamRole::Ir,
+            (1, 15),
+            (1, 15),
+            (15, 1),
+            98,
+            30,
+            2_000_000,
+            (15, 1),
+            true,
+            sequence,
+            timestamp,
+        )
     }
 
     #[test]
@@ -2278,6 +2303,7 @@ mod tests {
             .pop()
             .expect("one single");
         single.facts.sequence_raw = 10;
+        let rate_evidence = test_rate_evidence(&single.sequence, &single.timestamp);
         assert_eq!(
             super::SingleFrameProvenance::begin(
                 single.binding,
@@ -2286,6 +2312,7 @@ mod tests {
                 single.sequence,
                 single.timestamp,
                 single.capture_window,
+                rate_evidence,
             ),
             Err(super::RuntimeProvenanceError::FactsSequenceMismatch)
         );
@@ -2297,6 +2324,7 @@ mod tests {
             .pop()
             .expect("one single");
         single.facts.timestamp_micros += 1;
+        let rate_evidence = test_rate_evidence(&single.sequence, &single.timestamp);
         assert_eq!(
             super::SingleFrameProvenance::begin(
                 single.binding,
@@ -2305,6 +2333,7 @@ mod tests {
                 single.sequence,
                 single.timestamp,
                 single.capture_window,
+                rate_evidence,
             ),
             Err(super::RuntimeProvenanceError::FactsTimestampMismatch)
         );
@@ -2316,6 +2345,7 @@ mod tests {
             .pop()
             .expect("one single");
         corrupt.facts.known_flags |= v4l::buffer::Flags::ERROR.bits();
+        let rate_evidence = test_rate_evidence(&corrupt.sequence, &corrupt.timestamp);
         assert_eq!(
             super::SingleFrameProvenance::begin(
                 corrupt.binding.clone(),
@@ -2324,6 +2354,7 @@ mod tests {
                 corrupt.sequence,
                 corrupt.timestamp,
                 corrupt.capture_window,
+                rate_evidence,
             ),
             Err(super::RuntimeProvenanceError::DriverReportedCorruption)
         );
@@ -2340,6 +2371,7 @@ mod tests {
                     start: corrupt.capture_window.start,
                     end,
                 },
+                rate_evidence,
             ),
             Err(super::RuntimeProvenanceError::SingleWindowMustBePoint)
         );
@@ -2351,6 +2383,7 @@ mod tests {
             .pop()
             .expect("one single");
         single.binding.stream_role = crate::contracts::StreamRole::Rgb;
+        let rate_evidence = test_rate_evidence(&single.sequence, &single.timestamp);
         let pending = super::SingleFrameProvenance::begin(
             single.binding,
             single.format,
@@ -2358,6 +2391,7 @@ mod tests {
             single.sequence,
             single.timestamp,
             single.capture_window,
+            rate_evidence,
         )
         .expect("otherwise coherent");
         assert_eq!(

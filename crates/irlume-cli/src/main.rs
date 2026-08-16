@@ -3915,8 +3915,10 @@ fn report_capture_mode(report: &mut crate::doctor_report::Report) {
                         // An auto-switched verdict is sequential wearing an
                         // origin stamp; report it separately so it never reads
                         // as a measurement and the user learns how to replace it.
-                        if let Some(irlume_camera::CaptureModeOrigin::AutoSwitched { at_unix }) =
-                            irlume_camera::stored_capture_mode_origin(&rgb, &ir)
+                        if let Some(irlume_camera::CaptureModeOrigin::AutoSwitched {
+                            at_unix,
+                            ..
+                        }) = irlume_camera::stored_capture_mode_origin(&rgb, &ir)
                         {
                             let age_days = at_unix.map(|ts| {
                                 let now = std::time::SystemTime::now()

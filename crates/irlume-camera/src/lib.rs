@@ -2969,10 +2969,7 @@ pub struct RgbCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
-    #[expect(
-        dead_code,
-        reason = "immutable negotiation evidence is published by the delivered-rate slice"
-    )]
+    /// Immutable negotiation evidence published by the delivered-rate slice.
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
 }
@@ -3982,10 +3979,7 @@ pub struct IrCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
-    #[expect(
-        dead_code,
-        reason = "immutable negotiation evidence is published by the delivered-rate slice"
-    )]
+    /// Immutable negotiation evidence published by the delivered-rate slice.
     requested_interval: frame_interval::FrameInterval,
     accepted_interval: frame_interval::FrameInterval,
     width: u32,

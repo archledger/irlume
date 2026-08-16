@@ -230,11 +230,6 @@ impl RatePolicy {
     pub(crate) const fn tolerance_percent(&self) -> u32 {
         self.tolerance_percent
     }
-
-    #[must_use]
-    pub(crate) const fn window(&self) -> usize {
-        self.window
-    }
 }
 
 /// Immutable per-stream rate configuration threaded through every production

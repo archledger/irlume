@@ -18,16 +18,16 @@ pub use irlume_camera::{
     no_progress, setup_ir_emitter, store_capture_mode, store_capture_mode_if_absent,
     stored_capture_mode, CaptureMode, ContentionReport, PairSample, Progress, StoreIfAbsent,
 };
+/// Enumerate the Hello camera pairs. Re-exported for the daemon's
+/// camera-class `ListCameras` arm: clients must not enumerate for themselves
+/// (#187), so this is the only path to a listing.
+pub use irlume_camera::{camera_rate_diagnostics, list_pairs, privacy_engaged, CameraPair};
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair
 /// so select_pair can survive a udev renumber. Re-exported so the daemon can pick
 /// devices without depending on the camera crate directly. See
 /// [`irlume_camera::select_pair`].
 pub use irlume_camera::{capabilities, device_identity, select_pair};
-/// Enumerate the Hello camera pairs. Re-exported for the daemon's
-/// camera-class `ListCameras` arm: clients must not enumerate for themselves
-/// (#187), so this is the only path to a listing.
-pub use irlume_camera::{camera_rate_diagnostics, list_pairs, privacy_engaged, CameraPair};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {

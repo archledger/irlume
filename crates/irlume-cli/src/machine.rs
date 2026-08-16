@@ -37,6 +37,7 @@ const CAPABILITIES: &[&str] = &[
     "login-plan-json",
     "login-transactions",
     "models-list-json",
+    "camera-diagnostics",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -527,6 +528,58 @@ pub fn doctor(args: &[String]) -> ExitCode {
         &success(COMMAND, json!({ "checks": checks }), contract),
         ExitCode::SUCCESS,
     )
+}
+
+/// `irlume camera diagnostics --json`: machine-readable delivered-rate evidence
+/// for the configured camera pair (issue #462). Runs the ordinary gated capture
+/// session per present role and reports the exact requested/accepted/delivered
+/// rationals, sequence gaps/drops, timestamp clock/source, and same-domain
+/// RGB/IR skew. An under-rate stream is a measured `fail` object, never prose.
+pub fn camera_diagnostics(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "camera.diagnostics";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    if without_contract(args) != ["camera", "diagnostics", "--json"] {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    match crate::daemon_request(&Request::CameraDiagnostics) {
+        Ok(Response::CameraDiagnostics(report)) => emit(
+            &success(COMMAND, json!(report), contract),
+            ExitCode::SUCCESS,
+        ),
+        Ok(Response::OperationError { code, retryable }) => emit(
+            &failure(COMMAND, error_code(code), retryable, contract),
+            ExitCode::FAILURE,
+        ),
+        Ok(Response::Error(_)) => emit(
+            &failure(COMMAND, "operation-failed", false, contract),
+            ExitCode::FAILURE,
+        ),
+        Ok(_) => emit(
+            &failure(COMMAND, "protocol-error", false, contract),
+            ExitCode::FAILURE,
+        ),
+        Err(_) => emit(
+            &failure(COMMAND, "daemon-unavailable", true, contract),
+            ExitCode::FAILURE,
+        ),
+    }
 }
 
 /// `irlume login status --json`: which PAM surfaces carry face auth.
@@ -2296,7 +2349,8 @@ mod tests {
                 "auth-test-events",
                 "login-plan-json",
                 "login-transactions",
-                "models-list-json"
+                "models-list-json",
+                "camera-diagnostics"
             ])
         );
         assert!(document.get("error").is_none());

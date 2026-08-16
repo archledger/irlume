@@ -1354,7 +1354,7 @@ impl<S> TrackedStream<S> {
             stream: Some(stream),
             sequence: frame_provenance::SequenceTracker::new(),
             timestamp: frame_provenance::TimestampTracker::new(),
-            rate_window: rate_gate::RateWindow::new(),
+            rate_window: rate_gate::RateWindow::with_capacity(rate_config.policy().window()),
             rate_config,
             observations: 0,
             discarded_observations: 0,
@@ -6485,10 +6485,14 @@ mod tests {
     use super::*;
 
     fn test_rate_config(role: contracts::StreamRole) -> rate_gate::StreamRateConfig {
-        rate_gate::StreamRateConfig::new(
+        // Zero window: a "no gate" config for continuity/provenance fixtures so
+        // the 30-delta delivered-rate fill does not consume the frames those
+        // tests observe. Rate gating is exercised in rate_gate's own unit tests.
+        rate_gate::StreamRateConfig::with_window(
             role,
             frame_interval::FrameInterval::new(1, 15).expect("1/15"),
             frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+            0,
         )
     }
 

@@ -79,6 +79,7 @@ const fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
 #[derive(Clone, Debug)]
 pub(crate) struct RateWindow {
     deltas: [u64; RATE_WINDOW_CAPACITY],
+    capacity: usize,
     len: usize,
     head: usize,
     last_successful_timestamp_micros: Option<i64>,
@@ -86,8 +87,16 @@ pub(crate) struct RateWindow {
 
 impl RateWindow {
     pub(crate) const fn new() -> Self {
+        Self::with_capacity(RATE_WINDOW_CAPACITY)
+    }
+
+    /// A window that is "ready" after `capacity` positive deltas (<=
+    /// [`RATE_WINDOW_CAPACITY`]). Production uses the full 30; tests use a small
+    /// capacity so continuity fixtures need not supply a full-rate warm-up.
+    pub(crate) const fn with_capacity(capacity: usize) -> Self {
         Self {
             deltas: [0; RATE_WINDOW_CAPACITY],
+            capacity,
             len: 0,
             head: 0,
             last_successful_timestamp_micros: None,
@@ -123,12 +132,17 @@ impl RateWindow {
     }
 
     fn push(&mut self, delta: u64) {
-        if self.len < RATE_WINDOW_CAPACITY {
+        if self.capacity == 0 {
+            // A zero-capacity window is a test-only "no gate" mode: it is ready
+            // immediately, fills nothing, and never records a delta.
+            return;
+        }
+        if self.len < self.capacity {
             self.deltas[(self.head + self.len) % RATE_WINDOW_CAPACITY] = delta;
             self.len += 1;
         } else {
             self.deltas[self.head] = delta;
-            self.head = (self.head + 1) % RATE_WINDOW_CAPACITY;
+            self.head = (self.head + 1) % self.capacity;
         }
     }
 
@@ -148,17 +162,17 @@ impl RateWindow {
         self.len
     }
 
-    /// Whether the window holds the full [`RATE_WINDOW_CAPACITY`] deltas.
+    /// Whether the window holds its configured number of deltas.
     #[must_use]
     pub(crate) const fn ready(&self) -> bool {
-        self.len == RATE_WINDOW_CAPACITY
+        self.len == self.capacity
     }
 
     /// Sum of the held deltas in microseconds.
     #[must_use]
     pub(crate) fn span_us(&self) -> u64 {
         (0..self.len)
-            .map(|i| self.deltas[(self.head + i) % RATE_WINDOW_CAPACITY])
+            .map(|i| self.deltas[(self.head + i) % self.capacity])
             .sum()
     }
 
@@ -274,6 +288,28 @@ impl StreamRateConfig {
     #[must_use]
     pub(crate) const fn role(&self) -> StreamRole {
         self.role
+    }
+
+    /// The same policy as [`Self::new`] but with a caller-chosen window size.
+    /// Used only by tests (continuity fixtures) so they need not supply a full
+    /// 30-delta warm-up; production always uses the measured 30.
+    #[cfg(test)]
+    pub(crate) const fn with_window(
+        role: StreamRole,
+        requested: FrameInterval,
+        accepted: FrameInterval,
+        window: usize,
+    ) -> Self {
+        let (floor_num, floor_den) = match role {
+            StreamRole::Rgb => (RGB_FLOOR_NUM, RGB_FLOOR_DEN),
+            StreamRole::Ir => (IR_FLOOR_NUM, IR_FLOOR_DEN),
+        };
+        Self {
+            role,
+            policy: RatePolicy::new(floor_num, floor_den, DEFAULT_TOLERANCE_PERCENT, window),
+            requested,
+            accepted,
+        }
     }
 
     #[must_use]

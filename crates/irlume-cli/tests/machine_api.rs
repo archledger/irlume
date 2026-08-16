@@ -32,7 +32,8 @@ fn version_json_is_one_machine_document() {
             "auth-test-events",
             "login-plan-json",
             "login-transactions",
-            "models-list-json"
+            "models-list-json",
+            "camera-diagnostics"
         ])
     );
 }

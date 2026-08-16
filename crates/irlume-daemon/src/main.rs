@@ -5387,6 +5387,7 @@ mod tests {
         ListCameras => Request::ListCameras,
         Ping => Request::Ping,
         Health => Request::Health,
+        CameraDiagnostics => Request::CameraDiagnostics,
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
         SealPassword => Request::SealPassword {

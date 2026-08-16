@@ -5,7 +5,6 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added
 
 - **Camera discovery and opens now cross one process-owned backend boundary.**
@@ -39,6 +38,11 @@ All notable changes to irlume are documented here. This project adheres to
   two optional paths still referenced them. CI now compiles every supported ONNX
   execution provider independently and together so future API drift is caught
   before release (#454).
+- **TPM unseal returns the sealed secret instead of mangled bytes.** Policy
+  sessions are now salted against the SRK, so ESYS parameter encryption has a
+  real session key instead of the empty key of an unsalted, unbound session.
+  Enrollment and authentication secrets decrypt correctly on real hardware
+  (#486). Thanks to @Magniquick for the fix.
 
 ## [0.10.0] - 2026-08-12
 

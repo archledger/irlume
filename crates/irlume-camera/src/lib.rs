@@ -42,6 +42,7 @@ mod ir_metadata;
 pub mod lease;
 mod lifecycle;
 mod media_graph;
+mod rate_gate;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.

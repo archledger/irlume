@@ -404,21 +404,23 @@ fn main() {
             let mut verified_recognizer =
                 verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter), Some(&model));
             // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
-            // discovered Hello camera (built-in or external Brio/NexiGo), else defaults.
-            let (rgb_dev, ir_dev) = irlume_auth::select_pair();
-            // Log what is actually usable, not the raw (possibly fallback) selection;
-            // on camera-less or RGB-only hardware the fixed default pair doesn't exist.
-            {
-                let ok = |d: &str| std::path::Path::new(d).exists();
-                match (ok(&rgb_dev), ok(&ir_dev)) {
-                    (true, true) => eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)"),
-                    (true, false) => eprintln!(
-                        "irlumed: camera rgb={rgb_dev}, no IR node (convenience tier: screen unlock only)"
-                    ),
-                    (false, _) => eprintln!(
-                        "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
-                    ),
-                }
+            // discovered Hello camera (built-in or external Brio/NexiGo). No node-number
+            // fallback: a camera-less or RGB-only machine has no pair, and the
+            // convenience tier falls back to the first discoverable RGB node.
+            let caps = irlume_auth::capabilities();
+            let (rgb_dev, ir_dev) = irlume_auth::select_pair().unwrap_or_else(|| {
+                (irlume_auth::select_rgb().unwrap_or_default(), String::new())
+            });
+            if !ir_dev.is_empty() {
+                eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)");
+            } else if caps.rgb {
+                eprintln!(
+                    "irlumed: RGB-only camera, no IR pair (convenience tier: screen unlock only)"
+                );
+            } else {
+                eprintln!(
+                    "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
+                );
             }
             // Re-apply the KNOWN emitter control at startup. The emitter is camera
             // hardware state that resets on a USB/power cycle or a daemon restart, so
@@ -2432,7 +2434,11 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
     // One probe, at load, on the thread that owns the engine. Every later
     // Health answer reads this copy.
     let caps = irlume_auth::capabilities();
-    let (rgb, ir) = irlume_auth::select_pair();
+    // The Hello pair when one was selected. On a camera-less or RGB-only
+    // machine there is no pair, so the convenience tier falls back to the
+    // first discoverable RGB node (never a guessed `/dev/videoN`).
+    let (rgb, ir) = irlume_auth::select_pair()
+        .unwrap_or_else(|| (irlume_auth::select_rgb().unwrap_or_default(), String::new()));
     let rgb_dev = (caps.rgb && std::path::Path::new(&rgb).exists()).then_some(rgb);
     let ir_dev = (caps.ir_pair && std::path::Path::new(&ir).exists()).then_some(ir);
     let tier = if ir_dev.is_some() {

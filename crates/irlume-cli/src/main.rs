@@ -1926,8 +1926,12 @@ pub(crate) fn camera_pair() -> (String, String) {
                 rgb_dev.unwrap_or_else(|| "none".into()),
                 ir_dev.unwrap_or_else(|| "none".into()),
             ),
-            // Same rule as `caps`: probe only on proven absence.
-            Err(e) if daemon_proven_absent(&e) => irlume_camera::select_pair(), // the one permitted probe
+            // Same rule as `caps`: probe only on proven absence. `None` means
+            // no discoverable pair, reported as "none" rather than a guess.
+            Err(e) if daemon_proven_absent(&e) => {
+                // the one permitted probe
+                irlume_camera::select_pair().unwrap_or_else(|| ("none".into(), "none".into()))
+            }
             _ => irlume_camera::configured_pair_no_probe()
                 .unwrap_or_else(|| ("unknown".into(), "unknown".into())),
         }
@@ -2024,13 +2028,16 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
 pub(crate) fn devices_from_flags(
     rgb: Option<&str>,
     ir: Option<&str>,
-    selected: impl FnOnce() -> (String, String),
+    selected: impl FnOnce() -> Option<(String, String)>,
 ) -> Option<(String, String)> {
     match (rgb, ir) {
         (None, None) => None,
         (Some(r), Some(i)) => Some((r.to_string(), i.to_string())),
         (r, i) => {
-            let (sel_r, sel_i) = selected();
+            // One flag alone needs its partner from the selection; with no
+            // discoverable pair there is nothing to guess (no `/dev/videoN`
+            // folklore), so the half-pair is refused rather than invented.
+            let (sel_r, sel_i) = selected()?;
             Some((
                 r.map(str::to_string).unwrap_or(sel_r),
                 i.map(str::to_string).unwrap_or(sel_i),
@@ -4187,6 +4194,14 @@ fn stream_minimum_checks(report: &mut crate::doctor_report::Report, rgb_node: &s
     }
 }
 
+fn selected_stream_minimum_checks(
+    report: &mut crate::doctor_report::Report,
+    pair: Option<(String, String)>,
+) {
+    let (rgb_node, ir_node) = pair.unwrap_or_default();
+    stream_minimum_checks(report, &rgb_node, &ir_node);
+}
+
 /// One pass over the machine. Prints the human report or stays silent and
 /// records, depending on `report`.
 /// `args` carries `--user`, which doctor reports on in eight per-user lines.
@@ -4485,8 +4500,7 @@ fn doctor_run(
         // deliberate camera probe: doctor's job is to inspect the hardware,
         // and negotiating a stream format needs the node open. Foreground and
         // occasional, not a refresh loop, so it is not the #187 shape.
-        let (rgb_node, ir_node) = irlume_camera::select_pair();
-        stream_minimum_checks(report, &rgb_node, &ir_node);
+        selected_stream_minimum_checks(report, irlume_camera::select_pair());
     }
 
     // --- models / runtime --------------------------------------------------
@@ -5367,8 +5381,23 @@ mod tests {
     }
 
     #[test]
+    fn selected_stream_minimum_checks_emit_both_ids_when_selection_finds_no_pair() {
+        let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Collect);
+        selected_stream_minimum_checks(&mut report, None);
+
+        let checks = report.into_checks();
+        for id in ["ir-stream-hello-minimum", "rgb-stream-hello-minimum"] {
+            assert_eq!(
+                checks.iter().filter(|check| check.id == id).count(),
+                1,
+                "{id} must remain present when no camera pair is selected"
+            );
+        }
+    }
+
+    #[test]
     fn devices_from_flags_honors_either_flag_alone() {
-        let sel = || ("/dev/sel-rgb".to_string(), "/dev/sel-ir".to_string());
+        let sel = || Some(("/dev/sel-rgb".to_string(), "/dev/sel-ir".to_string()));
         // No flags: no override, and the selection must not even run.
         assert_eq!(
             devices_from_flags(None, None, || unreachable!("no probe without flags")),

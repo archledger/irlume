@@ -24,7 +24,9 @@ use std::path::Path;
 /// `// the one permitted probe` marks an accessor's daemon-silent fallback;
 /// `// deliberate camera probe:` marks a caller that is about to use the node.
 fn allowed(line: &str, preceding: &str) -> bool {
-    line.contains("// the one permitted probe") || preceding.contains("// deliberate camera probe:")
+    line.contains("// the one permitted probe")
+        || preceding.contains("// deliberate camera probe:")
+        || preceding.contains("// the one permitted probe")
 }
 
 /// Files where a direct probe is the point rather than a mistake.

@@ -3,9 +3,10 @@
 
 //! V4L2 capture for the paired RGB + IR cameras, and active-IR-emitter control.
 //!
-//! Hardware model (Windows-Hello-class module): one RGB sensor (`/dev/video0`)
-//! and one greyscale IR sensor (`/dev/video2`), plus an 850/940nm emitter fired
-//! via a UVC Extension-Unit control write (cf. linux-enable-ir-emitter).
+//! Hardware model (Windows-Hello-class module): one RGB sensor and one
+//! greyscale IR sensor on a single USB device, discovered by topology rather
+//! than assumed node numbers, plus an 850/940nm emitter fired via a UVC
+//! Extension-Unit control write (cf. linux-enable-ir-emitter).
 //!
 //! The auth path captures RGB and IR one at a time unless a measurement says
 //! the module can sustain both: `capture_mode_decision` in irlume-auth answers
@@ -380,6 +381,11 @@ pub struct IrCaptureStats {
     pub saturation_frame: Option<Vec<u8>>,
 }
 
+/// Default `--rgb`/`--ir` flag values for the dev diagnostic tools, and the
+/// engine's pre-`with_devices` placeholder. NOT a discovery fallback: the
+/// discovery path ([`select_pair`]) returns `None` rather than guessing a node
+/// number, because a guessed `/dev/videoN` is wrong the moment udev renumbers
+/// a device and can land a colour node in the IR slot (#385).
 pub const DEFAULT_RGB_DEVICE: &str = "/dev/video0";
 pub const DEFAULT_IR_DEVICE: &str = "/dev/video2";
 const RGB_W: u32 = 640;
@@ -2859,14 +2865,17 @@ pub fn configured_pair_no_probe() -> Option<(String, String)> {
 ///   2. Auto-discovery: a Hello camera is one physical device exposing *both* an
 ///      RGB and an IR node. Ranked: a device matching `IRLUME_CAMERA_PIN` wins,
 ///      else a built-in (`removable=fixed`) wins, else the first pair found.
-///   3. Compiled defaults (`video0`/`video2`).
-pub fn select_pair() -> (String, String) {
+///
+/// `None` when no pair could be established. There is deliberately no
+/// node-number fallback: a guessed `/dev/videoN` is wrong the moment udev
+/// renumbers a device, and can land a colour node in the IR slot (#385).
+pub fn select_pair() -> Option<(String, String)> {
     if let (Ok(r), Ok(i)) = (
         std::env::var("IRLUME_RGB_DEVICE"),
         std::env::var("IRLUME_IR_DEVICE"),
     ) {
         if !r.trim().is_empty() && !i.trim().is_empty() {
-            return (r, i);
+            return Some((r, i));
         }
     }
     // A user-chosen pair persisted via the daemon (TUI Cameras tab) overrides
@@ -2887,7 +2896,7 @@ pub fn select_pair() -> (String, String) {
             if let Some(pair) =
                 resolve_saved_pair(r, i, saved_rgb_id.as_deref(), saved_ir_id.as_deref())
             {
-                return pair;
+                return Some(pair);
             }
         }
     }
@@ -2904,7 +2913,17 @@ pub fn select_pair() -> (String, String) {
             best = Some((p.rgb, p.ir));
         }
     }
-    best.unwrap_or_else(|| (DEFAULT_RGB_DEVICE.into(), DEFAULT_IR_DEVICE.into()))
+    best
+}
+
+/// The first discoverable RGB node, for the convenience tier when no Hello
+/// pair exists. `None` on a camera-less machine. Reads the same discovery
+/// [`select_pair`] does, so it never guesses a node number.
+pub fn select_rgb() -> Option<String> {
+    discover_nodes()
+        .into_iter()
+        .find(|(_, role)| matches!(role, Role::Rgb))
+        .map(|(path, _)| path)
 }
 
 fn device_exists(dev: &str) -> bool {
@@ -10326,7 +10345,7 @@ mod tests {
         let _i = EnvGuard::set("IRLUME_IR_DEVICE", "/dev/irlume-test-ir");
         assert_eq!(
             select_pair(),
-            ("/dev/irlume-test-rgb".into(), "/dev/irlume-test-ir".into())
+            Some(("/dev/irlume-test-rgb".into(), "/dev/irlume-test-ir".into()))
         );
     }
 
@@ -11378,7 +11397,7 @@ mod tests {
     }
 
     #[test]
-    fn select_pair_persisted_conf_and_discovery_fallback() {
+    fn select_pair_persisted_conf_and_discovery() {
         let _lock = env_lock();
         let _rgb_env = EnvGuard::unset("IRLUME_RGB_DEVICE");
         let _ir_env = EnvGuard::unset("IRLUME_IR_DEVICE");
@@ -11388,18 +11407,13 @@ mod tests {
         let _conf = EnvGuard::set("IRLUME_CONFIG_DIR", dir.to_str().unwrap());
 
         // With no env override, no persisted pair and no discoverable Hello
-        // pair, the compiled defaults come back. Loopback nodes can never form
-        // a pair (no USB descriptors in sysfs), so this holds on CI; a dev box
-        // with a real Hello camera legitimately discovers its own pair
-        // instead, so the fallback asserts are skipped there.
+        // pair, there is no node-number fallback: `None`, never a guessed
+        // `/dev/videoN`. Loopback nodes can never form a pair (no USB
+        // descriptors in sysfs), so this holds on CI; a dev box with a real
+        // Hello camera legitimately discovers its own pair instead, so the
+        // fallback assert is skipped there.
         if list_pairs().is_empty() {
-            assert_eq!(
-                select_pair(),
-                (
-                    DEFAULT_RGB_DEVICE.to_string(),
-                    DEFAULT_IR_DEVICE.to_string()
-                )
-            );
+            assert_eq!(select_pair(), None);
         }
 
         // A persisted pair whose nodes are GONE (stale cameras.conf after a
@@ -11410,13 +11424,7 @@ mod tests {
         )
         .unwrap();
         if list_pairs().is_empty() {
-            assert_eq!(
-                select_pair(),
-                (
-                    DEFAULT_RGB_DEVICE.to_string(),
-                    DEFAULT_IR_DEVICE.to_string()
-                )
-            );
+            assert_eq!(select_pair(), None);
         }
 
         // A persisted pair whose nodes EXIST wins over discovery and defaults.
@@ -11425,7 +11433,7 @@ mod tests {
         std::fs::write(dir.join("cameras.conf"), "rgb=/dev/null\nir=/dev/zero\n").unwrap();
         assert_eq!(
             select_pair(),
-            ("/dev/null".to_string(), "/dev/zero".to_string())
+            Some(("/dev/null".to_string(), "/dev/zero".to_string()))
         );
 
         // A blank env override must not shadow the persisted pair...
@@ -11434,7 +11442,7 @@ mod tests {
             let _i = EnvGuard::set("IRLUME_IR_DEVICE", "  ");
             assert_eq!(
                 select_pair(),
-                ("/dev/null".to_string(), "/dev/zero".to_string())
+                Some(("/dev/null".to_string(), "/dev/zero".to_string()))
             );
         }
         // ...but a real one beats it, without an existence check (explicit
@@ -11443,10 +11451,10 @@ mod tests {
         let _i = EnvGuard::set("IRLUME_IR_DEVICE", "/dev/irlume-env-ir");
         assert_eq!(
             select_pair(),
-            (
+            Some((
                 "/dev/irlume-env-rgb".to_string(),
                 "/dev/irlume-env-ir".to_string()
-            )
+            ))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

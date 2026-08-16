@@ -28,7 +28,7 @@ pub use irlume_camera::{camera_rate_diagnostics, list_pairs, privacy_engaged, Ca
 /// so select_pair can survive a udev renumber. Re-exported so the daemon can pick
 /// devices without depending on the camera crate directly. See
 /// [`irlume_camera::select_pair`].
-pub use irlume_camera::{capabilities, device_identity, select_pair};
+pub use irlume_camera::{capabilities, device_identity, select_pair, select_rgb};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {

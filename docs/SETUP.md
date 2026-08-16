@@ -20,28 +20,36 @@ you out.
 irlume tui
 ```
 
-The TUI opens on a six-step wizard: **Welcome → Profiles → Keyring → Recovery →
-Login wiring → Done**. `Tab` moves forward, `⇧Tab` back, `[v]` reveals the
-advanced tabs (Cameras, Identify, Settings), and each screen shows its own keys
-in the footer.
+The TUI opens as a settings app with stable, grouped navigation and an
+**Overview** that shows live status plus the next recommended action. Use the
+sidebar or click a status row to jump directly to a section; `Tab`/`⇧Tab` and
+`←`/`→` move between sections without a mouse. `[v]` reveals technical tools
+(Cameras and Test Recognition), `[A]` expands recent activity, and `[?]` shows
+every action for the current section. Footer actions, selectable rows, and the
+sidebar can all be clicked.
 
-1. **Welcome**: press `[e]` to enroll right away, or `Tab` to walk the steps.
-2. **Profiles**: `[e]` enrolls a face. Look at the camera; it guides your
+1. **Overview**: follow the recommended action, or open any status row.
+2. **Faces**: `[e]` enrolls a face. Look at the camera; it guides your
    framing and captures ten scans automatically. Wear glasses sometimes? Add
    a scan with Improve Recognition (`[a]`) while wearing them, on the same
    profile; a face can only own one profile.
-3. **Keyring** *(recommended; IR camera + TPM)*: arm TPM keyring unlock so a
+3. **Password Wallet** *(recommended; IR camera + TPM)*: connect TPM-backed
+   wallet unlock so a
    face login opens your wallet with no prompt. You'll enter your login password
    once; it is sealed in the TPM, never stored in plaintext. Skip it and your
    wallet just prompts separately after login.
 4. **Recovery** *(recommended)*: set a recovery passphrase. It restores your
    templates after a TPM clear or firmware update without re-enrolling; without
    it, such a change forces a full re-enroll.
-5. **Login wiring**: press `[w]` to wire the **greeter and lock screen**
+5. **Login & Apps**: press `[w]` to connect irlume to the **greeter and lock screen**
    (runs `sudo irlume login enable --apply`). Face-`sudo` is opt-in and *not*
    included by `[w]`; see [face-sudo](#face-sudo-optional) below.
-6. **Done**: a dashboard of everything's state. If anything failed, the
-   **Repair** tab appears with one-key fixes.
+6. **Diagnostics**: review warnings or failures and apply focused fixes. Its
+   navigation item remains available, with an issue count when attention is
+   needed.
+
+Set `IRLUME_REDUCE_MOTION=1` before launching to replace indeterminate spinners
+with static activity marks. Determinate enrollment progress remains visible.
 
 That's it. Skip to [Verify](#verify) to confirm, or read on for the manual
 equivalents.

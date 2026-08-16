@@ -113,7 +113,7 @@ jobs:
       - name: Install nightly Rust (-Zsanitizer is unstable)
         # @master (declares the `toolchain` input); the version tag branches
         # have no such input and ignore `with: toolchain:`.
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
         with:
           toolchain: nightly
           # The sanitizer runtimes ship with the standard library for the

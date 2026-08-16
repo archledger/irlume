@@ -33,6 +33,7 @@ mod backend;
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;
+pub mod frame_interval;
 pub mod frame_provenance;
 mod inventory;
 pub mod ir_dark;
@@ -128,6 +129,110 @@ pub struct Frame {
     /// BOTH sensors need this: the RGB and IR frames of one decision come from
     /// separate streams that can drift apart without it.
     pub captured: CaptureWindow,
+    provenance: frame_provenance::RuntimeFrameProvenance,
+}
+
+impl Frame {
+    fn from_provenance(
+        width: u32,
+        height: u32,
+        spectrum: Spectrum,
+        data: Vec<u8>,
+        provenance: frame_provenance::RuntimeFrameProvenance,
+    ) -> irlume_common::Result<Self> {
+        let expected_role = match spectrum {
+            Spectrum::Rgb => contracts::StreamRole::Rgb,
+            Spectrum::Ir => contracts::StreamRole::Ir,
+        };
+        if provenance.stream_role() != expected_role {
+            return Err(Error::Hardware(
+                "frame spectrum disagrees with runtime provenance role".into(),
+            ));
+        }
+        if (provenance.format().width(), provenance.format().height()) != (width, height) {
+            return Err(Error::Hardware(
+                "frame geometry disagrees with validated runtime format".into(),
+            ));
+        }
+        let captured = provenance.capture_window();
+        Ok(Self {
+            width,
+            height,
+            spectrum,
+            data,
+            captured,
+            provenance,
+        })
+    }
+
+    /// Trusted runtime evidence transactionally attached to this frame.
+    #[must_use]
+    pub const fn provenance(&self) -> &frame_provenance::RuntimeFrameProvenance {
+        &self.provenance
+    }
+
+    fn into_single_provenance(
+        self,
+    ) -> Result<frame_provenance::SingleFrameProvenance, frame_provenance::RuntimeProvenanceError>
+    {
+        match self.provenance {
+            frame_provenance::RuntimeFrameProvenance::Single(single) => Ok(single),
+            frame_provenance::RuntimeFrameProvenance::Aggregate(_) => {
+                Err(frame_provenance::RuntimeProvenanceError::InvalidSelection)
+            }
+        }
+    }
+}
+
+fn checked_single_evidence(
+    binding: frame_provenance::FrameBinding,
+    format: frame_provenance::ValidatedFormatIdentity,
+    facts: frame_provenance::DequeuedBufferFacts,
+    sequence: frame_provenance::SequenceObservation,
+    timestamp: frame_provenance::TimestampObservation,
+    taken: std::time::Instant,
+    illumination: contracts::IlluminationProvenance,
+) -> irlume_common::Result<frame_provenance::SingleFrameProvenance> {
+    frame_provenance::SingleFrameProvenance::begin(
+        binding,
+        format,
+        facts,
+        sequence,
+        timestamp,
+        CaptureWindow::at(taken),
+    )
+    .and_then(|pending| pending.finalize_illumination(illumination))
+    .map_err(|error| Error::Hardware(format!("invalid runtime frame provenance: {error}")))
+}
+
+fn checked_single_provenance(
+    binding: frame_provenance::FrameBinding,
+    format: frame_provenance::ValidatedFormatIdentity,
+    facts: frame_provenance::DequeuedBufferFacts,
+    sequence: frame_provenance::SequenceObservation,
+    timestamp: frame_provenance::TimestampObservation,
+    taken: std::time::Instant,
+    illumination: contracts::IlluminationProvenance,
+) -> irlume_common::Result<frame_provenance::RuntimeFrameProvenance> {
+    checked_single_evidence(
+        binding,
+        format,
+        facts,
+        sequence,
+        timestamp,
+        taken,
+        illumination,
+    )
+    .map(frame_provenance::RuntimeFrameProvenance::Single)
+}
+
+fn checked_aggregate_provenance(
+    contributors: Vec<frame_provenance::SingleFrameProvenance>,
+    selection: frame_provenance::ContributorSelection,
+) -> irlume_common::Result<frame_provenance::RuntimeFrameProvenance> {
+    frame_provenance::AggregateFrameProvenance::new(contributors, selection)
+        .map(frame_provenance::RuntimeFrameProvenance::Aggregate)
+        .map_err(|error| Error::Hardware(format!("invalid aggregate frame provenance: {error}")))
 }
 
 /// The span of time a frame's pixels came from, on the monotonic clock.
@@ -137,7 +242,7 @@ pub struct Frame {
 /// a burst, so their contents belong to a stretch of time rather than an instant.
 /// Keeping the stretch (instead of stamping "now" at return) is what lets
 /// [`CaptureWindow::gap_to`] state a real bound rather than a flattering one.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureWindow {
     pub start: std::time::Instant,
     pub end: std::time::Instant,
@@ -412,6 +517,45 @@ impl CaptureDequeue for v4l::io::mmap::Stream<'_> {
     }
 }
 
+#[derive(Debug)]
+enum ValidatedDequeueError {
+    Io(std::io::Error),
+    Facts(frame_provenance::DequeuedBufferError),
+    Corrupt(frame_provenance::DequeuedBufferFacts),
+}
+
+impl ValidatedDequeueError {
+    fn invalidates_timestamp_epoch(&self) -> bool {
+        matches!(self, Self::Facts(_))
+    }
+    fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Io(error) => error,
+            Self::Facts(error) => std::io::Error::other(error),
+            Self::Corrupt(_) => std::io::Error::other(
+                frame_provenance::DequeuedBufferError::DriverReportedCorruption,
+            ),
+        }
+    }
+}
+
+fn validate_dequeued<'a>(
+    mapped: &'a [u8],
+    metadata: &v4l::buffer::Metadata,
+    layout: frame_provenance::PayloadLayout,
+) -> Result<(&'a [u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+    let facts = frame_provenance::DequeuedBufferFacts::from_v4l(metadata, mapped.len())
+        .map_err(ValidatedDequeueError::Facts)?;
+    layout
+        .validate(&facts)
+        .map_err(ValidatedDequeueError::Facts)?;
+    if facts.driver_reported_corruption() {
+        return Err(ValidatedDequeueError::Corrupt(facts));
+    }
+    Ok((&mapped[..facts.bytes_used()], facts))
+}
+
+#[cfg(test)]
 fn dequeue_validated<S, R>(
     stream: &mut S,
     layout: frame_provenance::PayloadLayout,
@@ -424,10 +568,22 @@ where
     require_endpoint()?;
     let (mapped, metadata) = stream.dequeue()?;
     require_endpoint()?;
-    let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, mapped.len())
-        .map_err(std::io::Error::other)?;
-    layout.validate(&facts).map_err(std::io::Error::other)?;
-    Ok((&mapped[..facts.bytes_used()], facts))
+    validate_dequeued(mapped, &metadata, layout).map_err(ValidatedDequeueError::into_io)
+}
+
+fn dequeue_validated_typed<S, R>(
+    stream: &mut S,
+    layout: frame_provenance::PayloadLayout,
+    mut require_endpoint: R,
+) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+where
+    S: CaptureDequeue,
+    R: FnMut() -> std::io::Result<()>,
+{
+    require_endpoint().map_err(ValidatedDequeueError::Io)?;
+    let (mapped, metadata) = stream.dequeue().map_err(ValidatedDequeueError::Io)?;
+    require_endpoint().map_err(ValidatedDequeueError::Io)?;
+    validate_dequeued(mapped, &metadata, layout)
 }
 
 /// A capture stream whose teardown cannot take the process down.
@@ -663,6 +819,12 @@ impl<'a> SafeStream<'a> {
     }
 
     fn next(&mut self) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)> {
+        self.next_typed().map_err(ValidatedDequeueError::into_io)
+    }
+
+    fn next_typed(
+        &mut self,
+    ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
         let Self {
             inner,
             device,
@@ -670,7 +832,7 @@ impl<'a> SafeStream<'a> {
             layout,
             ..
         } = self;
-        dequeue_validated(
+        dequeue_validated_typed(
             inner.as_mut().expect("stream taken only in Drop"),
             *layout,
             || {
@@ -683,22 +845,27 @@ impl<'a> SafeStream<'a> {
 }
 
 trait ValidatedStream {
-    fn next_validated(&mut self)
-        -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)>;
+    fn next_validated(
+        &mut self,
+    ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>;
 }
 
 impl ValidatedStream for SafeStream<'_> {
     fn next_validated(
         &mut self,
-    ) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)> {
-        self.next()
+    ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+        self.next_typed()
     }
 }
 
-/// Sequence state whose lifetime is independent of its replaceable mmap stream.
+/// Continuity state whose lifetime is independent of its replaceable mmap stream.
 struct TrackedStream<S> {
     stream: Option<S>,
     sequence: frame_provenance::SequenceTracker,
+    timestamp: frame_provenance::TimestampTracker,
+    observations: u64,
+    discarded_observations: u64,
+    sequence_span_sum: u64,
 }
 
 impl<S> TrackedStream<S> {
@@ -706,7 +873,20 @@ impl<S> TrackedStream<S> {
         Self {
             stream: Some(stream),
             sequence: frame_provenance::SequenceTracker::new(),
+            timestamp: frame_provenance::TimestampTracker::new(),
+            observations: 0,
+            discarded_observations: 0,
+            sequence_span_sum: 0,
         }
+    }
+
+    #[cfg(test)]
+    const fn accounting(&self) -> (u64, u64, u64) {
+        (
+            self.observations,
+            self.discarded_observations,
+            self.sequence_span_sum,
+        )
     }
 
     fn stream_mut(&mut self) -> Option<&mut S> {
@@ -717,33 +897,213 @@ impl<S> TrackedStream<S> {
         self.stream.take()
     }
 
-    fn install_recovered(
-        &mut self,
-        stream: S,
-    ) -> Result<(), frame_provenance::SequenceTrackerError> {
-        self.sequence.begin_new_epoch()?;
+    fn install_recovered(&mut self, stream: S) -> std::io::Result<()> {
+        let mut next_sequence = self.sequence.clone();
+        if let Err(error) = next_sequence.begin_new_epoch() {
+            self.sequence = next_sequence;
+            return Err(std::io::Error::other(error));
+        }
+        let mut next_timestamp = self.timestamp.clone();
+        if let Err(error) = next_timestamp.begin_new_epoch() {
+            self.timestamp = next_timestamp;
+            return Err(std::io::Error::other(error));
+        }
+        self.sequence = next_sequence;
+        self.timestamp = next_timestamp;
         self.stream = Some(stream);
         Ok(())
     }
 }
 
+fn account_continuity_observation(
+    observations: &mut u64,
+    discarded_observations: &mut u64,
+    sequence_span_sum: &mut u64,
+    sequence: &frame_provenance::SequenceObservation,
+    discarded: bool,
+    timestamp_tracker: &mut frame_provenance::TimestampTracker,
+) -> std::io::Result<()> {
+    let next_observations = observations.checked_add(1);
+    let next_discarded = if discarded {
+        discarded_observations.checked_add(1)
+    } else {
+        Some(*discarded_observations)
+    };
+    let next_span = sequence_span_sum.checked_add(u64::from(sequence.advance().unwrap_or(0)));
+    let (Some(next_observations), Some(next_discarded), Some(next_span)) =
+        (next_observations, next_discarded, next_span)
+    else {
+        timestamp_tracker.fail_current_epoch();
+        return Err(std::io::Error::other(
+            "continuity observation accounting overflowed; explicit recovery required",
+        ));
+    };
+    *observations = next_observations;
+    *discarded_observations = next_discarded;
+    *sequence_span_sum = next_span;
+    Ok(())
+}
+
+fn ensure_continuity_alignment(
+    sequence: &frame_provenance::SequenceObservation,
+    timestamp: &frame_provenance::TimestampObservation,
+    timestamp_tracker: &mut frame_provenance::TimestampTracker,
+) -> std::io::Result<()> {
+    if sequence.stream_epoch() != timestamp.stream_epoch()
+        || sequence.discontinuity() != timestamp.discontinuity()
+    {
+        timestamp_tracker.fail_current_epoch();
+        return Err(std::io::Error::other(
+            "sequence/timestamp continuity diverged; explicit stream recovery required",
+        ));
+    }
+    Ok(())
+}
+
+fn observe_continuity_facts(
+    sequence: &mut frame_provenance::SequenceTracker,
+    timestamp: &mut frame_provenance::TimestampTracker,
+    observations: &mut u64,
+    discarded_observations: &mut u64,
+    sequence_span_sum: &mut u64,
+    facts: &frame_provenance::DequeuedBufferFacts,
+    discarded: bool,
+) -> std::io::Result<(
+    frame_provenance::SequenceObservation,
+    frame_provenance::TimestampObservation,
+)> {
+    let mut next_timestamp = timestamp.clone();
+    let timestamp_observation = match if discarded {
+        next_timestamp.observe_discarded(
+            facts.timestamp_micros(),
+            facts.timestamp_clock(),
+            facts.timestamp_source(),
+        )
+    } else {
+        next_timestamp.observe(
+            facts.timestamp_micros(),
+            facts.timestamp_clock(),
+            facts.timestamp_source(),
+        )
+    } {
+        Ok(observation) => observation,
+        Err(error) => {
+            *timestamp = next_timestamp;
+            return Err(std::io::Error::other(error));
+        }
+    };
+    let mut next_sequence = sequence.clone();
+    let sequence_observation = match if discarded {
+        next_sequence.observe_discarded(facts.sequence_raw())
+    } else {
+        next_sequence.observe(facts.sequence_raw())
+    } {
+        Ok(observation) => observation,
+        Err(error) => {
+            *sequence = next_sequence;
+            return Err(std::io::Error::other(error));
+        }
+    };
+    ensure_continuity_alignment(&sequence_observation, &timestamp_observation, timestamp)?;
+    account_continuity_observation(
+        observations,
+        discarded_observations,
+        sequence_span_sum,
+        &sequence_observation,
+        discarded,
+        timestamp,
+    )?;
+    *timestamp = next_timestamp;
+    *sequence = next_sequence;
+    Ok((sequence_observation, timestamp_observation))
+}
+
 impl<S: ValidatedStream> TrackedStream<S> {
+    fn next_discarded(&mut self) -> std::io::Result<()> {
+        let Self {
+            stream,
+            sequence,
+            timestamp,
+            observations,
+            discarded_observations,
+            sequence_span_sum,
+        } = self;
+        let dequeued = stream
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
+            .next_validated();
+        let facts = match dequeued {
+            Ok((_, facts)) | Err(ValidatedDequeueError::Corrupt(facts)) => facts,
+            Err(error) => {
+                if error.invalidates_timestamp_epoch() {
+                    timestamp.fail_current_epoch();
+                }
+                return Err(error.into_io());
+            }
+        };
+        observe_continuity_facts(
+            sequence,
+            timestamp,
+            observations,
+            discarded_observations,
+            sequence_span_sum,
+            &facts,
+            true,
+        )?;
+        Ok(())
+    }
+
     fn next(
         &mut self,
     ) -> std::io::Result<(
         &[u8],
         frame_provenance::DequeuedBufferFacts,
         frame_provenance::SequenceObservation,
+        frame_provenance::TimestampObservation,
     )> {
-        let Self { stream, sequence } = self;
-        let (payload, facts) = stream
+        let Self {
+            stream,
+            sequence,
+            timestamp,
+            observations,
+            discarded_observations,
+            sequence_span_sum,
+        } = self;
+        let dequeued = stream
             .as_mut()
             .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
-            .next_validated()?;
-        let observation = sequence
-            .observe(facts.sequence_raw())
-            .map_err(std::io::Error::other)?;
-        Ok((payload, facts, observation))
+            .next_validated();
+        let (payload, facts) = match dequeued {
+            Ok(frame) => frame,
+            Err(ValidatedDequeueError::Corrupt(facts)) => {
+                observe_continuity_facts(
+                    sequence,
+                    timestamp,
+                    observations,
+                    discarded_observations,
+                    sequence_span_sum,
+                    &facts,
+                    true,
+                )?;
+                return Err(ValidatedDequeueError::Corrupt(facts).into_io());
+            }
+            Err(error) => {
+                if error.invalidates_timestamp_epoch() {
+                    timestamp.fail_current_epoch();
+                }
+                return Err(error.into_io());
+            }
+        };
+        let (sequence_observation, timestamp_observation) = observe_continuity_facts(
+            sequence,
+            timestamp,
+            observations,
+            discarded_observations,
+            sequence_span_sum,
+            &facts,
+            false,
+        )?;
+        Ok((payload, facts, sequence_observation, timestamp_observation))
     }
 }
 
@@ -2334,16 +2694,6 @@ pub struct RgbSession<'a> {
 }
 
 impl<'a> RgbSession<'a> {
-    /// The live stream. `recover` is the only path that leaves the slot
-    /// empty, and it either refills it or returns the error; a `None` here
-    /// outside that window is a bug, reported as hardware trouble rather
-    /// than a panic because this sits in the authentication path.
-    fn stream(&mut self) -> irlume_common::Result<&mut SafeStream<'a>> {
-        self.stream
-            .stream_mut()
-            .ok_or_else(|| Error::Hardware("RGB stream missing after a failed recovery".into()))
-    }
-
     /// Rebuild this session's stream on the SAME open device after a
     /// mid-stream fault.
     ///
@@ -2376,7 +2726,7 @@ impl<'a> RgbSession<'a> {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         self.stream.install_recovered(stream).map_err(|error| {
             Error::Hardware(format!(
-                "{}: could not begin the recovered sequence epoch: {error}",
+                "{}: could not begin the recovered continuity epochs: {error}",
                 self.cam.device
             ))
         })?;
@@ -2399,13 +2749,15 @@ impl<'a> RgbSession<'a> {
         }
         let device = self.cam.device.clone();
         let progress = self.progress.clone();
-        warm_up_stream(&device, self.stream()?, &progress)?;
+        warm_up_stream(&device, &mut self.stream, &progress)?;
         for _ in 0..AE_WARMUP {
             self.cam
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            self.stream()?.next().map_err(|e| map_io(&device, e))?; // discard while AE settles
+            self.stream
+                .next_discarded()
+                .map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
         self.warmed = true;
         Ok(())
@@ -2422,13 +2774,20 @@ impl<'a> RgbSession<'a> {
         let (w, h) = (self.cam.width, self.cam.height);
         let device = self.cam.device.clone();
         let chosen = self.cam.chosen;
+        let binding = self
+            .cam
+            .lease
+            .frame_binding(&device, contracts::StreamRole::Rgb)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let format =
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         let mut frames = Vec::with_capacity(n.max(1));
         for _ in 0..n.max(1) {
             self.cam
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, _meta, _sequence) =
+            let (buf, facts, sequence, timestamp) =
                 self.stream.next().map_err(|error| map_io(&device, error))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
@@ -2439,13 +2798,22 @@ impl<'a> RgbSession<'a> {
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            frames.push(Frame {
-                width: w,
-                height: h,
-                spectrum: Spectrum::Rgb,
+            let provenance = checked_single_provenance(
+                binding.clone(),
+                format.clone(),
+                facts,
+                sequence,
+                timestamp,
+                taken,
+                contracts::IlluminationProvenance::Unknown,
+            )?;
+            frames.push(Frame::from_provenance(
+                w,
+                h,
+                Spectrum::Rgb,
                 data,
-                captured: CaptureWindow::at(taken),
-            });
+                provenance,
+            )?);
         }
         Ok(frames)
     }
@@ -2462,7 +2830,7 @@ impl<'a> RgbSession<'a> {
     /// the burst, so one blurry or over-exposed frame cannot decide a match.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn denoised(&mut self) -> irlume_common::Result<Frame> {
-        Ok(median_frame(self.burst(RGB_BURST)?))
+        median_frame(self.burst(RGB_BURST)?)
     }
 }
 
@@ -2858,9 +3226,9 @@ pub fn capture_rgb_denoised_with_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<Frame> {
-    Ok(median_frame(capture_rgb_burst_with_progress(
+    median_frame(capture_rgb_burst_with_progress(
         device, RGB_BURST, progress,
-    )?))
+    )?)
 }
 
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
@@ -2868,16 +3236,11 @@ pub fn capture_rgb_denoised_with_progress(
 /// for a degenerate burst. Private on purpose: callers must pass at least one
 /// frame (`capture_rgb_burst` clamps to n.max(1)), and keeping it crate-local
 /// keeps that invariant next to the only code that must uphold it.
-fn median_frame(mut frames: Vec<Frame>) -> Frame {
+fn median_frame(mut frames: Vec<Frame>) -> irlume_common::Result<Frame> {
     if frames.len() <= 1 {
-        return frames.pop().expect("median_frame: empty burst");
+        return Ok(frames.pop().expect("median_frame: empty burst"));
     }
     let (w, h, spectrum) = (frames[0].width, frames[0].height, frames[0].spectrum);
-    let window = frames
-        .iter()
-        .map(|f| f.captured)
-        .reduce(CaptureWindow::union)
-        .unwrap_or_else(|| CaptureWindow::at(std::time::Instant::now()));
     let len = frames.iter().map(|f| f.data.len()).min().unwrap_or(0);
     let mut out = vec![0u8; len];
     let mut col = vec![0u8; frames.len()];
@@ -2888,15 +3251,16 @@ fn median_frame(mut frames: Vec<Frame>) -> Frame {
         col.sort_unstable();
         *o = col[col.len() / 2];
     }
-    Frame {
-        width: w,
-        height: h,
-        spectrum,
-        data: out,
-        // A median pixel can come from any frame in the burst, so the result
-        // belongs to the whole span, not to any one dequeue.
-        captured: window,
-    }
+    let contributors = frames
+        .into_iter()
+        .map(Frame::into_single_provenance)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::Hardware(format!("invalid median contributors: {error}")))?;
+    let provenance = checked_aggregate_provenance(
+        contributors,
+        frame_provenance::ContributorSelection::ReducedOverAll,
+    )?;
+    Frame::from_provenance(w, h, spectrum, out, provenance)
 }
 
 const IR_W: u32 = 640;
@@ -3093,12 +3457,12 @@ impl IrCamera {
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
-        let mut stream = SafeStream::open(
+        let mut stream = TrackedStream::new(SafeStream::open(
             &self.device,
             &self.dev,
             &self.negotiated,
             self.lease.clone(),
-        )?;
+        )?);
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
@@ -3140,7 +3504,7 @@ impl IrCamera {
         warm_up_stream(&self.device, &mut stream, progress)?;
         Ok(IrSession {
             cam: self,
-            stream: TrackedStream::new(stream),
+            stream,
             dec: IrDecoder::new(self.pix, self.quantization),
             lit: mode.lit(),
             _mode: mode,
@@ -3195,6 +3559,11 @@ impl IrSession<'_> {
         let card = &self.cam.card;
         let lit = self.lit;
         let white_level = self.dec.white_level();
+        let binding = lease
+            .frame_binding(device, contracts::StreamRole::Ir)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let format =
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         // The state is NOT impossible, which is why this is an error and not
         // the expect it used to be: a failed `recover` (its reopen can lose a
         // format race with another application, #427, or hit transient
@@ -3218,6 +3587,7 @@ impl IrSession<'_> {
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
         let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
         let mut taken: Vec<std::time::Instant> = Vec::with_capacity(IR_BURST);
+        let mut dequeue_evidence = Vec::with_capacity(IR_BURST);
         // Each frame's V4L2 buffer timestamp, the key that ties it to the
         // camera's illumination record. Measured identical across the image and
         // metadata queues for every frame of a 24-frame run; dequeue order is
@@ -3242,12 +3612,15 @@ impl IrSession<'_> {
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, bmeta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
+            let (buf, bmeta, sequence, timestamp) =
+                stream.next().map_err(|error| map_io(device, error))?;
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             stamps.push(bmeta.timestamp_micros());
-            taken.push(std::time::Instant::now());
+            let frame_taken = std::time::Instant::now();
+            taken.push(frame_taken);
+            dequeue_evidence.push((bmeta, sequence, timestamp, frame_taken));
             // Drain every iteration, not once at the end. The metadata ring is
             // smaller than a burst, so a single drain afterwards silently loses
             // the earliest frames' records: measured 7 of 10 frames classified
@@ -3324,7 +3697,6 @@ impl IrSession<'_> {
         let best_i =
             ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref()).unwrap_or(0);
         let mut best = Some(frames[best_i].clone());
-        let mut ir_window = CaptureWindow::at(taken[best_i]);
 
         // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in. On a
         // strobing emitter the frame adjacent to the brightest is an emitter-OFF
@@ -3355,6 +3727,7 @@ impl IrSession<'_> {
         let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
         // Stays None unless the returned pixels stop being the raw gate frame.
         let mut saturation_frame: Option<Vec<u8>> = None;
+        let mut ambient_used = None;
         if subtract {
             // An adjacent frame the camera flagged dark, else the darker
             // neighbour as before. Adjacency still bounds auto-exposure drift
@@ -3381,8 +3754,8 @@ impl IrSession<'_> {
                         // the raw ones.
                         saturation_frame = white_level.map(|_| frames[best_i].clone());
                         best = Some(sub);
+                        ambient_used = Some(ai);
                         // The result now carries pixels from BOTH frames.
-                        ir_window = ir_window.union(CaptureWindow::at(taken[ai]));
                     }
                     if debug_ir {
                         // Reads the same ceiling the gate-frame selection above
@@ -3507,17 +3880,42 @@ impl IrSession<'_> {
             }
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
-        Ok((
-            Frame {
-                width: w,
-                height: h,
-                spectrum: Spectrum::Ir,
-                data: grey,
-                // The returned pixels are the chosen burst frame's, so the window is
-                // that dequeue. Ambient subtraction mixes in an ADJACENT frame, so
-                // it widens to cover both.
-                captured: ir_window,
+        let contributors = dequeue_evidence
+            .into_iter()
+            .zip(flags.iter().copied())
+            .map(
+                |((facts, sequence, timestamp, frame_taken), illumination)| {
+                    let illumination = match illumination {
+                        Some(ir_metadata::Illumination::Lit) => {
+                            contracts::IlluminationProvenance::ActiveIr
+                        }
+                        Some(ir_metadata::Illumination::Dark) => {
+                            contracts::IlluminationProvenance::Ambient
+                        }
+                        None => contracts::IlluminationProvenance::Unknown,
+                    };
+                    checked_single_evidence(
+                        binding.clone(),
+                        format.clone(),
+                        facts,
+                        sequence,
+                        timestamp,
+                        frame_taken,
+                        illumination,
+                    )
+                },
+            )
+            .collect::<irlume_common::Result<Vec<_>>>()?;
+        let selection = ambient_used.map_or(
+            frame_provenance::ContributorSelection::Selected { index: best_i },
+            |ambient_index| frame_provenance::ContributorSelection::Subtracted {
+                lit_index: best_i,
+                ambient_index,
             },
+        );
+        let provenance = checked_aggregate_provenance(contributors, selection)?;
+        Ok((
+            Frame::from_provenance(w, h, Spectrum::Ir, grey, provenance)?,
             IrCaptureStats {
                 saturation_frame,
                 lit_mean: lit_level as f32,
@@ -3595,7 +3993,7 @@ impl IrSession<'_> {
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             self.stream.install_recovered(stream).map_err(|error| {
                 Error::Hardware(format!(
-                    "{}: could not begin the recovered sequence epoch: {error}",
+                    "{}: could not begin the recovered continuity epochs: {error}",
                     self.cam.device
                 ))
             })
@@ -3756,6 +4154,10 @@ pub mod ir_probe {
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
         let mut dec = super::IrDecoder::new(pix, fmt.quantization);
         let (w, h) = (fmt.width, fmt.height);
+        let binding = permit
+            .frame_binding(device, super::contracts::StreamRole::Ir)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let format = super::frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
         // reverse declaration order, so `stream` drops first and stops the
@@ -3779,16 +4181,20 @@ pub mod ir_probe {
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            let (buf, _meta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
+            let (buf, facts, sequence, timestamp) =
+                stream.next().map_err(|error| map_io(device, error))?;
             let taken = std::time::Instant::now();
+            let provenance = super::checked_single_provenance(
+                binding.clone(),
+                format.clone(),
+                facts,
+                sequence,
+                timestamp,
+                taken,
+                super::contracts::IlluminationProvenance::Unknown,
+            )?;
             out.push((
-                Frame {
-                    width: w,
-                    height: h,
-                    spectrum: Spectrum::Ir,
-                    data: dec.decode(buf, w, h),
-                    captured: super::CaptureWindow::at(taken),
-                },
+                Frame::from_provenance(w, h, Spectrum::Ir, dec.decode(buf, w, h), provenance)?,
                 t0.elapsed().as_secs_f64() * 1000.0,
             ));
         }
@@ -3865,6 +4271,10 @@ pub fn capture_ir_streaming<B>(
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
+    let binding = permit
+        .frame_binding(device, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
     // reverse declaration order, so `stream` drops first and stops the
@@ -3914,7 +4324,8 @@ pub fn capture_ir_streaming<B>(
     // user a password fallback. Reading the metadata queue here is how that gets
     // closed, and it is not done.
     for _ in 0..max_frames {
-        let (buf, _meta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
+        let (buf, facts, sequence, timestamp) =
+            stream.next().map_err(|error| map_io(device, error))?;
         let taken = std::time::Instant::now();
         let data = dec.decode(buf, w, h);
         let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
@@ -3961,7 +4372,7 @@ pub fn capture_ir_streaming<B>(
                     })
                     .map_err(|error| {
                         Error::Hardware(format!(
-                            "{device}: could not begin the recovered sequence epoch: {error}"
+                            "{device}: could not begin the recovered continuity epochs: {error}"
                         ))
                     })?;
                 mode = replacement_mode;
@@ -3972,13 +4383,16 @@ pub fn capture_ir_streaming<B>(
         if mean >= IR_BLOWN_MEAN {
             continue;
         }
-        let frame = Frame {
-            width: w,
-            height: h,
-            spectrum: Spectrum::Ir,
-            data,
-            captured: CaptureWindow::at(taken),
-        };
+        let provenance = checked_single_provenance(
+            binding.clone(),
+            format.clone(),
+            facts,
+            sequence,
+            timestamp,
+            taken,
+            contracts::IlluminationProvenance::Unknown,
+        )?;
+        let frame = Frame::from_provenance(w, h, Spectrum::Ir, data, provenance)?;
         if let std::ops::ControlFlow::Break(b) = on_frame(IrStreamFrame { frame, mean }) {
             return Ok(Some(b));
         }
@@ -4004,6 +4418,12 @@ pub fn capture_ir_sequence(
     samples: usize,
     burst: usize,
 ) -> irlume_common::Result<Vec<Frame>> {
+    let burst = burst.max(1);
+    if burst > 64 {
+        return Err(Error::Hardware(
+            "IR mini-burst exceeds the 64-contributor provenance cap".into(),
+        ));
+    }
     verify_pinned(device)?;
     let permit = lease::permit_for_endpoint(
         device,
@@ -4016,11 +4436,14 @@ pub fn capture_ir_sequence(
             "{device}: hardware privacy switch is ON"
         )));
     }
-    let burst = burst.max(1);
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
+    let binding = permit
+        .frame_binding(device, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
     // reverse declaration order, so `stream` drops first and stops the
@@ -4055,18 +4478,27 @@ pub fn capture_ir_sequence(
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
-        // The kept frame is one dequeue out of the mini-burst, so remember WHICH
-        // instant it came from rather than stamping the end of the burst.
-        let mut taken = std::time::Instant::now();
+        let mut best_index = 0;
+        let mut contributors = Vec::with_capacity(burst);
         for _ in 0..burst {
-            let (buf, _meta, _sequence) = stream.next().map_err(|error| map_io(device, error))?;
+            let (buf, facts, sequence, timestamp) =
+                stream.next().map_err(|error| map_io(device, error))?;
             let at = std::time::Instant::now();
             let data = dec.decode(buf, w, h);
             let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
+            contributors.push(checked_single_evidence(
+                binding.clone(),
+                format.clone(),
+                facts,
+                sequence,
+                timestamp,
+                at,
+                contracts::IlluminationProvenance::Unknown,
+            )?);
             if mean > best_mean {
                 best_mean = mean;
                 best = Some(data);
-                taken = at;
+                best_index = contributors.len() - 1;
             }
         }
         let Some(data) = best else { continue };
@@ -4113,7 +4545,7 @@ pub fn capture_ir_sequence(
                     })
                     .map_err(|error| {
                         Error::Hardware(format!(
-                            "{device}: could not begin the recovered sequence epoch: {error}"
+                            "{device}: could not begin the recovered continuity epochs: {error}"
                         ))
                     })?;
                 mode = replacement_mode;
@@ -4124,13 +4556,25 @@ pub fn capture_ir_sequence(
         if best_mean >= IR_BLOWN_MEAN {
             continue;
         }
-        frames.push(Frame {
-            width: w,
-            height: h,
-            spectrum: Spectrum::Ir,
+        let provenance = if contributors.len() == 1 {
+            frame_provenance::RuntimeFrameProvenance::Single(
+                contributors.into_iter().next().ok_or_else(|| {
+                    Error::Hardware("mini-burst produced no provenance contributor".into())
+                })?,
+            )
+        } else {
+            checked_aggregate_provenance(
+                contributors,
+                frame_provenance::ContributorSelection::Selected { index: best_index },
+            )?
+        };
+        frames.push(Frame::from_provenance(
+            w,
+            h,
+            Spectrum::Ir,
             data,
-            captured: CaptureWindow::at(taken),
-        });
+            provenance,
+        )?);
     }
     // A short return is a CAPTURE fault, not a quiet fact about the scene: the
     // attempt budget ran out because frames arrived frozen, blown out, or too
@@ -4559,7 +5003,7 @@ fn held_concurrent_arm<'d>(
             let t0 = std::time::Instant::now();
             let (rgb, ir) = std::thread::scope(|scope| {
                 let ir_thread = scope.spawn(|| is.capture_with_stats());
-                let rgb = rs.burst(RGB_BURST).map(median_frame);
+                let rgb = rs.burst(RGB_BURST).and_then(median_frame);
                 let ir = match ir_thread.join() {
                     Ok(result) => result,
                     // Re-raise into the composer's catch_unwind: a panic is a
@@ -5193,14 +5637,14 @@ pub fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// COMPLETED `TimedOut` return, so a frameless camera spending its whole
 /// budget here reports a heartbeat every window and the daemon's watchdog
 /// (#141) only starves when a driver call genuinely never returns.
-fn warm_up_stream(
+fn warm_up_stream<S: ValidatedStream>(
     device: &str,
-    stream: &mut SafeStream<'_>,
+    stream: &mut TrackedStream<S>,
     progress: &Progress,
 ) -> irlume_common::Result<()> {
     warm_up_with(
         device,
-        || stream.next().map(|_| ()),
+        || stream.next_discarded(),
         std::thread::sleep,
         progress,
     )
@@ -5401,7 +5845,343 @@ mod tests {
     }
 
     #[test]
-    fn recovery_epoch_survives_untracked_warmup_dequeues() {
+    fn facts_errors_invalidate_but_metadata_valid_corruption_does_not() {
+        let errors = [
+            frame_provenance::DequeuedBufferError::PayloadTooShort {
+                bytes_used: 1,
+                minimum: 2,
+            },
+            frame_provenance::DequeuedBufferError::PayloadExceedsMapping {
+                bytes_used: 2,
+                mapped_len: 1,
+            },
+        ];
+        for error in errors {
+            assert!(
+                ValidatedDequeueError::Facts(error).invalidates_timestamp_epoch(),
+                "a rejected dequeue could conceal contradictory timestamp metadata"
+            );
+        }
+        assert!(
+            !ValidatedDequeueError::Io(std::io::Error::other("no metadata"))
+                .invalidates_timestamp_epoch(),
+            "an I/O failure before metadata exists must remain retryable"
+        );
+        let corrupt = frame_provenance::DequeuedBufferFacts::from_v4l(
+            &continuity_metadata(
+                1,
+                1,
+                v4l::buffer::Flags::TIMESTAMP_MONOTONIC | v4l::buffer::Flags::ERROR,
+            ),
+            1,
+        )
+        .expect("valid continuity facts");
+        assert!(
+            !ValidatedDequeueError::Corrupt(corrupt).invalidates_timestamp_epoch(),
+            "metadata-valid corruption is observed as discarded, not epoch-fatal"
+        );
+    }
+
+    #[test]
+    fn continuity_accounting_overflow_poisons_without_advancing_trackers() {
+        let metadata = v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence: 2,
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            timestamp: v4l::timestamp::Timestamp::new(2, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata,
+        });
+        capture.observations = u64::MAX;
+        let sequence_state = capture.sequence.continuity_state_for_test();
+        let timestamp_state = capture.timestamp.continuity_state_for_test();
+
+        assert!(capture.next().is_err());
+        assert_eq!(capture.sequence.continuity_state_for_test(), sequence_state);
+        assert_eq!(
+            capture.timestamp.continuity_state_for_test(),
+            timestamp_state
+        );
+        assert!(
+            capture.timestamp.epoch_failed_for_test(),
+            "accounting overflow must poison the epoch"
+        );
+        assert_eq!(capture.accounting(), (u64::MAX, 0, 0));
+    }
+
+    struct ContinuityFixture {
+        payload: [u8; 1],
+        metadata: v4l::buffer::Metadata,
+    }
+
+    impl ValidatedStream for ContinuityFixture {
+        fn next_validated(
+            &mut self,
+        ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+            let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&self.metadata, 1)
+                .map_err(ValidatedDequeueError::Facts)?;
+            Ok((&self.payload, facts))
+        }
+    }
+
+    struct QueuedContinuityFixture {
+        payload: [u8; 1],
+        metadata: std::collections::VecDeque<v4l::buffer::Metadata>,
+    }
+
+    impl ValidatedStream for QueuedContinuityFixture {
+        fn next_validated(
+            &mut self,
+        ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+            let metadata = self.metadata.pop_front().ok_or_else(|| {
+                ValidatedDequeueError::Io(std::io::Error::other("fixture exhausted"))
+            })?;
+            let layout =
+                frame_provenance::PayloadLayout::new(*b"GREY", 1, 1, 1).expect("fixture layout");
+            validate_dequeued(&self.payload, &metadata, layout)
+        }
+    }
+
+    fn continuity_metadata(
+        sequence: u32,
+        seconds: i64,
+        flags: v4l::buffer::Flags,
+    ) -> v4l::buffer::Metadata {
+        v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence,
+            flags,
+            timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
+            ..v4l::buffer::Metadata::default()
+        }
+    }
+
+    #[test]
+    fn warmup_discards_metadata_valid_driver_corruption_without_failing_epoch() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let corrupt = continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR);
+        let valid = continuity_metadata(2, 2, monotonic);
+        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+            payload: [7],
+            metadata: [corrupt, valid].into(),
+        });
+
+        warm_up_with(
+            "fixture",
+            || tracked.next_discarded(),
+            |_| {},
+            &no_progress(),
+        )
+        .expect("metadata-valid corruption is a discarded warm-up observation");
+        assert_eq!(tracked.accounting(), (1, 1, 0));
+
+        let (payload, _, sequence, timestamp) =
+            tracked.next().expect("next payload remains usable");
+        assert_eq!(payload, &[7]);
+        assert_eq!(sequence.raw(), 2);
+        assert_eq!(sequence.gap(), 0);
+        assert_eq!(timestamp.micros(), 2_000_000);
+        assert_eq!(tracked.accounting(), (2, 1, 1));
+    }
+
+    #[test]
+    fn delivered_driver_corruption_is_discarded_but_next_payload_remains_usable() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let corrupt = continuity_metadata(10, 10, monotonic | v4l::buffer::Flags::ERROR);
+        let valid = continuity_metadata(11, 11, monotonic);
+        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+            payload: [9],
+            metadata: [corrupt, valid].into(),
+        });
+
+        let error = tracked
+            .next()
+            .expect_err("a corrupt payload must never be delivered");
+        assert!(error.to_string().contains("corrupt"));
+        assert_eq!(tracked.accounting(), (1, 1, 0));
+
+        let (payload, _, sequence, timestamp) =
+            tracked.next().expect("next payload remains usable");
+        assert_eq!(payload, &[9]);
+        assert_eq!(sequence.raw(), 11);
+        assert_eq!(sequence.gap(), 0);
+        assert_eq!(timestamp.micros(), 11_000_000);
+        assert_eq!(tracked.accounting(), (2, 1, 1));
+    }
+
+    #[test]
+    fn driver_corruption_cannot_mask_invalid_timestamp_metadata() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let corrupt_invalid = v4l::buffer::Metadata {
+            timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+            ..continuity_metadata(1, 1, monotonic | v4l::buffer::Flags::ERROR)
+        };
+        let valid = continuity_metadata(2, 2, monotonic);
+        let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+            payload: [3],
+            metadata: [corrupt_invalid, valid].into(),
+        });
+
+        assert!(tracked.next_discarded().is_err());
+        assert_eq!(tracked.accounting(), (0, 0, 0));
+        assert!(
+            tracked.next().is_err(),
+            "invalid metadata on a corrupt payload must leave the epoch failed closed"
+        );
+    }
+
+    #[test]
+    fn corrupt_discarded_continuity_discontinuities_poison_the_epoch() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let error = v4l::buffer::Flags::ERROR;
+        let cases = [
+            (
+                "clock change",
+                2,
+                2,
+                v4l::buffer::Flags::TIMESTAMP_UNKNOWN | error,
+            ),
+            (
+                "source change",
+                2,
+                2,
+                monotonic | v4l::buffer::Flags::TSTAMP_SRC_SOE | error,
+            ),
+            ("timestamp regression", 2, 1, monotonic | error),
+            ("sequence regression", 1, 2, monotonic | error),
+        ];
+
+        for (case, sequence, seconds, flags) in cases {
+            let baseline = continuity_metadata(1, 1, monotonic);
+            let corrupt = continuity_metadata(sequence, seconds, flags);
+            let valid = continuity_metadata(3, 3, monotonic);
+            let mut tracked = TrackedStream::new(QueuedContinuityFixture {
+                payload: [5],
+                metadata: [baseline, corrupt, valid].into(),
+            });
+
+            tracked.next().expect("baseline delivery");
+            assert!(
+                tracked.next_discarded().is_err(),
+                "corrupt payload concealed {case}"
+            );
+            assert_eq!(
+                tracked.accounting(),
+                (1, 0, 0),
+                "contradictory corrupt dequeue was accounted: {case}"
+            );
+            assert!(
+                tracked.next().is_err(),
+                "failed epoch healed after corrupt {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn discarded_malformed_timestamp_cannot_heal_in_same_epoch() {
+        let valid = v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence: 1,
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            timestamp: v4l::timestamp::Timestamp::new(1, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata {
+                timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+                ..valid
+            },
+        });
+        assert!(capture.next_discarded().is_err());
+        capture.stream_mut().expect("stream").metadata = valid;
+        assert!(capture.next().is_err(), "discarded invalid evidence healed");
+    }
+
+    #[test]
+    fn warmup_retry_cannot_heal_discarded_malformed_timestamp() {
+        struct WarmupFixture {
+            payload: [u8; 1],
+            metadata: std::collections::VecDeque<v4l::buffer::Metadata>,
+        }
+        impl ValidatedStream for WarmupFixture {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                let metadata = self.metadata.pop_front().ok_or_else(|| {
+                    ValidatedDequeueError::Io(std::io::Error::other("fixture exhausted"))
+                })?;
+                let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, 1)
+                    .map_err(ValidatedDequeueError::Facts)?;
+                Ok((&self.payload, facts))
+            }
+        }
+        let valid = v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence: 2,
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            timestamp: v4l::timestamp::Timestamp::new(2, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let mut tracked = TrackedStream::new(WarmupFixture {
+            payload: [1],
+            metadata: [
+                v4l::buffer::Metadata {
+                    sequence: 1,
+                    timestamp: v4l::timestamp::Timestamp::new(1, 1_000_000),
+                    ..valid
+                },
+                valid,
+            ]
+            .into(),
+        });
+        let result = warm_up_with(
+            "fixture",
+            || tracked.next_discarded(),
+            |_| {},
+            &no_progress(),
+        );
+        assert!(result.is_err(), "warm-up retry healed invalid evidence");
+    }
+
+    #[test]
+    fn discarded_timestamp_discontinuities_poison_the_epoch() {
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let cases = [
+            (v4l::buffer::Flags::TIMESTAMP_UNKNOWN, 2_i64),
+            (v4l::buffer::Flags::TIMESTAMP_COPY, 2),
+            (monotonic | v4l::buffer::Flags::TSTAMP_SRC_SOE, 2),
+            (monotonic, 1),
+        ];
+        for (flags, seconds) in cases {
+            let metadata = |sequence, seconds, flags| v4l::buffer::Metadata {
+                bytesused: 1,
+                sequence,
+                flags,
+                timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
+                ..v4l::buffer::Metadata::default()
+            };
+            let mut capture = TrackedStream::new(ContinuityFixture {
+                payload: [1],
+                metadata: metadata(1, 1, monotonic),
+            });
+            capture.next().expect("baseline");
+            capture.stream_mut().expect("stream").metadata = metadata(2, seconds, flags);
+            assert!(capture.next_discarded().is_err());
+            capture.stream_mut().expect("stream").metadata = metadata(3, 3, monotonic);
+            assert!(
+                capture.next().is_err(),
+                "discarded evidence healed: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_epochs_survive_continuity_aware_warmup_dequeues() {
         struct SequenceFixture {
             payload: [u8; 1],
             sequences: std::collections::VecDeque<u32>,
@@ -5410,18 +6190,20 @@ mod tests {
         impl ValidatedStream for SequenceFixture {
             fn next_validated(
                 &mut self,
-            ) -> std::io::Result<(&[u8], frame_provenance::DequeuedBufferFacts)> {
-                let sequence = self
-                    .sequences
-                    .pop_front()
-                    .ok_or_else(|| std::io::Error::other("fixture exhausted"))?;
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                let sequence = self.sequences.pop_front().ok_or_else(|| {
+                    ValidatedDequeueError::Io(std::io::Error::other("fixture exhausted"))
+                })?;
                 let metadata = v4l::buffer::Metadata {
                     bytesused: 1,
                     sequence,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(1, i64::from(sequence)),
                     ..v4l::buffer::Metadata::default()
                 };
                 let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, 1)
-                    .map_err(std::io::Error::other)?;
+                    .map_err(ValidatedDequeueError::Facts)?;
                 Ok((&self.payload, facts))
             }
         }
@@ -5431,24 +6213,306 @@ mod tests {
             sequences: sequences.iter().copied().collect(),
         };
         let mut capture = TrackedStream::new(fixture(&[41]));
-        let (_, _, baseline) = capture.next().expect("baseline delivery");
-        assert!(!baseline.discontinuity());
+        let (_, _, baseline_sequence, baseline_timestamp) =
+            capture.next().expect("baseline delivery");
+        assert!(!baseline_sequence.discontinuity());
+        assert!(!baseline_timestamp.discontinuity());
+        assert_eq!(capture.accounting(), (1, 0, 0));
 
         capture.take();
         capture
-            .install_recovered(fixture(&[500, 7]))
+            .install_recovered(fixture(&[500, 501]))
             .expect("representable recovery epoch");
-        capture
-            .stream_mut()
-            .expect("replacement stream")
-            .next_validated()
-            .expect("discarded warm-up dequeue");
+        capture.next_discarded().expect("discarded warm-up dequeue");
 
-        let (_, _, restarted) = capture.next().expect("first delivered recovery frame");
-        assert_eq!(restarted.raw(), 7);
-        assert_eq!(restarted.gap(), 0);
-        assert!(restarted.discontinuity());
-        assert_eq!(restarted.stream_epoch(), 1);
+        let (_, _, restarted_sequence, restarted_timestamp) =
+            capture.next().expect("first delivered recovery frame");
+        assert_eq!(restarted_sequence.raw(), 501);
+        assert_eq!(restarted_sequence.gap(), 0);
+        assert!(restarted_sequence.discontinuity());
+        assert_eq!(restarted_sequence.stream_epoch(), 1);
+        assert_eq!(restarted_timestamp.micros(), 1_000_501);
+        assert_eq!(restarted_timestamp.delta_micros(), Some(1));
+        assert!(restarted_timestamp.discontinuity());
+        assert_eq!(restarted_timestamp.stream_epoch(), 1);
+        assert_eq!(capture.accounting(), (3, 1, 1));
+    }
+
+    #[test]
+    fn discarded_sequence_discontinuity_requires_recovery_for_aligned_epochs() {
+        let metadata = |sequence, seconds| v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence,
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: metadata(1, 1),
+        });
+        capture.next().expect("baseline");
+        let sequence_state = capture.sequence.continuity_state_for_test();
+        let timestamp_state = capture.timestamp.continuity_state_for_test();
+        capture.stream_mut().expect("stream").metadata = metadata(1, 2);
+        assert!(
+            capture.next_discarded().is_err(),
+            "discarded duplicate sequence bypassed continuity alignment"
+        );
+        assert_eq!(capture.sequence.continuity_state_for_test(), sequence_state);
+        assert_eq!(
+            capture.timestamp.continuity_state_for_test(),
+            timestamp_state
+        );
+        assert!(capture.timestamp.epoch_failed_for_test());
+        capture.stream_mut().expect("stream").metadata = metadata(2, 3);
+        assert!(
+            capture.next_discarded().is_err(),
+            "discarded failed epoch healed without recovery"
+        );
+
+        assert!(capture.take().is_some());
+        capture
+            .install_recovered(ContinuityFixture {
+                payload: [1],
+                metadata: metadata(10, 10),
+            })
+            .expect("recovery");
+        capture.next_discarded().expect("recovered warm-up frame");
+        capture.stream_mut().expect("stream").metadata = metadata(11, 11);
+        let (_, _, sequence, timestamp) = capture.next().expect("recovered delivered frame");
+        assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
+        assert!(sequence.discontinuity());
+        assert!(timestamp.discontinuity());
+    }
+
+    #[test]
+    fn delivered_sequence_discontinuity_requires_recovery_for_aligned_epochs() {
+        let metadata = |sequence, seconds| v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence,
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: metadata(1, 1),
+        });
+        capture.next().expect("baseline");
+        let sequence_state = capture.sequence.continuity_state_for_test();
+        let timestamp_state = capture.timestamp.continuity_state_for_test();
+        capture.stream_mut().expect("stream").metadata = metadata(1, 2);
+        assert!(
+            capture.next().is_err(),
+            "duplicate sequence published contradictory provenance"
+        );
+        assert_eq!(capture.sequence.continuity_state_for_test(), sequence_state);
+        assert_eq!(
+            capture.timestamp.continuity_state_for_test(),
+            timestamp_state
+        );
+        assert!(capture.timestamp.epoch_failed_for_test());
+        capture.stream_mut().expect("stream").metadata = metadata(2, 3);
+        assert!(
+            capture.next().is_err(),
+            "failed epoch healed without recovery"
+        );
+
+        assert!(capture.take().is_some());
+        capture
+            .install_recovered(ContinuityFixture {
+                payload: [1],
+                metadata: metadata(10, 10),
+            })
+            .expect("recovery");
+        let (_, _, sequence, timestamp) = capture.next().expect("recovered frame");
+        assert_eq!(sequence.stream_epoch(), timestamp.stream_epoch());
+        assert!(sequence.discontinuity());
+        assert!(timestamp.discontinuity());
+    }
+
+    #[test]
+    fn timestamp_failure_does_not_advance_sequence_state() {
+        let metadata = |sequence, seconds, flags| v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence,
+            flags,
+            timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let monotonic = v4l::buffer::Flags::TIMESTAMP_MONOTONIC;
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: metadata(1, 1, monotonic),
+        });
+        capture.next().expect("baseline");
+        capture.stream_mut().expect("stream").metadata =
+            metadata(5, 2, v4l::buffer::Flags::TIMESTAMP_UNKNOWN);
+        assert!(capture.next().is_err());
+
+        capture.take();
+        capture
+            .install_recovered(ContinuityFixture {
+                payload: [1],
+                metadata: metadata(10, 1, monotonic),
+            })
+            .expect("recovery");
+        let (_, _, sequence, timestamp) = capture.next().expect("recovered frame");
+        assert_eq!(sequence.cumulative_drops(), 0);
+        assert!(sequence.discontinuity());
+        assert!(timestamp.discontinuity());
+    }
+
+    #[test]
+    fn recovery_epoch_overflow_never_partially_publishes_state() {
+        let fixture = || ContinuityFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata::default(),
+        };
+
+        let mut sequence_failure = TrackedStream::new(fixture());
+        sequence_failure
+            .sequence
+            .force_stream_epoch_overflow_on_recovery();
+        assert!(sequence_failure.take().is_some());
+        assert!(sequence_failure.install_recovered(fixture()).is_err());
+        assert!(sequence_failure.stream_mut().is_none());
+        assert!(sequence_failure.sequence.failed_for_test());
+        assert!(!sequence_failure.timestamp.failed_for_test());
+        assert_eq!(sequence_failure.timestamp.stream_epoch_for_test(), 0);
+
+        let mut timestamp_failure = TrackedStream::new(fixture());
+        timestamp_failure
+            .timestamp
+            .force_stream_epoch_overflow_on_recovery();
+        assert!(timestamp_failure.take().is_some());
+        assert!(timestamp_failure.install_recovered(fixture()).is_err());
+        assert!(timestamp_failure.stream_mut().is_none());
+        assert!(!timestamp_failure.sequence.failed_for_test());
+        assert_eq!(timestamp_failure.sequence.stream_epoch_for_test(), 0);
+        assert!(timestamp_failure.timestamp.failed_for_test());
+    }
+
+    #[test]
+    fn discarded_timestamp_failure_does_not_advance_sequence_state() {
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata {
+                bytesused: 1,
+                sequence: 1,
+                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                ..v4l::buffer::Metadata::default()
+            },
+        });
+        capture.next().expect("baseline");
+        let stream = capture.stream_mut().expect("stream");
+        stream.metadata.sequence = 5;
+        stream.metadata.flags = v4l::buffer::Flags::TIMESTAMP_UNKNOWN;
+        stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 0);
+        assert!(capture.next_discarded().is_err());
+        assert_eq!(capture.sequence.previous_for_test(), Some(1));
+    }
+
+    #[test]
+    fn discarded_sequence_failure_does_not_advance_timestamp_state() {
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata {
+                bytesused: 1,
+                sequence: 1,
+                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                ..v4l::buffer::Metadata::default()
+            },
+        });
+        capture.next().expect("baseline");
+        capture.sequence.force_drop_overflow_on_next_gap();
+        let stream = capture.stream_mut().expect("stream");
+        stream.metadata.sequence = 3;
+        stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 0);
+        assert!(capture.next_discarded().is_err());
+        assert_eq!(capture.timestamp.previous_for_test(), Some(1_000_000));
+    }
+
+    #[test]
+    fn sequence_failure_does_not_advance_timestamp_state() {
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata {
+                bytesused: 1,
+                sequence: 1,
+                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                ..v4l::buffer::Metadata::default()
+            },
+        });
+        capture.next().expect("baseline");
+        capture.sequence.force_drop_overflow_on_next_gap();
+        let stream = capture.stream_mut().expect("stream");
+        stream.metadata.sequence = 3;
+        stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 0);
+        assert!(capture.next().is_err());
+        assert_eq!(capture.timestamp.previous_for_test(), Some(1_000_000));
+    }
+
+    #[test]
+    fn malformed_raw_timestamp_fails_epoch_until_recovery() {
+        let valid = v4l::buffer::Metadata {
+            bytesused: 1,
+            sequence: 1,
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            timestamp: v4l::timestamp::Timestamp::new(1, 0),
+            ..v4l::buffer::Metadata::default()
+        };
+        let mut capture = TrackedStream::new(ContinuityFixture {
+            payload: [1],
+            metadata: valid,
+        });
+        capture.next().expect("baseline");
+        let stream = capture.stream_mut().expect("stream");
+        stream.metadata.timestamp = v4l::timestamp::Timestamp::new(2, 1_000_000);
+        assert!(capture.next().is_err());
+        let stream = capture.stream_mut().expect("stream");
+        stream.metadata.timestamp = v4l::timestamp::Timestamp::new(3, 0);
+        assert!(capture.next().is_err(), "same epoch must remain failed");
+        capture.take();
+        capture
+            .install_recovered(ContinuityFixture {
+                payload: [1],
+                metadata: valid,
+            })
+            .expect("recovery");
+        capture.next().expect("recovered frame");
+    }
+
+    #[test]
+    fn unsupported_timestamp_masks_fail_epoch_until_recovery() {
+        for bits in [0x0000_6000, 0x0002_2000] {
+            let valid = v4l::buffer::Metadata {
+                bytesused: 1,
+                sequence: 1,
+                flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                timestamp: v4l::timestamp::Timestamp::new(1, 0),
+                ..v4l::buffer::Metadata::default()
+            };
+            let mut capture = TrackedStream::new(ContinuityFixture {
+                payload: [1],
+                metadata: valid,
+            });
+            capture.next().expect("baseline");
+            let stream = capture.stream_mut().expect("stream");
+            stream.metadata.flags = v4l::buffer::Flags::from_bits_truncate(bits);
+            assert!(capture.next().is_err(), "unsupported mask 0x{bits:08x}");
+            let stream = capture.stream_mut().expect("stream");
+            stream.metadata = v4l::buffer::Metadata {
+                sequence: 3,
+                timestamp: v4l::timestamp::Timestamp::new(3, 0),
+                ..valid
+            };
+            assert!(capture.next().is_err(), "epoch healed for 0x{bits:08x}");
+        }
     }
 
     #[test]
@@ -5798,14 +6862,73 @@ mod tests {
         assert!(why.contains("could not be listed"), "{why}");
     }
 
+    thread_local! {
+        static TEST_SEQUENCE: std::cell::RefCell<frame_provenance::SequenceTracker> =
+            const { std::cell::RefCell::new(frame_provenance::SequenceTracker::new()) };
+        static TEST_TIMESTAMP: std::cell::RefCell<frame_provenance::TimestampTracker> =
+            const { std::cell::RefCell::new(frame_provenance::TimestampTracker::new()) };
+    }
+
+    fn frame_at(data: &[u8], at: std::time::Instant) -> Frame {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        let raw = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let micros = i64::from(raw) * 1_000;
+        let metadata = v4l::buffer::Metadata {
+            bytesused: data.len() as u32,
+            sequence: raw,
+            timestamp: v4l::timestamp::Timestamp::new(0, micros),
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            ..Default::default()
+        };
+        let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, data.len())
+            .expect("test buffer facts");
+        let sequence = TEST_SEQUENCE.with(|tracker| {
+            tracker
+                .borrow_mut()
+                .observe(raw)
+                .expect("test sequence observation")
+        });
+        let timestamp = TEST_TIMESTAMP.with(|tracker| {
+            tracker
+                .borrow_mut()
+                .observe(
+                    micros,
+                    frame_provenance::TimestampClock::Monotonic,
+                    frame_provenance::TimestampSource::EndOfFrame,
+                )
+                .expect("test timestamp observation")
+        });
+        let binding = frame_provenance::FrameBinding::new(
+            contracts::CameraInstanceId::new("22222222222222222222222222222222")
+                .expect("test camera identity"),
+            contracts::CameraGeneration::INITIAL,
+            contracts::StreamRole::Rgb,
+        );
+        let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(
+            &v4l::Format::new(data.len() as u32, 1, v4l::FourCC::new(b"RGB3")),
+        );
+        let provenance = checked_single_provenance(
+            binding,
+            format,
+            facts,
+            sequence,
+            timestamp,
+            at,
+            contracts::IlluminationProvenance::Unknown,
+        )
+        .expect("test runtime provenance");
+        Frame::from_provenance(
+            data.len() as u32,
+            1,
+            Spectrum::Rgb,
+            data.to_vec(),
+            provenance,
+        )
+        .expect("test frame")
+    }
+
     fn frame(data: &[u8]) -> Frame {
-        Frame {
-            width: data.len() as u32,
-            height: 1,
-            spectrum: Spectrum::Rgb,
-            data: data.to_vec(),
-            captured: CaptureWindow::at(std::time::Instant::now()),
-        }
+        frame_at(data, std::time::Instant::now())
     }
 
     // The decision the probe exists to make, checked against the two modules we
@@ -6300,16 +7423,30 @@ mod tests {
     fn median_frame_window_spans_the_whole_burst() {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
-        let mut frames = vec![frame(&[10, 10]), frame(&[20, 20]), frame(&[30, 30])];
-        for (i, f) in frames.iter_mut().enumerate() {
-            f.captured = CaptureWindow::at(t0 + Duration::from_millis(100 * i as u64));
-        }
+        let frames = vec![
+            frame_at(&[10, 10], t0),
+            frame_at(&[20, 20], t0 + Duration::from_millis(100)),
+            frame_at(&[30, 30], t0 + Duration::from_millis(200)),
+        ];
         // A median pixel may come from any frame, so the result cannot claim a
         // single instant: it must cover first-to-last dequeue.
-        let m = median_frame(frames);
+        let m = median_frame(frames).expect("coherent median provenance");
         assert_eq!(m.captured.start, t0);
         assert_eq!(m.captured.end, t0 + Duration::from_millis(200));
         assert_eq!(m.data, vec![20, 20]);
+        match m.provenance() {
+            frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) => {
+                assert_eq!(aggregate.contributors().len(), 3);
+                assert_eq!(
+                    aggregate.selection(),
+                    frame_provenance::ContributorSelection::ReducedOverAll
+                );
+                assert_eq!(aggregate.capture_window(), m.captured);
+            }
+            frame_provenance::RuntimeFrameProvenance::Single(_) => {
+                panic!("a multi-frame median must retain all contributors")
+            }
+        }
     }
 
     #[test]
@@ -6323,14 +7460,33 @@ mod tests {
             frame(&[99, 51, 199]),
             frame(&[100, 50, 200]),
         ];
-        let m = median_frame(frames);
+        let m = median_frame(frames).expect("coherent median provenance");
         assert_eq!(m.data, vec![100, 50, 200]);
     }
 
     #[test]
+    fn oversized_ir_sequence_burst_fails_before_device_access() {
+        let error = match capture_ir_sequence("/definitely/missing/video", 1, 65) {
+            Ok(_) => panic!("oversized provenance aggregate must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("64-contributor"), "{error}");
+    }
+
+    #[test]
+    fn frame_storage_is_mandatory_runtime_provenance() {
+        let frame = frame(&[1]);
+        let _: &frame_provenance::RuntimeFrameProvenance = &frame.provenance;
+    }
+
+    #[test]
     fn median_frame_passes_lone_frame_through() {
-        let m = median_frame(vec![frame(&[1, 2, 3])]);
+        let m = median_frame(vec![frame(&[1, 2, 3])]).expect("lone frame passes through");
         assert_eq!(m.data, vec![1, 2, 3]);
+        assert!(matches!(
+            m.provenance(),
+            frame_provenance::RuntimeFrameProvenance::Single(_)
+        ));
     }
 
     #[test]
@@ -6643,16 +7799,18 @@ mod tests {
     }
 
     #[test]
-    fn median_frame_even_burst_takes_upper_middle_and_min_length() {
+    fn median_frame_even_burst_takes_upper_middle_and_rejects_mixed_formats() {
         // Even burst: sorted [1,2,3,4] -> index 4/2 = 2 -> 3 (upper middle).
         let frames = vec![frame(&[1]), frame(&[4]), frame(&[2]), frame(&[3])];
-        assert_eq!(median_frame(frames).data, vec![3]);
-        // Mixed-length burst: output truncates to the shortest frame, and the
-        // dimensions/spectrum come from the first frame.
+        assert_eq!(
+            median_frame(frames)
+                .expect("coherent median provenance")
+                .data,
+            vec![3]
+        );
+        // A reduction may not silently combine different validated formats.
         let frames = vec![frame(&[9, 9, 9]), frame(&[5, 5]), frame(&[7, 7, 7])];
-        let m = median_frame(frames);
-        assert_eq!(m.data, vec![7, 7]);
-        assert_eq!((m.width, m.height, m.spectrum), (3, 1, Spectrum::Rgb));
+        assert!(median_frame(frames).is_err());
     }
 
     #[test]
@@ -7410,6 +8568,401 @@ mod tests {
                 .fold((u8::MAX, u8::MIN), |(lo, hi), &b| (lo.min(b), hi.max(b)));
             assert!(max > min, "a test pattern must not convert to a flat frame");
         }
+    }
+
+    #[derive(Default)]
+    struct ContinuityStressStats {
+        frames: u64,
+        gap_total: u64,
+        cumulative_drops: u64,
+        discontinuities: u64,
+        epoch_count: u64,
+        current_epoch: Option<u64>,
+        epoch_first_micros: Option<i64>,
+        epoch_last_micros: Option<i64>,
+        completed_span_sum: u64,
+        delta_count: u64,
+        delta_sum: u64,
+        min_delta: Option<u64>,
+        max_delta: Option<u64>,
+        clock: Option<frame_provenance::TimestampClock>,
+        source: Option<frame_provenance::TimestampSource>,
+        sequence_epoch: u64,
+        timestamp_epoch: u64,
+        first_micros: Option<i64>,
+        last_micros: Option<i64>,
+    }
+    impl ContinuityStressStats {
+        fn record(
+            &mut self,
+            sequence: frame_provenance::SequenceObservation,
+            timestamp: frame_provenance::TimestampObservation,
+        ) {
+            assert_eq!(
+                sequence.discontinuity(),
+                timestamp.discontinuity(),
+                "sequence/timestamp discontinuities diverged"
+            );
+            assert_eq!(
+                sequence.stream_epoch(),
+                timestamp.stream_epoch(),
+                "sequence/timestamp epochs diverged"
+            );
+            let micros = timestamp.micros();
+            let epoch = timestamp.stream_epoch();
+            let same_epoch = match self.current_epoch {
+                None => {
+                    self.epoch_count = 1;
+                    self.current_epoch = Some(epoch);
+                    self.epoch_first_micros = Some(micros);
+                    self.epoch_last_micros = Some(micros);
+                    false
+                }
+                Some(current) if current == epoch => true,
+                Some(current) => {
+                    let next = current.checked_add(1).expect("epoch overflow");
+                    assert_eq!(epoch, next, "stress epoch skipped");
+                    let first = self.epoch_first_micros.expect("epoch first timestamp");
+                    let last = self.epoch_last_micros.expect("epoch last timestamp");
+                    self.completed_span_sum = self
+                        .completed_span_sum
+                        .checked_add(last.abs_diff(first))
+                        .expect("timestamp span overflow");
+                    self.epoch_count += 1;
+                    self.current_epoch = Some(epoch);
+                    self.epoch_first_micros = Some(micros);
+                    self.epoch_last_micros = Some(micros);
+                    false
+                }
+            };
+            if same_epoch {
+                let delta = timestamp
+                    .delta_micros()
+                    .expect("same-epoch delivered timestamp has a delta");
+                self.epoch_last_micros = Some(micros);
+                self.delta_count = self
+                    .delta_count
+                    .checked_add(1)
+                    .expect("delta count overflow");
+                self.delta_sum = self
+                    .delta_sum
+                    .checked_add(delta)
+                    .expect("delta sum overflow");
+                self.min_delta = Some(self.min_delta.map_or(delta, |old| old.min(delta)));
+                self.max_delta = Some(self.max_delta.map_or(delta, |old| old.max(delta)));
+            }
+            self.frames += 1;
+            self.gap_total = sequence.cumulative_drops();
+            self.cumulative_drops = sequence.cumulative_drops();
+            self.discontinuities += u64::from(sequence.discontinuity());
+            self.clock = Some(timestamp.clock());
+            self.source = Some(timestamp.source());
+            self.sequence_epoch = sequence.stream_epoch();
+            self.timestamp_epoch = timestamp.stream_epoch();
+            self.first_micros.get_or_insert(timestamp.micros());
+            self.last_micros = Some(timestamp.micros());
+        }
+
+        fn as_json(
+            &self,
+            role: &str,
+            elapsed: std::time::Duration,
+            accounting: (u64, u64, u64),
+        ) -> serde_json::Value {
+            let (observations, discarded_observations, sequence_span_sum) = accounting;
+            assert_eq!(
+                observations,
+                self.frames
+                    .checked_add(discarded_observations)
+                    .expect("observation count overflow"),
+                "delivered/discarded observation accounting mismatch"
+            );
+            assert_eq!(
+                sequence_span_sum,
+                observations
+                    .checked_sub(self.epoch_count)
+                    .and_then(|value| value.checked_add(self.cumulative_drops))
+                    .expect("sequence span accounting overflow"),
+                "sequence span accounting mismatch"
+            );
+            let delivered_hz = self.frames as f64 / elapsed.as_secs_f64();
+            let epoch_first = self.epoch_first_micros.expect("epoch first timestamp");
+            let epoch_last = self.epoch_last_micros.expect("epoch last timestamp");
+            let timestamp_span_sum = self
+                .completed_span_sum
+                .checked_add(epoch_last.abs_diff(epoch_first))
+                .expect("timestamp span sum overflow");
+            assert_eq!(
+                self.delta_sum, timestamp_span_sum,
+                "delta/span sum mismatch"
+            );
+            assert_eq!(
+                self.delta_count,
+                self.frames
+                    .checked_sub(self.epoch_count)
+                    .expect("epoch count exceeds frames"),
+                "delta/frame/epoch count mismatch"
+            );
+            serde_json::json!({
+                "role": role,
+                "frames": self.frames,
+                "observations": observations,
+                "discarded_observations": discarded_observations,
+                "sequence_span_sum": sequence_span_sum,
+                "delivered_hz": delivered_hz,
+                "gap_total": self.gap_total,
+                "cumulative_drops": self.cumulative_drops,
+                "discontinuities": self.discontinuities,
+                "epoch_count": self.epoch_count,
+                "timestamp_span_sum_us": timestamp_span_sum,
+                "delta_count": self.delta_count,
+                "delta_sum_us": self.delta_sum,
+                "delta_min_us": self.min_delta,
+                "delta_max_us": self.max_delta,
+                "clock": self.clock.map(|value| format!("{value:?}")),
+                "source": self.source.map(|value| format!("{value:?}")),
+                "stream_epoch": self.timestamp_epoch,
+                "sequence_stream_epoch": self.sequence_epoch,
+                "timestamp_stream_epoch": self.timestamp_epoch,
+                "first_timestamp_us": self.first_micros,
+                "last_timestamp_us": self.last_micros,
+            })
+        }
+    }
+    #[test]
+    fn continuity_stress_gap_total_includes_discarded_observations() {
+        let mut sequence = frame_provenance::SequenceTracker::new();
+        let mut timestamp = frame_provenance::TimestampTracker::new();
+        sequence
+            .observe_discarded(1)
+            .expect("first discarded sequence");
+        timestamp
+            .observe_discarded(
+                1_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("first discarded timestamp");
+        sequence
+            .observe_discarded(4)
+            .expect("discarded sequence gap");
+        timestamp
+            .observe_discarded(
+                2_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("second discarded timestamp");
+        let sequence_observation = sequence.observe(5).expect("delivered sequence");
+        let timestamp_observation = timestamp
+            .observe(
+                3_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("delivered timestamp");
+        let mut stats = ContinuityStressStats::default();
+        stats.record(sequence_observation, timestamp_observation);
+        assert_eq!(stats.gap_total, 2);
+        assert_eq!(stats.cumulative_drops, 2);
+        assert_eq!(stats.delta_count, 0);
+        assert_eq!(stats.delta_sum, 0);
+
+        let sequence_observation = sequence.observe(6).expect("second delivered sequence");
+        let timestamp_observation = timestamp
+            .observe(
+                4_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("second delivered timestamp");
+        stats.record(sequence_observation, timestamp_observation);
+        sequence.begin_new_epoch().expect("sequence recovery epoch");
+        timestamp
+            .begin_new_epoch()
+            .expect("timestamp recovery epoch");
+        sequence
+            .observe_discarded(10)
+            .expect("recovery warm-up sequence");
+        timestamp
+            .observe_discarded(
+                10_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("recovery warm-up timestamp");
+        let sequence_observation = sequence.observe(11).expect("recovered sequence");
+        let timestamp_observation = timestamp
+            .observe(
+                11_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("recovered timestamp");
+        stats.record(sequence_observation, timestamp_observation);
+        let sequence_observation = sequence.observe(12).expect("second recovered sequence");
+        let timestamp_observation = timestamp
+            .observe(
+                13_000_000,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .expect("second recovered timestamp");
+        stats.record(sequence_observation, timestamp_observation);
+        let json = stats.as_json("rgb", std::time::Duration::from_secs(10), (7, 3, 7));
+        assert_eq!(json["epoch_count"], 2);
+        assert_eq!(json["delta_count"], 2);
+        assert_eq!(json["delta_sum_us"], 3_000_000);
+        assert_eq!(json["timestamp_span_sum_us"], 3_000_000);
+    }
+
+    #[test]
+    #[ignore = "needs real physical RGB and optional IR cameras"]
+    fn physical_timestamp_continuity_stress() {
+        assert!(
+            std::env::var_os("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA").is_none(),
+            "physical evidence forbids the virtual-camera escape"
+        );
+        let required =
+            |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
+        let seconds = required("IRLUME_TEST_DURATION_SECONDS")
+            .parse::<u64>()
+            .expect("duration must be an integer");
+        assert!(
+            (60..=600).contains(&seconds),
+            "physical stress duration must be between 60s and 600s"
+        );
+        let host = required("IRLUME_TEST_HOST");
+        let commit = required("IRLUME_TEST_COMMIT");
+        let git_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read tested git revision");
+        assert!(git_head.status.success(), "git rev-parse HEAD failed");
+        let actual_commit = String::from_utf8(git_head.stdout).expect("git SHA is UTF-8");
+        assert_eq!(actual_commit.trim(), commit, "evidence commit mismatch");
+        let hostname = std::process::Command::new("uname")
+            .arg("-n")
+            .output()
+            .expect("read tested host name");
+        assert!(hostname.status.success(), "uname -n failed");
+        let actual_host = String::from_utf8(hostname.stdout).expect("host name is UTF-8");
+        assert_eq!(actual_host.trim(), host, "evidence host mismatch");
+        let rgb_path = required("IRLUME_TEST_PHYSICAL_RGB_DEVICE");
+        let ir_path = std::env::var("IRLUME_TEST_PHYSICAL_IR_DEVICE").ok();
+        assert!(
+            ir_path.is_some() || std::env::var("IRLUME_TEST_EXPECT_RGB_ONLY").as_deref() == Ok("1"),
+            "an IR path or an explicit RGB-only assertion is required"
+        );
+        let mut endpoints = vec![rgb_path.as_str()];
+        if let Some(ir_path) = ir_path.as_deref() {
+            endpoints.push(ir_path);
+        }
+        let operation = lease::acquire_camera_operation(
+            &endpoints,
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire physical camera operation");
+        let rgb = operation
+            .open_rgb(&rgb_path)
+            .expect("open physical RGB camera");
+        let mut rgb_session = rgb.session().expect("open RGB session");
+        let ir = ir_path
+            .as_deref()
+            .map(|path| operation.open_ir(path))
+            .transpose()
+            .expect("open physical IR camera");
+        let mut ir_session = ir
+            .as_ref()
+            .map(|camera| camera.session())
+            .transpose()
+            .expect("open IR session");
+        rgb_session.warm_up().expect("initial RGB warm-up");
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(seconds);
+        let recovery_at = started + std::time::Duration::from_secs(seconds / 2);
+        let mut rgb_stats = ContinuityStressStats::default();
+        let mut ir_stats = ContinuityStressStats::default();
+        let mut recovered = false;
+        let mut recovery_duration = None;
+        let mut expect_rgb_discontinuity = false;
+        let mut expect_ir_discontinuity = false;
+        while std::time::Instant::now() < deadline {
+            let (_, _, sequence, timestamp) =
+                rgb_session.stream.next().expect("RGB tracked dequeue");
+            if expect_rgb_discontinuity {
+                assert!(sequence.discontinuity(), "RGB recovery marker missing");
+                expect_rgb_discontinuity = false;
+            }
+            rgb_stats.record(sequence, timestamp);
+            if let Some(session) = &mut ir_session {
+                let (_, _, sequence, timestamp) =
+                    session.stream.next().expect("IR tracked dequeue");
+                if let Some(log) = session.meta.as_mut() {
+                    log.begin_burst();
+                    log.drain();
+                }
+                if expect_ir_discontinuity {
+                    assert!(sequence.discontinuity(), "IR recovery marker missing");
+                    expect_ir_discontinuity = false;
+                }
+                ir_stats.record(sequence, timestamp);
+            }
+            if !recovered && std::time::Instant::now() >= recovery_at {
+                let recovery_started = std::time::Instant::now();
+                rgb_session.recover().expect("RGB recovery");
+                rgb_session.warm_up().expect("recovered RGB warm-up");
+                expect_rgb_discontinuity = true;
+                if let Some(session) = &mut ir_session {
+                    session.recover().expect("IR recovery");
+                    expect_ir_discontinuity = true;
+                }
+                recovery_duration = Some(recovery_started.elapsed());
+                recovered = true;
+            }
+        }
+        assert!(recovered, "mid-run recovery was not exercised");
+        assert!(!expect_rgb_discontinuity, "RGB post-recovery frame missing");
+        assert!(!expect_ir_discontinuity, "IR post-recovery frame missing");
+        assert_eq!(
+            rgb_stats.discontinuities, 1,
+            "unexpected RGB discontinuities"
+        );
+        if ir_session.is_some() {
+            assert_eq!(ir_stats.discontinuities, 1, "unexpected IR discontinuities");
+        }
+        assert!(rgb_stats.frames > 0);
+        assert!(ir_session.is_none() || ir_stats.frames > 0);
+        let elapsed = started.elapsed();
+        let recovery_duration = recovery_duration.expect("recovery duration was recorded");
+        let rgb_ir_skew_us = match (rgb_stats.last_micros, ir_stats.last_micros) {
+            (Some(rgb), Some(ir)) => Some(rgb.abs_diff(ir)),
+            _ => None,
+        };
+        let rgb_accounting = rgb_session.stream.accounting();
+        let ir_accounting = ir_session
+            .as_ref()
+            .map(|session| session.stream.accounting());
+        let mut streams = vec![rgb_stats.as_json("rgb", elapsed, rgb_accounting)];
+        if let Some(accounting) = ir_accounting {
+            streams.push(ir_stats.as_json("ir", elapsed, accounting));
+        }
+        eprintln!(
+            "\n{}",
+            serde_json::json!({
+                "kind": "irlume.slice4.hardware",
+                "schema_version": 1,
+                "host": host,
+                "commit": commit,
+                "requested_duration_seconds": seconds,
+                "duration_seconds": elapsed.as_secs_f64(),
+                "recovery_exercised": recovered,
+                "recovery_duration_seconds": recovery_duration.as_secs_f64(),
+                "rgb_ir_skew_us": rgb_ir_skew_us,
+                "streams": streams,
+            })
+        );
     }
 
     /// `IrSession::recover` must hand back a session as capable as the one it

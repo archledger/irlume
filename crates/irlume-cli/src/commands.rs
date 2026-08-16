@@ -2067,6 +2067,8 @@ SYSTEM INTEGRATION
                         camera picker runs this for you)
   camera-tune [--rounds N]        measure whether this camera can stream RGB and
                         IR at once without dimming, and store the answer (sudo)
+  camera-mode                     report the capture mode in force for the
+                        auto-selected pair, and where that verdict came from
   models [list|add|enable|disable [name]]   opt-in third-party models, measured
                         and checksum-pinned. A PAD entry is a deny-only liveness
                         cue; a recognition entry REPLACES the RGB matcher at its

@@ -224,6 +224,7 @@ fn main() -> std::process::ExitCode {
         (Some("calibrate-closure"), _) => calibrate_closure(&args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("camera-tune"), _) => camera_tune(&args),
+        (Some("camera-mode"), _) => camera_mode(&args),
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
@@ -1125,6 +1126,93 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
         "camera-tune",
         daemon_request(&Request::TuneCaptureMode { rounds }),
     )
+}
+
+/// `irlume camera-mode`: report which capture strategy the pair irlume would
+/// select uses, and where that verdict came from (a measurement, an auto-switch,
+/// or the unmeasured default). Unlike `doctor`, this opens the camera to
+/// auto-select the pair, so it answers on an install that never ran `set-cameras`.
+fn camera_mode(_args: &[String]) -> std::process::ExitCode {
+    use irlume_camera::{CaptureModeOrigin, MeasurementSource};
+    // The override decides alone, before anything stored is consulted.
+    if let Ok(v) = std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
+        let sequential = v.trim() == "1";
+        println!(
+            "capture mode: {} (forced by IRLUME_SEQUENTIAL_CAPTURE in this shell)",
+            if sequential {
+                "sequential"
+            } else {
+                "concurrent"
+            }
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    let (rgb, ir) = crate::camera_pair();
+    if rgb == "none" || rgb == "unknown" || ir == "none" || ir == "unknown" {
+        println!("capture mode: no camera pair resolved, so there is no mode to report.");
+        return std::process::ExitCode::SUCCESS;
+    }
+    println!("camera pair: rgb={rgb} ir={ir}");
+    let Some(mode) = irlume_camera::stored_capture_mode(&rgb, &ir) else {
+        println!(
+            "capture mode: sequential (the safe unmeasured default). Run \
+             `sudo irlume camera-tune` to measure whether this camera can \
+             capture RGB and IR concurrently."
+        );
+        return std::process::ExitCode::SUCCESS;
+    };
+    let when = |at_unix: Option<u64>| -> String {
+        match at_unix {
+            Some(ts) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                format!("{} days ago", now.saturating_sub(ts) / 86400)
+            }
+            None => "at an unknown date".to_string(),
+        }
+    };
+    match irlume_camera::stored_capture_mode_origin(&rgb, &ir) {
+        Some(CaptureModeOrigin::Measured {
+            by,
+            at_unix,
+            rgb_retention,
+            ir_retention,
+        }) => {
+            let source = match by {
+                MeasurementSource::CameraTune => "camera-tune",
+                MeasurementSource::EnrollmentProbe => "the enrollment probe",
+            };
+            let retention = match (rgb_retention, ir_retention) {
+                (Some(r), Some(i)) => format!(
+                    "; concurrent retained {:.0}% RGB and {:.0}% IR brightness",
+                    r * 100.0,
+                    i * 100.0
+                ),
+                _ => String::new(),
+            };
+            println!(
+                "capture mode: {} (measured by {source} {}{retention})",
+                mode.as_str(),
+                when(at_unix)
+            );
+        }
+        Some(CaptureModeOrigin::AutoSwitched { at_unix, streak }) => {
+            let streak = streak
+                .map(|s| format!(" after {s} consecutive concurrent RGB losses"))
+                .unwrap_or_default();
+            println!(
+                "capture mode: {} (auto-switched {}{streak}; run `sudo irlume \
+                 camera-tune` to re-measure)",
+                mode.as_str(),
+                when(at_unix)
+            );
+        }
+        None => {
+            println!("capture mode: {} (stored for this pair)", mode.as_str());
+        }
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 fn usage_profiles() -> std::process::ExitCode {
@@ -3822,8 +3910,8 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
             State::Info,
             "no pinned camera pair, so the stored verdict cannot be looked up here; irlume \
              auto-selects a pair at capture and any mode measured for that pair still \
-             applies. Run `sudo irlume set-cameras` to pin one, or `sudo irlume camera-tune` \
-             to measure and report the mode"
+             applies. Run `sudo irlume camera-mode` to report the mode for the \
+             auto-selected pair, or `sudo irlume set-cameras` to pin one"
                 .to_string(),
         ),
         CaptureModeReport::Overridden(sequential) => (

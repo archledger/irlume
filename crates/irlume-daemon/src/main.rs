@@ -2862,17 +2862,32 @@ fn run_capture_mode_probe(
              measured verdict"
         ));
     }
+    let origin = irlume_auth::CaptureModeOrigin::Measured {
+        by: match policy {
+            ProbeStore::Always => irlume_auth::MeasurementSource::CameraTune,
+            ProbeStore::ConclusiveOnly => irlume_auth::MeasurementSource::EnrollmentProbe,
+        },
+        at_unix: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        ),
+        // An arm that never completed a round has no ratio to record (#192,
+        // the BRIO's EINVAL on concurrent open); `None` means "cannot run at
+        // all", not a dimming percentage.
+        rgb_retention: (report.concurrent.rounds > 0).then(|| report.retained_rgb()),
+        ir_retention: (report.concurrent.rounds > 0).then(|| report.retained_ir()),
+    };
     match policy {
         // The explicit tune is an instruction to re-measure: it overwrites.
-        ProbeStore::Always => {
-            irlume_auth::store_capture_mode(rgb_dev, ir_dev, mode).map_err(|e| e.to_string())?
-        }
+        ProbeStore::Always => irlume_auth::store_capture_mode(rgb_dev, ir_dev, mode, origin)
+            .map_err(|e| e.to_string())?,
         // The automatic probe re-checks emptiness under the cameras.conf
         // writer lock: its first check and this write are separated by the
         // whole probe, and a verdict another process landed in that window
         // outranks the automatic result (#340 review).
         ProbeStore::ConclusiveOnly => {
-            match irlume_auth::store_capture_mode_if_absent(rgb_dev, ir_dev, mode)
+            match irlume_auth::store_capture_mode_if_absent(rgb_dev, ir_dev, mode, origin)
                 .map_err(|e| e.to_string())?
             {
                 irlume_auth::StoreIfAbsent::Stored => {}

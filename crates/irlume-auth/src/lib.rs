@@ -16,7 +16,8 @@ use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, E
 pub use irlume_camera::{
     apply_known_ir_emitter, list_ir_controls, measure_contention, measure_contention_with_progress,
     no_progress, setup_ir_emitter, store_capture_mode, store_capture_mode_if_absent,
-    stored_capture_mode, CaptureMode, ContentionReport, PairSample, Progress, StoreIfAbsent,
+    stored_capture_mode, CaptureMode, CaptureModeOrigin, ContentionReport, MeasurementSource,
+    PairSample, Progress, StoreIfAbsent,
 };
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
@@ -4064,8 +4065,12 @@ impl Engine {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let stored =
-            irlume_camera::store_sequential_if_still_concurrent(&self.rgb_dev, &self.ir_dev, now);
+        let stored = irlume_camera::store_sequential_if_still_concurrent(
+            &self.rgb_dev,
+            &self.ir_dev,
+            now,
+            consecutive_ir_only as u32,
+        );
         if let Some(line) = capture_mode_switch_line(SELF_HEAL_SWITCH_AFTER, &stored) {
             eprintln!("irlumed: {line}");
         }

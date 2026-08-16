@@ -6121,33 +6121,118 @@ pub fn capture_mode_pair_identity(rgb_dev: &str, ir_dev: &str) -> Option<String>
     Some(capture_mode_pair_key(&rgb_id, &ir_id))
 }
 
+/// Who measured the capture mode directly. A measurement outranks an
+/// inference (the auto-switch), so the two direct sources are worth telling
+/// apart in the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementSource {
+    /// `irlume camera-tune` — an explicit operator request to re-measure.
+    CameraTune,
+    /// The automatic enrollment probe (#340), which fills an empty verdict
+    /// before the first scan.
+    EnrollmentProbe,
+}
+
+impl MeasurementSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            MeasurementSource::CameraTune => "camera-tune",
+            MeasurementSource::EnrollmentProbe => "enroll-probe",
+        }
+    }
+}
+
 /// How a stored capture mode came to be there, when irlume recorded it.
 ///
-/// Only the automatic switch stamps this today; a verdict from `camera-tune`
-/// carries no origin, which reads as "measured" by absence. That asymmetry is
-/// deliberate for now: stamping the probe's writes too would change a command
-/// this change does not otherwise touch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Read-only provenance: it never changes the mode in force (the mode lives
+/// in its own key). Every direct measurement and the automatic switch stamp
+/// this now; a verdict with no sidecar value is unmeasured.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CaptureModeOrigin {
+    /// A direct measurement. The retention ratios say how much RGB/IR
+    /// brightness the concurrent path kept versus sequential; `None` when the
+    /// concurrent arm could not run at all (the BRIO's EINVAL), so there was
+    /// no ratio to measure.
+    Measured {
+        by: MeasurementSource,
+        at_unix: Option<u64>,
+        rgb_retention: Option<f32>,
+        ir_retention: Option<f32>,
+    },
     /// irlume switched this pairing to sequential itself, after repeated
     /// concurrent-capture RGB losses during real enrolment attempts (#100).
-    /// `at_unix` is when, or `None` when the stamp carried no readable time.
-    AutoSwitched { at_unix: Option<u64> },
+    /// `streak` is how many consecutive losses triggered it.
+    AutoSwitched {
+        at_unix: Option<u64>,
+        streak: Option<u32>,
+    },
 }
 
 /// Parse the origin sidecar's value. Pure, so the grammar is testable.
 ///
 /// Anything unrecognized degrades to `None`, meaning "origin not recorded".
 /// It can never change what mode is in force: the mode lives in its own key,
-/// and this one is read only to describe it.
+/// and this one is read only to describe it. The `auto-switch` form predates
+/// the `streak` field and parses without it.
 fn parse_capture_mode_origin(raw: &str) -> Option<CaptureModeOrigin> {
     let mut parts = raw.split_whitespace();
-    if parts.next()? != "auto-switch" {
-        return None;
+    match parts.next()? {
+        "auto-switch" => Some(CaptureModeOrigin::AutoSwitched {
+            at_unix: parts.next().and_then(|t| t.parse().ok()),
+            streak: parts.next().and_then(|t| t.parse().ok()),
+        }),
+        "measured" => {
+            let by = match parts.next()? {
+                "camera-tune" => MeasurementSource::CameraTune,
+                "enroll-probe" => MeasurementSource::EnrollmentProbe,
+                _ => return None,
+            };
+            Some(CaptureModeOrigin::Measured {
+                by,
+                at_unix: parts.next().and_then(|t| t.parse().ok()),
+                rgb_retention: parts.next().and_then(|t| t.parse().ok()),
+                ir_retention: parts.next().and_then(|t| t.parse().ok()),
+            })
+        }
+        _ => None,
     }
-    Some(CaptureModeOrigin::AutoSwitched {
-        at_unix: parts.next().and_then(|t| t.parse().ok()),
-    })
+}
+
+/// Serialize an origin to its sidecar value. Inverse of
+/// [`parse_capture_mode_origin`]. `-` is a deliberately unparseable stand-in
+/// for an absent numeric field, so `None` round-trips as `None` rather than
+/// as a spurious 0.
+fn serialize_capture_mode_origin(origin: CaptureModeOrigin) -> String {
+    fn u64_or_dash(n: Option<u64>) -> String {
+        n.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+    }
+    fn u32_or_dash(n: Option<u32>) -> String {
+        n.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+    }
+    fn f32_or_dash(n: Option<f32>) -> String {
+        n.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into())
+    }
+    match origin {
+        CaptureModeOrigin::Measured {
+            by,
+            at_unix,
+            rgb_retention,
+            ir_retention,
+        } => format!(
+            "measured {} {} {} {}",
+            by.as_str(),
+            u64_or_dash(at_unix),
+            f32_or_dash(rgb_retention),
+            f32_or_dash(ir_retention),
+        ),
+        CaptureModeOrigin::AutoSwitched { at_unix, streak } => {
+            format!(
+                "auto-switch {} {}",
+                u64_or_dash(at_unix),
+                u32_or_dash(streak),
+            )
+        }
+    }
 }
 
 /// The recorded origin of this pairing's stored capture mode, if any.
@@ -6216,6 +6301,7 @@ pub fn store_capture_mode(
     rgb_dev: &str,
     ir_dev: &str,
     mode: CaptureMode,
+    origin: CaptureModeOrigin,
 ) -> irlume_common::Result<()> {
     let rgb_id = device_identity(rgb_dev)
         .ok_or_else(|| Error::Hardware(format!("{rgb_dev}: cannot identify the RGB camera")))?;
@@ -6227,12 +6313,13 @@ pub fn store_capture_mode(
         mode.as_str(),
     )
     .map_err(|e| Error::Io(e.to_string()))?;
-    // An empty value is the clear: `read_kv` treats an empty value as absent,
-    // which is what `stored_capture_mode_origin` reads through.
+    // The origin is written AFTER the mode (see the doc comment): a crash
+    // between the two renames leaves a measured verdict wearing a stale
+    // origin, which understates what irlume knows rather than overstating it.
     irlume_common::config::write_kv(
         "cameras.conf",
         &capture_mode_origin_key(&rgb_id, &ir_id),
-        "",
+        &serialize_capture_mode_origin(origin),
     )
     .map_err(|e| Error::Io(e.to_string()))
 }
@@ -6260,13 +6347,14 @@ pub fn store_capture_mode_if_absent(
     rgb_dev: &str,
     ir_dev: &str,
     mode: CaptureMode,
+    origin: CaptureModeOrigin,
 ) -> irlume_common::Result<StoreIfAbsent> {
     let _guard = irlume_common::config::lock_exclusive("cameras.conf")
         .map_err(|e| Error::Io(e.to_string()))?;
     if let Some(existing) = stored_capture_mode(rgb_dev, ir_dev) {
         return Ok(StoreIfAbsent::AlreadyPresent(existing));
     }
-    store_capture_mode(rgb_dev, ir_dev, mode)?;
+    store_capture_mode(rgb_dev, ir_dev, mode, origin)?;
     Ok(StoreIfAbsent::Stored)
 }
 
@@ -6303,6 +6391,7 @@ pub fn store_sequential_if_still_concurrent(
     rgb_dev: &str,
     ir_dev: &str,
     origin_unix: u64,
+    streak: u32,
 ) -> irlume_common::Result<StoreIfConcurrent> {
     let _guard = irlume_common::config::lock_exclusive("cameras.conf")
         .map_err(|e| Error::Io(e.to_string()))?;
@@ -6317,7 +6406,10 @@ pub fn store_sequential_if_still_concurrent(
     irlume_common::config::write_kv(
         "cameras.conf",
         &capture_mode_origin_key(&rgb_id, &ir_id),
-        &format!("auto-switch {origin_unix}"),
+        &serialize_capture_mode_origin(CaptureModeOrigin::AutoSwitched {
+            at_unix: Some(origin_unix),
+            streak: Some(streak),
+        }),
     )
     .map_err(|e| Error::Io(e.to_string()))?;
     irlume_common::config::write_kv(
@@ -9220,23 +9312,86 @@ mod tests {
         assert_eq!(
             parse_capture_mode_origin("auto-switch 1786320000"),
             Some(CaptureModeOrigin::AutoSwitched {
-                at_unix: Some(1_786_320_000)
+                at_unix: Some(1_786_320_000),
+                streak: None,
             })
         );
         // A stamp with no time, or an unparseable one, still records WHO.
         for raw in ["auto-switch", "auto-switch banana", "  auto-switch  "] {
             assert_eq!(
                 parse_capture_mode_origin(raw),
-                Some(CaptureModeOrigin::AutoSwitched { at_unix: None }),
+                Some(CaptureModeOrigin::AutoSwitched {
+                    at_unix: None,
+                    streak: None,
+                }),
                 "{raw:?} must still report the switch"
             );
         }
+        // The measured grammar records the source, when, and both retentions.
+        assert_eq!(
+            parse_capture_mode_origin("measured camera-tune 1000000 0.4200 0.9800"),
+            Some(CaptureModeOrigin::Measured {
+                by: MeasurementSource::CameraTune,
+                at_unix: Some(1_000_000),
+                rgb_retention: Some(0.42),
+                ir_retention: Some(0.98),
+            })
+        );
+        assert_eq!(
+            parse_capture_mode_origin("measured enroll-probe 1000000 - -"),
+            Some(CaptureModeOrigin::Measured {
+                by: MeasurementSource::EnrollmentProbe,
+                at_unix: Some(1_000_000),
+                rgb_retention: None,
+                ir_retention: None,
+            })
+        );
         // Anything else is "origin not recorded", never a guess.
-        for raw in ["", "auto", "measured 5", "sequential", "camera-tune 12"] {
+        for raw in [
+            "",
+            "auto",
+            "measured 5",
+            "measured banana 12",
+            "sequential",
+            "camera-tune 12",
+        ] {
             assert_eq!(
                 parse_capture_mode_origin(raw),
                 None,
                 "{raw:?} must not be read as an origin"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_mode_origin_round_trips_through_serialization() {
+        for origin in [
+            CaptureModeOrigin::Measured {
+                by: MeasurementSource::CameraTune,
+                at_unix: Some(1_000_000),
+                rgb_retention: Some(0.42),
+                ir_retention: Some(0.98),
+            },
+            CaptureModeOrigin::Measured {
+                by: MeasurementSource::EnrollmentProbe,
+                at_unix: Some(1_000_000),
+                rgb_retention: None,
+                ir_retention: None,
+            },
+            CaptureModeOrigin::AutoSwitched {
+                at_unix: Some(1_000_000),
+                streak: Some(3),
+            },
+            CaptureModeOrigin::AutoSwitched {
+                at_unix: None,
+                streak: None,
+            },
+        ] {
+            let serialized = serialize_capture_mode_origin(origin);
+            assert_eq!(
+                parse_capture_mode_origin(&serialized),
+                Some(origin),
+                "round trip failed for {serialized:?}"
             );
         }
     }

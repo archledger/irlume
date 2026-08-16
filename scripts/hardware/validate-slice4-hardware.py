@@ -24,6 +24,7 @@ GLOBAL_SPAN_BOUNDARY_INTERVALS = 6
 RECORD_KEYS = {
     "kind",
     "schema_version",
+    "mode",
     "host",
     "commit",
     "requested_duration_seconds",
@@ -40,6 +41,8 @@ STREAM_KEYS = {
     "discarded_observations",
     "sequence_span_sum",
     "delivered_hz",
+    "duration_seconds",
+    "recovery_duration_seconds",
     "gap_total",
     "cumulative_drops",
     "discontinuities",
@@ -132,6 +135,9 @@ def main(argv):
     record = records[0]
     if set(record) != RECORD_KEYS:
         fail(f"unexpected evidence keys: {sorted(record)}")
+    mode = record.get("mode", "concurrent")
+    if mode not in {"concurrent", "sequential"}:
+        fail(f"unknown capture mode: {mode!r}")
     schema_version = bounded_u64(record.get("schema_version"), "schema version")
     if schema_version != 1:
         fail(f"unsupported evidence schema version: {schema_version}")
@@ -146,12 +152,20 @@ def main(argv):
     if not 60 <= requested <= 600:
         fail(f"invalid requested duration: {requested!r}")
     duration = finite_number(record.get("duration_seconds"), "measured duration")
-    if duration < requested or duration > requested + 30:
+    if mode == "sequential":
+        # Two full-duration phases (RGB then IR), so the whole run is bounded
+        # by twice the requested duration plus the usual overrun slack.
+        if duration < 2 * requested or duration > 2 * requested + 30:
+            fail(f"invalid measured duration: {duration!r}")
+    elif duration < requested or duration > requested + 30:
         fail(f"invalid measured duration: {duration!r}")
     recovery_duration = finite_number(
         record.get("recovery_duration_seconds"), "recovery duration"
     )
-    if recovery_duration <= 0 or recovery_duration > duration - requested / 2:
+    if mode == "sequential":
+        if recovery_duration <= 0 or recovery_duration > duration - requested:
+            fail(f"invalid recovery duration: {recovery_duration!r}")
+    elif recovery_duration <= 0 or recovery_duration > duration - requested / 2:
         fail(f"invalid recovery duration: {recovery_duration!r}")
 
     streams = record.get("streams")
@@ -174,6 +188,14 @@ def main(argv):
         observations = positive_u64(stream.get("observations"), f"{role}: observations")
         discarded_observations = bounded_u64(
             stream.get("discarded_observations"), f"{role}: discarded observations"
+        )
+        # Per-stream phase timing. A sequential run captures each stream in its
+        # own phase, so the whole-run duration/recovery no longer describe any
+        # one stream; every stream now carries its own (a concurrent run fills
+        # them with the shared whole-run values).
+        stream_duration = finite_number(stream.get("duration_seconds"), f"{role}: duration")
+        stream_recovery = finite_number(
+            stream.get("recovery_duration_seconds"), f"{role}: recovery duration"
         )
         # The delivered-rate fill discards a bounded number of frames per
         # stream on top of the warm-up discards: flush RATE_STARTUP_FLUSH (30)
@@ -199,7 +221,7 @@ def main(argv):
             stream.get("sequence_span_sum"), f"{role}: sequence span sum"
         )
         delivered = finite_number(stream.get("delivered_hz"), f"{role}: delivered rate")
-        expected_rate = frames / duration
+        expected_rate = frames / stream_duration
         if not math.isclose(delivered, expected_rate, rel_tol=1e-12, abs_tol=1e-12):
             fail(
                 f"{role}: delivered rate {delivered!r} does not match "
@@ -298,13 +320,13 @@ def main(argv):
         if timestamp_span_sum > timestamp_span:
             fail(f"{role}: per-epoch spans exceed the global timestamp span")
         omitted_span = timestamp_span - timestamp_span_sum
-        recovery_duration_us = recovery_duration * 1_000_000
+        recovery_duration_us = stream_recovery * 1_000_000
         if (
             abs(omitted_span - recovery_duration_us)
             > TIMESTAMP_BOUNDARY_INTERVALS * maximum
         ):
             fail(f"{role}: omitted timestamp span does not match recovery duration")
-        duration_us = duration * 1_000_000
+        duration_us = stream_duration * 1_000_000
         if (
             abs(timestamp_span - duration_us)
             > GLOBAL_SPAN_BOUNDARY_INTERVALS * maximum
@@ -315,7 +337,13 @@ def main(argv):
             )
         last_timestamps[role] = last_timestamp
 
-    if expected_streams == 2:
+    if mode == "sequential":
+        # Sequential captures run each stream in its own phase, so there is no
+        # RGB/IR skew to validate; the key stays present (as null) for a uniform
+        # record schema.
+        if record.get("rgb_ir_skew_us") is not None:
+            fail("sequential run unexpectedly reported RGB/IR skew")
+    elif expected_streams == 2:
         skew = bounded_u64(record.get("rgb_ir_skew_us"), "RGB/IR skew")
         expected_skew = abs(last_timestamps["rgb"] - last_timestamps["ir"])
         if skew != expected_skew:

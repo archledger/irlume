@@ -10671,6 +10671,7 @@ mod tests {
             &self,
             role: &str,
             elapsed: std::time::Duration,
+            recovery: std::time::Duration,
             accounting: (u64, u64, u64),
         ) -> serde_json::Value {
             let (observations, discarded_observations, sequence_span_sum) = accounting;
@@ -10714,6 +10715,8 @@ mod tests {
                 "discarded_observations": discarded_observations,
                 "sequence_span_sum": sequence_span_sum,
                 "delivered_hz": delivered_hz,
+                "duration_seconds": elapsed.as_secs_f64(),
+                "recovery_duration_seconds": recovery.as_secs_f64(),
                 "gap_total": self.gap_total,
                 "cumulative_drops": self.cumulative_drops,
                 "discontinuities": self.discontinuities,
@@ -10813,7 +10816,12 @@ mod tests {
             )
             .expect("second recovered timestamp");
         stats.record(sequence_observation, timestamp_observation);
-        let json = stats.as_json("rgb", std::time::Duration::from_secs(10), (7, 3, 7));
+        let json = stats.as_json(
+            "rgb",
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
+            (7, 3, 7),
+        );
         assert_eq!(json["epoch_count"], 2);
         assert_eq!(json["delta_count"], 2);
         assert_eq!(json["delta_sum_us"], 3_000_000);
@@ -11009,15 +11017,17 @@ mod tests {
         let ir_accounting = ir_session
             .as_ref()
             .map(|session| session.stream.accounting());
-        let mut streams = vec![rgb_stats.as_json("rgb", elapsed, rgb_accounting)];
+        let mut streams =
+            vec![rgb_stats.as_json("rgb", elapsed, recovery_duration, rgb_accounting)];
         if let Some(accounting) = ir_accounting {
-            streams.push(ir_stats.as_json("ir", elapsed, accounting));
+            streams.push(ir_stats.as_json("ir", elapsed, recovery_duration, accounting));
         }
         eprintln!(
             "\n{}",
             serde_json::json!({
                 "kind": "irlume.slice4.hardware",
                 "schema_version": 1,
+                "mode": "concurrent",
                 "host": host,
                 "commit": commit,
                 "requested_duration_seconds": seconds,
@@ -11025,6 +11035,183 @@ mod tests {
                 "recovery_exercised": recovered,
                 "recovery_duration_seconds": recovery_duration.as_secs_f64(),
                 "rgb_ir_skew_us": rgb_ir_skew_us,
+                "streams": streams,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "needs real physical RGB + IR cameras that cannot stream concurrently"]
+    fn physical_timestamp_continuity_stress_sequential() {
+        assert!(
+            std::env::var_os("IRLUME_TEST_ALLOW_VIRTUAL_CAMERA").is_none(),
+            "physical evidence forbids the virtual-camera escape"
+        );
+        let required =
+            |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
+        let seconds = required("IRLUME_TEST_DURATION_SECONDS")
+            .parse::<u64>()
+            .expect("duration must be an integer");
+        assert!(
+            (60..=600).contains(&seconds),
+            "physical stress duration must be between 60s and 600s"
+        );
+        let host = required("IRLUME_TEST_HOST");
+        let commit = required("IRLUME_TEST_COMMIT");
+        let git_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read tested git revision");
+        assert!(git_head.status.success(), "git rev-parse HEAD failed");
+        let actual_commit = String::from_utf8(git_head.stdout).expect("git SHA is UTF-8");
+        assert_eq!(actual_commit.trim(), commit, "evidence commit mismatch");
+        let hostname = std::process::Command::new("uname")
+            .arg("-n")
+            .output()
+            .expect("read tested host name");
+        assert!(hostname.status.success(), "uname -n failed");
+        let actual_host = String::from_utf8(hostname.stdout).expect("host name is UTF-8");
+        assert_eq!(actual_host.trim(), host, "evidence host mismatch");
+        let rgb_path = required("IRLUME_TEST_PHYSICAL_RGB_DEVICE");
+        let ir_path = required("IRLUME_TEST_PHYSICAL_IR_DEVICE");
+
+        // Each phase runs one stream at a time, exactly as a dual-incapable
+        // camera (the Logitech Brio) must be captured, and exercises its own
+        // mid-phase recovery, so every per-stream continuity and delivered-rate
+        // check the concurrent test makes also holds here — just without the two
+        // streams held at once. Scoped so the RGB stream is fully torn down
+        // (STREAMOFF) before the IR node opens.
+        let (rgb_stats, rgb_accounting, rgb_elapsed, rgb_recovery) = {
+            let operation = lease::acquire_camera_operation(
+                &[rgb_path.as_str()],
+                lease::CameraOperationKind::Capture,
+                std::time::Duration::from_secs(2),
+            )
+            .expect("acquire physical RGB operation");
+            let rgb = operation
+                .open_rgb(&rgb_path)
+                .expect("open physical RGB camera");
+            let mut rgb_session = rgb.session().expect("open RGB session");
+            rgb_session.warm_up().expect("initial RGB warm-up");
+            rgb_session
+                .stream
+                .fill_rate_evidence()
+                .expect("establish initial RGB rate");
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_secs(seconds);
+            let recovery_at = started + std::time::Duration::from_secs(seconds / 2);
+            let mut stats = ContinuityStressStats::default();
+            let mut recovered = false;
+            let mut recovery_duration = None;
+            let mut expect_discontinuity = false;
+            while std::time::Instant::now() < deadline {
+                let (_, _, sequence, timestamp, _) =
+                    rgb_session.stream.next().expect("RGB tracked dequeue");
+                if expect_discontinuity {
+                    assert!(sequence.discontinuity(), "RGB recovery marker missing");
+                    expect_discontinuity = false;
+                }
+                stats.record(sequence, timestamp);
+                if !recovered && std::time::Instant::now() >= recovery_at {
+                    let recovery_started = std::time::Instant::now();
+                    rgb_session.recover().expect("RGB recovery");
+                    rgb_session.warm_up().expect("recovered RGB warm-up");
+                    rgb_session
+                        .stream
+                        .fill_rate_evidence()
+                        .expect("re-establish RGB rate after recovery");
+                    expect_discontinuity = true;
+                    recovery_duration = Some(recovery_started.elapsed());
+                    recovered = true;
+                }
+            }
+            assert!(recovered, "RGB mid-run recovery was not exercised");
+            assert!(!expect_discontinuity, "RGB post-recovery frame missing");
+            assert_eq!(stats.discontinuities, 1, "unexpected RGB discontinuities");
+            assert!(stats.frames > 0);
+            let accounting = rgb_session.stream.accounting();
+            (
+                stats,
+                accounting,
+                started.elapsed(),
+                recovery_duration.expect("RGB recovery duration was recorded"),
+            )
+        };
+
+        let (ir_stats, ir_accounting, ir_elapsed, ir_recovery) = {
+            let operation = lease::acquire_camera_operation(
+                &[ir_path.as_str()],
+                lease::CameraOperationKind::Capture,
+                std::time::Duration::from_secs(2),
+            )
+            .expect("acquire physical IR operation");
+            let ir = operation
+                .open_ir(&ir_path)
+                .expect("open physical IR camera");
+            // `IrSession::session` already runs the IR warm-up; the fill below
+            // establishes the delivered-rate window before the loop.
+            let mut ir_session = ir.session().expect("open IR session");
+            ir_session
+                .stream
+                .fill_rate_evidence()
+                .expect("establish initial IR rate");
+            let started = std::time::Instant::now();
+            let deadline = started + std::time::Duration::from_secs(seconds);
+            let recovery_at = started + std::time::Duration::from_secs(seconds / 2);
+            let mut stats = ContinuityStressStats::default();
+            let mut recovered = false;
+            let mut recovery_duration = None;
+            let mut expect_discontinuity = false;
+            while std::time::Instant::now() < deadline {
+                let (_, _, sequence, timestamp, _) =
+                    ir_session.stream.next().expect("IR tracked dequeue");
+                if expect_discontinuity {
+                    assert!(sequence.discontinuity(), "IR recovery marker missing");
+                    expect_discontinuity = false;
+                }
+                stats.record(sequence, timestamp);
+                if !recovered && std::time::Instant::now() >= recovery_at {
+                    let recovery_started = std::time::Instant::now();
+                    ir_session.recover().expect("IR recovery");
+                    ir_session
+                        .stream
+                        .fill_rate_evidence()
+                        .expect("re-establish IR rate after recovery");
+                    expect_discontinuity = true;
+                    recovery_duration = Some(recovery_started.elapsed());
+                    recovered = true;
+                }
+            }
+            assert!(recovered, "IR mid-run recovery was not exercised");
+            assert!(!expect_discontinuity, "IR post-recovery frame missing");
+            assert_eq!(stats.discontinuities, 1, "unexpected IR discontinuities");
+            assert!(stats.frames > 0);
+            let accounting = ir_session.stream.accounting();
+            (
+                stats,
+                accounting,
+                started.elapsed(),
+                recovery_duration.expect("IR recovery duration was recorded"),
+            )
+        };
+
+        let streams = vec![
+            rgb_stats.as_json("rgb", rgb_elapsed, rgb_recovery, rgb_accounting),
+            ir_stats.as_json("ir", ir_elapsed, ir_recovery, ir_accounting),
+        ];
+        eprintln!(
+            "\n{}",
+            serde_json::json!({
+                "kind": "irlume.slice4.hardware",
+                "schema_version": 1,
+                "mode": "sequential",
+                "host": host,
+                "commit": commit,
+                "requested_duration_seconds": seconds,
+                "duration_seconds": (rgb_elapsed + ir_elapsed).as_secs_f64(),
+                "recovery_exercised": true,
+                "recovery_duration_seconds": (rgb_recovery + ir_recovery).as_secs_f64(),
+                "rgb_ir_skew_us": Option::<u64>::None,
                 "streams": streams,
             })
         );

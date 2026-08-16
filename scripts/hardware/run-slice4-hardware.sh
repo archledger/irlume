@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
-    echo "usage: $0 WORKTREE HOST SHA RGB_DEVICE IR_DEVICE|- [rgb-only]" >&2
+    echo "usage: $0 WORKTREE HOST SHA RGB_DEVICE IR_DEVICE|- [rgb-only|sequential]" >&2
     exit 2
 fi
 
@@ -12,6 +12,10 @@ sha=$3
 rgb=$4
 ir=$5
 mode=${6:-dual}
+case "$mode" in
+    dual | rgb-only | sequential) ;;
+    *) echo "hardware-run: unknown mode: $mode (want dual, rgb-only, or sequential)" >&2; exit 2 ;;
+esac
 source_worktree=$(realpath "$worktree")
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 script_root=$(git -C "$script_dir" rev-parse --show-toplevel)
@@ -346,11 +350,19 @@ fi
 run_dir=$(mktemp -d "$output_dir/slice4-${host}-${sha}.XXXXXX")
 log="$run_dir/run.log"
 evidence="$run_dir/evidence.json"
+test_name="physical_timestamp_continuity_stress"
+run_timeout=240
+if [ "$mode" = "sequential" ]; then
+    test_name="physical_timestamp_continuity_stress_sequential"
+    # Two full-duration phases (RGB then IR) plus a build, so the single-phase
+    # budget is doubled.
+    run_timeout=480
+fi
 set +e
-timeout --signal=TERM --kill-after=10s 240s \
+timeout --signal=TERM --kill-after=10s "${run_timeout}s" \
     env -u IRLUME_TEST_ALLOW_VIRTUAL_CAMERA "${env_args[@]}" \
-    ./scripts/run-tests-guarded.sh --require physical_timestamp_continuity_stress -- \
-    cargo test -p irlume-camera tests::physical_timestamp_continuity_stress --locked -- \
+    ./scripts/run-tests-guarded.sh --require "$test_name" -- \
+    cargo test -p irlume-camera "tests::$test_name" --locked -- \
     --ignored --exact --nocapture --test-threads=1 >"$log" 2>&1 &
 hardware_pid=$!
 wait "$hardware_pid"

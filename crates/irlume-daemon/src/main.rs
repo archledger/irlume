@@ -3736,7 +3736,7 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             let rgb = engine.rgb_device();
             let ir = engine.ir_available().then(|| engine.ir_device());
             match irlume_auth::camera_rate_diagnostics(rgb, ir) {
-                Ok(report) => Response::CameraDiagnostics(report),
+                Ok(report) => Response::CameraDiagnostics(Box::new(report)),
                 Err(error) => Response::Error(error.to_string()),
             }
         }

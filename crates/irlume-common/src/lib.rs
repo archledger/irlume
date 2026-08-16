@@ -907,7 +907,7 @@ pub enum Response {
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
     /// Delivered-rate diagnostic report (`CameraDiagnostics`).
-    CameraDiagnostics(CameraDiagnosticsReport),
+    CameraDiagnostics(Box<CameraDiagnosticsReport>),
     /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
     /// eye was detected in any frame.
     EarMedian(Option<f32>),

@@ -1384,7 +1384,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         },
         None => (None, None, None),
     };
-    StreamMode {
+    StreamMode::new(Box::new(UvcMode {
         handle: Some(EmitterHandle {
             handle,
             lease: None,
@@ -1397,7 +1397,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         applied,
         record,
         _lock: lock,
-    }
+    }))
 }
 
 pub(crate) fn enable_with_lease(
@@ -1407,9 +1407,7 @@ pub(crate) fn enable_with_lease(
     lease: crate::lease::CameraLease,
 ) -> StreamMode {
     let mut mode = lease.run_active(|| enable(handle, card, device));
-    if let Some(handle) = mode.handle.as_mut() {
-        handle.lease = Some(lease);
-    }
+    mode.attach_lease(lease);
     mode
 }
 
@@ -1440,8 +1438,12 @@ struct EmitterHandle {
     lease: Option<crate::lease::CameraLease>,
 }
 
-#[must_use = "dropping this immediately puts the control back and leaves the stream unlit"]
-pub struct StreamMode {
+/// The UVC extension-unit backend behind [`StreamMode`]. Holds the V4L2 handle,
+/// the unit/selector, and the crash-safe restore state for the ONE emitter
+/// mechanism irlume drives today. A second backend (LED-class sysfs, V4L2
+/// control, flash class) would be another implementation of [`EmitterBackend`],
+/// so `StreamMode` never grows a second set of restore semantics.
+struct UvcMode {
     /// The open camera the mode was applied through, kept alive for as long as
     /// this guard can write to it. `None` only for a guard over nothing, which
     /// never writes. A raw `c_int` here let a caller drop the `v4l::Device`
@@ -1507,28 +1509,7 @@ impl std::fmt::Display for RestoreError {
 
 impl std::error::Error for RestoreError {}
 
-impl StreamMode {
-    /// A guard over nothing: no control was applied, so `Drop` writes nothing.
-    ///
-    /// The ordinary outcome for hardware irlume does not drive, and the only
-    /// safe representation of it. An `Option<StreamMode>` would let a caller
-    /// write `let _ = ...` and silently discard a guard that DID hold a control.
-    /// Crate-visible so `IrSession::recover` can park an already-restored guard
-    /// before its reopen.
-    pub(crate) fn inert() -> Self {
-        StreamMode {
-            handle: None,
-            record: None,
-            _lock: None,
-            unit: 0,
-            selector: 0,
-            restore: Vec::new(),
-            applied: Vec::new(),
-            armed: false,
-            active: false,
-        }
-    }
-
+impl UvcMode {
     /// The descriptor the restore goes to, or -1 for a guard holding no camera.
     ///
     /// -1 is unreachable from an armed guard: `enable` is the only place that
@@ -1575,7 +1556,6 @@ impl StreamMode {
     /// replacement; `Drop` remains the ordinary end-of-session path, and can
     /// only print. `Err(Bookkeeping)` means no camera request was made at
     /// all — the mode is still applied, on purpose.
-    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
         let lease = self.handle.as_ref().and_then(|handle| handle.lease.clone());
         if let Some(lease) = lease {
@@ -1709,7 +1689,7 @@ impl StreamMode {
     }
 }
 
-impl Drop for StreamMode {
+impl Drop for UvcMode {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -1721,6 +1701,113 @@ impl Drop for StreamMode {
             eprintln!(
                 "irlume: could not put unit{}/sel{} back to the value irlume displaced: {e}",
                 self.unit, self.selector
+            );
+        }
+    }
+}
+
+/// A backend that can drive and restore an IR emitter. The UVC extension-unit
+/// path is the first implementation; an LED-class (sysfs) or V4L2-control/flash
+/// emitter is another backend behind the same [`StreamMode`] guard, so the
+/// guard never grows a second set of restore semantics.
+trait EmitterBackend {
+    /// Whether the emitter is active (lit) for this stream, whoever set it.
+    fn lit(&self) -> bool;
+    /// Whether this guard owns an outstanding change that must be put back.
+    fn owns_restore(&self) -> bool;
+    /// Put the change back now; `Drop` is the ordinary path.
+    fn restore(&mut self) -> std::result::Result<(), RestoreError>;
+    /// Attach the camera-operation lease so `restore` runs under it. No-op for
+    /// a backend that does not go through the V4L2 capture node (an LED-class
+    /// emitter is a sysfs path with no lease).
+    fn attach_lease(&mut self, lease: crate::lease::CameraLease);
+}
+
+impl EmitterBackend for UvcMode {
+    fn lit(&self) -> bool {
+        UvcMode::lit(self)
+    }
+    fn owns_restore(&self) -> bool {
+        UvcMode::owns_restore(self)
+    }
+    fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        UvcMode::restore(self)
+    }
+    fn attach_lease(&mut self, lease: crate::lease::CameraLease) {
+        if let Some(handle) = self.handle.as_mut() {
+            handle.lease = Some(lease);
+        }
+    }
+}
+
+/// A backend that does nothing: the guard over hardware irlume does not drive.
+struct InertBackend;
+
+impl EmitterBackend for InertBackend {
+    fn lit(&self) -> bool {
+        false
+    }
+    fn owns_restore(&self) -> bool {
+        false
+    }
+    fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        Ok(())
+    }
+    fn attach_lease(&mut self, _lease: crate::lease::CameraLease) {}
+}
+
+/// The face-auth emitter guard, held for the lifetime of ONE stream and put
+/// back when the stream ends. Backend-agnostic: it wraps an `EmitterBackend`,
+/// so the UVC extension-unit write and a future LED-class or V4L2-control
+/// emitter share one restore contract.
+///
+/// `Drop` does the restoring, because the paths that need it most are the ones
+/// no statement covers: an error taken by `?`, a panic in the decoder, a
+/// cancelled request.
+#[must_use = "dropping this immediately puts the control back and leaves the stream unlit"]
+pub struct StreamMode {
+    backend: Box<dyn EmitterBackend + Send>,
+}
+
+impl StreamMode {
+    fn new(backend: Box<dyn EmitterBackend + Send>) -> Self {
+        StreamMode { backend }
+    }
+
+    /// A guard over nothing: no control was applied, so `Drop` writes nothing.
+    pub(crate) fn inert() -> Self {
+        StreamMode::new(Box::new(InertBackend))
+    }
+
+    /// Whether the emitter control is active for this stream, whoever set it.
+    pub fn lit(&self) -> bool {
+        self.backend.lit()
+    }
+
+    /// Whether this guard owns an outstanding change that still has to be put
+    /// back.
+    pub fn owns_restore(&self) -> bool {
+        self.backend.owns_restore()
+    }
+
+    /// Put the control back now, rather than waiting for the drop.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        self.backend.restore()
+    }
+
+    fn attach_lease(&mut self, lease: crate::lease::CameraLease) {
+        self.backend.attach_lease(lease);
+    }
+}
+
+impl Drop for StreamMode {
+    fn drop(&mut self) {
+        if let Err(e) = self.backend.restore() {
+            // Not fatal, and not silent. The camera keeps a mode irlume chose,
+            // which is exactly the state this type exists to prevent.
+            eprintln!(
+                "irlume: could not put the IR emitter back to the value irlume displaced: {e}"
             );
         }
     }
@@ -5806,7 +5893,7 @@ mod tests {
             ..a_working_camera()
         });
         {
-            let _mode = StreamMode {
+            let _mode = UvcMode {
                 handle: None,
                 record: None,
                 _lock: None,
@@ -5845,7 +5932,7 @@ mod tests {
             ..a_working_camera()
         });
         drop(StreamMode::inert());
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -5880,7 +5967,7 @@ mod tests {
     /// the control back at all: the exact leak the restart logic exists to stop.
     #[test]
     fn ownership_of_the_restore_does_not_pass_to_a_guard_that_owns_nothing() {
-        let held = StreamMode {
+        let held = UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -5894,7 +5981,7 @@ mod tests {
         // What `enable` returns on a reopen when the control survived: active,
         // because the mode IS applied, and owning nothing, because it wrote
         // nothing.
-        let already = StreamMode {
+        let already = UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -5946,7 +6033,7 @@ mod tests {
         });
         // The guard as `enable` now builds it: restore is what the control HELD,
         // not what the camera calls its default.
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -5986,7 +6073,7 @@ mod tests {
             len: 3,
             ..a_working_camera()
         });
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -6034,7 +6121,7 @@ mod tests {
             len: 3,
             ..a_working_camera()
         });
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -6111,7 +6198,7 @@ mod tests {
 
         // The guard, armed the way `enable` arms it: only for `Wrote`. Its end
         // must leave the other writer's bytes exactly where they were.
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: None,
             _lock: None,
@@ -6345,7 +6432,7 @@ mod tests {
         );
         // The guard, wired the way `enable` wires it, resolves the record when
         // it puts the control back.
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: write.record,
             _lock: None,
@@ -6419,7 +6506,7 @@ mod tests {
             vec![1, 3, 1],
             "the claim hands back what the killed stream displaced"
         );
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: Some(claimed),
             _lock: None,
@@ -6505,7 +6592,7 @@ mod tests {
             })),
             ..a_working_camera()
         });
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: Some(record),
             _lock: None,
@@ -6554,7 +6641,7 @@ mod tests {
             current: vec![1, 3, 2],
             ..a_working_camera()
         });
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: Some(record),
             _lock: None,
@@ -6616,7 +6703,7 @@ mod tests {
             current: vec![1, 3, 2],
             ..a_working_camera()
         });
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: Some(record),
             _lock: None,
@@ -6654,7 +6741,7 @@ mod tests {
             fail_set_from: Some((1, libc::EIO)),
             ..a_working_camera()
         });
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: None,
             _lock: Some(lock),
@@ -6696,7 +6783,7 @@ mod tests {
         });
         // ...and the read-back fails transiently.
         fake_camera::fail_reads(libc::EIO);
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: Some(record),
             _lock: None,
@@ -6753,7 +6840,7 @@ mod tests {
             fail_set_from: Some((1, libc::EIO)),
             ..a_working_camera()
         });
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: Some(record),
             _lock: None,
@@ -6959,7 +7046,7 @@ mod tests {
         // runs a fresh enable while the old guard still exists, and a
         // retained bare lock made that enable refuse against its own
         // predecessor (review round 9).
-        let mut mode = StreamMode {
+        let mut mode = UvcMode {
             handle: None,
             record: None,
             _lock: write.lock,
@@ -7122,7 +7209,7 @@ mod tests {
                 fail_set_from: Some((1, libc::EIO)),
                 ..a_working_camera()
             });
-            drop(StreamMode {
+            drop(UvcMode {
                 handle: None,
                 record: Some(record),
                 _lock: None,
@@ -7222,7 +7309,7 @@ mod tests {
 
         // The guard, armed the way `enable` arms it: the write went out, but
         // it carried the restore bytes, so nothing is outstanding.
-        drop(StreamMode {
+        drop(UvcMode {
             handle: None,
             record: None,
             _lock: None,

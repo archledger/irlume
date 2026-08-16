@@ -3329,23 +3329,7 @@ impl App {
             // Hub: Enter opens the selected section (the summary IS the nav).
             (SC_WELCOME, KeyCode::Enter) => {
                 if let Some((_, _, target)) = self.hub_rows().get(self.hub_sel).copied() {
-                    self.screen = target;
-                    self.sel = 0;
-                    // Same fast paths as a Tab switch: diagnostics for
-                    // Repair/Fingerprint, a fresh profile poll for Profiles.
-                    if target == SC_CAMERAS || target == SC_REPAIR {
-                        self.refresh_camera_listing();
-                    }
-                    if target == SC_REPAIR || target == SC_FINGERPRINT {
-                        self.refresh_diagnostics();
-                    } else if target == SC_PROFILES {
-                        self.refresh_profiles();
-                    } else if target == SC_MODELS {
-                        // Same fresh-entry rule as a Tab switch: top of the
-                        // catalog (warning before commands) + a cache refresh.
-                        self.models_scroll = 0;
-                        self.request_probes();
-                    }
+                    self.enter_screen(target);
                 }
             }
             (SC_WELCOME, KeyCode::Char('d')) => self.enter_screen(SC_REPAIR),
@@ -4280,9 +4264,10 @@ impl App {
 
     /// A brand-new user (face camera present, nothing enrolled yet, sitting on
     /// Welcome, no capture in flight) gets one focused screen with one action
-    /// instead of the full sidebar. Tab or [v] moves off Welcome and restores
-    /// the sidebar. Fingerprint-only / no-camera hosts keep the classic Welcome
-    /// (its wording already adapts to their hardware).
+    /// instead of the full sidebar. Tab moves off Welcome and restores the
+    /// sidebar; `[v]` changes which technical sections Tab can reach.
+    /// Fingerprint-only / no-camera hosts keep the classic Welcome, whose wording
+    /// already adapts to their hardware.
     fn is_first_run(&self) -> bool {
         self.enroll.is_none()
             && self.screen == SC_WELCOME
@@ -4497,6 +4482,7 @@ impl App {
             || self.confirm.is_some()
             || self.enroll_merge.is_some()
             || self.enroll.is_some()
+            || self.op.is_some()
         {
             return;
         }
@@ -6037,19 +6023,23 @@ impl App {
         let (key, label) = self.overview_primary();
         lines.insert(
             at + n + 1,
-            Line::from(vec![
-                Span::styled("  Recommended method  ", Style::new().dim()),
-                Span::styled(self.recommended(), Style::new().fg(th().ok)),
-            ]),
+            Line::from(Span::styled("  Recommended method", Style::new().dim())),
         );
         lines.insert(
             at + n + 2,
+            Line::from(Span::styled(
+                format!("  {}", self.recommended()),
+                Style::new().fg(th().ok),
+            )),
+        );
+        lines.insert(
+            at + n + 3,
             Line::from(vec![
                 Span::styled(format!("  {key} "), th().chip),
                 Span::styled(label, Style::new().add_modifier(Modifier::BOLD)),
             ]),
         );
-        let action_y = area.y.saturating_add((at + n + 2) as u16);
+        let action_y = area.y.saturating_add((at + n + 3) as u16);
         if action_y < area.y.saturating_add(area.height) {
             self.hit(
                 Rect::new(area.x, action_y, area.width, 1),
@@ -7678,6 +7668,73 @@ mod tests {
     }
 
     #[test]
+    fn first_run_tab_exits_but_advanced_toggle_only_changes_future_navigation() {
+        let mut advanced = test_app();
+        advanced.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        advanced.profiles_loaded = true;
+        assert!(advanced.is_first_run());
+        advanced.on_key(KeyCode::Char('v'));
+        assert!(advanced.advanced);
+        assert!(advanced.is_first_run());
+
+        let mut tabbed = test_app();
+        tabbed.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        tabbed.profiles_loaded = true;
+        assert!(tabbed.is_first_run());
+        tabbed.on_key(KeyCode::Tab);
+        assert!(!tabbed.is_first_run());
+        assert_ne!(tabbed.screen, SC_WELCOME);
+    }
+
+    #[test]
+    fn clicking_where_the_sidebar_would_be_does_nothing_when_narrow() {
+        let mut app = test_app();
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        let area = Rect::new(0, 0, 80, 30);
+        let [_, _, body, _, _] = tui_rows(area);
+        assert!(app.body_split(body).0.is_none());
+
+        app.on_click(1, body.y + 2, area);
+
+        assert_eq!(app.screen, SC_WELCOME);
+    }
+
+    #[test]
+    fn narrow_overview_keeps_the_full_recommended_method_visible() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.screen = SC_WELCOME;
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+
+        assert!(
+            text.contains(app.recommended()),
+            "the recommended method was clipped at 80 columns:\n{text}"
+        );
+    }
+
+    #[test]
     fn clicking_a_sidebar_row_navigates_to_it() {
         let mut app = test_app();
         app.caps = irlume_camera::Caps {
@@ -7776,6 +7833,36 @@ mod tests {
             .expect("Overview status rows are clickable");
         app.on_click(row.x, row.y, area);
         assert_eq!(app.screen, target);
+    }
+
+    #[test]
+    fn mouse_navigation_is_blocked_while_an_operation_owns_input() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("me", &["scan-1"])];
+        app.recompute_visible();
+        app.screen = SC_WELCOME;
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let hub_row = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Hub(_)).then_some(*rect))
+            .expect("Overview has a clickable status row");
+        let (_tx, rx) = mpsc::channel();
+        app.op = Some(Op {
+            label: "busy".into(),
+            tag: OpTag::Generic,
+            rx,
+        });
+
+        app.on_click(hub_row.x, hub_row.y, area);
+
+        assert_eq!(app.screen, SC_WELCOME);
+        assert!(app.op.is_some(), "the click must not disturb the operation");
     }
 
     #[test]
@@ -12248,7 +12335,7 @@ mod tests {
         };
         let text = draw_text(&app);
         assert!(
-            row_with(&text, "Recommended").contains("in the dark"),
+            row_with(&text, "Face (IR)").contains("in the dark"),
             "{text}"
         );
         // "dark mode" reads as a UI theme, not an IR capability.

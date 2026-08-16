@@ -1209,7 +1209,10 @@ fn camera_mode(_args: &[String]) -> std::process::ExitCode {
             );
         }
         None => {
-            println!("capture mode: {} (stored for this pair)", mode.as_str());
+            println!(
+                "capture mode: {} (measured for this pair; provenance not recorded)",
+                mode.as_str()
+            );
         }
     }
     std::process::ExitCode::SUCCESS

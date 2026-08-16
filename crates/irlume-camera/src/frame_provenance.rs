@@ -928,6 +928,7 @@ pub enum RuntimeProvenanceError {
     FactsSequenceMismatch,
     FactsTimestampMismatch,
     ContinuityMismatch,
+    RateEvidenceMismatch,
     DriverReportedCorruption,
     SingleWindowMustBePoint,
     ActiveIrRequiresIrStream,
@@ -954,6 +955,7 @@ impl std::fmt::Display for RuntimeProvenanceError {
             Self::FactsSequenceMismatch => "dequeue facts and sequence observation disagree",
             Self::FactsTimestampMismatch => "dequeue facts and timestamp observation disagree",
             Self::ContinuityMismatch => "sequence and timestamp continuity disagree",
+            Self::RateEvidenceMismatch => "delivered-rate evidence disagrees with its timestamp",
             Self::DriverReportedCorruption => "V4L2 marked a provenance contributor corrupt",
             Self::SingleWindowMustBePoint => "single-frame capture window is not a point",
             Self::ActiveIrRequiresIrStream => "active-IR evidence requires an IR stream",
@@ -989,6 +991,150 @@ pub(crate) struct PendingSingleFrameProvenance {
     sequence: SequenceObservation,
     timestamp: TimestampObservation,
     capture_window: CaptureWindow,
+    rate_evidence: DeliveredRateEvidence,
+}
+
+/// Immutable delivered-rate evidence attached to one delivered dequeue.
+///
+/// Constructed from the same [`TimestampObservation`] and
+/// [`SequenceObservation`] that the frame carries, so clock/source/epoch/latest
+/// timestamp are consistent by construction. The delivered rate and floor
+/// verdict are exact reduced integers computed by the rate window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveredRateEvidence {
+    role: StreamRole,
+    requested_num: u32,
+    requested_den: u32,
+    accepted_num: u32,
+    accepted_den: u32,
+    floor_num: u32,
+    floor_den: u32,
+    tolerance_percent: u32,
+    window_count: u32,
+    window_span_us: u64,
+    delivered_num: u64,
+    delivered_den: u64,
+    meets_floor: bool,
+    sequence_gap: u32,
+    cumulative_drops: u64,
+    clock: TimestampClock,
+    source: TimestampSource,
+    latest_timestamp_us: i64,
+    stream_epoch: u64,
+}
+
+impl DeliveredRateEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        role: StreamRole,
+        requested: (u32, u32),
+        accepted: (u32, u32),
+        floor: (u32, u32),
+        tolerance_percent: u32,
+        window_count: u32,
+        window_span_us: u64,
+        delivered: (u64, u64),
+        meets_floor: bool,
+        sequence: &SequenceObservation,
+        timestamp: &TimestampObservation,
+    ) -> Self {
+        Self {
+            role,
+            requested_num: requested.0,
+            requested_den: requested.1,
+            accepted_num: accepted.0,
+            accepted_den: accepted.1,
+            floor_num: floor.0,
+            floor_den: floor.1,
+            tolerance_percent,
+            window_count,
+            window_span_us,
+            delivered_num: delivered.0,
+            delivered_den: delivered.1,
+            meets_floor,
+            sequence_gap: sequence.gap(),
+            cumulative_drops: sequence.cumulative_drops(),
+            clock: timestamp.clock(),
+            source: timestamp.source(),
+            latest_timestamp_us: timestamp.micros(),
+            stream_epoch: timestamp.stream_epoch(),
+        }
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> StreamRole {
+        self.role
+    }
+
+    #[must_use]
+    pub const fn requested(&self) -> (u32, u32) {
+        (self.requested_num, self.requested_den)
+    }
+
+    #[must_use]
+    pub const fn accepted(&self) -> (u32, u32) {
+        (self.accepted_num, self.accepted_den)
+    }
+
+    #[must_use]
+    pub const fn floor(&self) -> (u32, u32) {
+        (self.floor_num, self.floor_den)
+    }
+
+    #[must_use]
+    pub const fn tolerance_percent(&self) -> u32 {
+        self.tolerance_percent
+    }
+
+    #[must_use]
+    pub const fn window_count(&self) -> u32 {
+        self.window_count
+    }
+
+    #[must_use]
+    pub const fn window_span_us(&self) -> u64 {
+        self.window_span_us
+    }
+
+    #[must_use]
+    pub const fn delivered(&self) -> (u64, u64) {
+        (self.delivered_num, self.delivered_den)
+    }
+
+    #[must_use]
+    pub const fn meets_floor(&self) -> bool {
+        self.meets_floor
+    }
+
+    #[must_use]
+    pub const fn sequence_gap(&self) -> u32 {
+        self.sequence_gap
+    }
+
+    #[must_use]
+    pub const fn cumulative_drops(&self) -> u64 {
+        self.cumulative_drops
+    }
+
+    #[must_use]
+    pub const fn clock(&self) -> TimestampClock {
+        self.clock
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> TimestampSource {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn latest_timestamp_us(&self) -> i64 {
+        self.latest_timestamp_us
+    }
+
+    #[must_use]
+    pub const fn stream_epoch(&self) -> u64 {
+        self.stream_epoch
+    }
 }
 
 /// Complete trusted runtime evidence for one delivered dequeue.
@@ -1001,9 +1147,11 @@ pub struct SingleFrameProvenance {
     timestamp: TimestampObservation,
     capture_window: CaptureWindow,
     illumination: IlluminationProvenance,
+    rate_evidence: DeliveredRateEvidence,
 }
 
 impl SingleFrameProvenance {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         binding: FrameBinding,
         format: ValidatedFormatIdentity,
@@ -1011,6 +1159,7 @@ impl SingleFrameProvenance {
         sequence: SequenceObservation,
         timestamp: TimestampObservation,
         capture_window: CaptureWindow,
+        rate_evidence: DeliveredRateEvidence,
     ) -> Result<PendingSingleFrameProvenance, RuntimeProvenanceError> {
         if facts.sequence_raw() != sequence.raw() {
             return Err(RuntimeProvenanceError::FactsSequenceMismatch);
@@ -1026,6 +1175,13 @@ impl SingleFrameProvenance {
         {
             return Err(RuntimeProvenanceError::ContinuityMismatch);
         }
+        if rate_evidence.clock() != timestamp.clock()
+            || rate_evidence.source() != timestamp.source()
+            || rate_evidence.stream_epoch() != timestamp.stream_epoch()
+            || rate_evidence.latest_timestamp_us() != timestamp.micros()
+        {
+            return Err(RuntimeProvenanceError::RateEvidenceMismatch);
+        }
         if facts.driver_reported_corruption() {
             return Err(RuntimeProvenanceError::DriverReportedCorruption);
         }
@@ -1039,6 +1195,7 @@ impl SingleFrameProvenance {
             sequence,
             timestamp,
             capture_window,
+            rate_evidence,
         })
     }
 
@@ -1076,6 +1233,11 @@ impl SingleFrameProvenance {
     pub const fn illumination(&self) -> IlluminationProvenance {
         self.illumination
     }
+
+    #[must_use]
+    pub const fn rate_evidence(&self) -> DeliveredRateEvidence {
+        self.rate_evidence
+    }
 }
 
 impl PendingSingleFrameProvenance {
@@ -1096,6 +1258,7 @@ impl PendingSingleFrameProvenance {
             timestamp: self.timestamp,
             capture_window: self.capture_window,
             illumination,
+            rate_evidence: self.rate_evidence,
         })
     }
 }
@@ -1298,6 +1461,17 @@ impl AggregateFrameProvenance {
     #[must_use]
     pub const fn illumination(&self) -> IlluminationProvenance {
         self.illumination
+    }
+
+    /// The last contributor's delivered-rate evidence. Only reachable after the
+    /// aggregate's binding/format/domain/epoch invariants all pass, so the
+    /// evidence cannot be stale or cross-domain.
+    #[must_use]
+    pub fn rate_evidence(&self) -> DeliveredRateEvidence {
+        self.contributors
+            .last()
+            .expect("aggregate has contributors")
+            .rate_evidence()
     }
 
     #[must_use]

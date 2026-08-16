@@ -517,6 +517,77 @@ impl CaptureDequeue for v4l::io::mmap::Stream<'_> {
     }
 }
 
+/// Existing camera-state operations used while negotiating and claiming a
+/// capture stream. This protocol stays crate-private: it is an injected test
+/// seam, not new public API.
+trait CameraState {
+    type Device: 'static;
+    type Claim<'a>: CaptureDequeue;
+    type EndpointError: std::error::Error + Send + Sync + 'static;
+
+    fn set_format(&self, dev: &Self::Device, requested: &Format) -> std::io::Result<Format>;
+    fn require_endpoint(&self) -> Result<(), Self::EndpointError>;
+    fn compare_format(&self, expected: &Format, current: &Format) -> Option<String>;
+    fn claim_buffers<'a>(&self, dev: &'a Self::Device) -> std::io::Result<Self::Claim<'a>>;
+    fn current_format(&self, dev: &Self::Device) -> std::io::Result<Format>;
+    fn start_stream(&self) -> irlume_common::Result<()>;
+    fn stop_stream(&self);
+}
+
+#[derive(Clone)]
+struct V4l2CameraState {
+    device: String,
+    lease: lease::CameraLease,
+}
+
+impl V4l2CameraState {
+    fn new(device: &str, lease: lease::CameraLease) -> Self {
+        Self {
+            device: device.to_owned(),
+            lease,
+        }
+    }
+}
+
+impl CameraState for V4l2CameraState {
+    type Device = Device;
+    type Claim<'a> = v4l::io::mmap::Stream<'a>;
+    type EndpointError = lease::CameraLeaseError;
+
+    fn set_format(&self, dev: &Device, requested: &Format) -> std::io::Result<Format> {
+        Capture::set_format(dev, requested)
+    }
+
+    fn require_endpoint(&self) -> Result<(), Self::EndpointError> {
+        self.lease.require_endpoint(&self.device)
+    }
+
+    fn compare_format(&self, expected: &Format, current: &Format) -> Option<String> {
+        format_moved(expected, current)
+    }
+
+    fn claim_buffers<'a>(&self, dev: &'a Device) -> std::io::Result<Self::Claim<'a>> {
+        let mut stream =
+            v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)?;
+        stream.set_timeout(STREAM_DEQUEUE_TIMEOUT);
+        Ok(stream)
+    }
+
+    fn current_format(&self, dev: &Device) -> std::io::Result<Format> {
+        Capture::format(dev)
+    }
+
+    fn start_stream(&self) -> irlume_common::Result<()> {
+        self.lease
+            .start_stream()
+            .map_err(|error| Error::Hardware(error.to_string()))
+    }
+
+    fn stop_stream(&self) {
+        self.lease.stop_stream();
+    }
+}
+
 #[derive(Debug)]
 enum ValidatedDequeueError {
     Io(std::io::Error),
@@ -599,13 +670,15 @@ where
 /// Wrapping (rather than calling a "drop it safely" helper at each success
 /// path) is deliberate: every `?` early return drops the stream too, and those
 /// are exactly the paths a failing camera takes.
-struct SafeStream<'a> {
-    inner: Option<v4l::io::mmap::Stream<'a>>,
+struct CameraStateStream<'a, S: CameraState> {
+    inner: Option<S::Claim<'a>>,
+    state: S,
     device: String,
-    lease: lease::CameraLease,
     layout: frame_provenance::PayloadLayout,
-    lease_started: bool,
+    state_started: bool,
 }
+
+type SafeStream<'a> = CameraStateStream<'a, V4l2CameraState>;
 
 /// How long a single frame dequeue may block.
 ///
@@ -737,7 +810,7 @@ fn format_moved(expect: &v4l::Format, now: &v4l::Format) -> Option<String> {
     None
 }
 
-impl<'a> SafeStream<'a> {
+impl<'a, S: CameraState> CameraStateStream<'a, S> {
     /// Open a stream on `dev` with the standard buffer ring, and verify the
     /// device still holds the format the caller negotiated.
     ///
@@ -760,14 +833,19 @@ impl<'a> SafeStream<'a> {
     /// during emitter setup: a stall there would hang with a control changed and
     /// the restore never reached. Every wait now ends.
     fn open(
+        state: S,
         device: &str,
-        dev: &'a Device,
+        dev: &'a S::Device,
         expect: &v4l::Format,
-        lease: lease::CameraLease,
     ) -> irlume_common::Result<Self> {
-        lease
-            .require_endpoint(device)
+        state
+            .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        // Record the complete driver-echoed S_FMT identity at the existing
+        // pre-claim validation boundary. The self-comparison is infallible and
+        // has no observable production effect; the post-REQBUFS G_FMT identity
+        // must still compare equal to this same value.
+        let _ = state.compare_format(expect, expect);
         let layout = frame_provenance::PayloadLayout::new(
             expect.fourcc.repr,
             expect.width,
@@ -775,25 +853,26 @@ impl<'a> SafeStream<'a> {
             expect.stride,
         )
         .map_err(|error| Error::Hardware(format!("{device}: {error}")))?;
-        let mut inner = v4l::io::mmap::Stream::with_buffers(dev, Type::VideoCapture, MMAP_BUFFERS)
-            .map_err(|e| map_io(device, e))?;
-        inner.set_timeout(STREAM_DEQUEUE_TIMEOUT);
+        let inner = state.claim_buffers(dev).map_err(|e| map_io(device, e))?;
         // Constructed before the read-back so every error path below releases
         // the queue through the guarded Drop (STREAMOFF + REQBUFS(0)), never
         // through the v4l crate's panicking one.
         let mut stream = Self {
             inner: Some(inner),
+            state,
             device: device.to_string(),
-            lease,
             layout,
-            lease_started: false,
+            state_started: false,
         };
-        let now = Capture::format(dev).map_err(|e| map_io(device, e))?;
+        let now = stream
+            .state
+            .current_format(dev)
+            .map_err(|e| map_io(device, e))?;
         stream
-            .lease
-            .require_endpoint(device)
+            .state
+            .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        if let Some(moved) = format_moved(expect, &now) {
+        if let Some(moved) = stream.state.compare_format(expect, &now) {
             // Refusing rather than renegotiating, for the same reason the
             // emitter stands down under a foreign consumer (#169): a format
             // that moved means another application is actively configuring
@@ -810,11 +889,8 @@ impl<'a> SafeStream<'a> {
                  this camera{who}; refusing this capture"
             )));
         }
-        stream
-            .lease
-            .start_stream()
-            .map_err(|error| Error::Hardware(error.to_string()))?;
-        stream.lease_started = true;
+        stream.state.start_stream()?;
+        stream.state_started = true;
         Ok(stream)
     }
 
@@ -827,19 +903,14 @@ impl<'a> SafeStream<'a> {
     ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
         let Self {
             inner,
-            device,
-            lease,
+            state,
             layout,
             ..
         } = self;
         dequeue_validated_typed(
             inner.as_mut().expect("stream taken only in Drop"),
             *layout,
-            || {
-                lease
-                    .require_endpoint(device)
-                    .map_err(std::io::Error::other)
-            },
+            || state.require_endpoint().map_err(std::io::Error::other),
         )
     }
 }
@@ -850,7 +921,7 @@ trait ValidatedStream {
     ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>;
 }
 
-impl ValidatedStream for SafeStream<'_> {
+impl<S: CameraState> ValidatedStream for CameraStateStream<'_, S> {
     fn next_validated(
         &mut self,
     ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
@@ -1131,7 +1202,7 @@ fn install_recovered_resources<S, M, G, E>(
     }
 }
 
-impl Drop for SafeStream<'_> {
+impl<S: CameraState> Drop for CameraStateStream<'_, S> {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else {
             return;
@@ -1140,8 +1211,8 @@ impl Drop for SafeStream<'_> {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(inner))).is_err() {
             irlume_common::dlog!("{device}: stream teardown failed (STREAMOFF); frames unaffected");
         }
-        if self.lease_started {
-            self.lease.stop_stream();
+        if self.state_started {
+            self.state.stop_stream();
         }
     }
 }
@@ -2404,8 +2475,9 @@ impl RgbCamera {
     }
 
     fn open_uvc(device: &str, lease: lease::CameraLease) -> irlume_common::Result<Self> {
-        lease
-            .require_endpoint(device)
+        let state = V4l2CameraState::new(device, lease.clone());
+        state
+            .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
         if privacy_engaged_with_permit(device) {
@@ -2421,7 +2493,9 @@ impl RgbCamera {
         // is preferred; NV12 is the common uncompressed fallback.
         let chosen = negotiate_rgb_format(device, &dev)?;
         let fmt = Format::new(RGB_W, RGB_H, FourCC::new(&chosen));
-        let fmt = Capture::set_format(&dev, &fmt).map_err(|e| map_io(device, e))?;
+        let fmt = state
+            .set_format(&dev, &fmt)
+            .map_err(|e| map_io(device, e))?;
         if fmt.fourcc.repr != chosen {
             return Err(Error::Hardware(format!(
                 "{device}: driver gave {}, expected {}",
@@ -2429,8 +2503,8 @@ impl RgbCamera {
                 fourcc_str(&chosen)
             )));
         }
-        lease
-            .require_endpoint(device)
+        state
+            .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
             lease,
@@ -2483,10 +2557,10 @@ impl RgbCamera {
         // not (the Codex round's finding 1 on this PR).
         let blc_restore = apply_blc(self);
         let stream = SafeStream::open(
+            V4l2CameraState::new(&self.device, self.lease.clone()),
             &self.device,
             &self.dev,
             &self.negotiated,
-            self.lease.clone(),
         )?;
         self.lease
             .require_endpoint(&self.device)
@@ -2715,10 +2789,10 @@ impl<'a> RgbSession<'a> {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         drop(self.stream.take()); // STREAMOFF + buffer release before replacement
         let stream = SafeStream::open(
+            V4l2CameraState::new(&self.cam.device, self.cam.lease.clone()),
             &self.cam.device,
             &self.cam.dev,
             &self.cam.negotiated,
-            self.cam.lease.clone(),
         )?;
         self.cam
             .lease
@@ -3035,6 +3109,14 @@ const IR_CANDIDATES: [(&[u8; 4], IrPixel); 8] = [
 /// one the driver echoes back, and fail with a message naming what it offers.
 fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(Format, IrPixel)> {
     negotiate_ir_format_via(device, dev, Capture::set_format)
+}
+
+fn negotiate_ir_format_state<S: CameraState<Device = Device>>(
+    device: &str,
+    dev: &Device,
+    state: &S,
+) -> irlume_common::Result<(Format, IrPixel)> {
+    negotiate_ir_format_via(device, dev, |dev, fmt| state.set_format(dev, fmt))
 }
 
 /// The IR candidate walk with the format ioctl injected: capture applies it
@@ -3380,8 +3462,9 @@ impl IrCamera {
     }
 
     fn open_uvc(device: &str, lease: lease::CameraLease) -> irlume_common::Result<Self> {
-        lease
-            .require_endpoint(device)
+        let state = V4l2CameraState::new(device, lease.clone());
+        state
+            .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
         if privacy_engaged_with_permit(device) {
@@ -3390,10 +3473,10 @@ impl IrCamera {
             )));
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-        let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+        let (fmt, pix) = negotiate_ir_format_state(device, &dev, &state)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-        lease
-            .require_endpoint(device)
+        state
+            .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
             lease,
@@ -3458,10 +3541,10 @@ impl IrCamera {
         // this change removes. Assigned further down, once the stream exists.
         let mode;
         let mut stream = TrackedStream::new(SafeStream::open(
+            V4l2CameraState::new(&self.device, self.lease.clone()),
             &self.device,
             &self.dev,
             &self.negotiated,
-            self.lease.clone(),
         )?);
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
@@ -3969,10 +4052,10 @@ impl IrSession<'_> {
         })?;
         self._mode = ir_emitter::StreamMode::inert();
         let stream = SafeStream::open(
+            V4l2CameraState::new(&self.cam.device, self.cam.lease.clone()),
             &self.cam.device,
             &self.cam.dev,
             &self.cam.negotiated,
-            self.cam.lease.clone(),
         )?;
         let meta = ir_metadata::IlluminationLog::open(&self.cam.device);
         self.cam
@@ -4173,7 +4256,12 @@ pub mod ir_probe {
         // buffers; STREAMON happens on the first dequeue, so the set still
         // lands before streaming starts.
         let mode;
-        let stream = super::SafeStream::open(device, &dev, &fmt, permit.clone())?;
+        let stream = super::SafeStream::open(
+            super::V4l2CameraState::new(device, permit.clone()),
+            device,
+            &dev,
+            &fmt,
+        )?;
         let mut stream = super::TrackedStream::new(stream);
         mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
         // Bound, never read: held for its `Drop`, which restores the control.
@@ -4290,7 +4378,12 @@ pub fn capture_ir_streaming<B>(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    let stream = SafeStream::open(
+        V4l2CameraState::new(device, permit.clone()),
+        device,
+        &dev,
+        &fmt,
+    )?;
     let mut stream = TrackedStream::new(stream);
     mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
@@ -4363,7 +4456,12 @@ pub fn capture_ir_streaming<B>(
                          a frozen stream: {e}"
                     ))
                 })?;
-                let replacement = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+                let replacement = SafeStream::open(
+                    V4l2CameraState::new(device, permit.clone()),
+                    device,
+                    &dev,
+                    &fmt,
+                )?;
                 let replacement_mode =
                     ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
                 let ((), replacement_mode) =
@@ -4459,7 +4557,12 @@ pub fn capture_ir_sequence(
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
     let mut mode;
-    let stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    let stream = SafeStream::open(
+        V4l2CameraState::new(device, permit.clone()),
+        device,
+        &dev,
+        &fmt,
+    )?;
     let mut stream = TrackedStream::new(stream);
     mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
     // Set once per stream, before it starts, and not per frame (the
@@ -4536,7 +4639,12 @@ pub fn capture_ir_sequence(
                          a frozen stream: {e}"
                     ))
                 })?;
-                let replacement = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+                let replacement = SafeStream::open(
+                    V4l2CameraState::new(device, permit.clone()),
+                    device,
+                    &dev,
+                    &fmt,
+                )?;
                 let replacement_mode =
                     ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
                 let ((), replacement_mode) =
@@ -5441,7 +5549,12 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
-    let mut stream = SafeStream::open(device, &dev, &fmt, permit.clone())?;
+    let mut stream = SafeStream::open(
+        V4l2CameraState::new(device, permit.clone()),
+        device,
+        &dev,
+        &fmt,
+    )?;
     let fd = dev.handle().fd();
     for _ in 0..4 {
         let _ = stream.next(); // let the sensor settle before baseline
@@ -5699,6 +5812,328 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type CallLog = std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>;
+
+    struct FakeClaim {
+        calls: CallLog,
+        payload: Vec<u8>,
+        fail_dequeue: bool,
+    }
+
+    impl CaptureDequeue for FakeClaim {
+        fn dequeue(&mut self) -> std::io::Result<(&[u8], v4l::buffer::Metadata)> {
+            self.calls.borrow_mut().push("dequeue");
+            if self.fail_dequeue {
+                return Err(std::io::Error::other("dequeue failure"));
+            }
+            Ok((
+                &self.payload,
+                v4l::buffer::Metadata {
+                    bytesused: self.payload.len() as u32,
+                    ..v4l::buffer::Metadata::default()
+                },
+            ))
+        }
+    }
+
+    impl Drop for FakeClaim {
+        fn drop(&mut self) {
+            self.calls.borrow_mut().push("cleanup");
+        }
+    }
+
+    struct FakeCameraState {
+        calls: CallLog,
+        echoed: Format,
+        current: Format,
+        endpoint_calls: std::cell::Cell<usize>,
+        fail_set: bool,
+        fail_endpoint_at: Option<usize>,
+        fail_claim: bool,
+        fail_dequeue: bool,
+    }
+
+    impl FakeCameraState {
+        fn new(format: Format) -> (Self, CallLog) {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    calls: calls.clone(),
+                    echoed: format,
+                    current: format,
+                    endpoint_calls: std::cell::Cell::new(0),
+                    fail_set: false,
+                    fail_endpoint_at: None,
+                    fail_claim: false,
+                    fail_dequeue: false,
+                },
+                calls,
+            )
+        }
+    }
+
+    impl CameraState for FakeCameraState {
+        type Device = ();
+        type Claim<'a> = FakeClaim;
+        type EndpointError = std::io::Error;
+
+        fn set_format(&self, _dev: &(), _requested: &Format) -> std::io::Result<Format> {
+            self.calls.borrow_mut().push("set_format");
+            if self.fail_set {
+                Err(std::io::Error::other("set format failure"))
+            } else {
+                Ok(self.echoed)
+            }
+        }
+
+        fn require_endpoint(&self) -> Result<(), Self::EndpointError> {
+            self.calls.borrow_mut().push("endpoint");
+            let call = self.endpoint_calls.get() + 1;
+            self.endpoint_calls.set(call);
+            if self.fail_endpoint_at == Some(call) {
+                Err(std::io::Error::other("endpoint failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn compare_format(&self, expected: &Format, current: &Format) -> Option<String> {
+            self.calls.borrow_mut().push("check_format");
+            format_moved(expected, current)
+        }
+
+        fn claim_buffers<'a>(&self, _dev: &'a ()) -> std::io::Result<Self::Claim<'a>> {
+            self.calls.borrow_mut().push("reqbufs");
+            if self.fail_claim {
+                return Err(std::io::Error::other("buffer claim failure"));
+            }
+            Ok(FakeClaim {
+                calls: self.calls.clone(),
+                payload: vec![0; self.echoed.size as usize],
+                fail_dequeue: self.fail_dequeue,
+            })
+        }
+
+        fn current_format(&self, _dev: &()) -> std::io::Result<Format> {
+            self.calls.borrow_mut().push("g_fmt");
+            Ok(self.current)
+        }
+
+        fn start_stream(&self) -> irlume_common::Result<()> {
+            self.calls.borrow_mut().push("start");
+            Ok(())
+        }
+
+        fn stop_stream(&self) {
+            self.calls.borrow_mut().push("stop");
+        }
+    }
+
+    fn fake_format(fourcc: &[u8; 4]) -> Format {
+        let mut format = Format::new(2, 2, FourCC::new(fourcc));
+        format.stride = if fourcc == b"YUYV" { 4 } else { 2 };
+        format.size = format.stride * format.height;
+        format.field_order = v4l::format::FieldOrder::Progressive;
+        format.colorspace = v4l::format::Colorspace::SRGB;
+        format.quantization = v4l::format::Quantization::FullRange;
+        format.transfer = v4l::format::TransferFunction::SRGB;
+        format.flags = v4l::format::Flags::PREMUL_ALPHA;
+        format
+    }
+
+    fn exercise_fake_happy_path(format: Format) -> Vec<&'static str> {
+        let (state, calls) = FakeCameraState::new(format);
+        let echoed = state.set_format(&(), &format).expect("S_FMT");
+        state.require_endpoint().expect("endpoint after S_FMT");
+        let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &echoed)
+            .expect("buffer claim orchestration");
+        stream.next().expect("first dequeue");
+        drop(stream);
+        let recorded = calls.borrow().clone();
+        recorded
+    }
+
+    #[test]
+    fn camera_state_seam_records_rgb_and_ir_happy_path_order() {
+        let expected = vec![
+            "set_format",
+            "endpoint",
+            "endpoint",
+            "check_format",
+            "reqbufs",
+            "g_fmt",
+            "endpoint",
+            "check_format",
+            "start",
+            "endpoint",
+            "dequeue",
+            "endpoint",
+            "cleanup",
+            "stop",
+        ];
+        assert_eq!(exercise_fake_happy_path(fake_format(b"YUYV")), expected);
+        assert_eq!(exercise_fake_happy_path(fake_format(b"GREY")), expected);
+    }
+
+    #[test]
+    fn camera_state_seam_preserves_setup_and_dequeue_error_cleanup() {
+        let format = fake_format(b"GREY");
+
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.fail_set = true;
+        assert!(state.set_format(&(), &format).is_err());
+        assert_eq!(&*calls.borrow(), &["set_format"]);
+
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.fail_endpoint_at = Some(1);
+        assert!(state.set_format(&(), &format).is_ok());
+        assert!(state.require_endpoint().is_err());
+        assert_eq!(&*calls.borrow(), &["set_format", "endpoint"]);
+
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.fail_claim = true;
+        assert!(CameraStateStream::open(state, "/dev/fake", &(), &format).is_err());
+        assert_eq!(&*calls.borrow(), &["endpoint", "check_format", "reqbufs"]);
+
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.fail_endpoint_at = Some(2);
+        assert!(CameraStateStream::open(state, "/dev/fake", &(), &format).is_err());
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "endpoint",
+                "check_format",
+                "reqbufs",
+                "g_fmt",
+                "endpoint",
+                "cleanup"
+            ]
+        );
+
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.fail_dequeue = true;
+        let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &format).unwrap();
+        assert!(stream.next().is_err());
+        drop(stream);
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "endpoint",
+                "check_format",
+                "reqbufs",
+                "g_fmt",
+                "endpoint",
+                "check_format",
+                "start",
+                "endpoint",
+                "dequeue",
+                "cleanup",
+                "stop",
+            ]
+        );
+    }
+
+    #[test]
+    fn camera_state_seam_preserves_raw_endpoint_error_during_dequeue() {
+        let format = fake_format(b"GREY");
+
+        let (mut setup_state, setup_calls) = FakeCameraState::new(format);
+        setup_state.fail_endpoint_at = Some(1);
+        let setup_error = match CameraStateStream::open(setup_state, "/dev/fake", &(), &format) {
+            Ok(_) => panic!("stale endpoint must fail stream setup"),
+            Err(error) => error,
+        };
+        assert_eq!(setup_error.to_string(), "hardware: endpoint failure");
+        assert_eq!(&*setup_calls.borrow(), &["endpoint"]);
+
+        let (mut state, calls) = FakeCameraState::new(format);
+        // `open` performs two endpoint validations; fail the pre-dequeue one.
+        state.fail_endpoint_at = Some(3);
+        let mut stream =
+            CameraStateStream::open(state, "/dev/fake", &(), &format).expect("stream open");
+
+        let error = match stream.next() {
+            Ok(_) => panic!("stale endpoint must fail before dequeue"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "endpoint failure");
+        drop(stream);
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "endpoint",
+                "check_format",
+                "reqbufs",
+                "g_fmt",
+                "endpoint",
+                "check_format",
+                "start",
+                "endpoint",
+                "cleanup",
+                "stop",
+            ]
+        );
+    }
+
+    #[test]
+    fn camera_state_seam_compares_every_driver_echoed_format_field() {
+        let expected = fake_format(b"GREY");
+        let mut changed = Vec::new();
+
+        let mut value = expected;
+        value.fourcc = FourCC::new(b"YUYV");
+        changed.push(value);
+        let mut value = expected;
+        value.width += 1;
+        changed.push(value);
+        let mut value = expected;
+        value.height += 1;
+        changed.push(value);
+        let mut value = expected;
+        value.stride += 1;
+        changed.push(value);
+        let mut value = expected;
+        value.size += 1;
+        changed.push(value);
+        let mut value = expected;
+        value.field_order = v4l::format::FieldOrder::Interlaced;
+        changed.push(value);
+        let mut value = expected;
+        value.colorspace = v4l::format::Colorspace::Rec709;
+        changed.push(value);
+        let mut value = expected;
+        value.quantization = v4l::format::Quantization::LimitedRange;
+        changed.push(value);
+        let mut value = expected;
+        value.transfer = v4l::format::TransferFunction::Rec709;
+        changed.push(value);
+        let mut value = expected;
+        value.flags = v4l::format::Flags::empty();
+        changed.push(value);
+
+        for current in changed {
+            let (mut state, calls) = FakeCameraState::new(expected);
+            state.current = current;
+            let error = match CameraStateStream::open(state, "/dev/fake", &(), &expected) {
+                Ok(_) => panic!("every full-format drift must fail closed"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("stream format changed"));
+            assert_eq!(
+                &*calls.borrow(),
+                &[
+                    "endpoint",
+                    "check_format",
+                    "reqbufs",
+                    "g_fmt",
+                    "endpoint",
+                    "check_format",
+                    "cleanup"
+                ]
+            );
+        }
+    }
 
     struct SabotagingDequeue {
         payload: [u8; 4],

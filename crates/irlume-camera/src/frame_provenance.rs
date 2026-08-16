@@ -1470,7 +1470,7 @@ impl AggregateFrameProvenance {
     /// # Panics
     ///
     /// Panics if the aggregate has no contributors, which is unreachable:
-    /// [`AggregateFrameProvenance::new`] requires at least two.
+    /// construction requires at least two contributors.
     #[must_use]
     pub fn rate_evidence(&self) -> DeliveredRateEvidence {
         self.contributors

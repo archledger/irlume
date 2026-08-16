@@ -526,10 +526,29 @@ trait CameraState {
     type EndpointError: std::error::Error + Send + Sync + 'static;
 
     fn set_format(&self, dev: &Self::Device, requested: &Format) -> std::io::Result<Format>;
+    fn interval_domain(
+        &self,
+        dev: &Self::Device,
+        format: &Format,
+    ) -> irlume_common::Result<frame_interval::FrameIntervalDomain>;
+    fn set_interval(
+        &self,
+        dev: &Self::Device,
+        query: frame_interval::FrameIntervalQuery,
+        requested: frame_interval::FrameInterval,
+        stage: &'static str,
+    ) -> irlume_common::Result<frame_interval::FrameInterval>;
     fn require_endpoint(&self) -> Result<(), Self::EndpointError>;
     fn compare_format(&self, expected: &Format, current: &Format) -> Option<String>;
     fn claim_buffers<'a>(&self, dev: &'a Self::Device) -> std::io::Result<Self::Claim<'a>>;
+    fn accepted_interval(&self) -> Option<frame_interval::FrameInterval>;
     fn current_format(&self, dev: &Self::Device) -> std::io::Result<Format>;
+    fn current_interval(
+        &self,
+        dev: &Self::Device,
+        query: frame_interval::FrameIntervalQuery,
+        stage: &'static str,
+    ) -> irlume_common::Result<frame_interval::FrameInterval>;
     fn start_stream(&self) -> irlume_common::Result<()>;
     fn stop_stream(&self);
 }
@@ -538,6 +557,7 @@ trait CameraState {
 struct V4l2CameraState {
     device: String,
     lease: lease::CameraLease,
+    accepted_interval: Option<frame_interval::FrameInterval>,
 }
 
 impl V4l2CameraState {
@@ -545,6 +565,19 @@ impl V4l2CameraState {
         Self {
             device: device.to_owned(),
             lease,
+            accepted_interval: None,
+        }
+    }
+
+    fn with_interval(
+        device: &str,
+        lease: lease::CameraLease,
+        accepted_interval: frame_interval::FrameInterval,
+    ) -> Self {
+        Self {
+            device: device.to_owned(),
+            lease,
+            accepted_interval: Some(accepted_interval),
         }
     }
 }
@@ -556,6 +589,31 @@ impl CameraState for V4l2CameraState {
 
     fn set_format(&self, dev: &Device, requested: &Format) -> std::io::Result<Format> {
         Capture::set_format(dev, requested)
+    }
+
+    fn interval_domain(
+        &self,
+        dev: &Device,
+        format: &Format,
+    ) -> irlume_common::Result<frame_interval::FrameIntervalDomain> {
+        frame_interval::frame_interval_capabilities_for_fd(
+            &self.device,
+            dev.handle().fd(),
+            format.fourcc.repr,
+            format.width,
+            format.height,
+        )
+        .map_err(|error| Error::Hardware(error.to_string()))
+    }
+
+    fn set_interval(
+        &self,
+        dev: &Device,
+        query: frame_interval::FrameIntervalQuery,
+        requested: frame_interval::FrameInterval,
+        stage: &'static str,
+    ) -> irlume_common::Result<frame_interval::FrameInterval> {
+        set_stream_interval(&self.device, dev, query, requested, stage)
     }
 
     fn require_endpoint(&self) -> Result<(), Self::EndpointError> {
@@ -573,8 +631,21 @@ impl CameraState for V4l2CameraState {
         Ok(stream)
     }
 
+    fn accepted_interval(&self) -> Option<frame_interval::FrameInterval> {
+        self.accepted_interval
+    }
+
     fn current_format(&self, dev: &Device) -> std::io::Result<Format> {
         Capture::format(dev)
+    }
+
+    fn current_interval(
+        &self,
+        dev: &Device,
+        query: frame_interval::FrameIntervalQuery,
+        stage: &'static str,
+    ) -> irlume_common::Result<frame_interval::FrameInterval> {
+        read_stream_interval(&self.device, dev, query, stage)
     }
 
     fn start_stream(&self) -> irlume_common::Result<()> {
@@ -586,6 +657,136 @@ impl CameraState for V4l2CameraState {
     fn stop_stream(&self) {
         self.lease.stop_stream();
     }
+}
+
+fn streamparm_request(
+    interval: Option<frame_interval::FrameInterval>,
+) -> v4l::v4l_sys::v4l2_streamparm {
+    // SAFETY: `v4l2_streamparm` is a plain kernel C ABI object for which an
+    // all-zero value is valid; `type_` and the optional active capture fields
+    // are initialized immediately below before the ioctl.
+    let mut wire: v4l::v4l_sys::v4l2_streamparm = unsafe { std::mem::zeroed() };
+    wire.type_ = Type::VideoCapture as u32;
+    if let Some(interval) = interval {
+        let (numerator, denominator) = interval.parts();
+        wire.parm.capture.timeperframe.numerator = numerator;
+        wire.parm.capture.timeperframe.denominator = denominator;
+    }
+    wire
+}
+
+fn validate_streamparm_response(
+    device: &str,
+    query: frame_interval::FrameIntervalQuery,
+    stage: &'static str,
+    wire: &v4l::v4l_sys::v4l2_streamparm,
+) -> irlume_common::Result<frame_interval::FrameInterval> {
+    if wire.type_ != Type::VideoCapture as u32 {
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: {stage} returned type {}, expected video capture",
+            wire.type_
+        )));
+    }
+    // SAFETY: the validated type selects the capture union arm. Copy it
+    // immediately so no reference to union storage escapes this boundary.
+    let capture = unsafe { wire.parm.capture };
+    if capture.capability & v4l::v4l_sys::V4L2_CAP_TIMEPERFRAME == 0 {
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: {stage} lacks V4L2_CAP_TIMEPERFRAME"
+        )));
+    }
+    if capture.extendedmode != 0 {
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: {stage} returned unsupported extendedmode {}",
+            capture.extendedmode
+        )));
+    }
+    if capture.reserved != [0; 4] {
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: {stage} returned nonzero reserved fields"
+        )));
+    }
+    frame_interval::FrameInterval::new(
+        capture.timeperframe.numerator,
+        capture.timeperframe.denominator,
+    )
+    .map_err(|error| {
+        Error::Hardware(format!(
+            "{device}: {query:?}: {stage} returned malformed timeperframe: {error}"
+        ))
+    })
+}
+
+fn streamparm_transaction(
+    device: &str,
+    query: frame_interval::FrameIntervalQuery,
+    stage: &'static str,
+    operation: &'static str,
+    requested: Option<frame_interval::FrameInterval>,
+    ioctl: impl FnOnce(&mut v4l::v4l_sys::v4l2_streamparm) -> std::io::Result<()>,
+) -> irlume_common::Result<frame_interval::FrameInterval> {
+    let mut wire = streamparm_request(requested);
+    ioctl(&mut wire).map_err(|error| {
+        Error::Hardware(format!(
+            "{device}: {query:?}: {stage} {operation} failed: {error}"
+        ))
+    })?;
+    validate_streamparm_response(device, query, stage, &wire)
+}
+
+fn read_stream_interval(
+    device: &str,
+    dev: &Device,
+    query: frame_interval::FrameIntervalQuery,
+    stage: &'static str,
+) -> irlume_common::Result<frame_interval::FrameInterval> {
+    streamparm_transaction(device, query, stage, "VIDIOC_G_PARM", None, |wire| {
+        // SAFETY: `dev` owns the fd and `wire` is a fully initialized exact ABI object.
+        let rc = unsafe {
+            libc::ioctl(
+                dev.handle().fd(),
+                v4l::v4l2::vidioc::VIDIOC_G_PARM,
+                wire as *mut _ as *mut libc::c_void,
+            )
+        };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn set_stream_interval(
+    device: &str,
+    dev: &Device,
+    query: frame_interval::FrameIntervalQuery,
+    requested: frame_interval::FrameInterval,
+    stage: &'static str,
+) -> irlume_common::Result<frame_interval::FrameInterval> {
+    streamparm_transaction(
+        device,
+        query,
+        stage,
+        "VIDIOC_S_PARM",
+        Some(requested),
+        |wire| {
+            // SAFETY: same initialized ABI boundary as G_PARM; the response is
+            // validated before union data is used.
+            let rc = unsafe {
+                libc::ioctl(
+                    dev.handle().fd(),
+                    v4l::v4l2::vidioc::VIDIOC_S_PARM,
+                    wire as *mut _ as *mut libc::c_void,
+                )
+            };
+            if rc < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -657,6 +858,113 @@ where
     validate_dequeued(mapped, &metadata, layout)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NegotiatedInterval {
+    requested: frame_interval::FrameInterval,
+    accepted: frame_interval::FrameInterval,
+}
+
+fn negotiate_interval_after_format<S: CameraState>(
+    state: &S,
+    device: &str,
+    dev: &S::Device,
+    accepted_format: &Format,
+) -> irlume_common::Result<NegotiatedInterval> {
+    state
+        .require_endpoint()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let domain = state.interval_domain(dev, accepted_format)?;
+    let query = frame_interval::FrameIntervalQuery::new(
+        accepted_format.fourcc.repr,
+        accepted_format.width,
+        accepted_format.height,
+    )
+    .map_err(|error| Error::Hardware(format!("{device}: {error}")))?;
+    let requested = state.current_interval(dev, query, "factory default")?;
+    if !domain.contains(requested) {
+        let (numerator, denominator) = requested.parts();
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: driver default {numerator}/{denominator} is outside the \
+             enumerated interval domain"
+        )));
+    }
+    let accepted = state.set_interval(dev, query, requested, "factory request")?;
+    if !domain.contains(accepted) {
+        let (numerator, denominator) = accepted.parts();
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: driver accepted {numerator}/{denominator} outside the \
+             enumerated interval domain"
+        )));
+    }
+    verify_stream_state(
+        state,
+        device,
+        dev,
+        accepted_format,
+        accepted,
+        "after interval negotiation",
+    )?;
+    Ok(NegotiatedInterval {
+        requested,
+        accepted,
+    })
+}
+
+fn verify_stream_state<S: CameraState>(
+    state: &S,
+    device: &str,
+    dev: &S::Device,
+    expected_format: &Format,
+    expected_interval: frame_interval::FrameInterval,
+    stage: &'static str,
+) -> irlume_common::Result<()> {
+    state
+        .require_endpoint()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    verify_stream_snapshot(
+        state,
+        device,
+        dev,
+        expected_format,
+        expected_interval,
+        stage,
+    )
+}
+
+fn verify_stream_snapshot<S: CameraState>(
+    state: &S,
+    device: &str,
+    dev: &S::Device,
+    expected_format: &Format,
+    expected_interval: frame_interval::FrameInterval,
+    stage: &'static str,
+) -> irlume_common::Result<()> {
+    let current_format = state
+        .current_format(dev)
+        .map_err(|error| map_io(device, error))?;
+    if let Some(moved) = state.compare_format(expected_format, &current_format) {
+        return Err(Error::Hardware(format!(
+            "{device}: stream state drift at {stage}: {moved}; refusing this capture"
+        )));
+    }
+    let query = frame_interval::FrameIntervalQuery::new(
+        expected_format.fourcc.repr,
+        expected_format.width,
+        expected_format.height,
+    )
+    .map_err(|error| Error::Hardware(format!("{device}: {stage}: {error}")))?;
+    let current_interval = state.current_interval(dev, query, stage)?;
+    if current_interval != expected_interval {
+        let (current_num, current_den) = current_interval.parts();
+        let (expected_num, expected_den) = expected_interval.parts();
+        return Err(Error::Hardware(format!(
+            "{device}: stream interval drift at {stage}: now {current_num}/{current_den}, \
+             accepted {expected_num}/{expected_den}; refusing this capture"
+        )));
+    }
+    Ok(())
+}
+
 /// A capture stream whose teardown cannot take the process down.
 ///
 /// v4l 0.14's `Stream::drop` calls `stop()` and PANICS on any failure except
@@ -674,8 +982,12 @@ struct CameraStateStream<'a, S: CameraState> {
     inner: Option<S::Claim<'a>>,
     state: S,
     device: String,
+    dev: &'a S::Device,
+    expected_format: Format,
+    expected_interval: frame_interval::FrameInterval,
     layout: frame_provenance::PayloadLayout,
     state_started: bool,
+    stream_started_validated: bool,
 }
 
 type SafeStream<'a> = CameraStateStream<'a, V4l2CameraState>;
@@ -819,13 +1131,13 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
     /// streaming struct gated only on buffer ownership, and ownership begins
     /// at REQBUFS, not at open (#427; the audit in
     /// docs/research/2026-08-12-camera-handling-audit.md, Q3). Between the
-    /// caller's S_FMT and the REQBUFS here, any other process can retarget
-    /// the device, and the capture would then decode frames against stale
-    /// width, height and fourcc assumptions. Once `with_buffers` returns,
-    /// this handle owns the queue and S_FMT answers EBUSY to everyone, so a
-    /// G_FMT read taken HERE is stable for the stream's whole life; the same
-    /// window recurs at every reopen (recover, the frozen-stream restarts),
-    /// which is why the check lives in the one function they all call.
+    /// caller's S_FMT/S_PARM and the REQBUFS here, any other process can retarget
+    /// the device, and the capture would then decode frames against a stale full
+    /// format or interval. Read-only G_FMT/G_PARM checks therefore run before and
+    /// after buffer claim. The first successful dequeue is the first proof that
+    /// STREAMON delivered a frame, so its existing post-DQBUF endpoint check is
+    /// followed by one final full-tuple snapshot. Every reopen uses the immutable
+    /// factory-accepted interval and repeats the same checks without S_PARM.
     ///
     /// A dequeue timeout is set explicitly. v4l leaves it unset, which polls
     /// with -1 and waits forever, so a camera that stops delivering frames
@@ -838,14 +1150,19 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         dev: &'a S::Device,
         expect: &v4l::Format,
     ) -> irlume_common::Result<Self> {
-        state
-            .require_endpoint()
-            .map_err(|error| Error::Hardware(error.to_string()))?;
-        // Record the complete driver-echoed S_FMT identity at the existing
-        // pre-claim validation boundary. The self-comparison is infallible and
-        // has no observable production effect; the post-REQBUFS G_FMT identity
-        // must still compare equal to this same value.
-        let _ = state.compare_format(expect, expect);
+        let expected_interval = state.accepted_interval().ok_or_else(|| {
+            Error::Hardware(format!(
+                "{device}: no accepted stream interval is bound to this capture state"
+            ))
+        })?;
+        verify_stream_state(
+            &state,
+            device,
+            dev,
+            expect,
+            expected_interval,
+            "before buffer claim",
+        )?;
         let layout = frame_provenance::PayloadLayout::new(
             expect.fourcc.repr,
             expect.width,
@@ -861,34 +1178,21 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
             inner: Some(inner),
             state,
             device: device.to_string(),
+            dev,
+            expected_format: *expect,
+            expected_interval,
             layout,
             state_started: false,
+            stream_started_validated: false,
         };
-        let now = stream
-            .state
-            .current_format(dev)
-            .map_err(|e| map_io(device, e))?;
-        stream
-            .state
-            .require_endpoint()
-            .map_err(|error| Error::Hardware(error.to_string()))?;
-        if let Some(moved) = stream.state.compare_format(expect, &now) {
-            // Refusing rather than renegotiating, for the same reason the
-            // emitter stands down under a foreign consumer (#169): a format
-            // that moved means another application is actively configuring
-            // this camera, and fighting it over shared state serves nobody.
-            // The cost is one refused capture, which degrades toward the
-            // password prompt.
-            let who = match camera_holder(device) {
-                Some(h) => format!(", likely {h}"),
-                None => String::new(),
-            };
-            return Err(Error::Hardware(format!(
-                "{device}: the stream format changed between negotiation and \
-                 buffer claim ({moved}). Another application is configuring \
-                 this camera{who}; refusing this capture"
-            )));
-        }
+        verify_stream_state(
+            &stream.state,
+            device,
+            dev,
+            expect,
+            expected_interval,
+            "after buffer claim",
+        )?;
         stream.state.start_stream()?;
         stream.state_started = true;
         Ok(stream)
@@ -904,14 +1208,32 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         let Self {
             inner,
             state,
+            device,
+            dev,
+            expected_format,
+            expected_interval,
             layout,
+            stream_started_validated,
             ..
         } = self;
-        dequeue_validated_typed(
+        let dequeued = dequeue_validated_typed(
             inner.as_mut().expect("stream taken only in Drop"),
             *layout,
             || state.require_endpoint().map_err(std::io::Error::other),
-        )
+        )?;
+        if !*stream_started_validated {
+            verify_stream_snapshot(
+                state,
+                device,
+                dev,
+                expected_format,
+                *expected_interval,
+                "after first dequeue",
+            )
+            .map_err(|error| ValidatedDequeueError::Io(std::io::Error::other(error)))?;
+            *stream_started_validated = true;
+        }
+        Ok(dequeued)
     }
 }
 
@@ -937,6 +1259,7 @@ struct TrackedStream<S> {
     observations: u64,
     discarded_observations: u64,
     sequence_span_sum: u64,
+    recovery_epoch_pending: bool,
 }
 
 impl<S> TrackedStream<S> {
@@ -948,6 +1271,7 @@ impl<S> TrackedStream<S> {
             observations: 0,
             discarded_observations: 0,
             sequence_span_sum: 0,
+            recovery_epoch_pending: false,
         }
     }
 
@@ -969,19 +1293,13 @@ impl<S> TrackedStream<S> {
     }
 
     fn install_recovered(&mut self, stream: S) -> std::io::Result<()> {
-        let mut next_sequence = self.sequence.clone();
-        if let Err(error) = next_sequence.begin_new_epoch() {
-            self.sequence = next_sequence;
-            return Err(std::io::Error::other(error));
+        if self.stream.is_some() {
+            return Err(std::io::Error::other(
+                "replacement capture installed before the old stream was removed",
+            ));
         }
-        let mut next_timestamp = self.timestamp.clone();
-        if let Err(error) = next_timestamp.begin_new_epoch() {
-            self.timestamp = next_timestamp;
-            return Err(std::io::Error::other(error));
-        }
-        self.sequence = next_sequence;
-        self.timestamp = next_timestamp;
         self.stream = Some(stream);
+        self.recovery_epoch_pending = true;
         Ok(())
     }
 }
@@ -1089,6 +1407,30 @@ fn observe_continuity_facts(
     Ok((sequence_observation, timestamp_observation))
 }
 
+fn begin_recovered_continuity_epoch(
+    pending: &mut bool,
+    sequence: &mut frame_provenance::SequenceTracker,
+    timestamp: &mut frame_provenance::TimestampTracker,
+) -> std::io::Result<()> {
+    if !*pending {
+        return Ok(());
+    }
+    let mut next_sequence = sequence.clone();
+    if let Err(error) = next_sequence.begin_new_epoch() {
+        *sequence = next_sequence;
+        return Err(std::io::Error::other(error));
+    }
+    let mut next_timestamp = timestamp.clone();
+    if let Err(error) = next_timestamp.begin_new_epoch() {
+        *timestamp = next_timestamp;
+        return Err(std::io::Error::other(error));
+    }
+    *sequence = next_sequence;
+    *timestamp = next_timestamp;
+    *pending = false;
+    Ok(())
+}
+
 impl<S: ValidatedStream> TrackedStream<S> {
     fn next_discarded(&mut self) -> std::io::Result<()> {
         let Self {
@@ -1098,13 +1440,18 @@ impl<S: ValidatedStream> TrackedStream<S> {
             observations,
             discarded_observations,
             sequence_span_sum,
+            recovery_epoch_pending,
         } = self;
         let dequeued = stream
             .as_mut()
             .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
             .next_validated();
         let facts = match dequeued {
-            Ok((_, facts)) | Err(ValidatedDequeueError::Corrupt(facts)) => facts,
+            Ok((_, facts)) => {
+                begin_recovered_continuity_epoch(recovery_epoch_pending, sequence, timestamp)?;
+                facts
+            }
+            Err(ValidatedDequeueError::Corrupt(facts)) => facts,
             Err(error) => {
                 if error.invalidates_timestamp_epoch() {
                     timestamp.fail_current_epoch();
@@ -1139,6 +1486,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
             observations,
             discarded_observations,
             sequence_span_sum,
+            recovery_epoch_pending,
         } = self;
         let dequeued = stream
             .as_mut()
@@ -1165,6 +1513,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 return Err(error.into_io());
             }
         };
+        begin_recovered_continuity_epoch(recovery_epoch_pending, sequence, timestamp)?;
         let (sequence_observation, timestamp_observation) = observe_continuity_facts(
             sequence,
             timestamp,
@@ -2447,6 +2796,12 @@ pub struct RgbCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
+    #[expect(
+        dead_code,
+        reason = "immutable negotiation evidence is published by the delivered-rate slice"
+    )]
+    requested_interval: frame_interval::FrameInterval,
+    accepted_interval: frame_interval::FrameInterval,
 }
 
 impl RgbCamera {
@@ -2503,9 +2858,7 @@ impl RgbCamera {
                 fourcc_str(&chosen)
             )));
         }
-        state
-            .require_endpoint()
-            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let interval = negotiate_interval_after_format(&state, device, &dev, &fmt)?;
         Ok(Self {
             lease,
             session_active: std::sync::atomic::AtomicBool::new(false),
@@ -2515,6 +2868,8 @@ impl RgbCamera {
             width: fmt.width,
             height: fmt.height,
             negotiated: fmt,
+            requested_interval: interval.requested,
+            accepted_interval: interval.accepted,
         })
     }
 
@@ -2557,7 +2912,11 @@ impl RgbCamera {
         // not (the Codex round's finding 1 on this PR).
         let blc_restore = apply_blc(self);
         let stream = SafeStream::open(
-            V4l2CameraState::new(&self.device, self.lease.clone()),
+            V4l2CameraState::with_interval(
+                &self.device,
+                self.lease.clone(),
+                self.accepted_interval,
+            ),
             &self.device,
             &self.dev,
             &self.negotiated,
@@ -2789,7 +3148,11 @@ impl<'a> RgbSession<'a> {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         drop(self.stream.take()); // STREAMOFF + buffer release before replacement
         let stream = SafeStream::open(
-            V4l2CameraState::new(&self.cam.device, self.cam.lease.clone()),
+            V4l2CameraState::with_interval(
+                &self.cam.device,
+                self.cam.lease.clone(),
+                self.cam.accepted_interval,
+            ),
             &self.cam.device,
             &self.cam.dev,
             &self.cam.negotiated,
@@ -2800,7 +3163,7 @@ impl<'a> RgbSession<'a> {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         self.stream.install_recovered(stream).map_err(|error| {
             Error::Hardware(format!(
-                "{}: could not begin the recovered continuity epochs: {error}",
+                "{}: could not install the recovered stream: {error}",
                 self.cam.device
             ))
         })?;
@@ -3104,13 +3467,7 @@ const IR_CANDIDATES: [(&[u8; 4], IrPixel); 8] = [
     (b"YUYV", IrPixel::YuyvLuma),
 ];
 
-/// Negotiate an IR-decodable format on `dev`, mirroring [`negotiate_rgb_format`]:
-/// walk [`IR_CANDIDATES`] against what the driver advertises, accept the first
-/// one the driver echoes back, and fail with a message naming what it offers.
-fn negotiate_ir_format(device: &str, dev: &Device) -> irlume_common::Result<(Format, IrPixel)> {
-    negotiate_ir_format_via(device, dev, Capture::set_format)
-}
-
+/// Negotiate an IR-decodable format through the injected camera state.
 fn negotiate_ir_format_state<S: CameraState<Device = Device>>(
     device: &str,
     dev: &Device,
@@ -3119,8 +3476,19 @@ fn negotiate_ir_format_state<S: CameraState<Device = Device>>(
     negotiate_ir_format_via(device, dev, |dev, fmt| state.set_format(dev, fmt))
 }
 
+fn negotiate_ir_format_and_interval(
+    device: &str,
+    dev: &Device,
+    lease: &lease::CameraLease,
+) -> irlume_common::Result<(Format, IrPixel, NegotiatedInterval)> {
+    let state = V4l2CameraState::new(device, lease.clone());
+    let (format, pixel) = negotiate_ir_format_state(device, dev, &state)?;
+    let interval = negotiate_interval_after_format(&state, device, dev, &format)?;
+    Ok((format, pixel, interval))
+}
+
 /// The IR candidate walk with the format ioctl injected: capture applies it
-/// through `VIDIOC_S_FMT` ([`negotiate_ir_format`]) while the doctor's
+/// through `VIDIOC_S_FMT` while the doctor's
 /// read-only probe applies the SAME walk through `VIDIOC_TRY_FMT`
 /// ([`negotiated_stream`]). One walk, two ioctls, so the probe cannot drift
 /// from what capture negotiates.
@@ -3433,6 +3801,12 @@ pub struct IrCamera {
     /// buffers (#427); see `format_moved` for why the geometry alone is not
     /// enough.
     negotiated: v4l::Format,
+    #[expect(
+        dead_code,
+        reason = "immutable negotiation evidence is published by the delivered-rate slice"
+    )]
+    requested_interval: frame_interval::FrameInterval,
+    accepted_interval: frame_interval::FrameInterval,
     width: u32,
     height: u32,
     card: String,
@@ -3474,10 +3848,8 @@ impl IrCamera {
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
         let (fmt, pix) = negotiate_ir_format_state(device, &dev, &state)?;
+        let interval = negotiate_interval_after_format(&state, device, &dev, &fmt)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
-        state
-            .require_endpoint()
-            .map_err(|error| Error::Hardware(error.to_string()))?;
         Ok(Self {
             lease,
             session_active: std::sync::atomic::AtomicBool::new(false),
@@ -3487,6 +3859,8 @@ impl IrCamera {
             quantization: fmt.quantization,
             fourcc: fourcc_str(&fmt.fourcc.repr),
             negotiated: fmt,
+            requested_interval: interval.requested,
+            accepted_interval: interval.accepted,
             width: fmt.width,
             height: fmt.height,
             card,
@@ -3541,7 +3915,11 @@ impl IrCamera {
         // this change removes. Assigned further down, once the stream exists.
         let mode;
         let mut stream = TrackedStream::new(SafeStream::open(
-            V4l2CameraState::new(&self.device, self.lease.clone()),
+            V4l2CameraState::with_interval(
+                &self.device,
+                self.lease.clone(),
+                self.accepted_interval,
+            ),
             &self.device,
             &self.dev,
             &self.negotiated,
@@ -4052,7 +4430,11 @@ impl IrSession<'_> {
         })?;
         self._mode = ir_emitter::StreamMode::inert();
         let stream = SafeStream::open(
-            V4l2CameraState::new(&self.cam.device, self.cam.lease.clone()),
+            V4l2CameraState::with_interval(
+                &self.cam.device,
+                self.cam.lease.clone(),
+                self.cam.accepted_interval,
+            ),
             &self.cam.device,
             &self.cam.dev,
             &self.cam.negotiated,
@@ -4076,7 +4458,7 @@ impl IrSession<'_> {
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             self.stream.install_recovered(stream).map_err(|error| {
                 Error::Hardware(format!(
-                    "{}: could not begin the recovered continuity epochs: {error}",
+                    "{}: could not install the recovered stream: {error}",
                     self.cam.device
                 ))
             })
@@ -4095,7 +4477,7 @@ impl IrSession<'_> {
 /// are diagnostics for the strobe-probe example. Kept in the crate so the
 /// example and the capture path share one implementation.
 pub mod ir_probe {
-    use super::negotiate_ir_format;
+    use super::negotiate_ir_format_and_interval;
     use super::Device;
     use super::{
         ir_emitter, map_io, privacy_engaged_with_permit, verify_pinned, Error, Frame, Spectrum,
@@ -4234,7 +4616,7 @@ pub mod ir_probe {
             )));
         }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-        let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+        let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
         let mut dec = super::IrDecoder::new(pix, fmt.quantization);
         let (w, h) = (fmt.width, fmt.height);
         let binding = permit
@@ -4257,7 +4639,7 @@ pub mod ir_probe {
         // lands before streaming starts.
         let mode;
         let stream = super::SafeStream::open(
-            super::V4l2CameraState::new(device, permit.clone()),
+            super::V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
             device,
             &dev,
             &fmt,
@@ -4356,7 +4738,7 @@ pub fn capture_ir_streaming<B>(
         )));
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let binding = permit
@@ -4379,7 +4761,7 @@ pub fn capture_ir_streaming<B>(
     // lands before streaming starts.
     let mut mode;
     let stream = SafeStream::open(
-        V4l2CameraState::new(device, permit.clone()),
+        V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
         &fmt,
@@ -4457,7 +4839,7 @@ pub fn capture_ir_streaming<B>(
                     ))
                 })?;
                 let replacement = SafeStream::open(
-                    V4l2CameraState::new(device, permit.clone()),
+                    V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
                     device,
                     &dev,
                     &fmt,
@@ -4470,7 +4852,7 @@ pub fn capture_ir_streaming<B>(
                     })
                     .map_err(|error| {
                         Error::Hardware(format!(
-                            "{device}: could not begin the recovered continuity epochs: {error}"
+                            "{device}: could not install the recovered stream: {error}"
                         ))
                     })?;
                 mode = replacement_mode;
@@ -4535,7 +4917,7 @@ pub fn capture_ir_sequence(
         )));
     }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
-    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let binding = permit
@@ -4558,7 +4940,7 @@ pub fn capture_ir_sequence(
     // lands before streaming starts.
     let mut mode;
     let stream = SafeStream::open(
-        V4l2CameraState::new(device, permit.clone()),
+        V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
         &fmt,
@@ -4640,7 +5022,7 @@ pub fn capture_ir_sequence(
                     ))
                 })?;
                 let replacement = SafeStream::open(
-                    V4l2CameraState::new(device, permit.clone()),
+                    V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
                     device,
                     &dev,
                     &fmt,
@@ -4653,7 +5035,7 @@ pub fn capture_ir_sequence(
                     })
                     .map_err(|error| {
                         Error::Hardware(format!(
-                            "{device}: could not begin the recovered continuity epochs: {error}"
+                            "{device}: could not install the recovered stream: {error}"
                         ))
                     })?;
                 mode = replacement_mode;
@@ -5546,11 +5928,11 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     // `found` on the success path) and has to finish before this re-raises the
     // signal that stops the process.
     let _abort_orderly = ir_emitter::AbortOnSignal::install();
-    let (fmt, pix) = negotiate_ir_format(device, &dev)?;
+    let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = SafeStream::open(
-        V4l2CameraState::new(device, permit.clone()),
+        V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
         &fmt,
@@ -5847,6 +6229,13 @@ mod tests {
         calls: CallLog,
         echoed: Format,
         current: Format,
+        format_reads: std::cell::RefCell<std::collections::VecDeque<Format>>,
+        accepted_interval: frame_interval::FrameInterval,
+        current_interval: frame_interval::FrameInterval,
+        interval_reads:
+            std::cell::RefCell<std::collections::VecDeque<frame_interval::FrameInterval>>,
+        interval_domain: frame_interval::FrameIntervalDomain,
+        set_interval_response: frame_interval::FrameInterval,
         endpoint_calls: std::cell::Cell<usize>,
         fail_set: bool,
         fail_endpoint_at: Option<usize>,
@@ -5857,11 +6246,20 @@ mod tests {
     impl FakeCameraState {
         fn new(format: Format) -> (Self, CallLog) {
             let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let interval =
+                frame_interval::FrameInterval::new(1, 30).expect("valid fixture interval");
             (
                 Self {
                     calls: calls.clone(),
                     echoed: format,
                     current: format,
+                    format_reads: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                    accepted_interval: interval,
+                    current_interval: interval,
+                    interval_reads: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                    interval_domain: frame_interval::FrameIntervalDomain::discrete(vec![interval])
+                        .expect("valid fixture domain"),
+                    set_interval_response: interval,
                     endpoint_calls: std::cell::Cell::new(0),
                     fail_set: false,
                     fail_endpoint_at: None,
@@ -5885,6 +6283,26 @@ mod tests {
             } else {
                 Ok(self.echoed)
             }
+        }
+
+        fn interval_domain(
+            &self,
+            _dev: &(),
+            _format: &Format,
+        ) -> irlume_common::Result<frame_interval::FrameIntervalDomain> {
+            self.calls.borrow_mut().push("enum_intervals");
+            Ok(self.interval_domain.clone())
+        }
+
+        fn set_interval(
+            &self,
+            _dev: &(),
+            _query: frame_interval::FrameIntervalQuery,
+            _requested: frame_interval::FrameInterval,
+            _stage: &'static str,
+        ) -> irlume_common::Result<frame_interval::FrameInterval> {
+            self.calls.borrow_mut().push("set_interval");
+            Ok(self.set_interval_response)
         }
 
         fn require_endpoint(&self) -> Result<(), Self::EndpointError> {
@@ -5915,9 +6333,31 @@ mod tests {
             })
         }
 
+        fn accepted_interval(&self) -> Option<frame_interval::FrameInterval> {
+            Some(self.accepted_interval)
+        }
+
         fn current_format(&self, _dev: &()) -> std::io::Result<Format> {
             self.calls.borrow_mut().push("g_fmt");
-            Ok(self.current)
+            Ok(self
+                .format_reads
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.current))
+        }
+
+        fn current_interval(
+            &self,
+            _dev: &(),
+            _query: frame_interval::FrameIntervalQuery,
+            _stage: &'static str,
+        ) -> irlume_common::Result<frame_interval::FrameInterval> {
+            self.calls.borrow_mut().push("get_interval");
+            Ok(self
+                .interval_reads
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.current_interval))
         }
 
         fn start_stream(&self) -> irlume_common::Result<()> {
@@ -5942,10 +6382,28 @@ mod tests {
         format
     }
 
+    fn interval(numerator: u32, denominator: u32) -> frame_interval::FrameInterval {
+        frame_interval::FrameInterval::new(numerator, denominator).expect("valid test interval")
+    }
+
+    fn fake_query() -> frame_interval::FrameIntervalQuery {
+        frame_interval::FrameIntervalQuery::new(*b"GREY", 640, 480).expect("valid query")
+    }
+
+    fn streamparm_response(numerator: u32, denominator: u32) -> v4l::v4l_sys::v4l2_streamparm {
+        let mut wire = streamparm_request(None);
+        wire.parm.capture.capability = v4l::v4l_sys::V4L2_CAP_TIMEPERFRAME;
+        wire.parm.capture.timeperframe.numerator = numerator;
+        wire.parm.capture.timeperframe.denominator = denominator;
+        wire
+    }
+
     fn exercise_fake_happy_path(format: Format) -> Vec<&'static str> {
-        let (state, calls) = FakeCameraState::new(format);
+        let (mut state, calls) = FakeCameraState::new(format);
         let echoed = state.set_format(&(), &format).expect("S_FMT");
-        state.require_endpoint().expect("endpoint after S_FMT");
+        let negotiated = negotiate_interval_after_format(&state, "/dev/fake", &(), &echoed)
+            .expect("interval negotiation");
+        state.accepted_interval = negotiated.accepted;
         let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &echoed)
             .expect("buffer claim orchestration");
         stream.next().expect("first dequeue");
@@ -5959,21 +6417,369 @@ mod tests {
         let expected = vec![
             "set_format",
             "endpoint",
+            "enum_intervals",
+            "get_interval",
+            "set_interval",
             "endpoint",
-            "check_format",
-            "reqbufs",
             "g_fmt",
-            "endpoint",
             "check_format",
+            "get_interval",
+            "endpoint",
+            "g_fmt",
+            "check_format",
+            "get_interval",
+            "reqbufs",
+            "endpoint",
+            "g_fmt",
+            "check_format",
+            "get_interval",
             "start",
             "endpoint",
             "dequeue",
             "endpoint",
+            "g_fmt",
+            "check_format",
+            "get_interval",
             "cleanup",
             "stop",
         ];
         assert_eq!(exercise_fake_happy_path(fake_format(b"YUYV")), expected);
         assert_eq!(exercise_fake_happy_path(fake_format(b"GREY")), expected);
+    }
+
+    #[test]
+    fn streamparm_adapter_zeroes_full_request_and_reduces_exact_response() {
+        let requested = interval(2, 60);
+        let request = streamparm_request(Some(requested));
+        assert_eq!(std::mem::size_of_val(&request), 204);
+        assert_eq!(request.type_, Type::VideoCapture as u32);
+        // SAFETY: `streamparm_request` set VideoCapture and initialized the
+        // capture arm before this fixture reads its scalar fields.
+        let capture = unsafe { request.parm.capture };
+        assert_eq!(capture.capability, 0);
+        assert_eq!(capture.capturemode, 0);
+        assert_eq!(capture.timeperframe.numerator, 1);
+        assert_eq!(capture.timeperframe.denominator, 30);
+        assert_eq!(capture.extendedmode, 0);
+        assert_eq!(capture.readbuffers, 0);
+        assert_eq!(capture.reserved, [0; 4]);
+        // SAFETY: every byte of the union was zero-initialized before only the
+        // timeperframe subrange was written; raw inspection is fixture-only.
+        let raw = unsafe { request.parm.raw_data };
+        assert!(raw[..8].iter().all(|byte| *byte == 0));
+        assert!(raw[16..].iter().all(|byte| *byte == 0));
+
+        let mut response = streamparm_response(2, 60);
+        response.parm.capture.readbuffers = u32::MAX;
+        assert_eq!(
+            validate_streamparm_response("/dev/fake", fake_query(), "test", &response)
+                .expect("unreduced equivalent response"),
+            interval(1, 30)
+        );
+    }
+
+    #[test]
+    fn streamparm_adapter_rejects_malformed_responses_and_errno() {
+        let base = streamparm_response(1, 30);
+
+        let mut wrong_type = base;
+        wrong_type.type_ = Type::VideoOutput as u32;
+        assert!(
+            validate_streamparm_response("/dev/fake", fake_query(), "wrong type", &wrong_type)
+                .unwrap_err()
+                .to_string()
+                .contains("returned type")
+        );
+
+        let mut no_capability = base;
+        no_capability.parm.capture.capability = 0;
+        assert!(validate_streamparm_response(
+            "/dev/fake",
+            fake_query(),
+            "no capability",
+            &no_capability,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("V4L2_CAP_TIMEPERFRAME"));
+
+        for (numerator, denominator, needle) in [(0, 30, "numerator"), (1, 0, "denominator")] {
+            let malformed = streamparm_response(numerator, denominator);
+            assert!(validate_streamparm_response(
+                "/dev/fake",
+                fake_query(),
+                "zero rational",
+                &malformed,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains(needle));
+        }
+
+        let mut extended = base;
+        extended.parm.capture.extendedmode = 1;
+        assert!(
+            validate_streamparm_response("/dev/fake", fake_query(), "extended", &extended)
+                .unwrap_err()
+                .to_string()
+                .contains("extendedmode")
+        );
+
+        let mut reserved = base;
+        // SAFETY: the fixture was initialized with the capture arm and keeps
+        // `type_` set to VideoCapture while corrupting one response field.
+        unsafe {
+            reserved.parm.capture.reserved[3] = 1;
+        }
+        assert!(
+            validate_streamparm_response("/dev/fake", fake_query(), "reserved", &reserved)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+
+        let error = streamparm_transaction(
+            "/dev/fake",
+            fake_query(),
+            "errno stage",
+            "VIDIOC_G_PARM",
+            None,
+            |_| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("/dev/fake"));
+        assert!(error.contains("errno stage"));
+        assert!(error.contains("VIDIOC_G_PARM"));
+        assert!(error.contains("Input/output error"));
+    }
+
+    #[test]
+    fn streamparm_set_transaction_sends_only_type_and_timeperframe() {
+        let accepted = streamparm_transaction(
+            "/dev/fake",
+            fake_query(),
+            "set stage",
+            "VIDIOC_S_PARM",
+            Some(interval(1, 30)),
+            |wire| {
+                assert_eq!(wire.type_, Type::VideoCapture as u32);
+                // SAFETY: the transaction constructed the VideoCapture request
+                // and initialized this active union arm before invoking the fixture.
+                let capture = unsafe { wire.parm.capture };
+                assert_eq!(capture.capability, 0);
+                assert_eq!(capture.capturemode, 0);
+                assert_eq!(capture.timeperframe.numerator, 1);
+                assert_eq!(capture.timeperframe.denominator, 30);
+                assert_eq!(capture.extendedmode, 0);
+                assert_eq!(capture.readbuffers, 0);
+                assert_eq!(capture.reserved, [0; 4]);
+                // SAFETY: the request union was fully zeroed before only its
+                // timeperframe bytes were written; raw inspection is fixture-only.
+                let raw = unsafe { wire.parm.raw_data };
+                assert!(raw[..8].iter().all(|byte| *byte == 0));
+                assert!(raw[16..].iter().all(|byte| *byte == 0));
+                *wire = streamparm_response(2, 60);
+                Ok(())
+            },
+        )
+        .expect("valid adjusted response");
+        assert_eq!(accepted, interval(1, 30));
+    }
+
+    #[test]
+    fn factory_interval_negotiation_requires_domain_membership_and_stores_exact_evidence() {
+        let format = fake_format(b"GREY");
+        let (mut state, _) = FakeCameraState::new(format);
+        state.interval_domain =
+            frame_interval::FrameIntervalDomain::discrete(vec![interval(1, 30), interval(1, 15)])
+                .unwrap();
+        state.set_interval_response = interval(1, 15);
+        state
+            .interval_reads
+            .borrow_mut()
+            .extend([interval(1, 30), interval(1, 15)]);
+        let evidence = negotiate_interval_after_format(&state, "/dev/fake", &(), &format)
+            .expect("declared adjusted interval");
+        assert_eq!(evidence.requested, interval(1, 30));
+        assert_eq!(evidence.accepted, interval(1, 15));
+
+        let (mut outside_default, calls) = FakeCameraState::new(format);
+        outside_default.current_interval = interval(1, 25);
+        assert!(
+            negotiate_interval_after_format(&outside_default, "/dev/fake", &(), &format)
+                .unwrap_err()
+                .to_string()
+                .contains("driver default")
+        );
+        assert!(!calls.borrow().contains(&"set_interval"));
+
+        let domains = [
+            frame_interval::FrameIntervalDomain::discrete(vec![interval(1, 30)]).unwrap(),
+            frame_interval::FrameIntervalDomain::continuous(interval(1, 60), interval(1, 15))
+                .unwrap(),
+            frame_interval::FrameIntervalDomain::stepwise(
+                interval(1, 60),
+                interval(1, 30),
+                interval(1, 180),
+            )
+            .unwrap(),
+        ];
+        let rejected = [interval(1, 25), interval(1, 10), interval(1, 50)];
+        for (domain, adjusted) in domains.into_iter().zip(rejected) {
+            let (mut state, _) = FakeCameraState::new(format);
+            state.interval_domain = domain;
+            state.set_interval_response = adjusted;
+            assert!(
+                negotiate_interval_after_format(&state, "/dev/fake", &(), &format)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("driver accepted")
+            );
+        }
+    }
+
+    #[test]
+    fn factory_post_set_readback_detects_every_full_format_field() {
+        let format = fake_format(b"GREY");
+        let mut moved = Vec::new();
+        let mut value = format;
+        value.fourcc = FourCC::new(b"YUYV");
+        moved.push(value);
+        let mut value = format;
+        value.width += 1;
+        moved.push(value);
+        let mut value = format;
+        value.height += 1;
+        moved.push(value);
+        let mut value = format;
+        value.stride += 1;
+        moved.push(value);
+        let mut value = format;
+        value.size += 1;
+        moved.push(value);
+        let mut value = format;
+        value.field_order = v4l::format::FieldOrder::Interlaced;
+        moved.push(value);
+        let mut value = format;
+        value.colorspace = v4l::format::Colorspace::Rec709;
+        moved.push(value);
+        let mut value = format;
+        value.quantization = v4l::format::Quantization::LimitedRange;
+        moved.push(value);
+        let mut value = format;
+        value.transfer = v4l::format::TransferFunction::Rec709;
+        moved.push(value);
+        let mut value = format;
+        value.flags = v4l::format::Flags::empty();
+        moved.push(value);
+
+        for current in moved {
+            let (mut state, _) = FakeCameraState::new(format);
+            state.current = current;
+            assert!(
+                negotiate_interval_after_format(&state, "/dev/fake", &(), &format)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stream state drift")
+            );
+        }
+    }
+
+    #[test]
+    fn first_dequeue_refuses_format_or_interval_drift_and_validates_only_once() {
+        let format = fake_format(b"GREY");
+        let accepted = interval(1, 30);
+
+        let (state, calls) = FakeCameraState::new(format);
+        let mut changed = format;
+        changed.stride += 1;
+        state
+            .format_reads
+            .borrow_mut()
+            .extend([format, format, changed]);
+        let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &format).unwrap();
+        assert!(stream
+            .next()
+            .unwrap_err()
+            .to_string()
+            .contains("stream state drift"));
+        drop(stream);
+        assert!(calls.borrow().ends_with(&["cleanup", "stop"]));
+
+        let (state, calls) = FakeCameraState::new(format);
+        state
+            .interval_reads
+            .borrow_mut()
+            .extend([accepted, accepted, interval(1, 25)]);
+        let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &format).unwrap();
+        assert!(stream
+            .next()
+            .unwrap_err()
+            .to_string()
+            .contains("stream interval drift"));
+        drop(stream);
+        assert!(calls.borrow().ends_with(&["cleanup", "stop"]));
+
+        let (state, calls) = FakeCameraState::new(format);
+        let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &format).unwrap();
+        stream.next().expect("first frame");
+        stream.next().expect("second frame");
+        drop(stream);
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "get_interval")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn every_stream_endpoint_boundary_fails_closed_and_tears_down() {
+        let format = fake_format(b"GREY");
+        for fail_at in 1..=4 {
+            let (mut state, calls) = FakeCameraState::new(format);
+            state.fail_endpoint_at = Some(fail_at);
+            match CameraStateStream::open(state, "/dev/fake", &(), &format) {
+                Err(_) if fail_at <= 2 => {}
+                Ok(mut stream) if fail_at > 2 => {
+                    assert!(
+                        stream.next().is_err(),
+                        "boundary {fail_at} returned a frame"
+                    );
+                    drop(stream);
+                }
+                Ok(_) => panic!("boundary {fail_at} should fail during open"),
+                Err(error) => panic!("boundary {fail_at} failed too early: {error}"),
+            }
+            let calls = calls.borrow();
+            if fail_at == 1 {
+                assert!(!calls.contains(&"cleanup"));
+            } else {
+                assert!(calls.contains(&"cleanup"));
+            }
+            if fail_at > 2 {
+                assert!(calls.ends_with(&["cleanup", "stop"]));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_open_uses_immutable_accepted_interval_and_never_sets_it() {
+        let format = fake_format(b"GREY");
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.accepted_interval = interval(1, 30);
+        state.current_interval = interval(1, 25);
+        let error = match CameraStateStream::open(state, "/dev/fake", &(), &format) {
+            Ok(_) => panic!("recovery must refuse accepted-interval drift"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("accepted 1/30"));
+        let calls = calls.borrow();
+        assert!(!calls.contains(&"set_interval"));
+        assert!(!calls.contains(&"reqbufs"));
     }
 
     #[test]
@@ -5994,7 +6800,16 @@ mod tests {
         let (mut state, calls) = FakeCameraState::new(format);
         state.fail_claim = true;
         assert!(CameraStateStream::open(state, "/dev/fake", &(), &format).is_err());
-        assert_eq!(&*calls.borrow(), &["endpoint", "check_format", "reqbufs"]);
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "endpoint",
+                "g_fmt",
+                "check_format",
+                "get_interval",
+                "reqbufs"
+            ]
+        );
 
         let (mut state, calls) = FakeCameraState::new(format);
         state.fail_endpoint_at = Some(2);
@@ -6003,9 +6818,10 @@ mod tests {
             &*calls.borrow(),
             &[
                 "endpoint",
-                "check_format",
-                "reqbufs",
                 "g_fmt",
+                "check_format",
+                "get_interval",
+                "reqbufs",
                 "endpoint",
                 "cleanup"
             ]
@@ -6020,11 +6836,14 @@ mod tests {
             &*calls.borrow(),
             &[
                 "endpoint",
-                "check_format",
-                "reqbufs",
                 "g_fmt",
-                "endpoint",
                 "check_format",
+                "get_interval",
+                "reqbufs",
+                "endpoint",
+                "g_fmt",
+                "check_format",
+                "get_interval",
                 "start",
                 "endpoint",
                 "dequeue",
@@ -6063,11 +6882,14 @@ mod tests {
             &*calls.borrow(),
             &[
                 "endpoint",
-                "check_format",
-                "reqbufs",
                 "g_fmt",
-                "endpoint",
                 "check_format",
+                "get_interval",
+                "reqbufs",
+                "endpoint",
+                "g_fmt",
+                "check_format",
+                "get_interval",
                 "start",
                 "endpoint",
                 "cleanup",
@@ -6119,19 +6941,8 @@ mod tests {
                 Ok(_) => panic!("every full-format drift must fail closed"),
                 Err(error) => error,
             };
-            assert!(error.to_string().contains("stream format changed"));
-            assert_eq!(
-                &*calls.borrow(),
-                &[
-                    "endpoint",
-                    "check_format",
-                    "reqbufs",
-                    "g_fmt",
-                    "endpoint",
-                    "check_format",
-                    "cleanup"
-                ]
-            );
+            assert!(error.to_string().contains("stream state drift"));
+            assert_eq!(&*calls.borrow(), &["endpoint", "g_fmt", "check_format"]);
         }
     }
 
@@ -6347,9 +7158,32 @@ mod tests {
         assert_eq!(capture.accounting(), (u64::MAX, 0, 0));
     }
 
+    struct RecoveryValidationFixture {
+        payload: [u8; 1],
+        metadata: v4l::buffer::Metadata,
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+        fail_validation: bool,
+    }
+
     struct ContinuityFixture {
         payload: [u8; 1],
         metadata: v4l::buffer::Metadata,
+    }
+
+    impl ValidatedStream for RecoveryValidationFixture {
+        fn next_validated(
+            &mut self,
+        ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail_validation {
+                return Err(ValidatedDequeueError::Io(std::io::Error::other(
+                    "replacement validation failed",
+                )));
+            }
+            let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&self.metadata, 1)
+                .map_err(ValidatedDequeueError::Facts)?;
+            Ok((&self.payload, facts))
+        }
     }
 
     impl ValidatedStream for ContinuityFixture {
@@ -6800,6 +7634,54 @@ mod tests {
     }
 
     #[test]
+    fn recovered_stream_validates_before_continuity_epoch_installation() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fixture = |fail_validation| RecoveryValidationFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata::default(),
+            calls: calls.clone(),
+            fail_validation,
+        };
+        let mut capture = TrackedStream::new(fixture(false));
+        capture.sequence.force_stream_epoch_overflow_on_recovery();
+        assert!(capture.take().is_some());
+        capture
+            .install_recovered(fixture(false))
+            .expect("replacement installation is lazy");
+        assert!(capture.next_discarded().is_err());
+        assert_eq!(calls.get(), 1, "replacement was not validated first");
+
+        let failed_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut validation_failure = TrackedStream::new(RecoveryValidationFixture {
+            payload: [1],
+            metadata: v4l::buffer::Metadata::default(),
+            calls: failed_calls.clone(),
+            fail_validation: false,
+        });
+        let sequence_state = validation_failure.sequence.continuity_state_for_test();
+        let timestamp_state = validation_failure.timestamp.continuity_state_for_test();
+        assert!(validation_failure.take().is_some());
+        validation_failure
+            .install_recovered(RecoveryValidationFixture {
+                payload: [1],
+                metadata: v4l::buffer::Metadata::default(),
+                calls: failed_calls.clone(),
+                fail_validation: true,
+            })
+            .expect("replacement installation is lazy");
+        assert!(validation_failure.next().is_err());
+        assert_eq!(failed_calls.get(), 1);
+        assert_eq!(
+            validation_failure.sequence.continuity_state_for_test(),
+            sequence_state
+        );
+        assert_eq!(
+            validation_failure.timestamp.continuity_state_for_test(),
+            timestamp_state
+        );
+    }
+
+    #[test]
     fn recovery_epoch_overflow_never_partially_publishes_state() {
         let fixture = || ContinuityFixture {
             payload: [1],
@@ -6811,8 +7693,11 @@ mod tests {
             .sequence
             .force_stream_epoch_overflow_on_recovery();
         assert!(sequence_failure.take().is_some());
-        assert!(sequence_failure.install_recovered(fixture()).is_err());
-        assert!(sequence_failure.stream_mut().is_none());
+        sequence_failure
+            .install_recovered(fixture())
+            .expect("replacement installation is lazy");
+        assert!(sequence_failure.next().is_err());
+        assert!(sequence_failure.stream_mut().is_some());
         assert!(sequence_failure.sequence.failed_for_test());
         assert!(!sequence_failure.timestamp.failed_for_test());
         assert_eq!(sequence_failure.timestamp.stream_epoch_for_test(), 0);
@@ -6822,8 +7707,11 @@ mod tests {
             .timestamp
             .force_stream_epoch_overflow_on_recovery();
         assert!(timestamp_failure.take().is_some());
-        assert!(timestamp_failure.install_recovered(fixture()).is_err());
-        assert!(timestamp_failure.stream_mut().is_none());
+        timestamp_failure
+            .install_recovered(fixture())
+            .expect("replacement installation is lazy");
+        assert!(timestamp_failure.next().is_err());
+        assert!(timestamp_failure.stream_mut().is_some());
         assert!(!timestamp_failure.sequence.failed_for_test());
         assert_eq!(timestamp_failure.sequence.stream_epoch_for_test(), 0);
         assert!(timestamp_failure.timestamp.failed_for_test());

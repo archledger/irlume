@@ -480,6 +480,20 @@ struct DirectSource {
     file: File,
 }
 
+struct BorrowedFdSource {
+    fd: std::os::fd::RawFd,
+}
+
+impl RecordSource for BorrowedFdSource {
+    fn record(
+        &mut self,
+        query: FrameIntervalQuery,
+        index: u32,
+    ) -> Result<RawRecord, std::io::Error> {
+        direct_record(self.fd, query, index)
+    }
+}
+
 impl RecordSource for DirectSource {
     fn record(
         &mut self,
@@ -575,6 +589,22 @@ fn direct_record(
         reserved: raw.reserved,
         kind,
     })
+}
+
+/// Enumerates exact frame intervals on a caller-owned, already authorized fd.
+///
+/// This crate-private entrypoint performs no open, lease acquisition, endpoint
+/// lookup, or device-state mutation. The caller owns those lifecycle checks.
+pub(crate) fn frame_interval_capabilities_for_fd(
+    device: &str,
+    fd: std::os::fd::RawFd,
+    fourcc: [u8; 4],
+    width: u32,
+    height: u32,
+) -> Result<FrameIntervalDomain, FrameIntervalError> {
+    let query = FrameIntervalQuery::new(fourcc, width, height)?;
+    let mut source = BorrowedFdSource { fd };
+    enumerate_via(query, &mut source).map_err(|error| error.with_device(device))
 }
 
 /// Enumerates exact frame-interval capabilities without changing device state.
@@ -710,6 +740,24 @@ mod tests {
 
     fn errno(code: i32) -> std::io::Error {
         std::io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn same_fd_entrypoint_borrows_descriptor_and_retains_device_context() {
+        let file = File::open("/dev/null").expect("test fd");
+        let error = frame_interval_capabilities_for_fd(
+            "/dev/fake-owned-by-caller",
+            file.as_raw_fd(),
+            *b"YUYV",
+            640,
+            480,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/dev/fake-owned-by-caller"));
+        assert!(
+            file.metadata().is_ok(),
+            "same-fd enumeration closed caller fd"
+        );
     }
 
     #[test]

@@ -531,6 +531,11 @@ pub enum Request {
     /// must NOT enumerate for themselves; a second opener racing the
     /// daemon's stream is EBUSY on strict UVC modules (#187).
     ListCameras,
+    /// Machine-readable delivered-rate diagnostics for the configured camera
+    /// pair (issue #462). CAMERA-CLASS: runs the normal gated capture session
+    /// per present role and reports the measured evidence; a below-floor stream
+    /// is returned as a measured `fail`, never degraded to English.
+    CameraDiagnostics,
     /// Liveness/health ping.
     Ping,
     /// Daemon self-report: what it actually has loaded and which camera tier it
@@ -901,6 +906,8 @@ pub enum Response {
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
+    /// Delivered-rate diagnostic report (`CameraDiagnostics`).
+    CameraDiagnostics(CameraDiagnosticsReport),
     /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
     /// eye was detected in any frame.
     EarMedian(Option<f32>),
@@ -1004,6 +1011,76 @@ pub enum Response {
     },
 }
 
+/// One logical stream role's delivered-rate measurement, as a plain serializable
+/// DTO with no camera-crate dependency. Carried by [`Error::DeliveredRate`] and
+/// embedded in [`Response::CameraDiagnostics`] so a caller can act on an
+/// under-rate stream without parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraStreamRateEvidence {
+    /// `"rgb"` or `"ir"`.
+    pub role: String,
+    /// Requested frame interval, numerator and denominator (reduced).
+    pub requested_num: u32,
+    pub requested_den: u32,
+    /// Accepted (negotiated) frame interval, numerator and denominator (reduced).
+    pub accepted_num: u32,
+    pub accepted_den: u32,
+    /// Exact floor numerator/denominator in frames per second.
+    pub floor_num: u32,
+    pub floor_den: u32,
+    /// Whole-percent tolerance applied to the floor (98).
+    pub tolerance_percent: u32,
+    /// Number of deltas held in the rolling window.
+    pub window_count: u32,
+    /// Sum of the held deltas in microseconds.
+    pub window_span_us: u64,
+    /// Exact delivered rate numerator/denominator in frames per second (reduced).
+    pub delivered_num: u64,
+    pub delivered_den: u64,
+    /// Whether the measured rate clears the exact floor.
+    pub meets_floor: bool,
+    /// Sequence gap of the latest delivered frame.
+    pub sequence_gap: u32,
+    /// Cumulative dropped frames reported by sequence continuity.
+    pub cumulative_drops: u64,
+    /// V4L2 timestamp clock (`"monotonic"`, `"copy"`, `"unknown"`).
+    pub clock: String,
+    /// V4L2 timestamp source (`"end_of_frame"`, `"start_of_exposure"`).
+    pub source: String,
+    /// Latest successful timestamp in microseconds.
+    pub latest_timestamp_us: i64,
+    /// Stream epoch the evidence belongs to.
+    pub stream_epoch: u64,
+}
+
+/// One role's diagnostic result: whether it is known, its state, and the exact
+/// rate evidence when a measurement exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraRoleDiagnostic {
+    /// Whether this role is present on the machine at all.
+    pub known: bool,
+    /// `"measured"` (floor cleared), `"fail"` (under-rate), `"missing"` (no
+    /// node), or `"unknown"` (open/transport failure).
+    pub state: String,
+    /// Exact evidence, present for `measured` and `fail`, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub evidence: Option<CameraStreamRateEvidence>,
+}
+
+/// Complete machine diagnostic report for [`Response::CameraDiagnostics`].
+///
+/// Deliberately free of device paths, account identity, and template data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraDiagnosticsReport {
+    pub rgb: CameraRoleDiagnostic,
+    pub ir: CameraRoleDiagnostic,
+    /// Same-domain RGB/IR skew in microseconds. `None` means unknown (the two
+    /// latest timestamps do not share clock and source, or a role is missing).
+    pub skew_us: Option<i64>,
+    /// Capture strategy used by the diagnostic (`"burst"`, `"streaming"`, …).
+    pub capture_strategy: String,
+}
+
 /// Crate-wide error type.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1019,6 +1096,11 @@ pub enum Error {
     Tpm(String),
     #[error("policy: {0}")]
     Policy(String),
+    /// The camera delivered frames below the exact role floor. Carries the
+    /// machine-readable measurement so callers act on the rate, not the prose;
+    /// the message is a fixed, stable string and the evidence rides in the payload.
+    #[error("delivered rate below floor")]
+    DeliveredRate(Box<CameraStreamRateEvidence>),
     /// A long camera operation stopped early because an authentication needed
     /// the camera. Distinct from a failure: nothing went wrong and nothing was
     /// written, so the caller should say "retry", not "it broke".
@@ -1047,6 +1129,72 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+
+    /// The delivered-rate DTO is a plain serializable carrier: snake_case JSON
+    /// round-trips every field, and the typed error keeps a stable,
+    /// machine-parseable message with the evidence recoverable from the payload
+    /// rather than parsed from prose (#462).
+    #[test]
+    fn delivered_rate_error_carries_machine_readable_evidence() {
+        use super::{CameraStreamRateEvidence, Error};
+
+        let evidence = CameraStreamRateEvidence {
+            role: "ir".to_string(),
+            requested_num: 1,
+            requested_den: 15,
+            accepted_num: 1,
+            accepted_den: 15,
+            floor_num: 15,
+            floor_den: 1,
+            tolerance_percent: 98,
+            window_count: 30,
+            window_span_us: 2_000_000,
+            delivered_num: 15,
+            delivered_den: 1,
+            meets_floor: true,
+            sequence_gap: 0,
+            cumulative_drops: 0,
+            clock: "monotonic".to_string(),
+            source: "end_of_frame".to_string(),
+            latest_timestamp_us: 123_456_789,
+            stream_epoch: 1,
+        };
+
+        // snake_case JSON round-trips every field exactly.
+        let json = serde_json::to_string(&evidence).expect("serialize");
+        assert!(
+            json.contains("\"requested_num\":1"),
+            "requested_num: {json}"
+        );
+        assert!(
+            json.contains("\"window_span_us\":2000000"),
+            "window_span_us: {json}"
+        );
+        assert!(
+            json.contains("\"delivered_num\":15"),
+            "delivered_num: {json}"
+        );
+        assert!(
+            json.contains("\"tolerance_percent\":98"),
+            "tolerance_percent: {json}"
+        );
+        assert!(
+            json.contains("\"latest_timestamp_us\":123456789"),
+            "latest: {json}"
+        );
+        assert!(json.contains("\"clock\":\"monotonic\""), "clock: {json}");
+        let round: CameraStreamRateEvidence = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round, evidence);
+
+        // The error message is a fixed, stable prefix; the evidence is carried
+        // in the payload, not logged into the prose.
+        let error = Error::DeliveredRate(Box::new(evidence.clone()));
+        assert_eq!(error.to_string(), "delivered rate below floor");
+        match error {
+            Error::DeliveredRate(inner) => assert_eq!(*inner, evidence),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 
     /// The digest a `HashedModel` reports must be the digest of the bytes it
     /// carries, because callers skip their own hashing on the strength of it

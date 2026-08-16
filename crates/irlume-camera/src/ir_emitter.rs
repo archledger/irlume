@@ -2824,7 +2824,7 @@ pub(crate) fn recover_pending_write(
     // the record read at the start was removed at the end without being looked
     // at again, so a second process that resolved it and saved a new one in
     // between had its live record deleted.
-    match crate::emitter_journal::lock_camera(id) {
+    match crate::emitter_journal::lock_camera(fd, id) {
         Ok(Some(lock)) => {
             let outcome = recover_pending_write_locked(fd, id);
             drop(lock);
@@ -3394,7 +3394,7 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     // then again for the writes would leave a gap in which another process could
     // resolve this camera and start its own setup, and the record this run then
     // wrote would be filed over the top of that one.
-    let lock = match crate::emitter_journal::lock_camera(id) {
+    let lock = match crate::emitter_journal::lock_camera(fd, id) {
         Ok(Some(lock)) => lock,
         Ok(None) => return Err(DiscoveryError::CameraBusy),
         Err(why) => return Err(DiscoveryError::JournalUnwritable(why)),
@@ -4734,7 +4734,7 @@ mod tests {
                 payload: vec![1, 3, 2],
             },
             pending,
-            _lock: crate::emitter_journal::lock_camera(&id)
+            _lock: crate::emitter_journal::lock_camera(-1, &id)
                 .expect("lock")
                 .expect("not busy"),
         };
@@ -4792,7 +4792,7 @@ mod tests {
                 payload: vec![1, 3, 2],
             },
             pending,
-            _lock: crate::emitter_journal::lock_camera(&id)
+            _lock: crate::emitter_journal::lock_camera(-1, &id)
                 .expect("lock")
                 .expect("not busy"),
         };
@@ -4994,7 +4994,7 @@ mod tests {
                 payload: vec![1, 3, 2],
             },
             pending,
-            _lock: crate::emitter_journal::lock_camera(&id)
+            _lock: crate::emitter_journal::lock_camera(-1, &id)
                 .expect("lock")
                 .expect("not busy"),
         };
@@ -5350,7 +5350,7 @@ mod tests {
 
         let id = identity(0x3277, 0x0059);
         // Create the store and the lock path the same way production does.
-        let held = crate::emitter_journal::lock_camera(&id)
+        let held = crate::emitter_journal::lock_camera(-1, &id)
             .expect("take the lock")
             .expect("not busy");
         // Asked for by the same code the daemon uses, not rebuilt from the

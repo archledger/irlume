@@ -42,6 +42,7 @@
 
 use crate::uvc_descriptor::CameraIdentity;
 use serde::{Deserialize, Serialize};
+use std::os::raw::c_int;
 use std::path::PathBuf;
 
 /// The record format this build writes and is willing to act on.
@@ -638,7 +639,7 @@ fn lock_path(id: &CameraIdentity) -> PathBuf {
 /// every stream open during authentication; waiting behind a discovery run that
 /// takes tens of seconds would stall a login. A camera whose lock is held is a
 /// camera somebody else is already looking after.
-pub(crate) fn lock_camera(id: &CameraIdentity) -> Result<Option<CameraLock>, String> {
+pub(crate) fn lock_camera(fd: c_int, id: &CameraIdentity) -> Result<Option<CameraLock>, String> {
     use std::os::unix::io::AsRawFd as _;
     let path = lock_path(id);
     if let Some(dir) = path.parent() {
@@ -650,82 +651,11 @@ pub(crate) fn lock_camera(id: &CameraIdentity) -> Result<Option<CameraLock>, Str
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
-    // /dev/video* is root:video 0660, so the lock guarding that capability
-    // matches rather than being root-only. Without this a non-root caller in
-    // the video group (the nightly CI runner, ir-setup, camera-tune) can open
-    // the camera but not the lock, and ir-setup declines to drive the emitter
-    // with "passwordless sudo is required" even though the caller already owns
-    // the device it is trying to configure.
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = file
-            .metadata()
-            .map_err(|e| format!("stat {}: {e}", path.display()))?
-            .permissions();
-        // Fix the mode only when it is wrong AND this process can: fchmod on
-        // a root-owned file from a non-root caller is EPERM no matter what
-        // mode is requested, and failing the LOCK on it disabled the emitter
-        // for exactly the caller #392 exists to serve (the lock already
-        // exists as root:video 0660 after the daemon's first run, the video
-        // group member opens it through the group bit, and then the
-        // unconditional chmod errored). A wrong mode that cannot be fixed is
-        // reported by whoever cannot OPEN the file, with a better message
-        // than EPERM here.
-        let mode = perms.mode() & 0o777;
-        if mode != 0o660 {
-            perms.set_mode(0o660);
-            if let Err(e) = file.set_permissions(perms) {
-                // Whether an unfixable wrong mode is tolerable depends on
-                // WHICH way it is wrong. flock takes the lock on a read-only
-                // open, so any other-accessible bit lets an unprivileged
-                // process hold this camera's lock and keep the emitter dark
-                // for everyone; a lock that permissive cannot be trusted and
-                // the caller must refuse rather than authenticate behind it.
-                // A merely over-restrictive mode adds no holder who was not
-                // already root or group, so it degrades to a log the way the
-                // root-owned-0660 case does (the #392 caller this branch
-                // exists for).
-                if mode & 0o007 != 0 {
-                    return Err(format!(
-                        "emitter lock {} has mode {mode:o}, which any local user can \
-                         flock, and this process cannot correct it ({e}); refusing to \
-                         trust the lock. Fix it as root: chmod 660 {}",
-                        path.display(),
-                        path.display()
-                    ));
-                }
-                irlume_common::dlog!(
-                    "emitter lock {}: mode {mode:o} left as-is ({e}); a non-owner cannot chmod",
-                    path.display()
-                );
-            }
-        }
-    }
-    // Set the group to video so the lock is reachable by the same group that
-    // already owns /dev/video*. The caller is root (the daemon), so fchown
-    // succeeds. If the group does not exist on this system the mode alone is
-    // still an improvement: the lock was 0640 root:root and is now 0660, so a
-    // non-root caller whose primary group is video can open it.
-    //
-    // SAFETY: getgrnam_r reads /etc/group (or the nsswitch equivalent). The
-    // C string is a literal null-terminated byte string.
-    unsafe {
-        let mut grp: libc::group = std::mem::zeroed();
-        let mut buf = vec![0u8; 2048];
-        let mut result: *mut libc::group = std::ptr::null_mut();
-        let name = b"video\0";
-        if libc::getgrnam_r(
-            name.as_ptr().cast(),
-            &mut grp,
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            &mut result,
-        ) == 0
-            && !result.is_null()
-        {
-            let _ = libc::fchown(file.as_raw_fd(), u32::MAX, grp.gr_gid);
-        }
-    }
+    // Mirror the device's access control (group, mode, extended ACL) onto the
+    // lock, so the lock opens to exactly the callers the device opens to, not
+    // to a hardcoded video group (#487). A -1 fd (tests) or an unreadable
+    // device skips the mirror and leaves the lock at its creation default.
+    mirror_device_access(fd, &file, &path)?;
     // SAFETY: `fd` is owned by `file`, which outlives the call and the guard.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();
@@ -735,6 +665,107 @@ pub(crate) fn lock_camera(id: &CameraIdentity) -> Result<Option<CameraLock>, Str
         };
     }
     Ok(Some(CameraLock { _file: file }))
+}
+
+/// Mirror the device's access control (group, extended ACL, mode) onto the
+/// lock, so the lock opens to exactly the callers the device opens to, rather
+/// than a hardcoded `video`/`0660`. On an ACL-managed host the camera is
+/// reachable through a per-user uaccess ACL and a non-standard group, and a
+/// lock that mirrors neither stays closed to the exact callers it exists to
+/// serve (#487).
+///
+/// A `fstat` failure (a `-1` test fd, or an already-closed device) is a no-op:
+/// there is no device to mirror, so the lock keeps its creation default.
+fn mirror_device_access(
+    fd: c_int,
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: libc::stat is a plain C struct of integers, so all-zero is a
+    // valid value; fstat overwrites it next.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat reads the caller's device fd into `st`.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Ok(());
+    }
+    let lock_fd = file.as_raw_fd();
+
+    // Group first so the mode and ACL land on the device's group. uid -1
+    // leaves the owner alone. A non-root caller who is not in the device's
+    // group cannot chown to it, and that is exactly the case where the lock
+    // cannot be made to match, so the best-effort attempt is silent.
+    // SAFETY: fchown sets only the group on an owned fd.
+    let _ = unsafe { libc::fchown(lock_fd, u32::MAX, st.st_gid) };
+
+    // Copy the extended ACL, the part that grants a per-user uaccess caller.
+    // A device with none (the common case) leaves the lock a plain mode/group
+    // file.
+    copy_access_acl(fd, lock_fd);
+
+    // Mode last. The ACL mask (if any) already fixed the group bits; without
+    // an ACL the mode must be set to the device's exactly. Preserve the
+    // world-accessible refusal: a lock any local user can flock cannot be
+    // trusted, and one this process cannot correct must refuse rather than
+    // authenticate behind it.
+    let mode = st.st_mode & 0o777;
+    let mut perms = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .permissions();
+    let current = perms.mode() & 0o777;
+    if current != mode {
+        perms.set_mode(mode);
+        if let Err(e) = file.set_permissions(perms) {
+            if current & 0o007 != 0 {
+                return Err(format!(
+                    "emitter lock {} has mode {current:o}, which any local user can \
+                     flock, and this process cannot correct it ({e}); refusing to \
+                     trust the lock. Fix it as root: chmod {mode:o} {}",
+                    path.display(),
+                    path.display()
+                ));
+            }
+            irlume_common::dlog!(
+                "emitter lock {}: mode {current:o} left as-is ({e}); a non-owner cannot chmod",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Copy the device's extended POSIX ACL (the `system.posix_acl_access` xattr)
+/// onto the lock, byte-for-byte, so no parsing of the wire format is needed.
+/// Absence on the device (the ordinary case) and any read or write failure are
+/// a no-op: the lock then carries no extended ACL, which is still correct for
+/// a device that has none.
+fn copy_access_acl(from: c_int, to: c_int) {
+    const NAME: &[u8] = b"system.posix_acl_access\0";
+    // SAFETY: the name is a null-terminated literal; a null buffer with size 0
+    // asks the kernel for the required size.
+    let size = unsafe { libc::fgetxattr(from, NAME.as_ptr().cast(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return;
+    }
+    let mut buf = vec![0u8; size as usize];
+    // SAFETY: buf is size bytes; the name is null-terminated.
+    let got = unsafe {
+        libc::fgetxattr(
+            from,
+            NAME.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if got < 0 || got as usize != buf.len() {
+        return;
+    }
+    // SAFETY: buf holds exactly the bytes read; writing the same xattr onto
+    // the lock makes its access match the device's. Flags 0 (no replace).
+    let _ = unsafe { libc::fsetxattr(to, NAME.as_ptr().cast(), buf.as_ptr().cast(), buf.len(), 0) };
 }
 
 /// What the store has to say about the camera in front of us.
@@ -1035,7 +1066,8 @@ mod tests {
     #[test]
     #[ignore = "needs a root-owned pre-created lock; set IRLUME_EMITTER_LOCK_DIR and pre-create the lock file as root:<caller-group> 0660"]
     fn lock_succeeds_on_a_preexisting_lock_this_process_cannot_chmod() {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let _env = env_lock();
         let dir = std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
             .expect("IRLUME_EMITTER_LOCK_DIR is unset; this test is a request for the harness");
@@ -1050,7 +1082,15 @@ mod tests {
             me,
             "the pre-created lock must belong to another uid or this test proves nothing"
         );
-        let lock = lock_camera(&id).expect("a lock this process can open must be takeable");
+        // A stand-in device whose mode the mirror reads; it must not make a
+        // root-owned lock this process can open (but not chmod) refuse.
+        let device = std::env::temp_dir().join("irlume-lock-mirror-device");
+        let device_file = std::fs::File::create(&device).expect("device file");
+        device_file
+            .set_permissions(std::fs::Permissions::from_mode(0o660))
+            .expect("device mode");
+        let fd = device_file.as_raw_fd();
+        let lock = lock_camera(fd, &id).expect("a lock this process can open must be takeable");
         assert!(lock.is_some(), "nobody else holds it in this harness");
     }
 
@@ -1063,8 +1103,8 @@ mod tests {
     #[test]
     #[ignore = "needs a root-owned 0666 pre-created lock; set IRLUME_EMITTER_LOCK_DIR and pre-create the lock file as root 0666"]
     fn lock_refuses_an_other_accessible_lock_it_cannot_fix() {
-        use std::os::unix::fs::MetadataExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let _env = env_lock();
         let dir = std::env::var_os("IRLUME_EMITTER_LOCK_DIR")
             .expect("IRLUME_EMITTER_LOCK_DIR is unset; this test is a request for the harness");
@@ -1080,12 +1120,145 @@ mod tests {
             0o006,
             "the harness pre-creates the lock world-accessible"
         );
-        let err = lock_camera(&id)
+        // A stand-in device whose mode the mirror reads; it must not make a
+        // root-owned lock this process can open (but not chmod) refuse.
+        let device = std::env::temp_dir().join("irlume-lock-mirror-device");
+        let device_file = std::fs::File::create(&device).expect("device file");
+        device_file
+            .set_permissions(std::fs::Permissions::from_mode(0o660))
+            .expect("device mode");
+        let fd = device_file.as_raw_fd();
+        let err = lock_camera(fd, &id)
             .expect_err("a world-accessible lock this process cannot fix must refuse");
         assert!(
             err.contains("any local user can") && err.contains("chmod 660"),
             "the refusal must say why and how to fix it: {err}"
         );
+    }
+
+    /// The lock must mirror the device's access control, not a hardcoded
+    /// `video`/`0660`. On an ACL-managed host the camera is reachable through
+    /// a per-user uaccess ACL, so the lock guarding it must open to exactly
+    /// the same callers. A stand-in device with a distinctive mode must
+    /// produce a lock with that mode, not 0660.
+    #[test]
+    fn lock_mirrors_the_device_mode() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-lock-mirror-mode");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let device = dir.join("device");
+        let device_file = std::fs::File::create(&device).expect("device file");
+        device_file
+            .set_permissions(std::fs::Permissions::from_mode(0o640))
+            .expect("set the device mode");
+        let fd = device_file.as_raw_fd();
+
+        let id = identity();
+        let lock = lock_camera(fd, &id)
+            .expect("take the lock")
+            .expect("not busy");
+        let meta = std::fs::metadata(lock_path(&id)).expect("lock stat");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o640,
+            "the lock inherits the device mode, not the hardcoded 0660"
+        );
+        drop(lock);
+    }
+
+    /// The extended ACL is the part that grants a per-user uaccess caller, so
+    /// the lock must carry the device's ACL byte-for-byte. A named-user entry
+    /// written to the stand-in device must appear on the lock.
+    #[test]
+    fn lock_mirrors_the_device_acl() {
+        use std::os::fd::AsRawFd as _;
+
+        let _lock = env_lock();
+        let dir = std::env::temp_dir().join("irlume-journal-lock-mirror-acl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _env = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+
+        let device = dir.join("device");
+        let device_file = std::fs::File::create(&device).expect("device file");
+        let fd = device_file.as_raw_fd();
+
+        // SAFETY: geteuid reads this process's own credentials and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let acl = named_user_acl(me, 0o6);
+        set_access_acl(fd, &acl);
+
+        let id = identity();
+        let lock = lock_camera(fd, &id)
+            .expect("take the lock")
+            .expect("not busy");
+        let lock_file = std::fs::File::open(lock_path(&id)).expect("open the lock");
+        assert_eq!(
+            get_access_acl(lock_file.as_raw_fd()),
+            Some(acl),
+            "the lock inherits the device ACL byte-for-byte"
+        );
+        drop(lock);
+    }
+
+    /// A named-user POSIX ACL in the kernel's `system.posix_acl_access` wire
+    /// format: a version header then `posix_acl_xattr_entry` records sorted by
+    /// tag, with the id undefined for the object/mask/other entries.
+    fn named_user_acl(uid: u32, perm: u16) -> Vec<u8> {
+        const VERSION: u32 = 0x0002;
+        const USER_OBJ: u16 = 0x01;
+        const USER: u16 = 0x02;
+        const GROUP_OBJ: u16 = 0x04;
+        const MASK: u16 = 0x10;
+        const OTHER: u16 = 0x20;
+        const UNDEFINED_ID: u32 = 0xFFFF_FFFF;
+
+        let mut out = Vec::with_capacity(4 + 5 * 8);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        let mut push = |tag: u16, p: u16, id: u32| {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&p.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        };
+        push(USER_OBJ, 0o6, UNDEFINED_ID);
+        push(USER, perm, uid);
+        push(GROUP_OBJ, 0o4, UNDEFINED_ID);
+        push(MASK, 0o6, UNDEFINED_ID);
+        push(OTHER, 0o0, UNDEFINED_ID);
+        out
+    }
+
+    fn set_access_acl(fd: c_int, acl: &[u8]) {
+        const NAME: &[u8] = b"system.posix_acl_access\0";
+        // SAFETY: name is a null-terminated literal; acl points at acl.len()
+        // valid bytes.
+        let rc =
+            unsafe { libc::fsetxattr(fd, NAME.as_ptr().cast(), acl.as_ptr().cast(), acl.len(), 0) };
+        assert_eq!(rc, 0, "set the stand-in device ACL");
+    }
+
+    fn get_access_acl(fd: c_int) -> Option<Vec<u8>> {
+        const NAME: &[u8] = b"system.posix_acl_access\0";
+        // SAFETY: null buffer with size 0 asks the kernel for the required size.
+        let size = unsafe { libc::fgetxattr(fd, NAME.as_ptr().cast(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: buf is size bytes.
+        let got = unsafe {
+            libc::fgetxattr(fd, NAME.as_ptr().cast(), buf.as_mut_ptr().cast(), buf.len())
+        };
+        if got < 0 || got as usize != buf.len() {
+            return None;
+        }
+        Some(buf)
     }
 
     /// A camera identity backed by the real ASUS descriptor bytes, so these
@@ -1555,7 +1728,9 @@ mod tests {
         let id = identity();
         let path = lock_path(&id);
 
-        let held = lock_camera(&id).expect("take the lock").expect("not busy");
+        let held = lock_camera(-1, &id)
+            .expect("take the lock")
+            .expect("not busy");
 
         // `flock -n` exits 1 when the lock is held; the shell is a separate
         // process, which is the whole point.
@@ -1762,7 +1937,7 @@ mod tests {
             "one camera, one lock"
         );
 
-        let held = lock_camera(&with_serial)
+        let held = lock_camera(-1, &with_serial)
             .expect("take the lock")
             .expect("not busy");
         let path = lock_path(&without_serial);

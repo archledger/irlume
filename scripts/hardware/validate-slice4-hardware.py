@@ -167,11 +167,23 @@ def main(argv):
         discarded_observations = bounded_u64(
             stream.get("discarded_observations"), f"{role}: discarded observations"
         )
-        expected_discarded = {"rgb": 14, "ir": 1}[role]
-        if discarded_observations != expected_discarded:
+        # The delivered-rate fill discards a bounded number of frames per
+        # stream on top of the warm-up discards: flush RATE_STARTUP_FLUSH (30)
+        # + fill (1 seed + RATE_WINDOW_CAPACITY deltas = 31) per establishment,
+        # run twice (initial + post-recovery). The faster stream keeps
+        # discarding until its slower twin is ready, so the total is rate-ratio
+        # dependent; assert only the deterministic minimum, and let the
+        # delivered/discarded accounting check above catch inconsistency.
+        minimum_discarded = {
+            # warm-up (14 = 7 initial + 7 recovered; 1 = the IR session warm-up)
+            # + two fill establishments (2 * 61).
+            "rgb": 14 + 2 * 61,
+            "ir": 1 + 2 * 61,
+        }[role]
+        if discarded_observations < minimum_discarded:
             fail(
-                f"{role}: expected {expected_discarded} deterministic warm-up "
-                f"observations, got {discarded_observations}"
+                f"{role}: discarded observations {discarded_observations} below "
+                f"the minimum fill/warm-up {minimum_discarded}"
             )
         if observations != frames + discarded_observations:
             fail(f"{role}: delivered/discarded observation accounting mismatch")

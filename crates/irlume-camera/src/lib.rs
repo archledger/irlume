@@ -1340,8 +1340,8 @@ fn rate_evidence_to_common(
 }
 
 /// Maximum additional dequeue attempts for the bounded rate-evidence fill in
-/// [`TrackedStream::next`]. Nominal is 30 successful dequeues (~2 s at 15 fps);
-/// 64 gives >2x headroom for timeouts and corrupt frames.
+/// [`TrackedStream::next`]. Nominal is 31 successful dequeues (one seed plus
+/// 30 deltas, ~2 s at 15 fps); 64 gives >2x headroom for timeouts and corrupt frames.
 const MAX_RATE_FILL_ATTEMPTS: usize = 64;
 
 /// Frames discarded before the rate window is measured. The first window after
@@ -1403,6 +1403,16 @@ impl<S> TrackedStream<S> {
         }
         self.stream = Some(stream);
         self.recovery_epoch_pending = true;
+        // Drop the pre-recovery rate window immediately. The recovered stream
+        // has its own STREAMON transient and its timestamps may move to a new
+        // domain (the recovery epoch resets both trackers), so a stale "ready"
+        // window would make `fill_rate_evidence` early-return and skip the
+        // re-establishment — leaving the recovered stream to re-fill serially
+        // on its first `next()` and starve its twin (measured: RGB 5.26 fps,
+        // 236 drops after an IR-only recovery). Clearing it here forces the
+        // fill to re-run, which is where `begin_recovered_continuity_epoch`
+        // then re-seeds the baseline in the new epoch.
+        self.rate_window.reset();
         Ok(())
     }
 }
@@ -1719,6 +1729,93 @@ impl<S: ValidatedStream> TrackedStream<S> {
             rate_evidence,
         ))
     }
+}
+
+/// Establish the delivered-rate window for TWO streams by filling each one on
+/// its own thread, so the two fills run CONCURRENTLY rather than one after the
+/// other.
+///
+/// A single-threaded round-robin throttles the faster stream to the slower
+/// stream's rate: on the ASUS dual the RGB stream runs 30 fps and IR 15 fps,
+/// so a round-robin dequeues RGB at 15 fps, its V4L2 buffer overflows, and the
+/// shared-USB contention drops IR frames, pushing IR's measured rate below the
+/// floor (measured 14.5 Hz vs the 14.7 Hz floor). The 98 % tolerance was
+/// calibrated against a CONCURRENT probe measuring 14.714 Hz (see
+/// `DEFAULT_TOLERANCE_PERCENT`), so the fill must be concurrent — the same
+/// schedule production uses. Each stream's own serial fill is naturally paced
+/// by its frame arrival (a blocking DQBUF cannot outrun the camera), so two
+/// threads filling in parallel cannot starve each other the way one thread
+/// alternating between them does.
+///
+/// After this returns, each stream's `next()` sees a ready window and its own
+/// fill no-ops, so the capture loop measures only the settled rate.
+fn establish_concurrent_rate<A: ValidatedStream + Send, B: ValidatedStream + Send>(
+    primary: &mut TrackedStream<A>,
+    secondary: &mut TrackedStream<B>,
+) -> std::io::Result<()> {
+    if primary.rate_window.ready() && secondary.rate_window.ready() {
+        return Ok(());
+    }
+    let ready_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        let a = {
+            let count = std::sync::Arc::clone(&ready_count);
+            scope.spawn(move || drain_until_both_ready(primary, &count))
+        };
+        let b = {
+            let count = std::sync::Arc::clone(&ready_count);
+            scope.spawn(move || drain_until_both_ready(secondary, &count))
+        };
+        // A panic in a fill thread is a software defect, never a camera
+        // verdict: re-raise it (mirrors the capture-mode probe's rule, #263).
+        let a = a
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        let b = b
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        a?;
+        b?;
+        Ok(())
+    })
+}
+
+/// Fill one stream's delivered-rate window and keep discarding until BOTH
+/// streams are ready. The trailing discards are the point: the faster stream
+/// finishes its own fill first, and if it stopped there it would sit idle
+/// overflowing its V4L2 queue (dropping frames) while the slower twin finishes.
+/// Those dropped frames showed up as a >1 s timestamp gap on the next delivered
+/// frame, tripping the continuity ceiling. So once this stream is ready it
+/// keeps dequeuing (the window merely slides) until the other reports ready.
+fn drain_until_both_ready<S: ValidatedStream>(
+    stream: &mut TrackedStream<S>,
+    ready_count: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    // Flush the STREAMON transient; its sequence gaps would poison the window.
+    for _ in 0..RATE_STARTUP_FLUSH {
+        stream.next_discarded()?;
+    }
+    stream.rate_window.reset();
+    let mut reported = false;
+    let mut attempts = 0usize;
+    // Fill (bounded) plus the trailing drain while the twin finishes, itself
+    // bounded by the twin's worst-case fill.
+    let budget = MAX_RATE_FILL_ATTEMPTS + MAX_RATE_FILL_ATTEMPTS;
+    while ready_count.load(Ordering::Acquire) < 2 && attempts < budget {
+        stream.next_discarded()?;
+        if !reported && stream.rate_window.ready() {
+            ready_count.fetch_add(1, Ordering::AcqRel);
+            reported = true;
+        }
+        attempts += 1;
+    }
+    if !stream.rate_window.ready() {
+        return Err(std::io::Error::other(
+            "could not establish delivered-rate evidence within the bounded fill",
+        ));
+    }
+    Ok(())
 }
 
 fn install_recovered_resources<S, M, G, E>(
@@ -4767,6 +4864,25 @@ impl IrSession<'_> {
     }
 }
 
+/// Establish the delivered-rate evidence for a held RGB+IR pair by draining
+/// both streams concurrently until each holds a full window. See the
+/// module-level concurrent fill for why the fill must not be serial.
+///
+/// Called once per held session, before the capture loop, so the per-frame
+/// `next()` fills no-op on a ready window. Best-effort by contract: a failure
+/// is reported so the caller can log it, but the session stays usable — the
+/// per-stream serial fill in `next()` re-attempts establishment (and fails
+/// closed) on the first capture, preserving the existing error/retry shape.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn establish_pair_rate(
+    rgb: &mut RgbSession<'_>,
+    ir: &mut IrSession<'_>,
+) -> irlume_common::Result<()> {
+    let device = rgb.cam.device.clone();
+    establish_concurrent_rate(&mut rgb.stream, &mut ir.stream)
+        .map_err(|error| map_io(&device, error))
+}
+
 /// Ambient-subtraction helpers (Windows-Hello-style illuminated minus ambient).
 /// `subtract` is used by `capture_ir` when `IRLUME_IR_AMBIENT_SUBTRACT=1`
 /// (experimental, off by default); `capture_raw_burst`/`center_border_ratio`
@@ -5809,6 +5925,15 @@ fn held_concurrent_arm<'d>(
                 return Ok(());
             }
         };
+        // Establish the delivered-rate windows before measuring, draining both
+        // streams concurrently so the serial fill cannot starve one and skew
+        // the concurrent brightness this probe exists to measure.
+        if let Err(error) = establish_pair_rate(&mut rs, &mut is) {
+            irlume_common::dlog!(
+                "capture-mode probe: could not establish delivered-rate evidence \
+                 ({error}); the per-frame fill will retry"
+            );
+        }
         for _ in 0..rounds {
             progress();
             let t0 = std::time::Instant::now();
@@ -10603,6 +10728,27 @@ mod tests {
             .transpose()
             .expect("open IR session");
         rgb_session.warm_up().expect("initial RGB warm-up");
+        // Establish the delivered-rate windows for the held pair UP FRONT by
+        // draining both streams concurrently, exactly as the production held
+        // session does before its capture loop. The loop below runs RGB and IR
+        // concurrently too, but the FIRST `next()` on each stream would
+        // otherwise run the serial fill (30 flush + 30 fill) and starve the
+        // twin's V4L2 queue into dropping frames, so the twin's own fill then
+        // measures a false low rate (ping-pong starvation, measured on the ASUS
+        // dual). Establishing both windows first makes every loop `next()`
+        // no-op its fill and measure only the settled rate.
+        if let Some(ir) = ir_session.as_mut() {
+            establish_pair_rate(&mut rgb_session, ir).expect("establish initial pair rate");
+        } else {
+            // RGB-only: establish the single window up front too, so the first
+            // next() does not run a lazy serial fill inside the loop (which
+            // would shift the first delivered frame's timestamp ~5 s and make
+            // the global timestamp span undershoot the measured duration).
+            rgb_session
+                .stream
+                .fill_rate_evidence()
+                .expect("establish initial RGB rate");
+        }
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(seconds);
         let recovery_at = started + std::time::Duration::from_secs(seconds / 2);
@@ -10613,25 +10759,44 @@ mod tests {
         let mut expect_rgb_discontinuity = false;
         let mut expect_ir_discontinuity = false;
         while std::time::Instant::now() < deadline {
-            let (_, _, sequence, timestamp, _) =
-                rgb_session.stream.next().expect("RGB tracked dequeue");
+            // Concurrent capture, matching production's schedule: IR dequeues
+            // on a worker thread while RGB dequeues on this thread. A
+            // single-threaded round-robin throttles the 30 fps RGB stream to
+            // the 15 fps IR rate, overflowing RGB's queue and dropping IR
+            // frames (measured 14.5 vs 14.7 Hz), so the loop must run both
+            // streams concurrently rather than alternately.
+            let ((rgb_sequence, rgb_timestamp), ir_obs) = std::thread::scope(|scope| {
+                let ir_thread = ir_session.as_mut().map(|session| {
+                    scope.spawn(move || {
+                        let (_, _, sequence, timestamp, _) =
+                            session.stream.next().expect("IR tracked dequeue");
+                        if let Some(log) = session.meta.as_mut() {
+                            log.begin_burst();
+                            log.drain();
+                        }
+                        (sequence, timestamp)
+                    })
+                });
+                let (_, _, rgb_sequence, rgb_timestamp, _) =
+                    rgb_session.stream.next().expect("RGB tracked dequeue");
+                let ir_obs = ir_thread.map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+                });
+                ((rgb_sequence, rgb_timestamp), ir_obs)
+            });
             if expect_rgb_discontinuity {
-                assert!(sequence.discontinuity(), "RGB recovery marker missing");
+                assert!(rgb_sequence.discontinuity(), "RGB recovery marker missing");
                 expect_rgb_discontinuity = false;
             }
-            rgb_stats.record(sequence, timestamp);
-            if let Some(session) = &mut ir_session {
-                let (_, _, sequence, timestamp, _) =
-                    session.stream.next().expect("IR tracked dequeue");
-                if let Some(log) = session.meta.as_mut() {
-                    log.begin_burst();
-                    log.drain();
-                }
+            rgb_stats.record(rgb_sequence, rgb_timestamp);
+            if let Some((ir_sequence, ir_timestamp)) = ir_obs {
                 if expect_ir_discontinuity {
-                    assert!(sequence.discontinuity(), "IR recovery marker missing");
+                    assert!(ir_sequence.discontinuity(), "IR recovery marker missing");
                     expect_ir_discontinuity = false;
                 }
-                ir_stats.record(sequence, timestamp);
+                ir_stats.record(ir_sequence, ir_timestamp);
             }
             if !recovered && std::time::Instant::now() >= recovery_at {
                 let recovery_started = std::time::Instant::now();
@@ -10642,6 +10807,27 @@ mod tests {
                     session.recover().expect("IR recovery");
                     expect_ir_discontinuity = true;
                 }
+                // Re-establish the delivered-rate window(s) up front so the
+                // first post-recovery next() does not add a serial-fill gap
+                // outside the measured recovery duration: concurrently for the
+                // dual pair, serially for an RGB-only camera (single stream,
+                // nothing to starve). The recovery discontinuity markers
+                // survive these discarded dequeues (both trackers re-arm the
+                // pending marker on a discarded observation), so the assertions
+                // above still see them on the next delivered frame.
+                if let Some(ir) = ir_session.as_mut() {
+                    establish_pair_rate(&mut rgb_session, ir)
+                        .expect("re-establish pair rate after recovery");
+                } else {
+                    rgb_session
+                        .stream
+                        .fill_rate_evidence()
+                        .expect("re-establish RGB rate after recovery");
+                }
+                // The recovery duration spans teardown, re-arm, AND the rate
+                // re-establishment, so it matches the timestamp gap the
+                // evidence records between the last pre-recovery and first
+                // post-recovery delivered frame.
                 recovery_duration = Some(recovery_started.elapsed());
                 recovered = true;
             }
@@ -11427,6 +11613,98 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_rate_fill_drains_both_streams_in_parallel() {
+        // The fill must drive both streams on two threads SIMULTANEOUSLY. A
+        // serial (round-robin) fill throttles the faster stream to the slower
+        // one's rate, overflowing its V4L2 queue and dropping frames (measured
+        // on the ASUS dual: RGB 30 fps, IR 15 fps). Each fixture rendezvouses
+        // on a barrier on its FIRST dequeue: concurrent threads both arrive and
+        // pass; a serial fill deadlocks on it, which the watchdog below turns
+        // into a clean failure instead of a hung test.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        struct RendezvousFixture {
+            payload: [u8; 1],
+            first: bool,
+            next_sequence: u32,
+            next_seconds: i64,
+            barrier: std::sync::Arc<std::sync::Barrier>,
+        }
+
+        impl ValidatedStream for RendezvousFixture {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                if self.first {
+                    self.first = false;
+                    self.barrier.wait();
+                }
+                let metadata = v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: self.next_sequence,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(self.next_seconds, 0),
+                    ..v4l::buffer::Metadata::default()
+                };
+                self.next_sequence += 1;
+                self.next_seconds += 1;
+                let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, 1)
+                    .map_err(ValidatedDequeueError::Facts)?;
+                Ok((&self.payload, facts))
+            }
+        }
+
+        let small = |role| {
+            rate_gate::StreamRateConfig::with_window(
+                role,
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                4,
+            )
+        };
+        let mut rgb = TrackedStream::new(
+            RendezvousFixture {
+                payload: [1],
+                first: true,
+                next_sequence: 1,
+                next_seconds: 1,
+                barrier: barrier.clone(),
+            },
+            small(contracts::StreamRole::Rgb),
+        );
+        let mut ir = TrackedStream::new(
+            RendezvousFixture {
+                payload: [2],
+                first: true,
+                next_sequence: 1,
+                next_seconds: 1,
+                barrier: barrier.clone(),
+            },
+            small(contracts::StreamRole::Ir),
+        );
+
+        let (done, ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = establish_concurrent_rate(&mut rgb, &mut ir);
+            let _ = done.send(result.map(|()| (rgb.rate_window.ready(), ir.rate_window.ready())));
+        });
+        match ready.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok((rgb_ready, ir_ready))) => {
+                assert!(rgb_ready, "rgb window must be ready");
+                assert!(ir_ready, "ir window must be ready");
+            }
+            Ok(Err(error)) => panic!("concurrent fill errored: {error}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("concurrent fill deadlocked (serial fill stuck on the rendezvous)")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("concurrent fill thread panicked")
+            }
+        }
     }
 }
 

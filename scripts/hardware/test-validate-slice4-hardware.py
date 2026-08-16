@@ -26,9 +26,9 @@ def valid_record():
             {
                 "role": "rgb",
                 "frames": 100,
-                "observations": 114,
-                "discarded_observations": 14,
-                "sequence_span_sum": 114,
+                "observations": 236,
+                "discarded_observations": 136,
+                "sequence_span_sum": 236,
                 "delivered_hz": 100 / 60.5,
                 "gap_total": 2,
                 "cumulative_drops": 2,
@@ -50,9 +50,9 @@ def valid_record():
             {
                 "role": "ir",
                 "frames": 90,
-                "observations": 91,
-                "discarded_observations": 1,
-                "sequence_span_sum": 89,
+                "observations": 213,
+                "discarded_observations": 123,
+                "sequence_span_sum": 211,
                 "delivered_hz": 90 / 60.5,
                 "gap_total": 0,
                 "cumulative_drops": 0,
@@ -234,8 +234,8 @@ class ValidatorTests(unittest.TestCase):
         def keep_only_three_internally_consistent_rgb_frames(record):
             stream = record["streams"][0]
             stream["frames"] = 3
-            stream["observations"] = 17
-            stream["sequence_span_sum"] = 17
+            stream["observations"] = 139
+            stream["sequence_span_sum"] = 139
             stream["delivered_hz"] = 3 / record["duration_seconds"]
             stream["delta_count"] = 1
             stream["delta_min_us"] = stream["timestamp_span_sum_us"]
@@ -263,10 +263,10 @@ class ValidatorTests(unittest.TestCase):
 
     def test_sequence_observation_accounting_is_exact(self):
         self.assert_rejected(
-            lambda record: record["streams"][0].__setitem__("observations", 113)
+            lambda record: record["streams"][0].__setitem__("observations", 235)
         )
         self.assert_rejected(
-            lambda record: record["streams"][0].__setitem__("sequence_span_sum", 113)
+            lambda record: record["streams"][0].__setitem__("sequence_span_sum", 235)
         )
 
         def omit_rgb_warmup(record):

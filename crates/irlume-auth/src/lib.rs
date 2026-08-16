@@ -3147,10 +3147,20 @@ impl Engine {
                 // SAFETY: _cams is Some, and _rs/_is borrow from it. _cams is
                 // declared before _rs/_is so it outlives them.
                 let (ref cam_r, ref cam_i) = _cams.as_ref().unwrap();
-                if let (Ok(rs), Ok(is)) = (
+                if let (Ok(mut rs), Ok(mut is)) = (
                     cam_r.session_with_progress(&progress),
                     cam_i.session_with_progress(&progress),
                 ) {
+                    // Establish the delivered-rate windows for the HELD PAIR up
+                    // front, draining both streams concurrently. Best-effort: a
+                    // failure is logged, and the per-frame serial fill in
+                    // `next()` still re-attempts (and fails closed) on capture.
+                    if let Err(error) = irlume_camera::establish_pair_rate(&mut rs, &mut is) {
+                        irlume_common::dlog!(
+                            "auth: held pair could not establish delivered-rate evidence \
+                             ({error}); the per-frame fill will retry"
+                        );
+                    }
                     held_rgb = Some(rs);
                     held_ir = Some(is);
                 }
@@ -3782,6 +3792,16 @@ impl Engine {
                 r.session_with_progress(&progress),
                 i.session_with_progress(&progress),
             ) {
+                // Establish the delivered-rate windows for the HELD PAIR up
+                // front, draining both streams concurrently so neither starves
+                // the other's buffer queue. Best-effort: a failure is logged
+                // and the per-frame serial fill still re-attempts on capture.
+                if let Err(error) = irlume_camera::establish_pair_rate(&mut rs, &mut is) {
+                    irlume_common::dlog!(
+                        "enroll: held pair could not establish delivered-rate evidence \
+                         ({error}); the per-frame fill will retry"
+                    );
+                }
                 return self.capture_scan_loop(
                     want,
                     pitch_neutral,
@@ -3982,6 +4002,15 @@ impl Engine {
             Ok(pair) => pair,
             Err(_) => return false,
         };
+        // Establish the delivered-rate windows for the held pair before the
+        // A/B/A capture, so the serial fill cannot starve one stream and skew
+        // the concurrent mean it measures.
+        if let Err(error) = irlume_camera::establish_pair_rate(&mut rs, &mut is) {
+            irlume_common::dlog!(
+                "enroll: A/B/A check could not establish delivered-rate evidence \
+                 ({error}); the per-frame fill will retry"
+            );
+        }
         let (rgb, ir) = std::thread::scope(|scope| {
             let ir_thread = scope.spawn(|| is.capture_with_stats());
             let rgb = rs.denoised();

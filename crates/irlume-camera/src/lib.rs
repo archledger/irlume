@@ -128,6 +128,110 @@ pub struct Frame {
     /// BOTH sensors need this: the RGB and IR frames of one decision come from
     /// separate streams that can drift apart without it.
     pub captured: CaptureWindow,
+    provenance: frame_provenance::RuntimeFrameProvenance,
+}
+
+impl Frame {
+    fn from_provenance(
+        width: u32,
+        height: u32,
+        spectrum: Spectrum,
+        data: Vec<u8>,
+        provenance: frame_provenance::RuntimeFrameProvenance,
+    ) -> irlume_common::Result<Self> {
+        let expected_role = match spectrum {
+            Spectrum::Rgb => contracts::StreamRole::Rgb,
+            Spectrum::Ir => contracts::StreamRole::Ir,
+        };
+        if provenance.stream_role() != expected_role {
+            return Err(Error::Hardware(
+                "frame spectrum disagrees with runtime provenance role".into(),
+            ));
+        }
+        if (provenance.format().width(), provenance.format().height()) != (width, height) {
+            return Err(Error::Hardware(
+                "frame geometry disagrees with validated runtime format".into(),
+            ));
+        }
+        let captured = provenance.capture_window();
+        Ok(Self {
+            width,
+            height,
+            spectrum,
+            data,
+            captured,
+            provenance,
+        })
+    }
+
+    /// Trusted runtime evidence transactionally attached to this frame.
+    #[must_use]
+    pub const fn provenance(&self) -> &frame_provenance::RuntimeFrameProvenance {
+        &self.provenance
+    }
+
+    fn into_single_provenance(
+        self,
+    ) -> Result<frame_provenance::SingleFrameProvenance, frame_provenance::RuntimeProvenanceError>
+    {
+        match self.provenance {
+            frame_provenance::RuntimeFrameProvenance::Single(single) => Ok(single),
+            frame_provenance::RuntimeFrameProvenance::Aggregate(_) => {
+                Err(frame_provenance::RuntimeProvenanceError::InvalidSelection)
+            }
+        }
+    }
+}
+
+fn checked_single_evidence(
+    binding: frame_provenance::FrameBinding,
+    format: frame_provenance::ValidatedFormatIdentity,
+    facts: frame_provenance::DequeuedBufferFacts,
+    sequence: frame_provenance::SequenceObservation,
+    timestamp: frame_provenance::TimestampObservation,
+    taken: std::time::Instant,
+    illumination: contracts::IlluminationProvenance,
+) -> irlume_common::Result<frame_provenance::SingleFrameProvenance> {
+    frame_provenance::SingleFrameProvenance::begin(
+        binding,
+        format,
+        facts,
+        sequence,
+        timestamp,
+        CaptureWindow::at(taken),
+    )
+    .and_then(|pending| pending.finalize_illumination(illumination))
+    .map_err(|error| Error::Hardware(format!("invalid runtime frame provenance: {error}")))
+}
+
+fn checked_single_provenance(
+    binding: frame_provenance::FrameBinding,
+    format: frame_provenance::ValidatedFormatIdentity,
+    facts: frame_provenance::DequeuedBufferFacts,
+    sequence: frame_provenance::SequenceObservation,
+    timestamp: frame_provenance::TimestampObservation,
+    taken: std::time::Instant,
+    illumination: contracts::IlluminationProvenance,
+) -> irlume_common::Result<frame_provenance::RuntimeFrameProvenance> {
+    checked_single_evidence(
+        binding,
+        format,
+        facts,
+        sequence,
+        timestamp,
+        taken,
+        illumination,
+    )
+    .map(frame_provenance::RuntimeFrameProvenance::Single)
+}
+
+fn checked_aggregate_provenance(
+    contributors: Vec<frame_provenance::SingleFrameProvenance>,
+    selection: frame_provenance::ContributorSelection,
+) -> irlume_common::Result<frame_provenance::RuntimeFrameProvenance> {
+    frame_provenance::AggregateFrameProvenance::new(contributors, selection)
+        .map(frame_provenance::RuntimeFrameProvenance::Aggregate)
+        .map_err(|error| Error::Hardware(format!("invalid aggregate frame provenance: {error}")))
 }
 
 /// The span of time a frame's pixels came from, on the monotonic clock.
@@ -137,7 +241,7 @@ pub struct Frame {
 /// a burst, so their contents belong to a stretch of time rather than an instant.
 /// Keeping the stretch (instead of stamping "now" at return) is what lets
 /// [`CaptureWindow::gap_to`] state a real bound rather than a flattering one.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureWindow {
     pub start: std::time::Instant,
     pub end: std::time::Instant,
@@ -2669,13 +2773,20 @@ impl<'a> RgbSession<'a> {
         let (w, h) = (self.cam.width, self.cam.height);
         let device = self.cam.device.clone();
         let chosen = self.cam.chosen;
+        let binding = self
+            .cam
+            .lease
+            .frame_binding(&device, contracts::StreamRole::Rgb)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let format =
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         let mut frames = Vec::with_capacity(n.max(1));
         for _ in 0..n.max(1) {
             self.cam
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, _meta, _sequence, _timestamp) =
+            let (buf, facts, sequence, timestamp) =
                 self.stream.next().map_err(|error| map_io(&device, error))?;
             let taken = std::time::Instant::now();
             let data = match &chosen {
@@ -2686,13 +2797,22 @@ impl<'a> RgbSession<'a> {
                 .lease
                 .require_endpoint(&device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            frames.push(Frame {
-                width: w,
-                height: h,
-                spectrum: Spectrum::Rgb,
+            let provenance = checked_single_provenance(
+                binding.clone(),
+                format.clone(),
+                facts,
+                sequence,
+                timestamp,
+                taken,
+                contracts::IlluminationProvenance::Unknown,
+            )?;
+            frames.push(Frame::from_provenance(
+                w,
+                h,
+                Spectrum::Rgb,
                 data,
-                captured: CaptureWindow::at(taken),
-            });
+                provenance,
+            )?);
         }
         Ok(frames)
     }
@@ -2709,7 +2829,7 @@ impl<'a> RgbSession<'a> {
     /// the burst, so one blurry or over-exposed frame cannot decide a match.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn denoised(&mut self) -> irlume_common::Result<Frame> {
-        Ok(median_frame(self.burst(RGB_BURST)?))
+        median_frame(self.burst(RGB_BURST)?)
     }
 }
 
@@ -3105,9 +3225,9 @@ pub fn capture_rgb_denoised_with_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<Frame> {
-    Ok(median_frame(capture_rgb_burst_with_progress(
+    median_frame(capture_rgb_burst_with_progress(
         device, RGB_BURST, progress,
-    )?))
+    )?)
 }
 
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
@@ -3115,16 +3235,11 @@ pub fn capture_rgb_denoised_with_progress(
 /// for a degenerate burst. Private on purpose: callers must pass at least one
 /// frame (`capture_rgb_burst` clamps to n.max(1)), and keeping it crate-local
 /// keeps that invariant next to the only code that must uphold it.
-fn median_frame(mut frames: Vec<Frame>) -> Frame {
+fn median_frame(mut frames: Vec<Frame>) -> irlume_common::Result<Frame> {
     if frames.len() <= 1 {
-        return frames.pop().expect("median_frame: empty burst");
+        return Ok(frames.pop().expect("median_frame: empty burst"));
     }
     let (w, h, spectrum) = (frames[0].width, frames[0].height, frames[0].spectrum);
-    let window = frames
-        .iter()
-        .map(|f| f.captured)
-        .reduce(CaptureWindow::union)
-        .unwrap_or_else(|| CaptureWindow::at(std::time::Instant::now()));
     let len = frames.iter().map(|f| f.data.len()).min().unwrap_or(0);
     let mut out = vec![0u8; len];
     let mut col = vec![0u8; frames.len()];
@@ -3135,15 +3250,16 @@ fn median_frame(mut frames: Vec<Frame>) -> Frame {
         col.sort_unstable();
         *o = col[col.len() / 2];
     }
-    Frame {
-        width: w,
-        height: h,
-        spectrum,
-        data: out,
-        // A median pixel can come from any frame in the burst, so the result
-        // belongs to the whole span, not to any one dequeue.
-        captured: window,
-    }
+    let contributors = frames
+        .into_iter()
+        .map(Frame::into_single_provenance)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::Hardware(format!("invalid median contributors: {error}")))?;
+    let provenance = checked_aggregate_provenance(
+        contributors,
+        frame_provenance::ContributorSelection::ReducedOverAll,
+    )?;
+    Frame::from_provenance(w, h, spectrum, out, provenance)
 }
 
 const IR_W: u32 = 640;
@@ -3442,6 +3558,11 @@ impl IrSession<'_> {
         let card = &self.cam.card;
         let lit = self.lit;
         let white_level = self.dec.white_level();
+        let binding = lease
+            .frame_binding(device, contracts::StreamRole::Ir)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let format =
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         // The state is NOT impossible, which is why this is an error and not
         // the expect it used to be: a failed `recover` (its reopen can lose a
         // format race with another application, #427, or hit transient
@@ -3465,6 +3586,7 @@ impl IrSession<'_> {
         let mut frames: Vec<Vec<u8>> = Vec::with_capacity(IR_BURST);
         let mut means: Vec<f64> = Vec::with_capacity(IR_BURST);
         let mut taken: Vec<std::time::Instant> = Vec::with_capacity(IR_BURST);
+        let mut dequeue_evidence = Vec::with_capacity(IR_BURST);
         // Each frame's V4L2 buffer timestamp, the key that ties it to the
         // camera's illumination record. Measured identical across the image and
         // metadata queues for every frame of a 24-frame run; dequeue order is
@@ -3489,13 +3611,15 @@ impl IrSession<'_> {
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
-            let (buf, bmeta, _sequence, _timestamp) =
+            let (buf, bmeta, sequence, timestamp) =
                 stream.next().map_err(|error| map_io(device, error))?;
             lease
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             stamps.push(bmeta.timestamp_micros());
-            taken.push(std::time::Instant::now());
+            let frame_taken = std::time::Instant::now();
+            taken.push(frame_taken);
+            dequeue_evidence.push((bmeta, sequence, timestamp, frame_taken));
             // Drain every iteration, not once at the end. The metadata ring is
             // smaller than a burst, so a single drain afterwards silently loses
             // the earliest frames' records: measured 7 of 10 frames classified
@@ -3572,7 +3696,6 @@ impl IrSession<'_> {
         let best_i =
             ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref()).unwrap_or(0);
         let mut best = Some(frames[best_i].clone());
-        let mut ir_window = CaptureWindow::at(taken[best_i]);
 
         // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in. On a
         // strobing emitter the frame adjacent to the brightest is an emitter-OFF
@@ -3603,6 +3726,7 @@ impl IrSession<'_> {
         let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
         // Stays None unless the returned pixels stop being the raw gate frame.
         let mut saturation_frame: Option<Vec<u8>> = None;
+        let mut ambient_used = None;
         if subtract {
             // An adjacent frame the camera flagged dark, else the darker
             // neighbour as before. Adjacency still bounds auto-exposure drift
@@ -3629,8 +3753,8 @@ impl IrSession<'_> {
                         // the raw ones.
                         saturation_frame = white_level.map(|_| frames[best_i].clone());
                         best = Some(sub);
+                        ambient_used = Some(ai);
                         // The result now carries pixels from BOTH frames.
-                        ir_window = ir_window.union(CaptureWindow::at(taken[ai]));
                     }
                     if debug_ir {
                         // Reads the same ceiling the gate-frame selection above
@@ -3755,17 +3879,42 @@ impl IrSession<'_> {
             }
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
-        Ok((
-            Frame {
-                width: w,
-                height: h,
-                spectrum: Spectrum::Ir,
-                data: grey,
-                // The returned pixels are the chosen burst frame's, so the window is
-                // that dequeue. Ambient subtraction mixes in an ADJACENT frame, so
-                // it widens to cover both.
-                captured: ir_window,
+        let contributors = dequeue_evidence
+            .into_iter()
+            .zip(flags.iter().copied())
+            .map(
+                |((facts, sequence, timestamp, frame_taken), illumination)| {
+                    let illumination = match illumination {
+                        Some(ir_metadata::Illumination::Lit) => {
+                            contracts::IlluminationProvenance::ActiveIr
+                        }
+                        Some(ir_metadata::Illumination::Dark) => {
+                            contracts::IlluminationProvenance::Ambient
+                        }
+                        None => contracts::IlluminationProvenance::Unknown,
+                    };
+                    checked_single_evidence(
+                        binding.clone(),
+                        format.clone(),
+                        facts,
+                        sequence,
+                        timestamp,
+                        frame_taken,
+                        illumination,
+                    )
+                },
+            )
+            .collect::<irlume_common::Result<Vec<_>>>()?;
+        let selection = ambient_used.map_or(
+            frame_provenance::ContributorSelection::Selected { index: best_i },
+            |ambient_index| frame_provenance::ContributorSelection::Subtracted {
+                lit_index: best_i,
+                ambient_index,
             },
+        );
+        let provenance = checked_aggregate_provenance(contributors, selection)?;
+        Ok((
+            Frame::from_provenance(w, h, Spectrum::Ir, grey, provenance)?,
             IrCaptureStats {
                 saturation_frame,
                 lit_mean: lit_level as f32,
@@ -4004,6 +4153,10 @@ pub mod ir_probe {
         let (fmt, pix) = negotiate_ir_format(device, &dev)?;
         let mut dec = super::IrDecoder::new(pix, fmt.quantization);
         let (w, h) = (fmt.width, fmt.height);
+        let binding = permit
+            .frame_binding(device, super::contracts::StreamRole::Ir)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        let format = super::frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
         // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
         // reverse declaration order, so `stream` drops first and stops the
@@ -4027,17 +4180,20 @@ pub mod ir_probe {
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         for _ in 0..n {
-            let (buf, _meta, _sequence, _timestamp) =
+            let (buf, facts, sequence, timestamp) =
                 stream.next().map_err(|error| map_io(device, error))?;
             let taken = std::time::Instant::now();
+            let provenance = super::checked_single_provenance(
+                binding.clone(),
+                format.clone(),
+                facts,
+                sequence,
+                timestamp,
+                taken,
+                super::contracts::IlluminationProvenance::Unknown,
+            )?;
             out.push((
-                Frame {
-                    width: w,
-                    height: h,
-                    spectrum: Spectrum::Ir,
-                    data: dec.decode(buf, w, h),
-                    captured: super::CaptureWindow::at(taken),
-                },
+                Frame::from_provenance(w, h, Spectrum::Ir, dec.decode(buf, w, h), provenance)?,
                 t0.elapsed().as_secs_f64() * 1000.0,
             ));
         }
@@ -4114,6 +4270,10 @@ pub fn capture_ir_streaming<B>(
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
+    let binding = permit
+        .frame_binding(device, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
     // reverse declaration order, so `stream` drops first and stops the
@@ -4163,7 +4323,7 @@ pub fn capture_ir_streaming<B>(
     // user a password fallback. Reading the metadata queue here is how that gets
     // closed, and it is not done.
     for _ in 0..max_frames {
-        let (buf, _meta, _sequence, _timestamp) =
+        let (buf, facts, sequence, timestamp) =
             stream.next().map_err(|error| map_io(device, error))?;
         let taken = std::time::Instant::now();
         let data = dec.decode(buf, w, h);
@@ -4222,13 +4382,16 @@ pub fn capture_ir_streaming<B>(
         if mean >= IR_BLOWN_MEAN {
             continue;
         }
-        let frame = Frame {
-            width: w,
-            height: h,
-            spectrum: Spectrum::Ir,
-            data,
-            captured: CaptureWindow::at(taken),
-        };
+        let provenance = checked_single_provenance(
+            binding.clone(),
+            format.clone(),
+            facts,
+            sequence,
+            timestamp,
+            taken,
+            contracts::IlluminationProvenance::Unknown,
+        )?;
+        let frame = Frame::from_provenance(w, h, Spectrum::Ir, data, provenance)?;
         if let std::ops::ControlFlow::Break(b) = on_frame(IrStreamFrame { frame, mean }) {
             return Ok(Some(b));
         }
@@ -4254,6 +4417,12 @@ pub fn capture_ir_sequence(
     samples: usize,
     burst: usize,
 ) -> irlume_common::Result<Vec<Frame>> {
+    let burst = burst.max(1);
+    if burst > 64 {
+        return Err(Error::Hardware(
+            "IR mini-burst exceeds the 64-contributor provenance cap".into(),
+        ));
+    }
     verify_pinned(device)?;
     let permit = lease::permit_for_endpoint(
         device,
@@ -4266,11 +4435,14 @@ pub fn capture_ir_sequence(
             "{device}: hardware privacy switch is ON"
         )));
     }
-    let burst = burst.max(1);
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
     let (fmt, pix) = negotiate_ir_format(device, &dev)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
+    let binding = permit
+        .frame_binding(device, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&fmt);
     let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
     // DECLARED before the stream, ASSIGNED after it opens. Locals drop in
     // reverse declaration order, so `stream` drops first and stops the
@@ -4305,19 +4477,27 @@ pub fn capture_ir_sequence(
         }
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
-        // The kept frame is one dequeue out of the mini-burst, so remember WHICH
-        // instant it came from rather than stamping the end of the burst.
-        let mut taken = std::time::Instant::now();
+        let mut best_index = 0;
+        let mut contributors = Vec::with_capacity(burst);
         for _ in 0..burst {
-            let (buf, _meta, _sequence, _timestamp) =
+            let (buf, facts, sequence, timestamp) =
                 stream.next().map_err(|error| map_io(device, error))?;
             let at = std::time::Instant::now();
             let data = dec.decode(buf, w, h);
             let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
+            contributors.push(checked_single_evidence(
+                binding.clone(),
+                format.clone(),
+                facts,
+                sequence,
+                timestamp,
+                at,
+                contracts::IlluminationProvenance::Unknown,
+            )?);
             if mean > best_mean {
                 best_mean = mean;
                 best = Some(data);
-                taken = at;
+                best_index = contributors.len() - 1;
             }
         }
         let Some(data) = best else { continue };
@@ -4375,13 +4555,25 @@ pub fn capture_ir_sequence(
         if best_mean >= IR_BLOWN_MEAN {
             continue;
         }
-        frames.push(Frame {
-            width: w,
-            height: h,
-            spectrum: Spectrum::Ir,
+        let provenance = if contributors.len() == 1 {
+            frame_provenance::RuntimeFrameProvenance::Single(
+                contributors.into_iter().next().ok_or_else(|| {
+                    Error::Hardware("mini-burst produced no provenance contributor".into())
+                })?,
+            )
+        } else {
+            checked_aggregate_provenance(
+                contributors,
+                frame_provenance::ContributorSelection::Selected { index: best_index },
+            )?
+        };
+        frames.push(Frame::from_provenance(
+            w,
+            h,
+            Spectrum::Ir,
             data,
-            captured: CaptureWindow::at(taken),
-        });
+            provenance,
+        )?);
     }
     // A short return is a CAPTURE fault, not a quiet fact about the scene: the
     // attempt budget ran out because frames arrived frozen, blown out, or too
@@ -4810,7 +5002,7 @@ fn held_concurrent_arm<'d>(
             let t0 = std::time::Instant::now();
             let (rgb, ir) = std::thread::scope(|scope| {
                 let ir_thread = scope.spawn(|| is.capture_with_stats());
-                let rgb = rs.burst(RGB_BURST).map(median_frame);
+                let rgb = rs.burst(RGB_BURST).and_then(median_frame);
                 let ir = match ir_thread.join() {
                     Ok(result) => result,
                     // Re-raise into the composer's catch_unwind: a panic is a
@@ -6669,14 +6861,73 @@ mod tests {
         assert!(why.contains("could not be listed"), "{why}");
     }
 
+    thread_local! {
+        static TEST_SEQUENCE: std::cell::RefCell<frame_provenance::SequenceTracker> =
+            const { std::cell::RefCell::new(frame_provenance::SequenceTracker::new()) };
+        static TEST_TIMESTAMP: std::cell::RefCell<frame_provenance::TimestampTracker> =
+            const { std::cell::RefCell::new(frame_provenance::TimestampTracker::new()) };
+    }
+
+    fn frame_at(data: &[u8], at: std::time::Instant) -> Frame {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        let raw = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let micros = i64::from(raw) * 1_000;
+        let metadata = v4l::buffer::Metadata {
+            bytesused: data.len() as u32,
+            sequence: raw,
+            timestamp: v4l::timestamp::Timestamp::new(0, micros),
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            ..Default::default()
+        };
+        let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, data.len())
+            .expect("test buffer facts");
+        let sequence = TEST_SEQUENCE.with(|tracker| {
+            tracker
+                .borrow_mut()
+                .observe(raw)
+                .expect("test sequence observation")
+        });
+        let timestamp = TEST_TIMESTAMP.with(|tracker| {
+            tracker
+                .borrow_mut()
+                .observe(
+                    micros,
+                    frame_provenance::TimestampClock::Monotonic,
+                    frame_provenance::TimestampSource::EndOfFrame,
+                )
+                .expect("test timestamp observation")
+        });
+        let binding = frame_provenance::FrameBinding::new(
+            contracts::CameraInstanceId::new("22222222222222222222222222222222")
+                .expect("test camera identity"),
+            contracts::CameraGeneration::INITIAL,
+            contracts::StreamRole::Rgb,
+        );
+        let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(
+            &v4l::Format::new(data.len() as u32, 1, v4l::FourCC::new(b"RGB3")),
+        );
+        let provenance = checked_single_provenance(
+            binding,
+            format,
+            facts,
+            sequence,
+            timestamp,
+            at,
+            contracts::IlluminationProvenance::Unknown,
+        )
+        .expect("test runtime provenance");
+        Frame::from_provenance(
+            data.len() as u32,
+            1,
+            Spectrum::Rgb,
+            data.to_vec(),
+            provenance,
+        )
+        .expect("test frame")
+    }
+
     fn frame(data: &[u8]) -> Frame {
-        Frame {
-            width: data.len() as u32,
-            height: 1,
-            spectrum: Spectrum::Rgb,
-            data: data.to_vec(),
-            captured: CaptureWindow::at(std::time::Instant::now()),
-        }
+        frame_at(data, std::time::Instant::now())
     }
 
     // The decision the probe exists to make, checked against the two modules we
@@ -7171,16 +7422,30 @@ mod tests {
     fn median_frame_window_spans_the_whole_burst() {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
-        let mut frames = vec![frame(&[10, 10]), frame(&[20, 20]), frame(&[30, 30])];
-        for (i, f) in frames.iter_mut().enumerate() {
-            f.captured = CaptureWindow::at(t0 + Duration::from_millis(100 * i as u64));
-        }
+        let frames = vec![
+            frame_at(&[10, 10], t0),
+            frame_at(&[20, 20], t0 + Duration::from_millis(100)),
+            frame_at(&[30, 30], t0 + Duration::from_millis(200)),
+        ];
         // A median pixel may come from any frame, so the result cannot claim a
         // single instant: it must cover first-to-last dequeue.
-        let m = median_frame(frames);
+        let m = median_frame(frames).expect("coherent median provenance");
         assert_eq!(m.captured.start, t0);
         assert_eq!(m.captured.end, t0 + Duration::from_millis(200));
         assert_eq!(m.data, vec![20, 20]);
+        match m.provenance() {
+            frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) => {
+                assert_eq!(aggregate.contributors().len(), 3);
+                assert_eq!(
+                    aggregate.selection(),
+                    frame_provenance::ContributorSelection::ReducedOverAll
+                );
+                assert_eq!(aggregate.capture_window(), m.captured);
+            }
+            frame_provenance::RuntimeFrameProvenance::Single(_) => {
+                panic!("a multi-frame median must retain all contributors")
+            }
+        }
     }
 
     #[test]
@@ -7194,14 +7459,33 @@ mod tests {
             frame(&[99, 51, 199]),
             frame(&[100, 50, 200]),
         ];
-        let m = median_frame(frames);
+        let m = median_frame(frames).expect("coherent median provenance");
         assert_eq!(m.data, vec![100, 50, 200]);
     }
 
     #[test]
+    fn oversized_ir_sequence_burst_fails_before_device_access() {
+        let error = match capture_ir_sequence("/definitely/missing/video", 1, 65) {
+            Ok(_) => panic!("oversized provenance aggregate must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("64-contributor"), "{error}");
+    }
+
+    #[test]
+    fn frame_storage_is_mandatory_runtime_provenance() {
+        let frame = frame(&[1]);
+        let _: &frame_provenance::RuntimeFrameProvenance = &frame.provenance;
+    }
+
+    #[test]
     fn median_frame_passes_lone_frame_through() {
-        let m = median_frame(vec![frame(&[1, 2, 3])]);
+        let m = median_frame(vec![frame(&[1, 2, 3])]).expect("lone frame passes through");
         assert_eq!(m.data, vec![1, 2, 3]);
+        assert!(matches!(
+            m.provenance(),
+            frame_provenance::RuntimeFrameProvenance::Single(_)
+        ));
     }
 
     #[test]
@@ -7514,16 +7798,18 @@ mod tests {
     }
 
     #[test]
-    fn median_frame_even_burst_takes_upper_middle_and_min_length() {
+    fn median_frame_even_burst_takes_upper_middle_and_rejects_mixed_formats() {
         // Even burst: sorted [1,2,3,4] -> index 4/2 = 2 -> 3 (upper middle).
         let frames = vec![frame(&[1]), frame(&[4]), frame(&[2]), frame(&[3])];
-        assert_eq!(median_frame(frames).data, vec![3]);
-        // Mixed-length burst: output truncates to the shortest frame, and the
-        // dimensions/spectrum come from the first frame.
+        assert_eq!(
+            median_frame(frames)
+                .expect("coherent median provenance")
+                .data,
+            vec![3]
+        );
+        // A reduction may not silently combine different validated formats.
         let frames = vec![frame(&[9, 9, 9]), frame(&[5, 5]), frame(&[7, 7, 7])];
-        let m = median_frame(frames);
-        assert_eq!(m.data, vec![7, 7]);
-        assert_eq!((m.width, m.height, m.spectrum), (3, 1, Spectrum::Rgb));
+        assert!(median_frame(frames).is_err());
     }
 
     #[test]

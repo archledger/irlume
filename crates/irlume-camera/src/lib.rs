@@ -1344,6 +1344,13 @@ fn rate_evidence_to_common(
 /// 64 gives >2x headroom for timeouts and corrupt frames.
 const MAX_RATE_FILL_ATTEMPTS: usize = 64;
 
+/// Frames discarded before the rate window is measured. The first window after
+/// STREAMON spans the driver's initial buffer delivery, whose sequence gaps
+/// make a healthy 15 fps stream read ~7 fps (measured: 32 gaps on the ASUS IR).
+/// Flushing one window's worth of frames before resetting and measuring keeps
+/// the gate from rejecting a settled stream for its startup transient.
+const RATE_STARTUP_FLUSH: usize = 30;
+
 struct TrackedStream<S> {
     stream: Option<S>,
     sequence: frame_provenance::SequenceTracker,
@@ -1583,6 +1590,17 @@ impl<S: ValidatedStream> TrackedStream<S> {
 
     /// Boundedly establish the 30-delta window before the next delivered frame.
     fn fill_rate_evidence(&mut self) -> std::io::Result<()> {
+        if self.rate_window.ready() {
+            return Ok(());
+        }
+        // First fill: flush the STREAMON transient before measuring. The first
+        // window spans the driver's initial buffer delivery, whose sequence
+        // gaps would poison a settled stream's measurement. Reset before
+        // measuring so the startup deltas do not count against the floor.
+        for _ in 0..RATE_STARTUP_FLUSH {
+            self.next_discarded()?;
+        }
+        self.rate_window.reset();
         let mut attempts = 0;
         while !self.rate_window.ready() && attempts < MAX_RATE_FILL_ATTEMPTS {
             self.next_discarded()?;

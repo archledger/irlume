@@ -1475,8 +1475,19 @@ fn self_heal_streak(prev: u32, signal: CaptureModeSignal) -> u32 {
 
 #[cfg(test)]
 mod capture_mode_decision_tests {
-    use super::{capture_mode_decision, ENV_CAPTURE_MODE_SOURCE, STORED_CAPTURE_MODE_SOURCE};
+    use super::{
+        cameras_for_held_pair, capture_mode_decision, ENV_CAPTURE_MODE_SOURCE,
+        STORED_CAPTURE_MODE_SOURCE,
+    };
     use irlume_camera::CaptureMode;
+
+    struct DropProbe(std::rc::Rc<std::cell::Cell<bool>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
 
     #[test]
     fn a_set_env_var_decides_alone_in_both_directions() {
@@ -1518,6 +1529,33 @@ mod capture_mode_decision_tests {
         // concurrent fallback broke an enrollment on hardware that cannot
         // stream both nodes (#308).
         assert_eq!(capture_mode_decision(None, None), (true, "default"));
+    }
+
+    #[test]
+    fn sequential_selection_releases_preflight_camera_handles_immediately() {
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let cameras = Some(DropProbe(std::rc::Rc::clone(&dropped)));
+
+        let held = cameras_for_held_pair(true, cameras);
+
+        assert!(held.is_none());
+        assert!(
+            dropped.get(),
+            "the one-shot capture must be able to reopen the camera before auth continues"
+        );
+    }
+
+    #[test]
+    fn concurrent_selection_keeps_preflight_camera_handles() {
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let cameras = Some(DropProbe(std::rc::Rc::clone(&dropped)));
+
+        let held = cameras_for_held_pair(false, cameras);
+
+        assert!(held.is_some());
+        assert!(!dropped.get());
+        drop(held);
+        assert!(dropped.get());
     }
 
     #[test]
@@ -1827,6 +1865,22 @@ fn release_held(
 ) {
     *rgb = None;
     *ir = None;
+}
+
+/// Keep camera objects only when this operation will arm a held pair.
+///
+/// This must consume and explicitly drop the preflight opens on the sequential
+/// path. A conditional move such as `if sequential { None } else { cameras }`
+/// leaves the unselected value alive until the surrounding scope exits. The
+/// following one-shot capture then reopens the same nodes while those handles
+/// still exist, which is `EBUSY` on single-consumer drivers and v4l2loopback.
+fn cameras_for_held_pair<T>(sequential: bool, cameras: Option<T>) -> Option<T> {
+    if sequential {
+        drop(cameras);
+        None
+    } else {
+        cameras
+    }
 }
 
 impl Engine {
@@ -3806,7 +3860,7 @@ impl Engine {
                 capture_mode_selection(rgb, ir)
             });
         let sequential = capture_mode.is_sequential();
-        let held_cams = if sequential { None } else { resolved_cams };
+        let held_cams = cameras_for_held_pair(sequential, resolved_cams);
         let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
         let mut held_ir: Option<irlume_camera::IrSession<'_>> = None;
         if let (Some((cam_r, cam_i)), true) = (&held_cams, !sequential && self.ir_available) {

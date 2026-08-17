@@ -10,6 +10,7 @@
 //! with `SO_PEERCRED` (verify uid/gid of the peer) before honouring privileged
 //! requests such as enrollment.
 
+pub mod artifact;
 pub mod client;
 pub mod config;
 pub mod dbglog;

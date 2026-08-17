@@ -6434,6 +6434,20 @@ pub fn store_sequential_if_still_concurrent(
 ///
 /// A control is only written when its current value could be read back first, so
 /// anything changed can be undone.
+fn active_by_device_default_message(control: &ir_emitter::EmitterControl) -> String {
+    let encoded = control.encode();
+    let mode = if control.selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION {
+        "Face Authentication D1"
+    } else {
+        "IR Torch active mode"
+    };
+    format!(
+        "IR emitter mode active by device default: {encoded} on the camera's Microsoft \
+         camera-control unit; GET_CUR and GET_DEF both report the validated {mode} value \
+         (no camera write or saved config was needed)"
+    )
+}
+
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     verify_pinned(device)?;
@@ -6543,7 +6557,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     };
     permit.run_active(|| {
         match ir_emitter::discover(fd, &id, &mut measure, &mut privacy_allows_write) {
-            Ok(found) => {
+            Ok(ir_emitter::DiscoveryOutcome::Applied(found)) => {
                 let encoded = found.control().encode();
                 // Confirm, publish, release, in that order. The sequence lives in
                 // `finish` rather than here so it is reachable by a test.
@@ -6551,8 +6565,11 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
                 Ok(format!(
                     "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
                  using a value built from what the camera reports about that control \
-                 (saved; future captures rebuild it the same way)"
+                    (saved; future captures rebuild it the same way)"
                 ))
+            }
+            Ok(ir_emitter::DiscoveryOutcome::ActiveByDeviceDefault(control)) => {
+                Ok(active_by_device_default_message(&control))
             }
             Err(e) => Err(Error::Hardware(e.to_string())),
         }
@@ -6732,6 +6749,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_default_d1_message_reports_evidence_and_absence_of_writes() {
+        let message = active_by_device_default_message(&ir_emitter::EmitterControl {
+            unit: 12,
+            selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+            payload: vec![1, 2, 0b010],
+        });
+
+        assert!(message.contains("active by device default"), "{message}");
+        assert!(message.contains("Face Authentication D1"), "{message}");
+        assert!(message.contains("GET_CUR and GET_DEF"), "{message}");
+        assert!(
+            message.contains("no camera write or saved config was needed"),
+            "{message}"
+        );
+    }
 
     fn test_rate_config(role: contracts::StreamRole) -> rate_gate::StreamRateConfig {
         // Zero window: a "no gate" config for continuity/provenance fixtures so

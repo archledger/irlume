@@ -2288,12 +2288,19 @@ fn apply_known_payload(
 /// `ir-setup` recorded is re-derived exactly as it was found. Persisting only
 /// coordinates is coherent because of that: the camera is the authority at both
 /// moments, and nothing is replayed out of a file.
+struct IntendedValue {
+    payload: Vec<u8>,
+    /// The value is not merely supported: it is also what `GET_DEF` says this
+    /// camera chooses without a host write.
+    is_device_default: bool,
+}
+
 fn intended_value(
     fd: c_int,
     unit: u8,
     selector: u8,
     len: usize,
-) -> XuResult<std::result::Result<Vec<u8>, String>> {
+) -> XuResult<std::result::Result<IntendedValue, String>> {
     let def = get_of(fd, unit, selector, UVC_GET_DEF, len)?;
     if selector == crate::uvc_descriptor::MSXU_IR_TORCH {
         // Microsoft specifies IR Torch's GET_INFO as exactly 3: a synchronous
@@ -2312,12 +2319,20 @@ fn intended_value(
         let min = get_of(fd, unit, selector, UVC_GET_MIN, len)?;
         let max = get_of(fd, unit, selector, UVC_GET_MAX, len)?;
         let res = get_of(fd, unit, selector, UVC_GET_RES, len)?;
-        return Ok(ir_torch_default_is_usable(&def, &min, &max, &res).map(|()| def));
+        return Ok(
+            ir_torch_default_is_usable(&def, &min, &max, &res).map(|()| IntendedValue {
+                payload: def,
+                is_device_default: true,
+            }),
+        );
     }
     // Face Authentication's default is general-purpose mode on a dual-purpose
     // interface, so it is derived from the camera's advertised capabilities.
     let max = get_of(fd, unit, selector, UVC_GET_MAX, len)?;
-    Ok(face_auth_payload(&def, &max))
+    Ok(face_auth_payload(&def, &max).map(|payload| IntendedValue {
+        is_device_default: payload == def,
+        payload,
+    }))
 }
 
 /// Apply a control's own default, with the checks discovery makes.
@@ -2340,9 +2355,10 @@ fn apply_device_default(
         return Err(XuError::Unsupported);
     }
     let len = get_len(fd, unit, selector)?;
-    let Ok(wanted) = intended_value(fd, unit, selector, len)? else {
+    let Ok(intended) = intended_value(fd, unit, selector, len)? else {
         return Err(XuError::Unsupported);
     };
+    let wanted = intended.payload;
     let write = write_if_different(fd, unit, selector, len, &wanted, id)?;
     Ok((write, wanted))
 }
@@ -3382,7 +3398,7 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     // The caller supplies the privacy-shutter re-check through this, so the
     // check-to-write window is one syscall, not the whole discovery pipeline.
     before_forward_write: &mut G,
-) -> std::result::Result<Discovered, DiscoveryError> {
+) -> std::result::Result<DiscoveryOutcome, DiscoveryError> {
     let ms = id
         .microsoft_xu()
         .ok_or_else(|| DiscoveryError::NoMicrosoftXu {
@@ -3427,11 +3443,14 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
             // the configuration naming the applied control is durable, so nothing
             // else can file a record over this one in between.
             Ok(Attempt::Lit(control, pending)) => {
-                return Ok(Discovered {
+                return Ok(DiscoveryOutcome::Applied(Discovered {
                     control,
                     pending,
                     _lock: lock,
-                })
+                }))
+            }
+            Ok(Attempt::ActiveByDeviceDefault(control)) => {
+                return Ok(DiscoveryOutcome::ActiveByDeviceDefault(control))
             }
             Ok(Attempt::AlreadyApplied) => tried.push(format!(
                 "selector {selector:#04x} is already set to the value setup would apply"
@@ -3479,6 +3498,18 @@ fn lock_device_fd(fd: c_int) -> Option<c_int> {
         return None;
     }
     Some(fd)
+}
+
+/// What standards-based emitter discovery established.
+///
+/// `Applied` owns a camera change until its configuration is committed.
+/// `ActiveByDeviceDefault` is a read-only result: the camera reports the same
+/// validated active value in both `GET_CUR` and `GET_DEF`, so no write or
+/// persistence is needed to reproduce its declared power-on behaviour.
+#[derive(Debug)]
+pub enum DiscoveryOutcome {
+    Applied(Discovered),
+    ActiveByDeviceDefault(EmitterControl),
 }
 
 /// A discovery run that has left the camera lit, and the undo record that stays
@@ -3573,8 +3604,12 @@ impl Discovered {
 enum Attempt {
     /// Lit, and still holding the applied value, with its undo record open.
     Lit(EmitterControl, ExploratoryWrite),
+    /// The validated active value is both current and the device's own default.
+    /// Nothing was written, measured, journalled, or claimed by irlume.
+    ActiveByDeviceDefault(EmitterControl),
     /// The control is already set to the value setup would apply, so writing it
-    /// again could not demonstrate anything.
+    /// again could not demonstrate anything, but it is not the device default
+    /// and may be transient state owned by another client.
     AlreadyApplied,
     /// Usable but it did not brighten the image, or its default failed the
     /// checks the specification allows. The control was left as it was found.
@@ -3628,10 +3663,11 @@ fn try_documented_control<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), St
 
     // The same derivation every later capture will use, so what is recorded is
     // reproducible rather than a value that only existed during setup.
-    let wanted = match intended_value(fd, unit, selector, len)? {
+    let intended = match intended_value(fd, unit, selector, len)? {
         Ok(v) => v,
         Err(why) => return Ok(Attempt::NotUsable(why)),
     };
+    let wanted = intended.payload;
 
     // Nothing here assumes what "off" looks like.
     //
@@ -3647,6 +3683,25 @@ fn try_documented_control<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), St
     // learn from writing it again, and saying so is more honest than measuring
     // a difference that cannot exist.
     if original == wanted {
+        // The validation queries above are several USB round trips. Re-read at
+        // the decision point so a client that moved the control during them is
+        // not reported as a ready camera. UVC has no compare-and-get, so this
+        // narrows the unavoidable observation window to one request.
+        let now = get_cur(fd, unit, selector, len)?;
+        if now != original {
+            return Ok(Attempt::NotUsable(format!(
+                "the control changed while setup was validating it: it held {original:02x?} \
+                 when discovery began and {now:02x?} before the ready-state decision; \
+                 nothing was sent"
+            )));
+        }
+        if intended.is_device_default {
+            return Ok(Attempt::ActiveByDeviceDefault(EmitterControl {
+                unit,
+                selector,
+                payload: wanted,
+            }));
+        }
         return Ok(Attempt::AlreadyApplied);
     }
 
@@ -4532,6 +4587,111 @@ mod tests {
             res: vec![1, 1, 1],
             ..Default::default()
         }
+    }
+
+    /// Microsoft's Face Authentication control permits a dedicated IR
+    /// interface to declare D1 as its default. The BRIO 046d:085e does exactly
+    /// that after a USB reset: interface 2 is already in alternative-frame
+    /// illumination mode before the host sends anything.
+    ///
+    /// Setup must recognise that documented ready state without manufacturing
+    /// evidence by rewriting the same bytes. In particular, measurement,
+    /// `SET_CUR`, and the undo journal all belong only to an exploratory change.
+    #[test]
+    fn a_face_auth_d1_device_default_is_already_active_without_a_write() {
+        let _lock = crate::testenv::env_lock();
+        let camera = fake_camera::Camera {
+            current: vec![1, 2, 0b010],
+            len: 3,
+            info: 0b0000_0011,
+            def: vec![1, 2, 0b010],
+            max: vec![1, 2, 0b011],
+            ..Default::default()
+        };
+        let mut measurements = 0;
+        let (outcome, log, current, dir) = run_discovery(camera, "d1-default", || {
+            measurements += 1;
+            Some(50.0)
+        });
+
+        assert!(matches!(
+            outcome,
+            Ok(Attempt::ActiveByDeviceDefault(EmitterControl {
+                unit: 14,
+                selector: 6,
+                payload,
+            })) if payload == vec![1, 2, 0b010]
+        ));
+        assert_eq!(
+            measurements, 0,
+            "an unchanged device default needs no optical experiment"
+        );
+        assert_eq!(current, vec![1, 2, 0b010]);
+        assert_eq!(
+            log,
+            vec![
+                fake_camera::Request::Get {
+                    query: UVC_GET_INFO,
+                    size: 1,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_LEN,
+                    size: 2,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_CUR,
+                    size: 3,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_DEF,
+                    size: 3,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_MAX,
+                    size: 3,
+                },
+                fake_camera::Request::Get {
+                    query: UVC_GET_CUR,
+                    size: 3,
+                },
+            ],
+            "the ready path must contain reads only"
+        );
+        assert!(
+            !dir.exists(),
+            "a path that changed nothing must not create an undo journal"
+        );
+    }
+
+    /// A dual-purpose interface defaults to D0. If its current value is D1,
+    /// another client may own that transient state; matching the value setup
+    /// would choose does not make it irlume's device-default success.
+    #[test]
+    fn a_transient_face_auth_d1_is_not_promoted_to_device_default_success() {
+        let _lock = crate::testenv::env_lock();
+        let camera = fake_camera::Camera {
+            current: vec![1, 3, 0b010],
+            len: 3,
+            info: 0b0000_0011,
+            def: vec![1, 3, 0b001],
+            max: vec![1, 3, 0b011],
+            ..Default::default()
+        };
+        let mut measurements = 0;
+        let (outcome, log, current, dir) = run_discovery(camera, "transient-d1", || {
+            measurements += 1;
+            Some(50.0)
+        });
+
+        assert!(matches!(outcome, Ok(Attempt::AlreadyApplied)));
+        assert_eq!(measurements, 0);
+        assert_eq!(current, vec![1, 3, 0b010]);
+        assert!(
+            log.iter()
+                .all(|request| !matches!(request, fake_camera::Request::Set(_))),
+            "another client's matching value must not be rewritten"
+        );
+        assert!(!dir.exists());
     }
 
     /// The undo record is on disk, complete and correct, AT THE MOMENT the first

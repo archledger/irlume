@@ -7427,6 +7427,10 @@ fn guide_until_capture(
     GuideOutcome::Ready
 }
 
+fn merge_confirmation_required(first_new_profile_scan: bool, created: bool) -> bool {
+    first_new_profile_scan && !created
+}
+
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,
 /// then capture, repeating until `target` scans. Streams cues to the UI.
 fn enroll_worker(
@@ -7463,7 +7467,8 @@ fn enroll_worker(
                 GuideOutcome::Halt => return,
             }
             // Capture: first scan of a NEW profile creates it; the rest append.
-            let req = if i == 0 && add.is_none() {
+            let first_new_profile_scan = i == 0 && add.is_none();
+            let req = if first_new_profile_scan {
                 Request::Enroll {
                     user: user.clone(),
                     profile: Some(profile.clone()),
@@ -7487,13 +7492,13 @@ fn enroll_worker(
                 // adding the rest; the worker ends here (the UI spawns a
                 // continuation on confirm, or undoes the scan on decline).
                 Ok(Response::Enrolled {
-                    created: false,
+                    created,
                     profile: resolved,
                     room,
                     added_scans,
                     ambient_lit,
                     ..
-                }) => {
+                }) if merge_confirmation_required(first_new_profile_scan, created) => {
                     let _ = send(WMsg::MergePrompt {
                         profile: resolved,
                         room,
@@ -10023,6 +10028,16 @@ mod tests {
     }
 
     // ---- confirm & merge flows --------------------------------------------
+
+    #[test]
+    fn only_the_first_new_profile_scan_can_require_merge_confirmation() {
+        assert!(merge_confirmation_required(true, false));
+        assert!(!merge_confirmation_required(true, true));
+        assert!(
+            !merge_confirmation_required(false, false),
+            "AddScan always reports created=false and must never reopen the merge modal"
+        );
+    }
 
     #[test]
     fn confirm_yes_fires_the_stored_request_async() {

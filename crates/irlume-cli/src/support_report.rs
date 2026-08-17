@@ -11,7 +11,7 @@ use irlume_common::diagnostics::{
 use irlume_common::{Request, Response};
 use serde::Serialize;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -402,40 +402,42 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     if parsed.probe {
         eprintln!("irlume support-report: probe requested; the camera and IR emitter may activate");
     }
-    let report = collect(parsed.since, parsed.probe);
-    let bytes = match render_text(&report) {
-        Ok(bytes) => bytes,
-        Err(message) => {
-            eprintln!("irlume support-report: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
     let output = parsed.output.unwrap_or_else(default_output_path);
-    let mut artifact = match SecureArtifact::create(&output, MAX_REPORT_BYTES) {
-        Ok(artifact) => artifact,
-        Err(error) => {
-            eprintln!("irlume support-report: {}: {error}", output.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(error) = artifact.write_chunk(&bytes) {
-        eprintln!("irlume support-report: {}: {error}", output.display());
-        return ExitCode::FAILURE;
-    }
-    match artifact.commit() {
-        Ok(published) => {
-            if let Some(warning) = published.durability_warning {
-                eprintln!("irlume support-report: durability warning: {warning}");
-            }
-            println!("Support report created: {}", published.final_path.display());
+    match publish(collect(parsed.since, parsed.probe), &output) {
+        Ok(path) => {
+            println!("Support report created: {}", path.display());
             println!("Inspect it before sharing.");
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            eprintln!("irlume support-report: {}: {error}", output.display());
+        Err(message) => {
+            eprintln!("irlume support-report: {message}");
             ExitCode::FAILURE
         }
     }
+}
+
+pub(crate) fn create_read_only_default() -> Result<PathBuf, String> {
+    let output = default_output_path();
+    publish(
+        collect(Duration::from_millis(DEFAULT_HISTORY_MS), false),
+        &output,
+    )
+}
+
+fn publish(report: SupportReport, output: &Path) -> Result<PathBuf, String> {
+    let bytes = render_text(&report).map_err(str::to_owned)?;
+    let mut artifact = SecureArtifact::create(output, MAX_REPORT_BYTES)
+        .map_err(|error| format!("{}: {error}", output.display()))?;
+    artifact
+        .write_chunk(&bytes)
+        .map_err(|error| format!("{}: {error}", output.display()))?;
+    let published = artifact
+        .commit()
+        .map_err(|error| format!("{}: {error}", output.display()))?;
+    if let Some(warning) = published.durability_warning {
+        eprintln!("irlume support-report: durability warning: {warning}");
+    }
+    Ok(published.final_path)
 }
 
 struct HumanArgs {

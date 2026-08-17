@@ -297,6 +297,9 @@ enum Suspend {
     /// complete authoritative dump (incl. the info-only lines the Repair
     /// checklist omits), copy-pasteable for a bug report.
     Doctor,
+    /// Create the ordinary share-safe support report in the current directory.
+    /// This route is deliberately read-only: no probe and no trace flags.
+    SupportReport,
     /// Refresh the systemd-pcrlock policy after a firmware/Secure Boot change
     /// so a Tier-2 seal keeps validating. Idempotent (re-predicts the current
     /// PCRs); a system operation, so it is root-gated and clearly labeled.
@@ -2971,6 +2974,16 @@ impl App {
                 // reports on the same user the rest of the screen does.
                 let _ = crate::doctor(&["--user".to_string(), self.user.clone()]);
             }
+            Suspend::SupportReport => match crate::support_report::create_read_only_default() {
+                Ok(path) => self.log(
+                    '✓',
+                    format!(
+                        "Support report created: {} — inspect before sharing",
+                        path.display()
+                    ),
+                ),
+                Err(error) => self.set_error(format!("support report: {error}")),
+            },
             Suspend::PcrlockMakePolicy => self.sudo_step(
                 "refresh the pcrlock policy (re-predict the boot measurements)",
                 &["systemd-pcrlock", "make-policy"],
@@ -3422,6 +3435,13 @@ impl App {
             (SC_REPAIR, KeyCode::Char('d')) => {
                 self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
                 self.suspend = Some(Suspend::Doctor);
+            }
+            (SC_REPAIR, KeyCode::Char('s')) => {
+                self.log(
+                    '→',
+                    "creating a read-only support report (no camera capture)…",
+                );
+                self.suspend = Some(Suspend::SupportReport);
             }
             // IR liveness self-test: the daemon root-gates it (the raw
             // measurements are a spoof-tuning oracle), so like every other root
@@ -6060,7 +6080,7 @@ impl App {
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
         let [list_area, info_area] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(9)]).areas(area);
+            Layout::vertical([Constraint::Min(4), Constraint::Length(10)]).areas(area);
 
         // ---- checklist --------------------------------------------------
         let ok = self.repair.iter().filter(|c| c.sev == Sev::Ok).count();
@@ -6194,6 +6214,10 @@ impl App {
         ]));
         lines.push(Line::from(Span::styled(
             "  IR test    press [l] to run the IR PAD self-test (sudo; look at the camera)",
+            Style::new().dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Support    [s] Create Support Report (read-only; captures no camera data)",
             Style::new().dim(),
         )));
         let blk = Block::bordered()
@@ -6703,6 +6727,7 @@ impl App {
                 ("f", "Fix Selected Issue…"),
                 ("r", "Recheck"),
                 ("d", "Full Diagnostics"),
+                ("s", "Create Support Report"),
                 ("l", "Test Infrared Camera"),
                 ("g", "Show Logs"),
                 ("t", "Toggle Debug Logs"),
@@ -9762,6 +9787,28 @@ mod tests {
         app.on_key(KeyCode::Char('l'));
         assert!(matches!(app.suspend, Some(Suspend::SelfTestLiveness)));
         assert!(app.op.is_none() && app.error.is_none());
+    }
+
+    #[test]
+    fn diagnostics_offers_only_the_read_only_support_report() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        let text = draw_text(&app);
+        assert!(text.contains("Create Support Report"));
+        assert!(text.contains("read-only; captures no camera data"));
+
+        app.on_key(KeyCode::Char('s'));
+
+        assert!(matches!(app.suspend, Some(Suspend::SupportReport)));
+        let source = include_str!("tui.rs");
+        let branch = source
+            .split("Suspend::SupportReport =>")
+            .nth(1)
+            .and_then(|tail| tail.split("Suspend::PcrlockMakePolicy").next())
+            .expect("support-report suspend branch");
+        assert!(branch.contains("create_read_only_default"));
+        assert!(!branch.contains("--probe"));
+        assert!(!branch.contains("trace"));
     }
 
     #[test]

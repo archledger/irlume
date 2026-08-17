@@ -5,13 +5,15 @@
 
 use irlume_common::diagnostics::{
     CategoricalOutcome, DiagnosticSink, OperationClass, OperationId, ShareSafeEvent,
-    ShareSafeEventKind, SupportSnapshot, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS,
+    ShareSafeEventKind, SupportSnapshot, TraceEventKind, TraceLimits, TraceRecord, TraceWarning,
+    MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES, TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 pub(crate) trait Clock: Send + Sync {
@@ -42,6 +44,35 @@ struct Shared {
     inner: Mutex<Inner>,
     entropy: Mutex<Option<std::fs::File>>,
     fallback_sequence: AtomicU64,
+    trace: Mutex<Option<Weak<TraceSubscriber>>>,
+}
+
+const TRACE_CHANNEL_CAPACITY: usize = 1_024;
+
+struct TraceSubscriber {
+    sender: SyncSender<TraceRecord>,
+    inner: Mutex<TraceInner>,
+    limits: TraceLimits,
+    started_ms: u64,
+}
+
+struct TraceInner {
+    next_sequence: u64,
+    pending_dropped: u64,
+    emitted_bytes: u64,
+    finished: bool,
+}
+
+pub(crate) struct TraceSubscription {
+    subscriber: Arc<TraceSubscriber>,
+    receiver: Receiver<TraceRecord>,
+    operation_id: OperationId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TraceSubscribeError {
+    NotRoot,
+    Busy,
 }
 
 #[derive(Default)]
@@ -78,6 +109,7 @@ impl DiagnosticState {
                 }),
                 entropy: Mutex::new(std::fs::File::open("/dev/urandom").ok()),
                 fallback_sequence: AtomicU64::new(0),
+                trace: Mutex::new(None),
             }),
         }
     }
@@ -120,6 +152,82 @@ impl DiagnosticState {
         SupportSnapshot::bounded(now_ms, MAX_HISTORY_MS, None, Vec::new(), events, Vec::new())
     }
 
+    pub(crate) fn subscribe_trace(
+        &self,
+        peer_uid: u32,
+        duration_ms: u64,
+    ) -> Result<TraceSubscription, TraceSubscribeError> {
+        self.subscribe_trace_with_capacity(peer_uid, duration_ms, TRACE_CHANNEL_CAPACITY)
+    }
+
+    fn subscribe_trace_with_capacity(
+        &self,
+        peer_uid: u32,
+        duration_ms: u64,
+        capacity: usize,
+    ) -> Result<TraceSubscription, TraceSubscribeError> {
+        if peer_uid != 0 {
+            return Err(TraceSubscribeError::NotRoot);
+        }
+        let mut active = self
+            .shared
+            .trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err(TraceSubscribeError::Busy);
+        }
+
+        let limits = TraceLimits::bounded(duration_ms);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        let subscriber = Arc::new(TraceSubscriber {
+            sender,
+            inner: Mutex::new(TraceInner {
+                next_sequence: 0,
+                pending_dropped: 0,
+                emitted_bytes: 0,
+                finished: false,
+            }),
+            limits,
+            started_ms: monotonic_ms(),
+        });
+        *active = Some(Arc::downgrade(&subscriber));
+        drop(active);
+
+        let operation_id = self.next_operation_id();
+        subscriber.emit(
+            operation_id,
+            OperationClass::Status,
+            TraceEventKind::TraceStarted {
+                limits,
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+        );
+        Ok(TraceSubscription {
+            subscriber,
+            receiver,
+            operation_id,
+        })
+    }
+
+    fn emit_trace(
+        &self,
+        operation_id: OperationId,
+        operation: OperationClass,
+        kind: TraceEventKind,
+    ) {
+        let subscriber = self
+            .shared
+            .trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(subscriber) = subscriber {
+            subscriber.emit(operation_id, operation, kind);
+        }
+    }
+
     fn record(
         &self,
         operation_id: OperationId,
@@ -141,7 +249,7 @@ impl DiagnosticState {
         operation: OperationClass,
         kind: ShareSafeEventKind,
         finished: &AtomicBool,
-    ) {
+    ) -> bool {
         let now_ms = self.shared.clock.now_ms();
         let mut inner = self
             .shared
@@ -152,9 +260,10 @@ impl DiagnosticState {
         // Either this event lands first, or finish flips the bit and no later
         // event can cross the terminal boundary.
         if finished.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         record_locked(&mut inner, now_ms, operation_id, operation, kind);
+        true
     }
 
     fn next_operation_id(&self) -> OperationId {
@@ -189,6 +298,166 @@ impl DiagnosticState {
     }
 }
 
+impl TraceSubscriber {
+    fn emit(&self, operation_id: OperationId, operation: OperationClass, kind: TraceEventKind) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.finished {
+            return;
+        }
+        if inner.pending_dropped > 0 {
+            let dropped = inner.pending_dropped;
+            if !self.try_send_locked(
+                &mut inner,
+                operation_id,
+                operation,
+                TraceEventKind::EventsDropped { count: dropped },
+                false,
+            ) {
+                inner.pending_dropped = inner.pending_dropped.saturating_add(1);
+                return;
+            }
+            inner.pending_dropped = 0;
+        }
+        if !self.try_send_locked(&mut inner, operation_id, operation, kind, false) {
+            inner.pending_dropped = inner.pending_dropped.saturating_add(1);
+        }
+    }
+
+    fn try_send_locked(
+        &self,
+        inner: &mut TraceInner,
+        operation_id: OperationId,
+        operation: OperationClass,
+        event: TraceEventKind,
+        terminal: bool,
+    ) -> bool {
+        // Reserve a drop marker plus terminal marker, both written by the
+        // owning connection after it has stopped accepting producer events.
+        if !terminal && inner.next_sequence >= self.limits.max_events.saturating_sub(2) {
+            return false;
+        }
+        let record = self.record(
+            inner.next_sequence,
+            operation_id,
+            operation,
+            event,
+            terminal,
+        );
+        let Ok(serialized) = serde_json::to_vec(&record) else {
+            return false;
+        };
+        let bytes = u64::try_from(serialized.len().saturating_add(1)).unwrap_or(u64::MAX);
+        let terminal_reserve = u64::try_from(MAX_TRACE_LINE_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2);
+        if serialized.len() > MAX_TRACE_LINE_BYTES
+            || (!terminal
+                && inner.emitted_bytes.saturating_add(bytes)
+                    > self.limits.max_bytes.saturating_sub(terminal_reserve))
+        {
+            return false;
+        }
+        match self.sender.try_send(record) {
+            Ok(()) => {
+                inner.next_sequence = inner.next_sequence.saturating_add(1);
+                inner.emitted_bytes = inner.emitted_bytes.saturating_add(bytes);
+                true
+            }
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                inner.finished = true;
+                false
+            }
+        }
+    }
+
+    fn record(
+        &self,
+        sequence: u64,
+        operation_id: OperationId,
+        operation: OperationClass,
+        event: TraceEventKind,
+        terminal: bool,
+    ) -> TraceRecord {
+        let monotonic_ms = monotonic_ms();
+        TraceRecord {
+            trace_schema: TRACE_SCHEMA_VERSION,
+            sequence,
+            monotonic_us: monotonic_ms
+                .saturating_sub(self.started_ms)
+                .saturating_mul(1_000),
+            utc_unix_ms: utc_unix_ms(),
+            operation_id,
+            operation,
+            event,
+            terminal,
+        }
+    }
+}
+
+impl TraceSubscription {
+    pub(crate) fn limits(&self) -> TraceLimits {
+        self.subscriber.limits
+    }
+
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<TraceRecord, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub(crate) fn finish(&self, outcome: CategoricalOutcome) -> Vec<TraceRecord> {
+        let mut inner = self
+            .subscriber
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.finished {
+            return Vec::new();
+        }
+        inner.finished = true;
+        let mut records = Vec::with_capacity(2);
+        if inner.pending_dropped > 0
+            && inner.next_sequence < self.subscriber.limits.max_events.saturating_sub(1)
+        {
+            records.push(self.subscriber.record(
+                inner.next_sequence,
+                self.operation_id,
+                OperationClass::Status,
+                TraceEventKind::EventsDropped {
+                    count: inner.pending_dropped,
+                },
+                false,
+            ));
+            inner.next_sequence = inner.next_sequence.saturating_add(1);
+            inner.pending_dropped = 0;
+        }
+        records.push(self.subscriber.record(
+            inner.next_sequence,
+            self.operation_id,
+            OperationClass::Status,
+            TraceEventKind::Finished { outcome },
+            true,
+        ));
+        inner.next_sequence = inner.next_sequence.saturating_add(1);
+        records
+    }
+}
+
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn utc_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 fn record_locked(
     inner: &mut Inner,
     now_ms: u64,
@@ -221,8 +490,18 @@ pub(crate) struct OperationScope {
 
 impl OperationScope {
     pub(crate) fn emit(&self, kind: ShareSafeEventKind) {
-        self.state
-            .record_if_unfinished(self.operation_id, self.operation, kind, &self.finished);
+        if self.state.record_if_unfinished(
+            self.operation_id,
+            self.operation,
+            kind.clone(),
+            &self.finished,
+        ) {
+            self.state.emit_trace(
+                self.operation_id,
+                self.operation,
+                TraceEventKind::Shared { transition: kind },
+            );
+        }
     }
 
     pub(crate) fn finish(&self, outcome: CategoricalOutcome) {
@@ -244,6 +523,13 @@ impl OperationScope {
 impl DiagnosticSink for OperationScope {
     fn emit_share_safe(&self, kind: ShareSafeEventKind) {
         self.emit(kind);
+    }
+
+    fn emit_trace(&self, kind: TraceEventKind) {
+        if !self.finished.load(Ordering::Acquire) {
+            self.state
+                .emit_trace(self.operation_id, self.operation, kind);
+        }
     }
 }
 
@@ -345,5 +631,67 @@ mod tests {
                 outcome: CategoricalOutcome::Completed
             }
         ));
+    }
+
+    #[test]
+    fn trace_subscription_is_root_only_and_single_owner() {
+        let state = DiagnosticState::default();
+        assert!(matches!(
+            state.subscribe_trace(1_000, 60_000),
+            Err(TraceSubscribeError::NotRoot)
+        ));
+        let subscription = state.subscribe_trace(0, 60_000).unwrap();
+        assert!(matches!(
+            state.subscribe_trace(0, 60_000),
+            Err(TraceSubscribeError::Busy)
+        ));
+        drop(subscription);
+        assert!(state.subscribe_trace(0, 60_000).is_ok());
+    }
+
+    #[test]
+    fn slow_trace_reader_never_blocks_producers_and_gets_an_explicit_drop_marker() {
+        let state = DiagnosticState::default();
+        let subscription = state.subscribe_trace_with_capacity(0, 60_000, 2).unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            operation.emit(selected());
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+        operation.emit(selected());
+        records.extend(subscription.receiver.try_iter());
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+
+        assert!(records.iter().any(
+            |record| matches!(record.event, TraceEventKind::EventsDropped { count } if count > 0)
+        ));
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        assert!(matches!(
+            records.last(),
+            Some(TraceRecord {
+                event: TraceEventKind::Finished { .. },
+                terminal: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn trace_projects_share_safe_events_with_the_originating_operation_id() {
+        let state = DiagnosticState::default();
+        let subscription = state.subscribe_trace(0, 60_000).unwrap();
+        let operation = state.begin(OperationClass::Enrollment);
+        operation.emit(selected());
+        let records: Vec<_> = subscription.receiver.try_iter().collect();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[1].event, TraceEventKind::Shared { .. }));
+        assert_eq!(records[1].operation_id, operation.operation_id);
+        assert_eq!(records[1].operation, OperationClass::Enrollment);
     }
 }

@@ -94,7 +94,11 @@ pub fn classify(req: &Request) -> Class {
         | HasSealedPassword { .. }
         | RecoveryStatus { .. }
         | ListProfiles { .. }
-        | SupportSnapshot { .. } => Class::Status,
+        | SupportSnapshot { .. }
+        // Served directly by its connection thread before this classification
+        // is consulted; Status documents that it never belongs to the camera
+        // worker if a caller reaches this seam independently.
+        | TraceSubscribe { .. } => Class::Status,
         PositionSample { .. }
         | Identify
         | Enroll { .. }

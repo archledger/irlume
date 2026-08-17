@@ -2061,6 +2061,16 @@ fn serve(
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
+            // A trace is a privileged, bounded observation stream, not a
+            // camera operation. Serve it on this connection thread before
+            // model readiness and before the arbiter so subscribing can never
+            // queue behind, cancel, or take ownership from authentication.
+            if let Request::TraceSubscribe { duration_ms } = &req {
+                if let Some(resp) = pregate(&req, &peer) {
+                    return respond(stream, &resp);
+                }
+                return serve_trace(stream, diagnostic_state, peer.uid, *duration_ms);
+            }
             // The recent-event ring exists before model/camera startup and is
             // intentionally independent of engine readiness. Keep this one
             // status request useful during startup instead of replacing its
@@ -2159,6 +2169,67 @@ fn serve(
             respond(stream, &resp)
         }
     }
+}
+
+fn serve_trace(
+    mut stream: UnixStream,
+    diagnostic_state: &diagnostics::DiagnosticState,
+    peer_uid: u32,
+    duration_ms: u64,
+) -> std::io::Result<()> {
+    let subscription = match diagnostic_state.subscribe_trace(peer_uid, duration_ms) {
+        Ok(subscription) => subscription,
+        Err(diagnostics::TraceSubscribeError::NotRoot) => {
+            return respond(
+                stream,
+                &Response::Error(format!("trace record requires root (peer uid {peer_uid})")),
+            );
+        }
+        Err(diagnostics::TraceSubscribeError::Busy) => {
+            return respond(
+                stream,
+                &Response::Error("a diagnostic trace is already active".into()),
+            );
+        }
+    };
+    write_json_line(
+        &mut stream,
+        &Response::TraceAccepted {
+            limits: subscription.limits(),
+        },
+    )?;
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(subscription.limits().duration_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait = remaining.min(std::time::Duration::from_millis(250));
+        match subscription.recv_timeout(wait) {
+            Ok(record) => write_json_line(&mut stream, &record)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Stop producers first, then drain every record already assigned a
+    // sequence before appending the terminal records. This makes every file a
+    // contiguous, parser-valid prefix even when the channel was saturated.
+    let terminal = subscription.finish(irlume_common::diagnostics::CategoricalOutcome::Completed);
+    while let Ok(record) = subscription.recv_timeout(std::time::Duration::ZERO) {
+        write_json_line(&mut stream, &record)?;
+    }
+    for record in terminal {
+        write_json_line(&mut stream, &record)?;
+    }
+    stream.flush()
+}
+
+fn write_json_line<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *stream, value).map_err(std::io::Error::other)?;
+    stream.write_all(b"\n")
 }
 
 /// One parsed request line off the wire (see [`read_request`]).
@@ -2404,6 +2475,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         SupportProbe { .. } => RequestPosture {
             privilege: RootOnly {
                 command: "support-report --probe",
+            },
+            user: None,
+            enrollment: Reads,
+        },
+        TraceSubscribe { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "trace record",
             },
             user: None,
             enrollment: Reads,
@@ -3125,6 +3203,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | Ping
         | Health
         | SupportSnapshot { .. }
+        | TraceSubscribe { .. }
         | SealPassword { .. }
         | HasSealedPassword { .. }
         | KeyringInfo { .. }
@@ -3230,7 +3309,8 @@ fn dispatch_scoped(
         | Request::Health
         | Request::HasSealedPassword { .. }
         | Request::RecoveryStatus { .. }
-        | Request::SupportSnapshot { .. } => {
+        | Request::SupportSnapshot { .. }
+        | Request::TraceSubscribe { .. } => {
             Response::Error("status request routed past its handler".into())
         }
         Request::SupportProbe { since_ms } => match engine.support_probe(scope) {
@@ -5699,6 +5779,7 @@ mod tests {
         CameraDiagnostics => Request::CameraDiagnostics,
         SupportSnapshot => Request::SupportSnapshot { since_ms: 60_000 },
         SupportProbe => Request::SupportProbe { since_ms: 60_000 },
+        TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000 },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
         SealPassword => Request::SealPassword {
@@ -6754,6 +6835,36 @@ mod tests {
             }
             other => panic!("expected PasswordUnsealed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trace_stream_acknowledges_bounds_then_emits_a_complete_parseable_jsonl_trace() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let state = diagnostics::DiagnosticState::default();
+        let limits = irlume_common::diagnostics::TraceLimits::bounded(1);
+        let thread = std::thread::spawn(move || serve_trace(server, &state, 0, 1).unwrap());
+
+        let mut payload = String::new();
+        client.read_to_string(&mut payload).unwrap();
+        thread.join().unwrap();
+        let (accepted, trace) = payload.split_once('\n').unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(accepted).unwrap(),
+            Response::TraceAccepted { limits: actual } if actual == limits
+        ));
+        let parsed = irlume_common::diagnostics::parse_trace(
+            std::io::BufReader::new(trace.as_bytes()),
+            limits,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.records().first(),
+            Some(irlume_common::diagnostics::TraceRecord {
+                event: irlume_common::diagnostics::TraceEventKind::TraceStarted { .. },
+                ..
+            })
+        ));
+        assert!(parsed.records().last().unwrap().terminal);
     }
 
     /// Idle is healthy, work in flight is healthy while it reports progress, and

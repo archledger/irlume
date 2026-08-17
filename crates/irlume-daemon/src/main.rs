@@ -2833,15 +2833,59 @@ fn run_capture_mode_probe(
     // wedged driver by the watchdog (#141), and per silent warm-up window
     // inside each capture (#336).
     let progress: irlume_auth::Progress = std::sync::Arc::new(note_worker_progress);
-    let report = irlume_auth::measure_contention_with_progress(rgb_dev, ir_dev, rounds, &progress)
-        .map_err(|e| e.to_string())?;
+    let measurement = irlume_auth::measure_capture_qualification_with_progress(
+        rgb_dev, ir_dev, rounds, &progress,
+    )
+    .map_err(|e| e.to_string())?;
+    let report = measurement.report();
     let mode = report.recommended_mode();
-    if !probe_verdict_storable(policy, &report, rounds) {
+    let attempt = measurement.attempt().clone();
+    let conclusive = !matches!(
+        attempt.outcome(),
+        irlume_auth::AttemptOutcome::Inconclusive(_)
+    ) && probe_verdict_storable(policy, report, rounds);
+
+    let store = irlume_auth::QualificationStore::system();
+    let previous = store
+        .load(attempt.context())
+        .map_err(|error| error.to_string())?;
+    if policy == ProbeStore::AutomaticIfAbsent
+        && previous.as_ref().is_some_and(|record| {
+            !matches!(
+                record.resolve(attempt.context()),
+                irlume_auth::QualificationResolution::Unqualified(_)
+            )
+        })
+    {
+        return Ok(
+            "a context-bound capture qualification was stored while the automatic probe ran; \
+             keeping the newer authority and discarding this measurement"
+                .into(),
+        );
+    }
+    let expected_revision = previous
+        .as_ref()
+        .map(irlume_auth::CaptureQualificationRecord::revision);
+    match store.save_attempt(attempt, expected_revision) {
+        Ok(_) => {}
+        Err(irlume_auth::QualificationStoreError::StaleRevision { .. })
+            if policy == ProbeStore::AutomaticIfAbsent =>
+        {
+            return Ok(
+                "capture qualification changed while the automatic probe ran; \
+                 keeping the newer record and discarding this measurement"
+                    .into(),
+            );
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+
+    if !conclusive {
         // Not an error: the pair stays unmeasured, which the sequential
         // default already makes safe, and the caller's work proceeds. Name
         // the reason that actually blocked storing: thin evidence and dim
         // light are different problems with different fixes.
-        let why = if probe_rounds_complete(&report, rounds) {
+        let why = if probe_rounds_complete(report, rounds) {
             format!(
                 "the probe ran in a dim scene (RGB mean {:.0}), where a clean \
                  concurrent reading proves nothing",
@@ -2855,48 +2899,6 @@ fn run_capture_mode_probe(
              default). Run `sudo irlume camera-tune` with the room lit to store a \
              measured verdict"
         ));
-    }
-    let origin = irlume_auth::CaptureModeOrigin::Measured {
-        by: match policy {
-            ProbeStore::ExplicitReplace => irlume_auth::MeasurementSource::CameraTune,
-            ProbeStore::AutomaticIfAbsent => irlume_auth::MeasurementSource::EnrollmentProbe,
-        },
-        at_unix: Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-        ),
-        // An arm that never completed a round has no ratio to record (#192,
-        // the BRIO's EINVAL on concurrent open); `None` means "cannot run at
-        // all", not a dimming percentage.
-        rgb_retention: (report.concurrent.rounds > 0).then(|| report.retained_rgb()),
-        ir_retention: (report.concurrent.rounds > 0).then(|| report.retained_ir()),
-    };
-    match policy {
-        // The explicit tune is an instruction to re-measure: it overwrites.
-        ProbeStore::ExplicitReplace => {
-            irlume_auth::store_capture_mode(rgb_dev, ir_dev, mode, origin)
-                .map_err(|e| e.to_string())?
-        }
-        // The automatic probe re-checks emptiness under the cameras.conf
-        // writer lock: its first check and this write are separated by the
-        // whole probe, and a verdict another process landed in that window
-        // outranks the automatic result (#340 review).
-        ProbeStore::AutomaticIfAbsent => {
-            match irlume_auth::store_capture_mode_if_absent(rgb_dev, ir_dev, mode, origin)
-                .map_err(|e| e.to_string())?
-            {
-                irlume_auth::StoreIfAbsent::Stored => {}
-                irlume_auth::StoreIfAbsent::AlreadyPresent(existing) => {
-                    return Ok(format!(
-                        "capture mode {} was stored by someone else while the probe ran; \
-                         keeping it (the probe's own result, {}, was discarded)",
-                        existing.as_str(),
-                        mode.as_str()
-                    ));
-                }
-            }
-        }
     }
     // An arm that never streamed has no retention to report; percentages
     // from its empty samples would read as dimming when the finding is
@@ -3360,9 +3362,19 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // module) has nowhere to store a result either (#340 review).
             let identifiable = irlume_auth::device_identity(&rgb_dev).is_some()
                 && irlume_auth::device_identity(&ir_dev).is_some();
+            let qualified_mode = match irlume_auth::stored_capture_qualification(&rgb_dev, &ir_dev)
+            {
+                Ok(irlume_auth::QualificationResolution::ConcurrentQualified) => {
+                    Some(irlume_auth::CaptureMode::Concurrent)
+                }
+                Ok(irlume_auth::QualificationResolution::SequentialRequired(_)) => {
+                    Some(irlume_auth::CaptureMode::Sequential)
+                }
+                Ok(irlume_auth::QualificationResolution::Unqualified(_)) | Err(_) => None,
+            };
             enroll_with_capture_probe(
                 identifiable,
-                irlume_auth::stored_capture_mode(&rgb_dev, &ir_dev),
+                qualified_mode,
                 || {
                     eprintln!(
                         "irlumed: enroll: no measured capture mode for this camera pair; \

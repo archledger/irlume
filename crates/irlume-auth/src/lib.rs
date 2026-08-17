@@ -11,13 +11,18 @@
 use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
 
+pub use irlume_camera::capture_qualification::{
+    AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationResolution,
+    QualificationStore, QualificationStoreError, SequentialReason,
+};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
-    apply_known_ir_emitter, list_ir_controls, measure_contention, measure_contention_with_progress,
-    no_progress, setup_ir_emitter, store_capture_mode, store_capture_mode_if_absent,
-    stored_capture_mode, CaptureMode, CaptureModeOrigin, ContentionReport, MeasurementSource,
-    PairSample, Progress, StoreIfAbsent,
+    apply_known_ir_emitter, list_ir_controls, measure_capture_qualification_with_progress,
+    measure_contention, measure_contention_with_progress, no_progress, setup_ir_emitter,
+    store_capture_mode, store_capture_mode_if_absent, stored_capture_mode,
+    stored_capture_qualification, CaptureMode, CaptureModeOrigin, CaptureQualificationMeasurement,
+    ContentionReport, MeasurementSource, PairSample, Progress, StoreIfAbsent,
 };
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
@@ -832,9 +837,8 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 
 /// Whether captures on this RGB+IR pair should run one stream at a time, and
 /// where that answer came from. Order of authority: the explicit env
-/// override, then what `irlume camera-tune` measured on THIS pairing
-/// (cameras.conf, keyed by both camera identities; contention belongs to the
-/// pairing, not to the RGB module alone), then the sequential default.
+/// override, then a context-bound v2 qualification for THIS exact pairing,
+/// stream tuple, and USB connection, then the sequential default.
 ///
 /// One resolver for every consumer, because the two halves of the answer must
 /// agree: the ASSESS path uses it to order its reads, and the ENROLL path
@@ -843,9 +847,24 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 /// live anyway, which on a bandwidth-starved camera is indistinguishable
 /// from concurrent (#187).
 fn sequential_capture_selected(rgb_dev: &str, ir_dev: &str) -> (bool, &'static str) {
+    let stored = match irlume_camera::stored_capture_qualification(rgb_dev, ir_dev) {
+        Ok(irlume_camera::capture_qualification::QualificationResolution::ConcurrentQualified) => {
+            Some(irlume_camera::CaptureMode::Concurrent)
+        }
+        Ok(irlume_camera::capture_qualification::QualificationResolution::SequentialRequired(
+            _,
+        )) => Some(irlume_camera::CaptureMode::Sequential),
+        Ok(irlume_camera::capture_qualification::QualificationResolution::Unqualified(_)) => None,
+        Err(error) => {
+            irlume_common::dlog!(
+                "capture qualification unreadable ({error}); selecting one-at-a-time capture"
+            );
+            None
+        }
+    };
     capture_mode_decision(
         std::env::var("IRLUME_SEQUENTIAL_CAPTURE").ok().as_deref(),
-        irlume_camera::stored_capture_mode(rgb_dev, ir_dev),
+        stored,
     )
 }
 
@@ -871,7 +890,10 @@ fn capture_mode_decision(
     match env {
         Some(v) => (v.trim() == "1", ENV_CAPTURE_MODE_SOURCE),
         None => match stored {
-            Some(m) => (m == irlume_camera::CaptureMode::Sequential, "cameras.conf"),
+            Some(m) => (
+                m == irlume_camera::CaptureMode::Sequential,
+                STORED_CAPTURE_MODE_SOURCE,
+            ),
             None => (true, "default"),
         },
     }
@@ -915,6 +937,7 @@ fn self_heal_may_recapture(
 /// operator-forced mode binds to the same spelling that produces it, instead of
 /// two string literals that a rename would silently separate.
 const ENV_CAPTURE_MODE_SOURCE: &str = "IRLUME_SEQUENTIAL_CAPTURE";
+const STORED_CAPTURE_MODE_SOURCE: &str = "qualification-v2";
 
 /// Consecutive dimming self-heals on one camera pairing before irlume stops
 /// asking that pairing to capture concurrently (#100).
@@ -999,7 +1022,9 @@ fn self_heal_streak(prev: u32, signal: CaptureModeSignal) -> u32 {
 /// take effect the moment it is unset.
 #[allow(dead_code)] // used in capture_mode_switch_tests
 fn capture_mode_switch_due(mode_source: &str, streak: u32) -> bool {
-    mode_source != ENV_CAPTURE_MODE_SOURCE && streak >= SELF_HEAL_SWITCH_AFTER
+    mode_source != ENV_CAPTURE_MODE_SOURCE
+        && mode_source != STORED_CAPTURE_MODE_SOURCE
+        && streak >= SELF_HEAL_SWITCH_AFTER
 }
 
 /// The one journal line the switch leaves behind, or `None` when there is
@@ -1037,7 +1062,7 @@ fn capture_mode_switch_line(
 
 #[cfg(test)]
 mod capture_mode_decision_tests {
-    use super::{capture_mode_decision, ENV_CAPTURE_MODE_SOURCE};
+    use super::{capture_mode_decision, ENV_CAPTURE_MODE_SOURCE, STORED_CAPTURE_MODE_SOURCE};
     use irlume_camera::CaptureMode;
 
     #[test]
@@ -1065,11 +1090,11 @@ mod capture_mode_decision_tests {
         // any test that only checks one of them.
         assert_eq!(
             capture_mode_decision(None, Some(CaptureMode::Sequential)),
-            (true, "cameras.conf")
+            (true, STORED_CAPTURE_MODE_SOURCE)
         );
         assert_eq!(
             capture_mode_decision(None, Some(CaptureMode::Concurrent)),
-            (false, "cameras.conf")
+            (false, STORED_CAPTURE_MODE_SOURCE)
         );
     }
 
@@ -1109,7 +1134,7 @@ mod capture_mode_decision_tests {
         // camera does, or the flip would tax every healthy tuned install.
         assert_eq!(
             capture_mode_decision(None, Some(CaptureMode::Concurrent)),
-            (false, "cameras.conf")
+            (false, STORED_CAPTURE_MODE_SOURCE)
         );
     }
 }
@@ -1221,10 +1246,10 @@ mod capture_mode_switch_tests {
         // And the one mode the switch may act on.
         assert_eq!(
             capture_mode_decision(None, Some(CaptureMode::Concurrent)),
-            (false, "cameras.conf")
+            (false, STORED_CAPTURE_MODE_SOURCE)
         );
-        assert!(capture_mode_switch_due(
-            "cameras.conf",
+        assert!(!capture_mode_switch_due(
+            STORED_CAPTURE_MODE_SOURCE,
             SELF_HEAL_SWITCH_AFTER
         ));
     }

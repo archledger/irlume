@@ -5765,6 +5765,39 @@ impl ContentionReport {
     }
 }
 
+fn qualification_outcome(
+    report: &ContentionReport,
+    requested_rounds: usize,
+    context_stable: bool,
+) -> capture_qualification::AttemptOutcome {
+    use capture_qualification::{AttemptOutcome, InconclusiveReason, SequentialReason};
+
+    if !context_stable {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::ContractDrift);
+    }
+    let rounds_complete = report.sequential.rounds == requested_rounds
+        && report.sequential.failed == 0
+        && if report.concurrent_impossible() {
+            report.concurrent.failed == requested_rounds
+        } else {
+            report.concurrent.rounds == requested_rounds && report.concurrent.failed == 0
+        };
+    if !rounds_complete {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds);
+    }
+    if report.concurrent_impossible() {
+        return AttemptOutcome::SequentialRequired(SequentialReason::ConcurrentUnavailable);
+    }
+    if !report.conclusive() {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::DimScene);
+    }
+    if report.recommended_mode() == CaptureMode::Sequential {
+        AttemptOutcome::SequentialRequired(SequentialReason::SignalLoss)
+    } else {
+        AttemptOutcome::ConcurrentQualified
+    }
+}
+
 /// Why a concurrent capture attempt failed, as far as the evidence supports.
 ///
 /// `PairSample::failed` counts rounds that errored and says nothing about why,
@@ -5949,6 +5982,155 @@ pub fn measure_contention_with_progress(
         rounds,
         progress,
     )
+}
+
+/// A contention report bound to the exact persistent facts measured around it.
+pub struct CaptureQualificationMeasurement {
+    report: ContentionReport,
+    attempt: capture_qualification::QualificationAttempt,
+}
+
+impl CaptureQualificationMeasurement {
+    #[must_use]
+    pub const fn report(&self) -> &ContentionReport {
+        &self.report
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> &capture_qualification::QualificationAttempt {
+        &self.attempt
+    }
+
+    #[must_use]
+    pub fn into_attempt(self) -> capture_qualification::QualificationAttempt {
+        self.attempt
+    }
+}
+
+/// Measure contention and bind the result to pre/post fd-derived context.
+///
+/// Individual preflight opens do not stream or fire the emitter. They collect
+/// exact production negotiation and topology facts. The same facts are
+/// recollected after the real held-session probe; any change makes the attempt
+/// inconclusive rather than authoritative.
+///
+/// # Errors
+///
+/// Returns an error when either context snapshot or the underlying contention
+/// measurement cannot complete safely.
+pub fn measure_capture_qualification_with_progress(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+    progress: &Progress,
+) -> irlume_common::Result<CaptureQualificationMeasurement> {
+    let before = collect_qualification_context(rgb_dev, ir_dev)?;
+    let report = measure_contention_with_progress(rgb_dev, ir_dev, rounds, progress)?;
+    let after = collect_qualification_context(rgb_dev, ir_dev)?;
+    let requested_rounds = rounds.max(1);
+    let outcome = qualification_outcome(&report, requested_rounds, before == after);
+    let measured_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let attempt = capture_qualification::QualificationAttempt::new(
+        measured_at_unix,
+        before,
+        qualification_arm(&report.sequential, requested_rounds)?,
+        qualification_arm(&report.concurrent, requested_rounds)?,
+        outcome,
+    )
+    .map_err(|error| Error::Hardware(format!("capture qualification evidence: {error}")))?;
+    Ok(CaptureQualificationMeasurement { report, attempt })
+}
+
+fn collect_qualification_context(
+    rgb_dev: &str,
+    ir_dev: &str,
+) -> irlume_common::Result<capture_qualification::QualificationContext> {
+    let rgb = {
+        let operation = lease::acquire_camera_operation(
+            &[rgb_dev],
+            lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+        operation
+            .open_rgb(rgb_dev)
+            .map_err(|error| Error::Hardware(error.to_string()))?
+            .qualification_facts()
+            .map_err(|error| Error::Hardware(error.to_string()))?
+    };
+    let ir = {
+        let operation = lease::acquire_camera_operation(
+            &[ir_dev],
+            lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+        operation
+            .open_ir(ir_dev)
+            .map_err(|error| Error::Hardware(error.to_string()))?
+            .qualification_facts()
+            .map_err(|error| Error::Hardware(error.to_string()))?
+    };
+    capture_qualification::QualificationContext::new(rgb.0, ir.0, rgb.1, ir.1)
+        .map_err(|error| Error::Hardware(error.to_string()))
+}
+
+/// Resolve durable v2 authority for the exact camera pair currently opened.
+///
+/// The context is collected through one-at-a-time, non-streaming opens, so this
+/// check cannot itself consume concurrent USB bandwidth or fire the emitter.
+/// Absence returns `Unqualified(NoAuthority)`; malformed/unreadable state is an
+/// error and callers must select sequential.
+///
+/// # Errors
+///
+/// Returns an error when current fd context cannot be collected or the matching
+/// store record cannot be trusted.
+pub fn stored_capture_qualification(
+    rgb_dev: &str,
+    ir_dev: &str,
+) -> irlume_common::Result<capture_qualification::QualificationResolution> {
+    let context = collect_qualification_context(rgb_dev, ir_dev)?;
+    let record = capture_qualification::QualificationStore::system()
+        .load(&context)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    Ok(record.map_or(
+        capture_qualification::QualificationResolution::Unqualified(
+            capture_qualification::QualificationMismatch::NoAuthority,
+        ),
+        |record| record.resolve(&context),
+    ))
+}
+
+fn qualification_arm(
+    sample: &PairSample,
+    requested_rounds: usize,
+) -> irlume_common::Result<capture_qualification::ArmEvidence> {
+    let requested_rounds = u32::try_from(requested_rounds)
+        .map_err(|_| Error::Hardware("capture qualification round count overflow".into()))?;
+    let completed_rounds = u32::try_from(sample.rounds)
+        .map_err(|_| Error::Hardware("capture qualification completed count overflow".into()))?;
+    let failed_rounds = u32::try_from(sample.failed)
+        .map_err(|_| Error::Hardware("capture qualification failure count overflow".into()))?;
+    if !sample.total_ms.is_finite() || sample.total_ms < 0.0 || sample.total_ms > u64::MAX as f32 {
+        return Err(Error::Hardware(
+            "capture qualification elapsed time is invalid".into(),
+        ));
+    }
+    let all_returned_frames_healthy = completed_rounds > 0 && failed_rounds == 0;
+    capture_qualification::ArmEvidence::new(
+        requested_rounds,
+        completed_rounds,
+        failed_rounds,
+        all_returned_frames_healthy,
+        all_returned_frames_healthy,
+        sample.rgb_mean,
+        sample.ir_mean,
+        sample.total_ms.round() as u64,
+    )
+    .map_err(|error| Error::Hardware(format!("capture qualification arm: {error}")))
 }
 
 /// The concurrent arm over HELD sessions: the shape a `concurrent` verdict
@@ -9065,6 +9247,49 @@ mod tests {
             CaptureMode::Sequential
         );
         assert!(ir_loss_in_the_dark.conclusive());
+    }
+
+    #[test]
+    fn v2_outcome_requires_complete_stable_and_conclusive_evidence() {
+        use capture_qualification::{AttemptOutcome, InconclusiveReason, SequentialReason};
+        let report = |seq: (usize, usize, f32, f32), concurrent: (usize, usize, f32, f32)| {
+            let sample = |(rounds, failed, rgb_mean, ir_mean)| PairSample {
+                rgb_mean,
+                ir_mean,
+                total_ms: 1_000.0,
+                rounds,
+                failed,
+            };
+            ContentionReport {
+                sequential: sample(seq),
+                concurrent: sample(concurrent),
+            }
+        };
+
+        let healthy = report((6, 0, 140.0, 120.0), (6, 0, 135.0, 115.0));
+        assert_eq!(
+            qualification_outcome(&healthy, 6, true),
+            AttemptOutcome::ConcurrentQualified
+        );
+        assert_eq!(
+            qualification_outcome(&healthy, 6, false),
+            AttemptOutcome::Inconclusive(InconclusiveReason::ContractDrift)
+        );
+        let thin = report((4, 2, 140.0, 120.0), (6, 0, 135.0, 115.0));
+        assert_eq!(
+            qualification_outcome(&thin, 6, true),
+            AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds)
+        );
+        let dim = report((6, 0, 50.0, 120.0), (6, 0, 49.0, 115.0));
+        assert_eq!(
+            qualification_outcome(&dim, 6, true),
+            AttemptOutcome::Inconclusive(InconclusiveReason::DimScene)
+        );
+        let unavailable = report((6, 0, 140.0, 120.0), (0, 6, 0.0, 0.0));
+        assert_eq!(
+            qualification_outcome(&unavailable, 6, true),
+            AttemptOutcome::SequentialRequired(SequentialReason::ConcurrentUnavailable)
+        );
     }
 
     /// Each arm needs a log line as well as a number, and this pins which.

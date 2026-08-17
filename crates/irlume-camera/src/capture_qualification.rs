@@ -680,7 +680,7 @@ impl ArmEvidence {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequentialReason {
-    ConcurrentOpenOrArmFailed,
+    ConcurrentUnavailable,
     DeliveredRateShortfall,
     SignalLoss,
     InvalidProvenance,
@@ -765,7 +765,7 @@ impl QualificationAttempt {
                     return Err(QualificationError::InvalidEvidence);
                 }
                 let supported = match reason {
-                    SequentialReason::ConcurrentOpenOrArmFailed => {
+                    SequentialReason::ConcurrentUnavailable => {
                         self.concurrent.completed_rounds == 0
                             && self.concurrent.failed_rounds == self.concurrent.requested_rounds
                     }
@@ -790,6 +790,11 @@ impl QualificationAttempt {
     #[must_use]
     pub const fn context(&self) -> &QualificationContext {
         &self.context
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &AttemptOutcome {
+        &self.outcome
     }
 
     fn authoritative(&self) -> bool {

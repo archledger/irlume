@@ -33,9 +33,58 @@ fn version_json_is_one_machine_document() {
             "login-plan-json",
             "login-transactions",
             "models-list-json",
-            "camera-diagnostics"
+            "camera-diagnostics",
+            "support-report-json"
         ])
     );
+}
+
+#[test]
+fn support_report_json_is_one_document_and_creates_no_file() {
+    let root = std::env::temp_dir().join(format!("irlume-support-json-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["support-report", "--json", "--contract", "1"])
+        .env("IRLUME_SOCKET", root.join("no-daemon.sock"))
+        .current_dir(&root)
+        .output()
+        .expect("run irlume");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+        1
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["command"], "support-report");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["report_schema"], 1);
+    assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn machine_support_report_refuses_probe_without_creating_a_file() {
+    let root = std::env::temp_dir().join(format!(
+        "irlume-support-json-probe-it-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["support-report", "--json", "--probe", "--contract", "1"])
+        .env("IRLUME_SOCKET", root.join("no-daemon.sock"))
+        .current_dir(&root)
+        .output()
+        .expect("run irlume");
+
+    assert_eq!(output.status.code(), Some(2));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["error"]["code"], "usage-error");
+    assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A refusal happens before the stream begins, so it must arrive as the single

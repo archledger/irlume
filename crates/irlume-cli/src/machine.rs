@@ -38,6 +38,7 @@ const CAPABILITIES: &[&str] = &[
     "login-transactions",
     "models-list-json",
     "camera-diagnostics",
+    "support-report-json",
 ];
 
 /// The contract the caller asked for, or the failure to report.
@@ -528,6 +529,88 @@ pub fn doctor(args: &[String]) -> ExitCode {
         &success(COMMAND, json!({ "checks": checks }), contract),
         ExitCode::SUCCESS,
     )
+}
+
+/// `irlume support-report --json`: the same privacy-bounded report object as
+/// the text artifact, emitted as exactly one contract-1 document and without
+/// creating a file or activating a camera.
+pub fn support_report(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "support-report";
+    let contract = match negotiate(args) {
+        Contract::Agreed(version) => version,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    let args = without_contract(args);
+    let mut since = None;
+    let mut saw_json = false;
+    let mut index = 1;
+    if args.first().map(String::as_str) != Some("support-report") {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !saw_json => {
+                saw_json = true;
+                index += 1;
+            }
+            "--since" if since.is_none() => {
+                let Some(raw) = args.get(index + 1) else {
+                    return emit(
+                        &failure(COMMAND, "usage-error", false, contract),
+                        ExitCode::from(2),
+                    );
+                };
+                let Ok(duration) = crate::support_report::parse_since(Some(raw)) else {
+                    return emit(
+                        &failure(COMMAND, "usage-error", false, contract),
+                        ExitCode::from(2),
+                    );
+                };
+                since = Some(duration);
+                index += 2;
+            }
+            _ => {
+                return emit(
+                    &failure(COMMAND, "usage-error", false, contract),
+                    ExitCode::from(2),
+                )
+            }
+        }
+    }
+    if !saw_json {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    let report = crate::support_report::collect(
+        since.unwrap_or(std::time::Duration::from_secs(10 * 60)),
+        false,
+    );
+    match serde_json::to_value(report) {
+        Ok(value) => emit(&success(COMMAND, value, contract), ExitCode::SUCCESS),
+        Err(error) => {
+            eprintln!("irlume support report serialization failed: {error}");
+            emit(
+                &failure(COMMAND, "operation-failed", false, contract),
+                ExitCode::FAILURE,
+            )
+        }
+    }
 }
 
 /// `irlume camera diagnostics --json`: machine-readable delivered-rate evidence
@@ -2350,7 +2433,8 @@ mod tests {
                 "login-plan-json",
                 "login-transactions",
                 "models-list-json",
-                "camera-diagnostics"
+                "camera-diagnostics",
+                "support-report-json"
             ])
         );
         assert!(document.get("error").is_none());

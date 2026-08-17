@@ -103,6 +103,38 @@ fn run(cmd: &mut Command) -> (i32, String, String) {
     )
 }
 
+#[test]
+fn support_report_publishes_one_private_inspectable_text_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let sandbox = Sandbox::new("support-report");
+    for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+        sandbox.fake_tool(tool, "exit 1");
+    }
+    let output = sandbox.path("work/report.txt");
+    let (code, stdout, stderr) = run(&mut sandbox.cmd_with_fakes(&[
+        "support-report",
+        "--output",
+        output.to_str().unwrap(),
+        "--since",
+        "5m",
+    ]));
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains(output.to_str().unwrap()));
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(text.starts_with("IRLUME SUPPORT REPORT\nPrivacy:"));
+    assert!(text.contains("Unavailable sections"));
+    assert!(text.contains("SHA-256 (body):"));
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let (second_code, _, _) =
+        run(&mut sandbox.cmd_with_fakes(&["support-report", "--output", output.to_str().unwrap()]));
+    assert_ne!(second_code, 0, "an existing report must never be replaced");
+}
+
 /// Run with `input` piped to stdin.
 fn run_stdin(cmd: &mut Command, input: &str) -> (i32, String, String) {
     let mut child = cmd.stdin(Stdio::piped()).spawn().expect("spawn irlume");

@@ -2021,6 +2021,9 @@ SETUP & STATUS
   status                health dashboard (daemon, enrollment, keyring, cameras)
   detect                script probe; exit 0=ready / 10=partial / 20=absent
   doctor                platform / TPM / Secure Boot / camera / model checks
+  support-report [--output FILE.txt] [--since 10m] [--probe]
+                        create a private 0600 report; default is read-only and
+                        camera-free, while --probe is explicit and root-only
   deps                  verify runtime dependencies (onnxruntime, models, TPM)
 
 ENROLLMENT & AUTH
@@ -2090,7 +2093,7 @@ SYSTEM INTEGRATION
   version                         print the installed irlume version
 
 MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
-  --json                on version, status, doctor, profiles list, models list,
+  --json                on version, status, doctor, support-report, profiles list, models list,
                         login status, login plan/verify, auth test --events=jsonl:
                         one line of JSON on stdout, stable check ids and error
                         codes, nothing else printed

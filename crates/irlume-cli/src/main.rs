@@ -35,6 +35,7 @@ mod recovery;
 mod secrets;
 mod strays;
 mod suncal;
+mod support_report;
 mod tui;
 mod uninstall;
 
@@ -229,6 +230,9 @@ fn main() -> std::process::ExitCode {
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
         (Some("doctor"), _) if args.iter().any(|arg| arg == "--json") => machine::doctor(&args),
+        (Some("support-report"), _) if args.iter().any(|arg| arg == "--json") => {
+            machine::support_report(&args)
+        }
         (Some("camera"), Some("diagnostics")) if args.iter().any(|arg| arg == "--json") => {
             machine::camera_diagnostics(&args)
         }
@@ -239,6 +243,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::SUCCESS
         }
         (Some("doctor"), _) => doctor(&args),
+        (Some("support-report"), _) => support_report::run(&args),
         (Some("normprobe"), _) => normprobe(&args),
         (Some("status"), _) => commands::status(&args),
         (Some("detect"), _) => commands::detect(&args),

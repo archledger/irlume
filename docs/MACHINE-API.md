@@ -217,15 +217,6 @@ reused for a different meaning. The registry as of this contract:
 | `emitter-undo-pending` | camera controls an interrupted `ir-setup` left changed and has not put back. `unknown` when the root-only record store cannot be read, which is any run that is not root |
 | `emitter-stream-pending` | per-stream emitter records not yet resolved. An `applied` record is restored by a later authentication; a record whose write may never have reached the camera is never claimed, and is replaced by the next capture once the control no longer holds its bytes (a full power-off does that); a record that will not parse blocks until an administrator removes the named file. Either kind also refuses new stream writes, so this explains an emitter that stays dark. `unknown` when the root-only store cannot be read, which is any run that is not root |
 | `capture-mode` | the daemon-owned v2 resolution for its exact open RGB+IR pair. Reports qualified concurrent, measured sequential, the safe unmeasured/changed-context sequential default, a daemon environment override, or generation-scoped runtime degradation. `info` for a resolved strategy and `unknown` only when the daemon cannot collect exact status. Neither `doctor` nor `camera-mode` treats legacy `capture_mode.*` values in `cameras.conf` as concurrent authority |
-
-`CaptureModeStatus` includes `qualification_state` (`qualified_concurrent`,
-`measured_sequential`, `unqualified_no_authority`,
-`unqualified_context_changed`, `inconclusive`, `unreadable`, or `no_ir_pair`), an optional
-`qualification_reason`, the complete serialized v2 `qualification_context`
-(endpoint identity, requested and driver-accepted tuples, minimum rates, and
-USB connection facts), and an optional `runtime_degradation` cause. `ir` is
-nullable for an RGB-only host. `runtime_context` is the process-local exact
-context+camera-generation key; it is diagnostic, not durable authority.
 | `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
 | `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths |
@@ -251,6 +242,15 @@ context+camera-generation key; it is diagnostic, not durable authority.
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
 | `keyring-secrets` | the login keyring's lock state and provider |
+
+`CaptureModeStatus` includes `qualification_state` (`qualified_concurrent`,
+`measured_sequential`, `unqualified_no_authority`,
+`unqualified_context_changed`, `inconclusive`, `unreadable`, or `no_ir_pair`), an optional
+`qualification_reason`, the complete serialized v2 `qualification_context`
+(endpoint identity, requested and driver-accepted tuples, minimum rates, and
+USB connection facts), and an optional `runtime_degradation` cause. `ir` is
+nullable for an RGB-only host. `runtime_context` is the process-local exact
+context+camera-generation key; it is diagnostic, not durable authority.
 
 ## Schema, fixtures, and conformance
 

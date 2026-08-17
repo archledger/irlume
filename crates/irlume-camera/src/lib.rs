@@ -6612,11 +6612,10 @@ fn held_concurrent_arm<'d>(
         // Establish the delivered-rate windows before measuring, draining both
         // streams concurrently so the serial fill cannot starve one and skew
         // the concurrent brightness this probe exists to measure.
-        establish_pair_rate(&mut rs, &mut is).map_err(|error| {
-            Error::Hardware(format!(
-                "capture-mode probe: concurrent delivered-rate evidence could not be established: {error}"
-            ))
-        })?;
+        if let Err(error) = establish_pair_rate(&mut rs, &mut is) {
+            record_concurrent_establishment_failure(into, rounds, &error);
+            return Ok(());
+        }
         let mut continuity = PairContinuityState::default();
         for _ in 0..rounds {
             progress();
@@ -6644,6 +6643,27 @@ fn held_concurrent_arm<'d>(
         }
         Ok(())
     }
+}
+
+/// Account a held pair that armed but could not produce the bounded warm-up
+/// evidence needed before a measured concurrent round may begin.
+///
+/// This is capture failure rather than a typed rate shortfall: the warm-up uses
+/// validated dequeues to fill a window but does not evaluate the floor. The
+/// caller drops both sessions and the contention composer runs a fresh
+/// sequential control; if that control also fails, no capability verdict is
+/// published.
+fn record_concurrent_establishment_failure(
+    into: &mut PairSample,
+    rounds: usize,
+    error: &impl std::fmt::Display,
+) {
+    irlume_common::dlog!(
+        "capture-mode probe: cannot ESTABLISH delivered-rate evidence for the held pair \
+         ({error}); recording every concurrent round as failed"
+    );
+    into.failed += rounds;
+    into.capture_failures += rounds;
 }
 
 /// [`measure_contention_with_progress`] over injected captures and an
@@ -9776,8 +9796,10 @@ mod tests {
             illumination,
             frame_provenance::DeliveredRateEvidence::new(
                 role,
-                (15, 2),
-                (15, 2),
+                // Requested/accepted are frame intervals, not rates. The
+                // corresponding 7.5 fps floor below is intentionally 15/2.
+                (2, 15),
+                (2, 15),
                 (15, 2),
                 98,
                 30,
@@ -9795,11 +9817,18 @@ mod tests {
     fn runtime_gate_stream(
         role: capture_qualification::QualifiedStreamRole,
         fourcc: &str,
+        interval: (u32, u32),
     ) -> capture_qualification::StreamContract {
         use capture_qualification::{AcceptedStream, ExactInterval, ExactRate, RequestedStream};
         capture_qualification::StreamContract::new(
             role,
-            RequestedStream::new(4, 1, fourcc.into(), ExactInterval::new(2, 15).unwrap()).unwrap(),
+            RequestedStream::new(
+                4,
+                1,
+                fourcc.into(),
+                ExactInterval::new(interval.0, interval.1).unwrap(),
+            )
+            .unwrap(),
             AcceptedStream::new(
                 4,
                 1,
@@ -9811,7 +9840,7 @@ mod tests {
                 0,
                 0,
                 0,
-                ExactInterval::new(2, 15).unwrap(),
+                ExactInterval::new(interval.0, interval.1).unwrap(),
             )
             .unwrap(),
             ExactRate::new(15, 2).unwrap(),
@@ -9842,13 +9871,13 @@ mod tests {
         .unwrap()
     }
 
-    fn runtime_gate_contract() -> RuntimePairContract {
+    fn runtime_gate_contract_with_interval(interval: (u32, u32)) -> RuntimePairContract {
         use capture_qualification::QualifiedStreamRole;
         let context = capture_qualification::QualificationContext::new(
             runtime_gate_endpoint(QualifiedStreamRole::Rgb, 0),
             runtime_gate_endpoint(QualifiedStreamRole::Ir, 1),
-            runtime_gate_stream(QualifiedStreamRole::Rgb, "RGB3"),
-            runtime_gate_stream(QualifiedStreamRole::Ir, "GREY"),
+            runtime_gate_stream(QualifiedStreamRole::Rgb, "RGB3", interval),
+            runtime_gate_stream(QualifiedStreamRole::Ir, "GREY", interval),
         )
         .unwrap();
         let instance = contracts::CameraInstanceId::new("a".repeat(32)).unwrap();
@@ -9866,6 +9895,10 @@ mod tests {
             ),
             runtime_key: "test-runtime-key".into(),
         }
+    }
+
+    fn runtime_gate_contract() -> RuntimePairContract {
+        runtime_gate_contract_with_interval((2, 15))
     }
 
     #[test]
@@ -9937,6 +9970,21 @@ mod tests {
                 ),
             ),
             Err(RuntimePairViolation::StreamContract)
+        );
+        assert_eq!(
+            runtime_gate_contract_with_interval((1, 15)).validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    1,
+                    *b"GREY",
+                    true,
+                    false,
+                    IlluminationProvenance::ActiveIr
+                ),
+            ),
+            Err(RuntimePairViolation::StreamContract),
+            "a different requested/accepted interval is not the licensed tuple"
         );
         assert_eq!(
             contract.validate_pair(
@@ -10535,6 +10583,34 @@ mod tests {
         let report = measure_contention_impl(&rgb, &ir, arming_fails, 2, &no_progress(), None)
             .expect("an unarmable held pair with an answering camera is a verdict");
         assert!(report.concurrent_impossible());
+        assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
+    }
+
+    /// Physical BRIO and NexiGo evidence: both sessions can STREAMON, then the
+    /// bounded concurrent rate warm-up fails while dequeuing (EINVAL on BRIO;
+    /// a short YUYV payload on NexiGo). That is a failed concurrent arm, not a
+    /// probe abort. The trailing sequential control is the authority that
+    /// distinguishes contention from a camera that stopped answering.
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn failed_concurrent_rate_establishment_reaches_the_sequential_control() {
+        let rgb = || Ok(frame(&[100; 4]));
+        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let establishment_fails = |rounds: usize, _p: &Progress, into: &mut PairSample| {
+            record_concurrent_establishment_failure(
+                into,
+                rounds,
+                &std::io::Error::from_raw_os_error(libc::EINVAL),
+            );
+            Ok(())
+        };
+        let report =
+            measure_contention_impl(&rgb, &ir, establishment_fails, 2, &no_progress(), None)
+                .expect("an answering camera with failed concurrent warm-up is a verdict");
+        assert!(report.concurrent_impossible());
+        assert_eq!(report.concurrent.failed, 2);
+        assert_eq!(report.concurrent.capture_failures, 2);
+        assert!(report.trailing_sequential_control);
         assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
     }
 

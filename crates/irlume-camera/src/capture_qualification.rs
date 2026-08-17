@@ -550,7 +550,8 @@ impl StreamContract {
     }
 
     /// Verify that one delivered frame carries this exact accepted format and
-    /// the same requested/accepted/floor rate tuple used by qualification.
+    /// the same requested/accepted frame intervals and floor rate used by
+    /// qualification.
     pub(crate) fn matches_runtime(
         &self,
         provenance: &crate::frame_provenance::RuntimeFrameProvenance,
@@ -577,8 +578,8 @@ impl StreamContract {
             && self.accepted.quantization == format.quantization()
             && self.accepted.transfer == format.transfer()
             && self.accepted.flags == format.flags()
-            && rate.requested() == (requested_interval.1, requested_interval.0)
-            && rate.accepted() == (accepted_interval.1, accepted_interval.0)
+            && rate.requested() == requested_interval
+            && rate.accepted() == accepted_interval
             && rate.floor() == self.minimum_rate.parts()
     }
 }

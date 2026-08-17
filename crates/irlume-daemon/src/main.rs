@@ -2975,6 +2975,25 @@ fn enrollment_needs_capture_probe(
     identifiable && stored.is_none()
 }
 
+/// Only an affirmative dark measurement selects convenience-tier enrollment.
+/// A failed preflight is inconclusive and must not silently lower assurance.
+fn enrollment_capture_uses_ir<E>(emitter: &Result<bool, E>) -> bool {
+    !matches!(emitter, Ok(false))
+}
+
+fn prepare_enrollment_ir(device: &str) -> bool {
+    let emitter = irlume_auth::apply_known_ir_emitter(device);
+    match &emitter {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "irlumed: IR is dark; enrolling RGB (dark unlock unavailable). \
+             If this camera needs an emitter control, run `sudo irlume ir-setup`."
+        ),
+        Err(error) => eprintln!("irlumed: IR emitter check skipped: {error}"),
+    }
+    enrollment_capture_uses_ir(&emitter)
+}
+
 /// The enrollment probe's journal note, over an injected prober so the
 /// trigger rule is testable without cameras: `None` when a stored verdict
 /// made the probe unnecessary. A failed probe reports instead of failing the
@@ -3357,14 +3376,6 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             // Asking to enroll a face is not consent to probe camera firmware
             // for an unknown control, so this no longer falls through to a
             // search when IR is dark (#159).
-            match irlume_auth::apply_known_ir_emitter(engine.ir_device()) {
-                Ok(true) => {}
-                Ok(false) => eprintln!(
-                    "irlumed: IR is dark; enrolling RGB (dark unlock unavailable). \
-                     If this camera needs an emitter control, run `sudo irlume ir-setup`."
-                ),
-                Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
-            }
             // One-time capture-mode measurement (#340): an unmeasured pair
             // defaults to sequential capture, and enrollment is the reliable
             // moment to measure the real answer: the user is present, waiting
@@ -3409,7 +3420,9 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                         ProbeStore::AutomaticIfAbsent,
                     )
                 },
-                || match engine.enroll_profile(&user, profile, want) {
+                || match engine.enroll_profile_with_ir_preflight(&user, profile, want, || {
+                    prepare_enrollment_ir(&ir_dev)
+                }) {
                     Ok(outcome) => enroll_response(outcome),
                     Err(e) => Response::Error(e.to_string()),
                 },
@@ -3473,7 +3486,10 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
             scans,
             report_enrollment,
         } => {
-            match engine.add_scan(&user, &profile, scans.unwrap_or(1)) {
+            let ir_dev = engine.ir_device().to_owned();
+            match engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), || {
+                prepare_enrollment_ir(&ir_dev)
+            }) {
                 // The structured reply, opted into: the TUI needs the
                 // ambient-lit count of EVERY scan for the #312 completion
                 // note, and AddScan carries every scan after the first.
@@ -4503,6 +4519,16 @@ mod tests {
         );
         assert!(matches!(resp, Response::Ok(_)));
         assert_eq!(*events.lock().unwrap(), ["enroll"]);
+    }
+
+    #[test]
+    fn dark_ir_preflight_selects_rgb_only_enrollment_without_hiding_probe_errors() {
+        assert!(!enrollment_capture_uses_ir(&Ok::<_, String>(false)));
+        assert!(enrollment_capture_uses_ir(&Ok::<_, String>(true)));
+        assert!(
+            enrollment_capture_uses_ir(&Err::<bool, _>("camera temporarily busy")),
+            "an inconclusive preflight must not silently lower the assurance tier"
+        );
     }
 
     #[test]

@@ -312,6 +312,18 @@ struct CapturedScan {
     ambient_share: Option<f32>,
 }
 
+/// Enrollment may deliberately use the convenience-tier RGB path after a
+/// user-present emitter preflight measured this request's IR stream as dark.
+/// Physical IR presence alone must not undo that request-scoped decision.
+fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
+    ir_available && !force_rgb_only
+}
+
+struct EnrollmentCapturePolicy<'a> {
+    mode: &'a CaptureModeSelection,
+    use_ir: bool,
+}
+
 /// What one add-scan capture stored, with everything the daemon's reply
 /// needs: the appended scan names (undo target), the per-recognizer counts,
 /// and the ambient-lit count the completion note is built from (#312).
@@ -4483,6 +4495,7 @@ impl Engine {
         want: usize,
         pitch_neutral: Option<f32>,
         observed: &mut CaptureShape,
+        force_rgb_only: bool,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
         // Hold the cameras open for the whole loop. This is the heaviest repeated
         // capture in the codebase (the budget below is ten assessments per wanted
@@ -4507,7 +4520,8 @@ impl Engine {
             ));
         }
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
-        let endpoints: Vec<&str> = if self.ir_available {
+        let use_ir = enrollment_ir_enabled(self.ir_available, force_rgb_only);
+        let endpoints: Vec<&str> = if use_ir {
             vec![rgb_dev.as_str(), ir_dev.as_str()]
         } else {
             vec![rgb_dev.as_str()]
@@ -4518,7 +4532,7 @@ impl Engine {
             std::time::Duration::from_secs(2),
         )
         .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
-        let cams = if self.ir_available {
+        let cams = if use_ir {
             match (operation.open_rgb(&rgb_dev), operation.open_ir(&ir_dev)) {
                 (Ok(r), Ok(i)) => Some((r, i)),
                 _ => None,
@@ -4567,7 +4581,10 @@ impl Engine {
                                 want,
                                 pitch_neutral,
                                 Some((&mut rs, &mut is)),
-                                Some(&capture_mode),
+                                EnrollmentCapturePolicy {
+                                    mode: &capture_mode,
+                                    use_ir,
+                                },
                                 &operation,
                                 observed,
                             );
@@ -4621,7 +4638,10 @@ impl Engine {
             want,
             pitch_neutral,
             None,
-            Some(&capture_mode),
+            EnrollmentCapturePolicy {
+                mode: &capture_mode,
+                use_ir,
+            },
             &operation,
             observed,
         )
@@ -4642,7 +4662,7 @@ impl Engine {
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )>,
-        capture_mode: Option<&CaptureModeSelection>,
+        policy: EnrollmentCapturePolicy<'_>,
         operation: &irlume_camera::lease::CameraOperationSession,
         observed: &mut CaptureShape,
     ) -> Result<Vec<CapturedScan>, CapturePathError> {
@@ -4671,10 +4691,10 @@ impl Engine {
             let a = operation
                 .run(|| match &mut sessions {
                     Some((rs, is)) => {
-                        self.assess_full_with(Some((rs, is)), capture_mode, operation)
+                        self.assess_full_with(Some((rs, is)), Some(policy.mode), operation)
                     }
-                    None if self.ir_available => {
-                        self.assess_full_with(None, capture_mode, operation)
+                    None if policy.use_ir => {
+                        self.assess_full_with(None, Some(policy.mode), operation)
                     }
                     None => self.assess_rgb_only().map_err(CapturePathError::from),
                 })
@@ -4877,17 +4897,35 @@ impl Engine {
     /// an embedding-space change). A novel face gets a NEW profile; that errors
     /// if the account is already at MAX_PROFILES.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: `target` is a profile name returned by \
-                  `enroll_merge_target` from this same `enr`, so the `position` \
-                  lookup that follows always finds it"
-    )]
     pub fn enroll_profile(
         &mut self,
         user: &str,
         profile_name: Option<String>,
         want: usize,
+    ) -> irlume_common::Result<EnrollOutcome> {
+        self.enroll_profile_with_capture_policy(user, profile_name, want, || true)
+    }
+
+    /// Run a user-present IR readiness check only after the enrollment's
+    /// storage-only refusal gates pass, then keep its answer for every capture
+    /// in this request.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn enroll_profile_with_ir_preflight(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce() -> bool,
+    ) -> irlume_common::Result<EnrollOutcome> {
+        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight)
+    }
+
+    fn enroll_profile_with_capture_policy(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce() -> bool,
     ) -> irlume_common::Result<EnrollOutcome> {
         use irlume_core::storage::{
             self, Enrollment, FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE,
@@ -4903,6 +4941,7 @@ impl Engine {
                 )));
             }
         }
+        let force_rgb_only = !self.ir_available || !ir_preflight();
         // Probe scan first: it decides whether this face merges into an existing
         // profile, and therefore how many scans to capture at all. A profile
         // with 5 free slots gets a 5-scan top-up instead of a 10-scan session
@@ -4915,7 +4954,8 @@ impl Engine {
         // the first observed and the message cannot claim "on every attempt"
         // about a subset of them.
         let mut observed = CaptureShape::default();
-        let probe_scans = self.capture_scans(1, enr.pitch_neutral(), &mut observed)?;
+        let probe_scans =
+            self.capture_scans(1, enr.pitch_neutral(), &mut observed, force_rgb_only)?;
         let solo_probe = if probe_scans.is_empty() {
             self.solo_rgb_starvation_probe(observed)
         } else {
@@ -4961,7 +5001,12 @@ impl Engine {
         };
         let mut captured = vec![probe];
         if goal > 1 {
-            captured.extend(self.capture_scans(goal - 1, enr.pitch_neutral(), &mut observed)?);
+            captured.extend(self.capture_scans(
+                goal - 1,
+                enr.pitch_neutral(),
+                &mut observed,
+                force_rgb_only,
+            )?);
         }
         if captured.len() < goal {
             let solo_probe = self.solo_rgb_starvation_probe(observed);
@@ -5124,6 +5169,29 @@ impl Engine {
         profile_name: &str,
         count: usize,
     ) -> irlume_common::Result<AddScanOutcome> {
+        self.add_scan_with_capture_policy(user, profile_name, count, || true)
+    }
+
+    /// Run a user-present IR readiness check only after the target profile and
+    /// remaining room are validated, then keep its answer for this request.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn add_scan_with_ir_preflight(
+        &mut self,
+        user: &str,
+        profile_name: &str,
+        count: usize,
+        ir_preflight: impl FnOnce() -> bool,
+    ) -> irlume_common::Result<AddScanOutcome> {
+        self.add_scan_with_capture_policy(user, profile_name, count, ir_preflight)
+    }
+
+    fn add_scan_with_capture_policy(
+        &mut self,
+        user: &str,
+        profile_name: &str,
+        count: usize,
+        ir_preflight: impl FnOnce() -> bool,
+    ) -> irlume_common::Result<AddScanOutcome> {
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
         let mut enr = storage::load(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
@@ -5141,12 +5209,14 @@ impl Engine {
         if room == 0 {
             return Err(irlume_common::Error::Protocol(format!(
                 "'{profile_name}' already has the max {MAX_SCANS_PER_PROFILE} scans for the \
-                 loaded recognizer"
+                loaded recognizer"
             )));
         }
+        let force_rgb_only = !self.ir_available || !ir_preflight();
         let want = count.clamp(1, room);
         let mut observed = CaptureShape::default();
-        let captured = self.capture_scans(want, enr.pitch_neutral(), &mut observed)?;
+        let captured =
+            self.capture_scans(want, enr.pitch_neutral(), &mut observed, force_rgb_only)?;
         let solo_probe = if captured.len() < want {
             self.solo_rgb_starvation_probe(observed)
         } else {
@@ -9501,6 +9571,24 @@ mod engine_tests {
             .enroll_profile("irlume-test-enroll", Some("Work Laptop".into()), 3)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+        let emitter_touched = std::cell::Cell::new(false);
+        let err = s
+            .engine
+            .enroll_profile_with_ir_preflight(
+                "irlume-test-enroll",
+                Some("Work Laptop".into()),
+                3,
+                || {
+                    emitter_touched.set(true);
+                    true
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(
+            !emitter_touched.get(),
+            "a refused duplicate must not run the emitter preflight"
+        );
         // A novel name proceeds to the probe capture, which needs the camera.
         let err = s
             .engine
@@ -9511,6 +9599,13 @@ mod engine_tests {
     }
 
     #[test]
+    fn rgb_only_enrollment_policy_suppresses_ir_even_when_hardware_is_present() {
+        assert!(enrollment_ir_enabled(true, false));
+        assert!(!enrollment_ir_enabled(true, true));
+        assert!(!enrollment_ir_enabled(false, false));
+    }
+
+    #[test]
     fn add_scan_pre_camera_guards() {
         let _g = env_guard();
         let mut s = shared();
@@ -9518,6 +9613,19 @@ mod engine_tests {
         // Unknown user.
         let err = s.engine.add_scan("irlume-test-ghost", "P1", 1).unwrap_err();
         assert!(err.to_string().contains("is not enrolled"), "{err}");
+        let emitter_touched = std::cell::Cell::new(false);
+        let err = s
+            .engine
+            .add_scan_with_ir_preflight("irlume-test-ghost", "P1", 1, || {
+                emitter_touched.set(true);
+                true
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("is not enrolled"), "{err}");
+        assert!(
+            !emitter_touched.get(),
+            "an unknown enrollment must be refused before emitter preflight"
+        );
         // Known user, unknown profile.
         let mut e = Enrollment::new("irlume-test-add");
         e.profiles.push(FaceProfile {

@@ -704,12 +704,30 @@ pub(crate) fn spawn(supervisor: Weak<CameraSupervisor>) -> Result<(), LifecycleE
                 if let Err(error) =
                     coordinator.process_next(worker_supervisor.as_ref(), MONITOR_WAIT)
                 {
+                    if worker_retries_after(&error) {
+                        eprintln!(
+                            "irlume: camera lifecycle rescan deferred after a bounded event burst: \
+                             {error}"
+                        );
+                        continue;
+                    }
                     eprintln!("irlume: camera lifecycle monitor stopped: {error}");
                     return;
                 }
             }
         });
     finish_spawn(supervisor.as_ref(), spawned)
+}
+
+/// A quiet-snapshot bound is a fail-closed publication result, not loss of the
+/// monitor itself. Keep the inventory invalidated and retain the udev socket so
+/// a later remove/add event can rebuild it. Socket and inventory failures do
+/// not have that guarantee and still terminate the worker.
+fn worker_retries_after(error: &LifecycleError) -> bool {
+    matches!(
+        error,
+        LifecycleError::UnstableSnapshot | LifecycleError::EventStorm
+    )
 }
 
 fn finish_spawn<I: InventorySink>(
@@ -1456,6 +1474,18 @@ mod tests {
             coordinator.initialize(&inventory),
             Err(LifecycleError::UnstableSnapshot)
         );
+    }
+
+    #[test]
+    fn bounded_event_bursts_defer_rescan_without_killing_the_monitor() {
+        assert!(worker_retries_after(&LifecycleError::UnstableSnapshot));
+        assert!(worker_retries_after(&LifecycleError::EventStorm));
+        assert!(!worker_retries_after(&LifecycleError::Monitor(
+            "socket lost".into()
+        )));
+        assert!(!worker_retries_after(&LifecycleError::Inventory(
+            CameraInventoryError::Removed
+        )));
     }
 
     #[test]

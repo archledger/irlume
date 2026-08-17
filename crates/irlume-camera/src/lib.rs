@@ -6303,6 +6303,18 @@ impl RuntimePairContract {
         &self.runtime_key
     }
 
+    /// Current RGB camera incarnation captured by this contract.
+    #[must_use]
+    pub const fn rgb_generation(&self) -> u64 {
+        self.rgb_binding.generation().get()
+    }
+
+    /// Current IR camera incarnation captured by this contract.
+    #[must_use]
+    pub const fn ir_generation(&self) -> u64 {
+        self.ir_binding.generation().get()
+    }
+
     /// Validate a delivered concurrent pair before either frame reaches recognition.
     ///
     /// # Errors
@@ -9905,6 +9917,8 @@ mod tests {
     fn runtime_pair_gate_accepts_only_the_exact_live_provenance_contract() {
         use contracts::{IlluminationProvenance, StreamRole};
         let contract = runtime_gate_contract();
+        assert_eq!(contract.rgb_generation(), 1);
+        assert_eq!(contract.ir_generation(), 1);
         let rgb = || {
             runtime_gate_frame(
                 StreamRole::Rgb,

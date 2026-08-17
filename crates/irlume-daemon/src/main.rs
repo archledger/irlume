@@ -3168,7 +3168,7 @@ fn dispatch_scoped(
     req: Request,
     peer: &Peer,
     engine: &mut irlume_auth::Engine,
-    _scope: &diagnostics::OperationScope,
+    scope: &diagnostics::OperationScope,
 ) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
@@ -3399,7 +3399,7 @@ fn dispatch_scoped(
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            match engine.authenticate(&user, service.as_deref()) {
+            match engine.authenticate_with_diagnostics(&user, service.as_deref(), scope) {
                 Ok(o) => {
                     rate_record(&user, o.granted, !irlume_auth::presence_retryable(&o));
                     if convenience || irlume_common::dbglog::on() {
@@ -3561,9 +3561,13 @@ fn dispatch_scoped(
                         ProbeStore::AutomaticIfAbsent,
                     )
                 },
-                || match engine.enroll_profile_with_ir_preflight(&user, profile, want, || {
-                    prepare_enrollment_ir(&ir_dev)
-                }) {
+                || match engine.enroll_profile_with_ir_preflight_and_diagnostics(
+                    &user,
+                    profile,
+                    want,
+                    || prepare_enrollment_ir(&ir_dev),
+                    scope,
+                ) {
                     Ok(outcome) => enroll_response(outcome),
                     Err(e) => Response::Error(e.to_string()),
                 },
@@ -3829,7 +3833,7 @@ fn dispatch_scoped(
                     ));
                 }
             }
-            do_unseal_password(&user, service.as_deref(), engine)
+            do_unseal_password_scoped(&user, service.as_deref(), engine, scope)
         }
         Request::UnsealKeyring {
             user,
@@ -4363,10 +4367,22 @@ fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
 /// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
 /// temporal consent gesture by default. We log the decision + cosine score, but
 /// never the password or its length.
+#[cfg(test)]
 fn do_unseal_password(
     user: &str,
     service: Option<&str>,
     engine: &mut irlume_auth::Engine,
+) -> Response {
+    let state = diagnostics::DiagnosticState::default();
+    let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+    do_unseal_password_scoped(user, service, engine, &scope)
+}
+
+fn do_unseal_password_scoped(
+    user: &str,
+    service: Option<&str>,
+    engine: &mut irlume_auth::Engine,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
 ) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
@@ -4380,7 +4396,12 @@ fn do_unseal_password(
     if rate_limited(user) {
         return Response::Error("too many recent face attempts; use your password".into());
     }
-    let outcome = match engine.authenticate_for(user, service, credential_release_purpose()) {
+    let outcome = match engine.authenticate_for_with_diagnostics(
+        user,
+        service,
+        credential_release_purpose(),
+        diagnostics,
+    ) {
         Ok(o) => o,
         Err(e) => {
             // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it

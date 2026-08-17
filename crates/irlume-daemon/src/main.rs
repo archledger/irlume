@@ -57,6 +57,7 @@ pub(crate) mod test_support {
 }
 
 mod arbiter;
+mod diagnostics;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -391,6 +392,7 @@ fn main() {
     // starting and falls through to the password.
     let engine_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+    let diagnostic_state = std::sync::Arc::new(diagnostics::DiagnosticState::default());
     {
         let arbiter = std::sync::Arc::clone(&arbiter);
         let engine_ready = std::sync::Arc::clone(&engine_ready);
@@ -815,12 +817,16 @@ fn main() {
                                 peer,
                                 reply,
                                 link,
+                                scope,
                             } = job.payload;
                             // The client left while this sat in the queue: never open
                             // the camera for an answer nobody is waiting for. Release
                             // the slot first, exactly as the normal path does, so the
                             // uid is not locked out of the camera.
                             if !link.claim() {
+                                scope.finish(
+                                    irlume_common::diagnostics::CategoricalOutcome::Cancelled,
+                                );
                                 arbiter.finish(job.class, job.uid);
                                 irlume_common::dlog!(
                                     "queued request dropped: its client disconnected first"
@@ -835,7 +841,7 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                dispatch(req, &peer, &mut engine)
+                                dispatch_scoped(req, &peer, &mut engine, &scope)
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
@@ -892,6 +898,7 @@ fn main() {
                                     Response::Error("request failed".into())
                                 }
                             };
+                            scope.finish(categorical_outcome(&resp));
                             // The client may already be gone; its thread owns that.
                             let _ = reply.send(resp);
                             // Back to waiting for work: idle is healthy, and leaving the
@@ -1010,6 +1017,7 @@ fn main() {
                 }
                 let arbiter = std::sync::Arc::clone(&arbiter);
                 let engine_ready = std::sync::Arc::clone(&engine_ready);
+                let diagnostic_state = std::sync::Arc::clone(&diagnostic_state);
                 // A connection thread reads, parses and writes; it never touches
                 // the engine, so a panic in it is contained by the thread itself
                 // and the queued job (if any) is still completed and released by
@@ -1032,7 +1040,7 @@ fn main() {
                     .name("irlume-conn".into())
                     .spawn(move || {
                         let _slot = slot;
-                        if let Err(e) = serve(stream, &arbiter, &engine_ready) {
+                        if let Err(e) = serve(stream, &arbiter, &engine_ready, &diagnostic_state) {
                             eprintln!("irlumed: connection error: {e}");
                         }
                     })
@@ -1366,6 +1374,7 @@ struct Queued {
     reply: std::sync::mpsc::Sender<Response>,
     /// Lets the worker learn that this request's client has gone away.
     link: std::sync::Arc<ClientLink>,
+    scope: diagnostics::OperationScope,
 }
 
 /// The handshake between one connection thread and the camera worker, so work a
@@ -2043,6 +2052,7 @@ fn serve(
     stream: UnixStream,
     arbiter: &arbiter::Arbiter<Queued>,
     engine_ready: &std::sync::atomic::AtomicBool,
+    diagnostic_state: &diagnostics::DiagnosticState,
 ) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
@@ -2051,9 +2061,26 @@ fn serve(
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
         ReadOutcome::Req(req) => {
+            // The recent-event ring exists before model/camera startup and is
+            // intentionally independent of engine readiness. Keep this one
+            // status request useful during startup instead of replacing its
+            // evidence with the generic "still starting" response.
+            if matches!(req, Request::SupportSnapshot { .. }) {
+                if let Some(resp) = pregate(&req, &peer) {
+                    return respond(stream, &resp);
+                }
+                if let Some(resp) =
+                    dispatch_status_with_diagnostics(&req, &peer, Some(diagnostic_state))
+                {
+                    return respond(stream, &resp);
+                }
+            }
             // No engine yet means no worker to queue for.
             if !engine_ready.load(std::sync::atomic::Ordering::Acquire) {
                 return respond(stream, &dispatch_before_engine(req, &peer));
+            }
+            if let Some(resp) = pregate(&req, &peer) {
+                return respond(stream, &resp);
             }
             let class = arbiter::classify(&req);
             // Status is answered HERE, on the connection's own thread: it is
@@ -2068,10 +2095,13 @@ fn serve(
             // fail: the miss never reached the worker, so nothing ever
             // published, so every later listing missed too.
             if class == arbiter::Class::Status {
-                if let Some(resp) = dispatch_status(&req, &peer) {
+                if let Some(resp) =
+                    dispatch_status_with_diagnostics(&req, &peer, Some(diagnostic_state))
+                {
                     return respond(stream, &resp);
                 }
             }
+            let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
             let (reply, answer) = std::sync::mpsc::channel();
             let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
@@ -2079,6 +2109,7 @@ fn serve(
                 peer: peer.clone(),
                 reply,
                 link: std::sync::Arc::clone(&link),
+                scope: scope.clone(),
             };
             if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
                 // Refused, not queued: answer now so the client can retry rather
@@ -2086,6 +2117,7 @@ fn serve(
                 // so a client that spins on refusals throttles itself at accept
                 // time rather than costing a thread per attempt (#142).
                 record_refusal(peer.uid);
+                scope.finish(irlume_common::diagnostics::CategoricalOutcome::Unavailable);
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
             // Wait for the worker, checking between slices whether the client is
@@ -2714,8 +2746,27 @@ fn note_unseal_password_refusal(uid: u32) {
 /// bad username or an unauthorized peer here whatever the request is: `serve`
 /// only routes status requests here, and `dispatch` wants that answer anyway.
 fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
+    dispatch_status_with_diagnostics(req, peer, None)
+}
+
+fn dispatch_status_with_diagnostics(
+    req: &Request,
+    peer: &Peer,
+    diagnostic_state: Option<&diagnostics::DiagnosticState>,
+) -> Option<Response> {
     if let Some(resp) = pregate(req, peer) {
         return Some(resp);
+    }
+    if let Request::SupportSnapshot { since_ms } = req {
+        return Some(match diagnostic_state {
+            Some(state) => Response::SupportSnapshot(Box::new(
+                state.snapshot(std::time::Duration::from_millis(*since_ms)),
+            )),
+            None => Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: false,
+            },
+        });
     }
     let bits = engine_bits()
         .lock()
@@ -2763,10 +2814,6 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 key_present: irlume_core::template_key::has_key(user),
             }
         }
-        Request::SupportSnapshot { .. } => Response::OperationError {
-            code: irlume_common::OperationErrorCode::OperationFailed,
-            retryable: false,
-        },
         Request::ListProfiles { user, .. } => {
             // Cache HIT only: the summary the worker published after its
             // last load or mutation of this enrollment. A miss returns None
@@ -3048,7 +3095,81 @@ fn enroll_with_capture_probe(
     enroll()
 }
 
+fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::OperationClass {
+    use irlume_common::diagnostics::OperationClass;
+    use Request::*;
+    match req {
+        Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
+            OperationClass::Authentication
+        }
+        Enroll { .. } | AddScan { .. } | CaptureEarMedian { .. } | PositionSample { .. } => {
+            OperationClass::Enrollment
+        }
+        Identify => OperationClass::Identification,
+        TuneCaptureMode { .. } => OperationClass::CaptureQualification,
+        SupportProbe { .. } => OperationClass::SupportProbe,
+        SetupIrEmitter { .. }
+        | CaptureModeStatus
+        | SelfTest { .. }
+        | ListCameras
+        | CameraDiagnostics => OperationClass::CameraDiagnostics,
+        SetCameras { .. }
+        | ListProfiles { .. }
+        | DeleteProfile { .. }
+        | DeleteScan { .. }
+        | ForgetRecognizer { .. }
+        | RenameProfile { .. }
+        | RenameScan { .. }
+        | SetRequireEyesOpen { .. }
+        | SetClosureCalibration { .. }
+        | Ping
+        | Health
+        | SupportSnapshot { .. }
+        | SealPassword { .. }
+        | HasSealedPassword { .. }
+        | KeyringInfo { .. }
+        | ForgetPassword { .. }
+        | ReleaseTokenForDisarm { .. }
+        | ResealPassword { .. }
+        | RecoverySetup { .. }
+        | RecoveryRestore { .. }
+        | RecoveryStatus { .. }
+        | RecoveryForget { .. } => OperationClass::Status,
+    }
+}
+
+fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::CategoricalOutcome {
+    use irlume_common::diagnostics::{CategoricalOutcome, ProbeOutcome};
+    match response {
+        Response::AuthResult { granted: true, .. } => CategoricalOutcome::Granted,
+        Response::AuthResult { granted: false, .. } => CategoricalOutcome::Denied,
+        Response::SupportProbe(result) => match result.outcome {
+            ProbeOutcome::Captured
+            | ProbeOutcome::FallbackCaptured
+            | ProbeOutcome::RgbOnlyCaptured => CategoricalOutcome::Completed,
+            ProbeOutcome::Unavailable => CategoricalOutcome::Unavailable,
+            ProbeOutcome::Failed => CategoricalOutcome::Failed,
+        },
+        Response::Error(_) | Response::OperationError { .. } => CategoricalOutcome::Failed,
+        _ => CategoricalOutcome::Completed,
+    }
+}
+
+#[cfg(test)]
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
+    let state = diagnostics::DiagnosticState::default();
+    let scope = state.begin(diagnostic_operation_class(&req));
+    let response = dispatch_scoped(req, peer, engine, &scope);
+    scope.finish(categorical_outcome(&response));
+    response
+}
+
+fn dispatch_scoped(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    _scope: &diagnostics::OperationScope,
+) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
     // in behavior) if one is ever submitted anyway. The pregate rides inside.
@@ -5064,9 +5185,23 @@ mod tests {
         ready: &std::sync::atomic::AtomicBool,
         client: impl FnOnce(&UnixStream) -> R,
     ) -> R {
+        with_serve_and_diagnostics(
+            arbiter,
+            ready,
+            &diagnostics::DiagnosticState::default(),
+            client,
+        )
+    }
+
+    fn with_serve_and_diagnostics<R>(
+        arbiter: &arbiter::Arbiter<Queued>,
+        ready: &std::sync::atomic::AtomicBool,
+        diagnostic_state: &diagnostics::DiagnosticState,
+        client: impl FnOnce(&UnixStream) -> R,
+    ) -> R {
         std::thread::scope(|scope| {
             let (ours, theirs) = UnixStream::pair().unwrap();
-            let server = scope.spawn(|| serve(theirs, arbiter, ready).unwrap());
+            let server = scope.spawn(|| serve(theirs, arbiter, ready, diagnostic_state).unwrap());
             let out = client(&ours);
             // Dropped before the join so the server reads EOF rather than
             // waiting out the socket timeout. On the panic path the scope
@@ -5134,10 +5269,11 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 3] = [
+        let sources: [(&str, &str); 4] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
             ("arbiter.rs", include_str!("arbiter.rs")),
+            ("diagnostics.rs", include_str!("diagnostics.rs")),
         ];
         // The calls that end in glibc's getpwnam_r/getpwuid_r. `serve(` is
         // here because it REACHES them: `dispatch_status`/`dispatch_before_engine`
@@ -6058,6 +6194,7 @@ mod tests {
         // narrow scope was avoiding; readers overlap each other.
         let _passwd = passwd_lock();
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let diagnostic_state = diagnostics::DiagnosticState::default();
         // Wedge: an authentication sits queued forever (no worker exists).
         let (dead_reply, _keep) = std::sync::mpsc::channel();
         arbiter
@@ -6073,6 +6210,8 @@ mod tests {
                     },
                     reply: dead_reply,
                     link: std::sync::Arc::new(ClientLink::default()),
+                    scope: diagnostic_state
+                        .begin(irlume_common::diagnostics::OperationClass::Authentication),
                 },
             )
             .unwrap();
@@ -6111,6 +6250,37 @@ mod tests {
             });
             assert!(check(&resp), "wedged queue must not delay status: {resp:?}");
         }
+    }
+
+    #[test]
+    fn support_snapshot_answers_from_memory_without_worker_or_camera() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let seeded =
+            diagnostic_state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+        seeded.emit(
+            irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
+                schedule: irlume_common::diagnostics::CaptureSchedule::Sequential,
+                source: irlume_common::diagnostics::CaptureScheduleSource::SequentialDefault,
+            },
+        );
+
+        let response = with_serve_and_diagnostics(&arbiter, &ready, &diagnostic_state, |client| {
+            (&*client)
+                .write_all(b"{\"SupportSnapshot\":{\"since_ms\":60000}}\n")
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(line.trim()).unwrap()
+        });
+        let Response::SupportSnapshot(snapshot) = response else {
+            panic!("expected in-memory support snapshot");
+        };
+        assert_eq!(snapshot.events().len(), 1);
+        arbiter.close();
+        assert!(arbiter.take().is_none(), "snapshot must never queue");
     }
 
     #[test]
@@ -6433,6 +6603,7 @@ mod tests {
         // itself, without the request ever reaching the camera. If this only
         // worked because a worker drained the queue, the test would hang here.
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let diagnostic_state = diagnostics::DiagnosticState::default();
         let (_dead_reply, _) = std::sync::mpsc::channel();
         arbiter
             .submit(
@@ -6447,6 +6618,8 @@ mod tests {
                     },
                     reply: _dead_reply,
                     link: std::sync::Arc::new(ClientLink::default()),
+                    scope: diagnostic_state
+                        .begin(irlume_common::diagnostics::OperationClass::Authentication),
                 },
             )
             .unwrap();

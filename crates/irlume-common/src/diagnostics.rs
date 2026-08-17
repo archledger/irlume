@@ -514,6 +514,26 @@ impl SupportSnapshot {
             unavailable,
         }
     }
+
+    #[must_use]
+    pub fn capture(&self) -> Option<&CaptureStatus> {
+        self.capture.as_ref()
+    }
+
+    #[must_use]
+    pub fn cameras(&self) -> &[SanitizedCameraContext] {
+        &self.cameras
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[ShareSafeEvent] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn unavailable(&self) -> &[SupportUnavailable] {
+        &self.unavailable
+    }
 }
 
 impl<'de> Deserialize<'de> for SupportSnapshot {

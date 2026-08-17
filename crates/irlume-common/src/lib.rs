@@ -14,6 +14,7 @@ pub mod artifact;
 pub mod client;
 pub mod config;
 pub mod dbglog;
+pub mod diagnostics;
 pub mod gkr_wire;
 pub mod memlock;
 pub mod pam_service;
@@ -540,6 +541,10 @@ pub enum Request {
     /// per present role and reports the measured evidence; a below-floor stream
     /// is returned as a measured `fail`, never degraded to English.
     CameraDiagnostics,
+    /// Read the daemon's bounded, structurally share-safe diagnostic snapshot.
+    SupportSnapshot { since_ms: u64 },
+    /// Explicit root-only bounded camera probe for a support report.
+    SupportProbe { since_ms: u64 },
     /// Liveness/health ping.
     Ping,
     /// Daemon self-report: what it actually has loaded and which camera tier it
@@ -805,6 +810,10 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_degradation: Option<String>,
     },
+    /// Structurally share-safe daemon facts and recent typed events.
+    SupportSnapshot(Box<diagnostics::SupportSnapshot>),
+    /// Explicit support probe result with its contemporaneous safe snapshot.
+    SupportProbe(Box<diagnostics::SupportProbeResult>),
     /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
     /// face matched (check `live` to tell "no match" from "not a live face").
     Identified {

@@ -307,7 +307,7 @@ fn concurrent_contract_violation_records_fallback_without_measurements() {
     );
     assert_eq!(sink.share_safe(), vec![
         ShareSafeEventKind::CaptureFallback {
-            reason: RuntimeViolationLabel::DeliveredRate,
+            reason: RuntimeViolationLabel::DeliveredRateShortfall,
         },
     ]);
     assert!(!serde_json::to_string(&sink.share_safe()).unwrap().contains("score"));

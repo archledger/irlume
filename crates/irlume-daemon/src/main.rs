@@ -2369,6 +2369,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: None,
             enrollment: Reads,
         },
+        SupportProbe { .. } => RequestPosture {
+            privilege: RootOnly {
+                command: "support-report --probe",
+            },
+            user: None,
+            enrollment: Reads,
+        },
         // A dry run reads the camera's USB descriptors out of sysfs and sends
         // the device nothing, so it stays open to any peer (the arm charges it
         // the camera-probe interval); the real run writes camera firmware and
@@ -2391,13 +2398,17 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: user.as_deref(),
             enrollment: Reads,
         },
-        Ping | Health | Identify | ListCameras | CameraDiagnostics | CaptureModeStatus => {
-            RequestPosture {
-                privilege: AnyPeer,
-                user: None,
-                enrollment: Reads,
-            }
-        }
+        Ping
+        | Health
+        | Identify
+        | ListCameras
+        | CameraDiagnostics
+        | CaptureModeStatus
+        | SupportSnapshot { .. } => RequestPosture {
+            privilege: AnyPeer,
+            user: None,
+            enrollment: Reads,
+        },
     }
 }
 
@@ -2752,6 +2763,10 @@ fn dispatch_status(req: &Request, peer: &Peer) -> Option<Response> {
                 key_present: irlume_core::template_key::has_key(user),
             }
         }
+        Request::SupportSnapshot { .. } => Response::OperationError {
+            code: irlume_common::OperationErrorCode::OperationFailed,
+            retryable: false,
+        },
         Request::ListProfiles { user, .. } => {
             // Cache HIT only: the summary the worker published after its
             // last load or mutation of this enrollment. A miss returns None
@@ -3093,9 +3108,14 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
         Request::Ping
         | Request::Health
         | Request::HasSealedPassword { .. }
-        | Request::RecoveryStatus { .. } => {
+        | Request::RecoveryStatus { .. }
+        | Request::SupportSnapshot { .. } => {
             Response::Error("status request routed past its handler".into())
         }
+        Request::SupportProbe { .. } => Response::OperationError {
+            code: irlume_common::OperationErrorCode::OperationFailed,
+            retryable: false,
+        },
         Request::KeyringInfo { user } => {
             let armed = irlume_core::keyring::has_sealed_password(&user);
             let path = irlume_core::keyring::envelope_path(&user);
@@ -5514,6 +5534,8 @@ mod tests {
         Ping => Request::Ping,
         Health => Request::Health,
         CameraDiagnostics => Request::CameraDiagnostics,
+        SupportSnapshot => Request::SupportSnapshot { since_ms: 60_000 },
+        SupportProbe => Request::SupportProbe { since_ms: 60_000 },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
         SealPassword => Request::SealPassword {
@@ -5621,6 +5643,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn support_snapshot_is_read_only_and_probe_is_root_only() {
+        let snapshot = posture(&Request::SupportSnapshot { since_ms: 60_000 });
+        assert_eq!(snapshot.privilege, Privilege::AnyPeer);
+        assert_eq!(snapshot.user, None);
+        assert_eq!(snapshot.enrollment, EnrollmentEffect::Reads);
+
+        let probe = posture(&Request::SupportProbe { since_ms: 60_000 });
+        assert!(matches!(probe.privilege, Privilege::RootOnly { .. }));
+        assert_eq!(probe.user, None);
+        assert_eq!(probe.enrollment, EnrollmentEffect::Reads);
     }
 
     #[test]
@@ -6152,6 +6187,7 @@ mod tests {
                 user: u(),
                 structured_errors: false,
             },
+            Request::SupportSnapshot { since_ms: 60_000 },
         ] {
             assert_eq!(classify(&req), Class::Status, "{req:?}");
         }

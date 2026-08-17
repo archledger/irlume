@@ -3348,6 +3348,40 @@ impl RgbCamera {
             fps: driver_fps(&self.dev),
         }
     }
+
+    /// Exact fd identity, connection, request, and driver echo used by capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/topology evidence cannot be collected or
+    /// the negotiated stream cannot be represented by the strict qualification
+    /// contract.
+    pub fn qualification_facts(
+        &self,
+    ) -> Result<
+        (
+            capture_qualification::CameraEndpoint,
+            capture_qualification::StreamContract,
+        ),
+        capture_qualification::QualificationError,
+    > {
+        Ok((
+            capture_qualification::CameraEndpoint::from_fd(
+                self.dev.handle().fd(),
+                capture_qualification::QualifiedStreamRole::Rgb,
+                "uvc-v4l2",
+            )?,
+            capture_qualification::StreamContract::from_negotiated(
+                capture_qualification::QualifiedStreamRole::Rgb,
+                RGB_W,
+                RGB_H,
+                self.chosen,
+                self.requested_interval,
+                &self.negotiated,
+                self.accepted_interval,
+            )?,
+        ))
+    }
 }
 
 /// The negotiated stream of a camera, for the doctor report (#223).
@@ -4280,6 +4314,40 @@ impl IrCamera {
             fourcc: self.fourcc.clone(),
             fps: driver_fps(&self.dev),
         }
+    }
+
+    /// Exact fd identity, connection, request, and driver echo used by capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/topology evidence cannot be collected or
+    /// the negotiated stream cannot be represented by the strict qualification
+    /// contract.
+    pub fn qualification_facts(
+        &self,
+    ) -> Result<
+        (
+            capture_qualification::CameraEndpoint,
+            capture_qualification::StreamContract,
+        ),
+        capture_qualification::QualificationError,
+    > {
+        Ok((
+            capture_qualification::CameraEndpoint::from_fd(
+                self.dev.handle().fd(),
+                capture_qualification::QualifiedStreamRole::Ir,
+                "uvc-v4l2",
+            )?,
+            capture_qualification::StreamContract::from_negotiated(
+                capture_qualification::QualifiedStreamRole::Ir,
+                IR_W,
+                IR_H,
+                self.negotiated.fourcc.repr,
+                self.requested_interval,
+                &self.negotiated,
+                self.accepted_interval,
+            )?,
+        ))
     }
 
     /// Start streaming and fire the emitter.

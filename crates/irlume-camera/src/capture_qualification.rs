@@ -34,6 +34,7 @@ pub enum QualificationError {
     UnsupportedSchema(u32),
     UnsupportedPolicy(u32),
     Json(String),
+    System(String),
 }
 
 impl std::fmt::Display for QualificationError {
@@ -57,6 +58,7 @@ impl std::fmt::Display for QualificationError {
                 write!(f, "unsupported qualification policy {version}")
             }
             Self::Json(error) => write!(f, "invalid qualification JSON: {error}"),
+            Self::System(error) => f.write_str(error),
         }
     }
 }
@@ -111,6 +113,46 @@ impl ExactInterval {
     }
 }
 
+/// Positive frame rate in frames per second, represented exactly and canonically.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExactRate {
+    numerator: u32,
+    denominator: u32,
+}
+
+impl ExactRate {
+    /// Construct a reduced positive rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualificationError::ZeroInterval`] when either component is zero.
+    pub fn new(numerator: u32, denominator: u32) -> Result<Self, QualificationError> {
+        if numerator == 0 || denominator == 0 {
+            return Err(QualificationError::ZeroInterval);
+        }
+        let divisor = gcd(numerator, denominator);
+        Ok(Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        })
+    }
+
+    #[must_use]
+    pub const fn parts(self) -> (u32, u32) {
+        (self.numerator, self.denominator)
+    }
+
+    fn validate(self) -> Result<(), QualificationError> {
+        if self.numerator == 0
+            || self.denominator == 0
+            || gcd(self.numerator, self.denominator) != 1
+        {
+            return Err(QualificationError::InvalidEvidence);
+        }
+        Ok(())
+    }
+}
+
 const fn gcd(mut left: u32, mut right: u32) -> u32 {
     while right != 0 {
         let remainder = left % right;
@@ -124,7 +166,8 @@ const fn gcd(mut left: u32, mut right: u32) -> u32 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectionContext {
     controller_path: String,
-    speed_mbps: u32,
+    /// Exact sysfs link speed in thousandths of a megabit per second.
+    speed_millimbps: u64,
     driver: String,
     backend: String,
 }
@@ -138,13 +181,13 @@ impl ConnectionContext {
     /// driver/backend identifier.
     pub fn new(
         controller_path: String,
-        speed_mbps: u32,
+        speed_millimbps: u64,
         driver: String,
         backend: String,
     ) -> Result<Self, QualificationError> {
         let value = Self {
             controller_path,
-            speed_mbps,
+            speed_millimbps,
             driver,
             backend,
         };
@@ -154,7 +197,7 @@ impl ConnectionContext {
 
     fn validate(&self) -> Result<(), QualificationError> {
         validate_path(&self.controller_path)?;
-        if self.speed_mbps == 0 {
+        if self.speed_millimbps == 0 {
             return Err(QualificationError::InvalidEvidence);
         }
         validate_text(&self.driver)?;
@@ -205,6 +248,40 @@ impl CameraEndpoint {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Collect persistent identity and USB connection facts from a live camera fd.
+    ///
+    /// `backend` names the capture implementation that negotiated this endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fd identity, descriptors, topology, link speed, or
+    /// driver facts cannot be read and validated.
+    pub fn from_fd(
+        fd: std::os::fd::RawFd,
+        role: QualifiedStreamRole,
+        backend: &str,
+    ) -> Result<Self, QualificationError> {
+        let observed = crate::uvc_descriptor::identity_and_connection_from_fd(fd)
+            .map_err(|error| QualificationError::System(error.to_string()))?;
+        let identity = observed.identity;
+        let connection = ConnectionContext::new(
+            observed.connection.controller_devpath,
+            observed.connection.speed_millimbps,
+            observed.connection.driver,
+            backend.to_owned(),
+        )?;
+        Self::new(
+            irlume_common::sha256_hex(&identity.descriptors),
+            identity.vid,
+            identity.pid,
+            identity.serial,
+            identity.interface_number,
+            identity.usb_devpath,
+            role,
+            connection,
+        )
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
@@ -287,6 +364,11 @@ impl RequestedStream {
         validate_fourcc(&self.fourcc)?;
         self.interval.validate()
     }
+
+    #[must_use]
+    pub const fn interval(&self) -> ExactInterval {
+        self.interval
+    }
 }
 
 /// Every relevant field the driver returned after format and interval setup.
@@ -350,6 +432,11 @@ impl AcceptedStream {
         }
         self.interval.validate()
     }
+
+    #[must_use]
+    pub const fn interval(&self) -> ExactInterval {
+        self.interval
+    }
 }
 
 /// Exact requested, accepted, and minimum-rate contract for one role.
@@ -358,7 +445,7 @@ pub struct StreamContract {
     role: QualifiedStreamRole,
     requested: RequestedStream,
     accepted: AcceptedStream,
-    minimum_interval: ExactInterval,
+    minimum_rate: ExactRate,
 }
 
 impl StreamContract {
@@ -371,22 +458,93 @@ impl StreamContract {
         role: QualifiedStreamRole,
         requested: RequestedStream,
         accepted: AcceptedStream,
-        minimum_interval: ExactInterval,
+        minimum_rate: ExactRate,
     ) -> Result<Self, QualificationError> {
         let value = Self {
             role,
             requested,
             accepted,
-            minimum_interval,
+            minimum_rate,
         };
         value.validate()?;
         Ok(value)
     }
 
+    /// Snapshot the request and every driver-echoed stream field without floats.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a fourcc is not printable ASCII or any exact
+    /// format/rate fact violates the qualification contract.
+    pub(crate) fn from_negotiated(
+        role: QualifiedStreamRole,
+        requested_width: u32,
+        requested_height: u32,
+        requested_fourcc: [u8; 4],
+        requested_interval: crate::frame_interval::FrameInterval,
+        accepted: &v4l::Format,
+        accepted_interval: crate::frame_interval::FrameInterval,
+    ) -> Result<Self, QualificationError> {
+        let requested_fourcc = String::from_utf8(requested_fourcc.to_vec())
+            .map_err(|_| QualificationError::InvalidFourcc)?;
+        let accepted_fourcc = String::from_utf8(accepted.fourcc.repr.to_vec())
+            .map_err(|_| QualificationError::InvalidFourcc)?;
+        let (requested_num, requested_den) = requested_interval.parts();
+        let (accepted_num, accepted_den) = accepted_interval.parts();
+        let minimum_rate = match role {
+            QualifiedStreamRole::Rgb => ExactRate::new(
+                crate::rate_gate::RGB_FLOOR_NUM,
+                crate::rate_gate::RGB_FLOOR_DEN,
+            )?,
+            QualifiedStreamRole::Ir => ExactRate::new(
+                crate::rate_gate::IR_FLOOR_NUM,
+                crate::rate_gate::IR_FLOOR_DEN,
+            )?,
+        };
+        Self::new(
+            role,
+            RequestedStream::new(
+                requested_width,
+                requested_height,
+                requested_fourcc,
+                ExactInterval::new(requested_num, requested_den)?,
+            )?,
+            AcceptedStream::new(
+                accepted.width,
+                accepted.height,
+                accepted_fourcc,
+                accepted.stride,
+                accepted.size,
+                accepted.field_order as u32,
+                accepted.colorspace as u32,
+                accepted.quantization as u32,
+                accepted.transfer as u32,
+                accepted.flags.bits(),
+                ExactInterval::new(accepted_num, accepted_den)?,
+            )?,
+            minimum_rate,
+        )
+    }
+
     fn validate(&self) -> Result<(), QualificationError> {
         self.requested.validate()?;
         self.accepted.validate()?;
-        self.minimum_interval.validate()
+        self.minimum_rate.validate()
+    }
+
+    #[must_use]
+    pub const fn requested(&self) -> &RequestedStream {
+        &self.requested
+    }
+
+    #[must_use]
+    pub const fn accepted(&self) -> &AcceptedStream {
+        &self.accepted
+    }
+
+    #[must_use]
+    pub const fn minimum_rate(&self) -> ExactRate {
+        self.minimum_rate
     }
 }
 
@@ -1008,7 +1166,7 @@ fn validate_path(value: &str) -> Result<(), QualificationError> {
 }
 
 fn validate_fourcc(value: &str) -> Result<(), QualificationError> {
-    if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+    if value.len() != 4 || !value.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         return Err(QualificationError::InvalidFourcc);
     }
     Ok(())
@@ -1066,7 +1224,7 @@ mod tests {
             role,
             ConnectionContext::new(
                 "/devices/pci0000:00/0000:00:14.0".into(),
-                5_000,
+                5_000_000,
                 "uvcvideo".into(),
                 "v4l2-uvc".into(),
             )
@@ -1076,6 +1234,10 @@ mod tests {
     }
 
     fn stream(role: QualifiedStreamRole, fourcc: &str, height: u32) -> StreamContract {
+        let minimum_rate = match role {
+            QualifiedStreamRole::Rgb => ExactRate::new(15, 2).unwrap(),
+            QualifiedStreamRole::Ir => ExactRate::new(15, 1).unwrap(),
+        };
         StreamContract::new(
             role,
             RequestedStream::new(
@@ -1099,7 +1261,7 @@ mod tests {
                 ExactInterval::new(1, 30).unwrap(),
             )
             .unwrap(),
-            ExactInterval::new(1, 24).unwrap(),
+            minimum_rate,
         )
         .unwrap()
     }
@@ -1240,6 +1402,49 @@ mod tests {
         first.clear_serial_for_test();
         second.clear_serial_for_test();
         assert_ne!(first.filing_key(), second.filing_key());
+    }
+
+    #[test]
+    fn stream_contract_keeps_rate_and_interval_as_distinct_exact_units() {
+        let rgb = stream(QualifiedStreamRole::Rgb, "YUYV", 480);
+        assert_eq!(rgb.requested().interval().parts(), (1, 30));
+        assert_eq!(rgb.accepted().interval().parts(), (1, 30));
+        assert_eq!(rgb.minimum_rate().parts(), (15, 2));
+    }
+
+    #[test]
+    fn negotiated_contract_keeps_the_request_and_every_driver_echo_field() {
+        let mut accepted = v4l::Format::new(800, 600, v4l::FourCC::new(b"NV12"));
+        accepted.stride = 832;
+        accepted.size = 748_800;
+        accepted.flags = v4l::format::Flags::PREMUL_ALPHA;
+        let contract = StreamContract::from_negotiated(
+            QualifiedStreamRole::Rgb,
+            640,
+            480,
+            *b"YUYV",
+            crate::frame_interval::FrameInterval::new(1, 30).unwrap(),
+            &accepted,
+            crate::frame_interval::FrameInterval::new(1, 25).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(contract.requested.width, 640);
+        assert_eq!(contract.requested.height, 480);
+        assert_eq!(contract.requested.fourcc, "YUYV");
+        assert_eq!(contract.requested.interval.parts(), (1, 30));
+        assert_eq!(contract.accepted.width, 800);
+        assert_eq!(contract.accepted.height, 600);
+        assert_eq!(contract.accepted.fourcc, "NV12");
+        assert_eq!(contract.accepted.stride, 832);
+        assert_eq!(contract.accepted.image_size, 748_800);
+        assert_eq!(contract.accepted.field_order, accepted.field_order as u32);
+        assert_eq!(contract.accepted.colorspace, accepted.colorspace as u32);
+        assert_eq!(contract.accepted.quantization, accepted.quantization as u32);
+        assert_eq!(contract.accepted.transfer, accepted.transfer as u32);
+        assert_eq!(contract.accepted.flags, accepted.flags.bits());
+        assert_eq!(contract.accepted.interval.parts(), (1, 25));
+        assert_eq!(contract.minimum_rate.parts(), (15, 2));
     }
 
     #[test]

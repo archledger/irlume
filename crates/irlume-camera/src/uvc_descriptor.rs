@@ -248,8 +248,42 @@ pub struct CameraIdentity {
     pub usb_devpath: String,
 }
 
+/// USB connection facts whose change invalidates a concurrency measurement.
+#[derive(Debug)]
+pub(crate) struct UsbConnectionFacts {
+    pub(crate) controller_devpath: String,
+    /// Exact sysfs `speed` value in thousandths of a megabit per second.
+    pub(crate) speed_millimbps: u64,
+    pub(crate) driver: String,
+}
+
+/// Persistent camera identity and connection facts resolved from one live fd.
+pub(crate) struct FdCameraContext {
+    pub(crate) identity: CameraIdentity,
+    pub(crate) connection: UsbConnectionFacts,
+}
+
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdentity> {
+    let (iface_dir, dev_dir) = fd_usb_dirs(fd)?;
+    identity_from_dirs(&iface_dir, &dev_dir)
+}
+
+/// Resolve qualification identity and link facts from the fd that will stream.
+///
+/// Missing controller, speed, or driver evidence is an error. Concurrent
+/// authority must never be scoped by an invented default.
+pub(crate) fn identity_and_connection_from_fd(
+    fd: std::os::raw::c_int,
+) -> std::io::Result<FdCameraContext> {
+    let (iface_dir, dev_dir) = fd_usb_dirs(fd)?;
+    Ok(FdCameraContext {
+        identity: identity_from_dirs(&iface_dir, &dev_dir)?,
+        connection: connection_facts_from_dirs(&dev_dir, &iface_dir, Path::new("/sys"))?,
+    })
+}
+
+fn fd_usb_dirs(fd: std::os::raw::c_int) -> std::io::Result<(PathBuf, PathBuf)> {
     let (major, minor) = device_numbers(fd)?;
     let node = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}"))?;
 
@@ -259,15 +293,19 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
             node.display()
         ))
     })?;
+    let dev_dir = ancestor_with(&iface_dir, "descriptors")
+        .ok_or_else(|| bad(format!("no USB descriptors above {}", iface_dir.display())))?;
+
+    Ok((iface_dir, dev_dir))
+}
+
+fn identity_from_dirs(iface_dir: &Path, dev_dir: &Path) -> std::io::Result<CameraIdentity> {
     let interface_number = read_hex_u8(&iface_dir.join("bInterfaceNumber")).ok_or_else(|| {
         bad(format!(
             "{} has an unreadable bInterfaceNumber",
             iface_dir.display()
         ))
     })?;
-
-    let dev_dir = ancestor_with(&iface_dir, "descriptors")
-        .ok_or_else(|| bad(format!("no USB descriptors above {}", iface_dir.display())))?;
 
     Ok(CameraIdentity {
         descriptors: std::fs::read(dev_dir.join("descriptors"))?,
@@ -276,7 +314,7 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
             .ok_or_else(|| bad(format!("{} has no idVendor", dev_dir.display())))?,
         pid: read_hex_u16(&dev_dir.join("idProduct"))
             .ok_or_else(|| bad(format!("{} has no idProduct", dev_dir.display())))?,
-        serial: read_optional_serial(&dev_dir)?,
+        serial: read_optional_serial(dev_dir)?,
         // `dev_dir` came from `canonicalize`, so it is already the resolved
         // physical path. Stripping `/sys` makes the value the kernel's own
         // `DEVPATH` for this device, which is what `udevadm info -q path` prints
@@ -291,10 +329,98 @@ pub fn identity_from_fd(fd: std::os::raw::c_int) -> std::io::Result<CameraIdenti
         usb_devpath: dev_dir
             .strip_prefix("/sys")
             .map(|p| std::path::Path::new("/").join(p))
-            .unwrap_or_else(|_| dev_dir.clone())
+            .unwrap_or_else(|_| dev_dir.to_path_buf())
             .to_string_lossy()
             .into_owned(),
     })
+}
+
+fn connection_facts_from_dirs(
+    dev_dir: &Path,
+    iface_dir: &Path,
+    sysfs_root: &Path,
+) -> std::io::Result<UsbConnectionFacts> {
+    let root_hub = dev_dir
+        .ancestors()
+        .find(|candidate| {
+            candidate.join("busnum").is_file()
+                && candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.strip_prefix("usb").is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+                        })
+                    })
+        })
+        .ok_or_else(|| bad(format!("no USB root hub above {}", dev_dir.display())))?;
+    let controller = root_hub.parent().ok_or_else(|| {
+        bad(format!(
+            "USB root hub {} has no controller",
+            root_hub.display()
+        ))
+    })?;
+    let controller_devpath = devpath_below(sysfs_root, controller)?;
+
+    let speed_path = dev_dir.join("speed");
+    let speed_raw = std::fs::read_to_string(&speed_path)
+        .map_err(|error| bad(format!("could not read {}: {error}", speed_path.display())))?;
+    let speed_millimbps = parse_speed_millimbps(speed_raw.trim()).ok_or_else(|| {
+        bad(format!(
+            "{} contains an invalid USB speed {:?}",
+            speed_path.display(),
+            speed_raw.trim()
+        ))
+    })?;
+
+    let driver_path = iface_dir.join("driver");
+    let driver_target = std::fs::read_link(&driver_path)
+        .map_err(|error| bad(format!("could not read {}: {error}", driver_path.display())))?;
+    let driver = driver_target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| bad(format!("{} has no driver name", driver_path.display())))?
+        .to_owned();
+
+    Ok(UsbConnectionFacts {
+        controller_devpath,
+        speed_millimbps,
+        driver,
+    })
+}
+
+fn devpath_below(sysfs_root: &Path, path: &Path) -> std::io::Result<String> {
+    let relative = path.strip_prefix(sysfs_root).map_err(|_| {
+        bad(format!(
+            "{} is outside sysfs root {}",
+            path.display(),
+            sysfs_root.display()
+        ))
+    })?;
+    Ok(Path::new("/").join(relative).to_string_lossy().into_owned())
+}
+
+fn parse_speed_millimbps(raw: &str) -> Option<u64> {
+    let (whole, fraction) = raw.split_once('.').map_or((raw, ""), |parts| parts);
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 3
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?;
+    let mut fraction_value = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u64>().ok()?
+    };
+    for _ in fraction.len()..3 {
+        fraction_value = fraction_value.checked_mul(10)?;
+    }
+    let value = whole.checked_mul(1_000)?.checked_add(fraction_value)?;
+    (value > 0).then_some(value)
 }
 
 impl CameraIdentity {
@@ -414,6 +540,58 @@ fn bad(msg: String) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn connection_facts_bind_controller_speed_and_driver_without_bus_numbers() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("irlume-usb-connection-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sys = root.join("sys");
+        let controller = sys.join("devices/pci0000:00/0000:00:14.0");
+        let root_hub = controller.join("usb3");
+        let device = root_hub.join("3-2");
+        let interface = device.join("3-2:1.0");
+        let driver = sys.join("bus/usb/drivers/uvcvideo");
+        std::fs::create_dir_all(&interface).unwrap();
+        std::fs::create_dir_all(&driver).unwrap();
+        std::fs::write(root_hub.join("busnum"), "3\n").unwrap();
+        std::fs::write(device.join("speed"), "5000\n").unwrap();
+        symlink(&driver, interface.join("driver")).unwrap();
+
+        let facts = super::connection_facts_from_dirs(&device, &interface, &sys).unwrap();
+        assert_eq!(facts.controller_devpath, "/devices/pci0000:00/0000:00:14.0");
+        assert_eq!(facts.speed_millimbps, 5_000_000);
+        assert_eq!(facts.driver, "uvcvideo");
+        assert!(!facts.controller_devpath.contains("busnum"));
+
+        std::fs::write(device.join("speed"), "1.5\n").unwrap();
+        let low_speed = super::connection_facts_from_dirs(&device, &interface, &sys).unwrap();
+        assert_eq!(low_speed.speed_millimbps, 1_500);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_connection_evidence_is_an_error_not_a_permissive_default() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-usb-connection-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let sys = root.join("sys");
+        let controller = sys.join("devices/platform/controller");
+        let root_hub = controller.join("usb1");
+        let device = root_hub.join("1-1");
+        let interface = device.join("1-1:1.0");
+        std::fs::create_dir_all(&interface).unwrap();
+        std::fs::write(root_hub.join("busnum"), "1\n").unwrap();
+
+        let error = super::connection_facts_from_dirs(&device, &interface, &sys)
+            .expect_err("missing speed and driver must fail closed");
+        assert!(error.to_string().contains("speed"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A serial that could not be READ is not the same as a camera that has
     /// none, and the difference decides whether one camera's undo bytes may be

@@ -5651,6 +5651,62 @@ pub struct PairSample {
     /// answer: the BRIO's RGB open returns EINVAL whenever its IR sibling is
     /// streaming, so its concurrent arm fails every attempt (#192).
     pub failed: usize,
+    /// Completed rounds whose two delivered frames exactly matched the
+    /// driver-accepted stream contracts recorded for this attempt.
+    pub contract_rounds: usize,
+    /// Completed rounds whose two delivered-rate windows met their floors.
+    pub rate_floor_rounds: usize,
+    /// Completed rounds with no sequence, timestamp, or recovery discontinuity.
+    pub continuous_rounds: usize,
+    /// Completed rounds whose IR frame proved active-IR illumination.
+    pub active_ir_rounds: usize,
+    /// Explicitly observed contract mismatches.
+    pub contract_failures: usize,
+    /// Explicitly observed delivered-rate shortfalls.
+    pub rate_failures: usize,
+    /// Explicitly observed sequence/timestamp/recovery discontinuities.
+    pub continuity_failures: usize,
+    /// Explicitly observed missing or incorrect IR illumination provenance.
+    pub illumination_failures: usize,
+    /// Rounds that failed before both camera objects could be opened.
+    pub open_failures: usize,
+    /// Rounds that failed while creating the production-shaped sessions.
+    pub arm_failures: usize,
+    /// Rounds whose capture/decode operation returned an error.
+    pub capture_failures: usize,
+    /// Failed rounds carrying typed delivered-rate-below-floor evidence.
+    pub rate_shortfall_failures: usize,
+}
+
+impl PairSample {
+    fn provenance_missing(&self) -> bool {
+        self.contract_rounds.saturating_add(self.contract_failures) < self.rounds
+            || self.rate_floor_rounds.saturating_add(self.rate_failures) < self.rounds
+            || self
+                .continuous_rounds
+                .saturating_add(self.continuity_failures)
+                < self.rounds
+            || self
+                .active_ir_rounds
+                .saturating_add(self.illumination_failures)
+                < self.rounds
+    }
+
+    fn provenance_healthy(&self) -> bool {
+        !self.provenance_missing()
+            && self.contract_failures == 0
+            && self.rate_failures == 0
+            && self.continuity_failures == 0
+            && self.illumination_failures == 0
+    }
+
+    fn failures_accounted(&self) -> bool {
+        self.open_failures
+            .saturating_add(self.arm_failures)
+            .saturating_add(self.capture_failures)
+            .saturating_add(self.rate_shortfall_failures)
+            == self.failed
+    }
 }
 
 /// What the probe measured about capturing both sensors at once.
@@ -5658,6 +5714,8 @@ pub struct PairSample {
 pub struct ContentionReport {
     pub sequential: PairSample,
     pub concurrent: PairSample,
+    /// A fresh RGB-then-IR pair captured after an all-error concurrent arm.
+    pub trailing_sequential_control: bool,
 }
 
 /// Fraction of the sequential brightness the concurrent path must retain.
@@ -5785,8 +5843,34 @@ fn qualification_outcome(
     if !rounds_complete {
         return AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds);
     }
+    if !report.sequential.failures_accounted() || !report.concurrent.failures_accounted() {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance);
+    }
+    if report.sequential.provenance_missing()
+        || (!report.concurrent_impossible() && report.concurrent.provenance_missing())
+    {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance);
+    }
+    if !report.sequential.provenance_healthy() {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance);
+    }
     if report.concurrent_impossible() {
+        if !report.trailing_sequential_control {
+            return AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance);
+        }
+        if report.concurrent.rate_shortfall_failures == requested_rounds {
+            return AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall);
+        }
         return AttemptOutcome::SequentialRequired(SequentialReason::ConcurrentUnavailable);
+    }
+    if report.concurrent.contract_failures > 0 || report.concurrent.continuity_failures > 0 {
+        return AttemptOutcome::SequentialRequired(SequentialReason::InvalidProvenance);
+    }
+    if report.concurrent.rate_failures > 0 {
+        return AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall);
+    }
+    if report.concurrent.illumination_failures > 0 {
+        return AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance);
     }
     if !report.conclusive() {
         return AttemptOutcome::Inconclusive(InconclusiveReason::DimScene);
@@ -5975,12 +6059,38 @@ pub fn measure_contention_with_progress(
 ) -> irlume_common::Result<ContentionReport> {
     verify_pinned(rgb_dev)?;
     verify_pinned(ir_dev)?;
+    let operation = lease::acquire_camera_operation(
+        &[rgb_dev, ir_dev],
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
+    measure_contention_in_operation(rgb_dev, ir_dev, rounds, progress, &operation, None)
+}
+
+fn measure_contention_in_operation(
+    rgb_dev: &str,
+    ir_dev: &str,
+    rounds: usize,
+    progress: &Progress,
+    operation: &lease::CameraOperationSession,
+    context: Option<&capture_qualification::QualificationContext>,
+) -> irlume_common::Result<ContentionReport> {
     measure_contention_impl(
-        || capture_rgb_denoised_with_progress(rgb_dev, progress),
-        || capture_ir_with_stats_and_progress(ir_dev, progress),
-        held_concurrent_arm(rgb_dev, ir_dev),
+        || {
+            operation
+                .run(|| capture_rgb_denoised_with_progress(rgb_dev, progress))
+                .map_err(|error| Error::Hardware(error.to_string()))?
+        },
+        || {
+            operation
+                .run(|| capture_ir_with_stats_and_progress(ir_dev, progress))
+                .map_err(|error| Error::Hardware(error.to_string()))?
+        },
+        held_concurrent_arm(rgb_dev, ir_dev, operation, context),
         rounds,
         progress,
+        context,
     )
 }
 
@@ -5988,6 +6098,7 @@ pub fn measure_contention_with_progress(
 pub struct CaptureQualificationMeasurement {
     report: ContentionReport,
     attempt: capture_qualification::QualificationAttempt,
+    runtime_key: String,
 }
 
 impl CaptureQualificationMeasurement {
@@ -5999,6 +6110,12 @@ impl CaptureQualificationMeasurement {
     #[must_use]
     pub const fn attempt(&self) -> &capture_qualification::QualificationAttempt {
         &self.attempt
+    }
+
+    /// Generation-aware process-local key for the exact pair this operation measured.
+    #[must_use]
+    pub fn runtime_key(&self) -> &str {
+        &self.runtime_key
     }
 
     #[must_use]
@@ -6024,9 +6141,36 @@ pub fn measure_capture_qualification_with_progress(
     rounds: usize,
     progress: &Progress,
 ) -> irlume_common::Result<CaptureQualificationMeasurement> {
-    let before = collect_qualification_context(rgb_dev, ir_dev)?;
-    let report = measure_contention_with_progress(rgb_dev, ir_dev, rounds, progress)?;
-    let after = collect_qualification_context(rgb_dev, ir_dev)?;
+    verify_pinned(rgb_dev)?;
+    verify_pinned(ir_dev)?;
+    let operation = lease::acquire_camera_operation(
+        &[rgb_dev, ir_dev],
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
+    let before = collect_qualification_context_in_operation(rgb_dev, ir_dev, &operation)?;
+    let report = measure_contention_in_operation(
+        rgb_dev,
+        ir_dev,
+        rounds,
+        progress,
+        &operation,
+        Some(&before),
+    )?;
+    let after = collect_qualification_context_in_operation(rgb_dev, ir_dev, &operation)?;
+    let context_key = before
+        .runtime_key()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let rgb_binding = operation
+        .lease()
+        .frame_binding(rgb_dev, contracts::StreamRole::Rgb)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let ir_binding = operation
+        .lease()
+        .frame_binding(ir_dev, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let runtime_key = runtime_qualification_key(&context_key, &rgb_binding, &ir_binding)?;
     let requested_rounds = rounds.max(1);
     let outcome = qualification_outcome(&report, requested_rounds, before == after);
     let measured_at_unix = std::time::SystemTime::now()
@@ -6037,23 +6181,51 @@ pub fn measure_capture_qualification_with_progress(
         before,
         qualification_arm(&report.sequential, requested_rounds)?,
         qualification_arm(&report.concurrent, requested_rounds)?,
+        report.trailing_sequential_control,
         outcome,
     )
     .map_err(|error| Error::Hardware(format!("capture qualification evidence: {error}")))?;
-    Ok(CaptureQualificationMeasurement { report, attempt })
+    Ok(CaptureQualificationMeasurement {
+        report,
+        attempt,
+        runtime_key,
+    })
 }
 
 fn collect_qualification_context(
     rgb_dev: &str,
     ir_dev: &str,
 ) -> irlume_common::Result<capture_qualification::QualificationContext> {
+    let operation = lease::acquire_camera_operation(
+        &[rgb_dev, ir_dev],
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))?;
+    collect_qualification_context_in_operation(rgb_dev, ir_dev, &operation)
+}
+
+/// Collect the current persistent qualification context without streaming.
+///
+/// This is used to snapshot automatic-writer CAS state before a measurement
+/// begins; the measurement still recollects and validates its own context.
+///
+/// # Errors
+///
+/// Returns an error when the exact pair cannot be leased, opened, or described.
+pub fn current_capture_qualification_context(
+    rgb_dev: &str,
+    ir_dev: &str,
+) -> irlume_common::Result<capture_qualification::QualificationContext> {
+    collect_qualification_context(rgb_dev, ir_dev)
+}
+
+fn collect_qualification_context_in_operation(
+    rgb_dev: &str,
+    ir_dev: &str,
+    operation: &lease::CameraOperationSession,
+) -> irlume_common::Result<capture_qualification::QualificationContext> {
     let rgb = {
-        let operation = lease::acquire_camera_operation(
-            &[rgb_dev],
-            lease::CameraOperationKind::Diagnostics,
-            std::time::Duration::from_secs(2),
-        )
-        .map_err(|error| Error::Hardware(error.to_string()))?;
         operation
             .open_rgb(rgb_dev)
             .map_err(|error| Error::Hardware(error.to_string()))?
@@ -6061,18 +6233,26 @@ fn collect_qualification_context(
             .map_err(|error| Error::Hardware(error.to_string()))?
     };
     let ir = {
-        let operation = lease::acquire_camera_operation(
-            &[ir_dev],
-            lease::CameraOperationKind::Diagnostics,
-            std::time::Duration::from_secs(2),
-        )
-        .map_err(|error| Error::Hardware(error.to_string()))?;
         operation
             .open_ir(ir_dev)
             .map_err(|error| Error::Hardware(error.to_string()))?
             .qualification_facts()
             .map_err(|error| Error::Hardware(error.to_string()))?
     };
+    capture_qualification::QualificationContext::new(rgb.0, ir.0, rgb.1, ir.1)
+        .map_err(|error| Error::Hardware(error.to_string()))
+}
+
+fn qualification_context_from_cameras(
+    rgb_camera: &RgbCamera,
+    ir_camera: &IrCamera,
+) -> irlume_common::Result<capture_qualification::QualificationContext> {
+    let rgb = rgb_camera
+        .qualification_facts()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let ir = ir_camera
+        .qualification_facts()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
     capture_qualification::QualificationContext::new(rgb.0, ir.0, rgb.1, ir.1)
         .map_err(|error| Error::Hardware(error.to_string()))
 }
@@ -6100,6 +6280,117 @@ pub fn stored_capture_qualification(
 pub struct StoredCaptureQualificationState {
     pub resolution: capture_qualification::QualificationResolution,
     pub runtime_key: String,
+    pub last_attempt_outcome: Option<capture_qualification::AttemptOutcome>,
+}
+
+/// Exact live contract a concurrent production pair must satisfy before use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePairContract {
+    context: capture_qualification::QualificationContext,
+    rgb_binding: frame_provenance::FrameBinding,
+    ir_binding: frame_provenance::FrameBinding,
+    runtime_key: String,
+}
+
+impl RuntimePairContract {
+    #[must_use]
+    pub const fn context(&self) -> &capture_qualification::QualificationContext {
+        &self.context
+    }
+
+    #[must_use]
+    pub fn runtime_key(&self) -> &str {
+        &self.runtime_key
+    }
+
+    /// Validate a delivered concurrent pair before either frame reaches recognition.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a different camera generation, negotiated tuple, below-floor
+    /// rate, discontinuity, or IR frame without active-emitter provenance.
+    pub fn validate_pair(
+        &self,
+        rgb: &Frame,
+        ir: &Frame,
+    ) -> std::result::Result<(), RuntimePairViolation> {
+        let rgb_provenance = rgb.provenance();
+        let ir_provenance = ir.provenance();
+        if rgb_provenance.binding() != &self.rgb_binding
+            || ir_provenance.binding() != &self.ir_binding
+        {
+            return Err(RuntimePairViolation::CameraGeneration);
+        }
+        if !self.context.rgb_stream().matches_runtime(rgb_provenance)
+            || !self.context.ir_stream().matches_runtime(ir_provenance)
+        {
+            return Err(RuntimePairViolation::StreamContract);
+        }
+        if !rgb_provenance.rate_evidence().meets_floor()
+            || !ir_provenance.rate_evidence().meets_floor()
+        {
+            return Err(RuntimePairViolation::DeliveredRate);
+        }
+        if !rgb_provenance.is_continuous() || !ir_provenance.is_continuous() {
+            return Err(RuntimePairViolation::Continuity);
+        }
+        if ir_provenance.illumination() != contracts::IlluminationProvenance::ActiveIr {
+            return Err(RuntimePairViolation::ActiveIr);
+        }
+        Ok(())
+    }
+}
+
+/// Why a concurrent pair no longer satisfies its exact live license.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimePairViolation {
+    CameraGeneration,
+    StreamContract,
+    DeliveredRate,
+    Continuity,
+    ActiveIr,
+}
+
+impl std::fmt::Display for RuntimePairViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CameraGeneration => "camera generation changed",
+            Self::StreamContract => "delivered stream tuple differs from the licensed contract",
+            Self::DeliveredRate => "delivered frame rate fell below the licensed floor",
+            Self::Continuity => "frame continuity was lost",
+            Self::ActiveIr => "IR frame lacks active-emitter provenance",
+        })
+    }
+}
+
+/// Bind current negotiated contracts to the exact retained camera generation.
+///
+/// # Errors
+///
+/// Returns an error when context or lease identity cannot be proven for both cameras.
+pub fn runtime_pair_contract_from_cameras(
+    rgb_camera: &RgbCamera,
+    ir_camera: &IrCamera,
+) -> irlume_common::Result<RuntimePairContract> {
+    let context = qualification_context_from_cameras(rgb_camera, ir_camera)?;
+    let context_key = context
+        .runtime_key()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let rgb_binding = rgb_camera
+        .lease
+        .frame_binding(&rgb_camera.device, contracts::StreamRole::Rgb)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let ir_binding = ir_camera
+        .lease
+        .frame_binding(&ir_camera.device, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let runtime_key = runtime_qualification_key(&context_key, &rgb_binding, &ir_binding)?;
+    Ok(RuntimePairContract {
+        context,
+        rgb_binding,
+        ir_binding,
+        runtime_key,
+    })
 }
 
 /// Resolve durable v2 authority and retain its exact process-local context key.
@@ -6117,12 +6408,95 @@ pub fn stored_capture_qualification_state(
     ir_dev: &str,
 ) -> irlume_common::Result<StoredCaptureQualificationState> {
     let context = collect_qualification_context(rgb_dev, ir_dev)?;
+    resolve_capture_qualification_state(context)
+}
+
+/// Resolve v2 authority through a camera operation the caller already owns.
+///
+/// This is the authentication/enrollment path. Acquiring another operation for
+/// the same endpoints would wait against the caller's own lease and turn a
+/// valid concurrent qualification into the sequential error fallback.
+///
+/// # Errors
+///
+/// Returns an error when the operation is stale, does not cover both endpoints,
+/// current fd context cannot be collected, or the store record cannot be trusted.
+pub fn stored_capture_qualification_state_in_operation(
+    rgb_dev: &str,
+    ir_dev: &str,
+    operation: &lease::CameraOperationSession,
+) -> irlume_common::Result<StoredCaptureQualificationState> {
+    let context = collect_qualification_context_in_operation(rgb_dev, ir_dev, operation)?;
+    resolve_capture_qualification_state(context)
+}
+
+/// Resolve v2 authority from the exact open camera pair a caller may stream.
+///
+/// This closes the path-to-fd and negotiate-again gap: both identity and the
+/// driver-accepted contracts come from the same objects retained for session
+/// creation by authentication or enrollment.
+///
+/// # Errors
+///
+/// Returns an error when either open camera cannot provide complete context or
+/// the matching qualification record cannot be trusted.
+pub fn stored_capture_qualification_state_from_cameras(
+    rgb_camera: &RgbCamera,
+    ir_camera: &IrCamera,
+) -> irlume_common::Result<StoredCaptureQualificationState> {
+    let mut state = resolve_capture_qualification_state(qualification_context_from_cameras(
+        rgb_camera, ir_camera,
+    )?)?;
+    let rgb_binding = rgb_camera
+        .lease
+        .frame_binding(&rgb_camera.device, contracts::StreamRole::Rgb)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let ir_binding = ir_camera
+        .lease
+        .frame_binding(&ir_camera.device, contracts::StreamRole::Ir)
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    state.runtime_key = runtime_qualification_key(&state.runtime_key, &rgb_binding, &ir_binding)?;
+    Ok(state)
+}
+
+fn runtime_qualification_key(
+    context_key: &str,
+    rgb: &frame_provenance::FrameBinding,
+    ir: &frame_provenance::FrameBinding,
+) -> irlume_common::Result<String> {
+    if rgb.stream_role() != contracts::StreamRole::Rgb
+        || ir.stream_role() != contracts::StreamRole::Ir
+        || rgb.camera_instance_id() != ir.camera_instance_id()
+        || rgb.generation() != ir.generation()
+    {
+        return Err(Error::Hardware(
+            "RGB and IR qualification bindings do not name one camera incarnation".into(),
+        ));
+    }
+    Ok(irlume_common::sha256_hex(
+        format!(
+            "context:{}:{context_key}|instance:{}:{}|generation:{}",
+            context_key.len(),
+            rgb.camera_instance_id().as_str().len(),
+            rgb.camera_instance_id().as_str(),
+            rgb.generation().get(),
+        )
+        .as_bytes(),
+    ))
+}
+
+fn resolve_capture_qualification_state(
+    context: capture_qualification::QualificationContext,
+) -> irlume_common::Result<StoredCaptureQualificationState> {
     let runtime_key = context
         .runtime_key()
         .map_err(|error| Error::Hardware(error.to_string()))?;
     let record = capture_qualification::QualificationStore::system()
         .load(&context)
         .map_err(|error| Error::Hardware(error.to_string()))?;
+    let last_attempt_outcome = record
+        .as_ref()
+        .map(|record| record.last_attempt().outcome().clone());
     let resolution = record.map_or(
         capture_qualification::QualificationResolution::Unqualified(
             capture_qualification::QualificationMismatch::NoAuthority,
@@ -6132,6 +6506,7 @@ pub fn stored_capture_qualification_state(
     Ok(StoredCaptureQualificationState {
         resolution,
         runtime_key,
+        last_attempt_outcome,
     })
 }
 
@@ -6139,24 +6514,34 @@ fn qualification_arm(
     sample: &PairSample,
     requested_rounds: usize,
 ) -> irlume_common::Result<capture_qualification::ArmEvidence> {
-    let requested_rounds = u32::try_from(requested_rounds)
-        .map_err(|_| Error::Hardware("capture qualification round count overflow".into()))?;
-    let completed_rounds = u32::try_from(sample.rounds)
-        .map_err(|_| Error::Hardware("capture qualification completed count overflow".into()))?;
-    let failed_rounds = u32::try_from(sample.failed)
-        .map_err(|_| Error::Hardware("capture qualification failure count overflow".into()))?;
+    let count = |value: usize, name: &str| {
+        u32::try_from(value)
+            .map_err(|_| Error::Hardware(format!("capture qualification {name} count overflow")))
+    };
+    let requested_rounds = count(requested_rounds, "round")?;
+    let completed_rounds = count(sample.rounds, "completed")?;
+    let failed_rounds = count(sample.failed, "failure")?;
     if !sample.total_ms.is_finite() || sample.total_ms < 0.0 || sample.total_ms > u64::MAX as f32 {
         return Err(Error::Hardware(
             "capture qualification elapsed time is invalid".into(),
         ));
     }
-    let all_returned_frames_healthy = completed_rounds > 0 && failed_rounds == 0;
     capture_qualification::ArmEvidence::new(
         requested_rounds,
         completed_rounds,
         failed_rounds,
-        all_returned_frames_healthy,
-        all_returned_frames_healthy,
+        count(sample.contract_rounds, "contract")?,
+        count(sample.rate_floor_rounds, "rate-floor")?,
+        count(sample.continuous_rounds, "continuous")?,
+        count(sample.active_ir_rounds, "active-IR")?,
+        count(sample.contract_failures, "contract-failure")?,
+        count(sample.rate_failures, "rate-failure")?,
+        count(sample.continuity_failures, "continuity-failure")?,
+        count(sample.illumination_failures, "illumination-failure")?,
+        count(sample.open_failures, "open-failure")?,
+        count(sample.arm_failures, "arm-failure")?,
+        count(sample.capture_failures, "capture-failure")?,
+        count(sample.rate_shortfall_failures, "rate-shortfall-failure")?,
         sample.rgb_mean,
         sample.ir_mean,
         sample.total_ms.round() as u64,
@@ -6181,27 +6566,14 @@ fn qualification_arm(
 fn held_concurrent_arm<'d>(
     rgb_dev: &'d str,
     ir_dev: &'d str,
+    operation: &'d lease::CameraOperationSession,
+    context: Option<&'d capture_qualification::QualificationContext>,
 ) -> impl FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()> + 'd {
     move |rounds, progress, into| {
-        let operation = lease::acquire_camera_operation(
-            &[rgb_dev, ir_dev],
-            lease::CameraOperationKind::Diagnostics,
-            std::time::Duration::from_secs(2),
-        );
-        let held = operation.and_then(|operation| {
-            operation
-                .open_rgb(rgb_dev)
-                .map_err(|error| lease::CameraLeaseError::InvalidEndpoint(error.to_string()))
-                .and_then(|rgb| {
-                    operation
-                        .open_ir(ir_dev)
-                        .map(|ir| (operation, rgb, ir))
-                        .map_err(|error| {
-                            lease::CameraLeaseError::InvalidEndpoint(error.to_string())
-                        })
-                })
-        });
-        let (_operation, rgb_cam, ir_cam) = match held {
+        let held = operation
+            .open_rgb(rgb_dev)
+            .and_then(|rgb| operation.open_ir(ir_dev).map(|ir| (rgb, ir)));
+        let (rgb_cam, ir_cam) = match held {
             Ok(pair) => pair,
             Err(e) => {
                 irlume_common::dlog!(
@@ -6209,9 +6581,19 @@ fn held_concurrent_arm<'d>(
                      recording every concurrent round as failed"
                 );
                 into.failed += rounds;
+                into.open_failures += rounds;
                 return Ok(());
             }
         };
+        if let Some(expected) = context {
+            let actual = qualification_context_from_cameras(&rgb_cam, &ir_cam)?;
+            if &actual != expected {
+                return Err(Error::Hardware(
+                    "capture-mode probe: the held pair negotiated a different qualification context"
+                        .into(),
+                ));
+            }
+        }
         let sessions = rgb_cam
             .session_with_progress(progress)
             .and_then(|rs| ir_cam.session_with_progress(progress).map(|is| (rs, is)));
@@ -6223,33 +6605,42 @@ fn held_concurrent_arm<'d>(
                      recording every concurrent round as failed"
                 );
                 into.failed += rounds;
+                into.arm_failures += rounds;
                 return Ok(());
             }
         };
         // Establish the delivered-rate windows before measuring, draining both
         // streams concurrently so the serial fill cannot starve one and skew
         // the concurrent brightness this probe exists to measure.
-        if let Err(error) = establish_pair_rate(&mut rs, &mut is) {
-            irlume_common::dlog!(
-                "capture-mode probe: could not establish delivered-rate evidence \
-                 ({error}); the per-frame fill will retry"
-            );
-        }
+        establish_pair_rate(&mut rs, &mut is).map_err(|error| {
+            Error::Hardware(format!(
+                "capture-mode probe: concurrent delivered-rate evidence could not be established: {error}"
+            ))
+        })?;
+        let mut continuity = PairContinuityState::default();
         for _ in 0..rounds {
             progress();
             let t0 = std::time::Instant::now();
-            let (rgb, ir) = std::thread::scope(|scope| {
-                let ir_thread = scope.spawn(|| is.capture_with_stats());
-                let rgb = rs.burst(RGB_BURST).and_then(median_frame);
-                let ir = match ir_thread.join() {
-                    Ok(result) => result,
-                    // Re-raise into the composer's catch_unwind: a panic is a
-                    // software defect, never a stored hardware verdict (#263).
-                    Err(payload) => std::panic::resume_unwind(payload),
-                };
-                (rgb, ir)
-            });
-            accumulate(into, &rgb, &ir, t0.elapsed());
+            let (rgb, ir) = operation
+                .run(|| {
+                    std::thread::scope(|scope| {
+                        let ir_thread = scope.spawn(|| {
+                            operation
+                                .run(|| is.capture_with_stats())
+                                .map_err(|error| Error::Hardware(error.to_string()))?
+                        });
+                        let rgb = rs.burst(RGB_BURST).and_then(median_frame);
+                        let ir = match ir_thread.join() {
+                            Ok(result) => result,
+                            // Re-raise into the composer's catch_unwind: a panic is a
+                            // software defect, never a stored hardware verdict (#263).
+                            Err(payload) => std::panic::resume_unwind(payload),
+                        };
+                        (rgb, ir)
+                    })
+                })
+                .map_err(|error| Error::Hardware(error.to_string()))?;
+            accumulate(into, &mut continuity, &rgb, &ir, t0.elapsed(), context);
         }
         Ok(())
     }
@@ -6265,6 +6656,7 @@ fn measure_contention_impl<R, I, H>(
     concurrent_arm: H,
     rounds: usize,
     progress: &Progress,
+    context: Option<&capture_qualification::QualificationContext>,
 ) -> irlume_common::Result<ContentionReport>
 where
     R: Fn() -> irlume_common::Result<Frame>,
@@ -6273,13 +6665,21 @@ where
 {
     let rounds = rounds.max(1);
     let mut report = ContentionReport::default();
+    let mut sequential_continuity = PairContinuityState::default();
 
     for _ in 0..rounds {
         progress();
         let t0 = std::time::Instant::now();
         let rgb = rgb_cap();
         let ir = ir_cap();
-        accumulate(&mut report.sequential, &rgb, &ir, t0.elapsed());
+        accumulate(
+            &mut report.sequential,
+            &mut sequential_continuity,
+            &rgb,
+            &ir,
+            t0.elapsed(),
+            context,
+        );
     }
     // A capture that returns Err is a measured failed round. A capture that
     // PANICS is not a measurement of anything: counting it as a failed round
@@ -6317,7 +6717,8 @@ where
     // all-error case.
     if report.concurrent.rounds == 0 {
         progress();
-        if let Err(e) = rgb_cap() {
+        let control_rgb = rgb_cap();
+        if let Err(e) = &control_rgb {
             return Err(Error::Hardware(format!(
                 "capture-mode probe: all {rounds} concurrent attempts errored, \
                  and the trailing sequential RGB control then failed too ({e}); \
@@ -6325,7 +6726,8 @@ where
                  measured"
             )));
         }
-        if let Err(e) = ir_cap() {
+        let control_ir = ir_cap();
+        if let Err(e) = &control_ir {
             return Err(Error::Hardware(format!(
                 "capture-mode probe: all {rounds} concurrent attempts errored, \
                  and the trailing sequential IR control then failed too ({e}); \
@@ -6333,8 +6735,77 @@ where
                  measured"
             )));
         }
+        if let Some(context) = context {
+            let mut control = PairSample::default();
+            let mut control_continuity = PairContinuityState::default();
+            accumulate(
+                &mut control,
+                &mut control_continuity,
+                &control_rgb,
+                &control_ir,
+                std::time::Duration::ZERO,
+                Some(context),
+            );
+            if !control.provenance_healthy() {
+                return Err(Error::Hardware(
+                    "capture-mode probe: the trailing sequential control lacked exact contract, rate, continuity, or active-IR evidence"
+                        .into(),
+                ));
+            }
+        }
+        report.trailing_sequential_control = true;
     }
     Ok(report)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContinuityCursor {
+    stream_epoch: u64,
+    cumulative_drops: u64,
+    latest_timestamp_us: i64,
+}
+
+impl ContinuityCursor {
+    fn from_provenance(provenance: &frame_provenance::RuntimeFrameProvenance) -> Self {
+        let rate = provenance.rate_evidence();
+        Self {
+            stream_epoch: rate.stream_epoch(),
+            cumulative_drops: rate.cumulative_drops(),
+            latest_timestamp_us: rate.latest_timestamp_us(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PairContinuityState {
+    rgb: Option<ContinuityCursor>,
+    ir: Option<ContinuityCursor>,
+}
+
+impl PairContinuityState {
+    fn observe(
+        &mut self,
+        rgb: &frame_provenance::RuntimeFrameProvenance,
+        ir: &frame_provenance::RuntimeFrameProvenance,
+    ) -> bool {
+        let rgb_current = ContinuityCursor::from_provenance(rgb);
+        let ir_current = ContinuityCursor::from_provenance(ir);
+        let continuous = rgb.is_continuous()
+            && ir.is_continuous()
+            && continuity_advances(self.rgb, rgb_current)
+            && continuity_advances(self.ir, ir_current);
+        self.rgb = Some(rgb_current);
+        self.ir = Some(ir_current);
+        continuous
+    }
+}
+
+fn continuity_advances(previous: Option<ContinuityCursor>, current: ContinuityCursor) -> bool {
+    previous.is_none_or(|previous| {
+        current.stream_epoch == previous.stream_epoch
+            && current.cumulative_drops == previous.cumulative_drops
+            && current.latest_timestamp_us > previous.latest_timestamp_us
+    })
 }
 
 /// Fold one probe round into a running mean.
@@ -6352,12 +6823,21 @@ where
 /// frame; both are lit-phase means, which is the property this relies on.
 fn accumulate(
     into: &mut PairSample,
+    continuity: &mut PairContinuityState,
     rgb: &irlume_common::Result<Frame>,
     ir: &irlume_common::Result<(Frame, IrCaptureStats)>,
     elapsed: std::time::Duration,
+    context: Option<&capture_qualification::QualificationContext>,
 ) {
-    let (Ok(rgb), Ok((_, ir_stats))) = (rgb, ir) else {
+    let (Ok(rgb), Ok((ir, ir_stats))) = (rgb, ir) else {
         into.failed += 1;
+        if matches!(rgb, Err(irlume_common::Error::DeliveredRate(_)))
+            || matches!(ir, Err(irlume_common::Error::DeliveredRate(_)))
+        {
+            into.rate_shortfall_failures += 1;
+        } else {
+            into.capture_failures += 1;
+        }
         return;
     };
     let n = into.rounds as f32;
@@ -6366,6 +6846,34 @@ fn accumulate(
     into.ir_mean = mix(into.ir_mean, ir_stats.lit_mean);
     into.total_ms = mix(into.total_ms, elapsed.as_millis() as f32);
     into.rounds += 1;
+
+    let Some(context) = context else {
+        return;
+    };
+    let rgb_provenance = rgb.provenance();
+    let ir_provenance = ir.provenance();
+    if context.rgb_stream().matches_runtime(rgb_provenance)
+        && context.ir_stream().matches_runtime(ir_provenance)
+    {
+        into.contract_rounds += 1;
+    } else {
+        into.contract_failures += 1;
+    }
+    if rgb_provenance.rate_evidence().meets_floor() && ir_provenance.rate_evidence().meets_floor() {
+        into.rate_floor_rounds += 1;
+    } else {
+        into.rate_failures += 1;
+    }
+    if continuity.observe(rgb_provenance, ir_provenance) {
+        into.continuous_rounds += 1;
+    } else {
+        into.continuity_failures += 1;
+    }
+    if ir_provenance.illumination() == contracts::IlluminationProvenance::ActiveIr {
+        into.active_ir_rounds += 1;
+    } else {
+        into.illumination_failures += 1;
+    }
 }
 
 /// Mean of every byte in a frame.
@@ -9207,6 +9715,307 @@ mod tests {
         frame_at(data, std::time::Instant::now())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn runtime_gate_frame(
+        role: contracts::StreamRole,
+        spectrum: Spectrum,
+        illumination: contracts::IlluminationProvenance,
+        instance: char,
+        generation: u64,
+        fourcc: [u8; 4],
+        meets_floor: bool,
+        discontinuous: bool,
+    ) -> Frame {
+        let mut sequence_tracker = frame_provenance::SequenceTracker::new();
+        let mut timestamp_tracker = frame_provenance::TimestampTracker::new();
+        if discontinuous {
+            sequence_tracker.observe(1).unwrap();
+            timestamp_tracker
+                .observe(
+                    1_000,
+                    frame_provenance::TimestampClock::Monotonic,
+                    frame_provenance::TimestampSource::EndOfFrame,
+                )
+                .unwrap();
+        }
+        let raw = if discontinuous { 3 } else { 1 };
+        let micros = i64::from(raw) * 1_000;
+        let data = vec![80_u8; 4];
+        let metadata = v4l::buffer::Metadata {
+            bytesused: data.len() as u32,
+            sequence: raw,
+            timestamp: v4l::timestamp::Timestamp::new(0, micros),
+            flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            ..Default::default()
+        };
+        let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, data.len()).unwrap();
+        let sequence = sequence_tracker.observe(raw).unwrap();
+        let timestamp = timestamp_tracker
+            .observe(
+                micros,
+                frame_provenance::TimestampClock::Monotonic,
+                frame_provenance::TimestampSource::EndOfFrame,
+            )
+            .unwrap();
+        let binding = frame_provenance::FrameBinding::new(
+            contracts::CameraInstanceId::new(instance.to_string().repeat(32)).unwrap(),
+            contracts::CameraGeneration::new(generation).unwrap(),
+            role,
+        );
+        let mut stable = v4l::Format::new(4, 1, v4l::FourCC::new(&fourcc));
+        stable.stride = 4;
+        stable.size = 4;
+        let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(&stable);
+        let provenance = checked_single_provenance(
+            binding,
+            format,
+            facts,
+            sequence,
+            timestamp,
+            std::time::Instant::now(),
+            illumination,
+            frame_provenance::DeliveredRateEvidence::new(
+                role,
+                (15, 2),
+                (15, 2),
+                (15, 2),
+                98,
+                30,
+                2_000_000,
+                if meets_floor { (15, 2) } else { (5, 1) },
+                meets_floor,
+                &sequence,
+                &timestamp,
+            ),
+        )
+        .unwrap();
+        Frame::from_provenance(4, 1, spectrum, data, provenance).unwrap()
+    }
+
+    fn runtime_gate_stream(
+        role: capture_qualification::QualifiedStreamRole,
+        fourcc: &str,
+    ) -> capture_qualification::StreamContract {
+        use capture_qualification::{AcceptedStream, ExactInterval, ExactRate, RequestedStream};
+        capture_qualification::StreamContract::new(
+            role,
+            RequestedStream::new(4, 1, fourcc.into(), ExactInterval::new(2, 15).unwrap()).unwrap(),
+            AcceptedStream::new(
+                4,
+                1,
+                fourcc.into(),
+                4,
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ExactInterval::new(2, 15).unwrap(),
+            )
+            .unwrap(),
+            ExactRate::new(15, 2).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn runtime_gate_endpoint(
+        role: capture_qualification::QualifiedStreamRole,
+        interface: u8,
+    ) -> capture_qualification::CameraEndpoint {
+        capture_qualification::CameraEndpoint::new(
+            "a".repeat(64),
+            0x1234,
+            0x5678,
+            Some("runtime-gate".into()),
+            interface,
+            format!("/devices/usb/1-1/{interface}"),
+            role,
+            capture_qualification::ConnectionContext::new(
+                "/devices/controller".into(),
+                5_000,
+                "uvcvideo".into(),
+                "v4l2-uvc".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn runtime_gate_contract() -> RuntimePairContract {
+        use capture_qualification::QualifiedStreamRole;
+        let context = capture_qualification::QualificationContext::new(
+            runtime_gate_endpoint(QualifiedStreamRole::Rgb, 0),
+            runtime_gate_endpoint(QualifiedStreamRole::Ir, 1),
+            runtime_gate_stream(QualifiedStreamRole::Rgb, "RGB3"),
+            runtime_gate_stream(QualifiedStreamRole::Ir, "GREY"),
+        )
+        .unwrap();
+        let instance = contracts::CameraInstanceId::new("a".repeat(32)).unwrap();
+        RuntimePairContract {
+            context,
+            rgb_binding: frame_provenance::FrameBinding::new(
+                instance.clone(),
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Rgb,
+            ),
+            ir_binding: frame_provenance::FrameBinding::new(
+                instance,
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Ir,
+            ),
+            runtime_key: "test-runtime-key".into(),
+        }
+    }
+
+    #[test]
+    fn runtime_pair_gate_accepts_only_the_exact_live_provenance_contract() {
+        use contracts::{IlluminationProvenance, StreamRole};
+        let contract = runtime_gate_contract();
+        let rgb = || {
+            runtime_gate_frame(
+                StreamRole::Rgb,
+                Spectrum::Rgb,
+                IlluminationProvenance::Unknown,
+                'a',
+                1,
+                *b"RGB3",
+                true,
+                false,
+            )
+        };
+        let ir = |instance, generation, fourcc, floor, discontinuous, illumination| {
+            runtime_gate_frame(
+                StreamRole::Ir,
+                Spectrum::Ir,
+                illumination,
+                instance,
+                generation,
+                fourcc,
+                floor,
+                discontinuous,
+            )
+        };
+        assert_eq!(
+            contract.validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    1,
+                    *b"GREY",
+                    true,
+                    false,
+                    IlluminationProvenance::ActiveIr
+                ),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            contract.validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    2,
+                    *b"GREY",
+                    true,
+                    false,
+                    IlluminationProvenance::ActiveIr
+                ),
+            ),
+            Err(RuntimePairViolation::CameraGeneration)
+        );
+        assert_eq!(
+            contract.validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    1,
+                    *b"Y800",
+                    true,
+                    false,
+                    IlluminationProvenance::ActiveIr
+                ),
+            ),
+            Err(RuntimePairViolation::StreamContract)
+        );
+        assert_eq!(
+            contract.validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    1,
+                    *b"GREY",
+                    false,
+                    false,
+                    IlluminationProvenance::ActiveIr
+                ),
+            ),
+            Err(RuntimePairViolation::DeliveredRate)
+        );
+        assert_eq!(
+            contract.validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    1,
+                    *b"GREY",
+                    true,
+                    true,
+                    IlluminationProvenance::ActiveIr
+                ),
+            ),
+            Err(RuntimePairViolation::Continuity)
+        );
+        assert_eq!(
+            contract.validate_pair(
+                &rgb(),
+                &ir(
+                    'a',
+                    1,
+                    *b"GREY",
+                    true,
+                    false,
+                    IlluminationProvenance::Unknown
+                ),
+            ),
+            Err(RuntimePairViolation::ActiveIr)
+        );
+    }
+
+    #[test]
+    fn qualification_continuity_detects_between_round_drops_and_recovery() {
+        let baseline = ContinuityCursor {
+            stream_epoch: 7,
+            cumulative_drops: 11,
+            latest_timestamp_us: 1_000,
+        };
+        assert!(continuity_advances(None, baseline));
+        assert!(continuity_advances(
+            Some(baseline),
+            ContinuityCursor {
+                latest_timestamp_us: 2_000,
+                ..baseline
+            }
+        ));
+        assert!(!continuity_advances(
+            Some(baseline),
+            ContinuityCursor {
+                cumulative_drops: 12,
+                latest_timestamp_us: 2_000,
+                ..baseline
+            }
+        ));
+        assert!(!continuity_advances(
+            Some(baseline),
+            ContinuityCursor {
+                stream_epoch: 8,
+                latest_timestamp_us: 2_000,
+                ..baseline
+            }
+        ));
+        assert!(!continuity_advances(Some(baseline), baseline));
+    }
+
     // The decision the probe exists to make, checked against the two modules we
     // actually measured on 2026-07-25 rather than invented numbers.
     #[test]
@@ -9218,6 +10027,7 @@ mod tests {
                 total_ms: 3595.0,
                 rounds: 20,
                 failed: 0,
+                ..Default::default()
             },
             concurrent: PairSample {
                 rgb_mean: con_rgb,
@@ -9225,7 +10035,9 @@ mod tests {
                 total_ms: 2194.0,
                 rounds: 20,
                 failed: 0,
+                ..Default::default()
             },
+            trailing_sequential_control: false,
         };
 
         // NexiGo HelloCam N930W: RGB collapses when its own IR sibling streams.
@@ -9290,10 +10102,23 @@ mod tests {
                 total_ms: 1_000.0,
                 rounds,
                 failed,
+                contract_rounds: rounds,
+                rate_floor_rounds: rounds,
+                continuous_rounds: rounds,
+                active_ir_rounds: rounds,
+                contract_failures: 0,
+                rate_failures: 0,
+                continuity_failures: 0,
+                illumination_failures: 0,
+                open_failures: 0,
+                arm_failures: 0,
+                capture_failures: failed,
+                rate_shortfall_failures: 0,
             };
             ContentionReport {
                 sequential: sample(seq),
                 concurrent: sample(concurrent),
+                trailing_sequential_control: concurrent.0 == 0 && concurrent.1 > 0,
             }
         };
 
@@ -9320,6 +10145,83 @@ mod tests {
         assert_eq!(
             qualification_outcome(&unavailable, 6, true),
             AttemptOutcome::SequentialRequired(SequentialReason::ConcurrentUnavailable)
+        );
+        let rate_shortfall = ContentionReport {
+            concurrent: PairSample {
+                capture_failures: 0,
+                rate_shortfall_failures: 6,
+                ..unavailable.concurrent
+            },
+            ..unavailable
+        };
+        assert_eq!(
+            qualification_outcome(&rate_shortfall, 6, true),
+            AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall)
+        );
+        let no_control = ContentionReport {
+            trailing_sequential_control: false,
+            ..unavailable
+        };
+        assert_eq!(
+            qualification_outcome(&no_control, 6, true),
+            AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance)
+        );
+
+        for missing in [
+            PairSample {
+                contract_rounds: 5,
+                ..healthy.concurrent
+            },
+            PairSample {
+                rate_floor_rounds: 5,
+                ..healthy.concurrent
+            },
+            PairSample {
+                continuous_rounds: 5,
+                ..healthy.concurrent
+            },
+            PairSample {
+                active_ir_rounds: 5,
+                ..healthy.concurrent
+            },
+        ] {
+            let report = ContentionReport {
+                sequential: healthy.sequential,
+                concurrent: missing,
+                trailing_sequential_control: false,
+            };
+            assert_eq!(
+                qualification_outcome(&report, 6, true),
+                AttemptOutcome::Inconclusive(InconclusiveReason::MissingProvenance)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_qualification_key_changes_with_camera_incarnation() {
+        use contracts::{CameraGeneration, CameraInstanceId, StreamRole};
+        let binding = |instance: char, generation: u64, role| {
+            frame_provenance::FrameBinding::new(
+                CameraInstanceId::new(instance.to_string().repeat(32)).unwrap(),
+                CameraGeneration::new(generation).unwrap(),
+                role,
+            )
+        };
+        let rgb = binding('a', 1, StreamRole::Rgb);
+        let ir = binding('a', 1, StreamRole::Ir);
+        let replugged_rgb = binding('b', 1, StreamRole::Rgb);
+        let replugged_ir = binding('b', 1, StreamRole::Ir);
+        let regenerated_rgb = binding('a', 2, StreamRole::Rgb);
+        let regenerated_ir = binding('a', 2, StreamRole::Ir);
+
+        let key = runtime_qualification_key("context", &rgb, &ir).unwrap();
+        assert_ne!(
+            key,
+            runtime_qualification_key("context", &replugged_rgb, &replugged_ir).unwrap()
+        );
+        assert_ne!(
+            key,
+            runtime_qualification_key("context", &regenerated_rgb, &regenerated_ir).unwrap()
         );
     }
 
@@ -9428,12 +10330,14 @@ mod tests {
                 total_ms: 2200.0,
                 rounds: 6,
                 failed: 0,
+                ..Default::default()
             },
             concurrent: PairSample {
                 rounds: 0,
                 failed: 6,
                 ..Default::default()
             },
+            trailing_sequential_control: true,
         };
         assert!(brio.concurrent_impossible());
         assert_eq!(brio.recommended_mode(), CaptureMode::Sequential);
@@ -9447,6 +10351,7 @@ mod tests {
         let unattempted = ContentionReport {
             sequential: brio.sequential,
             concurrent: PairSample::default(),
+            trailing_sequential_control: false,
         };
         assert!(!unattempted.concurrent_impossible());
     }
@@ -9483,10 +10388,77 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 let r = rgb();
                 let i = ir();
-                accumulate(into, &r, &i, t0.elapsed());
+                accumulate(
+                    into,
+                    &mut PairContinuityState::default(),
+                    &r,
+                    &i,
+                    t0.elapsed(),
+                    None,
+                );
             }
             Ok(())
         }
+    }
+
+    fn below_floor_error(role: &str) -> Error {
+        Error::DeliveredRate(Box::new(irlume_common::CameraStreamRateEvidence {
+            role: role.into(),
+            requested_num: 1,
+            requested_den: 30,
+            accepted_num: 1,
+            accepted_den: 30,
+            floor_num: 15,
+            floor_den: 1,
+            tolerance_percent: 98,
+            window_count: 30,
+            window_span_us: 3_000_000,
+            delivered_num: 10,
+            delivered_den: 1,
+            meets_floor: false,
+            sequence_gap: 0,
+            cumulative_drops: 0,
+            clock: "monotonic".into(),
+            source: "end_of_frame".into(),
+            latest_timestamp_us: 1,
+            stream_epoch: 0,
+        }))
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn typed_concurrent_rate_failures_survive_the_probe_and_trailing_control() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rgb_calls = AtomicUsize::new(0);
+        let rgb = || {
+            let call = rgb_calls.fetch_add(1, Ordering::SeqCst);
+            if (2..4).contains(&call) {
+                Err(below_floor_error("rgb"))
+            } else {
+                Ok(frame(&[120; 4]))
+            }
+        };
+        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let mut report =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("typed shortfall is a measurement, not a probe abort");
+        assert_eq!(report.concurrent.failed, 2);
+        assert_eq!(report.concurrent.rate_shortfall_failures, 2);
+        assert_eq!(report.concurrent.capture_failures, 0);
+        assert!(report.trailing_sequential_control);
+        // The injected arm deliberately has no negotiated context. Mark the
+        // otherwise-healthy sequential frames as context-validated so this
+        // outcome assertion isolates the typed failed-round evidence path.
+        report.sequential.contract_rounds = 2;
+        report.sequential.rate_floor_rounds = 2;
+        report.sequential.continuous_rounds = 2;
+        report.sequential.active_ir_rounds = 2;
+        assert_eq!(
+            qualification_outcome(&report, 2, true),
+            capture_qualification::AttemptOutcome::SequentialRequired(
+                capture_qualification::SequentialReason::DeliveredRateShortfall
+            )
+        );
     }
 
     #[test]
@@ -9506,7 +10478,8 @@ mod tests {
         };
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // keep the test log clean
-        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress());
+        let got =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None);
         std::panic::set_hook(prev);
         let err = got.expect_err("a panic must abort the probe, never report");
         assert!(err.to_string().contains("panicked"), "{err}");
@@ -9532,8 +10505,9 @@ mod tests {
             }
         };
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
-        let report = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress())
-            .expect("an answering camera with an impossible concurrent arm is a verdict");
+        let report =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("an answering camera with an impossible concurrent arm is a verdict");
         assert!(report.concurrent_impossible());
         assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
         assert_eq!(
@@ -9555,9 +10529,10 @@ mod tests {
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
         let arming_fails = |rounds: usize, _p: &Progress, into: &mut PairSample| {
             into.failed += rounds;
+            into.arm_failures += rounds;
             Ok(())
         };
-        let report = measure_contention_impl(&rgb, &ir, arming_fails, 2, &no_progress())
+        let report = measure_contention_impl(&rgb, &ir, arming_fails, 2, &no_progress(), None)
             .expect("an unarmable held pair with an answering camera is a verdict");
         assert!(report.concurrent_impossible());
         assert_eq!(report.recommended_mode(), CaptureMode::Sequential);
@@ -9580,7 +10555,8 @@ mod tests {
             }
         };
         let ir = || Ok((frame(&[10; 4]), stats(50.0)));
-        let got = measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress());
+        let got =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None);
         let err = got.expect_err("a dead camera is a failed probe");
         assert!(err.to_string().contains("trailing"), "{err}");
     }

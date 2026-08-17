@@ -99,6 +99,7 @@ pub fn classify(req: &Request) -> Class {
         | CaptureEarMedian { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
+        | CaptureModeStatus
         | SelfTest { .. }
         | CameraDiagnostics
         // Enumeration OPENS every node, so it belongs to the camera class

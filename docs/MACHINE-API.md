@@ -216,7 +216,16 @@ reused for a different meaning. The registry as of this contract:
 | `boot-mode` | the boot chain, which decides which PCR policy tier applies |
 | `emitter-undo-pending` | camera controls an interrupted `ir-setup` left changed and has not put back. `unknown` when the root-only record store cannot be read, which is any run that is not root |
 | `emitter-stream-pending` | per-stream emitter records not yet resolved. An `applied` record is restored by a later authentication; a record whose write may never have reached the camera is never claimed, and is replaced by the next capture once the control no longer holds its bytes (a full power-off does that); a record that will not parse blocks until an administrator removes the named file. Either kind also refuses new stream writes, so this explains an emitter that stays dark. `unknown` when the root-only store cannot be read, which is any run that is not root |
-| `capture-mode` | which capture strategy the active camera pair uses (concurrent or sequential) and whether it was measured for that pair, switched automatically after repeated concurrent-capture RGB losses during enrolment, forced by `IRLUME_SEQUENTIAL_CAPTURE`, or is the unmeasured sequential default. `info` in every measured, auto-switched, forced, default, or no-pinned-pair case, since a capture mode is a strategy and not a fault; `unknown` when the root-only `cameras.conf` cannot be read, which is any run that is not root AND any run where the file exists but is unreadable. An auto-switched verdict is reported as sequential with an origin stamp and age, never as a measurement, and `camera-tune` is named as the way to replace it. The override is read from the reporting process, so a value set only in the `irlumed` unit environment decides captures and is not visible here; and with no pinned pair the stored verdict cannot be looked up, so `info` there does not mean no mode is in force |
+| `capture-mode` | the daemon-owned v2 resolution for its exact open RGB+IR pair. Reports qualified concurrent, measured sequential, the safe unmeasured/changed-context sequential default, a daemon environment override, or generation-scoped runtime degradation. `info` for a resolved strategy and `unknown` only when the daemon cannot collect exact status. Neither `doctor` nor `camera-mode` treats legacy `capture_mode.*` values in `cameras.conf` as concurrent authority |
+
+`CaptureModeStatus` includes `qualification_state` (`qualified_concurrent`,
+`measured_sequential`, `unqualified_no_authority`,
+`unqualified_context_changed`, `inconclusive`, `unreadable`, or `no_ir_pair`), an optional
+`qualification_reason`, the complete serialized v2 `qualification_context`
+(endpoint identity, requested and driver-accepted tuples, minimum rates, and
+USB connection facts), and an optional `runtime_degradation` cause. `ir` is
+nullable for an RGB-only host. `runtime_context` is the process-local exact
+context+camera-generation key; it is diagnostic, not durable authority.
 | `signed-pcr-policy` | the systemd signed-PCR (Tier 1) policy for sealing |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index |
 | `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths |

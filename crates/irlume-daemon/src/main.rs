@@ -2391,11 +2391,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: user.as_deref(),
             enrollment: Reads,
         },
-        Ping | Health | Identify | ListCameras | CameraDiagnostics => RequestPosture {
-            privilege: AnyPeer,
-            user: None,
-            enrollment: Reads,
-        },
+        Ping | Health | Identify | ListCameras | CameraDiagnostics | CaptureModeStatus => {
+            RequestPosture {
+                privilege: AnyPeer,
+                user: None,
+                enrollment: Reads,
+            }
+        }
     }
 }
 
@@ -2829,6 +2831,24 @@ fn run_capture_mode_probe(
     rounds: usize,
     policy: ProbeStore,
 ) -> Result<String, String> {
+    let store = irlume_auth::QualificationStore::system();
+    let automatic_baseline = if policy == ProbeStore::AutomaticIfAbsent {
+        let context = irlume_auth::current_capture_qualification_context(rgb_dev, ir_dev)
+            .map_err(|error| error.to_string())?;
+        if store
+            .load(&context)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(
+                "a capture qualification already exists; the automatic probe cannot replace it"
+                    .into(),
+            );
+        }
+        Some(context)
+    } else {
+        None
+    };
     // Reports between captures so a long but healthy tune is not read as a
     // wedged driver by the watchdog (#141), and per silent warm-up window
     // inside each capture (#336).
@@ -2840,32 +2860,30 @@ fn run_capture_mode_probe(
     let report = measurement.report();
     let mode = report.recommended_mode();
     let attempt = measurement.attempt().clone();
+    let measured_runtime_key = measurement.runtime_key().to_owned();
     let conclusive = !matches!(
         attempt.outcome(),
         irlume_auth::AttemptOutcome::Inconclusive(_)
     ) && probe_verdict_storable(policy, report, rounds);
 
-    let store = irlume_auth::QualificationStore::system();
-    let previous = store
-        .load(attempt.context())
-        .map_err(|error| error.to_string())?;
-    if policy == ProbeStore::AutomaticIfAbsent
-        && previous.as_ref().is_some_and(|record| {
-            !matches!(
-                record.resolve(attempt.context()),
-                irlume_auth::QualificationResolution::Unqualified(_)
-            )
-        })
+    if automatic_baseline
+        .as_ref()
+        .is_some_and(|context| context != attempt.context())
     {
         return Ok(
-            "a context-bound capture qualification was stored while the automatic probe ran; \
-             keeping the newer authority and discarding this measurement"
+            "the camera context changed after the automatic probe snapshot; discarding this measurement"
                 .into(),
         );
     }
-    let expected_revision = previous
-        .as_ref()
-        .map(irlume_auth::CaptureQualificationRecord::revision);
+    let expected_revision = if policy == ProbeStore::AutomaticIfAbsent {
+        None
+    } else {
+        store
+            .load(attempt.context())
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            .map(irlume_auth::CaptureQualificationRecord::revision)
+    };
     match store.save_attempt(attempt, expected_revision) {
         Ok(_) => {}
         Err(irlume_auth::QualificationStoreError::StaleRevision { .. })
@@ -2899,6 +2917,9 @@ fn run_capture_mode_probe(
              default). Run `sudo irlume camera-tune` with the room lit to store a \
              measured verdict"
         ));
+    }
+    if policy == ProbeStore::ExplicitReplace {
+        irlume_auth::reset_runtime_capture_health(&measured_runtime_key);
     }
     // An arm that never streamed has no retention to report; percentages
     // from its empty samples would read as dimming when the finding is
@@ -3763,6 +3784,56 @@ fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Resp
                 Err(error) => Response::Error(error.to_string()),
             }
         }
+        Request::CaptureModeStatus => {
+            let rgb_dev = engine.rgb_device().to_string();
+            let ir_dev = engine.ir_device().to_string();
+            if !engine.ir_available() {
+                return Response::CaptureModeStatus {
+                    mode: irlume_auth::CaptureMode::Sequential.as_str().to_owned(),
+                    source: "no-ir-pair".into(),
+                    rgb: rgb_dev,
+                    ir: None,
+                    runtime_context: None,
+                    qualification_state: "no_ir_pair".into(),
+                    qualification_reason: Some(
+                        "no IR endpoint is available; RGB-only capture applies".into(),
+                    ),
+                    qualification_context: None,
+                    runtime_degradation: None,
+                };
+            }
+            let status = (|| {
+                let operation = irlume_auth::lease::acquire_camera_operation(
+                    &[rgb_dev.as_str(), ir_dev.as_str()],
+                    irlume_auth::lease::CameraOperationKind::Diagnostics,
+                    std::time::Duration::from_secs(2),
+                )
+                .map_err(|error| error.to_string())?;
+                let rgb = operation
+                    .open_rgb(&rgb_dev)
+                    .map_err(|error| error.to_string())?;
+                let ir = operation
+                    .open_ir(&ir_dev)
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(irlume_auth::capture_mode_status_from_cameras(&rgb, &ir))
+            })();
+            match status {
+                Ok(status) => Response::CaptureModeStatus {
+                    mode: status.mode.as_str().to_owned(),
+                    source: status.source.to_owned(),
+                    rgb: rgb_dev,
+                    ir: Some(ir_dev),
+                    runtime_context: status.runtime_context,
+                    qualification_state: status.qualification_state,
+                    qualification_reason: status.qualification_reason,
+                    qualification_context: status.qualification_context,
+                    runtime_degradation: status.runtime_degradation,
+                },
+                Err(error) => Response::Error(format!(
+                    "capture mode status unavailable; safe sequential default applies: {error}"
+                )),
+            }
+        }
         Request::ListCameras => Response::Cameras(
             irlume_auth::list_pairs()
                 .into_iter()
@@ -4324,6 +4395,7 @@ mod tests {
         seq: (usize, usize, f32, f32),
         conc: (usize, usize, f32, f32),
     ) -> irlume_auth::ContentionReport {
+        let trailing_sequential_control = conc.0 == 0 && conc.1 > 0;
         let sample = |(rounds, failed, rgb_mean, ir_mean): (usize, usize, f32, f32)| {
             irlume_auth::PairSample {
                 rgb_mean,
@@ -4331,11 +4403,13 @@ mod tests {
                 total_ms: 100.0,
                 rounds,
                 failed,
+                ..Default::default()
             }
         };
         irlume_auth::ContentionReport {
             sequential: sample(seq),
             concurrent: sample(conc),
+            trailing_sequential_control,
         }
     }
 
@@ -5406,6 +5480,7 @@ mod tests {
         // The writing form. The dry run is an alternative shape, below.
         SetupIrEmitter => Request::SetupIrEmitter { dry_run: false },
         TuneCaptureMode => Request::TuneCaptureMode { rounds: None },
+        CaptureModeStatus => Request::CaptureModeStatus,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
         },

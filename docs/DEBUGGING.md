@@ -57,9 +57,9 @@ just above a floor is visible here long before it becomes a false reject. The
 dim/dark paths add `match(fusion)`, `match(ir-fallback)`,
 `liveness(ir-only/dark)`, and `match(ir/dark)` lines with the same shape. Most
 wall-clock time goes to camera I/O; the `assess:` lines show it, which helps
-when chasing a slow login. When the measured capture mode is concurrent
-(`irlume camera-tune`, stored in cameras.conf; an unmeasured pair captures one
-stream at a time), the RGB and IR captures run overlapped on the IR path, so
+when chasing a slow login. When the exact-context v2 qualification is concurrent
+(`irlume camera-tune`; an unmeasured or changed pair captures one stream at a
+time), the RGB and IR captures run overlapped on the IR path, so
 those two times overlap rather than sum; setting
 `IRLUME_SEQUENTIAL_CAPTURE=1` on the daemon forces back-to-back order
 when isolating a camera problem, whatever the stored mode says.
@@ -255,8 +255,22 @@ Do not infer camera firmware or the USB bus from the userspace errno alone;
 the kernel log line decides. When the kernel names bandwidth, a lower
 resolution, a lower frame rate, MJPEG, moving a camera off a shared hub, or
 the uvcvideo module parameter `quirks=0x80` can change the outcome; when
-`sudo irlume camera-tune` measures a pair that cannot sustain both streams,
-it stores one-at-a-time capture for it whatever the mechanism.
+`sudo irlume camera-tune` measures the daemon-owned pair under one camera
+operation. It records the driver-accepted contracts, connection, delivered
+rates, continuity, active-IR provenance, failures, trailing sequential control,
+and signal retention. `irlume camera-mode` and `irlume doctor` query that same
+daemon resolver; they do not infer active policy from `cameras.conf`.
+`camera-mode` also prints the v2 resolution reason, exact requested/accepted
+stream tuples, USB connection context, and any generation-scoped runtime
+breaker cause. `unqualified_context_changed` means the stored measurement no
+longer licenses the live tuple or connection; `unreadable` means the store
+could not be trusted. Both fail closed to RGB-then-IR.
+
+If a qualified concurrent pair later fails, irlume discards both sides, drops
+both streams and camera handles, retries fresh RGB then IR once, and marks only
+that process-local camera incarnation sequential. A successful explicit tune
+clears the process-local breaker. When a controlled tune proves a pair cannot
+sustain both streams, it stores one-at-a-time capture whatever the mechanism.
 
 Reproducing the published accuracy/anti-spoof claims end-to-end is covered in
 [VERIFY.md](VERIFY.md).

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: u32 = 2;
 /// Evidence policy understood by this build. Bump when qualification rules change.
 pub const POLICY_VERSION: u32 = 1;
+/// Version of the measurement engine that produced persisted arm evidence.
+pub const PRODUCER_ENGINE_VERSION: u32 = 1;
 /// Records are machine-generated summaries, not an unbounded document store.
 pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 
@@ -546,6 +548,39 @@ impl StreamContract {
     pub const fn minimum_rate(&self) -> ExactRate {
         self.minimum_rate
     }
+
+    /// Verify that one delivered frame carries this exact accepted format and
+    /// the same requested/accepted/floor rate tuple used by qualification.
+    pub(crate) fn matches_runtime(
+        &self,
+        provenance: &crate::frame_provenance::RuntimeFrameProvenance,
+    ) -> bool {
+        use crate::contracts::StreamRole;
+
+        let role = match self.role {
+            QualifiedStreamRole::Rgb => StreamRole::Rgb,
+            QualifiedStreamRole::Ir => StreamRole::Ir,
+        };
+        let format = provenance.format();
+        let rate = provenance.rate_evidence();
+        let requested_interval = self.requested.interval.parts();
+        let accepted_interval = self.accepted.interval.parts();
+        provenance.stream_role() == role
+            && rate.role() == role
+            && self.accepted.fourcc.as_bytes() == format.fourcc()
+            && self.accepted.width == format.width()
+            && self.accepted.height == format.height()
+            && self.accepted.stride == format.stride()
+            && self.accepted.image_size == format.image_size()
+            && self.accepted.field_order == format.field_order()
+            && self.accepted.colorspace == format.colorspace()
+            && self.accepted.quantization == format.quantization()
+            && self.accepted.transfer == format.transfer()
+            && self.accepted.flags == format.flags()
+            && rate.requested() == (requested_interval.1, requested_interval.0)
+            && rate.accepted() == (accepted_interval.1, accepted_interval.0)
+            && rate.floor() == self.minimum_rate.parts()
+    }
 }
 
 /// All persistent facts that must match before concurrent capture is selected.
@@ -633,8 +668,20 @@ pub struct ArmEvidence {
     requested_rounds: u32,
     completed_rounds: u32,
     failed_rounds: u32,
-    meets_rate_floor: bool,
-    continuous: bool,
+    contract_rounds: u32,
+    rate_floor_rounds: u32,
+    continuous_rounds: u32,
+    active_ir_rounds: u32,
+    contract_failures: u32,
+    rate_failures: u32,
+    continuity_failures: u32,
+    illumination_failures: u32,
+    open_failures: u32,
+    arm_failures: u32,
+    capture_failures: u32,
+    /// Failed rounds carrying typed below-floor delivery evidence.
+    #[serde(default)]
+    rate_shortfall_failures: u32,
     rgb_mean: f32,
     ir_mean: f32,
     elapsed_ms: u64,
@@ -651,8 +698,18 @@ impl ArmEvidence {
         requested_rounds: u32,
         completed_rounds: u32,
         failed_rounds: u32,
-        meets_rate_floor: bool,
-        continuous: bool,
+        contract_rounds: u32,
+        rate_floor_rounds: u32,
+        continuous_rounds: u32,
+        active_ir_rounds: u32,
+        contract_failures: u32,
+        rate_failures: u32,
+        continuity_failures: u32,
+        illumination_failures: u32,
+        open_failures: u32,
+        arm_failures: u32,
+        capture_failures: u32,
+        rate_shortfall_failures: u32,
         rgb_mean: f32,
         ir_mean: f32,
         elapsed_ms: u64,
@@ -661,8 +718,18 @@ impl ArmEvidence {
             requested_rounds,
             completed_rounds,
             failed_rounds,
-            meets_rate_floor,
-            continuous,
+            contract_rounds,
+            rate_floor_rounds,
+            continuous_rounds,
+            active_ir_rounds,
+            contract_failures,
+            rate_failures,
+            continuity_failures,
+            illumination_failures,
+            open_failures,
+            arm_failures,
+            capture_failures,
+            rate_shortfall_failures,
             rgb_mean,
             ir_mean,
             elapsed_ms,
@@ -672,8 +739,31 @@ impl ArmEvidence {
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
+        let exceeds_completed = |healthy: u32, failed: u32| {
+            healthy
+                .checked_add(failed)
+                .is_none_or(|total| total > self.completed_rounds)
+        };
         if self.requested_rounds == 0
             || self.completed_rounds.saturating_add(self.failed_rounds) > self.requested_rounds
+            || self.contract_rounds > self.completed_rounds
+            || self.rate_floor_rounds > self.completed_rounds
+            || self.continuous_rounds > self.completed_rounds
+            || self.active_ir_rounds > self.completed_rounds
+            || self.contract_failures > self.completed_rounds
+            || self.rate_failures > self.completed_rounds
+            || self.continuity_failures > self.completed_rounds
+            || self.illumination_failures > self.completed_rounds
+            || exceeds_completed(self.contract_rounds, self.contract_failures)
+            || exceeds_completed(self.rate_floor_rounds, self.rate_failures)
+            || exceeds_completed(self.continuous_rounds, self.continuity_failures)
+            || exceeds_completed(self.active_ir_rounds, self.illumination_failures)
+            || self
+                .open_failures
+                .checked_add(self.arm_failures)
+                .and_then(|total| total.checked_add(self.capture_failures))
+                .and_then(|total| total.checked_add(self.rate_shortfall_failures))
+                != Some(self.failed_rounds)
             || !self.rgb_mean.is_finite()
             || !self.ir_mean.is_finite()
             || self.rgb_mean < 0.0
@@ -685,10 +775,33 @@ impl ArmEvidence {
     }
 
     fn complete_and_healthy(&self) -> bool {
-        self.completed_rounds == self.requested_rounds
-            && self.failed_rounds == 0
-            && self.meets_rate_floor
-            && self.continuous
+        self.rounds_complete() && self.complete_provenance()
+    }
+
+    fn rounds_complete(&self) -> bool {
+        self.completed_rounds == self.requested_rounds && self.failed_rounds == 0
+    }
+
+    fn provenance_accounted(&self) -> bool {
+        self.contract_rounds.checked_add(self.contract_failures) == Some(self.completed_rounds)
+            && self.rate_floor_rounds.checked_add(self.rate_failures) == Some(self.completed_rounds)
+            && self.continuous_rounds.checked_add(self.continuity_failures)
+                == Some(self.completed_rounds)
+            && self
+                .active_ir_rounds
+                .checked_add(self.illumination_failures)
+                == Some(self.completed_rounds)
+    }
+
+    fn complete_provenance(&self) -> bool {
+        self.contract_rounds == self.completed_rounds
+            && self.rate_floor_rounds == self.completed_rounds
+            && self.continuous_rounds == self.completed_rounds
+            && self.active_ir_rounds == self.completed_rounds
+            && self.contract_failures == 0
+            && self.rate_failures == 0
+            && self.continuity_failures == 0
+            && self.illumination_failures == 0
     }
 }
 
@@ -724,10 +837,12 @@ pub enum AttemptOutcome {
 /// One measurement and all evidence needed to interpret it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QualificationAttempt {
+    producer_engine_version: u32,
     measured_at_unix: u64,
     context: QualificationContext,
     sequential: ArmEvidence,
     concurrent: ArmEvidence,
+    trailing_sequential_control: bool,
     outcome: AttemptOutcome,
 }
 
@@ -742,13 +857,16 @@ impl QualificationAttempt {
         context: QualificationContext,
         sequential: ArmEvidence,
         concurrent: ArmEvidence,
+        trailing_sequential_control: bool,
         outcome: AttemptOutcome,
     ) -> Result<Self, QualificationError> {
         let value = Self {
+            producer_engine_version: PRODUCER_ENGINE_VERSION,
             measured_at_unix,
             context,
             sequential,
             concurrent,
+            trailing_sequential_control,
             outcome,
         };
         value.validate()?;
@@ -759,7 +877,7 @@ impl QualificationAttempt {
         self.context.validate()?;
         self.sequential.validate()?;
         self.concurrent.validate()?;
-        if self.measured_at_unix == 0 {
+        if self.producer_engine_version != PRODUCER_ENGINE_VERSION || self.measured_at_unix == 0 {
             return Err(QualificationError::InvalidEvidence);
         }
         match self.outcome {
@@ -784,17 +902,50 @@ impl QualificationAttempt {
                     SequentialReason::ConcurrentUnavailable => {
                         self.concurrent.completed_rounds == 0
                             && self.concurrent.failed_rounds == self.concurrent.requested_rounds
+                            && self.trailing_sequential_control
                     }
-                    SequentialReason::DeliveredRateShortfall => !self.concurrent.meets_rate_floor,
+                    SequentialReason::DeliveredRateShortfall => {
+                        self.concurrent.rate_failures > 0
+                            || (self.concurrent.completed_rounds == 0
+                                && self.concurrent.failed_rounds
+                                    == self.concurrent.requested_rounds
+                                && self.concurrent.rate_shortfall_failures
+                                    == self.concurrent.requested_rounds
+                                && self.trailing_sequential_control)
+                    }
                     SequentialReason::SignalLoss => {
                         retained(self.concurrent.rgb_mean, self.sequential.rgb_mean)
                             < CONCURRENT_SIGNAL_FLOOR
                             || retained(self.concurrent.ir_mean, self.sequential.ir_mean)
                                 < CONCURRENT_SIGNAL_FLOOR
                     }
-                    SequentialReason::InvalidProvenance => !self.concurrent.continuous,
+                    SequentialReason::InvalidProvenance => {
+                        self.concurrent.contract_failures > 0
+                            || self.concurrent.continuity_failures > 0
+                    }
                 };
-                if !supported {
+                let complete_concurrent_evidence = match reason {
+                    SequentialReason::ConcurrentUnavailable => true,
+                    SequentialReason::DeliveredRateShortfall => {
+                        (self.concurrent.completed_rounds == 0
+                            && self.concurrent.failed_rounds == self.concurrent.requested_rounds
+                            && self.concurrent.rate_shortfall_failures
+                                == self.concurrent.requested_rounds
+                            && self.trailing_sequential_control)
+                            || (self.concurrent.rounds_complete()
+                                && self.concurrent.provenance_accounted()
+                                && self.concurrent.contract_failures == 0
+                                && self.concurrent.continuity_failures == 0
+                                && self.concurrent.illumination_failures == 0)
+                    }
+                    SequentialReason::SignalLoss => self.concurrent.complete_and_healthy(),
+                    SequentialReason::InvalidProvenance => {
+                        self.concurrent.rounds_complete()
+                            && self.concurrent.provenance_accounted()
+                            && self.concurrent.illumination_failures == 0
+                    }
+                };
+                if !supported || !complete_concurrent_evidence {
                     return Err(QualificationError::InvalidEvidence);
                 }
             }
@@ -1298,7 +1449,11 @@ mod tests {
     }
 
     fn arm(rounds: u32) -> ArmEvidence {
-        ArmEvidence::new(rounds, rounds, 0, true, true, 140.0, 120.0, 850).unwrap()
+        ArmEvidence::new(
+            rounds, rounds, 0, rounds, rounds, rounds, rounds, 0, 0, 0, 0, 0, 0, 0, 0, 140.0,
+            120.0, 850,
+        )
+        .unwrap()
     }
 
     fn concurrent_attempt(port: &str) -> QualificationAttempt {
@@ -1307,6 +1462,7 @@ mod tests {
             context(port),
             arm(6),
             arm(6),
+            false,
             AttemptOutcome::ConcurrentQualified,
         )
         .unwrap()
@@ -1359,7 +1515,11 @@ mod tests {
             1_786_944_000,
             ctx,
             arm(6),
-            ArmEvidence::new(6, 3, 3, false, false, 80.0, 90.0, 2_000).unwrap(),
+            ArmEvidence::new(
+                6, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 80.0, 90.0, 2_000,
+            )
+            .unwrap(),
+            false,
             AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds),
         )
         .unwrap();
@@ -1396,6 +1556,38 @@ mod tests {
             .unwrap()
         )
         .is_err());
+        assert!(
+            ArmEvidence::new(1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1).is_err(),
+            "one completed round cannot both match and fail the same contract"
+        );
+        let partial_rate_failure =
+            ArmEvidence::new(6, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1).unwrap();
+        assert!(
+            QualificationAttempt::new(
+                1,
+                context("/devices/usb3/3-2"),
+                arm(6),
+                partial_rate_failure,
+                false,
+                AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+            )
+            .is_err(),
+            "one rate-failed frame cannot authorize a six-round sequential verdict"
+        );
+        let typed_rate_shortfall =
+            ArmEvidence::new(6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0.0, 0.0, 1).unwrap();
+        assert!(
+            QualificationAttempt::new(
+                1,
+                context("/devices/usb3/3-2"),
+                arm(6),
+                typed_rate_shortfall,
+                true,
+                AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+            )
+            .is_ok(),
+            "six typed concurrent rate failures plus a healthy trailing control are authority"
+        );
     }
 
     #[test]
@@ -1409,6 +1601,13 @@ mod tests {
         assert_eq!(
             CaptureQualificationRecord::from_json(&future),
             Err(QualificationError::UnsupportedSchema(999))
+        );
+        let mut future_engine: serde_json::Value =
+            serde_json::from_str(&record.to_json().unwrap()).unwrap();
+        future_engine["last_attempt"]["producer_engine_version"] = serde_json::json!(999);
+        assert_eq!(
+            CaptureQualificationRecord::from_json(&serde_json::to_vec(&future_engine).unwrap()),
+            Err(QualificationError::InvalidEvidence)
         );
         assert_eq!(
             CaptureQualificationRecord::from_json(&vec![b' '; MAX_RECORD_BYTES + 1]),
@@ -1554,7 +1753,11 @@ mod tests {
             1_786_944_001,
             conclusive.context().clone(),
             arm(6),
-            ArmEvidence::new(6, 4, 2, false, false, 80.0, 90.0, 2_000).unwrap(),
+            ArmEvidence::new(
+                6, 4, 2, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 2, 0, 80.0, 90.0, 2_000,
+            )
+            .unwrap(),
+            false,
             AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds),
         )
         .unwrap();

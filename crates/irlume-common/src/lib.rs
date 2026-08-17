@@ -517,12 +517,15 @@ pub enum Request {
     /// brightness to detect success. `dry_run` only enumerates XU controls.
     SetupIrEmitter { dry_run: bool },
     /// Measure whether this camera can stream RGB and IR at once without losing
-    /// signal, and persist the answer (cameras.conf) so authentication picks the
-    /// right capture mode. Fires the camera for several seconds. PRIVILEGED.
+    /// signal, and persist context-bound v2 qualification authority so
+    /// authentication picks the right mode. Fires the camera. PRIVILEGED.
     TuneCaptureMode {
         #[serde(default)]
         rounds: Option<usize>,
     },
+    /// Resolve the daemon's active capture schedule from the exact camera pair
+    /// it owns, including process-local safety degradation. CAMERA-CLASS.
+    CaptureModeStatus,
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Enumerate the Hello camera pairs for the picker. CAMERA-CLASS: it
@@ -784,6 +787,23 @@ pub enum Response {
     /// Answer to [`Request::ListCameras`]: every physical camera exposing an
     /// RGB+IR pair, built-in first.
     Cameras(Vec<CameraPairInfo>),
+    /// Active RGB+IR scheduling policy resolved by the daemon.
+    CaptureModeStatus {
+        mode: String,
+        source: String,
+        rgb: String,
+        ir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_context: Option<String>,
+        #[serde(default)]
+        qualification_state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qualification_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qualification_context: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_degradation: Option<String>,
+    },
     /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
     /// face matched (check `live` to tell "no match" from "not a live face").
     Identified {

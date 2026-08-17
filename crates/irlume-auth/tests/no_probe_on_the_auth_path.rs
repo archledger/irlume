@@ -91,9 +91,9 @@ fn one_camera_operation_spans_consent_and_every_authentication_retry() {
         .find("    pub fn authenticate_for(")
         .expect("authenticate_for exists");
     let end = text[start..]
-        .find("\n    fn authenticate_once(")
+        .find("\n    #[allow(clippy::too_many_arguments)]\n    fn authentication_attempt_loop(")
         .map(|offset| start + offset)
-        .expect("authenticate_once follows authenticate_for");
+        .expect("authentication attempt loop follows authenticate_for");
     let body = &text[start..end];
 
     let acquire = body
@@ -103,8 +103,8 @@ fn one_camera_operation_spans_consent_and_every_authentication_retry() {
         .find("self.early_consent_watch")
         .expect("pre-match consent watch exists");
     let retries = body
-        .find("let out = loop {")
-        .expect("grace retry loop exists");
+        .find("self.authentication_attempt_loop(")
+        .expect("grace retry helper is called");
 
     assert_eq!(
         body.matches("acquire_camera_operation(").count(),
@@ -112,12 +112,23 @@ fn one_camera_operation_spans_consent_and_every_authentication_retry() {
         "authenticate_for must acquire exactly one operation"
     );
     assert!(acquire < consent && consent < retries);
-    assert!(body.contains("Self::run_camera_operation(&camera_operation"));
-    assert!(body.contains("Some(&camera_operation)"));
+    assert!(body.contains("&camera_operation"));
 
-    let once_start = text[end..]
-        .find("    fn authenticate_once(")
+    let loop_start = text[end..]
+        .find("    fn authentication_attempt_loop(")
         .map(|offset| end + offset)
+        .expect("authentication attempt loop exists");
+    let loop_end = text[loop_start..]
+        .find("\n    fn authenticate_once(")
+        .map(|offset| loop_start + offset)
+        .expect("authenticate_once follows the attempt loop");
+    let loop_body = &text[loop_start..loop_end];
+    assert!(loop_body.contains("loop {"));
+    assert!(loop_body.contains("Self::run_camera_operation(camera_operation"));
+
+    let once_start = text[loop_end..]
+        .find("    fn authenticate_once(")
+        .map(|offset| loop_end + offset)
         .expect("authenticate_once exists");
     let once_end = text[once_start..]
         .find("\n    fn ")
@@ -125,5 +136,36 @@ fn one_camera_operation_spans_consent_and_every_authentication_retry() {
         .expect("another method follows authenticate_once");
     let once = &text[once_start..once_end];
     assert!(once.contains("if !self.ir_available"));
-    assert!(once.contains("self.assess_rgb_only()?"));
+    assert!(once.contains("self.assess_rgb_only().map_err(CapturePathError::from)"));
+}
+
+#[test]
+fn qualification_lookup_uses_the_actual_open_pair() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("read irlume-auth/src/lib.rs");
+    let start = text
+        .find("fn capture_mode_selection(")
+        .expect("capture mode resolver exists");
+    let end = text[start..]
+        .find("\nfn standalone_capture_mode_selection(")
+        .map(|offset| start + offset)
+        .expect("standalone diagnostic resolver follows production resolver");
+    let resolver = &text[start..end];
+
+    assert!(
+        resolver.contains("rgb_camera: &irlume_camera::RgbCamera"),
+        "mode resolution must accept the actual RGB camera used by the operation"
+    );
+    assert!(
+        resolver.contains("ir_camera: &irlume_camera::IrCamera"),
+        "mode resolution must accept the actual IR camera used by the operation"
+    );
+    assert!(
+        resolver.contains("stored_capture_qualification_state_from_cameras"),
+        "mode resolution must derive context from the same open pair it may authorize"
+    );
+    assert!(
+        !resolver.contains("stored_capture_qualification_state_in_operation"),
+        "temporary cameras opened under the same lease still leave a path-to-fd race"
+    );
 }

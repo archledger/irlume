@@ -1133,89 +1133,48 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
 /// or the unmeasured default). Unlike `doctor`, this opens the camera to
 /// auto-select the pair, so it answers on an install that never ran `set-cameras`.
 fn camera_mode(_args: &[String]) -> std::process::ExitCode {
-    use irlume_camera::{CaptureModeOrigin, MeasurementSource};
-    // The override decides alone, before anything stored is consulted.
-    if let Ok(v) = std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
-        let sequential = v.trim() == "1";
-        println!(
-            "capture mode: {} (forced by IRLUME_SEQUENTIAL_CAPTURE in this shell)",
-            if sequential {
-                "sequential"
-            } else {
-                "concurrent"
-            }
-        );
-        return std::process::ExitCode::SUCCESS;
-    }
-    let (rgb, ir) = crate::camera_pair();
-    if rgb == "none" || rgb == "unknown" || ir == "none" || ir == "unknown" {
-        println!("capture mode: no camera pair resolved, so there is no mode to report.");
-        return std::process::ExitCode::SUCCESS;
-    }
-    println!("camera pair: rgb={rgb} ir={ir}");
-    let Some(mode) = irlume_camera::stored_capture_mode(&rgb, &ir) else {
-        println!(
-            "capture mode: sequential (the safe unmeasured default). Run \
-             `sudo irlume camera-tune` to measure whether this camera can \
-             capture RGB and IR concurrently."
-        );
-        return std::process::ExitCode::SUCCESS;
-    };
-    let when = |at_unix: Option<u64>| -> String {
-        match at_unix {
-            Some(ts) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                format!("{} days ago", now.saturating_sub(ts) / 86400)
-            }
-            None => "at an unknown date".to_string(),
-        }
-    };
-    match irlume_camera::stored_capture_mode_origin(&rgb, &ir) {
-        Some(CaptureModeOrigin::Measured {
-            by,
-            at_unix,
-            rgb_retention,
-            ir_retention,
+    use irlume_common::{Request, Response};
+    match daemon_request(&Request::CaptureModeStatus) {
+        Ok(Response::CaptureModeStatus {
+            mode,
+            source,
+            rgb,
+            ir,
+            runtime_context,
+            qualification_state,
+            qualification_reason,
+            qualification_context,
+            runtime_degradation,
         }) => {
-            let source = match by {
-                MeasurementSource::CameraTune => "camera-tune",
-                MeasurementSource::EnrollmentProbe => "the enrollment probe",
-            };
-            let retention = match (rgb_retention, ir_retention) {
-                (Some(r), Some(i)) => format!(
-                    "; concurrent retained {:.0}% RGB and {:.0}% IR brightness",
-                    r * 100.0,
-                    i * 100.0
-                ),
-                _ => String::new(),
-            };
             println!(
-                "capture mode: {} (measured by {source} {}{retention})",
-                mode.as_str(),
-                when(at_unix)
+                "camera pair: rgb={rgb} ir={}",
+                ir.as_deref().unwrap_or("unavailable")
             );
+            println!("capture mode: {mode} (daemon source: {source})");
+            println!("qualification: {qualification_state}");
+            if let Some(reason) = qualification_reason {
+                println!("qualification reason: {reason}");
+            }
+            if let Some(reason) = runtime_degradation {
+                println!("runtime degradation: {reason}");
+            }
+            if let Some(context) = runtime_context {
+                println!("runtime context: {context}");
+            }
+            if let Some(context) = qualification_context {
+                println!("exact qualification context: {context}");
+            }
+            std::process::ExitCode::SUCCESS
         }
-        Some(CaptureModeOrigin::AutoSwitched { at_unix, streak }) => {
-            let streak = streak
-                .map(|s| format!(" after {s} consecutive concurrent RGB losses"))
-                .unwrap_or_default();
-            println!(
-                "capture mode: {} (auto-switched {}{streak}; run `sudo irlume \
-                 camera-tune` to re-measure)",
-                mode.as_str(),
-                when(at_unix)
-            );
+        Ok(Response::Error(error)) | Err(error) => {
+            eprintln!("[camera-mode] {error}");
+            std::process::ExitCode::FAILURE
         }
-        None => {
-            println!(
-                "capture mode: {} (measured for this pair; provenance not recorded)",
-                mode.as_str()
-            );
+        Ok(other) => {
+            eprintln!("[camera-mode] unexpected response {other:?}");
+            std::process::ExitCode::FAILURE
         }
     }
-    std::process::ExitCode::SUCCESS
 }
 
 fn usage_profiles() -> std::process::ExitCode {
@@ -3853,31 +3812,21 @@ fn report_credential_release(
 /// a value so the wording is decided by a pure function and tested, separately
 /// from the root check and config reads that produce it.
 enum CaptureModeReport {
-    /// The verdict lives in root-only `cameras.conf` and this run cannot read it.
-    RootRequired,
-    /// `cameras.conf` exists but could not be read, so nothing was established.
-    ///
-    /// Kept apart from [`Self::NoPinnedPair`] because `read_kv` collapses
-    /// "absent" and "unreadable" into `None`, and its own doc says a caller
-    /// that REPORTS the state rather than falling back on a default must use
-    /// `observe_kv`. This is that caller: gating on euid alone made a root run
-    /// on an unreadable file (EACCES from a copy placed without `restorecon`)
-    /// report a guess as an observation, at `info` (#100 review).
+    /// The daemon could not resolve an exact v2 status.
     Unreadable(String),
-    /// No pair is persisted, so there is nothing to look a verdict up by; irlume
-    /// auto-selects a pair at capture and the mode follows from that.
-    NoPinnedPair,
     /// A verdict was measured for this pair and stored.
-    Measured(irlume_camera::CaptureMode),
+    Measured(irlume_camera::CaptureMode, Option<String>),
     /// The pair is pinned but no verdict was ever measured for it.
     Unmeasured,
+    /// This host has no IR endpoint, so RGB+IR qualification does not apply.
+    NoIrPair,
+    /// A controlled attempt ran but could not publish authority.
+    Inconclusive(String),
     /// `IRLUME_SEQUENTIAL_CAPTURE` is set in THIS process's environment and
     /// decides alone, whatever is stored.
     Overridden(bool),
-    /// irlume switched this pairing to sequential itself after repeated
-    /// concurrent-capture RGB losses (#100). `age_days` is the number of days
-    /// since the switch, or `None` when the stamp carried no readable time.
-    AutoSwitched { age_days: Option<u64> },
+    /// A qualified concurrent context failed live in this daemon generation.
+    RuntimeDegraded(String),
 }
 
 /// The `doctor` line and machine state for a capture-mode observation.
@@ -3894,43 +3843,18 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
     use crate::doctor_report::State;
     use irlume_camera::CaptureMode;
     match report {
-        CaptureModeReport::RootRequired => (
-            State::Unknown,
-            "root-only setting (reads /etc/irlume/cameras.conf); re-run `sudo irlume doctor` \
-             to read it"
-                .to_string(),
-        ),
         CaptureModeReport::Unreadable(why) => (
             State::Unknown,
             format!(
-                "/etc/irlume/cameras.conf could not be read ({why}), so the capture mode is \
-                 unknown; this is NOT the same as no mode being set"
+                "the daemon could not resolve v2 capture status ({why}); authentication stays \
+                 on the safe sequential fallback"
             ),
-        ),
-        // Says what it does and does not know. The old wording implied no
-        // verdict exists, and on an auto-discovered install that is wrong: the
-        // pin (`rgb=`/`ir=`) is written only by `set-cameras` and the TUI, while
-        // the verdict is keyed by device identity and written by `camera-tune`
-        // and the enrolment probe. So a machine that never pinned a pair can
-        // still have a measured verdict in that file, in force, unreported
-        // (#100 review). Resolving which one applies needs the device pair, and
-        // finding that without a pin means opening cameras, which doctor must
-        // not do.
-        CaptureModeReport::NoPinnedPair => (
-            State::Info,
-            "no pinned camera pair, so the stored verdict cannot be looked up here; irlume \
-             auto-selects a pair at capture and any mode measured for that pair still \
-             applies. Run `sudo irlume camera-mode` to report the mode for the \
-             auto-selected pair, or `sudo irlume set-cameras` to pin one"
-                .to_string(),
         ),
         CaptureModeReport::Overridden(sequential) => (
             State::Info,
             format!(
-                "{}, forced by IRLUME_SEQUENTIAL_CAPTURE in this process's environment, which \
-                 outranks any stored verdict. Note this reads THIS shell, not the daemon's \
-                 unit environment: a value set only in the irlumed unit decides captures and \
-                 is not visible here",
+                "{}, forced by IRLUME_SEQUENTIAL_CAPTURE in the daemon environment, which \
+                 outranks durable qualification authority",
                 if *sequential {
                     "sequential"
                 } else {
@@ -3938,19 +3862,21 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
                 }
             ),
         ),
-        CaptureModeReport::Measured(CaptureMode::Sequential) => (
+        CaptureModeReport::Measured(CaptureMode::Sequential, reason) => (
             State::Info,
             // The measured range, not one end of it. 700ms is the ASUS figure,
             // and the ASUS keeps 102% of its brightness under concurrent
             // capture, so it is measured CONCURRENT and never reaches this
             // line. The population that gets a sequential verdict is the
             // NexiGo-shaped one, measured at 1.3s (#100 review).
-            "sequential, measured for this camera pair (RGB then IR, one after the other: \
+            format!(
+                "sequential, measured for this camera pair (RGB then IR, one after the other: \
              0.7s to 1.3s more per capture on the modules measured for #340, and the \
-             reliable choice on a camera that dims when both sensors stream at once)"
-                .to_string(),
+             reliable choice on a camera that dims when both sensors stream at once); reason: {}",
+                reason.as_deref().unwrap_or("unspecified")
+            ),
         ),
-        CaptureModeReport::Measured(CaptureMode::Concurrent) => (
+        CaptureModeReport::Measured(CaptureMode::Concurrent, _) => (
             State::Info,
             "concurrent, measured for this camera pair (RGB and IR captured together, the \
              faster path)"
@@ -3963,76 +3889,88 @@ fn capture_mode_report_line(report: &CaptureModeReport) -> (crate::doctor_report
              and IR concurrently"
                 .to_string(),
         ),
-        CaptureModeReport::AutoSwitched { age_days } => {
-            let age = match age_days {
-                Some(d) => format!("{d} days ago"),
-                None => "at an unknown date".to_string(),
-            };
-            (
-                State::Info,
-                format!(
-                    "sequential, switched automatically {age} after repeated concurrent-capture \
-                     RGB losses; captures are slower and reliable. Run `sudo irlume camera-tune` \
-                     to replace this with a measurement"
-                ),
-            )
+        CaptureModeReport::NoIrPair => (
+            State::Info,
+            "RGB-only capture: no IR endpoint is available, so RGB+IR capture-mode \
+             qualification does not apply on this host"
+                .to_string(),
+        ),
+        CaptureModeReport::Inconclusive(reason) => (
+            State::Info,
+            format!(
+                "the last RGB+IR capture-mode measurement was inconclusive ({reason}); using \
+                 the safe sequential default. Run `sudo irlume camera-tune` under stable, lit \
+                 conditions to measure again"
+            ),
+        ),
+        CaptureModeReport::RuntimeDegraded(reason) => (
+            State::Info,
+            format!(
+                "sequential for this daemon generation after a live concurrent-pair failure \
+             ({reason}); \
+             both streams and camera handles were dropped before the sequential retry. Run \
+             `sudo irlume camera-tune` to publish fresh controlled evidence"
+            ),
+        ),
+    }
+}
+
+fn capture_mode_report_from_status(
+    mode: &str,
+    source: &str,
+    qualification_state: &str,
+    qualification_reason: Option<String>,
+    runtime_degradation: Option<String>,
+) -> CaptureModeReport {
+    let parsed = irlume_camera::CaptureMode::parse(mode);
+    match (source, qualification_state, parsed) {
+        ("IRLUME_SEQUENTIAL_CAPTURE", _, Some(mode)) => {
+            CaptureModeReport::Overridden(mode == irlume_camera::CaptureMode::Sequential)
         }
+        ("runtime-health", _, _) => CaptureModeReport::RuntimeDegraded(
+            runtime_degradation.unwrap_or_else(|| "unspecified".into()),
+        ),
+        (_, "qualified_concurrent" | "measured_sequential", Some(mode)) => {
+            CaptureModeReport::Measured(mode, qualification_reason)
+        }
+        (_, "unqualified_no_authority", _) => CaptureModeReport::Unmeasured,
+        (_, "no_ir_pair", _) => CaptureModeReport::NoIrPair,
+        (_, "inconclusive", _) => CaptureModeReport::Inconclusive(
+            qualification_reason.unwrap_or_else(|| "unspecified".into()),
+        ),
+        (_, "unqualified_context_changed" | "unreadable", _) => CaptureModeReport::Unreadable(
+            qualification_reason.unwrap_or_else(|| qualification_state.into()),
+        ),
+        _ => CaptureModeReport::Unreadable("invalid daemon response".into()),
     }
 }
 
 /// Doctor's capture-mode block: which capture strategy the active camera pair
 /// uses, and whether that was measured or is the unmeasured default.
 ///
-/// Reads the pinned pair without opening the camera ([`irlume_camera::configured_pair_no_probe`]),
-/// then the stored verdict; both live in root-only `cameras.conf`, so an
-/// unprivileged run reports `Unknown` and says to re-run under sudo, the same
-/// shape as the credential-release block. The wording of every case is
-/// [`capture_mode_report_line`], which is where the tests are.
+/// Asks the daemon to resolve policy from the exact pair it owns, serialized as
+/// camera-class work. This includes process-local runtime degradation and the
+/// daemon's environment, neither of which a CLI-side config read can observe.
+/// The wording of every case is [`capture_mode_report_line`].
 fn report_capture_mode(report: &mut crate::doctor_report::Report) {
-    // The override decides alone, in BOTH directions, before anything stored is
-    // consulted: that is `capture_mode_decision`'s first arm. Reporting a
-    // stored verdict as the mode in force while this is set states the opposite
-    // of what happens (#100 review). Read from this process, and the line says
-    // so, because a value set only in the daemon's unit environment is not
-    // visible from here.
-    let observed = if let Ok(v) = std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
-        CaptureModeReport::Overridden(v.trim() == "1")
-    } else if !is_root() {
-        CaptureModeReport::RootRequired
-    } else {
-        // `observe_kv`, not `read_kv`: the difference between "no pin" and
-        // "could not read the file" is exactly what this block reports.
-        match irlume_common::config::observe_kv("cameras.conf", "rgb") {
-            irlume_common::config::KvObservation::Unknown(e) => {
-                CaptureModeReport::Unreadable(e.to_string())
-            }
-            _ => match irlume_camera::configured_pair_no_probe() {
-                None => CaptureModeReport::NoPinnedPair,
-                Some((rgb, ir)) => match irlume_camera::stored_capture_mode(&rgb, &ir) {
-                    Some(mode) => {
-                        // An auto-switched verdict is sequential wearing an
-                        // origin stamp; report it separately so it never reads
-                        // as a measurement and the user learns how to replace it.
-                        if let Some(irlume_camera::CaptureModeOrigin::AutoSwitched {
-                            at_unix,
-                            ..
-                        }) = irlume_camera::stored_capture_mode_origin(&rgb, &ir)
-                        {
-                            let age_days = at_unix.map(|ts| {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs());
-                                now.saturating_sub(ts) / 86400
-                            });
-                            CaptureModeReport::AutoSwitched { age_days }
-                        } else {
-                            CaptureModeReport::Measured(mode)
-                        }
-                    }
-                    None => CaptureModeReport::Unmeasured,
-                },
-            },
-        }
+    use irlume_common::{Request, Response};
+    let observed = match daemon_request(&Request::CaptureModeStatus) {
+        Ok(Response::CaptureModeStatus {
+            mode,
+            source,
+            qualification_state,
+            qualification_reason,
+            runtime_degradation,
+            ..
+        }) => capture_mode_report_from_status(
+            &mode,
+            &source,
+            &qualification_state,
+            qualification_reason,
+            runtime_degradation,
+        ),
+        Ok(Response::Error(error)) | Err(error) => CaptureModeReport::Unreadable(error),
+        Ok(other) => CaptureModeReport::Unreadable(format!("unexpected response {other:?}")),
     };
     let (state, detail) = capture_mode_report_line(&observed);
     report.check_detail("capture-mode", state, detail.clone());
@@ -5590,17 +5528,13 @@ mod tests {
         use crate::doctor_report::State;
         use irlume_camera::CaptureMode;
 
-        let (state, line) = capture_mode_report_line(&CaptureModeReport::RootRequired);
-        assert!(matches!(state, State::Unknown), "a can't-read is Unknown");
-        assert!(line.contains("sudo"), "and tells the user how to read it");
-
         for (obs, want) in [
             (
-                CaptureModeReport::Measured(CaptureMode::Sequential),
+                CaptureModeReport::Measured(CaptureMode::Sequential, None),
                 "sequential",
             ),
             (
-                CaptureModeReport::Measured(CaptureMode::Concurrent),
+                CaptureModeReport::Measured(CaptureMode::Concurrent, None),
                 "concurrent",
             ),
         ] {
@@ -5624,42 +5558,37 @@ mod tests {
             "and is pointed at the command that measures it"
         );
 
-        let (state, line) = capture_mode_report_line(&CaptureModeReport::NoPinnedPair);
+        let (state, line) = capture_mode_report_line(&CaptureModeReport::NoIrPair);
         assert!(matches!(state, State::Info));
-        assert!(
-            line.contains("auto-select"),
-            "no pin means auto-selection at capture"
-        );
-        // ...and it must not imply no verdict exists. The pin and the verdict
-        // live on different keys written by different commands, so an
-        // auto-discovered install can have a measured mode in force with no pin
-        // at all (#100 review).
-        assert!(
-            line.contains("still applies"),
-            "must not read as 'no mode is set': {line}"
-        );
+        assert!(line.contains("RGB-only"), "{line}");
+        assert!(line.contains("does not apply"), "{line}");
+        assert!(!line.contains("camera-tune"), "{line}");
 
-        // An unreadable config is not an absent one. `read_kv` collapses them
-        // and its own doc says a reporting caller must not.
+        let (state, line) =
+            capture_mode_report_line(&CaptureModeReport::Inconclusive("dim_scene".into()));
+        assert!(matches!(state, State::Info));
+        assert!(line.contains("inconclusive"), "{line}");
+        assert!(line.contains("dim_scene"), "{line}");
+
+        // A daemon failure is unknown, never guessed from legacy config.
         let (state, line) =
             capture_mode_report_line(&CaptureModeReport::Unreadable("permission denied".into()));
         assert!(
             matches!(state, State::Unknown),
             "could-not-read must not be reported as an observation: {line}"
         );
-        assert!(line.contains("NOT the same"), "{line}");
+        assert!(line.contains("safe sequential"), "{line}");
 
         // The env override decides alone, in both directions, ahead of anything
-        // stored, and the line must say it read this process rather than the
-        // daemon's unit environment.
+        // stored, and the status comes from the daemon environment.
         for (seq, want) in [(true, "sequential"), (false, "concurrent")] {
             let (state, line) = capture_mode_report_line(&CaptureModeReport::Overridden(seq));
             assert!(matches!(state, State::Info));
             assert!(line.starts_with(want), "{line}");
             assert!(line.contains("IRLUME_SEQUENTIAL_CAPTURE"), "{line}");
             assert!(
-                line.contains("unit environment"),
-                "must disclose that it cannot see the daemon's environment: {line}"
+                line.contains("daemon environment"),
+                "must report the daemon's active environment: {line}"
             );
         }
 
@@ -5667,37 +5596,54 @@ mod tests {
         // ASUS end of it. The ASUS keeps 102% under concurrent capture, so it
         // is measured concurrent and never reaches this line at all.
         let (_, seq_line) =
-            capture_mode_report_line(&CaptureModeReport::Measured(CaptureMode::Sequential));
+            capture_mode_report_line(&CaptureModeReport::Measured(CaptureMode::Sequential, None));
         assert!(
             !seq_line.contains("700ms"),
             "700ms is the figure for a camera that never gets this verdict: {seq_line}"
         );
         assert!(seq_line.contains("1.3s"), "{seq_line}");
 
-        // An auto-switched pairing is sequential, but it must not read as
-        // measured. The line says how it came to be sequential and names the
-        // command that replaces the inference with a measurement.
-        for (age_days, want_age) in [(Some(5), "5 days ago"), (None, "at an unknown date")] {
-            let (state, line) =
-                capture_mode_report_line(&CaptureModeReport::AutoSwitched { age_days });
-            assert!(matches!(state, State::Info));
-            assert!(
-                line.contains("switched automatically"),
-                "must name how it was set: {line}"
-            );
-            assert!(
-                line.contains(want_age),
-                "must name the age ({want_age}): {line}"
-            );
-            assert!(
-                line.contains("camera-tune"),
-                "must name how to replace the inference: {line}"
-            );
-            assert!(
-                !line.contains("measured"),
-                "must not read as a measurement: {line}"
-            );
-        }
+        let (state, line) = capture_mode_report_line(&CaptureModeReport::RuntimeDegraded(
+            "concurrent_capture_failure".into(),
+        ));
+        assert!(matches!(state, State::Info));
+        assert!(line.contains("daemon generation"), "{line}");
+        assert!(line.contains("both streams"), "{line}");
+        assert!(line.contains("camera-tune"), "{line}");
+    }
+
+    #[test]
+    fn daemon_capture_mode_states_map_without_collapsing_no_ir_or_inconclusive() {
+        assert!(matches!(
+            capture_mode_report_from_status(
+                "sequential",
+                "no-ir-pair",
+                "no_ir_pair",
+                Some("no IR".into()),
+                None,
+            ),
+            CaptureModeReport::NoIrPair
+        ));
+        assert!(matches!(
+            capture_mode_report_from_status(
+                "sequential",
+                "default",
+                "inconclusive",
+                Some("dim_scene".into()),
+                None,
+            ),
+            CaptureModeReport::Inconclusive(reason) if reason == "dim_scene"
+        ));
+        assert!(matches!(
+            capture_mode_report_from_status(
+                "sequential",
+                "default",
+                "unqualified_no_authority",
+                Some("no authority".into()),
+                None,
+            ),
+            CaptureModeReport::Unmeasured
+        ));
     }
 
     /// The stored eye shape is tied to two conditions, room light and glasses,

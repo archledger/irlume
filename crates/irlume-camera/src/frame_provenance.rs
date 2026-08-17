@@ -1518,6 +1518,15 @@ pub enum RuntimeFrameProvenance {
 }
 
 impl RuntimeFrameProvenance {
+    /// Exact camera incarnation and role that produced this frame.
+    #[must_use]
+    pub fn binding(&self) -> &FrameBinding {
+        match self {
+            Self::Single(single) => single.binding(),
+            Self::Aggregate(aggregate) => aggregate.contributors[0].binding(),
+        }
+    }
+
     #[must_use]
     pub const fn capture_window(&self) -> CaptureWindow {
         match self {
@@ -1555,6 +1564,32 @@ impl RuntimeFrameProvenance {
         match self {
             Self::Single(single) => single.rate_evidence(),
             Self::Aggregate(aggregate) => aggregate.rate_evidence(),
+        }
+    }
+
+    /// Whether this delivered frame stayed within one trusted monotonic stream
+    /// epoch without a sequence gap, recovery marker, or aggregate drop.
+    #[must_use]
+    pub fn is_continuous(&self) -> bool {
+        match self {
+            Self::Single(single) => {
+                single.timestamp().clock() == TimestampClock::Monotonic
+                    && !single.timestamp().discontinuity()
+                    && !single.sequence().discontinuity()
+                    && single.sequence().gap() == 0
+                    && single.rate_evidence().sequence_gap() == 0
+            }
+            Self::Aggregate(aggregate) => {
+                aggregate.drops_within() == 0
+                    && aggregate.worst_gap() == 0
+                    && aggregate.contributors().iter().all(|contributor| {
+                        contributor.timestamp().clock() == TimestampClock::Monotonic
+                            && !contributor.timestamp().discontinuity()
+                            && !contributor.sequence().discontinuity()
+                            && contributor.sequence().gap() == 0
+                            && contributor.rate_evidence().sequence_gap() == 0
+                    })
+            }
         }
     }
 }

@@ -235,6 +235,10 @@ impl OperationScope {
             ShareSafeEventKind::OperationFinished { outcome },
         );
     }
+
+    pub(crate) fn snapshot(&self, since: Duration) -> SupportSnapshot {
+        self.state.snapshot(since)
+    }
 }
 
 impl DiagnosticSink for OperationScope {

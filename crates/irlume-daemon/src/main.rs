@@ -3233,9 +3233,15 @@ fn dispatch_scoped(
         | Request::SupportSnapshot { .. } => {
             Response::Error("status request routed past its handler".into())
         }
-        Request::SupportProbe { .. } => Response::OperationError {
-            code: irlume_common::OperationErrorCode::OperationFailed,
-            retryable: false,
+        Request::SupportProbe { since_ms } => match engine.support_probe(scope) {
+            Ok(mut result) => {
+                result.snapshot = scope.snapshot(std::time::Duration::from_millis(since_ms));
+                Response::SupportProbe(Box::new(result))
+            }
+            Err(_) => Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: false,
+            },
         },
         Request::KeyringInfo { user } => {
             let armed = irlume_core::keyring::has_sealed_password(&user);
@@ -7444,6 +7450,39 @@ mod tests {
         })
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn root_support_probe_executes_and_returns_bounded_categorical_evidence() {
+        use irlume_common::diagnostics::{ProbeOutcome, ShareSafeEventKind};
+        let _g = env_lock();
+        let mut engine = engine();
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin(irlume_common::diagnostics::OperationClass::SupportProbe);
+        let root = Peer {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+
+        let response = dispatch_scoped(
+            Request::SupportProbe { since_ms: 60_000 },
+            &root,
+            &mut engine,
+            &scope,
+        );
+
+        let Response::SupportProbe(result) = response else {
+            panic!("root support probe did not return its typed response");
+        };
+        assert!(matches!(
+            result.outcome,
+            ProbeOutcome::Unavailable | ProbeOutcome::Failed
+        ));
+        assert!(result.snapshot.events().iter().any(|event| matches!(
+            event.kind,
+            ShareSafeEventKind::CaptureScheduleSelected { .. }
+        )));
     }
 
     /// Isolated state/config/keyring/template-key/recovery dirs plus a method

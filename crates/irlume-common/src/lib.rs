@@ -545,6 +545,8 @@ pub enum Request {
     SupportSnapshot { since_ms: u64 },
     /// Explicit root-only bounded camera probe for a support report.
     SupportProbe { since_ms: u64 },
+    /// Root-only subscription to one bounded daemon-authored diagnostic trace.
+    TraceSubscribe { duration_ms: u64 },
     /// Liveness/health ping.
     Ping,
     /// Daemon self-report: what it actually has loaded and which camera tier it
@@ -814,6 +816,11 @@ pub enum Response {
     SupportSnapshot(Box<diagnostics::SupportSnapshot>),
     /// Explicit support probe result with its contemporaneous safe snapshot.
     SupportProbe(Box<diagnostics::SupportProbeResult>),
+    /// Trace subscription accepted with daemon-applied bounds. Subsequent
+    /// newline-delimited records use [`diagnostics::TraceRecord`].
+    TraceAccepted {
+        limits: diagnostics::TraceLimits,
+    },
     /// Result of a 1:N `Identify`. `user`/`profile` are `None` when no enrolled
     /// face matched (check `live` to tell "no match" from "not a live face").
     Identified {

@@ -12,6 +12,13 @@ pub const MAX_SHARE_SAFE_EVENTS: usize = 256;
 pub const MAX_SANITIZED_CAMERAS: usize = 8;
 pub const MAX_UNAVAILABLE_SECTIONS: usize = 16;
 pub const MAX_HISTORY_MS: u64 = 30 * 60 * 1_000;
+pub const TRACE_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_TRACE_DURATION_MS: u64 = 60_000;
+pub const MAX_TRACE_DURATION_MS: u64 = 5 * 60_000;
+pub const MAX_TRACE_EVENTS: u64 = 50_000;
+pub const MAX_TRACE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_TRACE_LINE_BYTES: usize = 64 * 1024;
+const MAX_TRACE_MEASUREMENTS: usize = 32;
 const MAX_SAFE_LABEL_BYTES: usize = 64;
 const MAX_USB_PORT_DEPTH: usize = 8;
 
@@ -591,9 +598,304 @@ pub struct SupportProbeResult {
     pub ir: ProbeRoleOutcome,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TraceLimits {
+    pub duration_ms: u64,
+    pub max_events: u64,
+    pub max_bytes: u64,
+}
+
+impl TraceLimits {
+    #[must_use]
+    pub const fn bounded(duration_ms: u64) -> Self {
+        Self {
+            duration_ms: if duration_ms == 0 {
+                DEFAULT_TRACE_DURATION_MS
+            } else if duration_ms > MAX_TRACE_DURATION_MS {
+                MAX_TRACE_DURATION_MS
+            } else {
+                duration_ms
+            },
+            max_events: MAX_TRACE_EVENTS,
+            max_bytes: MAX_TRACE_BYTES,
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.duration_ms > 0
+            && self.duration_ms <= MAX_TRACE_DURATION_MS
+            && self.max_events > 0
+            && self.max_events <= MAX_TRACE_EVENTS
+            && self.max_bytes > 0
+            && self.max_bytes <= MAX_TRACE_BYTES
+    }
+}
+
+diagnostic_enum!(TraceWarning {
+    PrivilegedDiagnosticOracle,
+});
+diagnostic_enum!(TraceStage {
+    CameraOpen,
+    StreamArm,
+    RateEstablishment,
+    RgbCapture,
+    IrCapture,
+    Detection,
+    Liveness,
+    Matching,
+    EmitterRestore,
+});
+diagnostic_enum!(TraceMetric {
+    DeliveredFramesPerSecond,
+    MinimumFramesPerSecond,
+    CaptureSkewMilliseconds,
+    RgbBrightness,
+    IrBrightness,
+    IrAmbientShare,
+    IrCenterEdgeRatio,
+    IrEyeGlint,
+    FaceFraction,
+    HeadYawAsymmetry,
+    HeadPitchFraction,
+    LivenessScore,
+    MatchCosine,
+});
+diagnostic_enum!(TraceVerdict {
+    Live,
+    Spoof,
+    Uncertain,
+    Match,
+    NoMatch,
+});
+diagnostic_enum!(EmitterTraceOutcome {
+    Applied,
+    AlreadyActive,
+    Refused,
+    Restored,
+    RestoreFailed,
+    Unavailable,
+});
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct TraceMeasurement {
+    pub metric: TraceMetric,
+    pub value: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+}
+
+impl TraceMeasurement {
+    /// Construct one finite diagnostic measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value or optional threshold is not finite.
+    pub fn new(
+        metric: TraceMetric,
+        value: f64,
+        threshold: Option<f64>,
+    ) -> Result<Self, InvalidDiagnosticValue> {
+        if !value.is_finite() || threshold.is_some_and(|value| !value.is_finite()) {
+            return Err(InvalidDiagnosticValue);
+        }
+        Ok(Self {
+            metric,
+            value,
+            threshold,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceMeasurement {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            metric: TraceMetric,
+            value: f64,
+            #[serde(default)]
+            threshold: Option<f64>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.metric, wire.value, wire.threshold)
+            .map_err(|_| serde::de::Error::custom("trace measurements must be finite"))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum TraceEventKind {
+    TraceStarted {
+        limits: TraceLimits,
+        warning: TraceWarning,
+    },
+    Shared {
+        transition: ShareSafeEventKind,
+    },
+    StreamContract {
+        role: CameraRoleLabel,
+        requested: ExactStreamContract,
+        accepted: ExactStreamContract,
+    },
+    StreamEvidence {
+        role: CameraRoleLabel,
+        delivered: ExactFraction,
+        minimum: ExactFraction,
+        dropped_frames: u64,
+        continuity_epoch: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_ir: Option<bool>,
+    },
+    Emitter {
+        outcome: EmitterTraceOutcome,
+    },
+    StageTiming {
+        stage: TraceStage,
+        elapsed_us: u64,
+    },
+    DetectorCount {
+        role: CameraRoleLabel,
+        count: u32,
+    },
+    Decision {
+        verdict: TraceVerdict,
+        measurements: Vec<TraceMeasurement>,
+    },
+    EventsDropped {
+        count: u64,
+    },
+    Finished {
+        outcome: CategoricalOutcome,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub trace_schema: u32,
+    pub sequence: u64,
+    pub monotonic_us: u64,
+    pub utc_unix_ms: u64,
+    pub operation_id: OperationId,
+    pub operation: OperationClass,
+    pub event: TraceEventKind,
+    pub terminal: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedTrace {
+    records: Vec<TraceRecord>,
+}
+
+impl ParsedTrace {
+    #[must_use]
+    pub fn records(&self) -> &[TraceRecord] {
+        &self.records
+    }
+}
+
+#[derive(Debug)]
+pub enum TraceParseError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    Limit,
+    Schema,
+    Sequence,
+    Terminal,
+    InvalidEvent,
+}
+
+impl fmt::Display for TraceParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "trace read failed: {error}"),
+            Self::Json(error) => write!(formatter, "invalid trace JSON: {error}"),
+            Self::Limit => formatter.write_str("trace exceeds its bounded limits"),
+            Self::Schema => formatter.write_str("unsupported trace schema"),
+            Self::Sequence => formatter.write_str("trace sequence is not contiguous"),
+            Self::Terminal => formatter.write_str("trace needs exactly one final terminal record"),
+            Self::InvalidEvent => formatter.write_str("trace event violates its contract"),
+        }
+    }
+}
+
+impl std::error::Error for TraceParseError {}
+
+/// Parse and validate one complete bounded JSONL trace.
+///
+/// # Errors
+///
+/// Rejects I/O/JSON errors, oversized input, schema or sequence drift, invalid
+/// event bounds, and missing/duplicate/non-final terminal records.
+pub fn parse_trace<R: std::io::BufRead>(
+    mut reader: R,
+    limits: TraceLimits,
+) -> Result<ParsedTrace, TraceParseError> {
+    if !limits.valid() {
+        return Err(TraceParseError::Limit);
+    }
+    let mut records = Vec::new();
+    let mut line = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut terminal_seen = false;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(TraceParseError::Io)?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(read).map_err(|_| TraceParseError::Limit)?)
+            .ok_or(TraceParseError::Limit)?;
+        if total_bytes > limits.max_bytes
+            || line.len() > MAX_TRACE_LINE_BYTES
+            || u64::try_from(records.len()).unwrap_or(u64::MAX) >= limits.max_events
+        {
+            return Err(TraceParseError::Limit);
+        }
+        if terminal_seen {
+            return Err(TraceParseError::Terminal);
+        }
+        let record: TraceRecord = serde_json::from_slice(&line).map_err(TraceParseError::Json)?;
+        if record.trace_schema != TRACE_SCHEMA_VERSION {
+            return Err(TraceParseError::Schema);
+        }
+        if record.sequence != u64::try_from(records.len()).map_err(|_| TraceParseError::Limit)? {
+            return Err(TraceParseError::Sequence);
+        }
+        validate_trace_event(&record.event)?;
+        terminal_seen = record.terminal;
+        if record.terminal && !matches!(record.event, TraceEventKind::Finished { .. }) {
+            return Err(TraceParseError::Terminal);
+        }
+        records.push(record);
+    }
+    if records.is_empty() || !terminal_seen {
+        return Err(TraceParseError::Terminal);
+    }
+    Ok(ParsedTrace { records })
+}
+
+fn validate_trace_event(event: &TraceEventKind) -> Result<(), TraceParseError> {
+    match event {
+        TraceEventKind::TraceStarted { limits, .. } if !limits.valid() => {
+            Err(TraceParseError::Limit)
+        }
+        TraceEventKind::Decision { measurements, .. }
+            if measurements.len() > MAX_TRACE_MEASUREMENTS =>
+        {
+            Err(TraceParseError::InvalidEvent)
+        }
+        TraceEventKind::EventsDropped { count: 0 } => Err(TraceParseError::InvalidEvent),
+        _ => Ok(()),
+    }
+}
+
 /// A non-blocking recipient for already-sanitized production decisions.
 pub trait DiagnosticSink: Send + Sync {
     fn emit_share_safe(&self, _kind: ShareSafeEventKind) {}
+
+    fn emit_trace(&self, _kind: TraceEventKind) {}
 }
 
 impl DiagnosticSink for () {}
@@ -783,7 +1085,6 @@ mod tests {
                         | "embedding"
                         | "landmark"
                         | "score"
-                        | "threshold"
                         | "credential"
                         | "payload"
                 ),
@@ -881,5 +1182,122 @@ mod tests {
             let json = serde_json::to_string(&response).unwrap();
             assert!(serde_json::from_str::<Response>(&json).is_ok());
         }
+    }
+
+    fn trace_record(sequence: u64, event: TraceEventKind, terminal: bool) -> TraceRecord {
+        TraceRecord {
+            trace_schema: TRACE_SCHEMA_VERSION,
+            sequence,
+            monotonic_us: sequence * 10,
+            utc_unix_ms: 1_700_000_000_000 + sequence,
+            operation_id: OperationId::from_bytes([0x42; 16]),
+            operation: OperationClass::Authentication,
+            event,
+            terminal,
+        }
+    }
+
+    fn trace_jsonl(records: &[TraceRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    #[test]
+    fn trace_schema_allows_finite_measurements_but_forbids_biometric_payloads() {
+        let record = trace_record(
+            0,
+            TraceEventKind::Decision {
+                verdict: TraceVerdict::Live,
+                measurements: vec![TraceMeasurement::new(
+                    TraceMetric::LivenessScore,
+                    0.82,
+                    Some(0.75),
+                )
+                .unwrap()],
+            },
+            false,
+        );
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["event"]["measurements"][0]["value"], 0.82);
+        assert_eq!(value["event"]["measurements"][0]["threshold"], 0.75);
+        let mut keys = BTreeSet::new();
+        collect_keys(&value, &mut keys);
+        for forbidden in [
+            "user",
+            "username",
+            "profile",
+            "serial",
+            "device_path",
+            "frame",
+            "crop",
+            "landmark",
+            "embedding",
+            "credential",
+            "emitter_payload",
+        ] {
+            assert!(
+                !keys.contains(forbidden),
+                "forbidden trace key: {forbidden}"
+            );
+        }
+        assert!(TraceMeasurement::new(TraceMetric::MatchCosine, f64::NAN, None).is_err());
+    }
+
+    #[test]
+    fn trace_parser_accepts_one_contiguous_stream_with_one_final_terminal() {
+        let limits = TraceLimits::bounded(60_000);
+        let records = vec![
+            trace_record(
+                0,
+                TraceEventKind::TraceStarted {
+                    limits,
+                    warning: TraceWarning::PrivilegedDiagnosticOracle,
+                },
+                false,
+            ),
+            trace_record(
+                1,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let parsed = parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits).unwrap();
+        assert_eq!(parsed.records(), records);
+    }
+
+    #[test]
+    fn trace_parser_rejects_gaps_duplicate_terminal_and_oversize() {
+        let limits = TraceLimits::bounded(60_000);
+        let finished = |sequence| {
+            trace_record(
+                sequence,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            )
+        };
+        assert!(matches!(
+            parse_trace(std::io::Cursor::new(trace_jsonl(&[finished(1)])), limits),
+            Err(TraceParseError::Sequence)
+        ));
+        assert!(matches!(
+            parse_trace(
+                std::io::Cursor::new(trace_jsonl(&[finished(0), finished(1)])),
+                limits
+            ),
+            Err(TraceParseError::Terminal)
+        ));
+        let oversized = vec![b'x'; MAX_TRACE_LINE_BYTES + 1];
+        assert!(matches!(
+            parse_trace(std::io::Cursor::new(oversized), limits),
+            Err(TraceParseError::Limit)
+        ));
     }
 }

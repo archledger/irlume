@@ -609,6 +609,22 @@ impl QualificationContext {
     pub const fn ir_stream(&self) -> &StreamContract {
         &self.ir_stream
     }
+
+    /// Stable key over every fact that makes this exact live context equal.
+    ///
+    /// Unlike the persistent pair filename, this includes connection and
+    /// stream-contract fields. It is suitable for process-local health state:
+    /// moving the camera, changing link speed, or renegotiating either stream
+    /// cannot inherit a degradation observed under another context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the validated context cannot be encoded.
+    pub fn runtime_key(&self) -> Result<String, QualificationError> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| QualificationError::Json(error.to_string()))?;
+        Ok(irlume_common::sha256_hex(&encoded))
+    }
 }
 
 /// Summary of one sequential or concurrent probe arm.
@@ -1407,6 +1423,38 @@ mod tests {
         first.clear_serial_for_test();
         second.clear_serial_for_test();
         assert_ne!(first.filing_key(), second.filing_key());
+    }
+
+    #[test]
+    fn runtime_context_key_covers_stream_and_connection_context() {
+        let original = context("/devices/usb3/3-2");
+        let changed_stream = QualificationContext::new(
+            original.rgb_endpoint().clone(),
+            original.ir_endpoint().clone(),
+            stream(QualifiedStreamRole::Rgb, "NV12", 480),
+            original.ir_stream().clone(),
+        )
+        .unwrap();
+
+        let mut moved_rgb = original.rgb_endpoint().clone();
+        moved_rgb.connection = ConnectionContext::new(
+            "/devices/pci0000:00/0000:00:08.1".into(),
+            480_000,
+            "uvcvideo".into(),
+            "v4l2-uvc".into(),
+        )
+        .unwrap();
+        let changed_connection = QualificationContext::new(
+            moved_rgb,
+            original.ir_endpoint().clone(),
+            original.rgb_stream().clone(),
+            original.ir_stream().clone(),
+        )
+        .unwrap();
+
+        let key = original.runtime_key().unwrap();
+        assert_ne!(key, changed_stream.runtime_key().unwrap());
+        assert_ne!(key, changed_connection.runtime_key().unwrap());
     }
 
     #[test]

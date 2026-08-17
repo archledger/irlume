@@ -6092,16 +6092,47 @@ pub fn stored_capture_qualification(
     rgb_dev: &str,
     ir_dev: &str,
 ) -> irlume_common::Result<capture_qualification::QualificationResolution> {
+    Ok(stored_capture_qualification_state(rgb_dev, ir_dev)?.resolution)
+}
+
+/// A qualification resolution bound to the exact live context that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredCaptureQualificationState {
+    pub resolution: capture_qualification::QualificationResolution,
+    pub runtime_key: String,
+}
+
+/// Resolve durable v2 authority and retain its exact process-local context key.
+///
+/// Callers that may adapt their schedule after a live failure use the key to
+/// scope that adaptation to this stream tuple and USB connection. The key is
+/// not durable authority and must never be written as a qualification.
+///
+/// # Errors
+///
+/// Returns an error when current fd context cannot be collected, keyed, or the
+/// matching store record cannot be trusted.
+pub fn stored_capture_qualification_state(
+    rgb_dev: &str,
+    ir_dev: &str,
+) -> irlume_common::Result<StoredCaptureQualificationState> {
     let context = collect_qualification_context(rgb_dev, ir_dev)?;
+    let runtime_key = context
+        .runtime_key()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
     let record = capture_qualification::QualificationStore::system()
         .load(&context)
         .map_err(|error| Error::Hardware(error.to_string()))?;
-    Ok(record.map_or(
+    let resolution = record.map_or(
         capture_qualification::QualificationResolution::Unqualified(
             capture_qualification::QualificationMismatch::NoAuthority,
         ),
         |record| record.resolve(&context),
-    ))
+    );
+    Ok(StoredCaptureQualificationState {
+        resolution,
+        runtime_key,
+    })
 }
 
 fn qualification_arm(

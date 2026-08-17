@@ -846,26 +846,61 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 /// disagreed, "sequential" ordered the reads of two streams that were both
 /// live anyway, which on a bandwidth-starved camera is indistinguishable
 /// from concurrent (#187).
-fn sequential_capture_selected(rgb_dev: &str, ir_dev: &str) -> (bool, &'static str) {
-    let stored = match irlume_camera::stored_capture_qualification(rgb_dev, ir_dev) {
-        Ok(irlume_camera::capture_qualification::QualificationResolution::ConcurrentQualified) => {
-            Some(irlume_camera::CaptureMode::Concurrent)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureModeSelection {
+    sequential: bool,
+    source: &'static str,
+    runtime_key: Option<String>,
+}
+
+struct AuthenticationCaptureContext<'a> {
+    mode: Option<&'a CaptureModeSelection>,
+    operation: Option<&'a irlume_camera::lease::CameraOperationSession>,
+}
+
+fn capture_mode_selection(rgb_dev: &str, ir_dev: &str) -> CaptureModeSelection {
+    if let Ok(value) = std::env::var("IRLUME_SEQUENTIAL_CAPTURE") {
+        let (sequential, source) = capture_mode_decision(Some(&value), None);
+        return CaptureModeSelection {
+            sequential,
+            source,
+            runtime_key: None,
+        };
+    }
+
+    let (stored, runtime_key) = match irlume_camera::stored_capture_qualification_state(
+        rgb_dev, ir_dev,
+    ) {
+        Ok(state) => {
+            let stored = match state.resolution {
+                    irlume_camera::capture_qualification::QualificationResolution::ConcurrentQualified => {
+                        Some(irlume_camera::CaptureMode::Concurrent)
+                    }
+                    irlume_camera::capture_qualification::QualificationResolution::SequentialRequired(
+                        _,
+                    ) => Some(irlume_camera::CaptureMode::Sequential),
+                    irlume_camera::capture_qualification::QualificationResolution::Unqualified(
+                        _,
+                    ) => None,
+                };
+            (stored, Some(state.runtime_key))
         }
-        Ok(irlume_camera::capture_qualification::QualificationResolution::SequentialRequired(
-            _,
-        )) => Some(irlume_camera::CaptureMode::Sequential),
-        Ok(irlume_camera::capture_qualification::QualificationResolution::Unqualified(_)) => None,
         Err(error) => {
             irlume_common::dlog!(
                 "capture qualification unreadable ({error}); selecting one-at-a-time capture"
             );
-            None
+            (None, None)
         }
     };
-    capture_mode_decision(
-        std::env::var("IRLUME_SEQUENTIAL_CAPTURE").ok().as_deref(),
-        stored,
-    )
+    let selected = capture_mode_decision(None, stored);
+    let selected = with_runtime_capture_health(|health| {
+        apply_runtime_capture_health(selected, runtime_key.as_deref(), health)
+    });
+    CaptureModeSelection {
+        sequential: selected.0,
+        source: selected.1,
+        runtime_key,
+    }
 }
 
 /// The decision itself, pure over its two observations so every arm is
@@ -938,6 +973,104 @@ fn self_heal_may_recapture(
 /// two string literals that a rename would silently separate.
 const ENV_CAPTURE_MODE_SOURCE: &str = "IRLUME_SEQUENTIAL_CAPTURE";
 const STORED_CAPTURE_MODE_SOURCE: &str = "qualification-v2";
+const RUNTIME_CAPTURE_MODE_SOURCE: &str = "runtime-health";
+
+/// Evidence that makes this daemon process stop attempting concurrent capture
+/// for one exact qualification context. This is deliberately not serialized:
+/// a live authentication failure is useful immediate safety evidence, but it
+/// is not a controlled A/B qualification and therefore must not rewrite the
+/// durable hardware verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeDegradation {
+    ConcurrentCaptureFailure,
+    ConfirmedSignalLoss,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeCaptureHealth {
+    demoted: std::collections::HashMap<String, RuntimeDegradation>,
+}
+
+impl RuntimeCaptureHealth {
+    fn trip(&mut self, context_key: &str, reason: RuntimeDegradation) -> bool {
+        self.demoted
+            .insert(context_key.to_owned(), reason)
+            .is_none()
+    }
+
+    fn requires_sequential(&self, context_key: &str) -> bool {
+        self.demoted.contains_key(context_key)
+    }
+}
+
+/// Apply process-local health after the explicit/stored/default authority
+/// decision. An explicit environment override remains authoritative; health
+/// only narrows an otherwise-qualified concurrent schedule to the safe one.
+fn apply_runtime_capture_health(
+    selected: (bool, &'static str),
+    context_key: Option<&str>,
+    health: &RuntimeCaptureHealth,
+) -> (bool, &'static str) {
+    if selected.0 || selected.1 == ENV_CAPTURE_MODE_SOURCE {
+        return selected;
+    }
+    match context_key {
+        Some(key) if health.requires_sequential(key) => (true, RUNTIME_CAPTURE_MODE_SOURCE),
+        _ => selected,
+    }
+}
+
+static RUNTIME_CAPTURE_HEALTH: std::sync::OnceLock<std::sync::Mutex<RuntimeCaptureHealth>> =
+    std::sync::OnceLock::new();
+
+fn with_runtime_capture_health<T>(use_health: impl FnOnce(&RuntimeCaptureHealth) -> T) -> T {
+    let health = RUNTIME_CAPTURE_HEALTH
+        .get_or_init(|| std::sync::Mutex::new(RuntimeCaptureHealth::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    use_health(&health)
+}
+
+fn trip_runtime_capture_health(context_key: &str, reason: RuntimeDegradation) {
+    let first = {
+        let mut health = RUNTIME_CAPTURE_HEALTH
+            .get_or_init(|| std::sync::Mutex::new(RuntimeCaptureHealth::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        health.trip(context_key, reason)
+    };
+    if first {
+        eprintln!(
+            "irlumed: concurrent capture degraded for this exact camera context; using \n+             one-at-a-time RGB then IR capture until this daemon restarts or the context changes"
+        );
+    }
+}
+
+fn concurrent_hard_failure_is_degradation(
+    sequential: bool,
+    held_sessions: bool,
+    rgb_failed: bool,
+    ir_failed: bool,
+) -> bool {
+    !sequential && !held_sessions && (rgb_failed || ir_failed)
+}
+
+fn pair_rate_failure_is_degradation(selection: &CaptureModeSelection) -> bool {
+    !selection.sequential
+        && selection.source != ENV_CAPTURE_MODE_SOURCE
+        && selection.runtime_key.is_some()
+}
+
+fn demote_after_pair_rate_failure(selection: &mut CaptureModeSelection) {
+    if !pair_rate_failure_is_degradation(selection) {
+        return;
+    }
+    if let Some(context_key) = selection.runtime_key.as_deref() {
+        trip_runtime_capture_health(context_key, RuntimeDegradation::ConcurrentCaptureFailure);
+    }
+    selection.sequential = true;
+    selection.source = RUNTIME_CAPTURE_MODE_SOURCE;
+}
 
 /// Consecutive dimming self-heals on one camera pairing before irlume stops
 /// asking that pairing to capture concurrently (#100).
@@ -1006,57 +1139,6 @@ fn self_heal_streak(prev: u32, signal: CaptureModeSignal) -> u32 {
         CaptureModeSignal::Dimming => prev.saturating_add(1),
         CaptureModeSignal::Clean => 0,
         CaptureModeSignal::Inconclusive => prev,
-    }
-}
-
-/// Is a switch due? Pure over the two things that decide it.
-///
-/// An operator-forced mode is never learned from. `IRLUME_SEQUENTIAL_CAPTURE=0`
-/// is the only env value that can reach a self-heal at all (`=1` makes the
-/// capture sequential, and the self-heal only runs on concurrent captures), and
-/// [`capture_mode_decision`] already states the authority rule: a set env var
-/// "decides alone ... because setting it is an explicit instruction and the
-/// stored answer must not outrank it". Writing a persistent verdict inferred
-/// from a mode the operator forced for one debugging session inverts that rule
-/// from the other side: the write would sit inert while the var is set, then
-/// take effect the moment it is unset.
-#[allow(dead_code)] // used in capture_mode_switch_tests
-fn capture_mode_switch_due(mode_source: &str, streak: u32) -> bool {
-    mode_source != ENV_CAPTURE_MODE_SOURCE
-        && mode_source != STORED_CAPTURE_MODE_SOURCE
-        && streak >= SELF_HEAL_SWITCH_AFTER
-}
-
-/// The one journal line the switch leaves behind, or `None` when there is
-/// nothing to say.
-///
-/// Pure over the write's outcome, so the wording AND the rule that a failed
-/// write never fails the enrolment are both testable without a camera or root.
-/// The signature is the pin: this takes a `&Result` and returns text, so there
-/// is no way for the write's error to propagate into the enrolment.
-fn capture_mode_switch_line(
-    events: u32,
-    stored: &irlume_common::Result<irlume_camera::StoreIfConcurrent>,
-) -> Option<String> {
-    match stored {
-        Ok(irlume_camera::StoreIfConcurrent::Stored) => Some(format!(
-            "capture mode switched to sequential for this camera pair after {events} consecutive \
-             concurrent-capture RGB losses; captures are slower and reliable. Measure this camera \
-             directly with `sudo irlume camera-tune` to replace this with a measurement."
-        )),
-        // Already what the switch wanted: nothing changed, nothing to announce.
-        Ok(irlume_camera::StoreIfConcurrent::Superseded(Some(
-            irlume_camera::CaptureMode::Sequential,
-        ))) => None,
-        Ok(irlume_camera::StoreIfConcurrent::Superseded(other)) => Some(format!(
-            "capture mode: {events} consecutive concurrent-capture RGB losses on this camera pair, \
-             but the stored verdict changed underneath ({other:?}); left it alone"
-        )),
-        Err(e) => Some(format!(
-            "capture mode: could not persist the sequential switch for this camera pair after \
-             {events} consecutive concurrent-capture RGB losses ({e}); run `sudo irlume doctor` \
-             to see the mode in force"
-        )),
     }
 }
 
@@ -1142,7 +1224,79 @@ mod capture_mode_decision_tests {
 #[cfg(test)]
 mod capture_mode_switch_tests {
     use super::*;
-    use irlume_camera::{CaptureMode, StoreIfConcurrent};
+    use irlume_camera::CaptureMode;
+
+    #[test]
+    fn runtime_degradation_is_process_local_and_exact_context_scoped() {
+        let mut health = RuntimeCaptureHealth::default();
+        let qualified = (false, STORED_CAPTURE_MODE_SOURCE);
+
+        assert_eq!(
+            apply_runtime_capture_health(qualified, Some("dock-a"), &health),
+            qualified
+        );
+
+        health.trip("dock-a", RuntimeDegradation::ConcurrentCaptureFailure);
+
+        assert_eq!(
+            apply_runtime_capture_health(qualified, Some("dock-a"), &health),
+            (true, RUNTIME_CAPTURE_MODE_SOURCE)
+        );
+        assert_eq!(
+            apply_runtime_capture_health(qualified, Some("dock-b"), &health),
+            qualified,
+            "a failure on one exact USB context must not demote another"
+        );
+    }
+
+    #[test]
+    fn runtime_health_never_overrides_an_explicit_operator_mode() {
+        let mut health = RuntimeCaptureHealth::default();
+        health.trip("dock-a", RuntimeDegradation::ConfirmedSignalLoss);
+
+        assert_eq!(
+            apply_runtime_capture_health((false, ENV_CAPTURE_MODE_SOURCE), Some("dock-a"), &health,),
+            (false, ENV_CAPTURE_MODE_SOURCE)
+        );
+    }
+
+    #[test]
+    fn only_a_one_shot_concurrent_hard_failure_trips_runtime_health() {
+        assert!(concurrent_hard_failure_is_degradation(
+            false, false, true, false
+        ));
+        assert!(concurrent_hard_failure_is_degradation(
+            false, false, false, true
+        ));
+        assert!(!concurrent_hard_failure_is_degradation(
+            true, false, true, true
+        ));
+        assert!(!concurrent_hard_failure_is_degradation(
+            false, true, true, false
+        ));
+        assert!(!concurrent_hard_failure_is_degradation(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn a_qualified_pair_rate_failure_demotes_but_other_schedules_do_not() {
+        let qualified = CaptureModeSelection {
+            sequential: false,
+            source: STORED_CAPTURE_MODE_SOURCE,
+            runtime_key: Some("dock-a".into()),
+        };
+        assert!(pair_rate_failure_is_degradation(&qualified));
+
+        let mut sequential = qualified.clone();
+        sequential.sequential = true;
+        assert!(!pair_rate_failure_is_degradation(&sequential));
+
+        let mut forced = qualified;
+        forced.source = ENV_CAPTURE_MODE_SOURCE;
+        forced.runtime_key = None;
+        assert!(!pair_rate_failure_is_degradation(&forced));
+    }
 
     /// Both clauses are required, and neither is sufficient. The four rows are
     /// the four situations this rule exists to separate, each with numbers the
@@ -1191,7 +1345,7 @@ mod capture_mode_switch_tests {
         );
         assert_eq!(
             (0..=4)
-                .map(|n| capture_mode_switch_due("cameras.conf", n))
+                .map(|n| n >= SELF_HEAL_SWITCH_AFTER)
                 .collect::<Vec<_>>(),
             vec![false, false, false, true, true]
         );
@@ -1228,15 +1382,9 @@ mod capture_mode_switch_tests {
         assert_eq!(self_heal_streak(2, Dimming), 3);
     }
 
-    /// A mode the operator forced is never learned from, at any streak length.
+    /// A mode the operator forced is never narrowed by runtime learning.
     #[test]
-    fn an_operator_forced_mode_is_never_written_back() {
-        for n in [1, SELF_HEAL_SWITCH_AFTER, SELF_HEAL_SWITCH_AFTER + 1, 99] {
-            assert!(
-                !capture_mode_switch_due(ENV_CAPTURE_MODE_SOURCE, n),
-                "streak {n} under an operator-forced mode must not switch"
-            );
-        }
+    fn an_operator_forced_mode_is_never_learned_from() {
         // Bind the guard to the one place that produces the string, so a rename
         // breaks this test instead of silently disabling the guard.
         assert_eq!(
@@ -1247,65 +1395,6 @@ mod capture_mode_switch_tests {
         assert_eq!(
             capture_mode_decision(None, Some(CaptureMode::Concurrent)),
             (false, STORED_CAPTURE_MODE_SOURCE)
-        );
-        assert!(!capture_mode_switch_due(
-            STORED_CAPTURE_MODE_SOURCE,
-            SELF_HEAL_SWITCH_AFTER
-        ));
-    }
-
-    /// The journal line is checked by RETURN VALUE, never by capturing stderr:
-    /// the debug-log switch freezes in a `OnceLock`, which is why the comparable
-    /// notes in this codebase return their text instead of printing it.
-    #[test]
-    fn the_switch_announces_itself_and_names_the_override() {
-        let line = capture_mode_switch_line(3, &Ok(StoreIfConcurrent::Stored))
-            .expect("a completed switch says so");
-        assert!(line.contains("sequential"), "names the new mode: {line}");
-        assert!(line.contains('3'), "names the evidence: {line}");
-        assert!(
-            line.contains("camera-tune"),
-            "names how to replace it with a measurement: {line}"
-        );
-    }
-
-    /// A verdict that changed under us is left alone, and the line says which
-    /// happened. Silence is only correct when the stored mode already agrees.
-    #[test]
-    fn a_verdict_that_changed_under_us_is_left_alone() {
-        assert_eq!(
-            capture_mode_switch_line(
-                3,
-                &Ok(StoreIfConcurrent::Superseded(Some(CaptureMode::Sequential)))
-            ),
-            None,
-            "already sequential: nothing was done and nothing needs saying"
-        );
-        let line = capture_mode_switch_line(3, &Ok(StoreIfConcurrent::Superseded(None)))
-            .expect("a verdict that vanished is worth a line");
-        assert!(
-            !line.contains("switched to sequential"),
-            "must not claim a write that did not happen: {line}"
-        );
-    }
-
-    /// A failed write is reported and never claims the mode changed. The
-    /// signature is the real pin: taking a `&Result` and returning text means
-    /// the error has no path into the enrolment's own result.
-    #[test]
-    fn a_failed_write_is_reported_and_never_claims_the_mode() {
-        let line = capture_mode_switch_line(
-            3,
-            &Err(irlume_common::Error::Hardware(
-                "cannot identify the RGB camera".into(),
-            )),
-        )
-        .expect("a failed write must be visible");
-        assert!(line.contains("could not persist"), "{line}");
-        assert!(line.contains("cannot identify the RGB camera"), "{line}");
-        assert!(
-            !line.contains("switched to sequential"),
-            "must not claim the switch landed: {line}"
         );
     }
 }
@@ -1926,7 +2015,7 @@ impl Engine {
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )>,
-        capture_mode: Option<(bool, &'static str)>,
+        capture_mode: Option<&CaptureModeSelection>,
         operation: &irlume_camera::lease::CameraOperationSession,
     ) -> irlume_common::Result<Assessment> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
@@ -1945,21 +2034,27 @@ impl Engine {
         // strict back-to-back capture (RGB, then IR only if RGB succeeded) to
         // isolate a suspected concurrency problem.
         // Order of authority: an explicit env override, then what the
-        // capture-mode probe measured on THIS camera (`irlume camera-tune`,
-        // stored per camera identity in cameras.conf), then the sequential
-        // default. The probe exists because the dimming above is a property of
-        // the hardware, not of irlume: the NexiGo N930W keeps 56% of its RGB
-        // brightness when both of its interfaces stream, the ASUS built-in keeps
-        // all of it, and only a measurement on the actual camera can tell which
-        // kind is plugged in.
-        // The caller's snapshot when sessions are HELD, a fresh read only when
-        // this call opens one-shot. Two reads of cameras.conf around one held
-        // capture are a check-to-act window (#313 review): the first read
-        // arms both streams for concurrent, a config write lands, and the
-        // second read orders "sequential" reads over two already-live
-        // streams, the exact state the mode exists to prevent.
-        let (sequential, mode_source) = capture_mode
-            .unwrap_or_else(|| sequential_capture_selected(&self.rgb_dev, &self.ir_dev));
+        // capture-mode probe measured for THIS exact endpoint pair, negotiated
+        // stream tuple, controller and link speed (`irlume camera-tune`), then
+        // the sequential default. The probe exists because the dimming above
+        // is a property of the whole live hardware context, not just a camera
+        // model: the NexiGo N930W keeps 56% of its RGB brightness when both of
+        // its interfaces stream, the ASUS built-in keeps all of it, and only a
+        // measurement on the actual connection can tell which schedule works.
+        // The caller supplies one snapshot when sessions are HELD; a one-shot
+        // call resolves once before opening either stream. Re-resolving after
+        // both streams are live would be a check-to-act window and can collide
+        // with cameras that reject a second open (#187, #313).
+        let fresh_selection;
+        let capture_mode = match capture_mode {
+            Some(selection) => selection,
+            None => {
+                fresh_selection = capture_mode_selection(&self.rgb_dev, &self.ir_dev);
+                &fresh_selection
+            }
+        };
+        let sequential = capture_mode.sequential;
+        let mode_source = capture_mode.source;
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
         // guessing this measurement work exists to remove.
@@ -2092,6 +2187,20 @@ impl Engine {
                 (rgb, rgb_ms, ir.map(Some), ir_ms)
             })
         };
+        let concurrent_hard_failure = concurrent_hard_failure_is_degradation(
+            sequential,
+            held_sessions,
+            rgb_res.is_err(),
+            ir_res.is_err(),
+        );
+        if concurrent_hard_failure {
+            if let Some(context_key) = capture_mode.runtime_key.as_deref() {
+                trip_runtime_capture_health(
+                    context_key,
+                    RuntimeDegradation::ConcurrentCaptureFailure,
+                );
+            }
+        }
         // Retry a hard-failed side alone: with the other stream stopped, a
         // bandwidth-starved capture succeeds; a genuine fault (privacy
         // switch, missing node) fails again with the same error. Logged so a
@@ -3147,7 +3256,8 @@ impl Engine {
         // below tries to open the same device again, which is EBUSY on a
         // single-consumer camera and on any v4l2loopback node with a producer
         // attached.
-        let (sequential, _mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
+        let mut capture_mode = capture_mode_selection(&rgb_dev, &ir_dev);
+        let sequential = capture_mode.sequential;
         // Declared in reverse drop order: the sessions borrow from `_cams`, so
         // Rust drops the sessions first and the cameras after.
         //
@@ -3181,14 +3291,19 @@ impl Engine {
                     // front, draining both streams concurrently. Best-effort: a
                     // failure is logged, and the per-frame serial fill in
                     // `next()` still re-attempts (and fails closed) on capture.
-                    if let Err(error) = irlume_camera::establish_pair_rate(&mut rs, &mut is) {
-                        irlume_common::dlog!(
-                            "auth: held pair could not establish delivered-rate evidence \
-                             ({error}); the per-frame fill will retry"
-                        );
+                    match irlume_camera::establish_pair_rate(&mut rs, &mut is) {
+                        Ok(()) => {
+                            held_rgb = Some(rs);
+                            held_ir = Some(is);
+                        }
+                        Err(error) => {
+                            irlume_common::dlog!(
+                                "auth: held pair could not establish delivered-rate evidence \
+                                 ({error}); dropping both streams and retrying one-at-a-time"
+                            );
+                            demote_after_pair_rate_failure(&mut capture_mode);
+                        }
                     }
-                    held_rgb = Some(rs);
-                    held_ir = Some(is);
                 }
             }
         }
@@ -3202,7 +3317,10 @@ impl Engine {
                     service,
                     &mut held_rgb,
                     &mut held_ir,
-                    Some(&camera_operation),
+                    AuthenticationCaptureContext {
+                        mode: Some(&capture_mode),
+                        operation: Some(&camera_operation),
+                    },
                 )
             })?;
             if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
@@ -3238,16 +3356,16 @@ impl Engine {
         // `authenticate_for`.
         held_rgb: &mut Option<irlume_camera::RgbSession<'_>>,
         held_ir: &mut Option<irlume_camera::IrSession<'_>>,
-        operation: Option<&irlume_camera::lease::CameraOperationSession>,
+        capture: AuthenticationCaptureContext<'_>,
     ) -> irlume_common::Result<Outcome> {
         let a = if !self.ir_available {
             self.assess_rgb_only()?
         } else if let (Some(rs), Some(is), Some(operation)) =
-            (held_rgb.as_mut(), held_ir.as_mut(), operation)
+            (held_rgb.as_mut(), held_ir.as_mut(), capture.operation)
         {
-            self.assess_full_with(Some((rs, is)), None, operation)?
-        } else if let Some(operation) = operation {
-            self.assess_full_with(None, None, operation)?
+            self.assess_full_with(Some((rs, is)), capture.mode, operation)?
+        } else if let Some(operation) = capture.operation {
+            self.assess_full_with(None, capture.mode, operation)?
         } else {
             self.assess()?
         };
@@ -3806,7 +3924,9 @@ impl Engine {
         // mode exists for exactly the cameras that cannot sustain both
         // streams, so on them this loop takes the per-frame path, which
         // opens one stream at a time and releases it before the other.
-        let (sequential, mode_source) = sequential_capture_selected(&rgb_dev, &ir_dev);
+        let mut capture_mode = capture_mode_selection(&rgb_dev, &ir_dev);
+        let sequential = capture_mode.sequential;
+        let mode_source = capture_mode.source;
         if sequential {
             irlume_common::dlog!(
                 "enroll: sequential capture mode (from {mode_source}); not holding \
@@ -3822,20 +3942,25 @@ impl Engine {
                 // front, draining both streams concurrently so neither starves
                 // the other's buffer queue. Best-effort: a failure is logged
                 // and the per-frame serial fill still re-attempts on capture.
-                if let Err(error) = irlume_camera::establish_pair_rate(&mut rs, &mut is) {
-                    irlume_common::dlog!(
-                        "enroll: held pair could not establish delivered-rate evidence \
-                         ({error}); the per-frame fill will retry"
-                    );
+                match irlume_camera::establish_pair_rate(&mut rs, &mut is) {
+                    Ok(()) => {
+                        return self.capture_scan_loop(
+                            want,
+                            pitch_neutral,
+                            Some((&mut rs, &mut is)),
+                            Some(&capture_mode),
+                            &operation,
+                            observed,
+                        );
+                    }
+                    Err(error) => {
+                        irlume_common::dlog!(
+                            "enroll: held pair could not establish delivered-rate evidence \
+                             ({error}); dropping both streams and retrying one-at-a-time"
+                        );
+                        demote_after_pair_rate_failure(&mut capture_mode);
+                    }
                 }
-                return self.capture_scan_loop(
-                    want,
-                    pitch_neutral,
-                    Some((&mut rs, &mut is)),
-                    Some((sequential, mode_source)),
-                    &operation,
-                    observed,
-                );
             }
         }
         // No held session. RELEASE THE DEVICES FIRST. The per-frame path below
@@ -3857,7 +3982,7 @@ impl Engine {
             want,
             pitch_neutral,
             None,
-            Some((sequential, mode_source)),
+            Some(&capture_mode),
             &operation,
             observed,
         )
@@ -3877,7 +4002,7 @@ impl Engine {
             &mut irlume_camera::RgbSession<'_>,
             &mut irlume_camera::IrSession<'_>,
         )>,
-        capture_mode: Option<(bool, &'static str)>,
+        capture_mode: Option<&CaptureModeSelection>,
         operation: &irlume_camera::lease::CameraOperationSession,
         observed: &mut CaptureShape,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
@@ -4061,13 +4186,13 @@ impl Engine {
         concurrent_mean < solo_mean * irlume_camera::CONCURRENT_SIGNAL_FLOOR
     }
 
-    /// Stop asking this pairing to capture concurrently once the enrolment loop
-    /// has seen enough evidence and the solo probe and A/B/A check both confirm
-    /// the camera is dimming under concurrent load (#100).
+    /// Stop asking this exact live context to capture concurrently for the rest
+    /// of this daemon process once enrollment's solo probe and A/B/A check both
+    /// confirm signal loss (#100).
     ///
-    /// A failed write is reported and dropped. This runs at the tail of an
-    /// enrolment that has already reached its verdict, and read-only `/etc` must
-    /// not turn a successful enrolment into an error.
+    /// This must remain process-local. Authentication traffic is not the
+    /// controlled qualification experiment and cannot rewrite durable v2
+    /// authority; `camera-tune` is the only path that may do that.
     fn maybe_switch_capture_mode_from_enrolment(
         &mut self,
         consecutive_ir_only: usize,
@@ -4077,28 +4202,17 @@ impl Engine {
         if consecutive_ir_only < SELF_HEAL_SWITCH_AFTER as usize {
             return;
         }
-        let (_, mode_source) = sequential_capture_selected(&self.rgb_dev, &self.ir_dev);
-        if mode_source == ENV_CAPTURE_MODE_SOURCE {
+        let selection = capture_mode_selection(&self.rgb_dev, &self.ir_dev);
+        if selection.sequential || selection.source == ENV_CAPTURE_MODE_SOURCE {
             return;
         }
-        if irlume_camera::capture_mode_pair_identity(&self.rgb_dev, &self.ir_dev).is_none() {
+        let Some(context_key) = selection.runtime_key.as_deref() else {
             return;
-        }
+        };
         if !self.aba_check_confirms(held_mean, solo_mean) {
             return;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let stored = irlume_camera::store_sequential_if_still_concurrent(
-            &self.rgb_dev,
-            &self.ir_dev,
-            now,
-            consecutive_ir_only as u32,
-        );
-        if let Some(line) = capture_mode_switch_line(SELF_HEAL_SWITCH_AFTER, &stored) {
-            eprintln!("irlumed: {line}");
-        }
+        trip_runtime_capture_health(context_key, RuntimeDegradation::ConfirmedSignalLoss);
     }
 
     /// Enroll `want` scans (capped at MAX_SCANS_PER_PROFILE). If the captured
@@ -4781,9 +4895,9 @@ struct CaptureShape {
     ir_only_attempts: usize,
     /// CONSECUTIVE (not total) attempts with the IR-only shape. A clean
     /// attempt (RGB found a face) resets this to zero. This is the trigger for
-    /// the capture-mode auto-switch (#100): three consecutive IR-only attempts
-    /// within one held enrolment loop, and the solo probe confirms the
-    /// camera is dimming under concurrent capture.
+    /// the process-local capture-mode breaker (#100): three consecutive
+    /// IR-only attempts within one held enrolment loop, followed by the solo
+    /// probe and A/B/A confirmation of concurrent signal loss.
     consecutive_ir_only: usize,
 }
 
@@ -4813,7 +4927,7 @@ impl CaptureShape {
         self.ir_only_attempts += other.ir_only_attempts;
         self.rgb_mean_sum += other.rgb_mean_sum;
         // The LAST loop's consecutive streak is the one that matters: the
-        // top-up loop runs after the probe loop, and the writer needs the
+        // top-up loop runs after the probe loop, and the breaker needs the
         // streak from the loop that just failed. Summing would let the probe
         // loop's streak (which was broken by a successful probe capture) pad
         // the top-up loop's, overcounting.
@@ -4945,8 +5059,8 @@ fn capture_advice(shape: CaptureShape, solo_probe: Option<StarvationProbeResult>
         // 2026-08-10, held 28.9 to 31.8 with no face, solo 163 with one. Naming
         // the camera first would put the wrong cause at the front of the
         // sentence in every one of them. The second held phase that WOULD
-        // separate the two is what #379's config write needs; a message does
-        // not earn a second pair of session opens on a failed enrolment.
+        // separate the two is the A/B/A check used before tripping runtime
+        // health; the diagnostic message itself asserts only the observations.
         Some(_) => String::from(
             "the colour frame was dark on every attempt while both sensors were streaming, and \
              a capture taken straight afterwards with only the colour sensor running found a \
@@ -6338,7 +6452,7 @@ mod tests {
     }
 
     /// A clean capture (RGB face found) resets the consecutive streak to zero,
-    /// so the auto-switch is never reached by summing coincidences weeks apart.
+    /// so the runtime breaker is never reached by summing unrelated events.
     #[test]
     fn a_clean_capture_resets_the_consecutive_ir_only_streak() {
         let mut shape = CaptureShape::default();

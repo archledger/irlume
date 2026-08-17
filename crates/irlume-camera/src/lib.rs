@@ -31,6 +31,7 @@
 //! panic on some drivers. Probe, don't assume.
 
 mod backend;
+pub mod capture_qualification;
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;

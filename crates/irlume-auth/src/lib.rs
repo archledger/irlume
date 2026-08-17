@@ -4876,12 +4876,10 @@ fn solo_probe_confirms_starvation(held_mean: f32, solo_mean: f32, solo_found_fac
 /// since the shipped capture default is sequential and only a stored
 /// `concurrent` verdict reaches the starvation case at all.
 ///
-/// The remedy says "in a lit room" on purpose. `camera-tune` stores its
-/// verdict unconditionally under `ProbeStore::Always`, and `conclusive()`
-/// records retention reading 121%, 122% and 126% at an RGB mean of 17, which
-/// is arithmetic on noise rather than a camera gaining signal. Advising a
-/// re-measure without that qualifier would talk a user in a dark room into
-/// persisting exactly the wrong verdict.
+/// The remedy says "in a lit room" on purpose. Retention reads 121%, 122% and
+/// 126% at an RGB mean of 17, which is arithmetic on noise rather than a camera
+/// gaining signal. `camera-tune` now refuses to store that weak evidence, and
+/// the qualifier tells the user how to produce a conclusive measurement.
 fn concurrent_starvation_hint(shape: CaptureShape) -> Option<&'static str> {
     // Held path only, and only when EVERY attempt had the shape. One attempt
     // out of ten is a user who blinked or turned away; ten out of ten on a
@@ -6551,11 +6549,9 @@ mod tests {
             with_hint.contains("dimming its colour stream"),
             "the second reading must be offered: {with_hint}"
         );
-        // The remedy is qualified on purpose. `camera-tune` stores under
-        // `ProbeStore::Always` without consulting `conclusive()`, and retention
-        // reads 121-126% at an RGB mean of 17, so advising a re-measure without
-        // "lit room" talks a user in the dark into persisting a Concurrent
-        // verdict computed from noise.
+        // The remedy is qualified on purpose. Retention reads 121-126% at an
+        // RGB mean of 17; `camera-tune` refuses that evidence, and "lit room"
+        // says how to make the re-measure conclusive.
         assert!(
             with_hint.contains("in a lit room"),
             "the re-measure advice must name the lighting it needs: {with_hint}"

@@ -97,6 +97,11 @@ pub(crate) const IR_LIT_MEAN: f32 = 40.0;
 /// Minimum mean lift over the emitter-off baseline before [`discover`]
 /// calls a control a success; filters ambient flicker and exposure drift.
 const AUTOCONF_MIN_LIFT: f32 = 20.0;
+/// A baseline/restored burst is affirmative D1-off evidence only when the two
+/// raw-sequence phases differ by no more than one decoded 8-bit mean point.
+/// Anything above that noise-sized band is ambiguous rather than the negation
+/// of the much stronger D1 proof threshold.
+const AUTOCONF_MAX_OFF_PHASE_DELTA: f32 = 1.0;
 /// One lost image or illumination record does not erase a burst, but a burst
 /// cannot bridge arbitrary capture discontinuities and remain one observation.
 const MAX_D1_MISSING_SEQUENCE_FRAMES: u32 = 1;
@@ -112,6 +117,13 @@ pub(crate) struct D1OpticalEvidence {
     consistent_pairs: usize,
     conflicting_pairs: usize,
     invalid_sequence_steps: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpticalD1Verdict {
+    Proven,
+    Refuted,
+    Inconclusive,
 }
 
 impl D1OpticalEvidence {
@@ -200,14 +212,31 @@ impl D1OpticalEvidence {
         }
     }
 
-    const fn proves_d1(self) -> bool {
-        self.valid_for_causality()
-            && self.phase_delta >= AUTOCONF_MIN_LIFT
+    const fn verdict(self) -> OpticalD1Verdict {
+        if !self.valid_for_causality() {
+            return OpticalD1Verdict::Inconclusive;
+        }
+        if self.phase_delta >= AUTOCONF_MIN_LIFT
             && self.bright_phase_support >= 3
             && self.dark_phase_support >= 3
             && self.consistent_pairs >= 3
             && self.conflicting_pairs == 0
-            && self.invalid_sequence_steps == 0
+        {
+            return OpticalD1Verdict::Proven;
+        }
+        if self.phase_delta <= AUTOCONF_MAX_OFF_PHASE_DELTA
+            && self.bright_phase_support == 0
+            && self.dark_phase_support == 0
+            && self.consistent_pairs == 0
+            && self.conflicting_pairs == 0
+        {
+            return OpticalD1Verdict::Refuted;
+        }
+        OpticalD1Verdict::Inconclusive
+    }
+
+    const fn proves_d1(self) -> bool {
+        matches!(self.verdict(), OpticalD1Verdict::Proven)
     }
 
     const fn valid_for_causality(self) -> bool {
@@ -215,7 +244,7 @@ impl D1OpticalEvidence {
     }
 
     const fn refutes_d1(self) -> bool {
-        self.valid_for_causality() && !self.proves_d1()
+        matches!(self.verdict(), OpticalD1Verdict::Refuted)
     }
 }
 
@@ -5353,6 +5382,31 @@ mod tests {
 
         let (outcome, _log, current, dir) =
             run_discovery(a_working_camera(), "optical-invalid-baseline", || {
+                measurements.next()
+            });
+
+        assert!(
+            matches!(outcome, Ok(Attempt::Inconclusive(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1]);
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subthreshold_periodicity_is_ambiguous_not_affirmative_d1_off() {
+        let _lock = crate::testenv::env_lock();
+        let weak_periodic = optical_burst(&[10.0, 29.0, 10.0, 29.0, 10.0, 29.0, 10.0, 29.0]);
+        let mut measurements = [
+            weak_periodic,
+            optical_burst(&[10.0, 40.0, 10.0, 40.0, 10.0, 40.0, 10.0, 40.0]),
+            weak_periodic,
+        ]
+        .into_iter();
+
+        let (outcome, _log, current, dir) =
+            run_discovery(a_working_camera(), "optical-ambiguous-baseline", || {
                 measurements.next()
             });
 

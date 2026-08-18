@@ -1328,6 +1328,10 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         std::mem::take(&mut self.privacy_refused)
     }
 
+    fn privacy_refused(&self) -> bool {
+        self.privacy_refused
+    }
+
     fn stop(&mut self) {
         let Some(inner) = self.inner.take() else {
             return;
@@ -1511,6 +1515,12 @@ impl<S> TrackedStream<S> {
 }
 
 impl TrackedStream<SafeStream<'_>> {
+    fn privacy_refused(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(CameraStateStream::privacy_refused)
+    }
+
     fn take_privacy_refusal(&mut self) -> bool {
         self.stream
             .as_mut()
@@ -1839,6 +1849,17 @@ fn fill_rate_then_drain_metadata<E>(
     fill_rate()?;
     drain_metadata();
     Ok(())
+}
+
+fn finish_hidden_rate_fill<E>(
+    result: Result<(), E>,
+    privacy_refused: bool,
+    drain_metadata: impl FnOnce(),
+) -> Result<(), E> {
+    if !privacy_refused {
+        drain_metadata();
+    }
+    result
 }
 
 /// Establish the delivered-rate window for TWO streams by filling each one on
@@ -4748,6 +4769,14 @@ impl IrSession<'_> {
                 "IR stream missing after a failed recovery".into(),
             ));
         }
+        let rate_fill = self.stream.fill_rate_evidence();
+        let privacy_refused = self.stream.privacy_refused();
+        finish_hidden_rate_fill(rate_fill, privacy_refused, || {
+            if let Some(log) = self.meta.as_mut() {
+                log.drain();
+            }
+        })
+        .map_err(|error| map_io(device, error))?;
         let stream = &mut self.stream;
         let dec = &mut self.dec;
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
@@ -5191,6 +5220,12 @@ pub fn establish_pair_rate(
 ) -> irlume_common::Result<()> {
     let device = rgb.cam.device.clone();
     let result = establish_concurrent_rate(&mut rgb.stream, &mut ir.stream);
+    let privacy_refused = ir.stream.privacy_refused();
+    let result = finish_hidden_rate_fill(result, privacy_refused, || {
+        if let Some(log) = ir.meta.as_mut() {
+            log.drain();
+        }
+    });
     if ir.stream.take_privacy_refusal() {
         let refusal = result
             .err()
@@ -8011,8 +8046,39 @@ mod tests {
             || calls.borrow_mut().push("drain-metadata"),
         )
         .expect("fixture fill succeeds");
+        calls.borrow_mut().push("begin-burst");
+        calls.borrow_mut().push("exposed-dequeue");
 
-        assert_eq!(*calls.borrow(), ["fill-rate", "drain-metadata"]);
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "fill-rate",
+                "drain-metadata",
+                "begin-burst",
+                "exposed-dequeue"
+            ]
+        );
+    }
+
+    #[test]
+    fn reusable_rate_fill_errors_requeue_metadata_but_privacy_refusals_do_not() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result =
+            finish_hidden_rate_fill(Err::<(), _>("ordinary delivery error"), false, || {
+                calls.borrow_mut().push("drain-metadata")
+            });
+        assert_eq!(result, Err("ordinary delivery error"));
+        assert_eq!(*calls.borrow(), ["drain-metadata"]);
+
+        calls.borrow_mut().clear();
+        let result = finish_hidden_rate_fill(Err::<(), _>("privacy refusal"), true, || {
+            calls.borrow_mut().push("must-not-drain")
+        });
+        assert_eq!(result, Err("privacy refusal"));
+        assert!(
+            calls.borrow().is_empty(),
+            "privacy refusal must proceed directly to teardown"
+        );
     }
 
     #[test]

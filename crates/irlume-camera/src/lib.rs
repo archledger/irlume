@@ -580,6 +580,28 @@ enum PrivacyBoundary {
     RequireReleased,
 }
 
+#[derive(Debug)]
+struct PrivacyBoundaryRefusal(String);
+
+impl std::fmt::Display for PrivacyBoundaryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PrivacyBoundaryRefusal {}
+
+fn privacy_boundary_error(why: String) -> std::io::Error {
+    std::io::Error::other(PrivacyBoundaryRefusal(why))
+}
+
+fn is_privacy_boundary_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PrivacyBoundaryRefusal>())
+        .is_some()
+}
+
 #[derive(Clone)]
 struct V4l2CameraState {
     device: String,
@@ -666,7 +688,7 @@ impl CameraState for V4l2CameraState {
     fn require_dequeue_boundary(&self, dev: &Device) -> std::io::Result<()> {
         self.require_endpoint().map_err(std::io::Error::other)?;
         if self.privacy_boundary == PrivacyBoundary::RequireReleased {
-            privacy_permits_ir_capture(privacy_state(dev)).map_err(std::io::Error::other)?;
+            privacy_permits_ir_capture(privacy_state(dev)).map_err(privacy_boundary_error)?;
         }
         Ok(())
     }
@@ -1039,6 +1061,7 @@ struct CameraStateStream<'a, S: CameraState> {
     layout: frame_provenance::PayloadLayout,
     state_started: bool,
     stream_started_validated: bool,
+    privacy_refused: bool,
 }
 
 type SafeStream<'a> = CameraStateStream<'a, V4l2CameraState>;
@@ -1235,6 +1258,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
             layout,
             state_started: false,
             stream_started_validated: false,
+            privacy_refused: false,
         };
         verify_stream_state(
             &stream.state,
@@ -1265,13 +1289,26 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
             expected_interval,
             layout,
             stream_started_validated,
+            privacy_refused,
             ..
         } = self;
-        let dequeued = dequeue_validated_typed(
-            inner.as_mut().expect("stream taken only in Drop"),
-            *layout,
-            || state.require_dequeue_boundary(dev),
-        )?;
+        let inner = inner.as_mut().ok_or_else(|| {
+            ValidatedDequeueError::Io(std::io::Error::other(
+                "capture stream stopped after privacy refusal",
+            ))
+        })?;
+        let dequeued = match dequeue_validated_typed(inner, *layout, || {
+            state.require_dequeue_boundary(dev)
+        }) {
+            Ok(dequeued) => dequeued,
+            Err(error) => {
+                if matches!(&error, ValidatedDequeueError::Io(io) if is_privacy_boundary_error(io))
+                {
+                    *privacy_refused = true;
+                }
+                return Err(error);
+            }
+        };
         if !*stream_started_validated {
             verify_stream_snapshot(
                 state,
@@ -1285,6 +1322,24 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
             *stream_started_validated = true;
         }
         Ok(dequeued)
+    }
+
+    fn take_privacy_refusal(&mut self) -> bool {
+        std::mem::take(&mut self.privacy_refused)
+    }
+
+    fn stop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let device = self.device.clone();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(inner))).is_err() {
+            irlume_common::dlog!("{device}: stream teardown failed (STREAMOFF); frames unaffected");
+        }
+        if self.state_started {
+            self.state.stop_stream();
+            self.state_started = false;
+        }
     }
 }
 
@@ -1452,6 +1507,14 @@ impl<S> TrackedStream<S> {
         // then re-seeds the baseline in the new epoch.
         self.rate_window.reset();
         Ok(())
+    }
+}
+
+impl TrackedStream<SafeStream<'_>> {
+    fn take_privacy_refusal(&mut self) -> bool {
+        self.stream
+            .as_mut()
+            .is_some_and(CameraStateStream::take_privacy_refusal)
     }
 }
 
@@ -1889,18 +1952,28 @@ fn install_recovered_resources<S, M, G, E>(
     }
 }
 
+fn teardown_ir_after_privacy_refusal<S, M, E>(
+    stream: &mut Option<S>,
+    metadata: &mut Option<M>,
+    restore_emitter: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    drop(stream.take());
+    drop(metadata.take());
+    restore_emitter()
+}
+
+fn finish_privacy_teardown<E: std::fmt::Display>(refusal: Error, restore: Result<(), E>) -> Error {
+    match restore {
+        Ok(()) => refusal,
+        Err(restore) => Error::Hardware(format!(
+            "{refusal}; additionally could not restore the emitter after the privacy refusal: {restore}"
+        )),
+    }
+}
+
 impl<S: CameraState> Drop for CameraStateStream<'_, S> {
     fn drop(&mut self) {
-        let Some(inner) = self.inner.take() else {
-            return;
-        };
-        let device = self.device.clone();
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(inner))).is_err() {
-            irlume_common::dlog!("{device}: stream teardown failed (STREAMOFF); frames unaffected");
-        }
-        if self.state_started {
-            self.state.stop_stream();
-        }
+        self.stop();
     }
 }
 
@@ -4625,6 +4698,30 @@ impl IrSession<'_> {
     /// (#221).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+        let result = self.capture_with_stats_inner();
+        if !self.stream.take_privacy_refusal() {
+            return result;
+        }
+        let refusal = result.err().unwrap_or_else(|| {
+            Error::Hardware(format!(
+                "{}: privacy boundary refused a capture after it produced a frame",
+                self.cam.device
+            ))
+        });
+        Err(self.stop_after_privacy_refusal(refusal))
+    }
+
+    fn stop_after_privacy_refusal(&mut self, refusal: Error) -> Error {
+        let restore =
+            teardown_ir_after_privacy_refusal(&mut self.stream.stream, &mut self.meta, || {
+                self._mode.restore()
+            });
+        self._mode = ir_emitter::StreamMode::inert();
+        self.lit = false;
+        finish_privacy_teardown(refusal, restore)
+    }
+
+    fn capture_with_stats_inner(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
         let device = self.cam.device.as_str();
         let lease = self.cam.lease.clone();
         lease
@@ -5093,8 +5190,20 @@ pub fn establish_pair_rate(
     ir: &mut IrSession<'_>,
 ) -> irlume_common::Result<()> {
     let device = rgb.cam.device.clone();
-    establish_concurrent_rate(&mut rgb.stream, &mut ir.stream)
-        .map_err(|error| map_io(&device, error))
+    let result = establish_concurrent_rate(&mut rgb.stream, &mut ir.stream);
+    if ir.stream.take_privacy_refusal() {
+        let refusal = result
+            .err()
+            .map(|error| map_io(&ir.cam.device, error))
+            .unwrap_or_else(|| {
+                Error::Hardware(format!(
+                    "{}: privacy boundary refused paired rate establishment",
+                    ir.cam.device
+                ))
+            });
+        return Err(ir.stop_after_privacy_refusal(refusal));
+    }
+    result.map_err(|error| map_io(&device, error))
 }
 
 /// Ambient-subtraction helpers (Windows-Hello-style illuminated minus ambient).
@@ -8062,7 +8171,7 @@ mod tests {
             self.dequeue_boundary_calls.set(call);
             if self.fail_dequeue_boundary_at == Some(call) {
                 self.calls.borrow_mut().push("privacy_refusal");
-                return Err(std::io::Error::other("privacy boundary failure"));
+                return Err(privacy_boundary_error("privacy boundary failure".into()));
             }
             self.require_endpoint()
         }
@@ -8213,6 +8322,10 @@ mod tests {
             error.to_string().contains("privacy boundary failure"),
             "{error}"
         );
+        assert!(
+            stream.take_privacy_refusal(),
+            "the session boundary must retain the typed refusal for teardown"
+        );
         drop(stream);
 
         let calls = calls.borrow();
@@ -8227,7 +8340,7 @@ mod tests {
         let cleanup = calls
             .iter()
             .position(|call| *call == "cleanup")
-            .expect("the rejected frame tears down its stream");
+            .expect("the rejected frame tears down when its owner responds to the marker");
         assert!(dequeue < refusal && refusal < cleanup, "{calls:?}");
     }
 
@@ -8798,6 +8911,51 @@ mod tests {
 
         assert_eq!(payload, &[1, 2, 3, 4]);
         assert_eq!(facts.bytes_used(), 4);
+    }
+
+    #[test]
+    fn privacy_refusal_stops_image_and_metadata_before_emitter_restore() {
+        #[derive(Debug)]
+        struct DropMark {
+            name: &'static str,
+            drops: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.drops.borrow_mut().push(self.name);
+            }
+        }
+
+        let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mark = |name| DropMark {
+            name,
+            drops: std::rc::Rc::clone(&drops),
+        };
+        let mut image = Some(mark("image-stream"));
+        let mut metadata = Some(mark("metadata-stream"));
+
+        teardown_ir_after_privacy_refusal(&mut image, &mut metadata, || {
+            drops.borrow_mut().push("emitter-restore");
+            Ok::<(), &str>(())
+        })
+        .expect("restore succeeds");
+
+        assert_eq!(
+            drops.borrow().as_slice(),
+            ["image-stream", "metadata-stream", "emitter-restore"]
+        );
+    }
+
+    #[test]
+    fn privacy_cleanup_reports_both_refusal_and_restore_failure() {
+        let error = finish_privacy_teardown(
+            Error::Hardware("privacy boundary failure".into()),
+            Err::<(), _>("restore failed"),
+        );
+        let message = error.to_string();
+        assert!(message.contains("privacy boundary failure"), "{message}");
+        assert!(message.contains("restore failed"), "{message}");
     }
 
     #[test]

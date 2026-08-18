@@ -2155,6 +2155,38 @@ impl EmitterBackend for InertBackend {
     fn attach_lease(&mut self, _lease: crate::lease::CameraLease) {}
 }
 
+#[cfg(test)]
+struct SentinelBackend {
+    events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    lit: bool,
+    owns_restore: bool,
+}
+
+#[cfg(test)]
+impl EmitterBackend for SentinelBackend {
+    fn lit(&self) -> bool {
+        self.lit
+    }
+
+    fn owns_restore(&self) -> bool {
+        self.owns_restore
+    }
+
+    fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        if self.owns_restore {
+            self.events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push("emitter-restore");
+            self.owns_restore = false;
+            self.lit = false;
+        }
+        Ok(())
+    }
+
+    fn attach_lease(&mut self, _lease: crate::lease::CameraLease) {}
+}
+
 /// The face-auth emitter guard, held for the lifetime of ONE stream and put
 /// back when the stream ends. Backend-agnostic: it wraps an `EmitterBackend`,
 /// so the UVC extension-unit write and a future LED-class or V4L2-control
@@ -2176,6 +2208,17 @@ impl StreamMode {
     /// A guard over nothing: no control was applied, so `Drop` writes nothing.
     pub(crate) fn inert() -> Self {
         StreamMode::new(Box::new(InertBackend))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sentinel(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> Self {
+        StreamMode::new(Box::new(SentinelBackend {
+            events,
+            lit: true,
+            owns_restore: true,
+        }))
     }
 
     /// Whether the emitter control is active for this stream, whoever set it.

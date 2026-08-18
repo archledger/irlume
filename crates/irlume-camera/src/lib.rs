@@ -610,6 +610,8 @@ struct V4l2CameraState {
     privacy_boundary: PrivacyBoundary,
     #[cfg(test)]
     privacy_refusal_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    delivery_failure_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl V4l2CameraState {
@@ -621,6 +623,8 @@ impl V4l2CameraState {
             privacy_boundary: PrivacyBoundary::LeaseOnly,
             #[cfg(test)]
             privacy_refusal_countdown: Default::default(),
+            #[cfg(test)]
+            delivery_failure_countdown: Default::default(),
         }
     }
 
@@ -636,6 +640,8 @@ impl V4l2CameraState {
             privacy_boundary: PrivacyBoundary::LeaseOnly,
             #[cfg(test)]
             privacy_refusal_countdown: Default::default(),
+            #[cfg(test)]
+            delivery_failure_countdown: Default::default(),
         }
     }
 
@@ -651,6 +657,8 @@ impl V4l2CameraState {
             privacy_boundary: PrivacyBoundary::RequireReleased,
             #[cfg(test)]
             privacy_refusal_countdown: Default::default(),
+            #[cfg(test)]
+            delivery_failure_countdown: Default::default(),
         }
     }
 }
@@ -695,6 +703,19 @@ impl CameraState for V4l2CameraState {
 
     fn require_dequeue_boundary(&self, dev: &Device) -> std::io::Result<()> {
         self.require_endpoint().map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let failed = self
+                .delivery_failure_countdown
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok_and(|remaining| remaining == 1);
+            if failed {
+                return Err(std::io::Error::other("injected delivery failure"));
+            }
+        }
         if self.privacy_boundary == PrivacyBoundary::RequireReleased {
             #[cfg(test)]
             {
@@ -1094,6 +1115,12 @@ impl CameraStateStream<'_, V4l2CameraState> {
     fn refuse_privacy_after(&self, boundaries: usize) {
         self.state
             .privacy_refusal_countdown
+            .store(boundaries, std::sync::atomic::Ordering::Release);
+    }
+
+    fn fail_delivery_after(&self, boundaries: usize) {
+        self.state
+            .delivery_failure_countdown
             .store(boundaries, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1553,6 +1580,14 @@ impl TrackedStream<SafeStream<'_>> {
             .as_ref()
             .expect("test sabotage requires a live stream")
             .refuse_privacy_after(boundaries);
+    }
+
+    #[cfg(test)]
+    fn fail_delivery_after(&self, boundaries: usize) {
+        self.stream
+            .as_ref()
+            .expect("test sabotage requires a live stream")
+            .fail_delivery_after(boundaries);
     }
 
     fn privacy_refused(&self) -> bool {
@@ -13535,6 +13570,12 @@ mod tests {
         .expect("acquire IR operation");
         let camera = operation.open_ir(&ir_path).expect("open IR camera");
         let mut session = camera.session().expect("open IR session");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.meta = Some(ir_metadata::IlluminationLog::test_sentinel(events.clone()));
+        session._mode = ir_emitter::StreamMode::test_sentinel(events.clone());
+        session.lit = session._mode.lit();
+        assert!(session.meta.is_some());
+        assert!(session.lit && session._mode.owns_restore());
         session.stream.refuse_privacy_after(1);
 
         let error = match session.capture_with_stats() {
@@ -13561,6 +13602,16 @@ mod tests {
             !session._mode.owns_restore(),
             "the restore is no longer live"
         );
+        let events = events.lock().unwrap_or_else(|error| error.into_inner());
+        let metadata_drop = events
+            .iter()
+            .position(|event| *event == "metadata-drop")
+            .expect("metadata sentinel must be dropped");
+        let emitter_restore = events
+            .iter()
+            .position(|event| *event == "emitter-restore")
+            .expect("owned emitter sentinel must be restored");
+        assert!(metadata_drop < emitter_restore, "{events:?}");
     }
 
     #[test]
@@ -13577,6 +13628,12 @@ mod tests {
         let ir_camera = operation.open_ir(&ir_path).expect("open IR camera");
         let mut rgb = rgb_camera.session().expect("open RGB session");
         let mut ir = ir_camera.session().expect("open IR session");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ir.meta = Some(ir_metadata::IlluminationLog::test_sentinel(events.clone()));
+        ir._mode = ir_emitter::StreamMode::test_sentinel(events.clone());
+        ir.lit = ir._mode.lit();
+        assert!(ir.meta.is_some());
+        assert!(ir.lit && ir._mode.owns_restore());
         rgb.stream.rate_window.reset();
         ir.stream.rate_window.reset();
         let rgb_before = rgb.stream.accounting().0;
@@ -13601,6 +13658,81 @@ mod tests {
         assert!(
             rgb.stream.accounting().0.saturating_sub(rgb_before) <= 1,
             "RGB may finish one in-flight dequeue, never the bounded fill"
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            ["metadata-drop", "emitter-restore"],
+            "privacy skips metadata drain and tears down before restore"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_recovered_fill_drains_metadata_before_the_exposed_burst() {
+        let (_, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire IR operation");
+        let camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let mut session = camera.session().expect("open IR session");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.meta = Some(ir_metadata::IlluminationLog::test_sentinel(events.clone()));
+        session.stream.rate_window.reset();
+
+        session
+            .capture_with_stats()
+            .expect("recovered-shape serial fill and capture succeed");
+
+        let events = events.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            events.get(..2),
+            Some(["metadata-drain", "metadata-begin-burst"].as_slice()),
+            "the hidden fill must requeue metadata before any exposed burst"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_pair_rate_ordinary_error_drains_metadata_without_teardown() {
+        let (rgb_path, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str(), ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire pair operation");
+        let rgb_camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let ir_camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let mut rgb = rgb_camera.session().expect("open RGB session");
+        let mut ir = ir_camera.session().expect("open IR session");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ir.meta = Some(ir_metadata::IlluminationLog::test_sentinel(events.clone()));
+        ir._mode = ir_emitter::StreamMode::test_sentinel(events.clone());
+        ir.lit = ir._mode.lit();
+        rgb.stream.rate_window.reset();
+        ir.stream.rate_window.reset();
+        ir.stream.fail_delivery_after(1);
+
+        let error = establish_pair_rate(&mut rgb, &mut ir)
+            .expect_err("ordinary injected delivery failure must be reported");
+
+        assert!(error.to_string().contains("injected delivery failure"));
+        assert!(ir.stream.stream.is_some(), "ordinary error stays reusable");
+        assert!(ir.meta.is_some(), "ordinary error keeps metadata open");
+        assert!(ir.lit && ir._mode.owns_restore());
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            ["metadata-drain"],
+            "ordinary failure requeues metadata and performs no teardown"
         );
     }
 

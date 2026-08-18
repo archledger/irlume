@@ -454,6 +454,8 @@ pub(crate) struct IlluminationLog {
     /// changed for the next process to open this camera.
     restore_format: u32,
     streaming: bool,
+    #[cfg(test)]
+    sentinel_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
 
 impl IlluminationLog {
@@ -483,6 +485,8 @@ impl IlluminationLog {
             by_timestamp: std::collections::HashMap::new(),
             restore_format: UVCH,
             streaming: false,
+            #[cfg(test)]
+            sentinel_events: None,
         };
         match log.start() {
             Ok(()) => Some(log),
@@ -597,6 +601,13 @@ impl IlluminationLog {
     /// would grow for the life of the session. Called once before a burst
     /// rather than inside `drain`, which runs per frame.
     pub(crate) fn begin_burst(&mut self) {
+        #[cfg(test)]
+        if let Some(events) = &self.sentinel_events {
+            events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push("metadata-begin-burst");
+        }
         self.by_timestamp.clear();
     }
 
@@ -606,6 +617,14 @@ impl IlluminationLog {
     /// queues advance together, so a drain per image frame keeps up, and a
     /// missed record costs one frame's classification rather than a stall.
     pub(crate) fn drain(&mut self) {
+        #[cfg(test)]
+        if let Some(events) = &self.sentinel_events {
+            events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push("metadata-drain");
+            return;
+        }
         if !self.streaming {
             return;
         }
@@ -674,10 +693,33 @@ impl IlluminationLog {
             std::io::Error::last_os_error()
         ))
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_sentinel(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> Self {
+        Self {
+            fd: -1,
+            device: "test-metadata".into(),
+            buffers: Vec::new(),
+            by_timestamp: std::collections::HashMap::new(),
+            restore_format: 0,
+            streaming: false,
+            sentinel_events: Some(events),
+        }
+    }
 }
 
 impl Drop for IlluminationLog {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(events) = &self.sentinel_events {
+            events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push("metadata-drop");
+            return;
+        }
         if self.streaming {
             let mut kind = META_CAPTURE as c_int;
             let _ = self.ioctl(

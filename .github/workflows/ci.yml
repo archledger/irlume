@@ -321,7 +321,7 @@ jobs:
           # harness-owned nodes (see THREAT_MODEL.md).
           IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9,/dev/video10
         run: |
-          ./scripts/run-tests-guarded.sh --min 17 -- cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 19 -- cargo test -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 7 -- cargo test -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 5 -- cargo test -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 1 -- cargo test -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1

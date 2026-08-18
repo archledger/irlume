@@ -97,6 +97,9 @@ pub(crate) const IR_LIT_MEAN: f32 = 40.0;
 /// Minimum mean lift over the emitter-off baseline before [`discover`]
 /// calls a control a success; filters ambient flicker and exposure drift.
 const AUTOCONF_MIN_LIFT: f32 = 20.0;
+/// One lost image or illumination record does not erase a burst, but a burst
+/// cannot bridge arbitrary capture discontinuities and remain one observation.
+const MAX_D1_MISSING_SEQUENCE_FRAMES: u32 = 1;
 
 /// Phase-locked optical evidence from one D1 setup burst.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,6 +107,8 @@ pub(crate) struct D1OpticalEvidence {
     even_frames: usize,
     odd_frames: usize,
     phase_delta: f32,
+    bright_phase_support: usize,
+    dark_phase_support: usize,
     consistent_pairs: usize,
     conflicting_pairs: usize,
     invalid_sequence_steps: usize,
@@ -135,9 +140,23 @@ impl D1OpticalEvidence {
         let even_median = median(&even).unwrap_or(0.0);
         let odd_median = median(&odd).unwrap_or(0.0);
         let bright_even = even_median > odd_median;
+        let (bright_phase, bright_median, dark_phase, dark_median) = if bright_even {
+            (&even, even_median, &odd, odd_median)
+        } else {
+            (&odd, odd_median, &even, even_median)
+        };
+        let bright_phase_support = bright_phase
+            .iter()
+            .filter(|mean| **mean >= dark_median + AUTOCONF_MIN_LIFT)
+            .count();
+        let dark_phase_support = dark_phase
+            .iter()
+            .filter(|mean| **mean <= bright_median - AUTOCONF_MIN_LIFT)
+            .count();
         let mut consistent_pairs = 0;
         let mut conflicting_pairs = 0;
         let mut invalid_sequence_steps = usize::from(!valid);
+        let mut missing_sequence_frames = 0u32;
         for pair in observations.windows(2) {
             let [(first_sequence, first_mean), (second_sequence, second_mean)] = pair else {
                 unreachable!("windows(2) always has two entries")
@@ -147,6 +166,13 @@ impl D1OpticalEvidence {
                 invalid_sequence_steps += 1;
                 continue;
             }
+            missing_sequence_frames = match missing_sequence_frames.checked_add(gap - 1) {
+                Some(missing) if missing <= MAX_D1_MISSING_SEQUENCE_FRAMES => missing,
+                _ => {
+                    invalid_sequence_steps += 1;
+                    continue;
+                }
+            };
             if gap != 1 {
                 continue;
             }
@@ -166,6 +192,8 @@ impl D1OpticalEvidence {
             even_frames: even.len(),
             odd_frames: odd.len(),
             phase_delta: (even_median - odd_median).abs(),
+            bright_phase_support,
+            dark_phase_support,
             consistent_pairs,
             conflicting_pairs,
             invalid_sequence_steps,
@@ -176,6 +204,8 @@ impl D1OpticalEvidence {
         self.even_frames >= 3
             && self.odd_frames >= 3
             && self.phase_delta >= AUTOCONF_MIN_LIFT
+            && self.bright_phase_support >= 3
+            && self.dark_phase_support >= 3
             && self.consistent_pairs >= 3
             && self.conflicting_pairs == 0
             && self.invalid_sequence_steps == 0
@@ -208,6 +238,7 @@ impl D1MetadataEvidence {
         let mut previous = None;
         let mut parity_consistent_pairs = 0;
         let mut parity_conflicts = 0;
+        let mut missing_sequence_frames = 0u32;
         for (sequence, flag) in observations.iter().copied() {
             let Some(lit) = flag else {
                 continue;
@@ -218,10 +249,20 @@ impl D1MetadataEvidence {
                 // Natural u32 wrap remains a small positive delta.
                 if gap == 0 || gap > i32::MAX as u32 {
                     parity_conflicts += 1;
-                } else if (lit == previous_lit) == (gap % 2 == 0) {
-                    parity_consistent_pairs += 1;
                 } else {
-                    parity_conflicts += 1;
+                    missing_sequence_frames = match missing_sequence_frames.checked_add(gap - 1) {
+                        Some(missing) if missing <= MAX_D1_MISSING_SEQUENCE_FRAMES => missing,
+                        _ => {
+                            parity_conflicts += 1;
+                            previous = Some((sequence, lit));
+                            continue;
+                        }
+                    };
+                    if (lit == previous_lit) == (gap % 2 == 0) {
+                        parity_consistent_pairs += 1;
+                    } else {
+                        parity_conflicts += 1;
+                    }
                 }
             }
             previous = Some((sequence, lit));
@@ -9717,6 +9758,36 @@ mod tests {
         assert_eq!(evidence.parity_conflicts, 0, "{evidence:?}");
     }
 
+    /// Parity survives any even gap mathematically, but evidence continuity
+    /// does not. Setup may tolerate one missing frame; it may not join two
+    /// unrelated capture epochs across an unbounded driver drop.
+    #[test]
+    fn d1_evidence_rejects_an_unbounded_forward_sequence_gap() {
+        let metadata = D1MetadataEvidence::from_sequence_flags(&[
+            (10, Some(false)),
+            (11, Some(true)),
+            (12, Some(false)),
+            (13, Some(true)),
+            (10_014, Some(false)),
+            (10_015, Some(true)),
+            (10_016, Some(false)),
+            (10_017, Some(true)),
+        ]);
+        let optical = D1OpticalEvidence::from_sequence_means(&[
+            (10, 10.0),
+            (11, 40.0),
+            (12, 10.0),
+            (13, 40.0),
+            (10_014, 10.0),
+            (10_015, 40.0),
+            (10_016, 10.0),
+            (10_017, 40.0),
+        ]);
+
+        assert!(!metadata.proves_d1(), "{metadata:?}");
+        assert!(!optical.proves_d1(), "{optical:?}");
+    }
+
     /// The metadata-absent fallback looks for the physical signature D1
     /// defines: a stable bright/dark phase keyed to raw frame parity. A smooth
     /// exposure excursion can move the burst maximum just as far, but cannot
@@ -9743,9 +9814,23 @@ mod tests {
             (16, 20.0),
             (17, 10.0),
         ]);
+        let two_spikes = D1OpticalEvidence::from_sequence_means(&[
+            (10, 0.0),
+            (11, 40.0),
+            (12, 0.0),
+            (13, 40.0),
+            (14, 0.0),
+            (15, 0.0),
+            (16, 0.0),
+            (17, 0.0),
+        ]);
 
         assert!(periodic.proves_d1(), "{periodic:?}");
         assert!(!exposure_drift.proves_d1(), "{exposure_drift:?}");
+        assert!(
+            !two_spikes.proves_d1(),
+            "two transient spikes are not stable phase support: {two_spikes:?}"
+        );
     }
 
     // --- round 6 ---------------------------------------------------------

@@ -608,6 +608,8 @@ struct V4l2CameraState {
     lease: lease::CameraLease,
     accepted_interval: Option<frame_interval::FrameInterval>,
     privacy_boundary: PrivacyBoundary,
+    #[cfg(test)]
+    privacy_refusal_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl V4l2CameraState {
@@ -617,6 +619,8 @@ impl V4l2CameraState {
             lease,
             accepted_interval: None,
             privacy_boundary: PrivacyBoundary::LeaseOnly,
+            #[cfg(test)]
+            privacy_refusal_countdown: Default::default(),
         }
     }
 
@@ -630,6 +634,8 @@ impl V4l2CameraState {
             lease,
             accepted_interval: Some(accepted_interval),
             privacy_boundary: PrivacyBoundary::LeaseOnly,
+            #[cfg(test)]
+            privacy_refusal_countdown: Default::default(),
         }
     }
 
@@ -643,6 +649,8 @@ impl V4l2CameraState {
             lease,
             accepted_interval: Some(accepted_interval),
             privacy_boundary: PrivacyBoundary::RequireReleased,
+            #[cfg(test)]
+            privacy_refusal_countdown: Default::default(),
         }
     }
 }
@@ -688,6 +696,21 @@ impl CameraState for V4l2CameraState {
     fn require_dequeue_boundary(&self, dev: &Device) -> std::io::Result<()> {
         self.require_endpoint().map_err(std::io::Error::other)?;
         if self.privacy_boundary == PrivacyBoundary::RequireReleased {
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                let refused = self
+                    .privacy_refusal_countdown
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok_and(|remaining| remaining == 1);
+                if refused {
+                    return Err(privacy_boundary_error(
+                        "injected privacy boundary failure".into(),
+                    ));
+                }
+            }
             privacy_permits_ir_capture(privacy_state(dev)).map_err(privacy_boundary_error)?;
         }
         Ok(())
@@ -1065,6 +1088,15 @@ struct CameraStateStream<'a, S: CameraState> {
 }
 
 type SafeStream<'a> = CameraStateStream<'a, V4l2CameraState>;
+
+#[cfg(test)]
+impl CameraStateStream<'_, V4l2CameraState> {
+    fn refuse_privacy_after(&self, boundaries: usize) {
+        self.state
+            .privacy_refusal_countdown
+            .store(boundaries, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// How long a single frame dequeue may block.
 ///
@@ -1515,6 +1547,14 @@ impl<S> TrackedStream<S> {
 }
 
 impl TrackedStream<SafeStream<'_>> {
+    #[cfg(test)]
+    fn refuse_privacy_after(&self, boundaries: usize) {
+        self.stream
+            .as_ref()
+            .expect("test sabotage requires a live stream")
+            .refuse_privacy_after(boundaries);
+    }
+
     fn privacy_refused(&self) -> bool {
         self.stream
             .as_ref()
@@ -13480,6 +13520,87 @@ mod tests {
         for f in &seq {
             assert!(f.data.len() >= (IR_W * IR_H) as usize);
         }
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_privacy_refusal_tears_down_the_reusable_ir_session() {
+        let (_, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire IR operation");
+        let camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let mut session = camera.session().expect("open IR session");
+        session.stream.refuse_privacy_after(1);
+
+        let error = match session.capture_with_stats() {
+            Ok(_) => panic!("the injected live privacy boundary must refuse"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected privacy boundary failure"),
+            "{error}"
+        );
+        assert!(
+            session.stream.stream.is_none(),
+            "the image queue must be stopped before the refusal returns"
+        );
+        assert!(
+            session.meta.is_none(),
+            "the metadata queue must be stopped before emitter restoration"
+        );
+        assert!(!session.lit, "a privacy-stopped session is inert");
+        assert!(
+            !session._mode.owns_restore(),
+            "the restore is no longer live"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_pair_rate_privacy_refusal_stops_only_ir_and_cancels_rgb() {
+        let (rgb_path, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str(), ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire pair operation");
+        let rgb_camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let ir_camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let mut rgb = rgb_camera.session().expect("open RGB session");
+        let mut ir = ir_camera.session().expect("open IR session");
+        rgb.stream.rate_window.reset();
+        ir.stream.rate_window.reset();
+        let rgb_before = rgb.stream.accounting().0;
+        ir.stream.refuse_privacy_after(1);
+
+        let error = establish_pair_rate(&mut rgb, &mut ir)
+            .expect_err("the injected IR privacy boundary must refuse paired fill");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected privacy boundary failure"),
+            "{error}"
+        );
+        assert!(ir.stream.stream.is_none(), "IR image queue must stop");
+        assert!(ir.meta.is_none(), "IR metadata queue must stop");
+        assert!(!ir.lit && !ir._mode.owns_restore());
+        assert!(
+            rgb.stream.stream.is_some(),
+            "the companion remains reusable after cancellation"
+        );
+        assert!(
+            rgb.stream.accounting().0.saturating_sub(rgb_before) <= 1,
+            "RGB may finish one in-flight dequeue, never the bounded fill"
+        );
     }
 
     #[test]

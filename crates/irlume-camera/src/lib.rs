@@ -612,6 +612,10 @@ struct V4l2CameraState {
     privacy_refusal_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     delivery_failure_countdown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    boundary_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    boundary_barrier_used: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl V4l2CameraState {
@@ -625,6 +629,10 @@ impl V4l2CameraState {
             privacy_refusal_countdown: Default::default(),
             #[cfg(test)]
             delivery_failure_countdown: Default::default(),
+            #[cfg(test)]
+            boundary_barrier: None,
+            #[cfg(test)]
+            boundary_barrier_used: Default::default(),
         }
     }
 
@@ -642,6 +650,10 @@ impl V4l2CameraState {
             privacy_refusal_countdown: Default::default(),
             #[cfg(test)]
             delivery_failure_countdown: Default::default(),
+            #[cfg(test)]
+            boundary_barrier: None,
+            #[cfg(test)]
+            boundary_barrier_used: Default::default(),
         }
     }
 
@@ -659,6 +671,10 @@ impl V4l2CameraState {
             privacy_refusal_countdown: Default::default(),
             #[cfg(test)]
             delivery_failure_countdown: Default::default(),
+            #[cfg(test)]
+            boundary_barrier: None,
+            #[cfg(test)]
+            boundary_barrier_used: Default::default(),
         }
     }
 }
@@ -706,6 +722,11 @@ impl CameraState for V4l2CameraState {
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
+            if !self.boundary_barrier_used.swap(true, Ordering::AcqRel) {
+                if let Some(barrier) = &self.boundary_barrier {
+                    barrier.wait();
+                }
+            }
             let failed = self
                 .delivery_failure_countdown
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -1122,6 +1143,13 @@ impl CameraStateStream<'_, V4l2CameraState> {
         self.state
             .delivery_failure_countdown
             .store(boundaries, std::sync::atomic::Ordering::Release);
+    }
+
+    fn synchronize_next_boundary(&mut self, barrier: std::sync::Arc<std::sync::Barrier>) {
+        self.state.boundary_barrier = Some(barrier);
+        self.state
+            .boundary_barrier_used
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1588,6 +1616,14 @@ impl TrackedStream<SafeStream<'_>> {
             .as_ref()
             .expect("test sabotage requires a live stream")
             .fail_delivery_after(boundaries);
+    }
+
+    #[cfg(test)]
+    fn synchronize_next_boundary(&mut self, barrier: std::sync::Arc<std::sync::Barrier>) {
+        self.stream
+            .as_mut()
+            .expect("test synchronization requires a live stream")
+            .synchronize_next_boundary(barrier);
     }
 
     fn privacy_refused(&self) -> bool {
@@ -13641,6 +13677,9 @@ mod tests {
         rgb.stream.rate_window.reset();
         ir.stream.rate_window.reset();
         let rgb_before = rgb.stream.accounting().0;
+        let boundary = std::sync::Arc::new(std::sync::Barrier::new(2));
+        rgb.stream.synchronize_next_boundary(boundary.clone());
+        ir.stream.synchronize_next_boundary(boundary);
         ir.stream.refuse_privacy_after(1);
 
         let error = establish_pair_rate(&mut rgb, &mut ir)

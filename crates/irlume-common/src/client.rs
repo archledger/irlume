@@ -95,6 +95,21 @@ pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<R
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
 }
 
+/// Open a bounded-time connection for a protocol that keeps reading after its
+/// first response line (currently the privileged diagnostic trace).
+///
+/// # Errors
+///
+/// Returns the same mapped connection/permission failures as [`request`], or a
+/// socket timeout configuration failure.
+pub fn connect_stream(rw_timeout: Duration) -> io::Result<UnixStream> {
+    let stream =
+        connect_with_timeout(&socket_path(), CONNECT_TIMEOUT).map_err(map_connect_failure)?;
+    stream.set_read_timeout(Some(rw_timeout))?;
+    stream.set_write_timeout(Some(rw_timeout))?;
+    Ok(stream)
+}
+
 /// Whether this failure PROVES nobody is listening on the socket.
 ///
 /// The distinction matters wherever "the daemon is not there" licenses an act

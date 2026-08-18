@@ -36,6 +36,7 @@ mod secrets;
 mod strays;
 mod suncal;
 mod support_report;
+mod trace;
 mod tui;
 mod uninstall;
 
@@ -244,6 +245,7 @@ fn main() -> std::process::ExitCode {
         }
         (Some("doctor"), _) => doctor(&args),
         (Some("support-report"), _) => support_report::run(&args),
+        (Some("trace"), _) => trace::run(&args),
         (Some("normprobe"), _) => normprobe(&args),
         (Some("status"), _) => commands::status(&args),
         (Some("detect"), _) => commands::detect(&args),

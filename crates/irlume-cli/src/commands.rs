@@ -2022,6 +2022,8 @@ SETUP & STATUS
   detect                script probe; exit 0=ready / 10=partial / 20=absent
   doctor                platform / TPM / Secure Boot / camera / model checks
   support-report [--output FILE.txt] [--since 10m] [--probe]
+  trace [record] [--duration 60s] [--output FILE.jsonl]
+  trace explain FILE.jsonl [--output FILE.txt]
                         create a private 0600 report; default is read-only and
                         camera-free, while --probe is explicit and root-only
   deps                  verify runtime dependencies (onnxruntime, models, TPM)

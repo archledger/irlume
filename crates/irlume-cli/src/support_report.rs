@@ -526,7 +526,7 @@ fn utc_timestamp() -> String {
     format_utc("%Y-%m-%dT%H:%M:%SZ").unwrap_or_else(|| "unknown".into())
 }
 
-fn utc_filename_timestamp() -> String {
+pub(crate) fn utc_filename_timestamp() -> String {
     format_utc("%Y%m%d-%H%M%S").unwrap_or_else(|| "unknown-time".into())
 }
 

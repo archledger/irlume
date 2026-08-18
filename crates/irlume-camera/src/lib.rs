@@ -510,13 +510,6 @@ fn apply_blc(cam: &RgbCamera) -> Option<BlcRestore<'_>> {
     }
 }
 
-/// Frozen-stream recovery for burst captures: after this many consecutive
-/// identical frames the stream is torn down and re-opened, at most
-/// `FROZEN_RESTART_BUDGET` times per burst (a fully static feed therefore
-/// yields 1 + budget frames instead of hanging).
-const FROZEN_RUN_BEFORE_RESTART: usize = 2;
-const FROZEN_RESTART_BUDGET: usize = 4;
-
 /// mmap ring size for every V4L2 capture stream. Four buffers is the classic
 /// quad-buffer: enough that the driver never stalls waiting for a dequeue at
 /// 30fps, small enough to be granted by every UVC camera we have seen.
@@ -559,6 +552,14 @@ trait CameraState {
         stage: &'static str,
     ) -> irlume_common::Result<frame_interval::FrameInterval>;
     fn require_endpoint(&self) -> Result<(), Self::EndpointError>;
+    /// Revalidate every invariant that can change while a dequeue blocks.
+    ///
+    /// The default preserves the lease-only behavior used by RGB and injected
+    /// test states. IR V4L2 streams additionally require a freshly released
+    /// privacy state on the same open device before and after every dequeue.
+    fn require_dequeue_boundary(&self, _dev: &Self::Device) -> std::io::Result<()> {
+        self.require_endpoint().map_err(std::io::Error::other)
+    }
     fn compare_format(&self, expected: &Format, current: &Format) -> Option<String>;
     fn claim_buffers<'a>(&self, dev: &'a Self::Device) -> std::io::Result<Self::Claim<'a>>;
     fn accepted_interval(&self) -> Option<frame_interval::FrameInterval>;
@@ -573,11 +574,18 @@ trait CameraState {
     fn stop_stream(&self);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivacyBoundary {
+    LeaseOnly,
+    RequireReleased,
+}
+
 #[derive(Clone)]
 struct V4l2CameraState {
     device: String,
     lease: lease::CameraLease,
     accepted_interval: Option<frame_interval::FrameInterval>,
+    privacy_boundary: PrivacyBoundary,
 }
 
 impl V4l2CameraState {
@@ -586,6 +594,7 @@ impl V4l2CameraState {
             device: device.to_owned(),
             lease,
             accepted_interval: None,
+            privacy_boundary: PrivacyBoundary::LeaseOnly,
         }
     }
 
@@ -598,6 +607,20 @@ impl V4l2CameraState {
             device: device.to_owned(),
             lease,
             accepted_interval: Some(accepted_interval),
+            privacy_boundary: PrivacyBoundary::LeaseOnly,
+        }
+    }
+
+    fn with_ir_interval(
+        device: &str,
+        lease: lease::CameraLease,
+        accepted_interval: frame_interval::FrameInterval,
+    ) -> Self {
+        Self {
+            device: device.to_owned(),
+            lease,
+            accepted_interval: Some(accepted_interval),
+            privacy_boundary: PrivacyBoundary::RequireReleased,
         }
     }
 }
@@ -638,6 +661,14 @@ impl CameraState for V4l2CameraState {
 
     fn require_endpoint(&self) -> Result<(), Self::EndpointError> {
         self.lease.require_endpoint(&self.device)
+    }
+
+    fn require_dequeue_boundary(&self, dev: &Device) -> std::io::Result<()> {
+        self.require_endpoint().map_err(std::io::Error::other)?;
+        if self.privacy_boundary == PrivacyBoundary::RequireReleased {
+            privacy_permits_ir_capture(privacy_state(dev)).map_err(std::io::Error::other)?;
+        }
+        Ok(())
     }
 
     fn compare_format(&self, expected: &Format, current: &Format) -> Option<String> {
@@ -1239,7 +1270,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         let dequeued = dequeue_validated_typed(
             inner.as_mut().expect("stream taken only in Drop"),
             *layout,
-            || state.require_endpoint().map_err(std::io::Error::other),
+            || state.require_dequeue_boundary(dev),
         )?;
         if !*stream_started_validated {
             verify_stream_snapshot(
@@ -1736,6 +1767,15 @@ impl<S: ValidatedStream> TrackedStream<S> {
             rate_evidence,
         ))
     }
+}
+
+fn fill_rate_then_drain_metadata<E>(
+    fill_rate: impl FnOnce() -> Result<(), E>,
+    drain_metadata: impl FnOnce(),
+) -> Result<(), E> {
+    fill_rate()?;
+    drain_metadata();
+    Ok(())
 }
 
 /// Establish the delivered-rate window for TWO streams by filling each one on
@@ -2641,6 +2681,57 @@ fn privacy_permits_setup(observed: std::io::Result<Option<bool>>) -> Result<(), 
              to camera firmware while the shutter state is unknown"
         )),
     }
+}
+
+/// Fail-closed privacy decision for IR capture and forward emitter writes.
+///
+/// A camera without the control preserves existing portability. Once a device
+/// publishes privacy, however, both an engaged state and a failed observation
+/// refuse the frame/write boundary: "could not read" is never evidence that a
+/// physical shutter is released.
+fn privacy_permits_ir_capture(observed: std::io::Result<Option<bool>>) -> Result<(), String> {
+    match observed {
+        Ok(Some(true)) => Err(
+            "the hardware privacy shutter is engaged (the `privacy` control reads 1); \
+             refusing IR capture and any forward emitter write"
+                .into(),
+        ),
+        Ok(Some(false)) | Ok(None) => Ok(()),
+        Err(error) => Err(format!(
+            "could not read the hardware privacy control ({error}); refusing IR capture \
+             and any forward emitter write while the shutter state is unknown"
+        )),
+    }
+}
+
+fn with_released_ir_privacy<T>(
+    observed: std::io::Result<Option<bool>>,
+    action: impl FnOnce() -> T,
+) -> Result<T, String> {
+    privacy_permits_ir_capture(observed)?;
+    Ok(action())
+}
+
+fn require_ir_privacy_released(
+    device: &str,
+    dev: &Device,
+    stage: &'static str,
+) -> irlume_common::Result<()> {
+    privacy_permits_ir_capture(privacy_state(dev))
+        .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))
+}
+
+fn enable_ir_emitter_privacy_bounded(
+    device: &str,
+    dev: &Device,
+    card: &str,
+    permit: lease::CameraLease,
+    stage: &'static str,
+) -> irlume_common::Result<ir_emitter::StreamMode> {
+    with_released_ir_privacy(privacy_state(dev), || {
+        ir_emitter::enable_with_lease(dev.handle(), card, device, permit)
+    })
+    .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))
 }
 
 /// The backend classification from a `VIDIOC_QUERYCAP` answer. The V4L2
@@ -3600,8 +3691,7 @@ impl<'a> RgbSession<'a> {
     /// EBUSY at .269393, and no close ran in between. Dropping the stream
     /// first releases the queue, and the replacement renegotiates on the fd
     /// this session already holds, so nothing new opens and nothing collides.
-    /// Same drop-then-reopen shape as the frozen-stream restart in the IR
-    /// one-shot path.
+    /// Same drop-then-reopen shape as explicit IR session recovery.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
         self.cam
@@ -4303,12 +4393,8 @@ impl IrCamera {
             .require_endpoint()
             .map_err(|error| Error::Hardware(error.to_string()))?;
         verify_pinned(device)?;
-        if privacy_engaged_with_permit(device) {
-            return Err(Error::Hardware(format!(
-                "{device}: hardware privacy switch is ON"
-            )));
-        }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+        require_ir_privacy_released(device, &dev, "before IR negotiation")?;
         let (fmt, pix) = negotiate_ir_format_state(device, &dev, &state)?;
         let interval = negotiate_interval_after_format(&state, device, &dev, &fmt)?;
         let card = dev.query_caps().map(|c| c.card).unwrap_or_default();
@@ -4375,18 +4461,16 @@ impl IrCamera {
 
     /// Start streaming and fire the emitter.
     ///
-    /// Holding the session across several captures is safe on the modules we
-    /// measured: after ONE control write the emitter stayed lit for 30s of
-    /// continuous streaming on both (ASUS built-in at a flat level of 144, NexiGo
-    /// N930W at ~37), and the control survives even stream close and process
-    /// exit. See `examples/ir_refire_probe.rs`.
+    /// One guard owns one stream: it applies the documented face-auth mode once
+    /// before the first image dequeue and restores the displaced value after
+    /// image and metadata STREAMOFF.
     ///
     /// The per-capture re-fires that used to sit below are gone (#168): they are
-    /// not part of the sequence Microsoft documents, and on a module that DOES
-    /// self-clear the illumination metadata from #167 now reports the dark
-    /// frames rather than leaving brightness to guess. The residual risk is a
-    /// module nobody here has seen going dark for a window, which costs the user
-    /// a password fallback rather than the hardware.
+    /// not part of the sequence Microsoft documents. The earlier claim that
+    /// self-clear was measured false on both cameras was incorrect: the harness
+    /// read after guard restoration and explicitly did not observe in-stream
+    /// `GET_CUR`. Illumination metadata now supplies frame evidence where the
+    /// camera reports it; absence stays Unknown rather than licensing re-fire.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn session(&self) -> irlume_common::Result<IrSession<'_>> {
         self.session_with_progress(&no_progress())
@@ -4412,7 +4496,7 @@ impl IrCamera {
         let mode;
         let mut stream = TrackedStream::new(
             SafeStream::open(
-                V4l2CameraState::with_interval(
+                V4l2CameraState::with_ir_interval(
                     &self.device,
                     self.lease.clone(),
                     self.accepted_interval,
@@ -4432,7 +4516,7 @@ impl IrCamera {
         // 25s when video went first). `SafeStream::open` only allocates
         // buffers; STREAMON happens on the first dequeue, which is inside
         // `warm_up_stream` below. This is the window, and it is the only one.
-        let meta = ir_metadata::IlluminationLog::open(&self.device);
+        let mut meta = ir_metadata::IlluminationLog::open(&self.device);
         // BEFORE the warm-up, because the warm-up's first dequeue is STREAMON.
         // Microsoft's sequence sets the property and THEN starts streaming, and
         // this ran the other way round: every authentication set the mode under
@@ -4444,10 +4528,10 @@ impl IrCamera {
         // the image queue is load-bearing and measured.
         //
         // The comment this replaces said the write had to happen "while
-        // streaming" because Hello modules reset the control per open. The reset
-        // is on DEVICE open, which happened in `IrCamera::open`, not here; and
-        // the record above says the control survives stream close and process
-        // exit on both cameras measured, so it is not stream-scoped.
+        // streaming" because Hello modules reset the control per open. No
+        // in-stream measurement established that claim. The published sequence
+        // is still unambiguous: set the mode before image STREAMON and restore
+        // the displaced value after STREAMOFF.
         //
         // Held for the session rather than just applied: dropping `IrSession`
         // puts back the value the capture write displaced — the camera's
@@ -4457,15 +4541,28 @@ impl IrCamera {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        mode = ir_emitter::enable_with_lease(
-            self.dev.handle(),
-            &self.card,
+        mode = enable_ir_emitter_privacy_bounded(
             &self.device,
+            &self.dev,
+            &self.card,
             self.lease.clone(),
-        );
+            "before Face Authentication D1",
+        )?;
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         warm_up_stream(&self.device, &mut stream, progress)?;
+        // Rate establishment internally discards more frames than the metadata
+        // ring can hold. Drain those records now, after the fill, so buffers are
+        // requeued before the first frame a caller can observe.
+        fill_rate_then_drain_metadata(
+            || stream.fill_rate_evidence(),
+            || {
+                if let Some(log) = meta.as_mut() {
+                    log.drain();
+                }
+            },
+        )
+        .map_err(|error| map_io(&self.device, error))?;
         Ok(IrSession {
             cam: self,
             stream,
@@ -4849,15 +4946,7 @@ impl IrSession<'_> {
             .zip(flags.iter().copied())
             .map(
                 |((facts, sequence, timestamp, frame_taken, rate_evidence), illumination)| {
-                    let illumination = match illumination {
-                        Some(ir_metadata::Illumination::Lit) => {
-                            contracts::IlluminationProvenance::ActiveIr
-                        }
-                        Some(ir_metadata::Illumination::Dark) => {
-                            contracts::IlluminationProvenance::Ambient
-                        }
-                        None => contracts::IlluminationProvenance::Unknown,
-                    };
+                    let illumination = illumination_provenance(illumination);
                     checked_single_evidence(
                         binding.clone(),
                         format.clone(),
@@ -4906,9 +4995,8 @@ impl IrSession<'_> {
     /// and the decoder is reset to its initial state. No new device open, so
     /// no EBUSY from a double-open-rejecting camera.
     ///
-    /// The old guard MUST go before the fresh `enable`, the same order the
-    /// frozen-stream restarts in `capture_ir_streaming` and
-    /// `capture_ir_sequence` use: while it lives it holds the per-camera
+    /// The old guard MUST go before the fresh `enable`: while it lives it holds
+    /// the per-camera
     /// stream lock, and `flock` excludes per open file description, so the
     /// fresh enable in this same process answered Busy, refused to drive the
     /// emitter, and the assignment below then dropped the old guard, whose
@@ -4923,7 +5011,7 @@ impl IrSession<'_> {
             .map_err(|error| Error::Hardware(error.to_string()))?;
         drop(self.stream.take()); // STREAMOFF + buffer release before replacement
         self.meta = None; // drop the metadata queue
-                          // A restore failure PROPAGATES, mirroring the frozen-stream restart:
+                          // A restore failure PROPAGATES before any replacement write:
                           // the guard is spent after one attempt, and an unrecorded write whose
                           // restore failed would otherwise become permanently unowned.
         self._mode.restore().map_err(|e| {
@@ -4934,7 +5022,7 @@ impl IrSession<'_> {
         })?;
         self._mode = ir_emitter::StreamMode::inert();
         let stream = SafeStream::open(
-            V4l2CameraState::with_interval(
+            V4l2CameraState::with_ir_interval(
                 &self.cam.device,
                 self.cam.lease.clone(),
                 self.cam.accepted_interval,
@@ -4948,12 +5036,13 @@ impl IrSession<'_> {
             .lease
             .require_endpoint(&self.cam.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
-        let mode = ir_emitter::enable_with_lease(
-            self.cam.dev.handle(),
-            &self.cam.card,
+        let mode = enable_ir_emitter_privacy_bounded(
             &self.cam.device,
+            &self.cam.dev,
+            &self.cam.card,
             self.cam.lease.clone(),
-        );
+            "before recovered Face Authentication D1",
+        )?;
         let lit = mode.lit();
         let (meta, mode) = install_recovered_resources(stream, meta, mode, |stream| {
             self.cam
@@ -5002,10 +5091,7 @@ pub fn establish_pair_rate(
 pub mod ir_probe {
     use super::negotiate_ir_format_and_interval;
     use super::Device;
-    use super::{
-        ir_emitter, map_delivery, map_io, privacy_engaged_with_permit, verify_pinned, Error, Frame,
-        Spectrum,
-    };
+    use super::{map_delivery, map_io, verify_pinned, Error, Frame, Spectrum};
 
     /// Mean brightness of an 8-bit greyscale buffer.
     pub fn mean(data: &[u8]) -> f64 {
@@ -5134,12 +5220,8 @@ pub mod ir_probe {
             std::time::Duration::from_secs(2),
         )
         .map_err(|error| Error::Hardware(error.to_string()))?;
-        if privacy_engaged_with_permit(device) {
-            return Err(Error::Hardware(format!(
-                "{device}: hardware privacy switch is ON"
-            )));
-        }
         let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+        super::require_ir_privacy_released(device, &dev, "before IR negotiation")?;
         let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
         let mut dec = super::IrDecoder::new(pix, fmt.quantization);
         let (w, h) = (fmt.width, fmt.height);
@@ -5163,7 +5245,7 @@ pub mod ir_probe {
         // lands before streaming starts.
         let mode;
         let stream = super::SafeStream::open(
-            super::V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
+            super::V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
             device,
             &dev,
             &fmt,
@@ -5176,7 +5258,13 @@ pub mod ir_probe {
                 interval.accepted,
             ),
         );
-        mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
+        mode = super::enable_ir_emitter_privacy_bounded(
+            device,
+            &dev,
+            &card,
+            permit.clone(),
+            "before Face Authentication D1",
+        )?;
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
@@ -5204,28 +5292,41 @@ pub mod ir_probe {
     }
 }
 
-/// Sparse content signature for the frozen-stream detector: up to 64 bytes
-/// sampled at a fixed stride across the frame. Verbatim extraction from
-/// [`capture_ir_sequence`] (the former `sig_of` closure) so the pure logic is
-/// unit-testable without a camera; zero behavior change.
-pub(crate) fn frame_signature(data: &[u8]) -> Vec<u8> {
-    let stride = (data.len() / 64).max(1);
-    data.iter().step_by(stride).take(64).copied().collect()
-}
-
-/// Frozen-stream predicate: BIT-IDENTICAL consecutive signatures on a frame
-/// whose mean sits in the normal exposure band (saturated / near-black frames
-/// are optical states, not a stall). Verbatim extraction of the `frozen`
-/// expression in [`capture_ir_sequence`] as a test seam; zero behavior change.
-pub(crate) fn frame_frozen(best_mean: f64, sig: &[u8], last_sig: Option<&[u8]>) -> bool {
-    (10.0..245.0).contains(&best_mean) && last_sig == Some(sig)
-}
-
 /// Mean IR value at/above which a decoded frame is treated as an exposure
 /// blow-out: a saturated frame carries no detectable face, so a streaming
-/// consumer skips it rather than spend a window slot on it. Matches the upper
-/// bound of [`frame_frozen`]'s normal-exposure band.
+/// consumer skips it rather than spend a window slot on it.
 const IR_BLOWN_MEAN: f64 = 245.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrFrameDisposition {
+    Deliver,
+    SkipBlown,
+}
+
+/// Classify only the optical usability of one delivered IR frame.
+///
+/// Transport health is established by the validated dequeue, sequence,
+/// timestamp, and delivered-rate boundaries before this function is called.
+/// Pixel equality is intentionally not an input: privacy firmware may deliver
+/// an advancing constant placeholder, and content can never license a stream
+/// restart or another emitter write.
+fn ir_frame_disposition(mean: f64) -> IrFrameDisposition {
+    if mean >= IR_BLOWN_MEAN {
+        IrFrameDisposition::SkipBlown
+    } else {
+        IrFrameDisposition::Deliver
+    }
+}
+
+fn illumination_provenance(
+    illumination: Option<ir_metadata::Illumination>,
+) -> contracts::IlluminationProvenance {
+    match illumination {
+        Some(ir_metadata::Illumination::Lit) => contracts::IlluminationProvenance::ActiveIr,
+        Some(ir_metadata::Illumination::Dark) => contracts::IlluminationProvenance::Ambient,
+        None => contracts::IlluminationProvenance::Unknown,
+    }
+}
 
 /// One usable IR frame delivered to a [`capture_ir_streaming`] consumer, with
 /// the decoded mean the caller would otherwise recompute (the strobe phase and
@@ -5236,21 +5337,21 @@ pub struct IrStreamFrame {
     pub mean: f64,
 }
 
-/// Drive a single held-open IR stream, invoking `on_frame` for each USABLE frame
-/// (non-frozen, non-blown) until the consumer returns [`std::ops::ControlFlow::Break`] or
+/// Drive a single held-open IR stream, invoking `on_frame` for each usable frame
+/// (non-blown) until the consumer returns [`std::ops::ControlFlow::Break`] or
 /// the `max_frames` attempt budget is spent. Returns the break value, or `None`
 /// if the budget ran out first.
 ///
 /// This is the rolling-capture core the burst helpers and the live consumers
-/// share: it owns the device, the V4L2 mmap stream, the emitter re-fire, and the
-/// frozen-stream restart, so a consumer only decides what to do with each frame
+/// share: it owns the device, the V4L2 mmap stream, and the emitter guard, so a
+/// consumer only decides what to do with each frame
 /// and when to stop. The consent watch can therefore return the instant it
 /// sees an accepted gesture instead of always draining a fixed window, and a
-/// preview can pull frames continuously; both get the same black/blown/frozen filtering.
+/// preview can pull frames continuously; both get the same blown-frame filtering.
 ///
 /// Usable = the same set [`capture_ir_sequence`] historically kept: emitter-off
 /// (dark) frames ARE delivered, because a consumer classifying the strobe needs
-/// them; only frozen and blown frames are dropped.
+/// them; only blown frames are dropped.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir_streaming<B>(
     device: &str,
@@ -5264,12 +5365,8 @@ pub fn capture_ir_streaming<B>(
         std::time::Duration::from_secs(2),
     )
     .map_err(|error| Error::Hardware(error.to_string()))?;
-    if privacy_engaged_with_permit(device) {
-        return Err(Error::Hardware(format!(
-            "{device}: hardware privacy switch is ON"
-        )));
-    }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    require_ir_privacy_released(device, &dev, "before IR negotiation")?;
     let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
@@ -5291,9 +5388,9 @@ pub fn capture_ir_streaming<B>(
     // other process's live stream. `SafeStream::open` only allocates
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
-    let mut mode;
+    let _mode;
     let stream = SafeStream::open(
-        V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
+        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
         &fmt,
@@ -5306,100 +5403,60 @@ pub fn capture_ir_streaming<B>(
             interval.accepted,
         ),
     );
-    mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
-    // Sparse content signature: BIT-IDENTICAL consecutive frames mean the stream
-    // has FROZEN (measured live 2026-07-01 in dark rooms: frames lock to a
-    // constant mid-grey for the rest of the window); real sensor noise never
-    // repeats exactly. Saturated and near-black frames are excluded from the
-    // check: those are optical states (exposure blow-out / emitter-off phase),
-    // not a stall, and restarting mid-settle only prolongs the settle.
-    // (Signature + predicate live in `frame_signature` / `frame_frozen`.)
-    let (mut dead_run, mut restarts) = (0usize, 0usize);
-    let mut last_sig: Option<Vec<u8>> = None;
-    // Set once per stream, before it starts, and not per frame; the
-    // frozen-stream restart below opens a new stream and applies it again,
-    // which is the only re-apply left.
+    // Metadata must STREAMON before the image queue's first dequeue.
+    let mut meta = ir_metadata::IlluminationLog::open(device);
+    _mode = enable_ir_emitter_privacy_bounded(
+        device,
+        &dev,
+        &card,
+        permit.clone(),
+        "before Face Authentication D1",
+    )?;
+    if max_frames > 0 {
+        fill_rate_then_drain_metadata(
+            || stream.fill_rate_evidence(),
+            || {
+                if let Some(log) = meta.as_mut() {
+                    log.drain();
+                }
+            },
+        )
+        .map_err(|error| map_io(device, error))?;
+    }
+    // Set once per stream, before it starts, and not per frame.
     //
     // This used to re-apply the control every eighth frame on the theory that
     // "some controls self-clear". At the default consent budget that is ten more
     // writes to camera firmware per watch, and `enable` is not a bare ioctl: each
     // call re-reads the USB descriptors from sysfs and takes a lock to scan the
     // undo journal on disk. Ten of those sit in the authentication path for a
-    // hypothesis this project MEASURED and found false: the record in
-    // `IrCamera::session` says the control survives stream close and process
-    // exit on both cameras here, so there was nothing self-clearing to re-arm
-    // against.
+    // hypothesis the project did not actually measure in-stream on the ASUS.
+    // Repeating a hardware write without that evidence remains unjustified;
+    // timestamp-correlated metadata below observes the frame result instead.
     //
-    // NOT justified by the illumination metadata from #167. `capture_with_stats`
-    // classifies its frames with that; this function never opens the metadata
-    // queue, and an earlier version of this comment claimed the evidence anyway.
-    // The residual risk is a module nobody here has seen whose control does
-    // self-clear mid stream: this path would go dark for the window and cost the
-    // user a password fallback. Reading the metadata queue here is how that gets
-    // closed, and it is not done.
+    // The metadata queue classifies each timestamp-correlated frame where the
+    // camera reports illumination. Missing records remain Unknown; host control
+    // readback is never promoted to optical provenance.
+    //
+    // Content equality is deliberately absent. The ASUS privacy shutter emits
+    // advancing, byte-identical 0x90 frames; those are live deliveries with
+    // substituted pixels, not a stalled transport. Dequeue timeout, corrupt
+    // metadata, or sequence/timestamp discontinuity already fails through the
+    // validated stream boundary without issuing another hardware write.
     for _ in 0..max_frames {
         let (buf, facts, sequence, timestamp, rate_evidence) =
             stream.next().map_err(|error| map_delivery(device, error))?;
         let taken = std::time::Instant::now();
+        let illumination = match meta.as_mut() {
+            Some(log) => {
+                log.drain();
+                log.illumination_at(facts.timestamp_micros())
+            }
+            None => None,
+        };
         let data = dec.decode(buf, w, h);
         let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
-        let sig = frame_signature(&data);
-        let frozen = frame_frozen(mean, &sig, last_sig.as_deref());
-        last_sig = Some(sig);
-        if frozen {
-            dead_run += 1;
-            if dead_run >= FROZEN_RUN_BEFORE_RESTART && restarts < FROZEN_RESTART_BUDGET {
-                restarts += 1;
-                dead_run = 0;
-                last_sig = None;
-                drop(stream.take()); // stop + release buffers before re-arming
-                                     // The OLD guard restores BEFORE the reopen. Its stream is
-                                     // already gone, and while the guard lives it holds the
-                                     // per-camera stream lock, which would make the fresh `enable`
-                                     // refuse to drive the emitter at all — the lock refuses
-                                     // contested writes rather than allowing an unrecorded one
-                                     // (#188, review round 4). Restoring here cannot write under
-                                     // the new stream either, because it happens before the fresh
-                                     // apply. Earlier versions kept the old guard armed across the
-                                     // reopen and negotiated ownership afterwards; the cost of
-                                     // this simpler shape is one restore/apply pair per restart,
-                                     // and restarts are the exception, not the path.
-                                     // A restore failure PROPAGATES rather than being logged
-                                     // over: the guard is spent after one attempt, and an
-                                     // UNRECORDED write whose restore failed here would otherwise
-                                     // become permanently unowned — the fresh enable finds the
-                                     // wanted bytes with no record to claim and leaves them
-                                     // forever (review round 12). Surfacing hardware trouble
-                                     // beats continuing to authenticate through it.
-                mode.restore().map_err(|e| {
-                    Error::Hardware(format!(
-                        "{device}: could not restore the emitter before restarting \
-                         a frozen stream: {e}"
-                    ))
-                })?;
-                let replacement = SafeStream::open(
-                    V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
-                    device,
-                    &dev,
-                    &fmt,
-                )?;
-                let replacement_mode =
-                    ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
-                let ((), replacement_mode) =
-                    install_recovered_resources(replacement, (), replacement_mode, |replacement| {
-                        stream.install_recovered(replacement)
-                    })
-                    .map_err(|error| {
-                        Error::Hardware(format!(
-                            "{device}: could not install the recovered stream: {error}"
-                        ))
-                    })?;
-                mode = replacement_mode;
-            }
-            continue;
-        }
-        dead_run = 0;
-        if mean >= IR_BLOWN_MEAN {
+        if ir_frame_disposition(mean) == IrFrameDisposition::SkipBlown {
             continue;
         }
         let provenance = checked_single_provenance(
@@ -5409,7 +5466,7 @@ pub fn capture_ir_streaming<B>(
             sequence,
             timestamp,
             taken,
-            contracts::IlluminationProvenance::Unknown,
+            illumination_provenance(illumination),
             rate_evidence,
         )?;
         let frame = Frame::from_provenance(w, h, Spectrum::Ir, data, provenance)?;
@@ -5451,12 +5508,8 @@ pub fn capture_ir_sequence(
         std::time::Duration::from_secs(2),
     )
     .map_err(|error| Error::Hardware(error.to_string()))?;
-    if privacy_engaged_with_permit(device) {
-        return Err(Error::Hardware(format!(
-            "{device}: hardware privacy switch is ON"
-        )));
-    }
     let dev = Device::with_path(device).map_err(|e| map_io(device, e))?;
+    require_ir_privacy_released(device, &dev, "before IR negotiation")?;
     let (fmt, pix, interval) = negotiate_ir_format_and_interval(device, &dev, &permit)?;
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
@@ -5478,9 +5531,9 @@ pub fn capture_ir_sequence(
     // other process's live stream. `SafeStream::open` only allocates
     // buffers; STREAMON happens on the first dequeue, so the set still
     // lands before streaming starts.
-    let mut mode;
+    let _mode;
     let stream = SafeStream::open(
-        V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
+        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
         &fmt,
@@ -5493,17 +5546,33 @@ pub fn capture_ir_sequence(
             interval.accepted,
         ),
     );
-    mode = ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
-    // Set once per stream, before it starts, and not per frame (the
-    // frozen-stream restart below re-applies on its new stream). This path also carried
-    // an every-eighth-frame re-fire; it went for the same reason, and with the
-    // same caveat: the justification is the MEASURED record in
-    // `IrCamera::session` that the control survives streaming, not the
-    // illumination metadata, which this function does not read either.
+    // Metadata must STREAMON before the image queue's first dequeue.
+    let mut meta = ir_metadata::IlluminationLog::open(device);
+    _mode = enable_ir_emitter_privacy_bounded(
+        device,
+        &dev,
+        &card,
+        permit.clone(),
+        "before Face Authentication D1",
+    )?;
+    if samples > 0 {
+        fill_rate_then_drain_metadata(
+            || stream.fill_rate_evidence(),
+            || {
+                if let Some(log) = meta.as_mut() {
+                    log.drain();
+                }
+            },
+        )
+        .map_err(|error| map_io(device, error))?;
+    }
+    // Set once per stream, before it starts, and not per frame. This path also
+    // carried an every-eighth-frame re-fire; it went for the same reason, and
+    // with the same caveat: one host-side readback does not prove optical
+    // output. The metadata queue above now supplies per-frame provenance where
+    // the camera reports it; absence remains Unknown.
     let mut frames = Vec::with_capacity(samples);
     let max_attempts = samples * 2 + 30;
-    let (mut dead_run, mut restarts) = (0usize, 0usize);
-    let mut last_sig: Option<Vec<u8>> = None;
     for _ in 0..max_attempts {
         if frames.len() >= samples {
             break;
@@ -5511,87 +5580,58 @@ pub fn capture_ir_sequence(
         let mut best: Option<Vec<u8>> = None;
         let mut best_mean = -1.0f64;
         let mut best_index = 0;
-        let mut contributors = Vec::with_capacity(burst);
+        let mut observations = Vec::with_capacity(burst);
+        let mut stamps = Vec::with_capacity(burst);
+        if let Some(log) = meta.as_mut() {
+            log.begin_burst();
+        }
         for _ in 0..burst {
             let (buf, facts, sequence, timestamp, rate_evidence) =
                 stream.next().map_err(|error| map_delivery(device, error))?;
             let at = std::time::Instant::now();
+            stamps.push(facts.timestamp_micros());
+            observations.push((facts, sequence, timestamp, at, rate_evidence));
+            if let Some(log) = meta.as_mut() {
+                log.drain();
+            }
             let data = dec.decode(buf, w, h);
             let mean = data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64;
-            contributors.push(checked_single_evidence(
-                binding.clone(),
-                format.clone(),
-                facts,
-                sequence,
-                timestamp,
-                at,
-                contracts::IlluminationProvenance::Unknown,
-                rate_evidence,
-            )?);
             if mean > best_mean {
                 best_mean = mean;
                 best = Some(data);
-                best_index = contributors.len() - 1;
+                best_index = observations.len() - 1;
             }
         }
+        let flags = match meta.as_mut() {
+            Some(log) => {
+                log.drain();
+                stamps
+                    .iter()
+                    .map(|timestamp| log.illumination_at(*timestamp))
+                    .collect::<Vec<_>>()
+            }
+            None => vec![None; observations.len()],
+        };
+        let contributors = observations
+            .into_iter()
+            .zip(flags)
+            .map(
+                |((facts, sequence, timestamp, at, rate_evidence), illumination)| {
+                    checked_single_evidence(
+                        binding.clone(),
+                        format.clone(),
+                        facts,
+                        sequence,
+                        timestamp,
+                        at,
+                        illumination_provenance(illumination),
+                        rate_evidence,
+                    )
+                },
+            )
+            .collect::<irlume_common::Result<Vec<_>>>()?;
         let Some(data) = best else { continue };
-        let sig = frame_signature(&data);
-        let frozen = frame_frozen(best_mean, &sig, last_sig.as_deref());
-        last_sig = Some(sig);
-        if frozen {
-            dead_run += 1;
-            if dead_run >= FROZEN_RUN_BEFORE_RESTART && restarts < FROZEN_RESTART_BUDGET {
-                restarts += 1;
-                dead_run = 0;
-                last_sig = None;
-                drop(stream.take()); // stop + release buffers before re-arming
-                                     // The OLD guard restores BEFORE the reopen. Its stream is
-                                     // already gone, and while the guard lives it holds the
-                                     // per-camera stream lock, which would make the fresh `enable`
-                                     // refuse to drive the emitter at all — the lock refuses
-                                     // contested writes rather than allowing an unrecorded one
-                                     // (#188, review round 4). Restoring here cannot write under
-                                     // the new stream either, because it happens before the fresh
-                                     // apply. Earlier versions kept the old guard armed across the
-                                     // reopen and negotiated ownership afterwards; the cost of
-                                     // this simpler shape is one restore/apply pair per restart,
-                                     // and restarts are the exception, not the path.
-                                     // A restore failure PROPAGATES rather than being logged
-                                     // over: the guard is spent after one attempt, and an
-                                     // UNRECORDED write whose restore failed here would otherwise
-                                     // become permanently unowned — the fresh enable finds the
-                                     // wanted bytes with no record to claim and leaves them
-                                     // forever (review round 12). Surfacing hardware trouble
-                                     // beats continuing to authenticate through it.
-                mode.restore().map_err(|e| {
-                    Error::Hardware(format!(
-                        "{device}: could not restore the emitter before restarting \
-                         a frozen stream: {e}"
-                    ))
-                })?;
-                let replacement = SafeStream::open(
-                    V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
-                    device,
-                    &dev,
-                    &fmt,
-                )?;
-                let replacement_mode =
-                    ir_emitter::enable_with_lease(dev.handle(), &card, device, permit.clone());
-                let ((), replacement_mode) =
-                    install_recovered_resources(replacement, (), replacement_mode, |replacement| {
-                        stream.install_recovered(replacement)
-                    })
-                    .map_err(|error| {
-                        Error::Hardware(format!(
-                            "{device}: could not install the recovered stream: {error}"
-                        ))
-                    })?;
-                mode = replacement_mode;
-            }
-            continue;
-        }
-        dead_run = 0;
-        if best_mean >= IR_BLOWN_MEAN {
+        if ir_frame_disposition(best_mean) == IrFrameDisposition::SkipBlown {
             continue;
         }
         let provenance = if contributors.len() == 1 {
@@ -5615,15 +5655,15 @@ pub fn capture_ir_sequence(
         )?);
     }
     // A short return is a CAPTURE fault, not a quiet fact about the scene: the
-    // attempt budget ran out because frames arrived frozen, blown out, or too
+    // attempt budget ran out because frames arrived blown out or too
     // slowly. Callers read this sequence as temporal evidence, so a silent
     // shortfall reads downstream as "the user did not blink" when the truth is
     // "the camera did not deliver a window to look at". Say so; the caller
     // decides whether a partial window is still worth judging.
     if frames.len() < samples {
         irlume_common::dlog!(
-            "{device}: IR sequence delivered {}/{samples} frames in {max_attempts} attempts \
-             ({restarts} stream restarts); temporal evidence is incomplete",
+            "{device}: IR sequence delivered {}/{samples} frames in {max_attempts} attempts; \
+             temporal evidence is incomplete",
             frames.len()
         );
     }
@@ -7493,7 +7533,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
     let mut dec = IrDecoder::new(pix, fmt.quantization);
     let (w, h) = (fmt.width, fmt.height);
     let mut stream = SafeStream::open(
-        V4l2CameraState::with_interval(device, permit.clone(), interval.accepted),
+        V4l2CameraState::with_ir_interval(device, permit.clone(), interval.accepted),
         device,
         &dev,
         &fmt,
@@ -7828,6 +7868,31 @@ mod tests {
     }
 
     #[test]
+    fn illumination_metadata_maps_to_frame_provenance_without_brightness_guessing() {
+        use contracts::IlluminationProvenance::{ActiveIr, Ambient, Unknown};
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        assert_eq!(illumination_provenance(Some(Lit)), ActiveIr);
+        assert_eq!(illumination_provenance(Some(Dark)), Ambient);
+        assert_eq!(illumination_provenance(None), Unknown);
+    }
+
+    #[test]
+    fn hidden_rate_fill_completes_before_metadata_is_drained_for_exposed_frames() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        fill_rate_then_drain_metadata(
+            || {
+                calls.borrow_mut().push("fill-rate");
+                Ok::<(), std::io::Error>(())
+            },
+            || calls.borrow_mut().push("drain-metadata"),
+        )
+        .expect("fixture fill succeeds");
+
+        assert_eq!(*calls.borrow(), ["fill-rate", "drain-metadata"]);
+    }
+
+    #[test]
     fn setup_burst_retains_sequence_locked_optical_evidence_without_metadata() {
         let measurement = setup_measurement_from_burst(
             &[10.0, 41.0, 11.0, 40.0, 9.0, 42.0, 10.0, 41.0],
@@ -7895,8 +7960,10 @@ mod tests {
         interval_domain: frame_interval::FrameIntervalDomain,
         set_interval_response: frame_interval::FrameInterval,
         endpoint_calls: std::cell::Cell<usize>,
+        dequeue_boundary_calls: std::cell::Cell<usize>,
         fail_set: bool,
         fail_endpoint_at: Option<usize>,
+        fail_dequeue_boundary_at: Option<usize>,
         fail_claim: bool,
         fail_dequeue: bool,
     }
@@ -7919,8 +7986,10 @@ mod tests {
                         .expect("valid fixture domain"),
                     set_interval_response: interval,
                     endpoint_calls: std::cell::Cell::new(0),
+                    dequeue_boundary_calls: std::cell::Cell::new(0),
                     fail_set: false,
                     fail_endpoint_at: None,
+                    fail_dequeue_boundary_at: None,
                     fail_claim: false,
                     fail_dequeue: false,
                 },
@@ -7972,6 +8041,16 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn require_dequeue_boundary(&self, _dev: &()) -> std::io::Result<()> {
+            let call = self.dequeue_boundary_calls.get() + 1;
+            self.dequeue_boundary_calls.set(call);
+            if self.fail_dequeue_boundary_at == Some(call) {
+                self.calls.borrow_mut().push("privacy_refusal");
+                return Err(std::io::Error::other("privacy boundary failure"));
+            }
+            self.require_endpoint()
         }
 
         fn compare_format(&self, expected: &Format, current: &Format) -> Option<String> {
@@ -8103,6 +8182,39 @@ mod tests {
         ];
         assert_eq!(exercise_fake_happy_path(fake_format(b"YUYV")), expected);
         assert_eq!(exercise_fake_happy_path(fake_format(b"GREY")), expected);
+    }
+
+    #[test]
+    fn dequeue_refuses_privacy_transition_after_the_blocking_call() {
+        let format = fake_format(b"GREY");
+        let (mut state, calls) = FakeCameraState::new(format);
+        state.fail_dequeue_boundary_at = Some(2);
+        let mut stream = CameraStateStream::open(state, "/dev/fake-ir", &(), &format)
+            .expect("stream opens before the simulated privacy transition");
+
+        let error = stream
+            .next()
+            .expect_err("post-dequeue privacy engagement must reject the frame");
+        assert!(
+            error.to_string().contains("privacy boundary failure"),
+            "{error}"
+        );
+        drop(stream);
+
+        let calls = calls.borrow();
+        let dequeue = calls
+            .iter()
+            .position(|call| *call == "dequeue")
+            .expect("the blocking dequeue ran");
+        let refusal = calls
+            .iter()
+            .position(|call| *call == "privacy_refusal")
+            .expect("the post-dequeue privacy boundary ran");
+        let cleanup = calls
+            .iter()
+            .position(|call| *call == "cleanup")
+            .expect("the rejected frame tears down its stream");
+        assert!(dequeue < refusal && refusal < cleanup, "{calls:?}");
     }
 
     #[test]
@@ -11623,39 +11735,15 @@ mod tests {
     }
 
     #[test]
-    fn frame_signature_is_sparse_and_content_sensitive() {
-        // Short frames: the whole content is the signature.
-        assert_eq!(frame_signature(&[1, 2, 3]), vec![1, 2, 3]);
-        // Long frames: capped at 64 sampled bytes.
-        let long = vec![7u8; 640 * 400];
-        let sig = frame_signature(&long);
-        assert_eq!(sig.len(), 64);
-        assert!(sig.iter().all(|&b| b == 7));
-        // Identical content -> identical signature; a change at a sampled
-        // position (index 0 is always sampled) -> different signature.
-        let mut changed = long.clone();
-        changed[0] = 8;
-        assert_eq!(frame_signature(&long), sig);
-        assert_ne!(frame_signature(&changed), sig);
-    }
-
-    #[test]
-    fn frozen_detector_fires_only_on_repeated_normal_exposure_frames() {
-        let sig = frame_signature(&[99u8; 1024]);
-        // First frame of a window (no previous signature): never frozen.
-        assert!(!frame_frozen(99.0, &sig, None));
-        // Bit-identical consecutive mid-grey frames: frozen.
-        assert!(frame_frozen(99.0, &sig, Some(&sig)));
-        // Same signature but saturated / near-black mean: optical state, not a
-        // stall (exposure blow-out or the emitter-off strobe phase).
-        assert!(!frame_frozen(250.0, &sig, Some(&sig)));
-        assert!(!frame_frozen(245.0, &sig, Some(&sig)));
-        assert!(!frame_frozen(5.0, &sig, Some(&sig)));
-        // Boundary means inside the band still count.
-        assert!(frame_frozen(10.0, &sig, Some(&sig)));
-        // Different content -> live stream.
-        let other = frame_signature(&[98u8; 1024]);
-        assert!(!frame_frozen(99.0, &sig, Some(&other)));
+    fn constant_content_is_deliverable_not_a_recovery_signal() {
+        // Repeated calls model a byte-identical advancing feed. Content is not
+        // part of this decision, so the exact ASUS privacy placeholder remains
+        // a delivered frame and can never authorize another emitter write.
+        assert_eq!(ir_frame_disposition(144.0), IrFrameDisposition::Deliver);
+        assert_eq!(ir_frame_disposition(144.0), IrFrameDisposition::Deliver);
+        assert_eq!(ir_frame_disposition(10.0), IrFrameDisposition::Deliver);
+        assert_eq!(ir_frame_disposition(244.9), IrFrameDisposition::Deliver);
+        assert_eq!(ir_frame_disposition(245.0), IrFrameDisposition::SkipBlown);
     }
 
     #[test]
@@ -12128,6 +12216,40 @@ mod tests {
         assert!(privacy_permits_setup(Ok(None)).is_ok());
     }
 
+    #[test]
+    fn privacy_capture_decision_blocks_forward_d1_on_engaged_or_unknown_state() {
+        let engaged = privacy_permits_ir_capture(Ok(Some(true)))
+            .expect_err("an engaged shutter must block capture and the D1 write");
+        assert!(engaged.contains("shutter is engaged"), "{engaged}");
+
+        let unreadable =
+            privacy_permits_ir_capture(Err(std::io::Error::from_raw_os_error(libc::EIO)))
+                .expect_err("an unreadable shutter must not authorize D1");
+        assert!(unreadable.contains("could not read"), "{unreadable}");
+
+        assert!(privacy_permits_ir_capture(Ok(Some(false))).is_ok());
+        assert!(privacy_permits_ir_capture(Ok(None)).is_ok());
+    }
+
+    #[test]
+    fn privacy_gate_never_invokes_forward_write_on_engaged_or_unknown_state() {
+        let writes = std::cell::Cell::new(0usize);
+        let write = || writes.set(writes.get() + 1);
+
+        assert!(with_released_ir_privacy(Ok(Some(true)), write).is_err());
+        assert_eq!(writes.get(), 0);
+        assert!(
+            with_released_ir_privacy(Err(std::io::Error::from_raw_os_error(libc::EIO)), write,)
+                .is_err()
+        );
+        assert_eq!(writes.get(), 0);
+
+        with_released_ir_privacy(Ok(Some(false)), write).expect("released privacy authorizes D1");
+        with_released_ir_privacy(Ok(None), write)
+            .expect("an absent privacy control preserves support");
+        assert_eq!(writes.get(), 2);
+    }
+
     /// The two backlight-compensation decisions (#426), every arm. The write
     /// only fires on an answered control holding something other than the
     /// wanted value, so an unreadable or absent control is never written
@@ -12226,7 +12348,7 @@ mod tests {
     // patterns (YUYV 640x480 / GREY 640x400), and exports the two vars.
     // Without them the tests return immediately (and are #[ignore]d anyway).
     // A THIRD node, IRLUME_TEST_SPARE_DEVICE, has NO CI-side feeder: tests
-    // that need a specific pattern (static for the frozen-stream detector,
+    // that need a specific pattern (static for constant-content capture,
     // alternating for strobe pairing) spawn their own ffmpeg against it and
     // kill the child on drop. Spare-node tests own that node exclusively;
     // CI runs the gated suite with --test-threads=1.
@@ -13258,37 +13380,28 @@ mod tests {
 
     #[test]
     #[ignore = "needs an unfed v4l2loopback node; set IRLUME_TEST_SPARE_DEVICE (CI does this)"]
-    fn loopback_frozen_static_feed_starves_the_sequence_window() {
-        // A bit-identical feed simulates the stalled-sensor failure the
-        // detector was built for (streams observed locking to a constant
-        // mid-grey). Expected arithmetic, from capture_ir_sequence: the first
-        // frame is accepted (no previous signature), every repeat is frozen,
-        // two frozen frames trigger a stream restart (budget 4), and each
-        // restart clears last_sig so exactly one more frame is accepted. A
-        // 6-sample window on a fully static feed therefore returns Ok with
-        // exactly 1 + 4 = 5 frames: a SHORT window, never an error.
+    fn loopback_advancing_static_feed_fills_the_sequence_without_recovery() {
+        // A bit-identical feed is valid content while V4L2 sequence and
+        // timestamps advance. It must fill the requested window without a
+        // content-triggered restart; privacy firmware can produce this exact
+        // shape, and another emitter write cannot repair it.
         let _lock = env_lock();
         let spare = spare_device();
         let _sub = EnvGuard::unset("IRLUME_IR_AMBIENT_SUBTRACT");
         let _esc = allow_virtual(&spare);
         let _feeder = FfmpegFeeder::spawn(&spare, "color=c=gray:size=640x400:rate=15");
 
-        // The single-shot path has no frozen gate: a static feed still yields
-        // a frame (this also blocks until the feeder's frames actually flow).
+        // The single-shot path also accepts static content (this blocks until
+        // the feeder's frames actually flow).
         let (frame, _) = capture_ir_with_stats(&spare).expect("static feed single capture");
         let mean = ir_probe::mean(&frame.data);
         assert!(
             (10.0..245.0).contains(&mean),
-            "harness: the static gray feed must sit inside the frozen \
-             detector's normal-exposure band, got mean {mean:.1}"
+            "harness: the static gray feed must be usable, got mean {mean:.1}"
         );
 
         let seq = capture_ir_sequence(&spare, 6, 1).expect("sequence returns Ok, not Err");
-        assert_eq!(
-            seq.len(),
-            5,
-            "static feed: 1 initial accept + 1 per stream restart (budget 4)"
-        );
+        assert_eq!(seq.len(), 6, "advancing static frames fill the window");
         for f in &seq {
             assert_eq!((f.width, f.height), (IR_W, IR_H));
             assert_eq!(f.spectrum, Spectrum::Ir);

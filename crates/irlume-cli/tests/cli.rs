@@ -2366,6 +2366,14 @@ fn blinkcap_selector_strictly_validates_attempt_headers_records_and_indices() {
         ),
         (
             format!(
+                "{{\"blinkcap\":true,\"label\":\"{}\",\"frames\":1}}\n{}",
+                "x".repeat(257),
+                record(0, "\"ear\":0.25,", "")
+            ),
+            "label must be 1..=256 bytes",
+        ),
+        (
+            format!(
                 "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":2}}\n{}{}",
                 record(0, "\"ear\":0.25,", ""),
                 record(0, "\"ear\":0.25,", "")

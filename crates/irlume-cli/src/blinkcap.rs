@@ -269,6 +269,7 @@ const SELECTOR_RECORDING_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SELECTOR_MAX_PROFILES: usize = 16;
 const SELECTOR_MAX_RECORDINGS_PER_PHASE: usize = 64;
 const SELECTOR_MAX_ATTEMPTS: usize = 512;
+const SELECTOR_MAX_LABEL_BYTES: usize = 256;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -345,6 +346,12 @@ fn load_recording_strict(path: &Path) -> Result<Recording, String> {
     .map_err(|error| format!("{}: invalid blinkcap header: {error}", path.display()))?;
     if !header.blinkcap {
         return Err(format!("{}: not a blinkcap recording", path.display()));
+    }
+    if header.label.is_empty() || header.label.len() > SELECTOR_MAX_LABEL_BYTES {
+        return Err(format!(
+            "{}: label must be 1..={SELECTOR_MAX_LABEL_BYTES} bytes",
+            path.display()
+        ));
     }
     let mut samples = Vec::new();
     for (line_index, line) in lines.enumerate() {

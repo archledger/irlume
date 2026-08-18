@@ -35,10 +35,37 @@ The outcome line tells you *what* was decided; tracing tells you *why* and *how
 long each stage took*:
 
 ```sh
-sudo irlume logs debug on       # systemd drop-in + daemon restart
-irlume logs -f                  # then test a login / run: irlume verify (IRLUME_DEV=1)
+sudo irlume trace --duration 60s --output ./irlume-trace.jsonl
+# reproduce the failure while the recorder is running, then:
+irlume trace explain ./irlume-trace.jsonl
+```
+
+The daemon authorizes the recorder with `SO_PEERCRED`, permits one subscriber,
+and caps it at five minutes, 50,000 events, and 16 MiB. Emission uses a bounded
+non-blocking channel: a slow reader produces an explicit `events_dropped`
+record but cannot delay authentication, camera capture, fallback, or emitter
+restoration. The final mode-0600 `.jsonl` name appears only after a clean
+terminal record; a disconnect or interruption leaves a clearly named partial
+for recovery and never publishes a truncated final file. Trace records may
+contain exact liveness and match measurements, but never frames, crops,
+landmarks, embeddings, credentials, account/profile names, or raw emitter
+payloads.
+
+For a public issue, start with `irlume support-report`. Its default action is
+read-only and camera-free, and its `.txt` output is structurally share-safe and
+meant to be inspected before sharing. `support-report --probe` is a separate
+root-only action because it may activate the camera and known IR emitter.
+
+The older persistent journal switch remains compatible for existing workflows:
+
+```sh
+sudo irlume logs debug on
+irlume logs -f
 sudo irlume logs debug off
 ```
+
+Unlike `irlume trace`, that switch installs a systemd drop-in, restarts the
+daemon, and stays enabled until explicitly turned off.
 
 A granted IR-path attempt looks like:
 

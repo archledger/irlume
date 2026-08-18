@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Report camera capture timings from irlume daemon debug logs.
+"""Report camera capture timings from legacy irlume daemon debug logs.
 
-The daemon prints per-verify capture timings only while debug tracing is on
-(`sudo irlume logs debug on`). The lines this parses look like:
+New investigations should record a bounded structured trace with `sudo irlume
+trace` and inspect it with `irlume trace explain`. This parser remains for old
+journal captures and compatibility with `irlume logs debug on`; the lines it
+parses look like:
 
     irlume[debug]: assess: rgb 640x480 in 704ms, faces=1 top-det=0.93
     irlume[debug]: assess: ir 640x400 in 1071ms, faces=1 top-det=0.93

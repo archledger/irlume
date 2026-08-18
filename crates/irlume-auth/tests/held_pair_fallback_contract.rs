@@ -56,3 +56,24 @@ fn enrollment_fallback_restarts_without_held_sessions() {
     assert!(capture.contains("drop(rs)"));
     assert!(capture.contains("drop(is)"));
 }
+
+#[test]
+fn support_probe_runs_every_dual_camera_assessment_inside_its_operation() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read auth source");
+    let probe = function(
+        &source,
+        "    pub fn support_probe(",
+        "\n    /// RGB-only capture",
+    );
+
+    assert_eq!(
+        probe.matches("self.assess_full_with_operation(").count(),
+        2,
+        "the concurrent and sequential probe paths must both install the held operation"
+    );
+    assert!(
+        !probe.contains("self.assess_full_with("),
+        "a raw dual-camera assessment reacquires the probe's own lease and times out"
+    );
+}

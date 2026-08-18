@@ -2882,7 +2882,7 @@ impl Engine {
             ) {
                 Ok((mut rgb_session, mut ir_session)) => {
                     match irlume_camera::establish_pair_rate(&mut rgb_session, &mut ir_session) {
-                        Ok(()) => match self.assess_full_with(
+                        Ok(()) => match self.assess_full_with_operation(
                             Some((&mut rgb_session, &mut ir_session)),
                             Some(&selection),
                             &operation,
@@ -2931,7 +2931,8 @@ impl Engine {
         }
 
         drop(held_cams);
-        let captured = self.assess_full_with(None, Some(&selection), &operation, &probe_sink);
+        let captured =
+            self.assess_full_with_operation(None, Some(&selection), &operation, &probe_sink);
         let fallback_reason = probe_sink.fallback();
         Ok(support_probe_result(
             selected_schedule,
@@ -3087,6 +3088,23 @@ impl Engine {
     ) -> irlume_common::Result<Assessment> {
         self.assess_full_with(None, None, operation, &())
             .map_err(CapturePathError::into_inner)
+    }
+
+    fn assess_full_with_operation(
+        &mut self,
+        held: Option<(
+            &mut irlume_camera::RgbSession<'_>,
+            &mut irlume_camera::IrSession<'_>,
+        )>,
+        capture_mode: Option<&CaptureModeSelection>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> Result<Assessment, CapturePathError> {
+        operation
+            .run(|| self.assess_full_with(held, capture_mode, operation, diagnostics))
+            .map_err(|error| {
+                CapturePathError::Other(irlume_common::Error::Hardware(error.to_string()))
+            })?
     }
 
     /// [`Self::assess_full`], optionally reusing already-streaming cameras.

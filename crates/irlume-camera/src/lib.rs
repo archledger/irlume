@@ -1983,6 +1983,7 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
         match (a, b) {
             (Ok(()), Ok(())) => Ok(()),
+            (Err(_), Err(b)) if is_privacy_boundary_error(&b) => Err(b),
             (Err(a), Err(b)) if paired_rate_fill_cancelled(&a) => Err(b),
             (Err(a), _) => Err(a),
             (_, Err(b)) => Err(b),
@@ -14412,6 +14413,58 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
             "the companion may finish one in-flight dequeue, never the bounded fill"
         );
+    }
+
+    #[test]
+    fn simultaneous_pair_errors_preserve_the_ir_privacy_refusal() {
+        struct BarrierFailure {
+            barrier: std::sync::Arc<std::sync::Barrier>,
+            privacy: bool,
+        }
+
+        impl ValidatedStream for BarrierFailure {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                self.barrier.wait();
+                let error = if self.privacy {
+                    privacy_boundary_error("IR privacy refusal".into())
+                } else {
+                    std::io::Error::other("RGB delivery failure")
+                };
+                Err(ValidatedDequeueError::Io(error))
+            }
+        }
+
+        let config = |role| {
+            rate_gate::StreamRateConfig::with_window(
+                role,
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                4,
+            )
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut rgb = TrackedStream::new(
+            BarrierFailure {
+                barrier: barrier.clone(),
+                privacy: false,
+            },
+            config(contracts::StreamRole::Rgb),
+        );
+        let mut ir = TrackedStream::new(
+            BarrierFailure {
+                barrier,
+                privacy: true,
+            },
+            config(contracts::StreamRole::Ir),
+        );
+
+        let error = establish_concurrent_rate(&mut rgb, &mut ir)
+            .expect_err("both members fail, but privacy is the safety authority");
+
+        assert!(error.to_string().contains("IR privacy refusal"), "{error}");
     }
 }
 

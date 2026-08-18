@@ -2,7 +2,12 @@
 
 Date: 2026-08-17
 
-Status: Accepted
+Status: Implemented
+
+Validation:
+
+- [Support report hardware matrix](../validation/2026-08-17-support-report.md)
+- [Diagnostic trace hardware matrix](../validation/2026-08-17-diagnostic-trace.md)
 
 ## Context
 

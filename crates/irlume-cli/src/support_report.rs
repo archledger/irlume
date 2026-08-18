@@ -5,8 +5,9 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    CaptureSchedule, CaptureScheduleSource, ProbeOutcome, ProbeRoleOutcome, ShareSafeEventKind,
-    SupportProbeResult, SupportSnapshot, SupportUnavailable, UnavailableReason,
+    CaptureSchedule, CaptureScheduleSource, DigestToken, ExactStreamContract, ProbeOutcome,
+    ProbeRoleOutcome, QualificationReason, QualificationState, RuntimeViolationLabel,
+    ShareSafeEventKind, SupportProbeResult, SupportSnapshot, SupportUnavailable, UnavailableReason,
 };
 use irlume_common::{Request, Response};
 use serde::Serialize;
@@ -286,6 +287,42 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
                     camera.serial_present
                 )
                 .unwrap();
+                let ports = camera
+                    .usb_port_chain
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                writeln!(
+                    body,
+                    "    transport: driver={} backend={} speed={}Mbps controller={} usb={}-{}",
+                    camera.driver.as_str(),
+                    camera.backend.as_str(),
+                    camera.speed_millimbps / 1_000,
+                    camera.controller.as_str(),
+                    camera.usb_bus,
+                    ports,
+                )
+                .unwrap();
+                writeln!(
+                    body,
+                    "    tokens: descriptor={} qualification={}",
+                    digest_token_text(camera.descriptor_token),
+                    optional_digest_token_text(camera.qualification_token),
+                )
+                .unwrap();
+                writeln!(
+                    body,
+                    "    requested: {}",
+                    stream_contract_text(&camera.requested)
+                )
+                .unwrap();
+                writeln!(
+                    body,
+                    "    accepted: {}",
+                    stream_contract_text(&camera.accepted)
+                )
+                .unwrap();
             }
         }
         None => writeln!(body, "  unavailable").unwrap(),
@@ -317,9 +354,31 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
             schedule_source_name(capture.source)
         )
         .unwrap();
-        writeln!(body, "  qualification: {:?}", capture.qualification_state).unwrap();
     } else {
         writeln!(body, "  no current capture decision retained").unwrap();
+    }
+    if let Some(capture) = report.daemon.as_ref().and_then(SupportSnapshot::capture) {
+        writeln!(
+            body,
+            "  qualification: {} reason={}",
+            qualification_state_name(capture.qualification_state),
+            capture
+                .qualification_reason
+                .map(qualification_reason_name)
+                .unwrap_or("none"),
+        )
+        .unwrap();
+        writeln!(
+            body,
+            "  contexts: runtime={} qualification={} degradation={}",
+            optional_digest_token_text(capture.runtime_context),
+            optional_digest_token_text(capture.qualification_context),
+            capture
+                .runtime_degradation
+                .map(runtime_violation_name)
+                .unwrap_or("none"),
+        )
+        .unwrap();
     }
 
     writeln!(body).unwrap();
@@ -655,6 +714,75 @@ fn role_outcome_name(value: ProbeRoleOutcome) -> &'static str {
     }
 }
 
+fn digest_token_text(value: DigestToken) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn optional_digest_token_text(value: Option<DigestToken>) -> String {
+    value.map_or_else(|| "none".into(), digest_token_text)
+}
+
+fn stream_contract_text(value: &ExactStreamContract) -> String {
+    let fourcc = std::str::from_utf8(value.fourcc.as_bytes()).unwrap_or("????");
+    format!(
+        "{}x{} {} interval={}/{}",
+        value.width,
+        value.height,
+        fourcc,
+        value.interval.numerator.get(),
+        value.interval.denominator.get(),
+    )
+}
+
+fn qualification_state_name(value: QualificationState) -> &'static str {
+    match value {
+        QualificationState::QualifiedConcurrent => "qualified_concurrent",
+        QualificationState::MeasuredSequential => "measured_sequential",
+        QualificationState::UnqualifiedNoAuthority => "unqualified_no_authority",
+        QualificationState::UnqualifiedContextChanged => "unqualified_context_changed",
+        QualificationState::Inconclusive => "inconclusive",
+        QualificationState::Unreadable => "unreadable",
+        QualificationState::NoIrPair => "no_ir_pair",
+    }
+}
+
+fn qualification_reason_name(value: QualificationReason) -> &'static str {
+    match value {
+        QualificationReason::ConcurrentUnavailable => "concurrent_unavailable",
+        QualificationReason::DeliveredRateShortfall => "delivered_rate_shortfall",
+        QualificationReason::SignalLoss => "signal_loss",
+        QualificationReason::InvalidProvenance => "invalid_provenance",
+        QualificationReason::NoStoredAuthority => "no_stored_authority",
+        QualificationReason::ContextChanged => "context_changed",
+        QualificationReason::IncompleteRounds => "incomplete_rounds",
+        QualificationReason::DimScene => "dim_scene",
+        QualificationReason::ContractDrift => "contract_drift",
+        QualificationReason::MissingProvenance => "missing_provenance",
+        QualificationReason::StoreUnreadable => "store_unreadable",
+    }
+}
+
+fn runtime_violation_name(value: RuntimeViolationLabel) -> &'static str {
+    match value {
+        RuntimeViolationLabel::ConcurrentCaptureFailure => "concurrent_capture_failure",
+        RuntimeViolationLabel::PairOpenFailure => "pair_open_failure",
+        RuntimeViolationLabel::PairArmFailure => "pair_arm_failure",
+        RuntimeViolationLabel::PairRateEstablishmentFailure => "pair_rate_establishment_failure",
+        RuntimeViolationLabel::StreamRecovery => "stream_recovery",
+        RuntimeViolationLabel::MissingRuntimeContract => "missing_runtime_contract",
+        RuntimeViolationLabel::CameraGenerationChanged => "camera_generation_changed",
+        RuntimeViolationLabel::StreamContractMismatch => "stream_contract_mismatch",
+        RuntimeViolationLabel::DeliveredRateShortfall => "delivered_rate_shortfall",
+        RuntimeViolationLabel::ContinuityLoss => "continuity_loss",
+        RuntimeViolationLabel::ActiveIrMissing => "active_ir_missing",
+        RuntimeViolationLabel::ConfirmedSignalLoss => "confirmed_signal_loss",
+    }
+}
+
 fn event_summary(value: &ShareSafeEventKind) -> String {
     match value {
         ShareSafeEventKind::LifecycleChanged { role, generation } => {
@@ -680,6 +808,11 @@ fn event_summary(value: &ShareSafeEventKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irlume_common::diagnostics::{
+        CameraRoleLabel, CaptureStatus, DigestToken, ExactFraction, ExactStreamContract, FourCc,
+        QualificationReason, QualificationState, RuntimeViolationLabel, SafeLabel,
+        SanitizedCameraContext,
+    };
 
     fn fixture_report() -> SupportReport {
         SupportReport {
@@ -703,6 +836,52 @@ mod tests {
         }
     }
 
+    fn fixture_camera_report() -> SupportReport {
+        let stream = ExactStreamContract {
+            width: 640,
+            height: 480,
+            fourcc: FourCc::new(*b"YUYV").unwrap(),
+            interval: ExactFraction::new(1, 30).unwrap(),
+        };
+        let camera = SanitizedCameraContext {
+            vid: 0x046d,
+            pid: 0x085e,
+            role: CameraRoleLabel::Rgb,
+            interface_number: 0,
+            driver: SafeLabel::new("uvcvideo").unwrap(),
+            backend: SafeLabel::new("uvc-v4l2").unwrap(),
+            speed_millimbps: 5_000_000,
+            controller: SafeLabel::new("0000:0d:00.3").unwrap(),
+            usb_bus: 4,
+            usb_port_chain: vec![2],
+            lifecycle_generation: 3,
+            serial_present: true,
+            descriptor_token: DigestToken::from_bytes([0x12; 8]),
+            qualification_token: Some(DigestToken::from_bytes([0x34; 8])),
+            requested: stream.clone(),
+            accepted: stream,
+        };
+        let capture = CaptureStatus {
+            schedule: CaptureSchedule::Sequential,
+            source: CaptureScheduleSource::StoredQualification,
+            runtime_context: Some(DigestToken::from_bytes([0x56; 8])),
+            qualification_state: QualificationState::MeasuredSequential,
+            qualification_reason: Some(QualificationReason::DeliveredRateShortfall),
+            qualification_context: Some(DigestToken::from_bytes([0x34; 8])),
+            runtime_degradation: Some(RuntimeViolationLabel::DeliveredRateShortfall),
+        };
+        let mut report = fixture_report();
+        report.daemon = Some(SupportSnapshot::bounded(
+            42_000,
+            60_000,
+            Some(capture),
+            vec![camera],
+            Vec::new(),
+            Vec::new(),
+        ));
+        report
+    }
+
     #[test]
     fn support_report_is_inspectable_and_integrity_marked() {
         let text = String::from_utf8(render_text(&fixture_report()).unwrap()).unwrap();
@@ -714,6 +893,24 @@ mod tests {
             digest_line.trim(),
             irlume_common::sha256_hex(body.as_bytes())
         );
+    }
+
+    #[test]
+    fn human_report_includes_sanitized_topology_contracts_and_capture_authority() {
+        let text = String::from_utf8(render_text(&fixture_camera_report()).unwrap()).unwrap();
+
+        assert!(text.contains(
+            "transport: driver=uvcvideo backend=uvc-v4l2 speed=5000Mbps controller=0000:0d:00.3 usb=4-2"
+        ));
+        assert!(text.contains("tokens: descriptor=1212121212121212 qualification=3434343434343434"));
+        assert!(text.contains("requested: 640x480 YUYV interval=1/30"));
+        assert!(text.contains("accepted: 640x480 YUYV interval=1/30"));
+        assert!(text.contains("qualification: measured_sequential reason=delivered_rate_shortfall"));
+        assert!(text.contains(
+            "contexts: runtime=5656565656565656 qualification=3434343434343434 degradation=delivered_rate_shortfall"
+        ));
+        assert!(!text.contains("/dev/video"));
+        assert!(!text.contains("raw-serial"));
     }
 
     #[test]

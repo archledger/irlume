@@ -1624,6 +1624,10 @@ impl irlume_common::diagnostics::DiagnosticSink for SupportProbeSink<'_> {
         }
         self.upstream.emit_share_safe(kind);
     }
+
+    fn emit_trace(&self, kind: irlume_common::diagnostics::TraceEventKind) {
+        self.upstream.emit_trace(kind);
+    }
 }
 
 fn support_probe_result(
@@ -2016,6 +2020,20 @@ mod capture_mode_switch_tests {
             Some(RuntimeViolationLabel::DeliveredRateShortfall)
         );
         assert_eq!(upstream.events().len(), 2);
+    }
+
+    #[test]
+    fn support_probe_forwards_trace_only_events_to_the_daemon_sink() {
+        let upstream = TraceRecordingSink::default();
+        let probe = SupportProbeSink::new(&upstream);
+        let event = TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::Detection,
+            elapsed_us: 42,
+        };
+
+        probe.emit_trace(event.clone());
+
+        assert_eq!(&*upstream.0.lock().unwrap(), &[event]);
     }
 
     #[test]

@@ -33,6 +33,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **`irlume diag` reports the keyring and face-template seals separately.** A
+  healthy keyring credential envelope can no longer hide a missing, unreadable,
+  or PCR-drifted template-key envelope behind one generic seal status; each row
+  now names the secret it protects and gives its own recovery action (#472).
 - **CUDA and OpenVINO feature builds compile against pinned `ort` rc.13 again.**
   The dependency update removed deprecated execution-provider aliases while these
   two optional paths still referenced them. CI now compiles every supported ONNX

@@ -207,6 +207,23 @@ fn one_profile() -> Vec<ProfileSummary> {
     }]
 }
 
+fn write_test_seal_without_pcr_snapshot(path: &Path) {
+    use irlume_core::envelope::{PolicyKind, SealedEnvelope, SecretKind, CURRENT_VERSION};
+
+    std::fs::create_dir_all(path.parent().expect("test seal has a parent")).unwrap();
+    let envelope = SealedEnvelope {
+        version: CURRENT_VERSION,
+        policy: PolicyKind::PcrLiteral,
+        secret: SecretKind::LoginPassword,
+        pcrs: vec![7],
+        public: vec![1, 2, 3],
+        private: vec![4, 5, 6],
+        pcr_values: Vec::new(),
+        password_wrap: None,
+    };
+    std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+}
+
 // ---------------------------------------------------------------- status arms
 
 // status renders one arm per daemon answer; cli.rs pins the all-green dashboard,
@@ -421,26 +438,218 @@ fn identify_no_live_face_and_daemon_error() {
 
 // ------------------------------------------------------------------- diag arms
 
-// With no readable envelope in the sandbox keyring dir but a reachable daemon,
-// diag reports the sealed state from HasSealedPassword: armed-but-unreadable,
-// and not-armed. cli.rs only reaches the dead-socket "unknown" arm.
+// With neither root-only envelope readable in the sandbox but a reachable
+// daemon, diag must name the keyring and template-key seals independently.
+// Collapsing them back into one generic "seal envelope" row recreates #472:
+// a healthy keyring seal can hide the broken template seal that face auth uses.
 #[test]
-fn diag_reports_sealed_state_from_daemon_when_envelope_unreadable() {
+fn diag_reports_both_seals_from_daemon_when_envelopes_are_unreadable() {
     let sb = Sandbox::new("diagarmed");
-    serve(&sb.sock(), |_| Response::HasPassword(true));
+    serve(&sb.sock(), |request| match request {
+        Request::HasSealedPassword { .. } => Response::HasPassword(true),
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: true,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
     let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]), "diag");
     assert_eq!(code, 0);
     assert!(out.contains("irlume diag for 'tester'"), "{out}");
     assert!(
-        out.contains("seal envelope : armed, but not readable here"),
+        out.contains("keyring seal  : armed, but not readable here"),
+        "{out}"
+    );
+    assert!(
+        out.contains("template seal : sealed, but not readable here"),
         "{out}"
     );
 
     let sb2 = Sandbox::new("diagunarmed");
-    serve(&sb2.sock(), |_| Response::HasPassword(false));
+    serve(&sb2.sock(), |request| match request {
+        Request::HasSealedPassword { .. } => Response::HasPassword(false),
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: false,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
     let (code, out, _) = run(&mut sb2.cmd(&["diag", "--user", "tester"]), "diag");
     assert_eq!(code, 0);
-    assert!(out.contains("seal envelope : not armed"), "{out}");
+    assert!(out.contains("keyring seal  : not armed"), "{out}");
+    assert!(
+        out.contains("template seal : not present (templates are plaintext at rest)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn diag_reports_keyring_and_template_states_independently() {
+    let armed_keyring = Sandbox::new("diag-keyring-only");
+    serve(&armed_keyring.sock(), |request| match request {
+        Request::HasSealedPassword { .. } => Response::HasPassword(true),
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let (code, out, _) = run(
+        &mut armed_keyring.cmd(&["diag", "--user", "tester"]),
+        "diag",
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("keyring seal  : armed"), "{out}");
+    assert!(out.contains("template seal : MISSING ✗"), "{out}");
+
+    let sealed_template = Sandbox::new("diag-template-only");
+    serve(&sealed_template.sock(), |request| match request {
+        Request::HasSealedPassword { .. } => Response::HasPassword(false),
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: true,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let (code, out, _) = run(
+        &mut sealed_template.cmd(&["diag", "--user", "tester"]),
+        "diag",
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("keyring seal  : not armed"), "{out}");
+    assert!(
+        out.contains("template seal : sealed, but not readable here"),
+        "{out}"
+    );
+}
+
+#[test]
+fn diag_does_not_call_a_seal_healthy_without_a_recorded_pcr_snapshot() {
+    let sb = Sandbox::new("diag-no-pcr-snapshot");
+    write_test_seal_without_pcr_snapshot(&sb.path("keyring/tester.json"));
+    write_test_seal_without_pcr_snapshot(&sb.path("state/template-keys/tester.json"));
+
+    let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]), "diag");
+
+    assert_eq!(code, 0);
+    assert!(out.contains("keyring seal  :"), "{out}");
+    assert!(out.contains("template seal :"), "{out}");
+    assert_eq!(
+        out.matches(
+            "PCR drift   : unknown ⚠ (envelope has no recorded PCR snapshot; unseal was not tested)"
+        )
+        .count(),
+        2,
+        "{out}"
+    );
+    assert!(!out.contains("can unseal"), "{out}");
+}
+
+#[test]
+fn diag_reports_malformed_envelopes_as_corrupt_instead_of_falling_back() {
+    let sb = Sandbox::new("diag-corrupt-envelopes");
+    std::fs::write(sb.path("keyring/tester.json"), b"{not-json").unwrap();
+    std::fs::create_dir_all(sb.path("state/template-keys")).unwrap();
+    std::fs::write(
+        sb.path("state/template-keys/tester.json"),
+        b"{also-not-json",
+    )
+    .unwrap();
+
+    let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]), "diag");
+
+    assert_eq!(code, 0);
+    assert!(
+        out.contains(
+            "keyring seal  : CORRUPT ✗ (envelope JSON is malformed; preserve the file and do not force-forget it)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "template seal : CORRUPT ✗ (envelope JSON is malformed; preserve the file; run `irlume recovery restore` if a recovery passphrase was set, otherwise re-enroll)"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("daemon unreachable"), "{out}");
+}
+
+#[test]
+fn diag_reports_an_encrypted_store_with_no_template_key_as_unrecoverable() {
+    let sb = Sandbox::new("diag-missing-template-key");
+    serve(&sb.sock(), |request| match request {
+        Request::HasSealedPassword { .. } => Response::HasPassword(false),
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]), "diag");
+
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("template seal : MISSING ✗ (encrypted templates cannot be opened; re-enroll)"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("template seal : sealed, but not readable here"),
+        "{out}"
+    );
+}
+
+#[test]
+fn diag_reports_a_missing_template_key_as_recoverable_when_a_recovery_wrap_exists() {
+    let sb = Sandbox::new("diag-recoverable-template-key");
+    serve(&sb.sock(), |request| match request {
+        Request::HasSealedPassword { .. } => Response::HasPassword(false),
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: true,
+            recovery_set: true,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]), "diag");
+
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("template seal : MISSING ⚠ (recoverable: run `irlume recovery restore`)"),
+        "{out}"
+    );
+    assert!(!out.contains("re-enroll"), "{out}");
+}
+
+#[test]
+fn diag_does_not_call_a_reachable_daemon_unreachable_when_its_reply_is_unexpected() {
+    let sb = Sandbox::new("diag-unexpected-reply");
+    serve(&sb.sock(), |_| Response::Pong);
+
+    let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]), "diag");
+
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("keyring seal  : unknown (daemon returned an unexpected response)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("template seal : unknown (daemon returned an unexpected response)"),
+        "{out}"
+    );
+    assert!(!out.contains("daemon unreachable"), "{out}");
 }
 
 // ---------------------------------------------------------------- selinux load

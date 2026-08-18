@@ -995,9 +995,75 @@ pub fn identify(_args: &[String]) -> ExitCode {
     }
 }
 
+/// Print one root-readable TPM seal and its PCR-drift diagnosis. Missing and
+/// permission-denied paths return false so the caller can use a daemon summary;
+/// malformed or other unreadable files are reported here and return true.
+fn print_seal_diagnostics(
+    label: &str,
+    path: &std::path::Path,
+    healthy: &str,
+    drift_fix: &str,
+    corrupt_fix: &str,
+) -> bool {
+    let serialized = match std::fs::read_to_string(path) {
+        Ok(serialized) => serialized,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return false;
+        }
+        Err(error) => {
+            println!(
+                "  {label:<14}: UNREADABLE {NO} (I/O error {:?}; seal health is unknown)",
+                error.kind()
+            );
+            return true;
+        }
+    };
+    let env = match serde_json::from_str::<irlume_core::envelope::SealedEnvelope>(&serialized) {
+        Ok(env) => env,
+        Err(_) => {
+            println!("  {label:<14}: CORRUPT {NO} (envelope JSON is malformed; {corrupt_fix})");
+            return true;
+        }
+    };
+    println!("  {label:<14}: {} {OK}", path.display());
+    println!(
+        "    policy      : {}, bound PCRs {:?}",
+        env.policy.describe(),
+        env.pcrs
+    );
+    if env.pcr_values.is_empty() {
+        println!(
+            "    PCR drift   : unknown {WARN} (envelope has no recorded PCR snapshot; unseal was not tested)"
+        );
+        return true;
+    }
+    match irlume_core::tpm::diagnose_pcrs(&env) {
+        Ok(drifted) if drifted.is_empty() => {
+            println!("    PCR drift   : none {OK} ({healthy})");
+        }
+        Ok(drifted) => {
+            println!(
+                "    PCR drift   : DRIFTED at {drifted:?} {WARN}; unseal will FAIL; {drift_fix}"
+            );
+        }
+        Err(error) => {
+            println!(
+                "    PCR drift   : could not replay PCRs ({error}); need TPM access (tss group / root)"
+            );
+        }
+    }
+    true
+}
+
 /// `irlume diag`: TPM seal / PCR-drift diagnostics (the dbx/firmware debugger).
-/// Needs root + TPM access to read the root-only envelope and replay PCRs; falls
-/// back to a daemon-only summary otherwise.
+/// The keyring credential and face-template key are independent seals and are
+/// always reported separately. Needs root + TPM access to read their root-only
+/// envelopes and replay PCRs; falls back to daemon summaries otherwise.
 pub fn diag(args: &[String]) -> ExitCode {
     use irlume_common::secureboot;
     let user = user_arg(args);
@@ -1038,28 +1104,73 @@ pub fn diag(args: &[String]) -> ExitCode {
         ),
     }
 
-    // Keyring envelope: policy kind, bound PCRs, drift (root + TPM only).
-    let path = irlume_core::keyring::envelope_path(&user);
-    match irlume_core::envelope::SealedEnvelope::load(&path) {
-        Ok(env) => {
-            let kind = env.policy.describe();
-            println!("  seal envelope : {} {OK}", path.display());
-            println!("  seal policy   : {kind}, bound PCRs {:?}", env.pcrs);
-            match irlume_core::tpm::diagnose_pcrs(&env) {
-                Ok(d) if d.is_empty() => println!("  PCR drift     : none {OK} (the seal still satisfies; face unlock will release the password)"),
-                Ok(d) => println!("  PCR drift     : DRIFTED at {d:?} {WARN}; unseal will FAIL until you `irlume keyring arm` (or `irlume recovery restore`)"),
-                Err(e) => println!("  PCR drift     : could not replay PCRs ({e}); need TPM access (tss group / root)"),
+    // These envelopes protect different things and can drift independently. A
+    // healthy keyring seal says nothing about the template key that face auth
+    // must unseal, which is the misleading single-row diagnosis #472 exposed.
+    let keyring_path = irlume_core::keyring::envelope_path(&user);
+    if !print_seal_diagnostics(
+        "keyring seal",
+        &keyring_path,
+        "the keyring credential can unseal",
+        "run `irlume keyring arm` or log in with the typed password to recover and re-bind it",
+        "preserve the file and do not force-forget it",
+    ) {
+        match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
+            Ok(Response::HasPassword(true)) => println!(
+                "  keyring seal  : armed, but not readable here; run `sudo irlume diag` for PCR-drift detail"
+            ),
+            Ok(Response::HasPassword(false)) => {
+                println!("  keyring seal  : not armed (run `irlume keyring arm`)")
             }
+            Ok(_) => println!(
+                "  keyring seal  : unknown (daemon returned an unexpected response)"
+            ),
+            Err(_) => println!("  keyring seal  : unknown (daemon unreachable)"),
         }
-        Err(_) => {
-            // No readable envelope: either not armed, or not root.
-            match daemon_request(&Request::HasSealedPassword { user: user.clone() }) {
-                Ok(Response::HasPassword(true)) =>
-                    println!("  seal envelope : armed, but not readable here; run `sudo irlume diag` for PCR-drift detail"),
-                Ok(Response::HasPassword(false)) =>
-                    println!("  seal envelope : not armed (run `irlume keyring arm`)"),
-                _ => println!("  seal envelope : unknown (daemon unreachable)"),
-            }
+    }
+
+    let template_path = irlume_core::template_key::key_path(&user);
+    if !print_seal_diagnostics(
+        "template seal",
+        &template_path,
+        "the face-template key can unseal",
+        "run `irlume recovery restore`; without a recovery passphrase, re-enroll",
+        "preserve the file; run `irlume recovery restore` if a recovery passphrase was set, otherwise re-enroll",
+    ) {
+        match daemon_request(&Request::RecoveryStatus { user: user.clone() }) {
+            Ok(Response::RecoveryStatus {
+                encrypted: true,
+                key_present: false,
+                recovery_set: true,
+                ..
+            }) => println!(
+                "  template seal : MISSING {WARN} (recoverable: run `irlume recovery restore`)"
+            ),
+            Ok(Response::RecoveryStatus {
+                encrypted: true,
+                key_present: false,
+                recovery_set: false,
+                ..
+            }) => println!(
+                "  template seal : MISSING {NO} (encrypted templates cannot be opened; re-enroll)"
+            ),
+            Ok(Response::RecoveryStatus {
+                encrypted: true,
+                recovery_set,
+                ..
+            }) => println!(
+                "  template seal : sealed, but not readable here; recovery passphrase {}; run `sudo irlume diag` for PCR-drift detail",
+                if recovery_set { "set" } else { "NOT SET" }
+            ),
+            Ok(Response::RecoveryStatus {
+                encrypted: false, ..
+            }) => println!(
+                "  template seal : not present (templates are plaintext at rest)"
+            ),
+            Ok(_) => println!(
+                "  template seal : unknown (daemon returned an unexpected response)"
+            ),
+            Err(_) => println!("  template seal : unknown (daemon unreachable)"),
         }
     }
     ExitCode::SUCCESS

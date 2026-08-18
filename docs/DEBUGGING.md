@@ -130,7 +130,7 @@ release are identical.
 ```sh
 irlume doctor          # platform, TPM, Secure Boot, cameras, models, install origin
 irlume login status    # per-service wiring + face trigger mode (on-demand / face-first)
-irlume diag            # TPM seal + PCR drift (sudo for detail)
+irlume diag            # both TPM seals + PCR drift (sudo for detail)
 irlume status          # daemon + enrollment state
 ```
 

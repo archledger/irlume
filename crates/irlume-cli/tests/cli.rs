@@ -762,9 +762,15 @@ fn diag_falls_back_to_the_daemon_summary_and_reports_unknown() {
     let (code, out, _) = run(&mut sb.cmd(&["diag", "--user", "tester"]));
     assert_eq!(code, 0);
     assert!(out.contains("irlume diag for 'tester'"), "{out}");
-    // No envelope in the sandboxed keyring dir + dead socket:
+    // Neither envelope exists in the sandbox + dead socket. They must stay
+    // distinct: a generic seal summary can hide the broken template key behind
+    // a healthy keyring credential (#472).
     assert!(
-        out.contains("seal envelope : unknown (daemon unreachable)"),
+        out.contains("keyring seal  : unknown (daemon unreachable)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("template seal : unknown (daemon unreachable)"),
         "{out}"
     );
 }

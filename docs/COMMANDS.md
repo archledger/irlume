@@ -47,7 +47,7 @@ Conventions that apply everywhere:
 | `irlume keyring <arm\|status\|forget>` | TPM-sealed secret so a login also unlocks the wallet/keyring. What is sealed depends on the backend: the login password, the KDE wallet key, or a random token this re-keys a GNOME keyring to. `status` names which; `forget` re-keys a token back and takes `--force` to skip that |
 | `irlume reseal` | re-bind the sealed secret to the current PCRs after a firmware or kernel update; prompts for the password, safe to re-run. A GNOME keyring token re-binds itself on the next password login, so this reports that and does nothing |
 | `irlume recovery <status\|setup\|restore\|forget>` | recovery passphrase + profile encryption |
-| `irlume diag` | TPM seal + PCR-drift diagnostics; run with `sudo` for full detail |
+| `irlume diag` | Separate keyring-credential and face-template-key seal/PCR-drift diagnostics; run with `sudo` for full detail |
 
 ## System integration
 

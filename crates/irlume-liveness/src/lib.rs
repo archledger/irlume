@@ -1854,6 +1854,82 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
 /// describes one lighting condition, which `calibrate-closure` and `doctor` both
 /// now say out loud. [`detect_nod`] is pose-defined and carries none of this,
 /// which is why it is the default and the only gesture the prompts name.
+/// Observed open- and closed-eye EAR ranges for one shadow calibration profile.
+///
+/// This is evidence-tooling input, not persisted enrollment state. The selector
+/// below returns the slice index so profile names and serialization stay outside
+/// the liveness crate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClosureProfileRange {
+    pub open_min: f32,
+    pub open_max: f32,
+    pub closed_min: f32,
+    pub closed_max: f32,
+}
+
+impl ClosureProfileRange {
+    fn is_valid(self) -> bool {
+        [
+            self.open_min,
+            self.open_max,
+            self.closed_min,
+            self.closed_max,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+            && self.open_min <= self.open_max
+            && self.closed_min <= self.closed_max
+            && self.closed_max < self.open_min
+    }
+}
+
+/// Non-authoritative result of classifying a pre-gesture open-eye prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureProfileSelection {
+    /// Exactly one profile contains every prefix observation.
+    Unique(usize),
+    /// More than one profile contains the complete prefix; no tie is broken.
+    Ambiguous,
+    /// Evidence is absent, invalid, closed-like, or outside every open range.
+    OutOfRange,
+}
+
+/// Classify a pre-gesture EAR prefix against explicit observed profile ranges.
+///
+/// No nearest-profile fallback exists. If any prefix observation is compatible
+/// with any stored closed range, the whole prefix is refused before open-range
+/// classification so one profile's closure cannot become another profile's
+/// open evidence.
+pub fn select_closure_profile(
+    prefix: &[f32],
+    profiles: &[ClosureProfileRange],
+) -> ClosureProfileSelection {
+    if prefix.is_empty()
+        || profiles.is_empty()
+        || prefix.iter().any(|value| !value.is_finite())
+        || profiles.iter().any(|profile| !profile.is_valid())
+        || prefix.iter().any(|value| {
+            profiles
+                .iter()
+                .any(|profile| (profile.closed_min..=profile.closed_max).contains(value))
+        })
+    {
+        return ClosureProfileSelection::OutOfRange;
+    }
+
+    let mut candidates = profiles.iter().enumerate().filter_map(|(index, profile)| {
+        prefix
+            .iter()
+            .all(|value| (profile.open_min..=profile.open_max).contains(value))
+            .then_some(index)
+    });
+    match (candidates.next(), candidates.next()) {
+        (Some(index), None) => ClosureProfileSelection::Unique(index),
+        (Some(_), Some(_)) => ClosureProfileSelection::Ambiguous,
+        (None, _) => ClosureProfileSelection::OutOfRange,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ClosureCalibration {
     /// Median EAR with the eyes open (the smaller eye, as [`EarSample::ear`]).
@@ -2980,6 +3056,78 @@ mod tests {
         ClosureCalibration {
             ear_open: 0.24,
             ear_closed: 0.05,
+        }
+    }
+
+    fn profile(
+        open_min: f32,
+        open_max: f32,
+        closed_min: f32,
+        closed_max: f32,
+    ) -> ClosureProfileRange {
+        ClosureProfileRange {
+            open_min,
+            open_max,
+            closed_min,
+            closed_max,
+        }
+    }
+
+    #[test]
+    fn closure_profile_selector_locks_only_the_unique_open_range() {
+        let profiles = [
+            profile(0.24, 0.26, 0.01, 0.04),
+            profile(0.27, 0.30, 0.10, 0.14),
+        ];
+
+        assert_eq!(
+            select_closure_profile(&[0.281, 0.276, 0.289], &profiles),
+            ClosureProfileSelection::Unique(1)
+        );
+    }
+
+    #[test]
+    fn closure_profile_selector_never_breaks_an_open_range_tie() {
+        let profiles = [
+            profile(0.24, 0.28, 0.01, 0.04),
+            profile(0.26, 0.30, 0.10, 0.14),
+        ];
+
+        assert_eq!(
+            select_closure_profile(&[0.271, 0.274], &profiles),
+            ClosureProfileSelection::Ambiguous
+        );
+    }
+
+    #[test]
+    fn closure_profile_selector_refuses_a_prefix_closed_under_any_profile() {
+        let profiles = [
+            profile(0.24, 0.26, 0.10, 0.13),
+            profile(0.10, 0.14, 0.05, 0.09),
+        ];
+
+        assert_eq!(
+            select_closure_profile(&[0.11, 0.12], &profiles),
+            ClosureProfileSelection::OutOfRange,
+            "one profile's closed evidence must not become another profile's open prefix"
+        );
+    }
+
+    #[test]
+    fn closure_profile_selector_fails_closed_on_bad_or_missing_evidence() {
+        let valid = [profile(0.24, 0.26, 0.01, 0.04)];
+        let invalid = [profile(0.26, 0.24, 0.01, 0.04)];
+
+        for (prefix, profiles) in [
+            (&[][..], &valid[..]),
+            (&[f32::NAN][..], &valid[..]),
+            (&[0.20][..], &valid[..]),
+            (&[0.25][..], &invalid[..]),
+        ] {
+            assert_eq!(
+                select_closure_profile(prefix, profiles),
+                ClosureProfileSelection::OutOfRange
+            );
         }
     }
 

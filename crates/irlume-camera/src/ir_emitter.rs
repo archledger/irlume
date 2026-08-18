@@ -1520,6 +1520,36 @@ fn foreign_consumers(proc_root: &std::path::Path, dev: &str, self_pid: u32) -> C
     scan
 }
 
+fn apply_capture_action_guarded(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    action: CaptureAction,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(Option<CaptureWrite>, Vec<u8>), String> {
+    match action {
+        CaptureAction::Nothing => Ok((None, Vec::new())),
+        CaptureAction::Override(ctrl) => {
+            let payload = ctrl.payload.clone();
+            apply_override_guarded(fd, id, &ctrl, before_forward_write)
+                .map(|write| (Some(write), payload))
+        }
+        CaptureAction::DeviceDefault { unit, selector } => {
+            match apply_device_default_guarded(fd, id, unit, selector, before_forward_write) {
+                Ok((write, sent)) => Ok((Some(write), sent)),
+                Err(GuardedApplyError::Apply(_)) => Ok((None, Vec::new())),
+                Err(GuardedApplyError::Guard(why)) => Err(why),
+            }
+        }
+        CaptureAction::KnownPayload(ctrl) => {
+            match apply_known_payload_guarded(fd, id, &ctrl, before_forward_write) {
+                Ok(write) => Ok((Some(write), ctrl.payload)),
+                Err(GuardedApplyError::Apply(_)) => Ok((None, Vec::new())),
+                Err(GuardedApplyError::Guard(why)) => Err(why),
+            }
+        }
+    }
+}
+
 /// Light the emitter on the open `fd` for `device`, if a control is configured.
 /// Returns whether a `SET_CUR` succeeded. Best-effort.
 ///
@@ -1699,35 +1729,7 @@ fn enable_guarded(
     // user about their infrared. A control that already held the wanted value
     // is active and not irlume's to undo, and collapsing the pair reported it
     // dark.
-    let (write, applied) = match action {
-        CaptureAction::Nothing => (None, Vec::new()),
-        CaptureAction::Override(ctrl) => {
-            let payload = ctrl.payload.clone();
-            (
-                Some(apply_override_guarded(
-                    fd,
-                    &id,
-                    &ctrl,
-                    before_forward_write,
-                )?),
-                payload,
-            )
-        }
-        CaptureAction::DeviceDefault { unit, selector } => {
-            match apply_device_default_guarded(fd, &id, unit, selector, before_forward_write) {
-                Ok((w, sent)) => (Some(w), sent),
-                Err(GuardedApplyError::Apply(_)) => (None, Vec::new()),
-                Err(GuardedApplyError::Guard(why)) => return Err(why),
-            }
-        }
-        CaptureAction::KnownPayload(ctrl) => {
-            match apply_known_payload_guarded(fd, &id, &ctrl, before_forward_write) {
-                Ok(w) => (Some(w), ctrl.payload),
-                Err(GuardedApplyError::Apply(_)) => (None, Vec::new()),
-                Err(GuardedApplyError::Guard(why)) => return Err(why),
-            }
-        }
-    };
+    let (write, applied) = apply_capture_action_guarded(fd, &id, action, before_forward_write)?;
     let active = write
         .as_ref()
         .is_some_and(|w| w.outcome != Applied::Nothing);
@@ -8434,6 +8436,47 @@ mod tests {
                 .any(|request| matches!(request, fake_camera::Request::Set(_))),
             "the degraded unrecorded path still sends nothing"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_capture_action_arm_propagates_the_late_guard_refusal() {
+        use std::os::fd::AsRawFd as _;
+
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-capture-action-guard-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let file = std::fs::File::open("/dev/null").expect("stable fake fd");
+        let id = identity(0x3277, 0x0059);
+        let control = || ctrl(14, 6, vec![1, 3, 2]);
+        let actions = [
+            CaptureAction::Override(control()),
+            CaptureAction::DeviceDefault {
+                unit: 14,
+                selector: 6,
+            },
+            CaptureAction::KnownPayload(control()),
+        ];
+
+        for action in actions {
+            let _fake = fake_camera::install(a_working_camera());
+            let error = apply_capture_action_guarded(file.as_raw_fd(), &id, action, &mut || {
+                Err("late privacy refusal".into())
+            })
+            .expect_err("every forward-write action must propagate the guard");
+            assert!(error.contains("privacy refusal"), "{error}");
+            assert!(
+                !fake_camera::log()
+                    .iter()
+                    .any(|request| matches!(request, fake_camera::Request::Set(_))),
+                "no action arm may degrade the refusal into best-effort apply"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

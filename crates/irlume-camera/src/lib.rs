@@ -1887,15 +1887,51 @@ fn establish_concurrent_rate<A: ValidatedStream + Send, B: ValidatedStream + Sen
     if primary.rate_window.ready() && secondary.rate_window.ready() {
         return Ok(());
     }
+    establish_concurrent_rate_with_cancel(
+        primary,
+        secondary,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+#[derive(Debug)]
+struct PairedRateFillCancelled;
+
+impl std::fmt::Display for PairedRateFillCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("paired rate fill cancelled after companion failure")
+    }
+}
+
+impl std::error::Error for PairedRateFillCancelled {}
+
+fn paired_rate_fill_cancelled(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PairedRateFillCancelled>())
+        .is_some()
+}
+
+fn paired_rate_cancel_error() -> std::io::Error {
+    std::io::Error::other(PairedRateFillCancelled)
+}
+
+fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: ValidatedStream + Send>(
+    primary: &mut TrackedStream<A>,
+    secondary: &mut TrackedStream<B>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
     let ready_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::scope(|scope| {
         let a = {
             let count = std::sync::Arc::clone(&ready_count);
-            scope.spawn(move || drain_until_both_ready(primary, &count))
+            let cancelled = std::sync::Arc::clone(&cancelled);
+            scope.spawn(move || drain_until_both_ready(primary, &count, &cancelled))
         };
         let b = {
             let count = std::sync::Arc::clone(&ready_count);
-            scope.spawn(move || drain_until_both_ready(secondary, &count))
+            let cancelled = std::sync::Arc::clone(&cancelled);
+            scope.spawn(move || drain_until_both_ready(secondary, &count, &cancelled))
         };
         // A panic in a fill thread is a software defect, never a camera
         // verdict: re-raise it (mirrors the capture-mode probe's rule, #263).
@@ -1905,9 +1941,12 @@ fn establish_concurrent_rate<A: ValidatedStream + Send, B: ValidatedStream + Sen
         let b = b
             .join()
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
-        a?;
-        b?;
-        Ok(())
+        match (a, b) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Err(b)) if paired_rate_fill_cancelled(&a) => Err(b),
+            (Err(a), _) => Err(a),
+            (_, Err(b)) => Err(b),
+        }
     })
 }
 
@@ -1921,11 +1960,18 @@ fn establish_concurrent_rate<A: ValidatedStream + Send, B: ValidatedStream + Sen
 fn drain_until_both_ready<S: ValidatedStream>(
     stream: &mut TrackedStream<S>,
     ready_count: &std::sync::atomic::AtomicUsize,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
     // Flush the STREAMON transient; its sequence gaps would poison the window.
     for _ in 0..RATE_STARTUP_FLUSH {
-        stream.next_discarded()?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(paired_rate_cancel_error());
+        }
+        if let Err(error) = stream.next_discarded() {
+            cancelled.store(true, Ordering::Release);
+            return Err(error);
+        }
     }
     stream.rate_window.reset();
     let mut reported = false;
@@ -1934,7 +1980,13 @@ fn drain_until_both_ready<S: ValidatedStream>(
     // bounded by the twin's worst-case fill.
     let budget = MAX_RATE_FILL_ATTEMPTS + MAX_RATE_FILL_ATTEMPTS;
     while ready_count.load(Ordering::Acquire) < 2 && attempts < budget {
-        stream.next_discarded()?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(paired_rate_cancel_error());
+        }
+        if let Err(error) = stream.next_discarded() {
+            cancelled.store(true, Ordering::Release);
+            return Err(error);
+        }
         if !reported && stream.rate_window.ready() {
             ready_count.fetch_add(1, Ordering::AcqRel);
             reported = true;
@@ -4686,9 +4738,9 @@ impl IrCamera {
 /// A running IR stream with its emitter lit.
 pub struct IrSession<'a> {
     cam: &'a IrCamera,
-    /// `None` only transiently inside [`Self::recover`]: the broken stream
-    /// must be DROPPED (STREAMOFF + buffer release) before its replacement
-    /// negotiates, and a plain re-assignment builds the new value first.
+    /// `None` while [`Self::recover`] replaces a broken stream, after a failed
+    /// recovery, or after a privacy refusal deliberately tears the session
+    /// down. Recovery must open a fresh stream before capture can resume.
     stream: TrackedStream<SafeStream<'a>>,
     dec: IrDecoder,
     lit: bool,
@@ -5209,10 +5261,10 @@ impl IrSession<'_> {
 /// module-level concurrent fill for why the fill must not be serial.
 ///
 /// Called once per held session, before the capture loop, so the per-frame
-/// `next()` fills no-op on a ready window. Best-effort by contract: a failure
-/// is reported so the caller can log it, but the session stays usable — the
-/// per-stream serial fill in `next()` re-attempts establishment (and fails
-/// closed) on the first capture, preserving the existing error/retry shape.
+/// `next()` fills no-op on a ready window. An ordinary failure is reported but
+/// leaves both sessions reusable, so `next()` may retry its serial fill. A
+/// privacy refusal is different: the IR stream and metadata queue are stopped,
+/// D1 is restored, and that session remains inert until explicit recovery.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn establish_pair_rate(
     rgb: &mut RgbSession<'_>,
@@ -14165,6 +14217,80 @@ mod tests {
                 panic!("concurrent fill thread panicked")
             }
         }
+    }
+
+    #[test]
+    fn paired_rate_failure_cancels_the_companion_fill_without_spending_its_budget() {
+        struct ImmediateFailure;
+
+        impl ValidatedStream for ImmediateFailure {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                Err(ValidatedDequeueError::Io(std::io::Error::other(
+                    "privacy refusal",
+                )))
+            }
+        }
+
+        struct CancelAwareFixture {
+            payload: [u8; 1],
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl ValidatedStream for CancelAwareFixture {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                use std::sync::atomic::Ordering;
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                while !self.cancelled.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                let metadata = v4l::buffer::Metadata {
+                    bytesused: 1,
+                    sequence: call as u32,
+                    flags: v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                    timestamp: v4l::timestamp::Timestamp::new(call as i64 + 1, 0),
+                    ..v4l::buffer::Metadata::default()
+                };
+                let facts = frame_provenance::DequeuedBufferFacts::from_v4l(&metadata, 1)
+                    .map_err(ValidatedDequeueError::Facts)?;
+                Ok((&self.payload, facts))
+            }
+        }
+
+        let config = |role| {
+            rate_gate::StreamRateConfig::with_window(
+                role,
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                frame_interval::FrameInterval::new(1, 15).expect("1/15"),
+                4,
+            )
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut rgb = TrackedStream::new(
+            CancelAwareFixture {
+                payload: [1],
+                calls: calls.clone(),
+                cancelled: cancelled.clone(),
+            },
+            config(contracts::StreamRole::Rgb),
+        );
+        let mut ir = TrackedStream::new(ImmediateFailure, config(contracts::StreamRole::Ir));
+
+        let error = establish_concurrent_rate_with_cancel(&mut rgb, &mut ir, cancelled)
+            .expect_err("the IR refusal must remain the paired result");
+
+        assert!(error.to_string().contains("privacy refusal"), "{error}");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
+            "the companion may finish one in-flight dequeue, never the bounded fill"
+        );
     }
 }
 

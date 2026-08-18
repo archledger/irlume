@@ -403,10 +403,32 @@ const RETRY_SEAM_ALLOWANCE_MS: u64 = 10_000;
 /// hardware we have is the NexiGo N930W at ~3.6s for a full sequential pair, so
 /// 3s of GAP between two windows means something went wrong rather than slow.
 ///
-/// Exceeding it is [`Verdict::Uncertain`], never Spoof: a stale pair is a
-/// capture fault and says nothing about the person in front of the camera. That
-/// kind is presence-retryable, so the grace window just captures again.
+/// Exceeding it is never accepted as a pair: stale RGB evidence is discarded.
+/// A valid IR face may continue through the separately gated IR-only path;
+/// otherwise the capture is [`Verdict::Uncertain`], never Spoof, because stale
+/// frames say nothing about the person in front of the camera.
 const MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Debug, Eq, PartialEq)]
+enum EligiblePairEvidence<T> {
+    Paired(Option<T>),
+    IrOnly,
+    Reject,
+}
+
+fn eligible_pair_evidence<T>(
+    skew: std::time::Duration,
+    rgb_evidence: Option<T>,
+    has_ir_face: bool,
+) -> EligiblePairEvidence<T> {
+    if skew <= MAX_CROSS_SPECTRUM_SKEW {
+        EligiblePairEvidence::Paired(rgb_evidence)
+    } else if has_ir_face {
+        EligiblePairEvidence::IrOnly
+    } else {
+        EligiblePairEvidence::Reject
+    }
+}
 
 /// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
 /// (testing); otherwise sudo/su and polkit get the short window (the user is
@@ -3708,11 +3730,62 @@ impl Engine {
                 .duration_since(ir.captured.start)
                 .as_millis()
         );
-        if skew > MAX_CROSS_SPECTRUM_SKEW {
-            // Uncertain, not Spoof: a stale pair is a capture-quality problem and
-            // says nothing about the person. `OutcomeKind::Uncertain` is
-            // presence-retryable, so a caller inside the grace window simply
-            // captures again, which is exactly the fix.
+        // Move the RGB detection into the eligibility decision. The IR-only
+        // variant has no field in which stale RGB evidence could survive, so
+        // all later signal and embedding code can consume only eligible data.
+        let eligible_pair = eligible_pair_evidence(skew, rgb_top, ir_top.is_some());
+        let (rgb_top, stale_pair_reason) = match eligible_pair {
+            EligiblePairEvidence::Paired(rgb_top) => (rgb_top, None),
+            EligiblePairEvidence::IrOnly => {
+                // Keep the actual detector count above for capture provenance,
+                // but make the stale RGB face structurally unavailable before
+                // any liveness signal or embedding is derived. Authentication
+                // can then enter only the independently gated IR-only path;
+                // identify and enrollment remain RGB-primary and cannot consume
+                // this frame.
+                let reason = format!(
+                    "RGB and IR frames are {}ms apart (limit {}ms); discarded stale RGB and using IR-only authentication",
+                    skew.as_millis(),
+                    MAX_CROSS_SPECTRUM_SKEW.as_millis()
+                );
+                irlume_common::dlog!("assess: {reason}");
+                (None, Some(reason))
+            }
+            EligiblePairEvidence::Reject => {
+                // Uncertain, not Spoof: a stale pair is a capture-quality
+                // problem and says nothing about the person. With no usable IR
+                // face there is no independent modality to salvage.
+                let measurements = irlume_common::diagnostics::TraceMeasurement::new(
+                    irlume_common::diagnostics::TraceMetric::CaptureSkewMilliseconds,
+                    skew.as_secs_f64() * 1_000.0,
+                    Some(MAX_CROSS_SPECTRUM_SKEW.as_secs_f64() * 1_000.0),
+                )
+                .into_iter()
+                .collect();
+                diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::Decision {
+                    verdict: irlume_common::diagnostics::TraceVerdict::Uncertain,
+                    measurements,
+                });
+                return Ok(Assessment {
+                    verdict: Verdict::Uncertain,
+                    rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
+                    reason: format!(
+                        "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
+                        skew.as_millis(),
+                        MAX_CROSS_SPECTRUM_SKEW.as_millis()
+                    ),
+                    embedding: None,
+                    ir_embedding: None,
+                    signals: Default::default(),
+                    ir_center_edge_ratio: 0.0,
+                    ir_brightness: 0.0,
+                    ir_ambient_share: None,
+                    eyes_open: false,
+                    thirdparty_fake: None,
+                });
+            }
+        };
+        if stale_pair_reason.is_some() {
             let measurements = irlume_common::diagnostics::TraceMeasurement::new(
                 irlume_common::diagnostics::TraceMetric::CaptureSkewMilliseconds,
                 skew.as_secs_f64() * 1_000.0,
@@ -3723,23 +3796,6 @@ impl Engine {
             diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::Decision {
                 verdict: irlume_common::diagnostics::TraceVerdict::Uncertain,
                 measurements,
-            });
-            return Ok(Assessment {
-                verdict: Verdict::Uncertain,
-                rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
-                reason: format!(
-                    "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
-                    skew.as_millis(),
-                    MAX_CROSS_SPECTRUM_SKEW.as_millis()
-                ),
-                embedding: None,
-                ir_embedding: None,
-                signals: Default::default(),
-                ir_center_edge_ratio: 0.0,
-                ir_brightness: 0.0,
-                ir_ambient_share: None,
-                eyes_open: false,
-                thirdparty_fake: None,
             });
         }
 
@@ -3813,7 +3869,10 @@ impl Engine {
             rgb_specular_frac: 0.0,
         };
         let liveness_started = std::time::Instant::now();
-        let (verdict, _cues, reason) = self.gate.evaluate(&signals);
+        let (verdict, _cues, reason) = match stale_pair_reason {
+            Some(reason) => (Verdict::Uncertain, Default::default(), reason),
+            None => self.gate.evaluate(&signals),
+        };
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
@@ -7878,6 +7937,38 @@ mod tests {
         // Non-Uncertain verdicts never take this path at all.
         assert!(!uncertain_short_circuits(Verdict::Live, false, true));
         assert!(!uncertain_short_circuits(Verdict::Spoof, true, true));
+    }
+
+    #[test]
+    fn a_stale_pair_with_an_ir_face_discards_rgb_for_ir_only_authentication() {
+        assert_eq!(
+            eligible_pair_evidence(
+                MAX_CROSS_SPECTRUM_SKEW + std::time::Duration::from_millis(1),
+                Some(42_u8),
+                true,
+            ),
+            EligiblePairEvidence::IrOnly,
+        );
+    }
+
+    #[test]
+    fn a_pair_at_the_skew_limit_remains_eligible_for_cross_spectrum_authentication() {
+        assert_eq!(
+            eligible_pair_evidence(MAX_CROSS_SPECTRUM_SKEW, Some(42_u8), true),
+            EligiblePairEvidence::Paired(Some(42_u8)),
+        );
+    }
+
+    #[test]
+    fn a_stale_pair_without_an_ir_face_remains_a_capture_rejection() {
+        assert_eq!(
+            eligible_pair_evidence(
+                MAX_CROSS_SPECTRUM_SKEW + std::time::Duration::from_millis(1),
+                Some(42_u8),
+                false,
+            ),
+            EligiblePairEvidence::Reject,
+        );
     }
 
     #[test]

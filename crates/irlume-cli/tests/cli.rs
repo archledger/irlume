@@ -2032,6 +2032,214 @@ fn write_pose_recording(path: &std::path::Path, label: &str, pitches: &[f32]) {
     std::fs::write(path, s).unwrap();
 }
 
+/// A blink recording exactly as `blinkcap capture` writes it.
+fn write_blink_recording(path: &std::path::Path, label: &str, ears: &[f32]) {
+    let mut s = format!(
+        "{{\"blinkcap\":true,\"label\":\"{label}\",\"frames\":{}}}\n",
+        ears.len()
+    );
+    for (i, ear) in ears.iter().enumerate() {
+        s.push_str(&format!(
+            "{{\"idx\":{i},\"ear\":{ear},\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0}}\n"
+        ));
+    }
+    std::fs::write(path, s).unwrap();
+}
+
+fn write_selector_manifest(path: &std::path::Path, profiles: serde_json::Value) {
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&serde_json::json!({ "profiles": profiles })).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn blinkcap_selector_locks_one_profile_and_discards_the_prefix() {
+    let sb = Sandbox::new("bc-selector-unique");
+    let dir = sb.path("work");
+    for (file, label, ears) in [
+        ("bare-open-1.jsonl", "bare-open", vec![0.24; 3]),
+        ("bare-open-2.jsonl", "bare-open", vec![0.25; 3]),
+        ("bare-closed-1.jsonl", "bare-closed", vec![0.02; 3]),
+        ("bare-closed-2.jsonl", "bare-closed", vec![0.03; 3]),
+        ("glasses-open-1.jsonl", "glasses-open", vec![0.27; 3]),
+        ("glasses-open-2.jsonl", "glasses-open", vec![0.29; 3]),
+        ("glasses-closed-1.jsonl", "glasses-closed", vec![0.10; 3]),
+        ("glasses-closed-2.jsonl", "glasses-closed", vec![0.12; 3]),
+    ] {
+        write_blink_recording(&dir.join(file), label, &ears);
+    }
+    let manifest = dir.join("profiles.json");
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([
+            {
+                "name": "bare",
+                "open": ["bare-open-1.jsonl", "bare-open-2.jsonl"],
+                "closed": ["bare-closed-1.jsonl", "bare-closed-2.jsonl"]
+            },
+            {
+                "name": "glasses",
+                "open": ["glasses-open-1.jsonl", "glasses-open-2.jsonl"],
+                "closed": ["glasses-closed-1.jsonl", "glasses-closed-2.jsonl"]
+            }
+        ]),
+    );
+    let mut attempt = vec![0.28, 0.281, 0.279];
+    attempt.extend([0.11; 11]);
+    attempt.extend([0.28; 4]);
+    let attempt_file = dir.join("attempt.jsonl");
+    write_blink_recording(&attempt_file, "held-closure-glasses", &attempt);
+
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempt_file.to_str().unwrap(),
+            "--prefix-frames",
+            "3",
+        ])
+        .env("IRLUME_DEV", "1"));
+
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("SHADOW ONLY"), "{out}");
+    assert!(out.contains("selector=unique:glasses"), "{out}");
+    assert!(out.contains("prefix=3 remaining=15"), "{out}");
+    assert!(out.contains("shadow-consent=Blinked"), "{out}");
+}
+
+#[test]
+fn blinkcap_selector_never_runs_consent_for_ambiguous_or_closed_like_prefixes() {
+    let sb = Sandbox::new("bc-selector-refuse");
+    let dir = sb.path("work");
+    for (file, label, ears) in [
+        ("a-open-1.jsonl", "a-open", vec![0.24; 3]),
+        ("a-open-2.jsonl", "a-open", vec![0.28; 3]),
+        ("a-closed-1.jsonl", "a-closed", vec![0.02; 3]),
+        ("a-closed-2.jsonl", "a-closed", vec![0.03; 3]),
+        ("b-open-1.jsonl", "b-open", vec![0.25; 3]),
+        ("b-open-2.jsonl", "b-open", vec![0.29; 3]),
+        ("b-closed-1.jsonl", "b-closed", vec![0.10; 3]),
+        ("b-closed-2.jsonl", "b-closed", vec![0.12; 3]),
+    ] {
+        write_blink_recording(&dir.join(file), label, &ears);
+    }
+    let manifest = dir.join("profiles.json");
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([
+            {
+                "name": "a",
+                "open": ["a-open-1.jsonl", "a-open-2.jsonl"],
+                "closed": ["a-closed-1.jsonl", "a-closed-2.jsonl"]
+            },
+            {
+                "name": "b",
+                "open": ["b-open-1.jsonl", "b-open-2.jsonl"],
+                "closed": ["b-closed-1.jsonl", "b-closed-2.jsonl"]
+            }
+        ]),
+    );
+    let attempts = dir.join("attempts");
+    std::fs::create_dir(&attempts).unwrap();
+    write_blink_recording(&attempts.join("ambiguous.jsonl"), "ambiguous", &[0.26; 6]);
+    write_blink_recording(
+        &attempts.join("closed-first.jsonl"),
+        "closed-first",
+        &[0.11; 6],
+    );
+
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempts.to_str().unwrap(),
+            "--prefix-frames",
+            "3",
+        ])
+        .env("IRLUME_DEV", "1"));
+
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ambiguous.jsonl label=ambiguous prefix=3 remaining=3 selector=ambiguous shadow-consent=not-run"),
+        "{out}"
+    );
+    assert!(
+        out.contains("closed-first.jsonl label=closed-first prefix=3 remaining=3 selector=out-of-range shadow-consent=not-run"),
+        "{out}"
+    );
+}
+
+#[test]
+fn blinkcap_selector_rejects_duplicate_profiles_and_partial_recordings() {
+    let sb = Sandbox::new("bc-selector-invalid");
+    let dir = sb.path("work");
+    let manifest = dir.join("profiles.json");
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([
+            {"name": "same", "open": ["x", "y"], "closed": ["z", "q"]},
+            {"name": "same", "open": ["x", "y"], "closed": ["z", "q"]}
+        ]),
+    );
+    let attempt = dir.join("attempt.jsonl");
+    write_blink_recording(&attempt, "attempt", &[0.25; 6]);
+
+    let (code, _out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempt.to_str().unwrap(),
+            "--prefix-frames",
+            "3",
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1);
+    assert!(err.contains("duplicate profile name 'same'"), "{err}");
+
+    write_blink_recording(&dir.join("open-1.jsonl"), "open", &[0.24; 3]);
+    write_blink_recording(&dir.join("open-2.jsonl"), "open", &[0.25; 3]);
+    write_blink_recording(&dir.join("closed-1.jsonl"), "closed", &[0.02; 3]);
+    std::fs::write(
+        dir.join("closed-2.jsonl"),
+        "{\"blinkcap\":true,\"label\":\"closed\",\"frames\":2}\n\
+         {\"idx\":0,\"ear\":0.03,\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0}\n",
+    )
+    .unwrap();
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([{
+            "name": "profile",
+            "open": ["open-1.jsonl", "open-2.jsonl"],
+            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
+        }]),
+    );
+    let (code, _out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempt.to_str().unwrap(),
+            "--prefix-frames",
+            "3",
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1);
+    assert!(err.contains("declares 2 frames but 1 were read"), "{err}");
+}
+
 #[test]
 fn blinkcap_replay_accepts_a_single_pose_file_and_a_pose_only_dir() {
     let sb = Sandbox::new("bc-pose-ok");

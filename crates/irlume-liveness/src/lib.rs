@@ -1868,7 +1868,9 @@ pub struct ClosureProfileRange {
 }
 
 impl ClosureProfileRange {
-    fn is_valid(self) -> bool {
+    /// Whether every bound is finite, ordered, non-negative, and the observed
+    /// closed range stays strictly below the observed open range.
+    pub fn is_valid(self) -> bool {
         [
             self.open_min,
             self.open_max,

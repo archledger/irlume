@@ -17,6 +17,23 @@
 //!
 //!   replay:  `IRLUME_DEV=1 irlume blinkcap replay data/`   (a file or a directory)
 //!
+//!   selector shadow:
+//!   `IRLUME_DEV=1 irlume blinkcap select --profiles profiles.json \
+//!      --attempts attempts/ --prefix-frames 6`
+//!
+//! The selector manifest names repeated open/closed blinkcap recordings for
+//! each condition. Paths are relative to the manifest unless absolute:
+//!
+//! ```json
+//! {"profiles":[{"name":"desk-glasses",
+//!   "open":["open-1.jsonl","open-2.jsonl"],
+//!   "closed":["closed-1.jsonl","closed-2.jsonl"]}]}
+//! ```
+//!
+//! Selector output is evidence only. It never reaches the daemon, enrollment,
+//! or authorization outcome, and the prefix length is deliberately explicit
+//! because no production value has been qualified.
+//!
 //! Labels are free text; the replay summary groups by them. The suggested set
 //! for the consent-gesture campaign: `held-closure` (genuine deliberate closes),
 //! `natural-blink` (passive spontaneous blinks, must NOT pass), `ae-settle`
@@ -25,9 +42,10 @@
 
 use crate::{engine, flag};
 use irlume_liveness::{
-    detect_blink, detect_deliberate_closure, BlinkResult, ClosureCalibration, EarSample,
+    detect_blink, detect_deliberate_closure, select_closure_profile, BlinkResult,
+    ClosureCalibration, ClosureProfileRange, ClosureProfileSelection, EarSample,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Derive a [`ClosureCalibration`] from a pool of samples: open = the 75th
@@ -94,11 +112,13 @@ pub fn run(args: &[String]) -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("capture") => capture(args),
         Some("replay") => replay(args),
+        Some("select") => selector(args),
         _ => {
             eprintln!(
-                "usage: irlume blinkcap <capture|replay>\n  \
+                "usage: irlume blinkcap <capture|replay|select>\n  \
                  capture --label L --det <y.onnx> --model <g.onnx> --mesh <fl.onnx> --out F.jsonl [--ir DEV] [--n 75]\n  \
-                 replay <file.jsonl | dir>   (runs the detectors + sweeps the closure threshold)"
+                 replay <file.jsonl | dir>   (runs the detectors + sweeps the closure threshold)\n  \
+                 select --profiles P.json --attempts <file.jsonl | dir> --prefix-frames N"
             );
             ExitCode::from(2)
         }
@@ -242,6 +262,337 @@ struct Recording {
     file: String,
     label: String,
     samples: Vec<EarSample>,
+}
+
+const SELECTOR_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+const SELECTOR_RECORDING_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SELECTOR_MAX_PROFILES: usize = 16;
+const SELECTOR_MAX_RECORDINGS_PER_PHASE: usize = 64;
+const SELECTOR_MAX_ATTEMPTS: usize = 512;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectorManifest {
+    profiles: Vec<SelectorProfileSpec>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectorProfileSpec {
+    name: String,
+    open: Vec<String>,
+    closed: Vec<String>,
+}
+
+fn read_bounded(path: &Path, max: u64, kind: &str) -> Result<String, String> {
+    let len = std::fs::metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    if len > max {
+        return Err(format!(
+            "{}: {kind} is {len} bytes; limit is {max}",
+            path.display()
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn load_recording_strict(path: &Path) -> Result<Recording, String> {
+    let text = read_bounded(path, SELECTOR_RECORDING_MAX_BYTES, "blink recording")?;
+    let mut lines = text.lines();
+    let header: serde_json::Value = serde_json::from_str(
+        lines
+            .next()
+            .ok_or_else(|| format!("{}: empty recording", path.display()))?,
+    )
+    .map_err(|error| format!("{}: invalid blinkcap header: {error}", path.display()))?;
+    if header.get("blinkcap").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("{}: not a blinkcap recording", path.display()));
+    }
+    let expected = header
+        .get("frames")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| format!("{}: header has no valid frame count", path.display()))?;
+    let label = header
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unlabeled")
+        .to_owned();
+    let mut samples = Vec::new();
+    for (line_index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: RecordedSample = serde_json::from_str(line).map_err(|error| {
+            format!(
+                "{}:{}: invalid blink record: {error}",
+                path.display(),
+                line_index + 2
+            )
+        })?;
+        let sample = EarSample::from(&record);
+        if sample.ear.is_some_and(|ear| !ear.is_finite() || ear < 0.0) {
+            return Err(format!(
+                "{}:{}: EAR must be finite and non-negative",
+                path.display(),
+                line_index + 2
+            ));
+        }
+        samples.push(sample);
+    }
+    if samples.len() != expected {
+        return Err(format!(
+            "{}: header declares {expected} frames but {} were read",
+            path.display(),
+            samples.len()
+        ));
+    }
+    Ok(Recording {
+        file: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        label,
+        samples,
+    })
+}
+
+fn median(values: &mut [f32]) -> f32 {
+    values.sort_by(f32::total_cmp);
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+fn recording_median(path: &Path) -> Result<f32, String> {
+    let recording = load_recording_strict(path)?;
+    let mut ears: Vec<f32> = recording
+        .samples
+        .iter()
+        .filter_map(|sample| sample.ear)
+        .collect();
+    if ears.is_empty() {
+        return Err(format!(
+            "{}: recording contains no EAR samples",
+            path.display()
+        ));
+    }
+    Ok(median(&mut ears))
+}
+
+fn resolve_recording(manifest_path: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    }
+}
+
+fn phase_medians(manifest_path: &Path, files: &[String]) -> Result<Vec<f32>, String> {
+    files
+        .iter()
+        .map(|file| recording_median(&resolve_recording(manifest_path, file)))
+        .collect()
+}
+
+fn load_selector_profiles(
+    manifest_path: &Path,
+) -> Result<Vec<(String, ClosureProfileRange, ClosureCalibration)>, String> {
+    let text = read_bounded(
+        manifest_path,
+        SELECTOR_MANIFEST_MAX_BYTES,
+        "selector manifest",
+    )?;
+    let manifest: SelectorManifest = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "{}: invalid selector manifest: {error}",
+            manifest_path.display()
+        )
+    })?;
+    if !(1..=SELECTOR_MAX_PROFILES).contains(&manifest.profiles.len()) {
+        return Err(format!(
+            "selector manifest needs 1..={SELECTOR_MAX_PROFILES} profiles"
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for spec in &manifest.profiles {
+        if spec.name.is_empty() || spec.name.len() > 64 || spec.name.trim() != spec.name {
+            return Err("profile names must be 1..=64 characters without outer whitespace".into());
+        }
+        if !names.insert(spec.name.clone()) {
+            return Err(format!("duplicate profile name '{}'", spec.name));
+        }
+        for (phase, files) in [("open", &spec.open), ("closed", &spec.closed)] {
+            if !(2..=SELECTOR_MAX_RECORDINGS_PER_PHASE).contains(&files.len()) {
+                return Err(format!(
+                    "profile '{}' {phase} phase needs 2..={SELECTOR_MAX_RECORDINGS_PER_PHASE} recordings",
+                    spec.name
+                ));
+            }
+            if files.iter().any(|file| file.trim().is_empty()) {
+                return Err(format!("profile '{}' has an empty {phase} path", spec.name));
+            }
+        }
+    }
+
+    let mut profiles = Vec::with_capacity(manifest.profiles.len());
+    for spec in manifest.profiles {
+        let mut open = phase_medians(manifest_path, &spec.open)?;
+        let mut closed = phase_medians(manifest_path, &spec.closed)?;
+        open.sort_by(f32::total_cmp);
+        closed.sort_by(f32::total_cmp);
+        let range = ClosureProfileRange {
+            open_min: open[0],
+            open_max: open[open.len() - 1],
+            closed_min: closed[0],
+            closed_max: closed[closed.len() - 1],
+        };
+        let calibration = ClosureCalibration {
+            ear_open: median(&mut open),
+            ear_closed: median(&mut closed),
+        };
+        if !range.is_valid() || !calibration.is_usable() {
+            return Err(format!(
+                "profile '{}': open and closed evidence is not cleanly separated",
+                spec.name
+            ));
+        }
+        profiles.push((spec.name, range, calibration));
+    }
+    Ok(profiles)
+}
+
+fn selector_attempt_files(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .into_iter()
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    files.sort();
+    if files.is_empty() || files.len() > SELECTOR_MAX_ATTEMPTS {
+        return Err(format!(
+            "{}: expected 1..={SELECTOR_MAX_ATTEMPTS} JSONL attempts",
+            path.display()
+        ));
+    }
+    Ok(files)
+}
+
+fn split_selector_prefix(
+    samples: &[EarSample],
+    required: usize,
+) -> Option<(Vec<f32>, &[EarSample])> {
+    let mut prefix = Vec::with_capacity(required);
+    for (index, sample) in samples.iter().enumerate() {
+        if let Some(ear) = sample.ear {
+            prefix.push(ear);
+            if prefix.len() == required {
+                return Some((prefix, &samples[index + 1..]));
+            }
+        }
+    }
+    None
+}
+
+fn escaped(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
+}
+
+fn evaluate_selector(
+    attempts: &Path,
+    prefix_frames: usize,
+    profiles: &[(String, ClosureProfileRange, ClosureCalibration)],
+) -> Result<(), String> {
+    let ranges: Vec<ClosureProfileRange> = profiles.iter().map(|(_, range, _)| *range).collect();
+    println!("== closure profile selector (SHADOW ONLY; never authorizes) ==");
+    for path in selector_attempt_files(attempts)? {
+        let recording = load_recording_strict(&path)?;
+        let file = escaped(&recording.file);
+        let label = escaped(&recording.label);
+        let Some((prefix, remaining)) = split_selector_prefix(&recording.samples, prefix_frames)
+        else {
+            let observed = recording
+                .samples
+                .iter()
+                .filter(|sample| sample.ear.is_some())
+                .count();
+            println!(
+                "  {file} label={label} prefix={observed} remaining=0 selector=out-of-range shadow-consent=not-run"
+            );
+            continue;
+        };
+        let selection = select_closure_profile(&prefix, &ranges);
+        match selection {
+            ClosureProfileSelection::Unique(index) => {
+                let profile = escaped(&profiles[index].0);
+                let verdict = detect_deliberate_closure(remaining, &profiles[index].2);
+                println!(
+                    "  {file} label={label} prefix={} remaining={} selector=unique:{profile} shadow-consent={verdict:?}",
+                    prefix.len(),
+                    remaining.len()
+                );
+            }
+            ClosureProfileSelection::Ambiguous => println!(
+                "  {file} label={label} prefix={} remaining={} selector=ambiguous shadow-consent=not-run",
+                prefix.len(),
+                remaining.len()
+            ),
+            ClosureProfileSelection::OutOfRange => println!(
+                "  {file} label={label} prefix={} remaining={} selector=out-of-range shadow-consent=not-run",
+                prefix.len(),
+                remaining.len()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn selector(args: &[String]) -> ExitCode {
+    let (Some(manifest), Some(attempts), Some(prefix)) = (
+        flag(args, "--profiles"),
+        flag(args, "--attempts"),
+        flag(args, "--prefix-frames"),
+    ) else {
+        eprintln!(
+            "usage: irlume blinkcap select --profiles P.json --attempts <file.jsonl | dir> --prefix-frames N"
+        );
+        return ExitCode::from(2);
+    };
+    let prefix = match prefix.parse::<usize>() {
+        Ok(value) if (1..=120).contains(&value) => value,
+        _ => {
+            eprintln!("[blinkcap] --prefix-frames requires a number from 1 to 120");
+            return ExitCode::from(2);
+        }
+    };
+    match load_selector_profiles(Path::new(manifest))
+        .and_then(|profiles| evaluate_selector(Path::new(attempts), prefix, &profiles))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("[blinkcap] {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn load_recording(path: &Path) -> Option<Recording> {

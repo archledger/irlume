@@ -88,6 +88,22 @@ Each prints its own usage line when run without arguments. `padcapture` /
 [PAD_SELFTEST.md](PAD_SELFTEST.md); `suncal` is the outdoor/sunlight
 calibration analyzer.
 
+`blinkcap select` evaluates the issue #173 multi-calibration selector without
+changing authentication or enrollment:
+
+```console
+IRLUME_DEV=1 irlume blinkcap select \
+  --profiles profiles.json --attempts attempts/ --prefix-frames 6
+```
+
+The manifest contains one or more named profiles, each referencing at least two
+existing blinkcap JSONL recordings for its `open` phase and two for its `closed`
+phase. Relative paths resolve beside the manifest. The command derives observed
+ranges from per-recording medians, classifies only the explicit prefix, discards
+that prefix, and runs the existing detector only when exactly one profile is
+eligible. Its output is marked `SHADOW ONLY`; ambiguous, closed-like,
+out-of-range, malformed, or incomplete evidence can never become consent.
+
 ## Where to go next
 
 - First-time setup, step by step: [SETUP.md](SETUP.md)

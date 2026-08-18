@@ -201,14 +201,21 @@ impl D1OpticalEvidence {
     }
 
     const fn proves_d1(self) -> bool {
-        self.even_frames >= 3
-            && self.odd_frames >= 3
+        self.valid_for_causality()
             && self.phase_delta >= AUTOCONF_MIN_LIFT
             && self.bright_phase_support >= 3
             && self.dark_phase_support >= 3
             && self.consistent_pairs >= 3
             && self.conflicting_pairs == 0
             && self.invalid_sequence_steps == 0
+    }
+
+    const fn valid_for_causality(self) -> bool {
+        self.even_frames >= 3 && self.odd_frames >= 3 && self.invalid_sequence_steps == 0
+    }
+
+    const fn refutes_d1(self) -> bool {
+        self.valid_for_causality() && !self.proves_d1()
     }
 }
 
@@ -220,6 +227,7 @@ pub(crate) struct D1MetadataEvidence {
     dark: usize,
     parity_consistent_pairs: usize,
     parity_conflicts: usize,
+    invalid_sequence_steps: usize,
 }
 
 impl D1MetadataEvidence {
@@ -238,6 +246,7 @@ impl D1MetadataEvidence {
         let mut previous = None;
         let mut parity_consistent_pairs = 0;
         let mut parity_conflicts = 0;
+        let mut invalid_sequence_steps = 0;
         let mut missing_sequence_frames = 0u32;
         for (sequence, flag) in observations.iter().copied() {
             let Some(lit) = flag else {
@@ -248,12 +257,12 @@ impl D1MetadataEvidence {
                 // A zero or reverse/ambiguous delta cannot establish parity.
                 // Natural u32 wrap remains a small positive delta.
                 if gap == 0 || gap > i32::MAX as u32 {
-                    parity_conflicts += 1;
+                    invalid_sequence_steps += 1;
                 } else {
                     missing_sequence_frames = match missing_sequence_frames.checked_add(gap - 1) {
                         Some(missing) if missing <= MAX_D1_MISSING_SEQUENCE_FRAMES => missing,
                         _ => {
-                            parity_conflicts += 1;
+                            invalid_sequence_steps += 1;
                             previous = Some((sequence, lit));
                             continue;
                         }
@@ -279,6 +288,7 @@ impl D1MetadataEvidence {
                 .count(),
             parity_consistent_pairs,
             parity_conflicts,
+            invalid_sequence_steps,
         }
     }
 
@@ -291,7 +301,8 @@ impl D1MetadataEvidence {
     }
 
     const fn proves_d1(self) -> bool {
-        self.classified() >= 4
+        self.invalid_sequence_steps == 0
+            && self.classified() >= 4
             && self.lit >= 2
             && self.dark >= 2
             && self.parity_consistent_pairs >= 3
@@ -299,7 +310,7 @@ impl D1MetadataEvidence {
     }
 
     const fn contradicts_d1(self) -> bool {
-        self.classified() >= 4 && self.parity_conflicts > 0
+        self.invalid_sequence_steps == 0 && self.classified() >= 4 && self.parity_conflicts > 0
     }
 }
 
@@ -4273,12 +4284,10 @@ fn try_documented_control<
             .is_some_and(D1MetadataEvidence::contradicts_d1);
     let optical_proves_d1 = face_auth
         && lit.d1_optical.is_some_and(D1OpticalEvidence::proves_d1)
-        && before
-            .d1_optical
-            .is_some_and(|evidence| !evidence.proves_d1())
+        && before.d1_optical.is_some_and(D1OpticalEvidence::refutes_d1)
         && after_restore
             .d1_optical
-            .is_some_and(|evidence| !evidence.proves_d1());
+            .is_some_and(D1OpticalEvidence::refutes_d1);
     if face_auth
         && lit.d1_metadata.is_some_and(D1MetadataEvidence::proves_d1)
         && (before
@@ -5310,6 +5319,96 @@ mod tests {
             3,
             "proof still uses exploratory apply, exact restore, and final apply"
         );
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Did not prove D1" includes malformed observations and therefore cannot
+    /// stand in for positive evidence that D1 was absent. Both sides of the
+    /// transition must be continuous before an applied burst can be called
+    /// control-correlated.
+    #[test]
+    fn discontinuous_optical_baseline_cannot_prove_control_correlation() {
+        let _lock = crate::testenv::env_lock();
+        let invalid_baseline = SetupMeasurement::with_d1_evidence(
+            10.0,
+            D1OpticalEvidence::from_sequence_means(&[
+                (10, 10.0),
+                (11, 10.0),
+                (12, 10.0),
+                (13, 10.0),
+                (10_014, 10.0),
+                (10_015, 10.0),
+                (10_016, 10.0),
+                (10_017, 10.0),
+            ]),
+            None,
+        );
+        let mut measurements = [
+            invalid_baseline,
+            optical_burst(&[10.0, 40.0, 11.0, 41.0, 9.0, 39.0, 10.0, 40.0]),
+            optical_burst(&[10.0; 8]),
+        ]
+        .into_iter();
+
+        let (outcome, _log, current, dir) =
+            run_discovery(a_working_camera(), "optical-invalid-baseline", || {
+                measurements.next()
+            });
+
+        assert!(
+            matches!(outcome, Ok(Attempt::Inconclusive(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1]);
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discontinuous_metadata_baseline_cannot_prove_control_correlation() {
+        let _lock = crate::testenv::env_lock();
+        let invalid_d0 = D1MetadataEvidence::from_sequence_flags(&[
+            (10, Some(false)),
+            (11, Some(false)),
+            (12, Some(false)),
+            (13, Some(false)),
+            (10_014, Some(false)),
+            (10_015, Some(false)),
+        ]);
+        let d1 = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+        ]);
+        let d0 = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ]);
+        let mut measurements = [
+            SetupMeasurement::with_d1_metadata(10.0, invalid_d0),
+            SetupMeasurement::with_d1_metadata(40.0, d1),
+            SetupMeasurement::with_d1_metadata(10.0, d0),
+        ]
+        .into_iter();
+
+        let (outcome, _log, current, dir) =
+            run_discovery(a_working_camera(), "metadata-invalid-baseline", || {
+                measurements.next()
+            });
+
+        assert!(
+            matches!(outcome, Ok(Attempt::Inconclusive(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1]);
         drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }

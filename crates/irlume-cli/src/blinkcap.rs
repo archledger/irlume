@@ -611,48 +611,51 @@ fn evaluate_selector(
     profiles: &[(String, ClosureProfileRange, ClosureCalibration)],
 ) -> Result<(), String> {
     let ranges: Vec<ClosureProfileRange> = profiles.iter().map(|(_, range, _)| *range).collect();
-    let recordings = selector_attempt_files(attempts)?
+    let rows = selector_attempt_files(attempts)?
         .iter()
-        .map(|path| load_recording_strict(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    println!("== closure profile selector (SHADOW ONLY; never authorizes) ==");
-    for recording in recordings {
-        let file = escaped(&recording.file);
-        let label = escaped(&recording.label);
-        let Some((prefix, remaining)) = split_selector_prefix(&recording.samples, prefix_frames)
-        else {
-            let observed = recording
-                .samples
-                .iter()
-                .filter(|sample| sample.ear.is_some())
-                .count();
-            println!(
-                "  {file} label={label} prefix={observed} remaining=0 selector=out-of-range shadow-consent=not-run"
-            );
-            continue;
-        };
-        let selection = select_closure_profile(&prefix, &ranges);
-        match selection {
-            ClosureProfileSelection::Unique(index) => {
-                let profile = escaped(&profiles[index].0);
-                let verdict = detect_deliberate_closure(remaining, &profiles[index].2);
-                println!(
-                    "  {file} label={label} prefix={} remaining={} selector=unique:{profile} shadow-consent={verdict:?}",
+        .map(|path| -> Result<String, String> {
+            let recording = load_recording_strict(path)?;
+            let file = escaped(&recording.file);
+            let label = escaped(&recording.label);
+            let Some((prefix, remaining)) =
+                split_selector_prefix(&recording.samples, prefix_frames)
+            else {
+                let observed = recording
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.ear.is_some())
+                    .count();
+                return Ok(format!(
+                    "{file} label={label} prefix={observed} remaining=0 selector=out-of-range shadow-consent=not-run"
+                ));
+            };
+            let row = match select_closure_profile(&prefix, &ranges) {
+                ClosureProfileSelection::Unique(index) => {
+                    let profile = escaped(&profiles[index].0);
+                    let verdict = detect_deliberate_closure(remaining, &profiles[index].2);
+                    format!(
+                        "{file} label={label} prefix={} remaining={} selector=unique:{profile} shadow-consent={verdict:?}",
+                        prefix.len(),
+                        remaining.len()
+                    )
+                }
+                ClosureProfileSelection::Ambiguous => format!(
+                    "{file} label={label} prefix={} remaining={} selector=ambiguous shadow-consent=not-run",
                     prefix.len(),
                     remaining.len()
-                );
-            }
-            ClosureProfileSelection::Ambiguous => println!(
-                "  {file} label={label} prefix={} remaining={} selector=ambiguous shadow-consent=not-run",
-                prefix.len(),
-                remaining.len()
-            ),
-            ClosureProfileSelection::OutOfRange => println!(
-                "  {file} label={label} prefix={} remaining={} selector=out-of-range shadow-consent=not-run",
-                prefix.len(),
-                remaining.len()
-            ),
-        }
+                ),
+                ClosureProfileSelection::OutOfRange => format!(
+                    "{file} label={label} prefix={} remaining={} selector=out-of-range shadow-consent=not-run",
+                    prefix.len(),
+                    remaining.len()
+                ),
+            };
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    println!("== closure profile selector (SHADOW ONLY; never authorizes) ==");
+    for row in rows {
+        println!("  {row}");
     }
     Ok(())
 }

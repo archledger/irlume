@@ -1829,31 +1829,6 @@ pub fn detect_blink(samples: &[EarSample]) -> BlinkResult {
     }
 }
 
-/// Per-user eye-closure calibration: the enrolled open-eye and closed-eye EAR
-/// medians. Set once from an enrollment calibration (a few open frames, then a
-/// held closure), NOT from the gesture window itself.
-///
-/// The consent gesture is measured against an ABSOLUTE, per-user threshold, not
-/// a running-median baseline. That is deliberate: a running median is polluted
-/// by the very closure being detected (once the eyes are shut for most of the
-/// window the median drops to the closed value and the closure vanishes into the
-/// "baseline"), a documented failure mode of relative EAR gating. Capturing the
-/// open/closed extremes offline and comparing at a fixed midpoint (the
-/// Modified-EAR method, PeerJ CS-943 / PMC9044337) avoids it, and validated
-/// cleanly on real captures (a deliberate hold reads a 18-35 frame sub-threshold
-/// run; spontaneous blinks and squints read ≤5).
-///
-/// KNOWN COST OF THAT CHOICE, measured 2026-07-27, one user, 20 readings: absolute
-/// values move with the LIGHT. The same seated position gave a median open EAR of
-/// 0.109 at an ambient of 22-42 and 0.166 at an ambient of 1, a 52% shift, with
-/// the closed values rising too. No single calibration spans both sessions:
-/// registering the deepest closure (0.0894) and the shallowest reopen (0.0984)
-/// requires `(CLOSURE_REOPEN_FRACTION - CLOSURE_DEEP_FRACTION) * gap <= 0.0090`,
-/// so `gap <= 0.030`, while [`MIN_CALIBRATION_SEPARATION`] demands 0.05. Each
-/// session calibrates fine alone; the pair cannot. A calibration therefore
-/// describes one lighting condition, which `calibrate-closure` and `doctor` both
-/// now say out loud. [`detect_nod`] is pose-defined and carries none of this,
-/// which is why it is the default and the only gesture the prompts name.
 /// Observed open- and closed-eye EAR ranges for one shadow calibration profile.
 ///
 /// This is evidence-tooling input, not persisted enrollment state. The selector
@@ -1932,6 +1907,31 @@ pub fn select_closure_profile(
     }
 }
 
+/// Per-user eye-closure calibration: the enrolled open-eye and closed-eye EAR
+/// medians. Set once from an enrollment calibration (a few open frames, then a
+/// held closure), NOT from the gesture window itself.
+///
+/// The consent gesture is measured against an ABSOLUTE, per-user threshold, not
+/// a running-median baseline. That is deliberate: a running median is polluted
+/// by the very closure being detected (once the eyes are shut for most of the
+/// window the median drops to the closed value and the closure vanishes into the
+/// "baseline"), a documented failure mode of relative EAR gating. Capturing the
+/// open/closed extremes offline and comparing at a fixed midpoint (the
+/// Modified-EAR method, PeerJ CS-943 / PMC9044337) avoids it, and validated
+/// cleanly on real captures (a deliberate hold reads a 18-35 frame sub-threshold
+/// run; spontaneous blinks and squints read ≤5).
+///
+/// KNOWN COST OF THAT CHOICE, measured 2026-07-27, one user, 20 readings: absolute
+/// values move with the LIGHT. The same seated position gave a median open EAR of
+/// 0.109 at an ambient of 22-42 and 0.166 at an ambient of 1, a 52% shift, with
+/// the closed values rising too. No single calibration spans both sessions:
+/// registering the deepest closure (0.0894) and the shallowest reopen (0.0984)
+/// requires `(CLOSURE_REOPEN_FRACTION - CLOSURE_DEEP_FRACTION) * gap <= 0.0090`,
+/// so `gap <= 0.030`, while [`MIN_CALIBRATION_SEPARATION`] demands 0.05. Each
+/// session calibrates fine alone; the pair cannot. A calibration therefore
+/// describes one lighting condition, which `calibrate-closure` and `doctor` both
+/// now say out loud. [`detect_nod`] is pose-defined and carries none of this,
+/// which is why it is the default and the only gesture the prompts name.
 #[derive(Debug, Clone, Copy)]
 pub struct ClosureCalibration {
     /// Median EAR with the eyes open (the smaller eye, as [`EarSample::ear`]).

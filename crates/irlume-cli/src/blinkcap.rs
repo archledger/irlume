@@ -284,54 +284,126 @@ struct SelectorProfileSpec {
     closed: Vec<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectorRecordingHeader {
+    blinkcap: bool,
+    label: String,
+    frames: usize,
+    #[serde(default, rename = "host")]
+    _host: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectorRecordedSample {
+    idx: usize,
+    ear: serde_json::Value,
+    bri: f32,
+    cx: f32,
+    cy: f32,
+    fsize: f32,
+    contrast: f32,
+}
+
 fn read_bounded(path: &Path, max: u64, kind: &str) -> Result<String, String> {
-    let len = std::fs::metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?
-        .len();
-    if len > max {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{}: {kind} must be a regular file", path.display()));
+    }
+    let mut text = String::new();
+    file.take(max + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if text.len() as u64 > max {
         return Err(format!(
-            "{}: {kind} is {len} bytes; limit is {max}",
+            "{}: {kind} exceeds the {max}-byte limit",
             path.display()
         ));
     }
-    std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
+    Ok(text)
 }
 
 fn load_recording_strict(path: &Path) -> Result<Recording, String> {
     let text = read_bounded(path, SELECTOR_RECORDING_MAX_BYTES, "blink recording")?;
     let mut lines = text.lines();
-    let header: serde_json::Value = serde_json::from_str(
+    let header: SelectorRecordingHeader = serde_json::from_str(
         lines
             .next()
             .ok_or_else(|| format!("{}: empty recording", path.display()))?,
     )
     .map_err(|error| format!("{}: invalid blinkcap header: {error}", path.display()))?;
-    if header.get("blinkcap").and_then(serde_json::Value::as_bool) != Some(true) {
+    if !header.blinkcap {
         return Err(format!("{}: not a blinkcap recording", path.display()));
     }
-    let expected = header
-        .get("frames")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok())
-        .ok_or_else(|| format!("{}: header has no valid frame count", path.display()))?;
-    let label = header
-        .get("label")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unlabeled")
-        .to_owned();
     let mut samples = Vec::new();
     for (line_index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let record: RecordedSample = serde_json::from_str(line).map_err(|error| {
+        let record: SelectorRecordedSample = serde_json::from_str(line).map_err(|error| {
             format!(
                 "{}:{}: invalid blink record: {error}",
                 path.display(),
                 line_index + 2
             )
         })?;
-        let sample = EarSample::from(&record);
+        let expected_index = samples.len();
+        if record.idx != expected_index {
+            return Err(format!(
+                "{}:{}: expected frame index {expected_index}, got {}",
+                path.display(),
+                line_index + 2,
+                record.idx
+            ));
+        }
+        let ear = match &record.ear {
+            serde_json::Value::Null => None,
+            serde_json::Value::Number(number) => number.as_f64().map(|value| value as f32),
+            _ => None,
+        };
+        if !record.ear.is_null() && ear.is_none() {
+            return Err(format!(
+                "{}:{}: EAR must be a number or null",
+                path.display(),
+                line_index + 2
+            ));
+        }
+        let sample = EarSample {
+            idx: record.idx,
+            ear,
+            bri: record.bri,
+            cx: record.cx,
+            cy: record.cy,
+            fsize: record.fsize,
+            contrast: record.contrast,
+        };
+        if [
+            sample.bri,
+            sample.cx,
+            sample.cy,
+            sample.fsize,
+            sample.contrast,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "{}:{}: sample fields must be finite",
+                path.display(),
+                line_index + 2
+            ));
+        }
         if sample.ear.is_some_and(|ear| !ear.is_finite() || ear < 0.0) {
             return Err(format!(
                 "{}:{}: EAR must be finite and non-negative",
@@ -341,10 +413,11 @@ fn load_recording_strict(path: &Path) -> Result<Recording, String> {
         }
         samples.push(sample);
     }
-    if samples.len() != expected {
+    if samples.len() != header.frames {
         return Err(format!(
-            "{}: header declares {expected} frames but {} were read",
+            "{}: header declares {} frames but {} were read",
             path.display(),
+            header.frames,
             samples.len()
         ));
     }
@@ -354,7 +427,7 @@ fn load_recording_strict(path: &Path) -> Result<Recording, String> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned(),
-        label,
+        label: header.label,
         samples,
     })
 }
@@ -444,6 +517,21 @@ fn load_selector_profiles(
         }
     }
 
+    for spec in &manifest.profiles {
+        let mut paths = std::collections::BTreeSet::new();
+        for file in spec.open.iter().chain(&spec.closed) {
+            let path = resolve_recording(manifest_path, file);
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            if !paths.insert(canonical) {
+                return Err(format!(
+                    "profile '{}' requires distinct recording files",
+                    spec.name
+                ));
+            }
+        }
+    }
+
     let mut profiles = Vec::with_capacity(manifest.profiles.len());
     for spec in manifest.profiles {
         let mut open = phase_medians(manifest_path, &spec.open)?;
@@ -523,9 +611,12 @@ fn evaluate_selector(
     profiles: &[(String, ClosureProfileRange, ClosureCalibration)],
 ) -> Result<(), String> {
     let ranges: Vec<ClosureProfileRange> = profiles.iter().map(|(_, range, _)| *range).collect();
+    let recordings = selector_attempt_files(attempts)?
+        .iter()
+        .map(|path| load_recording_strict(path))
+        .collect::<Result<Vec<_>, _>>()?;
     println!("== closure profile selector (SHADOW ONLY; never authorizes) ==");
-    for path in selector_attempt_files(attempts)? {
-        let recording = load_recording_strict(&path)?;
+    for recording in recordings {
         let file = escaped(&recording.file);
         let label = escaped(&recording.label);
         let Some((prefix, remaining)) = split_selector_prefix(&recording.samples, prefix_frames)

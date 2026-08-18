@@ -2113,6 +2113,57 @@ fn blinkcap_selector_locks_one_profile_and_discards_the_prefix() {
 }
 
 #[test]
+fn blinkcap_selector_prefix_cannot_supply_closure_frames() {
+    let sb = Sandbox::new("bc-selector-prefix-discard");
+    let dir = sb.path("work");
+    for (file, label, ears) in [
+        ("open-low.jsonl", "open", vec![0.10; 3]),
+        ("open-high-1.jsonl", "open", vec![0.30; 3]),
+        ("open-high-2.jsonl", "open", vec![0.30; 3]),
+        ("closed-1.jsonl", "closed", vec![0.04; 3]),
+        ("closed-2.jsonl", "closed", vec![0.05; 3]),
+    ] {
+        write_blink_recording(&dir.join(file), label, &ears);
+    }
+    let manifest = dir.join("profiles.json");
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([{
+            "name": "wide-open-range",
+            "open": ["open-low.jsonl", "open-high-1.jsonl", "open-high-2.jsonl"],
+            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
+        }]),
+    );
+    // Derived calibration: open 0.30, closed 0.045, threshold 0.1215. The
+    // prefix at 0.11 is closure-like to the detector while remaining inside
+    // the observed open selector range. If it leaks into detection, 3 + 8
+    // frames reaches the 11-frame consent floor; discarding it leaves only 8.
+    let mut attempt = vec![0.11; 3];
+    attempt.extend([0.11; 8]);
+    attempt.extend([0.30; 4]);
+    let attempt_file = dir.join("attempt.jsonl");
+    write_blink_recording(&attempt_file, "prefix-sabotage", &attempt);
+
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempt_file.to_str().unwrap(),
+            "--prefix-frames",
+            "3",
+        ])
+        .env("IRLUME_DEV", "1"));
+
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("selector=unique:wide-open-range"), "{out}");
+    assert!(out.contains("prefix=3 remaining=12"), "{out}");
+    assert!(out.contains("shadow-consent=NoBlink"), "{out}");
+}
+
+#[test]
 fn blinkcap_selector_never_runs_consent_for_ambiguous_or_closed_like_prefixes() {
     let sb = Sandbox::new("bc-selector-refuse");
     let dir = sb.path("work");
@@ -2210,6 +2261,30 @@ fn blinkcap_selector_rejects_duplicate_profiles_and_partial_recordings() {
     write_blink_recording(&dir.join("open-1.jsonl"), "open", &[0.24; 3]);
     write_blink_recording(&dir.join("open-2.jsonl"), "open", &[0.25; 3]);
     write_blink_recording(&dir.join("closed-1.jsonl"), "closed", &[0.02; 3]);
+    write_blink_recording(&dir.join("closed-2.jsonl"), "closed", &[0.03; 3]);
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([{
+            "name": "profile",
+            "open": ["open-1.jsonl", "./open-1.jsonl"],
+            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
+        }]),
+    );
+    let (code, _out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempt.to_str().unwrap(),
+            "--prefix-frames",
+            "3",
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1);
+    assert!(err.contains("distinct recording files"), "{err}");
+
     std::fs::write(
         dir.join("closed-2.jsonl"),
         "{\"blinkcap\":true,\"label\":\"closed\",\"frames\":2}\n\
@@ -2237,6 +2312,141 @@ fn blinkcap_selector_rejects_duplicate_profiles_and_partial_recordings() {
         ])
         .env("IRLUME_DEV", "1"));
     assert_eq!(code, 1);
+    assert!(err.contains("declares 2 frames but 1 were read"), "{err}");
+}
+
+#[test]
+fn blinkcap_selector_strictly_validates_attempt_headers_records_and_indices() {
+    let sb = Sandbox::new("bc-selector-strict-attempt");
+    let dir = sb.path("work");
+    for (file, label, ears) in [
+        ("open-1.jsonl", "open", vec![0.24; 3]),
+        ("open-2.jsonl", "open", vec![0.25; 3]),
+        ("closed-1.jsonl", "closed", vec![0.02; 3]),
+        ("closed-2.jsonl", "closed", vec![0.03; 3]),
+    ] {
+        write_blink_recording(&dir.join(file), label, &ears);
+    }
+    let manifest = dir.join("profiles.json");
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([{
+            "name": "profile",
+            "open": ["open-1.jsonl", "open-2.jsonl"],
+            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
+        }]),
+    );
+    let attempt = dir.join("attempt.jsonl");
+    let record = |idx: usize, ear_field: &str, extra: &str| {
+        format!(
+            "{{\"idx\":{idx},{ear_field}\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0{extra}}}\n"
+        )
+    };
+    let cases = [
+        (
+            format!(
+                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":1}}\n{}",
+                record(0, "\"ear\":0.25,", ",\"extra\":true")
+            ),
+            "unknown field",
+        ),
+        (
+            format!(
+                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":1}}\n{}",
+                record(0, "", "")
+            ),
+            "missing field `ear`",
+        ),
+        (
+            format!(
+                "{{\"blinkcap\":true,\"label\":7,\"frames\":1}}\n{}",
+                record(0, "\"ear\":0.25,", "")
+            ),
+            "invalid blinkcap header",
+        ),
+        (
+            format!(
+                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":2}}\n{}{}",
+                record(0, "\"ear\":0.25,", ""),
+                record(0, "\"ear\":0.25,", "")
+            ),
+            "expected frame index 1",
+        ),
+        (
+            format!(
+                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":2}}\n{}{}",
+                record(0, "\"ear\":0.25,", ""),
+                record(2, "\"ear\":0.25,", "")
+            ),
+            "expected frame index 1",
+        ),
+    ];
+
+    for (contents, expected) in cases {
+        std::fs::write(&attempt, contents).unwrap();
+        let (code, _out, err) = run(sb
+            .cmd(&[
+                "blinkcap",
+                "select",
+                "--profiles",
+                manifest.to_str().unwrap(),
+                "--attempts",
+                attempt.to_str().unwrap(),
+                "--prefix-frames",
+                "1",
+            ])
+            .env("IRLUME_DEV", "1"));
+        assert_eq!(code, 1, "expected {expected}; stderr: {err}");
+        assert!(err.contains(expected), "expected {expected}; stderr: {err}");
+    }
+}
+
+#[test]
+fn blinkcap_selector_emits_no_partial_report_when_a_later_attempt_is_damaged() {
+    let sb = Sandbox::new("bc-selector-atomic-report");
+    let dir = sb.path("work");
+    for (file, label, ears) in [
+        ("open-1.jsonl", "open", vec![0.24; 3]),
+        ("open-2.jsonl", "open", vec![0.25; 3]),
+        ("closed-1.jsonl", "closed", vec![0.02; 3]),
+        ("closed-2.jsonl", "closed", vec![0.03; 3]),
+    ] {
+        write_blink_recording(&dir.join(file), label, &ears);
+    }
+    let manifest = dir.join("profiles.json");
+    write_selector_manifest(
+        &manifest,
+        serde_json::json!([{
+            "name": "profile",
+            "open": ["open-1.jsonl", "open-2.jsonl"],
+            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
+        }]),
+    );
+    let attempts = dir.join("attempts");
+    std::fs::create_dir(&attempts).unwrap();
+    write_blink_recording(&attempts.join("a-valid.jsonl"), "valid", &[0.25; 3]);
+    std::fs::write(
+        attempts.join("z-damaged.jsonl"),
+        "{\"blinkcap\":true,\"label\":\"damaged\",\"frames\":2}\n\
+         {\"idx\":0,\"ear\":0.25,\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0}\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "blinkcap",
+            "select",
+            "--profiles",
+            manifest.to_str().unwrap(),
+            "--attempts",
+            attempts.to_str().unwrap(),
+            "--prefix-frames",
+            "1",
+        ])
+        .env("IRLUME_DEV", "1"));
+
+    assert_eq!(code, 1);
+    assert!(out.is_empty(), "partial report leaked to stdout: {out}");
     assert!(err.contains("declares 2 frames but 1 were read"), "{err}");
 }
 

@@ -98,6 +98,107 @@ pub(crate) const IR_LIT_MEAN: f32 = 40.0;
 /// calls a control a success; filters ambient flicker and exposure drift.
 const AUTOCONF_MIN_LIFT: f32 = 20.0;
 
+/// Camera-reported illumination observations from one setup burst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct D1MetadataEvidence {
+    total: usize,
+    lit: usize,
+    dark: usize,
+    parity_consistent_pairs: usize,
+    parity_conflicts: usize,
+}
+
+impl D1MetadataEvidence {
+    pub(crate) fn from_lit_flags(flags: &[Option<bool>]) -> Self {
+        let mut previous = None;
+        let mut parity_consistent_pairs = 0;
+        let mut parity_conflicts = 0;
+        for (index, flag) in flags.iter().copied().enumerate() {
+            let Some(lit) = flag else {
+                continue;
+            };
+            if let Some((previous_index, previous_lit)) = previous {
+                let even_gap = (index - previous_index) % 2 == 0;
+                if (lit == previous_lit) == even_gap {
+                    parity_consistent_pairs += 1;
+                } else {
+                    parity_conflicts += 1;
+                }
+            }
+            previous = Some((index, lit));
+        }
+        Self {
+            total: flags.len(),
+            lit: flags.iter().filter(|flag| **flag == Some(true)).count(),
+            dark: flags.iter().filter(|flag| **flag == Some(false)).count(),
+            parity_consistent_pairs,
+            parity_conflicts,
+        }
+    }
+
+    const fn classified(self) -> usize {
+        self.lit + self.dark
+    }
+
+    const fn missing(self) -> usize {
+        self.total - self.classified()
+    }
+
+    const fn proves_d1(self) -> bool {
+        self.classified() >= 4
+            && self.lit >= 2
+            && self.dark >= 2
+            && self.parity_consistent_pairs >= 3
+            && self.parity_conflicts == 0
+    }
+
+    const fn contradicts_d1(self) -> bool {
+        self.classified() >= 4 && self.parity_conflicts > 0
+    }
+}
+
+/// One setup burst, keeping optical and camera-reported evidence separate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SetupMeasurement {
+    brightness: f32,
+    d1_metadata: Option<D1MetadataEvidence>,
+}
+
+impl SetupMeasurement {
+    pub(crate) const fn optical(brightness: f32) -> Self {
+        Self {
+            brightness,
+            d1_metadata: None,
+        }
+    }
+
+    pub(crate) const fn with_d1_metadata(brightness: f32, evidence: D1MetadataEvidence) -> Self {
+        Self {
+            brightness,
+            d1_metadata: Some(evidence),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn brightness(self) -> f32 {
+        self.brightness
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn metadata_proves_d1(self) -> bool {
+        match self.d1_metadata {
+            Some(evidence) => evidence.proves_d1(),
+            None => false,
+        }
+    }
+}
+
+impl From<f32> for SetupMeasurement {
+    fn from(brightness: f32) -> Self {
+        Self::optical(brightness)
+    }
+}
+
 /// Built-in table, keyed on USB `idVendor:idProduct`. Verified on-hardware.
 ///
 /// This used to match a substring of the V4L card name, so every camera whose
@@ -2474,9 +2575,13 @@ pub enum DiscoveryError {
     /// The camera has no Microsoft-XU, so irlume has no documented control to
     /// address on it.
     NoMicrosoftXu { seen: Vec<u8> },
-    /// The Microsoft-XU is present but advertises no control irlume can use, or
-    /// the ones it advertises did not light anything.
+    /// The Microsoft-XU is present but advertises no control whose documented
+    /// capability and value contract irlume can safely use.
     NoUsableControl { unit: u8, tried: Vec<String> },
+    /// A documented control was accepted, read back, and exactly restored, but
+    /// the available frame evidence could not prove that it affected the IR
+    /// stream. This is an observation gap, not an unsupported control.
+    Inconclusive { unit: u8, tried: Vec<String> },
     /// The camera stopped answering. Discovery is abandoned immediately.
     Unresponsive {
         unit: u8,
@@ -2529,6 +2634,14 @@ impl std::fmt::Display for DiscoveryError {
             Self::NoUsableControl { unit, tried } => write!(
                 f,
                 "unit {unit} advertises no usable emitter control ({})",
+                tried.join("; ")
+            ),
+            Self::Inconclusive { unit, tried } => write!(
+                f,
+                "IR emitter setup was inconclusive at unit {unit} ({}). This does not show that \
+                 the control is unsupported or unusable. Put a nearby subject in the IR camera's \
+                 view, keep the scene still, make sure the privacy shutter is open, and retry \
+                 `sudo irlume ir-setup`",
                 tried.join("; ")
             ),
             // Two different situations reach here, and calling a refusal
@@ -3502,6 +3615,19 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     // check-to-write window is one syscall, not the whole discovery pipeline.
     before_forward_write: &mut G,
 ) -> std::result::Result<DiscoveryOutcome, DiscoveryError> {
+    let mut measure_with_evidence = || measure().map(SetupMeasurement::optical);
+    discover_with_measurements(fd, id, &mut measure_with_evidence, before_forward_write)
+}
+
+pub(crate) fn discover_with_measurements<
+    F: FnMut() -> Option<SetupMeasurement>,
+    G: FnMut() -> Result<(), String>,
+>(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    measure: &mut F,
+    before_forward_write: &mut G,
+) -> std::result::Result<DiscoveryOutcome, DiscoveryError> {
     let ms = id
         .microsoft_xu()
         .ok_or_else(|| DiscoveryError::NoMicrosoftXu {
@@ -3532,6 +3658,7 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
     }
 
     let mut tried = Vec::new();
+    let mut inconclusive = Vec::new();
 
     for selector in [
         crate::uvc_descriptor::MSXU_IR_TORCH,
@@ -3558,6 +3685,9 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
             Ok(Attempt::AlreadyApplied) => tried.push(format!(
                 "selector {selector:#04x} is already set to the value setup would apply"
             )),
+            Ok(Attempt::Inconclusive(why)) => {
+                inconclusive.push(format!("selector {selector:#04x}: {why}"));
+            }
             Ok(Attempt::NotUsable(why)) => tried.push(format!("selector {selector:#04x}: {why}")),
             Err(TryFailure::Measurement) => return Err(DiscoveryError::MeasurementFailed),
             Err(TryFailure::Restore(err)) => {
@@ -3586,10 +3716,17 @@ pub fn discover<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
         }
     }
 
-    Err(DiscoveryError::NoUsableControl {
-        unit: ms.unit_id,
-        tried,
-    })
+    if inconclusive.is_empty() {
+        Err(DiscoveryError::NoUsableControl {
+            unit: ms.unit_id,
+            tried,
+        })
+    } else {
+        Err(DiscoveryError::Inconclusive {
+            unit: ms.unit_id,
+            tried: inconclusive,
+        })
+    }
 }
 
 /// Production always mirrors the real device descriptor. Unit tests that stop
@@ -3714,8 +3851,11 @@ enum Attempt {
     /// again could not demonstrate anything, but it is not the device default
     /// and may be transient state owned by another client.
     AlreadyApplied,
-    /// Usable but it did not brighten the image, or its default failed the
-    /// checks the specification allows. The control was left as it was found.
+    /// The documented control transaction was safe, but the available frame
+    /// evidence could not establish a functional effect.
+    Inconclusive(String),
+    /// The control's documented capability or value contract failed validation.
+    /// The control was left as it was found.
     NotUsable(String),
 }
 
@@ -3743,7 +3883,10 @@ impl From<XuError> for TryFailure {
 
 /// Try one advertised, documented control, leaving it as it was found unless it
 /// worked.
-fn try_documented_control<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), String>>(
+fn try_documented_control<
+    F: FnMut() -> Option<SetupMeasurement>,
+    G: FnMut() -> Result<(), String>,
+>(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     unit: u8,
@@ -3890,11 +4033,35 @@ fn try_documented_control<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), St
     // Those are different questions; conflating them made success depend on room
     // lighting, and the same camera here has measured 38 to 168 depending only
     // on what was in front of it.
-    if lit < before + AUTOCONF_MIN_LIFT {
+    let metadata_proves_d1 = selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
+        && lit.d1_metadata.is_some_and(D1MetadataEvidence::proves_d1);
+    let contradictory_metadata = if selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION {
+        lit.d1_metadata.filter(|evidence| evidence.contradicts_d1())
+    } else {
+        None
+    };
+    if let Some(evidence) = contradictory_metadata {
         pending.restore_once().map_err(TryFailure::Restore)?;
         pending.confirm_restored().map_err(TryFailure::Journal)?;
-        return Ok(Attempt::NotUsable(format!(
-            "the image did not brighten (before {before:.0}, after {lit:.0}, needs +{AUTOCONF_MIN_LIFT:.0})"
+        return Ok(Attempt::Inconclusive(format!(
+            "the camera supplied {} classified illumination records ({} lit, {} dark, {} missing), \
+             but their frame parity contradicted D1 alternation; the exact original value was \
+             restored and verified, and no configuration was saved",
+            evidence.classified(),
+            evidence.lit,
+            evidence.dark,
+            evidence.missing()
+        )));
+    }
+    if !metadata_proves_d1 && lit.brightness < before.brightness + AUTOCONF_MIN_LIFT {
+        pending.restore_once().map_err(TryFailure::Restore)?;
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Ok(Attempt::Inconclusive(format!(
+            "the camera accepted and read back the device-derived value, but the optical change \
+             was too weak to classify (before {:.0}, after {:.0}, needs \
+             +{AUTOCONF_MIN_LIFT:.0}); the exact original value was restored and verified, and \
+             no configuration was saved",
+            before.brightness, lit.brightness
         )));
     }
 
@@ -3903,20 +4070,24 @@ fn try_documented_control<F: FnMut() -> Option<f32>, G: FnMut() -> Result<(), St
     // illuminator. Put the control back and require the brightness to fall with
     // it: a change that does not follow the control is not caused by it.
     pending.restore_once().map_err(TryFailure::Restore)?;
-    let Some(after_restore) = measure() else {
-        return Err(TryFailure::Measurement);
-    };
-    if after_restore >= lit - AUTOCONF_MIN_LIFT {
-        // Restored above, and this branch writes nothing further, so the record
-        // is resolvable here. The read-back is what resolves it: the restoring
-        // `set_cur` returning success says the ioctl was accepted, not that the
-        // control holds those bytes.
-        pending.confirm_restored().map_err(TryFailure::Journal)?;
-        return Ok(Attempt::NotUsable(format!(
-            "the image brightened but stayed bright when the control was put back \
-             ({before:.0} before, {lit:.0} with it set, {after_restore:.0} after undoing it), \
-             so the change did not come from this control"
-        )));
+    if !metadata_proves_d1 {
+        let Some(after_restore) = measure() else {
+            return Err(TryFailure::Measurement);
+        };
+        if after_restore.brightness >= lit.brightness - AUTOCONF_MIN_LIFT {
+            // Restored above, and this branch writes nothing further, so the record
+            // is resolvable here. The read-back is what resolves it: the restoring
+            // `set_cur` returning success says the ioctl was accepted, not that the
+            // control holds those bytes.
+            pending.confirm_restored().map_err(TryFailure::Journal)?;
+            return Ok(Attempt::Inconclusive(format!(
+                "the image brightened but stayed bright when the control was put back \
+                 ({:.0} before, {:.0} with it set, {:.0} after undoing it), \
+                 so the change could not be assigned to this control; the exact original value \
+                 was restored and verified, and no configuration was saved",
+                before.brightness, lit.brightness, after_restore.brightness
+            )));
+        }
     }
 
     // It followed the control both ways. Apply it and report it.
@@ -4631,10 +4802,10 @@ mod tests {
     /// Returns the ordered request log and the value the control ends up
     /// holding. `IRLUME_STATE_DIR` points at a scratch directory so the undo
     /// record is real.
-    fn run_discovery(
+    fn run_discovery<M: Into<SetupMeasurement>>(
         camera: fake_camera::Camera,
         tag: &str,
-        measure: impl FnMut() -> Option<f32>,
+        measure: impl FnMut() -> Option<M>,
     ) -> (
         std::result::Result<Attempt, TryFailure>,
         Vec<fake_camera::Request>,
@@ -4644,10 +4815,10 @@ mod tests {
         run_discovery_guarded(camera, tag, measure, || Ok(()))
     }
 
-    fn run_discovery_guarded(
+    fn run_discovery_guarded<M: Into<SetupMeasurement>>(
         camera: fake_camera::Camera,
         tag: &str,
-        mut measure: impl FnMut() -> Option<f32>,
+        mut measure: impl FnMut() -> Option<M>,
         mut guard: impl FnMut() -> Result<(), String>,
     ) -> (
         std::result::Result<Attempt, TryFailure>,
@@ -4669,8 +4840,15 @@ mod tests {
         .find(|s| ms.advertises(*s))
         .expect("fixture advertises an emitter selector");
         // fd is never reached: the fake intercepts before the ioctl.
-        let outcome =
-            try_documented_control(-1, &id, ms.unit_id, selector, &mut measure, &mut guard);
+        let mut measure_with_evidence = || measure().map(Into::into);
+        let outcome = try_documented_control(
+            -1,
+            &id,
+            ms.unit_id,
+            selector,
+            &mut measure_with_evidence,
+            &mut guard,
+        );
         (outcome, fake_camera::log(), fake_camera::current(), dir)
     }
 
@@ -4690,6 +4868,178 @@ mod tests {
             res: vec![1, 1, 1],
             ..Default::default()
         }
+    }
+
+    /// A weak scene is an observation gap, not evidence that a documented D1
+    /// control is unusable. This reproduces the ASUS setup result from #492:
+    /// the device-derived value is accepted, read back, and exactly restored,
+    /// but the short optical window moves only four brightness points.
+    #[test]
+    fn weak_reflection_is_inconclusive_not_no_usable_control() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-discovery-weak-reflection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let _fake = fake_camera::install(a_working_camera());
+        let id = identity(0x3277, 0x0059);
+        let mut readings = [48.0, 52.0].into_iter();
+        let mut permit = || Ok(());
+
+        let error = discover(-1, &id, &mut || readings.next(), &mut permit)
+            .expect_err("weak optical evidence must not publish a configuration");
+
+        assert!(
+            !matches!(error, DiscoveryError::NoUsableControl { .. }),
+            "a scene-dependent miss must not classify the advertised control as unusable: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("inconclusive"), "{message}");
+        assert!(!message.contains("no usable emitter control"), "{message}");
+        assert_eq!(
+            fake_camera::current(),
+            vec![1, 3, 1],
+            "the exact original value must be restored"
+        );
+        let sets = fake_camera::log()
+            .iter()
+            .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+            .count();
+        assert_eq!(
+            sets, 2,
+            "only exploratory apply and exact restore may be sent"
+        );
+        let records = std::fs::read_dir(dir.join("ir-emitter-journal"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(records, 0, "a confirmed restore must clear the journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Brightening that does not reverse with the control is compatible with
+    /// ambient or exposure drift. It must neither prove D1 nor condemn a
+    /// documented control that was safely restored.
+    #[test]
+    fn independent_brightness_drift_is_inconclusive_not_unusable() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-discovery-independent-drift-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let _fake = fake_camera::install(a_working_camera());
+        let id = identity(0x3277, 0x0059);
+        let mut readings = [10.0, 40.0, 35.0].into_iter();
+        let mut permit = || Ok(());
+
+        let error = discover(-1, &id, &mut || readings.next(), &mut permit)
+            .expect_err("a change independent of the control must not be published");
+
+        assert!(
+            matches!(error, DiscoveryError::Inconclusive { .. }),
+            "ambient or exposure drift is an evidence gap, not an unusable control: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("stayed bright"), "{message}");
+        assert_eq!(fake_camera::current(), vec![1, 3, 1]);
+        let sets = fake_camera::log()
+            .iter()
+            .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+            .count();
+        assert_eq!(sets, 2, "drift permits only exploratory apply and restore");
+        let records = std::fs::read_dir(dir.join("ir-emitter-journal"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(records, 0, "a confirmed restore clears the journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Microsoft D1 metadata can prove the alternating mode even when the
+    /// scene is too weak for the optical heuristic. The proof remains labelled
+    /// as metadata evidence; it does not claim to have measured photons.
+    #[test]
+    fn d1_metadata_proves_setup_when_optical_lift_is_weak() {
+        let _lock = crate::testenv::env_lock();
+        let evidence = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+        ]);
+        let mut measurements = [
+            SetupMeasurement::optical(48.0),
+            SetupMeasurement::with_d1_metadata(52.0, evidence),
+        ]
+        .into_iter();
+
+        let (outcome, log, current, dir) =
+            run_discovery(a_working_camera(), "metadata-proves-weak-optical", || {
+                measurements.next()
+            });
+
+        assert!(matches!(outcome, Ok(Attempt::Lit(..))), "{outcome:?}");
+        assert_eq!(current, vec![1, 3, 2], "proven D1 is left applied");
+        let sets = log
+            .iter()
+            .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+            .count();
+        assert_eq!(
+            sets, 3,
+            "metadata proof still performs exploratory apply, exact restore, and final apply"
+        );
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once the camera supplies enough metadata to contradict D1, a reversible
+    /// brightness swing cannot erase that contradiction. The result needs a
+    /// better observation, not a persisted mode with dishonest provenance.
+    #[test]
+    fn contradictory_d1_metadata_cannot_be_overridden_by_optical_lift() {
+        let _lock = crate::testenv::env_lock();
+        let contradictory = D1MetadataEvidence::from_lit_flags(&[
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+        ]);
+        let mut measurements = [
+            SetupMeasurement::optical(10.0),
+            SetupMeasurement::with_d1_metadata(40.0, contradictory),
+            SetupMeasurement::optical(10.0),
+        ]
+        .into_iter();
+
+        let (outcome, log, current, dir) =
+            run_discovery(a_working_camera(), "metadata-contradicts-optical", || {
+                measurements.next()
+            });
+
+        assert!(
+            matches!(outcome, Ok(Attempt::Inconclusive(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the exact original is restored");
+        let sets = log
+            .iter()
+            .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+            .count();
+        assert_eq!(sets, 2, "a contradiction may only apply and restore");
+        let records = std::fs::read_dir(dir.join("ir-emitter-journal"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(records, 0, "the confirmed restore clears the journal");
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Microsoft's Face Authentication control permits a dedicated IR
@@ -8931,6 +9281,25 @@ mod tests {
         // Ambient infrared with no real change must still be rejected.
         let bright_ambient = 120.0f32;
         assert!(bright_ambient + 5.0 < bright_ambient + AUTOCONF_MIN_LIFT);
+    }
+
+    /// One absent metadata record is an observation gap, not a dark frame.
+    /// The remaining records still prove D1 when their states agree with frame
+    /// parity and include both phases more than once.
+    #[test]
+    fn d1_metadata_alternation_tolerates_one_missing_record() {
+        let evidence = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(false),
+            Some(true),
+        ]);
+
+        assert!(evidence.proves_d1(), "{evidence:?}");
+        assert_eq!(evidence.classified(), 5);
+        assert_eq!(evidence.missing(), 1);
     }
 
     // --- round 6 ---------------------------------------------------------

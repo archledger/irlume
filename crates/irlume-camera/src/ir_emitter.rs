@@ -2160,6 +2160,7 @@ struct SentinelBackend {
     events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     lit: bool,
     owns_restore: bool,
+    restore_failure: Option<String>,
 }
 
 #[cfg(test)]
@@ -2180,6 +2181,9 @@ impl EmitterBackend for SentinelBackend {
                 .push("emitter-restore");
             self.owns_restore = false;
             self.lit = false;
+            if let Some(why) = self.restore_failure.take() {
+                return Err(RestoreError::Bookkeeping(why));
+            }
         }
         Ok(())
     }
@@ -2218,6 +2222,19 @@ impl StreamMode {
             events,
             lit: true,
             owns_restore: true,
+            restore_failure: None,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_failing_sentinel(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> Self {
+        StreamMode::new(Box::new(SentinelBackend {
+            events,
+            lit: true,
+            owns_restore: true,
+            restore_failure: Some("sentinel restore failure".into()),
         }))
     }
 

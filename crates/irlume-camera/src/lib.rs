@@ -13572,7 +13572,7 @@ mod tests {
         let mut session = camera.session().expect("open IR session");
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         session.meta = Some(ir_metadata::IlluminationLog::test_sentinel(events.clone()));
-        session._mode = ir_emitter::StreamMode::test_sentinel(events.clone());
+        session._mode = ir_emitter::StreamMode::test_failing_sentinel(events.clone());
         session.lit = session._mode.lit();
         assert!(session.meta.is_some());
         assert!(session.lit && session._mode.owns_restore());
@@ -13588,6 +13588,10 @@ mod tests {
                 .to_string()
                 .contains("injected privacy boundary failure"),
             "{error}"
+        );
+        assert!(
+            error.to_string().contains("sentinel restore failure"),
+            "the explicit restore failure must be combined with privacy: {error}"
         );
         assert!(
             session.stream.stream.is_none(),

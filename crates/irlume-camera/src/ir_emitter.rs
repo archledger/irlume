@@ -811,6 +811,7 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
 #[doc(hidden)]
 pub mod raw {
     use super::c_int;
+    use crate::lease::CameraOperationSession;
 
     /// `GET_LEN` for a control, as the device reports it.
     pub fn get_len(fd: c_int, unit: u8, selector: u8) -> Result<usize, String> {
@@ -827,9 +828,24 @@ pub mod raw {
         super::get_of(fd, unit, selector, super::UVC_GET_DEF, len).map_err(|e| e.to_string())
     }
 
-    /// ONE `SET_CUR`, owned by no guard, recorded in no journal.
-    pub fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> Result<(), String> {
-        super::set_cur(fd, unit, selector, payload).map_err(|e| e.to_string())
+    /// ONE `SET_CUR` under a current camera operation, owned by no restore
+    /// guard and recorded in no journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation is stale or does not cover the open
+    /// endpoint, or when the camera refuses or does not answer the write.
+    pub fn set_cur(
+        operation: &CameraOperationSession,
+        fd: c_int,
+        unit: u8,
+        selector: u8,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        operation
+            .lease()
+            .run_active(|| super::set_cur(fd, unit, selector, payload))
+            .map_err(|error| error.to_string())
     }
 }
 

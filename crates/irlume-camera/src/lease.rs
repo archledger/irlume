@@ -959,6 +959,45 @@ mod tests {
     }
 
     #[test]
+    fn raw_set_cur_enters_the_acquired_operations_active_scope() {
+        let (_authority, _inventory, lease) = lease_fixture();
+        let session = CameraOperationSession::new(lease);
+        let _camera =
+            crate::ir_emitter::fake_camera::install(crate::ir_emitter::fake_camera::Camera {
+                at_first_write: Some(Box::new(|| match active_permit("/dev/video0") {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err("SET_CUR had no current operation".into()),
+                    Err(error) => Err(format!("SET_CUR operation was invalid: {error}")),
+                })),
+                ..Default::default()
+            });
+
+        assert_eq!(
+            crate::ir_emitter::raw::set_cur(&session, -1_i32, 1, 1, &[7]),
+            Ok(())
+        );
+        assert_eq!(
+            crate::ir_emitter::fake_camera::log(),
+            vec![crate::ir_emitter::fake_camera::Request::Set(vec![7])]
+        );
+    }
+
+    #[test]
+    fn raw_set_cur_keeps_a_stale_operation_fail_closed_as_estale() {
+        use std::os::fd::AsRawFd;
+
+        let (_authority, inventory, lease) = lease_fixture();
+        let session = CameraOperationSession::new(lease);
+        inventory.lock().unwrap().invalidate_all();
+        let file = std::fs::File::open("/dev/null").unwrap();
+
+        let error = crate::ir_emitter::raw::set_cur(&session, file.as_raw_fd(), 1, 1, &[7])
+            .expect_err("a stale operation must not reach SET_CUR");
+        assert!(error.starts_with("camera did not answer ("));
+        assert!(error.ends_with(&format!("(os error {}))", libc::ESTALE)));
+    }
+
+    #[test]
     #[ignore = "requires an operator-controlled UVC interface unbind"]
     fn production_active_pair_lease_becomes_stale_on_uvc_loss() {
         use std::io::Write;

@@ -109,7 +109,7 @@ fn run() -> Result<(), String> {
         .lease()
         .validate()
         .map_err(|error| error.to_string())?;
-    raw::set_cur(fd, unit, selector, &payload)?;
+    raw::set_cur(&operation, fd, unit, selector, &payload)?;
     let after = raw::get_cur(fd, unit, selector, len)?;
     eprintln!("xu_set: unit{unit}/sel{selector} wrote:  {payload:02x?}");
     eprintln!("xu_set: unit{unit}/sel{selector} after:  {after:02x?}");

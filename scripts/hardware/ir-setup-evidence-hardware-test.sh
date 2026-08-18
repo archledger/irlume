@@ -6,7 +6,8 @@
 #
 # `transition` is restricted to the ASUS 3277:0059 and NexiGo 3443:c803
 # modules already validated with a device-derived Face Authentication payload.
-# It parks selector 6 at this camera's own GET_DEF, then runs setup once with
+# It durably records selector 6's exact GET_CUR, parks the selector at this
+# camera's own GET_DEF, then runs setup once with
 # UVCM metadata enabled and once with it forcibly disabled. Success and the
 # explicit Inconclusive result are both valid functional outcomes; every result
 # is checked against its persistence, journal, read-back, and restoration rules.
@@ -29,8 +30,8 @@ DAEMON="$TREE/target/release/irlumed"
 XU_SET="$TREE/target/release/examples/xu_set"
 MODELS=${IRLUME_MODEL_DIR:-/usr/share/irlume/models}
 SOCK="/run/irlume-492-$$.sock"
-STATE=$(mktemp -d /var/lib/irlume-492.XXXXXX)
-OUT=$(mktemp -d /tmp/irlume-492-evidence.XXXXXX)
+STATE=""
+OUT=""
 CONF="$STATE/ir_emitter.conf"
 LOCKS="$STATE/locks"
 STORE="$STATE/ir-emitter-journal"
@@ -40,6 +41,10 @@ ORT=${ORT_DYLIB_PATH:-$(systemctl cat irlumed 2>/dev/null |
 daemon_pid=""
 unit=""
 control_needs_restore=no
+initial_cur=""
+initial_payload=""
+initial_identity=""
+expected_d1=""
 pass=0
 fail=0
 
@@ -55,35 +60,93 @@ stop_private() {
     rm -f "$SOCK"
 }
 
-restore_default() {
-    if [ "$control_needs_restore" = yes ] && [ -n "$unit" ] && [ -e "$IR" ]; then
-        stop_private
-        if "$XU_SET" "$IR" "$unit" 6 def >"$OUT/cleanup-restore.out" 2>&1; then
-            control_needs_restore=no
+read_cur() { # diagnostic tag
+    local tag=$1 value
+    if ! value=$("$XU_SET" "$IR" "$unit" 6 get 2>"$OUT/get-$tag.err"); then
+        echo "GET_CUR failed ($tag)" >&2
+        sed 's/^/    /' "$OUT/get-$tag.err" >&2
+        return 1
+    fi
+    if [[ ! "$value" =~ ^([0-9a-fA-F][0-9a-fA-F])+$ ]]; then
+        echo "GET_CUR returned malformed bytes ($tag): $value" >&2
+        return 1
+    fi
+    printf '%s\n' "${value,,}"
+}
+
+hex_to_payload() {
+    local value=$1 result="" byte
+    while [ -n "$value" ]; do
+        byte=${value:0:2}
+        value=${value:2}
+        result="${result:+$result,}0x$byte"
+    done
+    printf '%s\n' "$result"
+}
+
+restore_initial() {
+    local restored
+    [ "$control_needs_restore" = yes ] || return 0
+    stop_private
+    if [ -z "$unit" ] || [ -z "$initial_cur" ] || [ -z "$initial_payload" ] \
+        || [ -z "$initial_identity" ] || [ ! -e "$IR" ]; then
+        echo "cannot restore: initial control identity or camera node is unavailable" >&2
+        return 1
+    fi
+    if ! "$XU_SET" "$IR" "$unit" 6 "$initial_payload" \
+        --expect-camera "$initial_identity" >"$OUT/cleanup-restore.out" 2>&1; then
+        sed 's/^/    /' "$OUT/cleanup-restore.out" >&2
+        return 1
+    fi
+    if ! restored=$(read_cur cleanup); then
+        return 1
+    fi
+    if [ "$restored" != "$initial_cur" ]; then
+        echo "restore verification failed: $restored != $initial_cur" >&2
+        return 1
+    fi
+    control_needs_restore=no
+}
+
+cleanup() {
+    local original_status=$? cleanup_status=0
+    trap - EXIT INT TERM HUP
+    stop_private
+    if ! restore_initial; then
+        cleanup_status=1
+        echo "CRITICAL: exact control restoration failed." >&2
+        echo "Recovery state is preserved at $STATE; transcripts are at $OUT." >&2
+        echo "The packaged daemon will NOT be restarted while the camera may be altered." >&2
+    fi
+    rm -f "$SOCK"
+    if [ "$cleanup_status" -eq 0 ]; then
+        case "$STATE" in
+            /var/lib/irlume-492.*) rm -rf "$STATE" ;;
+            *) echo "refusing to remove unexpected state path $STATE" >&2; cleanup_status=1 ;;
+        esac
+    fi
+    if [ "$cleanup_status" -eq 0 ] && [ "$packaged_was_active" = active ]; then
+        if systemctl start irlumed && systemctl is-active --quiet irlumed; then
+            echo "  (packaged irlumed: active)"
         else
-            echo "  WARNING: cleanup could not restore the device default" >&2
-            sed 's/^/    /' "$OUT/cleanup-restore.out" >&2
+            echo "FAILED: packaged irlumed did not restart" >&2
+            cleanup_status=1
         fi
     fi
+    [ "$cleanup_status" -eq 0 ] || exit 1
+    exit "$original_status"
 }
-
-packaged_was_active=$(systemctl is-active irlumed 2>/dev/null || true)
-cleanup() {
-    stop_private
-    restore_default
-    rm -f "$SOCK"
-    case "$STATE" in
-        /var/lib/irlume-492.*) rm -rf "$STATE" ;;
-        *) echo "refusing to remove unexpected state path $STATE" >&2 ;;
-    esac
-    if [ "$packaged_was_active" = active ]; then
-        systemctl start irlumed 2>/dev/null || true
-        echo "  (packaged irlumed: $(systemctl is-active irlumed 2>/dev/null || true))"
-    fi
-}
-trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || { echo "refusing: physical camera gate requires root"; exit 2; }
+STATE=$(mktemp -d /var/lib/irlume-492.XXXXXX) || exit 2
+OUT=$(mktemp -d /tmp/irlume-492-evidence.XXXXXX) || exit 2
+CONF="$STATE/ir_emitter.conf"
+LOCKS="$STATE/locks"
+STORE="$STATE/ir-emitter-journal"
+packaged_was_active=$(systemctl is-active irlumed 2>/dev/null || true)
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 [ -x "$CLI" ] && [ -x "$DAEMON" ] && [ -x "$XU_SET" ] || {
     echo "refusing: release irlume, irlumed, or xu_set is missing under $TREE/target/release"
     exit 2
@@ -95,7 +158,14 @@ mkdir -p "$LOCKS"
 if [ -d /var/lib/irlume/models-thirdparty ]; then
     ln -s /var/lib/irlume/models-thirdparty "$STATE/models-thirdparty"
 fi
-systemctl stop irlumed 2>/dev/null || true
+if ! systemctl stop irlumed; then
+    echo "refusing: failed to stop packaged irlumed"
+    exit 2
+fi
+if systemctl is-active --quiet irlumed; then
+    echo "refusing: packaged irlumed is still active"
+    exit 2
+fi
 
 start_private() { # tag, metadata-disabled(0|1)
     local tag=$1 no_meta=$2
@@ -118,7 +188,10 @@ start_private() { # tag, metadata-disabled(0|1)
         "$DAEMON" >"$OUT/daemon-$tag.log" 2>&1 &
     daemon_pid=$!
     for _ in $(seq 1 1800); do
-        [ -S "$SOCK" ] && return 0
+        if [ -S "$SOCK" ] \
+            && IRLUME_SOCKET="$SOCK" "$CLI" ir-setup --dry-run >/dev/null 2>&1; then
+            return 0
+        fi
         kill -0 "$daemon_pid" 2>/dev/null || {
             tail -20 "$OUT/daemon-$tag.log"
             return 1
@@ -139,62 +212,100 @@ sed 's/^/    /' "$OUT/dry-run.out"
 unit=$(sed -n 's/.*unit \([0-9]*\) (Microsoft camera control).*/\1/p' "$OUT/dry-run.out" | head -1)
 
 run_transition_case() { # tag, metadata-disabled
-    local tag=$1 no_meta=$2 rc current default
+    local tag=$1 no_meta=$2 rc current parked_default
     rm -f "$CONF"
     rm -rf "$STORE"
-    "$XU_SET" "$IR" "$unit" 6 def >"$OUT/$tag-park.out" 2>&1 || return 2
     control_needs_restore=yes
-    default=$("$XU_SET" "$IR" "$unit" 6 get)
+    "$XU_SET" "$IR" "$unit" 6 def --expect-camera "$initial_identity" \
+        >"$OUT/$tag-park.out" 2>&1 || return 2
+    if ! parked_default=$(read_cur "$tag-parked"); then return 2; fi
     start_private "$tag" "$no_meta" || return 2
     run_cli >"$OUT/$tag.out" 2>&1
     rc=$?
     stop_private
-    current=$("$XU_SET" "$IR" "$unit" 6 get)
+    if ! current=$(read_cur "$tag-result"); then return 2; fi
     sed 's/^/    /' "$OUT/$tag.out"
 
     if [ "$rc" -eq 0 ]; then
         grep -q "IR emitter enabled" "$OUT/$tag.out" && ok "$tag reports proven success" ||
             bad "$tag success is explicitly labelled" "unexpected output"
-        [ -f "$CONF" ] && ok "$tag saves the proven control" ||
-            bad "$tag saves the proven control" "no $CONF"
+        [ "$(sed -n '1p' "$CONF" 2>/dev/null)" = "$vid:$pid $unit:6" ] \
+            && ok "$tag saves the proven control for this camera" ||
+            bad "$tag saves the proven control for this camera" "unexpected or absent $CONF"
+        [ "$current" = "$expected_d1" ] && ok "$tag leaves exactly the proven D1 value applied" ||
+            bad "$tag leaves exactly the proven D1 value applied" "$current != $expected_d1"
     elif [ "$rc" -eq 1 ] && grep -qi "inconclusive" "$OUT/$tag.out"; then
         ok "$tag reports the typed inconclusive outcome"
         [ ! -e "$CONF" ] && ok "$tag saves no inconclusive control" ||
             bad "$tag saves no inconclusive control" "config exists"
-        [ "$current" = "$default" ] && ok "$tag exactly restores the original" ||
-            bad "$tag exactly restores the original" "$current != $default"
+        [ "$current" = "$parked_default" ] && ok "$tag exactly restores the parked value" ||
+            bad "$tag exactly restores the parked value" "$current != $parked_default"
     else
         bad "$tag returns success or typed inconclusive" "exit $rc"
     fi
 
     [ -z "$(records)" ] && ok "$tag leaves no undo record" ||
         bad "$tag leaves no undo record" "$(records)"
-    "$XU_SET" "$IR" "$unit" 6 def >"$OUT/$tag-final-restore.out" 2>&1 || return 2
-    control_needs_restore=no
-    current=$("$XU_SET" "$IR" "$unit" 6 get)
-    [ "$current" = "$default" ] && ok "$tag finishes at the device default" ||
-        bad "$tag finishes at the device default" "$current != $default"
 }
 
 case "$CLASS" in
     transition)
-        grep -q "unit $unit (Microsoft camera control): advertises \[.*0x06" "$OUT/dry-run.out" || {
-            echo "refusing: target does not advertise Face Authentication selector 6"
+        if ! snapshot=$("$XU_SET" "$IR" "$unit" 6 snapshot 2>"$OUT/get-initial.err"); then
+            echo "refusing: could not atomically capture camera identity and GET_CUR"
+            sed 's/^/    /' "$OUT/get-initial.err" >&2
             exit 2
-        }
-        devpath=$(udevadm info -q path -n "$IR" 2>/dev/null | sed 's,/video4linux.*,,' | sed 's,/[^/]*$,,')
-        vid=$(cat "/sys$devpath/idVendor" 2>/dev/null || true)
-        pid=$(cat "/sys$devpath/idProduct" 2>/dev/null || true)
-        case "$vid:$pid" in 3277:0059|3443:c803) ;; *)
-            echo "refusing: transition parking is validated only on ASUS and NexiGo, got $vid:$pid"
+        fi
+        snapshot_extra=""
+        read -r initial_identity snapshot_usb_id snapshot_interface snapshot_unit \
+            snapshot_selector initial_cur snapshot_extra <<<"$snapshot"
+        if [[ ! "$initial_identity" =~ ^[0-9a-f]{64}$ ]] \
+            || [[ ! "$snapshot_usb_id" =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] \
+            || [[ ! "$snapshot_interface" =~ ^[0-9]+$ ]] \
+            || [[ ! "$snapshot_unit" =~ ^[0-9]+$ ]] \
+            || [ "$snapshot_selector" != 6 ] \
+            || [[ ! "$initial_cur" =~ ^([0-9a-f][0-9a-f])+$ ]] \
+            || [ -n "$snapshot_extra" ]; then
+            echo "refusing: malformed camera snapshot: $snapshot"
             exit 2
+        fi
+        case "$snapshot_usb_id" in
+            3277:0059) expected_unit=14 ;;
+            3443:c803) expected_unit=4 ;;
+            *)
+                echo "refusing: transition parking is validated only on ASUS and NexiGo, got $snapshot_usb_id"
+                exit 2
+                ;;
         esac
+        if [ "$snapshot_unit" != "$expected_unit" ]; then
+            echo "refusing: $snapshot_usb_id reported unexpected Microsoft unit $snapshot_unit"
+            exit 2
+        fi
+        unit=$snapshot_unit
+        vid=${snapshot_usb_id%:*}
+        pid=${snapshot_usb_id#*:}
+        expected_d1=010302000000000000
+        initial_payload=$(hex_to_payload "$initial_cur")
+        recovery="$STATE/pretest-control"
+        {
+            printf 'device=%s\n' "$IR"
+            printf 'usb_id=%s\ninterface=%s\n' "$snapshot_usb_id" "$snapshot_interface"
+            printf 'unit=%s\nselector=%s\n' "$unit" "$snapshot_selector"
+            printf 'initial_cur=%s\n' "$initial_cur"
+            printf 'camera_identity=%s\n' "$initial_identity"
+            printf 'restore_payload=%s\n' "$initial_payload"
+            printf 'transcripts=%s\n' "$OUT"
+        } >"$recovery"
+        chmod 600 "$recovery"
+        if ! sync -f "$recovery" || ! sync -f "$STATE"; then
+            echo "refusing: could not durably record the pre-test control"
+            exit 2
+        fi
         run_transition_case metadata-present 0 || exit 2
         run_transition_case metadata-absent 1 || exit 2
         ;;
     device-default)
         [ -n "$unit" ] || { echo "refusing: no Microsoft XU"; exit 2; }
-        before=$("$XU_SET" "$IR" "$unit" 6 get)
+        if ! before=$(read_cur device-default-before); then exit 2; fi
         for mode in metadata-present metadata-absent; do
             disabled=0; [ "$mode" = metadata-absent ] && disabled=1
             rm -f "$CONF"; rm -rf "$STORE"
@@ -210,7 +321,7 @@ case "$CLASS" in
                 bad "$mode sends no Face Authentication write" "SET_CUR found"
             [ ! -e "$CONF" ] && [ -z "$(records)" ] && ok "$mode persists nothing" ||
                 bad "$mode persists nothing" "config or journal exists"
-            after=$("$XU_SET" "$IR" "$unit" 6 get)
+            if ! after=$(read_cur "$mode-after"); then exit 2; fi
             [ "$after" = "$before" ] && ok "$mode leaves the exact control unchanged" ||
                 bad "$mode leaves the exact control unchanged" "$after != $before"
         done

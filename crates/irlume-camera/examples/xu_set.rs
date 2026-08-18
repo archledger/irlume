@@ -24,14 +24,19 @@
 //!
 //! Usage:
 //!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> get
+//!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> snapshot
+//!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> identity
 //!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> def
 //!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> <b0,b1,...>
+//!   cargo run -p irlume-camera --example xu_set -- <video-dev> <unit> <selector> \
+//!       <b0,b1,...> --expect-camera <identity-token>
 //!
 //! `get` reads GET_CUR and writes nothing at all. Bytes are decimal or 0x-hex,
 //! comma-separated, and must match GET_LEN.
 
 use irlume_camera::ir_emitter::raw;
 use irlume_camera::uvc_descriptor;
+use std::os::unix::fs::MetadataExt;
 
 fn parse_byte(s: &str) -> Result<u8, String> {
     let s = s.trim();
@@ -42,10 +47,57 @@ fn parse_byte(s: &str) -> Result<u8, String> {
     }
 }
 
+fn identity_token(id: &uvc_descriptor::CameraIdentity, sysfs_instance: (u64, u64)) -> String {
+    let descriptor_sha256 = irlume_common::sha256_hex(&id.descriptors);
+    let serial = id.serial.as_deref().unwrap_or("");
+    irlume_common::sha256_hex(
+        format!(
+            "descriptors:{descriptor_sha256}|interface:{}|serial:{}:{serial}|devpath:{}:{}|sysfs:{}:{}",
+            id.interface_number,
+            serial.len(),
+            id.usb_devpath.len(),
+            id.usb_devpath,
+            sysfs_instance.0,
+            sysfs_instance.1,
+        )
+        .as_bytes(),
+    )
+}
+
+fn live_identity_token(id: &uvc_descriptor::CameraIdentity) -> Result<String, String> {
+    let path = format!("/sys{}", id.usb_devpath);
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("inspect current camera incarnation at {path}: {error}"))?;
+    Ok(identity_token(id, (metadata.dev(), metadata.ino())))
+}
+
+fn snapshot_line(
+    id: &uvc_descriptor::CameraIdentity,
+    token: &str,
+    unit: u8,
+    selector: u8,
+    bytes: &[u8],
+) -> String {
+    let bytes = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{token} {} {} {unit} {selector} {bytes}",
+        id.usb_id(),
+        id.interface_number,
+    )
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [device, unit, selector, value] = args.as_slice() else {
-        return Err("usage: xu_set <video-dev> <unit> <selector> <get|def|b0,b1,...>".to_string());
+    let (device, unit, selector, value, expected_camera) = match args.as_slice() {
+        [device, unit, selector, value] => (device, unit, selector, value, None),
+        [device, unit, selector, value, flag, expected] if flag == "--expect-camera" => {
+            (device, unit, selector, value, Some(expected.as_str()))
+        }
+        _ => {
+            return Err("usage: xu_set <video-dev> <unit> <selector> \
+                 <get|snapshot|identity|def|b0,b1,...> [--expect-camera <identity-token>]"
+                .to_string());
+        }
     };
     let unit: u8 = unit.parse().map_err(|e| format!("unit {unit}: {e}"))?;
     let selector: u8 = selector
@@ -76,9 +128,34 @@ fn run() -> Result<(), String> {
             id.usb_id()
         ));
     }
+    let current_camera = live_identity_token(&id)?;
+    if value == "identity" {
+        if expected_camera.is_some() {
+            return Err("identity does not accept --expect-camera".to_string());
+        }
+        println!("{current_camera}");
+        return Ok(());
+    }
+    if let Some(expected) = expected_camera {
+        if current_camera != expected {
+            return Err(format!(
+                "camera identity changed: expected {expected}, found {current_camera}; nothing was sent"
+            ));
+        }
+    }
 
     let len = raw::get_len(fd, unit, selector)?;
     let before = raw::get_cur(fd, unit, selector, len)?;
+    if value == "snapshot" {
+        if expected_camera.is_some() {
+            return Err("snapshot does not accept --expect-camera".to_string());
+        }
+        println!(
+            "{}",
+            snapshot_line(&id, &current_camera, unit, selector, &before)
+        );
+        return Ok(());
+    }
     if value == "get" {
         // Read-only: the one line a harness parses, and no ioctl but GETs.
         println!(
@@ -129,5 +206,44 @@ fn main() {
     if let Err(why) = run() {
         eprintln!("xu_set: {why}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> irlume_camera::uvc_descriptor::CameraIdentity {
+        irlume_camera::uvc_descriptor::CameraIdentity {
+            descriptors: vec![1, 2, 3, 4],
+            interface_number: 1,
+            vid: 0x3277,
+            pid: 0x0059,
+            serial: Some("camera-a".into()),
+            usb_devpath: "/devices/pci/usb/camera".into(),
+        }
+    }
+
+    #[test]
+    fn expected_camera_token_binds_the_current_sysfs_incarnation() {
+        let id = identity();
+        assert_eq!(identity_token(&id, (7, 11)), identity_token(&id, (7, 11)));
+        assert_ne!(identity_token(&id, (7, 11)), identity_token(&id, (7, 12)));
+
+        let mut replacement = identity();
+        replacement.serial = Some("camera-b".into());
+        assert_ne!(
+            identity_token(&id, (7, 11)),
+            identity_token(&replacement, (7, 11))
+        );
+    }
+
+    #[test]
+    fn snapshot_line_binds_control_bytes_to_descriptor_identity() {
+        let id = identity();
+        assert_eq!(
+            snapshot_line(&id, "identity-token", 14, 6, &[1, 3, 1]),
+            "identity-token 3277:0059 1 14 6 010301"
+        );
     }
 }

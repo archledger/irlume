@@ -489,6 +489,16 @@ pub(crate) struct OperationScope {
 }
 
 impl OperationScope {
+    #[cfg(test)]
+    pub(crate) const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn operation_class(&self) -> OperationClass {
+        self.operation
+    }
+
     pub(crate) fn emit(&self, kind: ShareSafeEventKind) {
         if self.state.record_if_unfinished(
             self.operation_id,
@@ -508,10 +518,13 @@ impl OperationScope {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.state.record(
+        let kind = ShareSafeEventKind::OperationFinished { outcome };
+        self.state
+            .record(self.operation_id, self.operation, kind.clone());
+        self.state.emit_trace(
             self.operation_id,
             self.operation,
-            ShareSafeEventKind::OperationFinished { outcome },
+            TraceEventKind::Shared { transition: kind },
         );
     }
 
@@ -688,10 +701,20 @@ mod tests {
         let subscription = state.subscribe_trace(0, 60_000).unwrap();
         let operation = state.begin(OperationClass::Enrollment);
         operation.emit(selected());
+        operation.finish(CategoricalOutcome::Completed);
         let records: Vec<_> = subscription.receiver.try_iter().collect();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         assert!(matches!(records[1].event, TraceEventKind::Shared { .. }));
         assert_eq!(records[1].operation_id, operation.operation_id);
         assert_eq!(records[1].operation, OperationClass::Enrollment);
+        assert!(matches!(
+            records[2].event,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed
+                }
+            }
+        ));
+        assert_eq!(records[2].operation_id, operation.operation_id);
     }
 }

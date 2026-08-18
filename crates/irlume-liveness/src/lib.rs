@@ -696,6 +696,87 @@ impl LivenessGate {
     }
 }
 
+/// Convert one already-computed gate result into the bounded, trace-only
+/// measurements owned by this crate. This never includes a reason string or
+/// biometric payload; callers emit the returned value only to a privileged
+/// diagnostic sink.
+#[must_use]
+pub fn diagnostic_trace_decision(
+    verdict: Verdict,
+    signals: &Signals,
+) -> irlume_common::diagnostics::TraceEventKind {
+    use irlume_common::diagnostics::{TraceEventKind, TraceMeasurement, TraceMetric, TraceVerdict};
+
+    let mut measurements = Vec::with_capacity(11);
+    let mut add = |metric, value: f32, threshold: Option<f32>| {
+        if let Ok(measurement) =
+            TraceMeasurement::new(metric, f64::from(value), threshold.map(f64::from))
+        {
+            measurements.push(measurement);
+        }
+    };
+    add(
+        TraceMetric::RgbBrightness,
+        signals.rgb_face_brightness,
+        Some(RGB_FACE_MIN_BRIGHTNESS),
+    );
+    add(
+        TraceMetric::IrBrightness,
+        signals.ir_face_brightness,
+        Some(IR_FACE_MIN_BRIGHTNESS),
+    );
+    add(
+        TraceMetric::IrCenterEdgeRatio,
+        signals.ir_center_edge_ratio,
+        Some(MIN_CENTER_EDGE_RATIO),
+    );
+    if let Some(glint) = signals.ir_eye_glint {
+        add(TraceMetric::IrEyeGlint, glint, Some(GLINT_MIN));
+    }
+    add(
+        TraceMetric::IrAmbientShare,
+        signals.ir_ambient,
+        Some(IR_AMBIENT_FLOOD),
+    );
+    add(
+        TraceMetric::HeadYawAsymmetry,
+        signals.head_yaw_asym,
+        Some(YAW_ASYM_MAX),
+    );
+    add(
+        TraceMetric::HeadPitchFraction,
+        signals.head_pitch_frac,
+        None,
+    );
+    add(TraceMetric::FaceFraction, signals.face_frac, None);
+    if let Some(saturated) = signals.ir_saturated_frac {
+        add(
+            TraceMetric::IrSaturatedFraction,
+            saturated,
+            Some(IR_SATURATED_FRAC_MAX),
+        );
+    }
+    add(
+        TraceMetric::RgbSpecularFraction,
+        signals.rgb_specular_frac,
+        Some(RGB_SPECULAR_MAX),
+    );
+    add(
+        TraceMetric::RgbMoireScore,
+        signals.rgb_moire_score,
+        Some(rgb_moire_max()),
+    );
+
+    TraceEventKind::Decision {
+        verdict: match verdict {
+            Verdict::Live => TraceVerdict::Live,
+            Verdict::Spoof => TraceVerdict::Spoof,
+            Verdict::Uncertain => TraceVerdict::Uncertain,
+        },
+        measurements,
+    }
+}
+
 /// The exposure refusal, shared by every evaluator that can release credentials.
 ///
 /// A blown face region measures nothing: the cues below it degrade together as
@@ -3784,5 +3865,47 @@ mod nod_evidence_tests {
             counts.1,
             counts.2
         );
+    }
+
+    #[test]
+    fn diagnostic_trace_uses_the_gate_owned_values_and_thresholds() {
+        use irlume_common::diagnostics::{TraceEventKind, TraceMetric, TraceVerdict};
+
+        let signals = Signals {
+            rgb_face_brightness: 91.0,
+            ir_face_brightness: 77.0,
+            ir_center_edge_ratio: 1.42,
+            ir_eye_glint: Some(203.0),
+            ir_ambient: 12.0,
+            head_yaw_asym: 0.08,
+            head_pitch_frac: 0.52,
+            face_frac: 0.31,
+            ir_saturated_frac: Some(0.02),
+            rgb_specular_frac: 0.03,
+            rgb_moire_score: 11.0,
+            ..Signals::default()
+        };
+        let TraceEventKind::Decision {
+            verdict,
+            measurements,
+        } = diagnostic_trace_decision(Verdict::Live, &signals)
+        else {
+            panic!("liveness tracing must produce a typed decision")
+        };
+        assert_eq!(verdict, TraceVerdict::Live);
+        let ir_brightness = measurements
+            .iter()
+            .find(|measurement| measurement.metric == TraceMetric::IrBrightness)
+            .unwrap();
+        assert_eq!(ir_brightness.value, 77.0);
+        assert_eq!(
+            ir_brightness.threshold,
+            Some(f64::from(IR_FACE_MIN_BRIGHTNESS))
+        );
+        assert!(measurements
+            .iter()
+            .any(|measurement| measurement.metric == TraceMetric::IrSaturatedFraction));
+
+        assert!(measurements.len() <= 11);
     }
 }

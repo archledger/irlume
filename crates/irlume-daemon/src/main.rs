@@ -6867,6 +6867,30 @@ mod tests {
         assert!(parsed.records().last().unwrap().terminal);
     }
 
+    #[test]
+    fn trace_correlation_ignores_a_client_supplied_operation_id() {
+        let mut wire = serde_json::to_value(Request::Authenticate {
+            user: "carol".into(),
+            service: Some("sudo".into()),
+        })
+        .unwrap();
+        wire.get_mut("Authenticate")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(
+                "operation_id".into(),
+                serde_json::Value::String("01010101010101010101010101010101".into()),
+            );
+        let request: Request = serde_json::from_value(wire).unwrap();
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin(diagnostic_operation_class(&request));
+        assert_ne!(scope.operation_id().as_bytes(), &[1; 16]);
+        assert_eq!(
+            scope.operation_class(),
+            irlume_common::diagnostics::OperationClass::Authentication
+        );
+    }
+
     /// Idle is healthy, work in flight is healthy while it reports progress, and
     /// only a job that has gone quiet past the deadline counts as wedged. Getting
     /// this backwards either restarts a busy daemon or never restarts a hung one.

@@ -650,15 +650,19 @@ diagnostic_enum!(TraceMetric {
     MinimumFramesPerSecond,
     CaptureSkewMilliseconds,
     RgbBrightness,
+    RgbSpecularFraction,
+    RgbMoireScore,
     IrBrightness,
     IrAmbientShare,
     IrCenterEdgeRatio,
     IrEyeGlint,
+    IrSaturatedFraction,
     FaceFraction,
     HeadYawAsymmetry,
     HeadPitchFraction,
     LivenessScore,
     MatchCosine,
+    FusionProbability,
 });
 diagnostic_enum!(TraceVerdict {
     Live,
@@ -785,6 +789,84 @@ pub struct ParsedTrace {
     records: Vec<TraceRecord>,
 }
 
+/// Incremental validator for a live trace stream. A caller may persist each
+/// line only after [`Self::push_line`] accepts it, then publish only after
+/// [`Self::finish`] confirms one final terminal record.
+pub struct TraceValidator {
+    limits: TraceLimits,
+    total_bytes: u64,
+    records: u64,
+    terminal_seen: bool,
+}
+
+impl TraceValidator {
+    /// Start validating against daemon-applied bounds.
+    ///
+    /// # Errors
+    ///
+    /// Refuses limits outside the public trace contract.
+    pub fn new(limits: TraceLimits) -> Result<Self, TraceParseError> {
+        if !limits.valid() {
+            return Err(TraceParseError::Limit);
+        }
+        Ok(Self {
+            limits,
+            total_bytes: 0,
+            records: 0,
+            terminal_seen: false,
+        })
+    }
+
+    /// Validate and return one complete JSONL record.
+    ///
+    /// # Errors
+    ///
+    /// Refuses byte/record limits, malformed schema, sequence gaps, invalid
+    /// event bounds, or any record after the terminal.
+    pub fn push_line(&mut self, line: &[u8]) -> Result<TraceRecord, TraceParseError> {
+        let line_bytes = u64::try_from(line.len()).map_err(|_| TraceParseError::Limit)?;
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(line_bytes)
+            .ok_or(TraceParseError::Limit)?;
+        if self.total_bytes > self.limits.max_bytes
+            || line.len() > MAX_TRACE_LINE_BYTES
+            || self.records >= self.limits.max_events
+        {
+            return Err(TraceParseError::Limit);
+        }
+        if self.terminal_seen {
+            return Err(TraceParseError::Terminal);
+        }
+        let record: TraceRecord = serde_json::from_slice(line).map_err(TraceParseError::Json)?;
+        if record.trace_schema != TRACE_SCHEMA_VERSION {
+            return Err(TraceParseError::Schema);
+        }
+        if record.sequence != self.records {
+            return Err(TraceParseError::Sequence);
+        }
+        validate_trace_event(&record.event)?;
+        self.terminal_seen = record.terminal;
+        if record.terminal && !matches!(record.event, TraceEventKind::Finished { .. }) {
+            return Err(TraceParseError::Terminal);
+        }
+        self.records = self.records.saturating_add(1);
+        Ok(record)
+    }
+
+    /// Confirm the stream ended after exactly one final terminal record.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an empty or truncated stream.
+    pub fn finish(self) -> Result<(), TraceParseError> {
+        if self.records == 0 || !self.terminal_seen {
+            return Err(TraceParseError::Terminal);
+        }
+        Ok(())
+    }
+}
+
 impl ParsedTrace {
     #[must_use]
     pub fn records(&self) -> &[TraceRecord] {
@@ -829,13 +911,9 @@ pub fn parse_trace<R: std::io::BufRead>(
     mut reader: R,
     limits: TraceLimits,
 ) -> Result<ParsedTrace, TraceParseError> {
-    if !limits.valid() {
-        return Err(TraceParseError::Limit);
-    }
+    let mut validator = TraceValidator::new(limits)?;
     let mut records = Vec::new();
     let mut line = Vec::new();
-    let mut total_bytes = 0_u64;
-    let mut terminal_seen = false;
     loop {
         line.clear();
         let read = reader
@@ -844,35 +922,9 @@ pub fn parse_trace<R: std::io::BufRead>(
         if read == 0 {
             break;
         }
-        total_bytes = total_bytes
-            .checked_add(u64::try_from(read).map_err(|_| TraceParseError::Limit)?)
-            .ok_or(TraceParseError::Limit)?;
-        if total_bytes > limits.max_bytes
-            || line.len() > MAX_TRACE_LINE_BYTES
-            || u64::try_from(records.len()).unwrap_or(u64::MAX) >= limits.max_events
-        {
-            return Err(TraceParseError::Limit);
-        }
-        if terminal_seen {
-            return Err(TraceParseError::Terminal);
-        }
-        let record: TraceRecord = serde_json::from_slice(&line).map_err(TraceParseError::Json)?;
-        if record.trace_schema != TRACE_SCHEMA_VERSION {
-            return Err(TraceParseError::Schema);
-        }
-        if record.sequence != u64::try_from(records.len()).map_err(|_| TraceParseError::Limit)? {
-            return Err(TraceParseError::Sequence);
-        }
-        validate_trace_event(&record.event)?;
-        terminal_seen = record.terminal;
-        if record.terminal && !matches!(record.event, TraceEventKind::Finished { .. }) {
-            return Err(TraceParseError::Terminal);
-        }
-        records.push(record);
+        records.push(validator.push_line(&line)?);
     }
-    if records.is_empty() || !terminal_seen {
-        return Err(TraceParseError::Terminal);
-    }
+    validator.finish()?;
     Ok(ParsedTrace { records })
 }
 

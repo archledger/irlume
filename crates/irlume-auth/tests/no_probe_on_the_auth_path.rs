@@ -136,7 +136,7 @@ fn one_camera_operation_spans_consent_and_every_authentication_retry() {
         .expect("another method follows authenticate_once");
     let once = &text[once_start..once_end];
     assert!(once.contains("if !self.ir_available"));
-    assert!(once.contains("self.assess_rgb_only().map_err(CapturePathError::from)"));
+    assert!(once.contains("self.assess_rgb_only_with_diagnostics(diagnostics)"));
 }
 
 #[test]

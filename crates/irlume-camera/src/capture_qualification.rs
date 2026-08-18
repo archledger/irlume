@@ -549,6 +549,45 @@ impl StreamContract {
         self.minimum_rate
     }
 
+    pub(crate) fn diagnostic_contracts(
+        &self,
+    ) -> Result<
+        (
+            irlume_common::diagnostics::ExactStreamContract,
+            irlume_common::diagnostics::ExactStreamContract,
+        ),
+        irlume_common::diagnostics::InvalidDiagnosticValue,
+    > {
+        use irlume_common::diagnostics::{ExactFraction, ExactStreamContract, FourCc};
+
+        fn fourcc(
+            value: &str,
+        ) -> Result<FourCc, irlume_common::diagnostics::InvalidDiagnosticValue> {
+            let bytes: [u8; 4] = value
+                .as_bytes()
+                .try_into()
+                .map_err(|_| irlume_common::diagnostics::InvalidDiagnosticValue)?;
+            FourCc::new(bytes)
+        }
+
+        let requested_interval = self.requested.interval.parts();
+        let accepted_interval = self.accepted.interval.parts();
+        Ok((
+            ExactStreamContract {
+                width: self.requested.width,
+                height: self.requested.height,
+                fourcc: fourcc(&self.requested.fourcc)?,
+                interval: ExactFraction::new(requested_interval.0, requested_interval.1)?,
+            },
+            ExactStreamContract {
+                width: self.accepted.width,
+                height: self.accepted.height,
+                fourcc: fourcc(&self.accepted.fourcc)?,
+                interval: ExactFraction::new(accepted_interval.0, accepted_interval.1)?,
+            },
+        ))
+    }
+
     /// Verify that one delivered frame carries this exact accepted format and
     /// the same requested/accepted frame intervals and floor rate used by
     /// qualification.

@@ -98,6 +98,90 @@ pub(crate) const IR_LIT_MEAN: f32 = 40.0;
 /// calls a control a success; filters ambient flicker and exposure drift.
 const AUTOCONF_MIN_LIFT: f32 = 20.0;
 
+/// Phase-locked optical evidence from one D1 setup burst.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct D1OpticalEvidence {
+    even_frames: usize,
+    odd_frames: usize,
+    phase_delta: f32,
+    consistent_pairs: usize,
+    conflicting_pairs: usize,
+    invalid_sequence_steps: usize,
+}
+
+impl D1OpticalEvidence {
+    pub(crate) fn from_sequence_means(observations: &[(u32, f32)]) -> Self {
+        let valid = observations
+            .iter()
+            .all(|(_, mean)| mean.is_finite() && *mean >= 0.0);
+        let mut even: Vec<f32> = observations
+            .iter()
+            .filter_map(|(sequence, mean)| (sequence % 2 == 0).then_some(*mean))
+            .collect();
+        let mut odd: Vec<f32> = observations
+            .iter()
+            .filter_map(|(sequence, mean)| (sequence % 2 == 1).then_some(*mean))
+            .collect();
+        even.sort_by(f32::total_cmp);
+        odd.sort_by(f32::total_cmp);
+        let median = |values: &[f32]| -> Option<f32> {
+            let middle = values.len() / 2;
+            match values.len() {
+                0 => None,
+                len if len % 2 == 0 => Some((values[middle - 1] + values[middle]) / 2.0),
+                _ => Some(values[middle]),
+            }
+        };
+        let even_median = median(&even).unwrap_or(0.0);
+        let odd_median = median(&odd).unwrap_or(0.0);
+        let bright_even = even_median > odd_median;
+        let mut consistent_pairs = 0;
+        let mut conflicting_pairs = 0;
+        let mut invalid_sequence_steps = usize::from(!valid);
+        for pair in observations.windows(2) {
+            let [(first_sequence, first_mean), (second_sequence, second_mean)] = pair else {
+                unreachable!("windows(2) always has two entries")
+            };
+            let gap = second_sequence.wrapping_sub(*first_sequence);
+            if gap == 0 || gap > i32::MAX as u32 {
+                invalid_sequence_steps += 1;
+                continue;
+            }
+            if gap != 1 {
+                continue;
+            }
+            let (bright, dark) = if (*first_sequence % 2 == 0) == bright_even {
+                (*first_mean, *second_mean)
+            } else {
+                (*second_mean, *first_mean)
+            };
+            let difference = bright - dark;
+            if difference >= AUTOCONF_MIN_LIFT {
+                consistent_pairs += 1;
+            } else if difference <= -AUTOCONF_MIN_LIFT {
+                conflicting_pairs += 1;
+            }
+        }
+        Self {
+            even_frames: even.len(),
+            odd_frames: odd.len(),
+            phase_delta: (even_median - odd_median).abs(),
+            consistent_pairs,
+            conflicting_pairs,
+            invalid_sequence_steps,
+        }
+    }
+
+    const fn proves_d1(self) -> bool {
+        self.even_frames >= 3
+            && self.odd_frames >= 3
+            && self.phase_delta >= AUTOCONF_MIN_LIFT
+            && self.consistent_pairs >= 3
+            && self.conflicting_pairs == 0
+            && self.invalid_sequence_steps == 0
+    }
+}
+
 /// Camera-reported illumination observations from one setup burst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct D1MetadataEvidence {
@@ -109,28 +193,49 @@ pub(crate) struct D1MetadataEvidence {
 }
 
 impl D1MetadataEvidence {
+    #[cfg(test)]
     pub(crate) fn from_lit_flags(flags: &[Option<bool>]) -> Self {
+        let observations: Vec<(u32, Option<bool>)> = flags
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(sequence, lit)| (sequence as u32, lit))
+            .collect();
+        Self::from_sequence_flags(&observations)
+    }
+
+    pub(crate) fn from_sequence_flags(observations: &[(u32, Option<bool>)]) -> Self {
         let mut previous = None;
         let mut parity_consistent_pairs = 0;
         let mut parity_conflicts = 0;
-        for (index, flag) in flags.iter().copied().enumerate() {
+        for (sequence, flag) in observations.iter().copied() {
             let Some(lit) = flag else {
                 continue;
             };
-            if let Some((previous_index, previous_lit)) = previous {
-                let even_gap = (index - previous_index) % 2 == 0;
-                if (lit == previous_lit) == even_gap {
+            if let Some((previous_sequence, previous_lit)) = previous {
+                let gap = sequence.wrapping_sub(previous_sequence);
+                // A zero or reverse/ambiguous delta cannot establish parity.
+                // Natural u32 wrap remains a small positive delta.
+                if gap == 0 || gap > i32::MAX as u32 {
+                    parity_conflicts += 1;
+                } else if (lit == previous_lit) == (gap % 2 == 0) {
                     parity_consistent_pairs += 1;
                 } else {
                     parity_conflicts += 1;
                 }
             }
-            previous = Some((index, lit));
+            previous = Some((sequence, lit));
         }
         Self {
-            total: flags.len(),
-            lit: flags.iter().filter(|flag| **flag == Some(true)).count(),
-            dark: flags.iter().filter(|flag| **flag == Some(false)).count(),
+            total: observations.len(),
+            lit: observations
+                .iter()
+                .filter(|(_, flag)| *flag == Some(true))
+                .count(),
+            dark: observations
+                .iter()
+                .filter(|(_, flag)| *flag == Some(false))
+                .count(),
             parity_consistent_pairs,
             parity_conflicts,
         }
@@ -161,6 +266,7 @@ impl D1MetadataEvidence {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SetupMeasurement {
     brightness: f32,
+    d1_optical: Option<D1OpticalEvidence>,
     d1_metadata: Option<D1MetadataEvidence>,
 }
 
@@ -168,14 +274,29 @@ impl SetupMeasurement {
     pub(crate) const fn optical(brightness: f32) -> Self {
         Self {
             brightness,
+            d1_optical: None,
             d1_metadata: None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn with_d1_metadata(brightness: f32, evidence: D1MetadataEvidence) -> Self {
         Self {
             brightness,
+            d1_optical: None,
             d1_metadata: Some(evidence),
+        }
+    }
+
+    pub(crate) const fn with_d1_evidence(
+        brightness: f32,
+        optical: D1OpticalEvidence,
+        metadata: Option<D1MetadataEvidence>,
+    ) -> Self {
+        Self {
+            brightness,
+            d1_optical: Some(optical),
+            d1_metadata: metadata,
         }
     }
 
@@ -187,6 +308,14 @@ impl SetupMeasurement {
     #[cfg(test)]
     pub(crate) const fn metadata_proves_d1(self) -> bool {
         match self.d1_metadata {
+            Some(evidence) => evidence.proves_d1(),
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn optical_proves_d1(self) -> bool {
+        match self.d1_optical {
             Some(evidence) => evidence.proves_d1(),
             None => false,
         }
@@ -620,6 +749,12 @@ pub(crate) mod fake_camera {
         pub(crate) gets_seen: usize,
         /// `SET_CUR`s seen so far, so `fail_set_from` can count.
         pub(crate) sets_seen: usize,
+        /// Accept this numbered `SET_CUR` without changing `current`.
+        ///
+        /// Some firmware acknowledges a request but clamps or ignores its
+        /// payload. Discovery must prove the exploratory value with GET_CUR
+        /// before interpreting any subsequent frames as D1 evidence.
+        pub(crate) ignore_set_at: Option<usize>,
         /// Run at the instant the first `SET_CUR` is intercepted, before it is
         /// recorded or applied.
         ///
@@ -726,6 +861,7 @@ pub(crate) mod fake_camera {
                         Some((from, errno)) if cam.sets_seen >= from => {
                             Err(XuError::from_errno(errno))
                         }
+                        _ if cam.ignore_set_at == Some(cam.sets_seen) => Ok(()),
                         _ => {
                             // An accepted write changes what the control holds,
                             // so a read-back sees it. A fake whose GET_CUR never
@@ -2953,7 +3089,7 @@ impl ExploratoryWrite {
     /// returning success says the ioctl was accepted, not that the control now
     /// holds those bytes, and assuming the two are the same thing is what left
     /// the camera changed in the first place.
-    fn confirm_restored(&mut self) -> Result<(), String> {
+    fn verify_restored(&mut self) -> Result<(), String> {
         let now = get_cur(self.fd, self.unit, self.selector, self.original.len())
             .map_err(|e| format!("read the control back: {e}"))?;
         crate::emitter_journal::trace(&format!("read back {now:02x?}"));
@@ -2963,6 +3099,11 @@ impl ExploratoryWrite {
                 now, self.original
             ));
         }
+        Ok(())
+    }
+
+    fn confirm_restored(&mut self) -> Result<(), String> {
+        self.verify_restored()?;
         crate::emitter_journal::clear(&self.record_path)?;
         self.resolved = true;
         Ok(())
@@ -2997,15 +3138,22 @@ impl ExploratoryWrite {
     /// and this module's rule is that nothing further is sent to a camera in
     /// that state. A value mismatch does NOT disarm it, because there the camera
     /// is answering fine and the control genuinely needs putting back.
-    fn confirm_applied(&mut self) -> Result<(), String> {
+    fn read_applied(&mut self) -> XuResult<Vec<u8>> {
         let now = match get_cur(self.fd, self.unit, self.selector, self.attempted.len()) {
             Ok(now) => now,
             Err(e) => {
                 self.exploratory_value_is_live = false;
-                return Err(format!("read the applied control back: {e}"));
+                return Err(e);
             }
         };
         crate::emitter_journal::trace(&format!("read back applied {now:02x?}"));
+        Ok(now)
+    }
+
+    fn confirm_applied(&mut self) -> Result<(), String> {
+        let now = self
+            .read_applied()
+            .map_err(|e| format!("read the applied control back: {e}"))?;
         if now != self.attempted {
             return Err(format!(
                 "the control reads {now:02x?} after being set to {:02x?}",
@@ -3658,7 +3806,7 @@ pub(crate) fn discover_with_measurements<
     }
 
     let mut tried = Vec::new();
-    let mut inconclusive = Vec::new();
+    let mut saw_inconclusive = false;
 
     for selector in [
         crate::uvc_descriptor::MSXU_IR_TORCH,
@@ -3686,7 +3834,8 @@ pub(crate) fn discover_with_measurements<
                 "selector {selector:#04x} is already set to the value setup would apply"
             )),
             Ok(Attempt::Inconclusive(why)) => {
-                inconclusive.push(format!("selector {selector:#04x}: {why}"));
+                saw_inconclusive = true;
+                tried.push(format!("selector {selector:#04x}: {why}"));
             }
             Ok(Attempt::NotUsable(why)) => tried.push(format!("selector {selector:#04x}: {why}")),
             Err(TryFailure::Measurement) => return Err(DiscoveryError::MeasurementFailed),
@@ -3716,16 +3865,14 @@ pub(crate) fn discover_with_measurements<
         }
     }
 
-    if inconclusive.is_empty() {
-        Err(DiscoveryError::NoUsableControl {
-            unit: ms.unit_id,
-            tried,
-        })
+    Err(exhausted_discovery(ms.unit_id, tried, saw_inconclusive))
+}
+
+fn exhausted_discovery(unit: u8, tried: Vec<String>, saw_inconclusive: bool) -> DiscoveryError {
+    if saw_inconclusive {
+        DiscoveryError::Inconclusive { unit, tried }
     } else {
-        Err(DiscoveryError::Inconclusive {
-            unit: ms.unit_id,
-            tried: inconclusive,
-        })
+        DiscoveryError::NoUsableControl { unit, tried }
     }
 }
 
@@ -4019,6 +4166,15 @@ fn try_documented_control<
         return Err(TryFailure::Guard(why));
     }
     pending.apply_exploratory(&wanted)?;
+    let applied = pending.read_applied()?;
+    if applied != wanted {
+        pending.restore_once().map_err(TryFailure::Restore)?;
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Ok(Attempt::NotUsable(format!(
+            "the camera accepted the device-derived value {wanted:02x?} but immediately read back \
+             {applied:02x?}; the exact original value was restored and verified"
+        )));
+    }
     let Some(lit) = measure() else {
         // The stream died after the control was changed. Aborting without
         // putting it back would leave the camera altered by a run that
@@ -4033,9 +4189,8 @@ fn try_documented_control<
     // Those are different questions; conflating them made success depend on room
     // lighting, and the same camera here has measured 38 to 168 depending only
     // on what was in front of it.
-    let metadata_proves_d1 = selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
-        && lit.d1_metadata.is_some_and(D1MetadataEvidence::proves_d1);
-    let contradictory_metadata = if selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION {
+    let face_auth = selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION;
+    let contradictory_metadata = if face_auth {
         lit.d1_metadata.filter(|evidence| evidence.contradicts_d1())
     } else {
         None
@@ -4053,8 +4208,56 @@ fn try_documented_control<
             evidence.missing()
         )));
     }
-    if !metadata_proves_d1 && lit.brightness < before.brightness + AUTOCONF_MIN_LIFT {
-        pending.restore_once().map_err(TryFailure::Restore)?;
+    // A single before-and-after pair is not evidence. Someone moving, a cloud,
+    // or an exposure transition produces the same twenty points as a working
+    // illuminator. Put the control back and require the brightness to fall with
+    // it: a change that does not follow the control is not caused by it.
+    pending.restore_once().map_err(TryFailure::Restore)?;
+    // Prove the restore before treating the next frames as the restored phase.
+    // Keep the record open because a successful run still has one final,
+    // guarded application to make after the evidence decision.
+    pending.verify_restored().map_err(TryFailure::Journal)?;
+    let Some(after_restore) = measure() else {
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Err(TryFailure::Measurement);
+    };
+
+    let metadata_proves_d1 = face_auth
+        && lit.d1_metadata.is_some_and(D1MetadataEvidence::proves_d1)
+        && before
+            .d1_metadata
+            .is_some_and(D1MetadataEvidence::contradicts_d1)
+        && after_restore
+            .d1_metadata
+            .is_some_and(D1MetadataEvidence::contradicts_d1);
+    let optical_proves_d1 = face_auth
+        && lit.d1_optical.is_some_and(D1OpticalEvidence::proves_d1)
+        && before
+            .d1_optical
+            .is_some_and(|evidence| !evidence.proves_d1())
+        && after_restore
+            .d1_optical
+            .is_some_and(|evidence| !evidence.proves_d1());
+    if face_auth
+        && lit.d1_metadata.is_some_and(D1MetadataEvidence::proves_d1)
+        && (before
+            .d1_metadata
+            .is_some_and(D1MetadataEvidence::proves_d1)
+            || after_restore
+                .d1_metadata
+                .is_some_and(D1MetadataEvidence::proves_d1))
+    {
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Ok(Attempt::Inconclusive(
+            "D1 illumination metadata was present after the write but did not begin and end with \
+             the control transition; the exact original value was restored and verified, and no \
+             configuration was saved"
+                .into(),
+        ));
+    }
+
+    let d1_proven = metadata_proves_d1 || optical_proves_d1;
+    if !d1_proven && lit.brightness < before.brightness + AUTOCONF_MIN_LIFT {
         pending.confirm_restored().map_err(TryFailure::Journal)?;
         return Ok(Attempt::Inconclusive(format!(
             "the camera accepted and read back the device-derived value, but the optical change \
@@ -4064,30 +4267,24 @@ fn try_documented_control<
             before.brightness, lit.brightness
         )));
     }
-
-    // A single before-and-after pair is not evidence. Someone moving, a cloud,
-    // or an exposure transition produces the same twenty points as a working
-    // illuminator. Put the control back and require the brightness to fall with
-    // it: a change that does not follow the control is not caused by it.
-    pending.restore_once().map_err(TryFailure::Restore)?;
-    if !metadata_proves_d1 {
-        let Some(after_restore) = measure() else {
-            return Err(TryFailure::Measurement);
-        };
-        if after_restore.brightness >= lit.brightness - AUTOCONF_MIN_LIFT {
-            // Restored above, and this branch writes nothing further, so the record
-            // is resolvable here. The read-back is what resolves it: the restoring
-            // `set_cur` returning success says the ioctl was accepted, not that the
-            // control holds those bytes.
-            pending.confirm_restored().map_err(TryFailure::Journal)?;
-            return Ok(Attempt::Inconclusive(format!(
-                "the image brightened but stayed bright when the control was put back \
-                 ({:.0} before, {:.0} with it set, {:.0} after undoing it), \
-                 so the change could not be assigned to this control; the exact original value \
-                 was restored and verified, and no configuration was saved",
-                before.brightness, lit.brightness, after_restore.brightness
-            )));
-        }
+    if !d1_proven && after_restore.brightness >= lit.brightness - AUTOCONF_MIN_LIFT {
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Ok(Attempt::Inconclusive(format!(
+            "the image brightened but stayed bright when the control was put back \
+             ({:.0} before, {:.0} with it set, {:.0} after undoing it), \
+             so the change could not be assigned to this control; the exact original value \
+             was restored and verified, and no configuration was saved",
+            before.brightness, lit.brightness, after_restore.brightness
+        )));
+    }
+    if face_auth && !d1_proven {
+        pending.confirm_restored().map_err(TryFailure::Journal)?;
+        return Ok(Attempt::Inconclusive(
+            "the reversible brightness change did not contain control-correlated alternating-frame \
+             D1 evidence; the exact original value was restored and verified, and no configuration \
+             was saved"
+                .into(),
+        ));
     }
 
     // It followed the control both ways. Apply it and report it.
@@ -4870,6 +5067,23 @@ mod tests {
         }
     }
 
+    fn optical_burst(means: &[f32]) -> SetupMeasurement {
+        let observations: Vec<(u32, f32)> = (10u32..).zip(means.iter().copied()).collect();
+        SetupMeasurement::with_d1_evidence(
+            means.iter().copied().reduce(f32::max).expect("non-empty"),
+            D1OpticalEvidence::from_sequence_means(&observations),
+            None,
+        )
+    }
+
+    fn optically_proven_d1_triplet() -> [SetupMeasurement; 3] {
+        [
+            optical_burst(&[10.0; 8]),
+            optical_burst(&[10.0, 40.0, 11.0, 41.0, 9.0, 39.0, 10.0, 40.0]),
+            optical_burst(&[10.0; 8]),
+        ]
+    }
+
     /// A weak scene is an observation gap, not evidence that a documented D1
     /// control is unusable. This reproduces the ASUS setup result from #492:
     /// the device-derived value is accepted, read back, and exactly restored,
@@ -4886,7 +5100,7 @@ mod tests {
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
         let _fake = fake_camera::install(a_working_camera());
         let id = identity(0x3277, 0x0059);
-        let mut readings = [48.0, 52.0].into_iter();
+        let mut readings = [48.0, 52.0, 48.0].into_iter();
         let mut permit = || Ok(());
 
         let error = discover(-1, &id, &mut || readings.next(), &mut permit)
@@ -4916,6 +5130,46 @@ mod tests {
             .map(|entries| entries.flatten().count())
             .unwrap_or(0);
         assert_eq!(records, 0, "a confirmed restore must clear the journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An accepted SET_CUR is not proof that D1 became current. No frame
+    /// captured after a write the camera ignored may be interpreted as D1
+    /// evidence, and the exact pre-test value still has to be verified before
+    /// the undo record is cleared.
+    #[test]
+    fn exploratory_d1_is_read_back_before_any_d1_measurement() {
+        let _lock = crate::testenv::env_lock();
+        let mut camera = a_working_camera();
+        camera.ignore_set_at = Some(1);
+        let mut measurements: usize = 0;
+
+        let (outcome, log, current, dir) = run_discovery(camera, "exploratory-readback", || {
+            measurements += 1;
+            Some([10.0, 40.0, 10.0][measurements.saturating_sub(1).min(2)])
+        });
+
+        assert!(matches!(outcome, Ok(Attempt::NotUsable(_))), "{outcome:?}");
+        assert_eq!(
+            measurements, 1,
+            "only the pre-write baseline may be measured when D1 was not retained"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the exact original remains active");
+        assert!(
+            log.windows(2).any(|requests| matches!(
+                requests,
+                [
+                    fake_camera::Request::Set(value),
+                    fake_camera::Request::Get { query: UVC_GET_CUR, .. }
+                ] if value == &[1, 3, 2]
+            )),
+            "the exploratory write must be read back immediately: {log:?}"
+        );
+        let records = std::fs::read_dir(dir.join("ir-emitter-journal"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(records, 0, "the unchanged original resolves the journal");
+        drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4959,13 +5213,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Even a reversible max-brightness triplet can be an exposure transient.
+    /// Face Authentication D1 has a stronger optical signature available:
+    /// alternative-frame periodicity. Without that within-burst evidence the
+    /// safe result is inconclusive, not a persisted control.
+    #[test]
+    fn one_reversible_brightness_triplet_does_not_prove_d1() {
+        let _lock = crate::testenv::env_lock();
+        let mut brightness = [10.0f32, 40.0, 10.0].into_iter();
+
+        let (outcome, log, current, dir) =
+            run_discovery(a_working_camera(), "one-triplet", || brightness.next());
+
+        assert!(
+            matches!(outcome, Ok(Attempt::Inconclusive(_))),
+            "a triplet without alternating-frame evidence must not prove D1: {outcome:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the exact original is restored");
+        assert_eq!(
+            log.iter()
+                .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+                .count(),
+            2,
+            "an inconclusive run does not perform the final application"
+        );
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A weak change in the burst maximum can still contain strong, stable D1
+    /// phase contrast. This is the metadata-absent success path requested by
+    /// #492: the phase appears only while the read-back-confirmed D1 value is
+    /// active and disappears after the exact original is restored.
+    #[test]
+    fn control_correlated_optical_periodicity_proves_d1_without_metadata() {
+        let _lock = crate::testenv::env_lock();
+        let mut measurements = [
+            optical_burst(&[48.0; 8]),
+            optical_burst(&[30.0, 55.0, 29.0, 54.0, 31.0, 56.0, 30.0, 55.0]),
+            optical_burst(&[48.0; 8]),
+        ]
+        .into_iter();
+
+        let (outcome, log, current, dir) =
+            run_discovery(a_working_camera(), "optical-periodicity", || {
+                measurements.next()
+            });
+
+        assert!(matches!(outcome, Ok(Attempt::Lit(..))), "{outcome:?}");
+        assert_eq!(current, vec![1, 3, 2], "proven D1 remains applied");
+        assert_eq!(
+            log.iter()
+                .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+                .count(),
+            3,
+            "proof still uses exploratory apply, exact restore, and final apply"
+        );
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Microsoft D1 metadata can prove the alternating mode even when the
     /// scene is too weak for the optical heuristic. The proof remains labelled
     /// as metadata evidence; it does not claim to have measured photons.
     #[test]
     fn d1_metadata_proves_setup_when_optical_lift_is_weak() {
         let _lock = crate::testenv::env_lock();
-        let evidence = D1MetadataEvidence::from_lit_flags(&[
+        let d1 = D1MetadataEvidence::from_lit_flags(&[
             Some(false),
             Some(true),
             None,
@@ -4973,9 +5287,18 @@ mod tests {
             Some(false),
             Some(true),
         ]);
+        let d0 = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ]);
         let mut measurements = [
-            SetupMeasurement::optical(48.0),
-            SetupMeasurement::with_d1_metadata(52.0, evidence),
+            SetupMeasurement::with_d1_metadata(48.0, d0),
+            SetupMeasurement::with_d1_metadata(52.0, d1),
+            SetupMeasurement::with_d1_metadata(48.0, d0),
         ]
         .into_iter();
 
@@ -4985,6 +5308,11 @@ mod tests {
             });
 
         assert!(matches!(outcome, Ok(Attempt::Lit(..))), "{outcome:?}");
+        assert_eq!(
+            measurements.len(),
+            0,
+            "metadata success must observe baseline, applied D1, and exact restore"
+        );
         assert_eq!(current, vec![1, 3, 2], "proven D1 is left applied");
         let sets = log
             .iter()
@@ -4994,6 +5322,55 @@ mod tests {
             sets, 3,
             "metadata proof still performs exploratory apply, exact restore, and final apply"
         );
+        drop(outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An alternating metadata stream that predates the exploratory write is
+    /// not evidence that this selector caused D1. This can happen when another
+    /// interface or firmware-owned mode is already producing illumination
+    /// records while the queried control reports a different value.
+    #[test]
+    fn metadata_alternation_must_begin_with_the_control_transition() {
+        let _lock = crate::testenv::env_lock();
+        let d1 = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+        ]);
+        let d0 = D1MetadataEvidence::from_lit_flags(&[
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ]);
+        let mut measurements = [
+            SetupMeasurement::with_d1_metadata(48.0, d1),
+            SetupMeasurement::with_d1_metadata(52.0, d1),
+            SetupMeasurement::with_d1_metadata(48.0, d0),
+        ]
+        .into_iter();
+
+        let (outcome, log, current, dir) =
+            run_discovery(a_working_camera(), "metadata-predates-control", || {
+                measurements.next()
+            });
+
+        assert!(
+            matches!(outcome, Ok(Attempt::Inconclusive(_))),
+            "pre-existing alternation cannot prove this selector: {outcome:?}"
+        );
+        assert_eq!(current, vec![1, 3, 1], "the exact original is restored");
+        let sets = log
+            .iter()
+            .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
+            .count();
+        assert_eq!(sets, 2, "inconclusive metadata may only apply and restore");
         drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5182,7 +5559,7 @@ mod tests {
             Ok(())
         }));
 
-        let mut brightness = [10.0f32, 90.0, 10.0].into_iter();
+        let mut brightness = optically_proven_d1_triplet().into_iter();
         let (outcome, log, _current, dir) =
             run_discovery(camera, "record-first", move || brightness.next());
 
@@ -7813,7 +8190,7 @@ mod tests {
     #[test]
     fn a_guard_refusal_before_the_final_write_leaves_the_control_restored() {
         let _lock = crate::testenv::env_lock();
-        let mut readings = [10.0, 40.0, 10.0].into_iter();
+        let mut readings = optically_proven_d1_triplet().into_iter();
         let mut calls = 0;
         let (outcome, log, current, dir) = run_discovery_guarded(
             a_working_camera(),
@@ -8547,6 +8924,25 @@ mod tests {
             err: XuError::Unsupported,
         };
         assert!(stuck.to_string().contains("could not be restored"));
+    }
+
+    #[test]
+    fn inconclusive_discovery_keeps_every_selector_diagnostic() {
+        let error = exhausted_discovery(
+            14,
+            vec![
+                "selector 0x08: advertised range is malformed".into(),
+                "selector 0x06: optical evidence was inconclusive".into(),
+            ],
+            true,
+        );
+
+        let DiscoveryError::Inconclusive { tried, .. } = error else {
+            panic!("an evidence gap must dominate the aggregate outcome: {error:?}");
+        };
+        assert_eq!(tried.len(), 2);
+        assert!(tried[0].contains("malformed"), "{tried:?}");
+        assert!(tried[1].contains("inconclusive"), "{tried:?}");
     }
 
     // --- IR Torch value checking ------------------------------------------
@@ -9300,6 +9696,56 @@ mod tests {
         assert!(evidence.proves_d1(), "{evidence:?}");
         assert_eq!(evidence.classified(), 5);
         assert_eq!(evidence.missing(), 1);
+    }
+
+    /// Image buffers can be dropped without losing the metadata record's frame
+    /// identity. Alternation follows the device's wrapping V4L2 sequence, not
+    /// the position at which userspace happened to retain an observation.
+    #[test]
+    fn d1_metadata_parity_uses_raw_frame_sequence_across_a_drop() {
+        let evidence = D1MetadataEvidence::from_sequence_flags(&[
+            (10, Some(false)),
+            (11, Some(true)),
+            // Sequence 12 was dropped. Sequence 13 therefore has the same
+            // illumination phase as 11 even though these entries are adjacent.
+            (13, Some(true)),
+            (14, Some(false)),
+            (15, Some(true)),
+        ]);
+
+        assert!(evidence.proves_d1(), "{evidence:?}");
+        assert_eq!(evidence.parity_conflicts, 0, "{evidence:?}");
+    }
+
+    /// The metadata-absent fallback looks for the physical signature D1
+    /// defines: a stable bright/dark phase keyed to raw frame parity. A smooth
+    /// exposure excursion can move the burst maximum just as far, but cannot
+    /// supply that phase-locked periodicity.
+    #[test]
+    fn optical_d1_evidence_separates_periodicity_from_exposure_drift() {
+        let periodic = D1OpticalEvidence::from_sequence_means(&[
+            (10, 10.0),
+            (11, 41.0),
+            (12, 11.0),
+            (13, 40.0),
+            (14, 9.0),
+            (15, 42.0),
+            (16, 10.0),
+            (17, 41.0),
+        ]);
+        let exposure_drift = D1OpticalEvidence::from_sequence_means(&[
+            (10, 10.0),
+            (11, 20.0),
+            (12, 30.0),
+            (13, 40.0),
+            (14, 35.0),
+            (15, 30.0),
+            (16, 20.0),
+            (17, 10.0),
+        ]);
+
+        assert!(periodic.proves_d1(), "{periodic:?}");
+        assert!(!exposure_drift.proves_d1(), "{exposure_drift:?}");
     }
 
     // --- round 6 ---------------------------------------------------------

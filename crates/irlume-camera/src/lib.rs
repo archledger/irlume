@@ -7427,23 +7427,33 @@ fn active_by_device_default_message(control: &ir_emitter::EmitterControl) -> Str
 
 fn setup_measurement_from_burst(
     means: &[f32],
+    sequences: &[u32],
     flags: &[Option<ir_metadata::Illumination>],
 ) -> Option<ir_emitter::SetupMeasurement> {
     let brightness = means.iter().copied().reduce(f32::max)?;
-    if means.len() != flags.len() || !flags.iter().any(Option::is_some) {
+    if means.len() != sequences.len() || means.len() != flags.len() {
         return Some(ir_emitter::SetupMeasurement::optical(brightness));
     }
-    let lit_flags: Vec<Option<bool>> = flags
+    let optical_observations: Vec<(u32, f32)> = sequences
         .iter()
-        .map(|flag| match flag {
-            Some(ir_metadata::Illumination::Lit) => Some(true),
-            Some(ir_metadata::Illumination::Dark) => Some(false),
-            None => None,
-        })
+        .copied()
+        .zip(means.iter().copied())
         .collect();
-    Some(ir_emitter::SetupMeasurement::with_d1_metadata(
-        brightness,
-        ir_emitter::D1MetadataEvidence::from_lit_flags(&lit_flags),
+    let optical = ir_emitter::D1OpticalEvidence::from_sequence_means(&optical_observations);
+    let metadata = flags.iter().any(Option::is_some).then(|| {
+        let observations: Vec<(u32, Option<bool>)> = sequences
+            .iter()
+            .copied()
+            .zip(flags.iter().map(|flag| match flag {
+                Some(ir_metadata::Illumination::Lit) => Some(true),
+                Some(ir_metadata::Illumination::Dark) => Some(false),
+                None => None,
+            }))
+            .collect();
+        ir_emitter::D1MetadataEvidence::from_sequence_flags(&observations)
+    });
+    Some(ir_emitter::SetupMeasurement::with_d1_evidence(
+        brightness, optical, metadata,
     ))
 }
 
@@ -7541,12 +7551,14 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         }
         let mut means = Vec::with_capacity(8);
         let mut stamps = Vec::with_capacity(8);
+        let mut sequences = Vec::with_capacity(8);
         for _ in 0..8 {
             if ir_emitter::abort_requested() {
                 return None;
             }
             let (buf, facts) = stream.next().ok()?;
             stamps.push(facts.timestamp_micros());
+            sequences.push(facts.sequence_raw());
             if let Some(log) = meta.as_mut() {
                 log.drain();
             }
@@ -7566,7 +7578,7 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
             }
             None => vec![None; means.len()],
         };
-        setup_measurement_from_burst(&means, &flags)
+        setup_measurement_from_burst(&means, &sequences, &flags)
     };
 
     let id = crate::uvc_descriptor::identity_from_fd(fd)
@@ -7805,20 +7817,28 @@ mod tests {
         use ir_metadata::Illumination::{Dark, Lit};
 
         let measurement = setup_measurement_from_burst(
-            &[48.0, 52.0, 49.0, 51.0, 48.0, 52.0],
-            &[
-                Some(Dark),
-                Some(Lit),
-                None,
-                Some(Lit),
-                Some(Dark),
-                Some(Lit),
-            ],
+            &[48.0, 52.0, 51.0, 48.0, 52.0],
+            &[10, 11, 13, 14, 15],
+            &[Some(Dark), Some(Lit), Some(Lit), Some(Dark), Some(Lit)],
         )
         .expect("a non-empty decoded burst is measurable");
 
         assert_eq!(measurement.brightness(), 52.0);
         assert!(measurement.metadata_proves_d1(), "{measurement:?}");
+    }
+
+    #[test]
+    fn setup_burst_retains_sequence_locked_optical_evidence_without_metadata() {
+        let measurement = setup_measurement_from_burst(
+            &[10.0, 41.0, 11.0, 40.0, 9.0, 42.0, 10.0, 41.0],
+            &[10, 11, 12, 13, 14, 15, 16, 17],
+            &[None, None, None, None, None, None, None, None],
+        )
+        .expect("a non-empty decoded burst is measurable");
+
+        assert_eq!(measurement.brightness(), 42.0);
+        assert!(measurement.optical_proves_d1(), "{measurement:?}");
+        assert!(!measurement.metadata_proves_d1(), "{measurement:?}");
     }
 
     fn test_rate_config(role: contracts::StreamRole) -> rate_gate::StreamRateConfig {

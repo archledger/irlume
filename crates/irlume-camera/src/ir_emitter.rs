@@ -1251,14 +1251,45 @@ impl CaptureWrite {
 /// a busy lock into IR authentication going dark. The cost of proceeding
 /// unrecorded is that a kill mid-stream leaves a leftover no later session
 /// can claim, which is exactly the pre-#188 status quo.
-fn write_if_different(
+#[derive(Debug, PartialEq)]
+enum CaptureWriteError {
+    Hardware(XuError),
+    Guard(String),
+}
+
+#[derive(Debug)]
+enum GuardedApplyError<E> {
+    Apply(E),
+    Guard(String),
+}
+
+impl From<XuError> for CaptureWriteError {
+    fn from(error: XuError) -> Self {
+        Self::Hardware(error)
+    }
+}
+
+fn write_if_different_guarded(
     fd: c_int,
     unit: u8,
     selector: u8,
     len: usize,
     wanted: &[u8],
     id: &crate::uvc_descriptor::CameraIdentity,
-) -> XuResult<CaptureWrite> {
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<CaptureWrite, CaptureWriteError> {
+    write_if_different_inner(fd, unit, selector, len, wanted, id, before_forward_write)
+}
+
+fn write_if_different_inner(
+    fd: c_int,
+    unit: u8,
+    selector: u8,
+    len: usize,
+    wanted: &[u8],
+    id: &crate::uvc_descriptor::CameraIdentity,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<CaptureWrite, CaptureWriteError> {
     let lock = match crate::stream_record::acquire(id) {
         Ok(lock) => Some(lock),
         // A LIVE irlume guard owns this camera. Writing anyway — even
@@ -1344,6 +1375,14 @@ fn write_if_different(
         // bookkeeping or exclusion — there is nothing left to hold.
         None => (None, None),
     };
+    if let Err(why) = before_forward_write() {
+        if let Some(record) = record {
+            if let Err(error) = record.resolve() {
+                eprintln!("irlume: {error}");
+            }
+        }
+        return Err(CaptureWriteError::Guard(why));
+    }
     if set_cur(fd, unit, selector, wanted).is_ok() {
         // Confirm only after the camera accepted. A failure here leaves the
         // record PREPARED on disk — the write happened, but a crash from this
@@ -1517,11 +1556,21 @@ fn foreign_consumers(proc_root: &std::path::Path, dev: &str, self_pid: u32) -> C
 /// prevent it (#189). Holding the `Arc` makes the descriptor outlive the guard
 /// by construction.
 pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &str) -> StreamMode {
+    enable_guarded(handle, card, device, &mut || Ok(()))
+        .unwrap_or_else(|_| unreachable!("the unguarded path cannot refuse"))
+}
+
+fn enable_guarded(
+    handle: std::sync::Arc<v4l::device::Handle>,
+    card: &str,
+    device: &str,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<StreamMode, String> {
     let _ = card;
     let fd = handle.fd();
     let setting = override_setting(std::env::var("IRLUME_IR_EMITTER"));
     let wanted = match setting {
-        OverrideSetting::Disabled => return StreamMode::inert(),
+        OverrideSetting::Disabled => return Ok(StreamMode::inert()),
         // A value that is set but cannot be read as a control is NOT the same as
         // no value. Treating it as absent fell through to the built-in table, so
         // one mistyped byte in an override meant to replace that payload made
@@ -1529,7 +1578,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         // variable is consent to the control named in it and to nothing else.
         OverrideSetting::Malformed(why) => {
             eprintln!("irlume: refusing to drive the IR emitter: IRLUME_IR_EMITTER {why}");
-            return StreamMode::inert();
+            return Ok(StreamMode::inert());
         }
         OverrideSetting::Absent => None,
         OverrideSetting::Control(ctrl) => Some(ctrl),
@@ -1562,7 +1611,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
              camera ({}); its configuration is left untouched",
             who.join(", ")
         );
-        return StreamMode::inert();
+        return Ok(StreamMode::inert());
     }
     if scan.permission_denied {
         // Once per process, not per capture: under the packaged capability
@@ -1604,7 +1653,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
                     ctrl.selector
                 );
             }
-            return StreamMode::inert();
+            return Ok(StreamMode::inert());
         }
     };
 
@@ -1632,7 +1681,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
     // its coordinates; every read of the control itself happens inside the
     // apply path, on the same pass that decides whether to write.
     let Some((unit, selector)) = action.coordinates() else {
-        return StreamMode::inert();
+        return Ok(StreamMode::inert());
     };
 
     // Armed only when irlume actually CHANGED the control, and the guard's
@@ -1654,18 +1703,30 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         CaptureAction::Nothing => (None, Vec::new()),
         CaptureAction::Override(ctrl) => {
             let payload = ctrl.payload.clone();
-            (Some(apply_override(fd, &id, &ctrl)), payload)
+            (
+                Some(apply_override_guarded(
+                    fd,
+                    &id,
+                    &ctrl,
+                    before_forward_write,
+                )?),
+                payload,
+            )
         }
         CaptureAction::DeviceDefault { unit, selector } => {
-            match apply_device_default(fd, &id, unit, selector) {
+            match apply_device_default_guarded(fd, &id, unit, selector, before_forward_write) {
                 Ok((w, sent)) => (Some(w), sent),
-                Err(_) => (None, Vec::new()),
+                Err(GuardedApplyError::Apply(_)) => (None, Vec::new()),
+                Err(GuardedApplyError::Guard(why)) => return Err(why),
             }
         }
-        CaptureAction::KnownPayload(ctrl) => match apply_known_payload(fd, &id, &ctrl) {
-            Ok(w) => (Some(w), ctrl.payload),
-            Err(_) => (None, Vec::new()),
-        },
+        CaptureAction::KnownPayload(ctrl) => {
+            match apply_known_payload_guarded(fd, &id, &ctrl, before_forward_write) {
+                Ok(w) => (Some(w), ctrl.payload),
+                Err(GuardedApplyError::Apply(_)) => (None, Vec::new()),
+                Err(GuardedApplyError::Guard(why)) => return Err(why),
+            }
+        }
     };
     let active = write
         .as_ref()
@@ -1718,7 +1779,7 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         },
         None => (None, None, None),
     };
-    StreamMode::new(Box::new(UvcMode {
+    Ok(StreamMode::new(Box::new(UvcMode {
         handle: Some(EmitterHandle {
             handle,
             lease: None,
@@ -1731,18 +1792,20 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         applied,
         record,
         _lock: lock,
-    }))
+    })))
 }
 
-pub(crate) fn enable_with_lease(
+pub(crate) fn enable_with_lease_guarded(
     handle: std::sync::Arc<v4l::device::Handle>,
     card: &str,
     device: &str,
     lease: crate::lease::CameraLease,
-) -> StreamMode {
-    let mut mode = lease.run_active(|| enable(handle, card, device));
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<StreamMode, String> {
+    let mut mode =
+        lease.run_active(|| enable_guarded(handle, card, device, before_forward_write))?;
     mode.attach_lease(lease);
-    mode
+    Ok(mode)
 }
 
 /// The face-auth mode held for the lifetime of ONE stream, put back when the
@@ -2475,11 +2538,22 @@ enum Applied {
 /// put the control back. It is read because a control that cannot be read is not
 /// demonstrably the control the documentation described, and because a control
 /// already holding the payload needs no write at all.
+#[cfg(test)]
 fn apply_override(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
 ) -> CaptureWrite {
+    apply_override_guarded(fd, id, ctrl, &mut || Ok(()))
+        .unwrap_or_else(|_| unreachable!("the unguarded path cannot refuse"))
+}
+
+fn apply_override_guarded(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<CaptureWrite, String> {
     let key = match override_key(fd, id, ctrl) {
         Ok(key) => key,
         Err(err) => {
@@ -2488,7 +2562,7 @@ fn apply_override(
                  so irlume cannot tell whether this was already applied",
                 ctrl.encode()
             );
-            return CaptureWrite::refused();
+            return Ok(CaptureWrite::refused());
         }
     };
 
@@ -2513,14 +2587,14 @@ fn apply_override(
                  after a panic, so irlume cannot tell whether this was already applied",
                 ctrl.encode()
             );
-            return CaptureWrite::refused();
+            return Ok(CaptureWrite::refused());
         }
     };
     match reuse(memo.get(&key), &ctrl.payload) {
         // A remembered refusal stands: re-running the checks every capture is
         // the traffic the record exists to stop, and the answer is "no" either
         // way.
-        Reuse::Answer(false) => return CaptureWrite::refused(),
+        Reuse::Answer(false) => return Ok(CaptureWrite::refused()),
         // A remembered SUCCESS says this payload was checked against this
         // camera's descriptors and accepted. It does NOT say the control still
         // holds it, and since the mode is now restored when each stream ends it
@@ -2537,15 +2611,16 @@ fn apply_override(
         // applied again for this stream. That is one write per stream, which is
         // the documented sequence, not the repeated writing this change removes.
         Reuse::Answer(true) => {
-            return match check_and_apply_override(fd, id, ctrl) {
-                Ok(write) => write,
-                Err(why) => {
+            return match check_and_apply_override_guarded(fd, id, ctrl, before_forward_write) {
+                Ok(write) => Ok(write),
+                Err(GuardedApplyError::Apply(why)) => {
                     eprintln!(
                         "irlume: refusing IRLUME_IR_EMITTER={}: {why}",
                         ctrl.encode()
                     );
-                    CaptureWrite::refused()
+                    Ok(CaptureWrite::refused())
                 }
+                Err(GuardedApplyError::Guard(why)) => Err(why),
             }
         }
         Reuse::RefuseChanged => {
@@ -2557,13 +2632,13 @@ fn apply_override(
                 ctrl.unit,
                 ctrl.selector
             );
-            return CaptureWrite::refused();
+            return Ok(CaptureWrite::refused());
         }
         Reuse::Decide => {}
     }
-    let write = match check_and_apply_override(fd, id, ctrl) {
+    let write = match check_and_apply_override_guarded(fd, id, ctrl, before_forward_write) {
         Ok(write) => write,
-        Err(why) => {
+        Err(GuardedApplyError::Apply(why)) => {
             // Silence here would read as "the value was applied and the camera
             // is simply dark", which is the reading that sends someone back to
             // try another unit and selector.
@@ -2573,6 +2648,7 @@ fn apply_override(
             );
             CaptureWrite::refused()
         }
+        Err(GuardedApplyError::Guard(why)) => return Err(why),
     };
     memo.insert(
         key,
@@ -2583,7 +2659,7 @@ fn apply_override(
             applied: write.outcome != Applied::Nothing,
         },
     );
-    write
+    Ok(write)
 }
 
 /// Test-only: hold a caller inside the gate so another thread can observe what
@@ -2627,17 +2703,31 @@ fn test_park() -> &'static TestPark {
 
 /// The gate itself, separated from the memo and the message so a test can assert
 /// on the reason rather than on a bare `false`.
+#[cfg(test)]
 fn check_and_apply_override(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
 ) -> std::result::Result<CaptureWrite, OverrideRefusal> {
+    match check_and_apply_override_guarded(fd, id, ctrl, &mut || Ok(())) {
+        Ok(write) => Ok(write),
+        Err(GuardedApplyError::Apply(error)) => Err(error),
+        Err(GuardedApplyError::Guard(_)) => unreachable!("the unguarded path cannot refuse"),
+    }
+}
+
+fn check_and_apply_override_guarded(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> std::result::Result<CaptureWrite, GuardedApplyError<OverrideRefusal>> {
     #[cfg(test)]
     park_inside_for_test();
 
     // First, and before the fd is touched at all: a unit this camera does not
     // publish is refused without a single ioctl reaching the device.
-    override_is_published(id, ctrl)?;
+    override_is_published(id, ctrl).map_err(GuardedApplyError::Apply)?;
 
     let (unit, selector) = (ctrl.unit, ctrl.selector);
     // Every query failure below is reported the same way for the reason
@@ -2645,37 +2735,53 @@ fn check_and_apply_override(
     // just confirmed as advertised, so a failure is the camera contradicting its
     // own descriptor, and uvcvideo's errnos cannot separate a healthy refusal
     // from a device in trouble. Either way nothing further is sent.
-    let info = get_info(fd, unit, selector).map_err(|err| OverrideRefusal::Unreadable {
-        unit,
-        selector,
-        err,
-    })?;
-    if !info_allows_set(info) {
-        return Err(OverrideRefusal::WriteNotAccepted {
+    let info = get_info(fd, unit, selector).map_err(|err| {
+        GuardedApplyError::Apply(OverrideRefusal::Unreadable {
             unit,
             selector,
-            info,
-        });
+            err,
+        })
+    })?;
+    if !info_allows_set(info) {
+        return Err(GuardedApplyError::Apply(
+            OverrideRefusal::WriteNotAccepted {
+                unit,
+                selector,
+                info,
+            },
+        ));
     }
-    let len = get_len(fd, unit, selector).map_err(|err| OverrideRefusal::Unreadable {
-        unit,
-        selector,
-        err,
+    let len = get_len(fd, unit, selector).map_err(|err| {
+        GuardedApplyError::Apply(OverrideRefusal::Unreadable {
+            unit,
+            selector,
+            err,
+        })
     })?;
     if len != ctrl.payload.len() {
-        return Err(OverrideRefusal::WrongLength {
+        return Err(GuardedApplyError::Apply(OverrideRefusal::WrongLength {
             unit,
             selector,
             wants: len,
             given: ctrl.payload.len(),
-        });
+        }));
     }
-    write_if_different(fd, unit, selector, len, &ctrl.payload, id).map_err(|err| {
-        OverrideRefusal::Unreadable {
+    write_if_different_guarded(
+        fd,
+        unit,
+        selector,
+        len,
+        &ctrl.payload,
+        id,
+        before_forward_write,
+    )
+    .map_err(|error| match error {
+        CaptureWriteError::Hardware(err) => GuardedApplyError::Apply(OverrideRefusal::Unreadable {
             unit,
             selector,
             err,
-        }
+        }),
+        CaptureWriteError::Guard(why) => GuardedApplyError::Guard(why),
     })
 }
 
@@ -2687,19 +2793,45 @@ fn check_and_apply_override(
 /// that size right now. Writing a nine-byte payload to a control the camera has
 /// just reported as disabled, or as a different length, is not something a
 /// validated VID:PID should buy.
+#[cfg(test)]
 fn apply_known_payload(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     ctrl: &EmitterControl,
 ) -> XuResult<CaptureWrite> {
-    if !info_allows_set(get_info(fd, ctrl.unit, ctrl.selector)?) {
-        return Err(XuError::Unsupported);
+    match apply_known_payload_guarded(fd, id, ctrl, &mut || Ok(())) {
+        Ok(write) => Ok(write),
+        Err(GuardedApplyError::Apply(error)) => Err(error),
+        Err(GuardedApplyError::Guard(_)) => unreachable!("the unguarded path cannot refuse"),
     }
-    let len = get_len(fd, ctrl.unit, ctrl.selector)?;
+}
+
+fn apply_known_payload_guarded(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    ctrl: &EmitterControl,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<CaptureWrite, GuardedApplyError<XuError>> {
+    if !info_allows_set(get_info(fd, ctrl.unit, ctrl.selector).map_err(GuardedApplyError::Apply)?) {
+        return Err(GuardedApplyError::Apply(XuError::Unsupported));
+    }
+    let len = get_len(fd, ctrl.unit, ctrl.selector).map_err(GuardedApplyError::Apply)?;
     if len != ctrl.payload.len() {
-        return Err(XuError::Unsupported);
+        return Err(GuardedApplyError::Apply(XuError::Unsupported));
     }
-    write_if_different(fd, ctrl.unit, ctrl.selector, len, &ctrl.payload, id)
+    write_if_different_guarded(
+        fd,
+        ctrl.unit,
+        ctrl.selector,
+        len,
+        &ctrl.payload,
+        id,
+        before_forward_write,
+    )
+    .map_err(|error| match error {
+        CaptureWriteError::Hardware(error) => GuardedApplyError::Apply(error),
+        CaptureWriteError::Guard(why) => GuardedApplyError::Guard(why),
+    })
 }
 
 /// The bytes to write for one documented control, or why the camera has not
@@ -2766,21 +2898,42 @@ fn intended_value(
 /// this function derives them and the caller needs them: `enable` records what
 /// the guard APPLIED, which for IR Torch is the camera's own default rather
 /// than anything the caller named.
+#[cfg(test)]
 fn apply_device_default(
     fd: c_int,
     id: &crate::uvc_descriptor::CameraIdentity,
     unit: u8,
     selector: u8,
 ) -> XuResult<(CaptureWrite, Vec<u8>)> {
-    if !info_allows_set(get_info(fd, unit, selector)?) {
-        return Err(XuError::Unsupported);
+    match apply_device_default_guarded(fd, id, unit, selector, &mut || Ok(())) {
+        Ok(write) => Ok(write),
+        Err(GuardedApplyError::Apply(error)) => Err(error),
+        Err(GuardedApplyError::Guard(_)) => unreachable!("the unguarded path cannot refuse"),
     }
-    let len = get_len(fd, unit, selector)?;
-    let Ok(intended) = intended_value(fd, unit, selector, len)? else {
-        return Err(XuError::Unsupported);
+}
+
+fn apply_device_default_guarded(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+    unit: u8,
+    selector: u8,
+    before_forward_write: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(CaptureWrite, Vec<u8>), GuardedApplyError<XuError>> {
+    if !info_allows_set(get_info(fd, unit, selector).map_err(GuardedApplyError::Apply)?) {
+        return Err(GuardedApplyError::Apply(XuError::Unsupported));
+    }
+    let len = get_len(fd, unit, selector).map_err(GuardedApplyError::Apply)?;
+    let Ok(intended) = intended_value(fd, unit, selector, len).map_err(GuardedApplyError::Apply)?
+    else {
+        return Err(GuardedApplyError::Apply(XuError::Unsupported));
     };
     let wanted = intended.payload;
-    let write = write_if_different(fd, unit, selector, len, &wanted, id)?;
+    let write =
+        write_if_different_guarded(fd, unit, selector, len, &wanted, id, before_forward_write)
+            .map_err(|error| match error {
+                CaptureWriteError::Hardware(error) => GuardedApplyError::Apply(error),
+                CaptureWriteError::Guard(why) => GuardedApplyError::Guard(why),
+            })?;
     Ok((write, wanted))
 }
 
@@ -8203,6 +8356,83 @@ mod tests {
             stream_store_state(&dir).0,
             0,
             "a record must not describe a write the camera refused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_capture_guard_refusal_sends_nothing_and_resolves_its_record() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-capture-guard-recorded-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
+        let _fake = fake_camera::install(a_working_camera());
+        let id = identity(0x3277, 0x0059);
+        let calls = std::cell::Cell::new(0usize);
+
+        let error = write_if_different_guarded(-1, 14, 6, 3, &[1, 3, 2], &id, &mut || {
+            calls.set(calls.get() + 1);
+            Err("privacy engaged after initial authorization".into())
+        })
+        .expect_err("the late privacy boundary must refuse the forward write");
+
+        assert!(
+            matches!(error, CaptureWriteError::Guard(ref why) if why.contains("privacy engaged")),
+            "{error:?}"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "the guard runs exactly at the write boundary"
+        );
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|request| matches!(request, fake_camera::Request::Set(_))),
+            "no SET_CUR may follow the refusal: {:?}",
+            fake_camera::log()
+        );
+        assert_eq!(
+            stream_store_state(&dir).0,
+            0,
+            "the prepared no-write record must be removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_late_capture_guard_also_blocks_an_unrecorded_write() {
+        let _lock = crate::testenv::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-capture-guard-unrecorded-{}",
+            std::process::id()
+        ));
+        let lock_path = dir.join("not-a-directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        std::fs::write(&lock_path, b"block lock directory creation").expect("blocking file");
+        let _env = EnvGuard::set("IRLUME_STATE_DIR", &lock_path);
+        let _fake = fake_camera::install(a_working_camera());
+        let id = identity(0x3277, 0x0059);
+        let calls = std::cell::Cell::new(0usize);
+
+        let error = write_if_different_guarded(-1, 14, 6, 3, &[1, 3, 2], &id, &mut || {
+            calls.set(calls.get() + 1);
+            Err("privacy became unreadable".into())
+        })
+        .expect_err("journal degradation must not bypass the privacy boundary");
+
+        assert!(matches!(error, CaptureWriteError::Guard(_)), "{error:?}");
+        assert_eq!(calls.get(), 1);
+        assert!(
+            !fake_camera::log()
+                .iter()
+                .any(|request| matches!(request, fake_camera::Request::Set(_))),
+            "the degraded unrecorded path still sends nothing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2704,6 +2704,7 @@ fn privacy_permits_ir_capture(observed: std::io::Result<Option<bool>>) -> Result
     }
 }
 
+#[cfg(test)]
 fn with_released_ir_privacy<T>(
     observed: std::io::Result<Option<bool>>,
     action: impl FnOnce() -> T,
@@ -2728,9 +2729,22 @@ fn enable_ir_emitter_privacy_bounded(
     permit: lease::CameraLease,
     stage: &'static str,
 ) -> irlume_common::Result<ir_emitter::StreamMode> {
-    with_released_ir_privacy(privacy_state(dev), || {
-        ir_emitter::enable_with_lease(dev.handle(), card, device, permit)
-    })
+    privacy_permits_ir_capture(privacy_state(dev))
+        .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))?;
+    let write_permit = permit.clone();
+    let mut before_forward_write = || {
+        write_permit
+            .require_endpoint(device)
+            .map_err(|error| error.to_string())?;
+        privacy_permits_ir_capture(privacy_state(dev))
+    };
+    ir_emitter::enable_with_lease_guarded(
+        dev.handle(),
+        card,
+        device,
+        permit,
+        &mut before_forward_write,
+    )
     .map_err(|why| Error::Hardware(format!("{device}: {stage}: {why}")))
 }
 

@@ -685,6 +685,44 @@ impl QualificationContext {
         &self.ir_stream
     }
 
+    /// Project the exact pair into the structurally share-safe support schema.
+    /// Raw sysfs paths and serial values are reduced to topology components,
+    /// safe labels, presence, and fixed correlation tokens here, in the module
+    /// that owns the unsanitized facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when topology components or diagnostic labels cannot
+    /// be represented by the bounded support schema.
+    pub fn diagnostic_camera_contexts(
+        &self,
+        rgb_generation: u64,
+        ir_generation: u64,
+    ) -> Result<
+        [irlume_common::diagnostics::SanitizedCameraContext; 2],
+        irlume_common::diagnostics::InvalidDiagnosticValue,
+    > {
+        let qualification_token = irlume_common::diagnostics::DigestToken::from_sha256_hex(
+            &self
+                .runtime_key()
+                .map_err(|_| irlume_common::diagnostics::InvalidDiagnosticValue)?,
+        )?;
+        Ok([
+            diagnostic_camera_context(
+                &self.rgb_endpoint,
+                &self.rgb_stream,
+                rgb_generation,
+                Some(qualification_token),
+            )?,
+            diagnostic_camera_context(
+                &self.ir_endpoint,
+                &self.ir_stream,
+                ir_generation,
+                Some(qualification_token),
+            )?,
+        ])
+    }
+
     /// Stable key over every fact that makes this exact live context equal.
     ///
     /// Unlike the persistent pair filename, this includes connection and
@@ -700,6 +738,64 @@ impl QualificationContext {
             .map_err(|error| QualificationError::Json(error.to_string()))?;
         Ok(irlume_common::sha256_hex(&encoded))
     }
+}
+
+pub(crate) fn diagnostic_camera_context(
+    endpoint: &CameraEndpoint,
+    stream: &StreamContract,
+    lifecycle_generation: u64,
+    qualification_token: Option<irlume_common::diagnostics::DigestToken>,
+) -> Result<
+    irlume_common::diagnostics::SanitizedCameraContext,
+    irlume_common::diagnostics::InvalidDiagnosticValue,
+> {
+    use irlume_common::diagnostics::{
+        CameraRoleLabel, InvalidDiagnosticValue, SafeLabel, SanitizedCameraContext,
+    };
+
+    let controller = std::path::Path::new(&endpoint.connection.controller_path)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(InvalidDiagnosticValue)?;
+    let usb_component = std::path::Path::new(&endpoint.usb_devpath)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or(InvalidDiagnosticValue)?;
+    let (bus, ports) = usb_component
+        .split_once('-')
+        .ok_or(InvalidDiagnosticValue)?;
+    let usb_bus = bus.parse::<u16>().map_err(|_| InvalidDiagnosticValue)?;
+    let usb_port_chain = ports
+        .split('.')
+        .map(|port| port.parse::<u8>().map_err(|_| InvalidDiagnosticValue))
+        .collect::<Result<Vec<_>, _>>()?;
+    if usb_bus == 0 || usb_port_chain.is_empty() || usb_port_chain.contains(&0) {
+        return Err(InvalidDiagnosticValue);
+    }
+    let (requested, accepted) = stream.diagnostic_contracts()?;
+    Ok(SanitizedCameraContext {
+        vid: endpoint.vid,
+        pid: endpoint.pid,
+        role: match endpoint.role {
+            QualifiedStreamRole::Rgb => CameraRoleLabel::Rgb,
+            QualifiedStreamRole::Ir => CameraRoleLabel::Ir,
+        },
+        interface_number: endpoint.interface_number,
+        driver: SafeLabel::new(endpoint.connection.driver.clone())?,
+        backend: SafeLabel::new(endpoint.connection.backend.clone())?,
+        speed_millimbps: endpoint.connection.speed_millimbps,
+        controller: SafeLabel::new(controller)?,
+        usb_bus,
+        usb_port_chain,
+        lifecycle_generation,
+        serial_present: endpoint.serial.is_some(),
+        descriptor_token: irlume_common::diagnostics::DigestToken::from_sha256_hex(
+            &endpoint.descriptor_sha256,
+        )?,
+        qualification_token,
+        requested,
+        accepted,
+    })
 }
 
 /// Summary of one sequential or concurrent probe arm.
@@ -1486,6 +1582,23 @@ mod tests {
             stream(QualifiedStreamRole::Ir, "GREY", 400),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn diagnostic_camera_contexts_remove_paths_and_serial_values() {
+        let contexts = context("/devices/pci0000:00/0000:00:14.0/usb4/4-2")
+            .diagnostic_camera_contexts(7, 9)
+            .unwrap();
+        let json = serde_json::to_string(&contexts).unwrap();
+
+        assert_eq!(contexts[0].usb_bus, 4);
+        assert_eq!(contexts[0].usb_port_chain, [2]);
+        assert_eq!(contexts[0].lifecycle_generation, 7);
+        assert_eq!(contexts[1].lifecycle_generation, 9);
+        assert!(contexts.iter().all(|camera| camera.serial_present));
+        assert!(!json.contains("batch-serial"));
+        assert!(!json.contains("/devices/"));
+        assert!(!json.contains("/dev/video"));
     }
 
     fn arm(rounds: u32) -> ArmEvidence {

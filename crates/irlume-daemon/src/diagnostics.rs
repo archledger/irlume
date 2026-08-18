@@ -4,9 +4,10 @@
 //! Process-local ownership for bounded, share-safe diagnostic history.
 
 use irlume_common::diagnostics::{
-    CategoricalOutcome, DiagnosticSink, OperationClass, OperationId, ShareSafeEvent,
-    ShareSafeEventKind, SupportSnapshot, TraceEventKind, TraceLimits, TraceRecord, TraceWarning,
-    MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES, TRACE_SCHEMA_VERSION,
+    CaptureStatus, CategoricalOutcome, DiagnosticSink, OperationClass, OperationId,
+    SanitizedCameraContext, ShareSafeEvent, ShareSafeEventKind, SupportSnapshot, TraceEventKind,
+    TraceLimits, TraceRecord, TraceWarning, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS,
+    MAX_TRACE_LINE_BYTES, TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
@@ -79,6 +80,8 @@ pub(crate) enum TraceSubscribeError {
 struct Inner {
     events: VecDeque<TimedShareSafeEvent>,
     next_sequence: u64,
+    capture: Option<CaptureStatus>,
+    cameras: Vec<SanitizedCameraContext>,
 }
 
 struct TimedShareSafeEvent {
@@ -148,8 +151,24 @@ impl DiagnosticState {
                 })
             })
             .collect();
+        let capture = inner.capture.clone();
+        let cameras = inner.cameras.clone();
         drop(inner);
-        SupportSnapshot::bounded(now_ms, MAX_HISTORY_MS, None, Vec::new(), events, Vec::new())
+        SupportSnapshot::bounded(now_ms, MAX_HISTORY_MS, capture, cameras, events, Vec::new())
+    }
+
+    fn publish_support_context(
+        &self,
+        capture: CaptureStatus,
+        cameras: Vec<SanitizedCameraContext>,
+    ) {
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.capture = Some(capture);
+        inner.cameras = cameras;
     }
 
     pub(crate) fn subscribe_trace(
@@ -544,6 +563,16 @@ impl DiagnosticSink for OperationScope {
                 .emit_trace(self.operation_id, self.operation, kind);
         }
     }
+
+    fn publish_support_context(
+        &self,
+        capture: CaptureStatus,
+        cameras: Vec<SanitizedCameraContext>,
+    ) {
+        if !self.finished.load(Ordering::Acquire) {
+            self.state.publish_support_context(capture, cameras);
+        }
+    }
 }
 
 fn prune_expired(events: &mut VecDeque<TimedShareSafeEvent>, now_ms: u64) {
@@ -560,7 +589,9 @@ fn prune_expired(events: &mut VecDeque<TimedShareSafeEvent>, now_ms: u64) {
 mod tests {
     use super::*;
     use irlume_common::diagnostics::{
-        CaptureSchedule, CaptureScheduleSource, CategoricalOutcome, ShareSafeEventKind,
+        CameraRoleLabel, CaptureSchedule, CaptureScheduleSource, CategoricalOutcome, DigestToken,
+        ExactFraction, ExactStreamContract, FourCc, QualificationState, SafeLabel,
+        ShareSafeEventKind,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -587,6 +618,54 @@ mod tests {
             schedule: CaptureSchedule::Sequential,
             source: CaptureScheduleSource::SequentialDefault,
         }
+    }
+
+    fn camera() -> SanitizedCameraContext {
+        let stream = ExactStreamContract {
+            width: 640,
+            height: 480,
+            fourcc: FourCc::new(*b"YUYV").unwrap(),
+            interval: ExactFraction::new(1, 30).unwrap(),
+        };
+        SanitizedCameraContext {
+            vid: 0x046d,
+            pid: 0x085e,
+            role: CameraRoleLabel::Rgb,
+            interface_number: 0,
+            driver: SafeLabel::new("uvcvideo").unwrap(),
+            backend: SafeLabel::new("uvc-v4l2").unwrap(),
+            speed_millimbps: 5_000_000,
+            controller: SafeLabel::new("0000:0d:00.3").unwrap(),
+            usb_bus: 4,
+            usb_port_chain: vec![2],
+            lifecycle_generation: 3,
+            serial_present: true,
+            descriptor_token: DigestToken::from_bytes([1; 8]),
+            qualification_token: Some(DigestToken::from_bytes([2; 8])),
+            requested: stream.clone(),
+            accepted: stream,
+        }
+    }
+
+    #[test]
+    fn latest_support_context_is_retained_without_reopening_a_camera() {
+        let state = DiagnosticState::default();
+        let operation = state.begin(OperationClass::SupportProbe);
+        let capture = CaptureStatus {
+            schedule: CaptureSchedule::Sequential,
+            source: CaptureScheduleSource::StoredQualification,
+            runtime_context: Some(DigestToken::from_bytes([3; 8])),
+            qualification_state: QualificationState::MeasuredSequential,
+            qualification_reason: None,
+            qualification_context: Some(DigestToken::from_bytes([2; 8])),
+            runtime_degradation: None,
+        };
+
+        operation.publish_support_context(capture.clone(), vec![camera()]);
+        let snapshot = operation.snapshot(Duration::from_secs(60));
+
+        assert_eq!(snapshot.capture(), Some(&capture));
+        assert_eq!(snapshot.cameras(), &[camera()]);
     }
 
     #[test]

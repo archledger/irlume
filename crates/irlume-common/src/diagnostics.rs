@@ -76,6 +76,25 @@ impl DigestToken {
     pub const fn as_bytes(&self) -> &[u8; 8] {
         &self.0
     }
+
+    /// Truncate a validated lowercase SHA-256 hexadecimal digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `value` is exactly 64 lowercase hexadecimal
+    /// characters.
+    pub fn from_sha256_hex(value: &str) -> Result<Self, InvalidDiagnosticValue> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(InvalidDiagnosticValue);
+        }
+        decode_hex::<8>(&value[..16])
+            .map(Self)
+            .ok_or(InvalidDiagnosticValue)
+    }
 }
 
 impl fmt::Debug for DigestToken {
@@ -948,6 +967,13 @@ pub trait DiagnosticSink: Send + Sync {
     fn emit_share_safe(&self, _kind: ShareSafeEventKind) {}
 
     fn emit_trace(&self, _kind: TraceEventKind) {}
+
+    fn publish_support_context(
+        &self,
+        _capture: CaptureStatus,
+        _cameras: Vec<SanitizedCameraContext>,
+    ) {
+    }
 }
 
 impl DiagnosticSink for () {}
@@ -1031,6 +1057,19 @@ mod tests {
             requested: stream(b"MJPG"),
             accepted: stream(b"MJPG"),
         }
+    }
+
+    #[test]
+    fn sha256_digest_projection_is_canonical_and_bounded() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            DigestToken::from_sha256_hex(digest),
+            Ok(DigestToken::from_bytes([
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            ]))
+        );
+        assert!(DigestToken::from_sha256_hex(&digest.to_uppercase()).is_err());
+        assert!(DigestToken::from_sha256_hex(&digest[..63]).is_err());
     }
 
     fn capture_status() -> CaptureStatus {

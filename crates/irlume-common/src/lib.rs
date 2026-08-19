@@ -1308,6 +1308,51 @@ mod tests {
         assert!(!declined_by_gesture, "absent must decode false (no abort)");
     }
 
+    #[test]
+    fn enrollment_response_is_compatible_in_both_reader_directions() {
+        #[derive(serde::Deserialize)]
+        enum OldResponse {
+            Enrollment {
+                profiles: Vec<ProfileSummary>,
+                require_eyes_open: bool,
+            },
+        }
+
+        let new = Response::Enrollment {
+            profiles: Vec::new(),
+            require_eyes_open: true,
+            closure_calibrated: true,
+            ir_ratio_calibrated: true,
+        };
+        let old: OldResponse = serde_json::from_value(
+            serde_json::to_value(new).expect("serialize current enrollment response"),
+        )
+        .expect("old reader requires require_eyes_open");
+        let OldResponse::Enrollment {
+            profiles,
+            require_eyes_open,
+        } = old;
+        assert!(profiles.is_empty());
+        assert!(require_eyes_open);
+
+        let old = r#"{"Enrollment":{"profiles":[],"require_eyes_open":true}}"#;
+        let current: Response =
+            serde_json::from_str(old).expect("current reader accepts old reply");
+        let Response::Enrollment {
+            profiles,
+            require_eyes_open,
+            closure_calibrated,
+            ir_ratio_calibrated,
+        } = current
+        else {
+            panic!("old enrollment reply must remain Enrollment");
+        };
+        assert!(profiles.is_empty());
+        assert!(require_eyes_open);
+        assert!(!closure_calibrated);
+        assert!(!ir_ratio_calibrated);
+    }
+
     /// Every directory whose entry has to survive is in the chain, shallowest
     /// first, including the one a RELATIVE state root is anchored in.
     ///

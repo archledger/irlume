@@ -1068,6 +1068,57 @@ mod tests {
     }
 
     #[test]
+    fn named_eye_fields_are_compatible_in_both_reader_directions() {
+        #[derive(serde::Deserialize)]
+        struct FutureEnrollment {
+            user: String,
+            profiles: Vec<FaceProfile>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyEnrollment {
+            user: String,
+            profiles: Vec<FaceProfile>,
+            #[serde(default)]
+            require_eyes_open: bool,
+            #[serde(default)]
+            closure_calibration: Option<(f32, f32)>,
+        }
+
+        let old = r#"{"user":"u","profiles":[],"require_eyes_open":true,
+            "closure_calibration":[0.24,0.05]}"#;
+        let future: FutureEnrollment = serde_json::from_str(old).expect("unknown fields ignored");
+        assert_eq!(future.user, "u");
+        assert!(future.profiles.is_empty());
+
+        let new = r#"{"user":"u","profiles":[]}"#;
+        let legacy: LegacyEnrollment = serde_json::from_str(new).expect("missing fields default");
+        assert_eq!(legacy.user, "u");
+        assert!(legacy.profiles.is_empty());
+        assert!(!legacy.require_eyes_open);
+        assert_eq!(legacy.closure_calibration, None);
+    }
+
+    #[test]
+    fn named_eye_fields_are_compatible_in_encrypted_inner_payload() {
+        #[derive(serde::Deserialize)]
+        struct FutureEnrollment {
+            user: String,
+            profiles: Vec<FaceProfile>,
+        }
+
+        let key = crypto::generate_key();
+        let old = br#"{"user":"u","profiles":[],"require_eyes_open":true,
+            "closure_calibration":[0.24,0.05]}"#;
+        let encrypted = crypto::encrypt(&key, old).expect("encrypt old inner payload");
+        let decrypted = crypto::decrypt(&key, &encrypted).expect("decrypt old inner payload");
+        let future: FutureEnrollment =
+            serde_json::from_slice(&decrypted).expect("unknown fields ignored after decryption");
+
+        assert_eq!(future.user, "u");
+        assert!(future.profiles.is_empty());
+    }
+
+    #[test]
     fn encrypted_envelope_binds_itself_to_the_template_key() {
         let key = crypto::generate_key();
         let bytes = serialize_enrollment(&sample(), Some(&key)).unwrap();

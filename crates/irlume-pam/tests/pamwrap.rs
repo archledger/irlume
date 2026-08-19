@@ -593,7 +593,10 @@ fn pamwrap_confirmation_response_is_hidden_and_never_becomes_authtok() {
         "not-the-real-password\nreal-password\n",
         None,
     );
-    assert!(ok, "fallback stack must complete after a fresh prompt: {out}");
+    assert!(
+        ok,
+        "fallback stack must complete after a fresh prompt: {out}"
+    );
     assert!(out.contains(FACE_INTENT_PROMPT), "prompt missing: {out}");
     assert!(
         !out.contains("not-the-real-password") && !out.contains("real-password"),

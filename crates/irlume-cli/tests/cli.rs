@@ -315,7 +315,7 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         (
             &["gesturecap"],
             2,
-            "usage: irlume gesturecap <capture|replay|identity|attempt>",
+            "usage: irlume gesturecap <capture|replay>",
         ),
         (&["normprobe"], 2, "usage: irlume normprobe --dir"),
         (&["liveness"], 2, "usage: irlume liveness --det"),
@@ -2206,36 +2206,27 @@ fn gesturecap_replay_keeps_rejection_evidence_in_csv_not_stderr() {
 }
 
 #[test]
-fn gesturecap_hardware_adapter_surfaces_fail_closed_offline() {
-    let sandbox = Sandbox::new("gesturecap-hardware-adapter");
+fn gesturecap_hardware_subcommands_are_retired() {
+    let sandbox = Sandbox::new("gesturecap-retired-hardware");
 
-    let mut identity = sandbox.cmd(&[
-        "gesturecap",
-        "identity",
-        "--expected-camera-identity-digest",
-        &"a".repeat(64),
-    ]);
-    identity
-        .env("IRLUME_DEV", "1")
-        .env("IRLUME_RGB_DEVICE", "/dev/irlume-test-rgb")
-        .env("IRLUME_IR_DEVICE", "/dev/irlume-test-ir");
-    let (code, stdout, stderr) = run(&mut identity);
-    assert_ne!(code, 0);
-    assert!(stdout.is_empty(), "{stdout}");
-    assert!(
-        stderr.contains("cannot resolve configured RGB camera identity"),
-        "{stderr}"
-    );
-
-    let mut attempt = sandbox.cmd(&["gesturecap", "attempt"]);
-    attempt.env("IRLUME_DEV", "1");
-    let (code, stdout, stderr) = run(&mut attempt);
-    assert_eq!(code, 2, "{stderr}");
-    assert!(stdout.is_empty(), "{stdout}");
-    assert!(
-        stderr.contains("usage: irlume gesturecap attempt"),
-        "{stderr}"
-    );
+    for subcommand in ["identity", "attempt"] {
+        let mut command = sandbox.cmd(&["gesturecap", subcommand]);
+        command
+            .env("IRLUME_DEV", "1")
+            .env("IRLUME_RGB_DEVICE", "/dev/irlume-must-not-open-rgb")
+            .env("IRLUME_IR_DEVICE", "/dev/irlume-must-not-open-ir");
+        let (code, stdout, stderr) = run(&mut command);
+        assert_eq!(code, 2, "{subcommand}: {stderr}");
+        assert!(stdout.is_empty(), "{subcommand}: {stdout}");
+        assert!(
+            stderr.contains("usage: irlume gesturecap <capture|replay>"),
+            "{subcommand}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("irlume-must-not-open"),
+            "retired {subcommand} inspected a camera path: {stderr}"
+        );
+    }
 }
 
 #[test]

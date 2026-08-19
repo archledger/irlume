@@ -60,9 +60,6 @@ Run by hand on a machine with the hardware. Nothing automated calls them.
 | `emitter-override-per-stream-test.sh` | Does an `IRLUME_IR_EMITTER` override reach the camera on every stream, or only the first after a daemon start? (#168) |
 | `emitter-selfclear-test.sh` | Does a control set once before streaming stay set for a whole capture window? (#168) |
 | `emitter-stream-record-hardware-test.sh` | The per-stream emitter record, on real hardware. |
-| `run-head-gesture-matrix.sh` | Runs one explicitly confirmed, bounded head-gesture trial and publishes privacy-bounded evidence for the frozen four-host matrix. |
-| `head-gesture-matrix-adapter.sh` | Reviewed detector-only adapter for the matrix runner; binds the candidate binary and configured camera-pair digest, and rejects service-policy trials. |
-| `validate-head-gesture-matrix.py` | Validates matrix schema, privacy bounds, exact host/cell coverage, face evidence, and qualification. Its fixture suite and the adapter's pure contract suite open no camera. |
 
 ## `research/`: the instruments behind the published numbers
 

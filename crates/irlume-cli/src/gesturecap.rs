@@ -13,9 +13,6 @@
 //! IRLUME_DEV=1 irlume gesturecap capture --label nod \
 //!   --det <yunet.onnx> --model <recognizer.onnx> --out nod.jsonl [--ir DEV] [--n 75]
 //! IRLUME_DEV=1 irlume gesturecap replay <file.jsonl | dir>
-//! IRLUME_DEV=1 irlume gesturecap identity [--expected-camera-identity-digest SHA256]
-//! IRLUME_DEV=1 irlume gesturecap attempt --expected-camera-identity-digest SHA256 \
-//!   --expected-gesture LABEL --det <yunet.onnx> --model <recognizer.onnx> [--n 75]
 //! ```
 
 use crate::{devices_from_flags, flag};
@@ -55,102 +52,13 @@ pub fn run(args: &[String]) -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("capture") => capture(args),
         Some("replay") => replay(args),
-        Some("identity") => identity(args),
-        Some("attempt") => attempt(args),
         _ => {
             eprintln!(
-                "usage: irlume gesturecap <capture|replay|identity|attempt>\n  \
+                "usage: irlume gesturecap <capture|replay>\n  \
                  capture --label L --det <y.onnx> --model <g.onnx> --out F.jsonl [--rgb DEV] [--ir DEV] [--n 75]\n  \
-                 replay <file.jsonl | dir>\n  \
-                 identity [--expected-camera-identity-digest SHA256]\n  \
-                 attempt --expected-camera-identity-digest SHA256 --expected-gesture LABEL --det <y.onnx> --model <g.onnx> [--n 75]"
+                 replay <file.jsonl | dir>"
             );
             ExitCode::from(2)
-        }
-    }
-}
-
-fn camera_node_sysfs_path(device: &str) -> Result<String, String> {
-    let node = device
-        .strip_prefix("/dev/")
-        .filter(|node| !node.is_empty() && !node.contains('/'))
-        .ok_or_else(|| format!("invalid configured camera node: {device}"))?;
-    std::fs::canonicalize(format!("/sys/class/video4linux/{node}/device"))
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| format!("cannot resolve configured camera {device}: {error}"))
-}
-
-fn camera_pair_identity_digest(
-    rgb_node: &str,
-    rgb_identity: &str,
-    rgb_sysfs: &str,
-    ir_node: &str,
-    ir_identity: &str,
-    ir_sysfs: &str,
-) -> String {
-    let material = format!(
-        "irlume-camera-pair-v1\0{rgb_node}\0{rgb_identity}\0{rgb_sysfs}\0{ir_node}\0{ir_identity}\0{ir_sysfs}\0"
-    );
-    irlume_common::thirdparty::sha256_hex(material.as_bytes())
-}
-
-fn selected_camera_pair_identity() -> Result<(String, String, String), String> {
-    let (rgb, ir) = irlume_camera::configured_pair_no_probe()
-        .or_else(irlume_camera::select_pair)
-        .ok_or_else(|| {
-            "no RGB+IR camera pair is available for hardware qualification".to_string()
-        })?;
-    camera_pair_identity(&rgb, &ir).map(|digest| (rgb, ir, digest))
-}
-
-fn camera_pair_identity(rgb: &str, ir: &str) -> Result<String, String> {
-    let rgb_identity = irlume_camera::device_identity(rgb)
-        .ok_or_else(|| format!("cannot resolve configured RGB camera identity for {rgb}"))?;
-    let ir_identity = irlume_camera::device_identity(ir)
-        .ok_or_else(|| format!("cannot resolve configured IR camera identity for {ir}"))?;
-    let rgb_sysfs = camera_node_sysfs_path(rgb)?;
-    let ir_sysfs = camera_node_sysfs_path(ir)?;
-    Ok(camera_pair_identity_digest(
-        rgb,
-        &rgb_identity,
-        &rgb_sysfs,
-        ir,
-        &ir_identity,
-        &ir_sysfs,
-    ))
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn identity(args: &[String]) -> ExitCode {
-    let result = || -> Result<String, String> {
-        let (_, _, digest) = selected_camera_pair_identity()?;
-        if let Some(expected) = flag(args, "--expected-camera-identity-digest") {
-            if !valid_digest(expected) {
-                return Err("expected camera identity digest must be lowercase SHA-256".into());
-            }
-            if expected != digest {
-                return Err(
-                    "configured camera identity digest does not match the frozen expectation"
-                        .into(),
-                );
-            }
-        }
-        Ok(digest)
-    }();
-    match result {
-        Ok(digest) => {
-            println!("{}", serde_json::json!({"camera_identity_digest": digest}));
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("[gesturecap] {error}");
-            ExitCode::FAILURE
         }
     }
 }
@@ -175,98 +83,6 @@ fn classify_production_gesture_window(
     }
     let (verdict, evidence) = irlume_liveness::detect_head_gesture_with_evidence(samples);
     (verdict, evidence, samples.len())
-}
-
-fn attempt(args: &[String]) -> ExitCode {
-    let (Some(expected_digest), Some(expected_gesture), Some(detector), Some(recognizer)) = (
-        flag(args, "--expected-camera-identity-digest"),
-        flag(args, "--expected-gesture"),
-        flag(args, "--det"),
-        flag(args, "--model"),
-    ) else {
-        eprintln!(
-            "usage: irlume gesturecap attempt --expected-camera-identity-digest SHA256 \
-             --expected-gesture LABEL --det <y.onnx> --model <g.onnx> [--n 75]"
-        );
-        return ExitCode::from(2);
-    };
-    if !valid_digest(expected_digest) {
-        eprintln!("[gesturecap] expected camera identity digest must be lowercase SHA-256");
-        return ExitCode::from(2);
-    }
-    if !matches!(
-        expected_gesture,
-        "nod" | "shake" | "still" | "look-around" | "look-down-and-hold"
-    ) {
-        eprintln!("[gesturecap] unsupported hardware-matrix gesture label");
-        return ExitCode::from(2);
-    }
-    let count = match flag(args, "--n").unwrap_or("75").parse::<usize>() {
-        Ok(value) if (1..=300).contains(&value) => value,
-        _ => {
-            eprintln!("[gesturecap] --n must be a number from 1 to 300");
-            return ExitCode::from(2);
-        }
-    };
-
-    let result = || -> irlume_common::Result<serde_json::Value> {
-        let (rgb, ir, before) =
-            selected_camera_pair_identity().map_err(irlume_common::Error::Hardware)?;
-        if before != expected_digest {
-            return Err(irlume_common::Error::Hardware(
-                "configured camera identity digest does not match the frozen expectation".into(),
-            ));
-        }
-        let mut engine_args = args.to_vec();
-        engine_args.extend(["--rgb".into(), rgb.clone(), "--ir".into(), ir.clone()]);
-        let mut engine = crate::engine(detector, recognizer, &engine_args)?;
-        let samples = engine.capture_pose_samples(count)?;
-        let after = camera_pair_identity(&rgb, &ir).map_err(irlume_common::Error::Hardware)?;
-        if after != before {
-            return Err(irlume_common::Error::Hardware(
-                "configured camera identity changed during the attempt".into(),
-            ));
-        }
-        let (verdict, evidence, window_frames) = classify_production_gesture_window(&samples);
-        let yaw: Vec<f32> = samples[..window_frames]
-            .iter()
-            .filter_map(|sample| sample.yaw_signed)
-            .collect();
-        let yaw_crossings = irlume_liveness::signal_crossings(
-            &yaw,
-            evidence.yaw_range,
-            irlume_liveness::NOD_CROSSING_AMP_FRAC,
-        );
-        let typed_outcome = match verdict {
-            irlume_liveness::HeadGesture::Nod => "approved",
-            irlume_liveness::HeadGesture::Shake => "declined",
-            irlume_liveness::HeadGesture::None | irlume_liveness::HeadGesture::NoFace => {
-                "no-gesture"
-            }
-        };
-        Ok(serde_json::json!({
-            "typed_outcome": typed_outcome,
-            "detector_evidence": {
-                "frames": window_frames,
-                "face_frames": evidence.frames,
-                "pitch_range": evidence.pitch_range,
-                "yaw_range": evidence.yaw_range,
-                "pitch_crossings": evidence.crossings,
-                "yaw_crossings": yaw_crossings,
-                "mean_step": evidence.mean_step,
-            }
-        }))
-    }();
-    match result {
-        Ok(document) => {
-            println!("{document}");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("[gesturecap] {error}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 fn capture(args: &[String]) -> ExitCode {
@@ -736,66 +552,6 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"sentinel\n");
         assert!(!output.exists());
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn camera_pair_digest_has_a_frozen_role_ordered_encoding() {
-        let digest = camera_pair_identity_digest(
-            "/dev/video0",
-            "abcd:1234:serial",
-            "/sys/devices/rgb",
-            "/dev/video2",
-            "abcd:1234:serial",
-            "/sys/devices/ir",
-        );
-
-        assert_eq!(
-            digest,
-            "5561b6e7da27ba01fbb50e92e1fe7a39f80f28490ac6dc0b213be641932bdab6"
-        );
-        assert_ne!(
-            digest,
-            camera_pair_identity_digest(
-                "/dev/video2",
-                "abcd:1234:serial",
-                "/sys/devices/ir",
-                "/dev/video0",
-                "abcd:1234:serial",
-                "/sys/devices/rgb",
-            )
-        );
-    }
-
-    #[test]
-    fn hardware_attempt_keeps_a_terminal_rolling_nod_despite_later_yaw_noise() {
-        let mut samples: Vec<PoseSample> = [
-            0.50, 0.50, 0.50, 0.50, 0.60, 0.40, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(idx, pitch_frac)| PoseSample {
-            idx,
-            pitch_frac: Some(pitch_frac),
-            yaw_signed: Some(0.0),
-            bri: 80.0,
-        })
-        .collect();
-        samples.extend((12..18).map(|idx| PoseSample {
-            idx,
-            pitch_frac: Some(0.50),
-            yaw_signed: Some(if idx == 17 { 3.0 } else { 0.0 }),
-            bri: 80.0,
-        }));
-        assert_eq!(
-            irlume_liveness::detect_head_gesture(&samples),
-            irlume_liveness::HeadGesture::None,
-            "the fixture must reproduce the full-take regression"
-        );
-
-        let (verdict, _, frames) = classify_production_gesture_window(&samples);
-
-        assert_eq!(verdict, irlume_liveness::HeadGesture::Nod);
-        assert_eq!(frames, 12);
     }
 
     #[test]

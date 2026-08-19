@@ -305,14 +305,11 @@ enum Suspend {
     /// state). Root op; the daemon reads it live, no restart.
     Biopolicy(bool),
     /// Toggle the credential-release gesture gate (the bool is the target state).
-    /// Root op; the daemon reads it live, no restart. Turning it OFF weakens
-    /// credential release, so the TUI confirms first and the CLI still prints its
-    /// own warning in the cooked terminal.
+    /// Root op; the daemon reads it live, no restart.
     CredentialReleaseChallenge(bool),
     /// Toggle the head gesture for one PAM service (the bool is the target
     /// state). Root op; runs `sudo irlume credential-release-challenge <service>
-    /// on|off --yes`. Disabling a high-privilege service is confirmed by the TUI
-    /// first (the `--yes` then skips the CLI's own prompt).
+    /// on|off`. Keyboard confirmation remains mandatory either way.
     ServiceGesture {
         service: String,
         on: bool,
@@ -1137,7 +1134,7 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                // Settings holds user preferences (per-service head gesture,
+                // Settings holds user preferences (additional head gesture,
                 // keyring gesture, biopolicy,
                 // third-party models), not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
@@ -2966,9 +2963,6 @@ impl App {
                 },
                 &["irlume", "biopolicy", if on { "on" } else { "off" }],
             ),
-            // `--yes`: the TUI already ran the confirm above. The CLI still prints
-            // its warning to the cooked terminal, which is the point of routing
-            // through it rather than writing settings.conf from here.
             Suspend::CredentialReleaseChallenge(on) => self.sudo_step(
                 if on {
                     "require a gesture before releasing the keyring password"
@@ -2979,7 +2973,6 @@ impl App {
                     "irlume",
                     "credential-release-challenge",
                     if on { "on" } else { "off" },
-                    "--yes",
                 ],
             ),
             Suspend::ServiceGesture { service, on } => self.sudo_step(
@@ -2993,7 +2986,6 @@ impl App {
                     "credential-release-challenge",
                     service.as_str(),
                     if on { "on" } else { "off" },
-                    "--yes",
                 ],
             ),
             Suspend::SelfTestLiveness => self.sudo_step(
@@ -3606,11 +3598,11 @@ impl App {
             // Opt-in wiring extras; each logs the exact command then suspends,
             // so nothing needs to be copied out of the TUI to be run.
             (SC_PAM, KeyCode::Char('u')) => {
-                self.log('→', "sudo irlume login enable --with-sudo --apply: nod to approve and shake your head to decline sudo prompts (password still works)");
+                self.log('→', "sudo irlume login enable --with-sudo --apply: type yes for one face attempt; an optional head gesture runs only if explicitly enabled (password still works)");
                 self.suspend = Some(Suspend::LoginEnableSudo);
             }
             (SC_PAM, KeyCode::Char('p')) => {
-                self.log('→', "sudo irlume login enable --with-polkit --apply: face + head gesture approves app prompts (Bitwarden, pkexec)");
+                self.log('→', "sudo irlume login enable --with-polkit --apply: type yes for one face attempt at app prompts; head gesture is optional and experimental");
                 self.suspend = Some(Suspend::LoginEnablePolkit);
             }
             // Un-wiring is destructive-ish (face login stops working until
@@ -3664,12 +3656,9 @@ impl App {
                     ));
                 }
             }
-            // Per-service head gesture: ↑/↓ pick the service, [c] toggles it.
-            // settings.conf is root-only, so this shells out to the CLI, the one
-            // place the write and its high-privilege confirmation live. Every
-            // service in the list is elevation or app-consent, so disabling the
-            // gesture (a face match alone would then approve it) asks first;
-            // enabling only adds friction and goes straight through.
+            // Per-service experimental head gesture: ↑/↓ pick, [c] toggles.
+            // Keyboard confirmation remains mandatory in both directions, so
+            // disabling is not a security downgrade and needs no modal.
             (SC_SETTINGS, KeyCode::Char('c')) => {
                 // Same clamp as the draw: a key must not panic on a stale index.
                 let svc = SETTINGS_GESTURE_SERVICES
@@ -3709,21 +3698,18 @@ impl App {
                         '→',
                         format!(
                             "sudo irlume credential-release-challenge {svc} on: \
-                             require a head gesture for '{svc}' (nod to approve; shake to decline)"
+                             add an experimental head gesture for '{svc}' (may reject valid attempts; keyboard confirmation remains required)"
                         ),
                     );
-                    self.suspend = Some(sus);
                 } else {
-                    self.confirm = Some((
+                    self.log(
+                        '→',
                         format!(
-                            "Disable the head gesture for '{svc}'? A face match alone would \
-                             then approve it: a print of your face held to the camera could use \
-                             '{svc}'. Your typed password still works."
+                            "sudo irlume credential-release-challenge {svc} off: remove the experimental head gesture; keyboard confirmation remains required"
                         ),
-                        "Disable",
-                        ConfirmAct::Sus(sus),
-                    ));
+                    );
                 }
+                self.suspend = Some(sus);
             }
             // Credential-release gesture gate. DEFAULT OFF: the keyring releases
             // after the face match with no nod. 'g' toggles the opt-in extra
@@ -4866,14 +4852,11 @@ impl App {
         );
     }
 
-    /// The Settings tab's per-service consent-gesture section: a header carrying
-    /// the keys, then one row of service names with the picked one
+    /// The Settings tab's fixed confirmation and optional-gesture section: the
+    /// mandatory boundary, then one row of service names with the picked one
     /// (`settings_svc_sel`) highlighted and its EFFECTIVE state. Arrow keys pick,
-    /// `c` toggles the picked one. Compact (three lines) because the Settings
-    /// panel does not scroll. settings.conf is root-only, so an unreadable value
-    /// falls
-    /// back to the per-service default (all four default on) rather than guessing
-    /// off on a security setting.
+    /// `c` toggles the picked one. settings.conf is root-only, so an unreadable
+    /// optional value is rendered unknown rather than guessed.
     fn service_gesture_lines(&self) -> Vec<Line<'static>> {
         // Clamped, not indexed. The arrow handler wraps this selection modulo the
         // list length, so it is in range today, but a DRAW must never be able to
@@ -4884,12 +4867,9 @@ impl App {
             .get(self.settings_svc_sel)
             .copied()
             .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
-        // The EFFECTIVE state the engine enforces, not the elevation-only default:
-        // polkit is AppConsent and defaults ON, so the old computation rendered
-        // `polkit-1: no` on a default install while the daemon required a gesture.
-        // Tri-state, like the two panels below it: an unprivileged TUI cannot read
-        // the root-only settings.conf, and a definite badge there is a guess
-        // dressed as a fact.
+        // Tri-state, like the panels below it: an unprivileged TUI cannot read
+        // root-only settings.conf, so an explicit value can be unknown even
+        // though the optional default is off.
         let required = irlume_common::config::service_gesture_required_visible(picked);
         let mut row: Vec<Span> = vec![Span::raw("  ")];
         for (i, &svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
@@ -4903,7 +4883,8 @@ impl App {
         row.push(Span::raw(format!("   {picked}: ")));
         row.push(onoff_opt(required));
         vec![
-            section("Per-service head gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
+            section("Face confirmation: keyboard required"),
+            section("Additional head gesture (experimental)   ([↑/↓] pick  [c] toggle)"),
             Line::from(row),
             // The decline half, stated once where the gesture is configured. A
             // user told only how to approve does not know a shake is a
@@ -4922,10 +4903,10 @@ impl App {
         // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
         // drew "turn it on" while the daemon was already enforcing.
         let bio = irlume_common::config::enforce_biopolicy_visible();
-        // The service picker is the second row of `service_gesture_lines`.
+        // The service picker is the third row of `service_gesture_lines`.
         // Make each label directly selectable; the click chooses only, while
         // [c] remains the deliberate state-changing action.
-        let service_y = area.y.saturating_add(1);
+        let service_y = area.y.saturating_add(2);
         let mut service_x = area.x.saturating_add(2);
         for (i, svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
             let width = svc.chars().count() as u16 + 3;
@@ -6669,7 +6650,7 @@ impl App {
             ],
             SC_SETTINGS => &[
                 ("↑/↓", "Select Service"),
-                ("c", "Toggle Per-service Head Gesture…"),
+                ("c", "Toggle Additional Head Gesture…"),
                 ("g", "Wallet Gesture…"),
                 ("b", "Biopolicy…"),
                 ("m", "Third-Party Model…"),
@@ -8191,7 +8172,7 @@ mod tests {
 
     /// The per-service head-gesture toggle follows the effective shared policy:
     /// absent is off, so the first press enables; an explicit on makes the next
-    /// press take the disable-confirmation path.
+    /// press disable it directly because keyboard confirmation remains mandatory.
     #[test]
     fn settings_per_service_gesture_toggle_uses_the_effective_opt_in_state() {
         let _g = crate::testenv::ENV_LOCK
@@ -8208,7 +8189,14 @@ mod tests {
 
         // The section renders with the service names.
         let text = draw_text(&app);
-        assert!(text.contains("Per-service head gesture"), "{text}");
+        assert!(
+            text.contains("Face confirmation: keyboard required"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Additional head gesture (experimental)"),
+            "{text}"
+        );
         assert!(text.contains("sudo") && text.contains("polkit-1"), "{text}");
 
         // Default (no key): sudo is off, so [c] enables it directly.
@@ -8246,14 +8234,14 @@ mod tests {
         ));
         app.settings_svc_sel = 0;
 
-        // A service explicitly ON currently asks before disabling it.
+        // A service explicitly ON disables directly: keyboard confirmation is
+        // mandatory and cannot be weakened by this toggle.
         std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=1\n").unwrap();
         app.on_key(KeyCode::Char('c'));
-        assert!(app.suspend.is_none());
+        assert!(app.confirm.is_none());
         assert!(matches!(
-            app.confirm.take(),
-            Some((_, _, ConfirmAct::Sus(Suspend::ServiceGesture { ref service, on: false })))
-                if service == "sudo"
+            app.suspend.take(),
+            Some(Suspend::ServiceGesture { ref service, on: false }) if service == "sudo"
         ));
 
         match old {
@@ -11426,7 +11414,7 @@ mod tests {
             (SC_PAM, "Connect Login", "Disconnect"),
             (
                 SC_SETTINGS,
-                "Toggle Per-service Head Gesture",
+                "Toggle Additional Head Gesture",
                 "Third-Party Model",
             ),
             (SC_DONE, "Connect Login", "Refresh Status"),
@@ -12677,6 +12665,8 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
+        assert!(text.contains("Face confirmation: keyboard required"));
+        assert!(text.contains("Additional head gesture (experimental)"));
         assert!(text.contains("Keep nodding to approve; shake your head to decline."));
         for retired in ["Require eyes open", "Calibrate gesture", "eye-closure"] {
             assert!(
@@ -12687,7 +12677,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_gesture_keys_do_not_dispatch_and_service_toggle_stays_confirmed() {
+    fn retired_gesture_keys_do_not_dispatch_and_service_toggle_disables_directly() {
         let _g = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12718,10 +12708,10 @@ mod tests {
 
         app.on_key(KeyCode::Char('c'));
         assert!(matches!(
-            app.confirm,
-            Some((_, _, ConfirmAct::Sus(Suspend::ServiceGesture { ref service, on: false })))
-                if service == "sudo"
+            app.suspend,
+            Some(Suspend::ServiceGesture { ref service, on: false }) if service == "sudo"
         ));
+        assert!(app.confirm.is_none());
 
         match old {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),

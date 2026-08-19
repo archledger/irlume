@@ -1514,12 +1514,22 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// liveness (measured 2026-07-27, the gesture fired on a hand-held print 2 times
 /// in 24, so it never stood between a photograph and the credential; the
 /// cross-spectrum liveness and PAD cues do, and the typed password is always the
-/// fallback). Turning any gesture on adds a deliberate step; disabling it for a
-/// high-privilege escalation service (sudo, su, doas, polkit) asks for
-/// confirmation first.
+/// fallback). Turning any gesture on adds an experimental additional step;
+/// disabling it cannot remove the mandatory keyboard confirmation on a
+/// high-privilege service.
 /// One service's effective head-gesture line, shared by the all-services
 /// `status` and the per-service `<svc> status` so the two can never disagree.
 fn print_service_gesture_status(tag: &str, svc: &str) {
+    let privileged = irlume_common::pam_service::classify(svc)
+        .is_some_and(irlume_common::pam_service::ServiceKind::requires_face_intent_confirmation);
+    if privileged {
+        println!("{tag} {svc}: Face confirmation: keyboard required");
+    }
+    let additional = if privileged {
+        "Additional head gesture: "
+    } else {
+        ""
+    };
     let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
     match irlume_common::config::observe_kv("settings.conf", &key) {
         // Per-service keys use `!falsy` (the daemon's `service_gesture`
@@ -1527,9 +1537,13 @@ fn print_service_gesture_status(tag: &str, svc: &str) {
         // what the engine does for this key.
         irlume_common::config::KvObservation::Value(v) => {
             if !irlume_common::config::falsy(&v) {
-                println!("{tag} {svc}: REQUIRED {OK} (explicit)");
+                if privileged {
+                    println!("{tag} {svc}: {additional}on (experimental, explicit)");
+                } else {
+                    println!("{tag} {svc}: REQUIRED {OK} (explicit)");
+                }
             } else {
-                println!("{tag} {svc}: off (explicit)");
+                println!("{tag} {svc}: {additional}off (explicit)");
             }
         }
         irlume_common::config::KvObservation::Absent => {
@@ -1537,20 +1551,21 @@ fn print_service_gesture_status(tag: &str, svc: &str) {
                 // The keyring release falls back to the global gate,
                 // which now defaults OFF.
                 "credential_release" => irlume_common::config::credential_release_challenge(),
-                // Every PAM service through the shared helper, which
-                // knows polkit (AppConsent) defaults ON and that
-                // `polkit_gesture=0` turns that default off. The
-                // hardcoded `true` here could not see the second half.
+                // Every PAM service through the shared explicit-only helper.
                 _ => irlume_common::config::service_gesture_required(svc),
             };
             if required {
-                println!("{tag} {svc}: REQUIRED {OK} (default)");
+                if privileged {
+                    println!("{tag} {svc}: {additional}on (experimental, configured)");
+                } else {
+                    println!("{tag} {svc}: REQUIRED {OK} (default)");
+                }
             } else {
-                println!("{tag} {svc}: off (default)");
+                println!("{tag} {svc}: {additional}off (default)");
             }
         }
         irlume_common::config::KvObservation::Unknown(_) => {
-            println!("{tag} {svc}: root-only setting, re-run with sudo");
+            println!("{tag} {svc}: {additional}root-only setting, re-run with sudo");
         }
     }
 }
@@ -1636,36 +1651,26 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                              effect only if a PAM stack really uses that service name."
                         );
                     }
-                    // Disabling the gesture for a high-privilege escalation
-                    // service (sudo, su, doas, sudo-i, su-l, runuser, polkit) asks
-                    // for confirmation first: a face match alone would then
-                    // approve it. The set comes from the shared pam_service table,
-                    // not a private list that already omitted sudo-i/su-l/runuser
-                    // (the #362 drift). The keyring release (`credential_release`)
-                    // is NOT here: it defaults OFF by design, so disabling it is
-                    // the default state, not a weakening that warrants a warning.
-                    let high_priv = matches!(
-                        irlume_common::pam_service::classify(svc),
-                        Some(
-                            irlume_common::pam_service::ServiceKind::Elevation
-                                | irlume_common::pam_service::ServiceKind::AppConsent
-                        )
+                    let high_priv = irlume_common::pam_service::classify(svc).is_some_and(
+                        irlume_common::pam_service::ServiceKind::requires_face_intent_confirmation,
                     );
-                    if v == "off" && high_priv {
-                        let assumed_yes = args.iter().any(|a| a == "--yes" || a == "-y");
-                        if !assumed_yes && !confirm_high_privilege_disable(svc) {
-                            println!("{TAG} {svc}: left REQUIRED.");
-                            return ExitCode::SUCCESS;
-                        }
-                    }
                     let val = if v == "on" { "1" } else { "0" };
                     let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
                     match irlume_common::config::write_kv("settings.conf", &key, val) {
                         Ok(()) => {
-                            if v == "on" {
+                            if v == "on" && high_priv {
+                                println!("{TAG} {svc}: Additional head gesture on (experimental)");
+                                eprintln!(
+                                    "{TAG} WARNING: the head classifier is not population-qualified and may reject valid attempts. Face confirmation: keyboard required."
+                                );
+                            } else if v == "off" && high_priv {
+                                println!(
+                                    "{TAG} {svc}: Additional head gesture off; keyboard confirmation remains required"
+                                );
+                            } else if v == "on" {
                                 println!("{TAG} {svc}: head gesture REQUIRED {OK}");
                             } else {
-                                eprintln!("{TAG} {svc}: head gesture off {WARN}");
+                                println!("{TAG} {svc}: head gesture off");
                             }
                             ExitCode::SUCCESS
                         }
@@ -1732,21 +1737,6 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             ExitCode::from(2)
         }
     }
-}
-
-/// Confirmation for disabling the head gesture on a high-privilege service.
-fn confirm_high_privilege_disable(service: &str) -> bool {
-    use std::io::Write as _;
-    println!(
-        "WARNING: Disabling the head gesture for '{service}' means a face match alone\n\
-         approves this service. If someone holds a print of your face to the camera,\n\
-         they can use '{service}' without your knowledge."
-    );
-    print!("Disable the gesture for '{service}'? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).unwrap_or_default();
-    matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
 pub fn reseal(args: &[String]) -> ExitCode {
@@ -2182,10 +2172,10 @@ SYSTEM INTEGRATION
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   credential-release-challenge [<service>] <on|off|status>
-                        the head gesture: keep nodding to approve;
-                        shake your head to decline. Named with a service (sudo, su, doas,
-                        polkit-1) it sets that service's gesture; sudo-style
-                        elevation and polkit require one by default. Bare, it
+                        optional experimental head gesture: keep nodding to approve;
+                        shake your head to decline. Named with a service (sudo, su,
+                        doas, polkit-1) it adds or removes that service's gesture;
+                        privileged face auth always keeps keyboard confirmation. Bare, it
                         sets the gate on releasing your keyring password, which
                         is OFF by default: a cold login and logout release it on
                         the face match alone

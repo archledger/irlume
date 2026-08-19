@@ -324,8 +324,22 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     // No settings.conf at all: defaults shown, and status never fails.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
     assert_eq!(code, 0);
-    assert!(out.contains("sudo: off (default)"), "{out}");
-    assert!(out.contains("polkit-1: off (default)"), "{out}");
+    assert!(
+        out.contains("sudo: Face confirmation: keyboard required"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sudo: Additional head gesture: off (default)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("polkit-1: Face confirmation: keyboard required"),
+        "{out}"
+    );
+    assert!(
+        out.contains("polkit-1: Additional head gesture: off (default)"),
+        "{out}"
+    );
     assert!(out.contains("credential_release: off (default)"), "{out}");
     assert!(
         out.contains("global credential_release_challenge: off (default)"),
@@ -343,7 +357,14 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     // `<svc> on|off`: the exact command four surfaces recommended exited 2.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "sudo", "status"]), cmd);
     assert_eq!(code, 0, "the taught per-service form must work: {out}");
-    assert!(out.contains("sudo: off (default)"), "{out}");
+    assert!(
+        out.contains("sudo: Face confirmation: keyboard required"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sudo: Additional head gesture: off (default)"),
+        "{out}"
+    );
     assert!(
         !out.contains("polkit-1:"),
         "one service asked, one service answered: {out}"
@@ -407,6 +428,31 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     assert_eq!(code, 0);
     assert!(out.contains("off (the default)"), "{out}");
     assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
+
+    // Per-service gesture is only an experimental additional gate. Enabling
+    // warns about false rejects; disabling is direct and explicitly preserves
+    // mandatory keyboard confirmation.
+    let (code, out, err) = run(&mut sb.cmd(&[cmd, "sudo", "on"]), cmd);
+    assert_eq!(code, 0, "{out}{err}");
+    let text = format!("{out}{err}");
+    assert!(text.contains("experimental"), "{text}");
+    assert!(text.contains("may reject valid attempts"), "{text}");
+    assert!(!text.contains("face match alone"), "{text}");
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("service_gesture.sudo=1"));
+
+    let (code, out, err) = run(&mut sb.cmd(&[cmd, "sudo", "off"]), cmd);
+    assert_eq!(code, 0, "{out}{err}");
+    let text = format!("{out}{err}");
+    assert!(
+        text.contains("keyboard confirmation remains required"),
+        "{text}"
+    );
+    assert!(!text.contains("WARNING: Disabling"), "{text}");
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("service_gesture.sudo=0"));
 }
 
 #[test]

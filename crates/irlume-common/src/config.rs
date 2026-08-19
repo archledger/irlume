@@ -537,6 +537,34 @@ impl HeadConsentPolicy {
     }
 }
 
+/// One-release compile-compatibility adapter for callers awaiting migration to
+/// [`HeadConsentPolicy`]. Authorization code must use [`head_consent_policy`]
+/// directly; this type never maps retired closure configuration to an accepted
+/// gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentGesture {
+    /// Compatibility result for a ready, nod-only policy.
+    Nod,
+    /// Exhaustiveness-only legacy variant; [`consent_gesture_mode`] never returns it.
+    Closure,
+    /// Exhaustiveness-only legacy variant; [`consent_gesture_mode`] never returns it.
+    Either,
+    /// Compatibility result for every blocked policy.
+    Misconfigured,
+}
+
+impl ConsentGesture {
+    /// Compatibility prompt; legacy closure remains a repair instruction.
+    pub fn instruction(self, what: &str) -> String {
+        match self {
+            Self::Nod | Self::Either => HeadConsentPolicy::Ready,
+            Self::Closure => HeadConsentPolicy::LegacyClosure,
+            Self::Misconfigured => HeadConsentPolicy::Misconfigured,
+        }
+        .instruction(what)
+    }
+}
+
 fn parse_head_consent_policy(value: Option<&str>) -> HeadConsentPolicy {
     match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         None | Some("nod") => HeadConsentPolicy::Ready,
@@ -548,6 +576,18 @@ fn parse_head_consent_policy(value: Option<&str>) -> HeadConsentPolicy {
 /// Resolve the head-consent policy using the environment-over-settings precedence.
 pub fn head_consent_policy() -> HeadConsentPolicy {
     head_consent_policy_reporting(std::io::stderr())
+}
+
+/// One-release compile adapter for callers not yet migrated to
+/// [`head_consent_policy`]. Retired or malformed configuration always maps to
+/// the fail-closed compatibility result.
+pub fn consent_gesture_mode() -> ConsentGesture {
+    match head_consent_policy() {
+        HeadConsentPolicy::Ready => ConsentGesture::Nod,
+        HeadConsentPolicy::LegacyClosure | HeadConsentPolicy::Misconfigured => {
+            ConsentGesture::Misconfigured
+        }
+    }
 }
 
 fn head_consent_policy_reporting(mut out: impl std::io::Write) -> HeadConsentPolicy {
@@ -1320,6 +1360,45 @@ mod tests {
         );
 
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compatibility_gesture_mode_maps_ready_policy_to_nod() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cg-compat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        assert_eq!(consent_gesture_mode(), ConsentGesture::Nod);
+        write_kv("settings.conf", "consent_gesture", "nod").unwrap();
+        assert_eq!(consent_gesture_mode(), ConsentGesture::Nod);
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compatibility_gesture_mode_maps_legacy_and_malformed_to_fail_closed() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cg-compat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        for value in ["closure", "clousure"] {
+            write_kv("settings.conf", "consent_gesture", value).unwrap();
+            assert_eq!(
+                consent_gesture_mode(),
+                ConsentGesture::Misconfigured,
+                "consent_gesture={value:?}"
+            );
+        }
+
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

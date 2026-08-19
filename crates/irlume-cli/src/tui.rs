@@ -273,9 +273,6 @@ enum Suspend {
     LoginDisable,
     /// Re-apply wiring a distro PAM regeneration stripped (Repair fix).
     LoginReconcile,
-    /// Teach the eye-closure consent gesture; interactive + root, so it runs
-    /// `sudo irlume calibrate-closure` in the cooked terminal.
-    CalibrateClosure,
     /// Flip daemon debug logging; the bool is the direction to switch TO.
     LogsDebug(bool),
     /// fprintd verify runs as the user with its own prompts (like Add).
@@ -539,7 +536,6 @@ struct App {
     screen: usize,
     sel: usize,
     profiles: Vec<ProfileSummary>,
-    eyes_open: bool,
     keyring_armed: Option<bool>,
     /// Seal-tier label from `KeyringInfo` (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -692,7 +688,6 @@ struct App {
 enum ProfilesOutcome {
     Loaded {
         profiles: Vec<ProfileSummary>,
-        eyes_open: bool,
     },
     /// The daemon answered with an error (corrupt enrollment, missing
     /// template key): real state, shown on Repair like the sync path did.
@@ -1060,7 +1055,6 @@ impl App {
             screen,
             sel: 0,
             profiles: Vec::new(),
-            eyes_open: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -1143,8 +1137,8 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                // Settings holds user preferences (eyes-open, per-service consent
-                // gesture, keyring gesture, biopolicy,
+                // Settings holds user preferences (per-service head gesture,
+                // keyring gesture, biopolicy,
                 // third-party models), not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
@@ -1389,14 +1383,7 @@ impl App {
                 },
                 std::time::Duration::from_secs(60),
             ) {
-                Ok(Response::Enrollment {
-                    profiles,
-                    require_eyes_open,
-                    ..
-                }) => ProfilesOutcome::Loaded {
-                    profiles,
-                    eyes_open: require_eyes_open,
-                },
+                Ok(Response::Enrollment { profiles, .. }) => ProfilesOutcome::Loaded { profiles },
                 // A corrupt/unreadable enrollment (or a missing template key
                 // for an encrypted file) surfaces as an Error, not empty;
                 // don't silently show "no face enrolled"; capture it so
@@ -1553,18 +1540,15 @@ impl App {
             // IRLUME_MESH_MODEL at it, so a running daemon reporting the mesh
             // is the ground truth that the TFLite runtime loaded, the same way
             // Health answers for ONNX. A daemon running WITHOUT the mesh is
-            // not fine: passive blink liveness and the eye-closure consent
-            // gesture are off, and with the release challenge on, a face
-            // login leaves the keyring locked.
+            // not fine: passive blink liveness is off, and with the release
+            // challenge on, a face login leaves the keyring locked.
             v.push(mk(
                 "TFLite runtime",
                 if h.mesh { Sev::Ok } else { Sev::Warn },
                 if h.mesh {
                     "loaded (the daemon reports FaceMesh, which ships as a .tflite)".into()
                 } else {
-                    "FaceMesh is not loaded: passive blink liveness and the eye-closure \
-                     consent gesture are off"
-                        .into()
+                    "FaceMesh is not loaded: passive blink liveness is off".into()
                 },
                 if h.mesh {
                     Fix::None
@@ -2451,12 +2435,8 @@ impl App {
             if let Ok(outcome) = rx.try_recv() {
                 self.profiles_load = None;
                 match outcome {
-                    ProfilesOutcome::Loaded {
-                        profiles,
-                        eyes_open,
-                    } => {
+                    ProfilesOutcome::Loaded { profiles } => {
                         self.profiles = profiles;
-                        self.eyes_open = eyes_open;
                         self.enroll_error = None;
                         self.profiles_loaded = true;
                     }
@@ -2780,12 +2760,8 @@ impl App {
     ///
     /// A second `sudo` from a root process resets `SUDO_USER` to `root`, because
     /// root is then the invoking user. Every per-user command resolves its target
-    /// from `SUDO_USER` (see `user_arg`), so `sudo irlume tui` -> `[c]` ->
-    /// `sudo irlume calibrate-closure` taught the consent gesture and stored it
-    /// for **root**, while the daemon reads the calibration from the real user's
-    /// enrollment: the user calibrated, saw it succeed, and their own prompts
-    /// never used it. Found by walking the TUI as root on 2026-08-12. The same
-    /// reset silently retargeted every other per-user step (enrol, keyring).
+    /// from `SUDO_USER` (see `user_arg`), so nested privilege elevation silently
+    /// retargets every per-user step (enrol, keyring).
     ///
     /// Running the command directly when root keeps the OUTER sudo's
     /// `SUDO_USER`, which names the person who started the TUI.
@@ -2930,10 +2906,6 @@ impl App {
             Suspend::LoginReconcile => self.sudo_step(
                 "re-apply the login wiring",
                 &["irlume", "login", "reconcile"],
-            ),
-            Suspend::CalibrateClosure => self.sudo_step(
-                "calibrate the eye-closure gesture",
-                &["irlume", "calibrate-closure", "--user", &target],
             ),
             Suspend::LogsDebug(on) => self.sudo_step(
                 if on {
@@ -3643,10 +3615,6 @@ impl App {
                 self.log('→', "sudo irlume login enable --with-polkit --apply: face + consent gesture approve app prompts (Bitwarden, pkexec)");
                 self.suspend = Some(Suspend::LoginEnablePolkit);
             }
-            (SC_PAM, KeyCode::Char('c')) => {
-                self.log('→', "sudo irlume calibrate-closure: teach the eye-closure consent gesture (the head nod needs no calibration)");
-                self.suspend = Some(Suspend::CalibrateClosure);
-            }
             // Un-wiring is destructive-ish (face login stops working until
             // re-enabled), so it gets the y/n gate.
             (SC_PAM, KeyCode::Char('x')) => {
@@ -3673,35 +3641,6 @@ impl App {
                 None => self.log('·', "Bitwarden is not installed on this system"),
             },
             // Settings.
-            (SC_SETTINGS, KeyCode::Enter) | (SC_SETTINGS, KeyCode::Char(' ')) => {
-                let on = !self.eyes_open;
-                // Turning it ON is refused by the daemon (#386), so do not fire
-                // a request known in advance to fail. The refusal still lives
-                // there, because that is the one choke point both this and the
-                // CLI go through; this only avoids offering the user an action
-                // whose only outcome is an error modal.
-                if on {
-                    // The row no longer advertises enter while off, so this is
-                    // a bare keypress: a log line, not a modal. The wording
-                    // matches the daemon's own refusal at its choke point.
-                    self.log(
-                        '·',
-                        "require-eyes-open cannot be enabled: it refuses the user it \
-                         exists to admit (measured 1 of 12 bare-eyed frames with eyes \
-                         open, 0 of 12 with glasses). See issue #386.",
-                    );
-                    return;
-                }
-                self.start_async(
-                    "toggle require-eyes-open",
-                    OpTag::Generic,
-                    Request::SetRequireEyesOpen {
-                        user: self.user.clone(),
-                        on,
-                    },
-                    map_settings,
-                );
-            }
             // Biopolicy gate: enabling changes the security posture (restricts
             // which services a face may satisfy), so it is confirmed; disabling
             // just relaxes back to default and goes straight through.
@@ -4966,7 +4905,7 @@ impl App {
         row.push(Span::raw(format!("   {picked}: ")));
         row.push(onoff_opt(required));
         vec![
-            section("Per-service consent gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
+            section("Per-service head gesture   ([↑/↓] pick  [c] toggle; disabling asks first)"),
             Line::from(row),
             // The decline half, stated once where the gesture is configured. A
             // user told only how to approve does not know a shake is a
@@ -4985,11 +4924,10 @@ impl App {
         // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
         // drew "turn it on" while the daemon was already enforcing.
         let bio = irlume_common::config::enforce_biopolicy_visible();
-        // The service picker is the second row of `service_gesture_lines`,
-        // after four rows in the eyes-open section. Make each label directly
-        // selectable; the click chooses only, while [c] remains the deliberate
-        // state-changing action.
-        let service_y = area.y.saturating_add(6);
+        // The service picker is the second row of `service_gesture_lines`.
+        // Make each label directly selectable; the click chooses only, while
+        // [c] remains the deliberate state-changing action.
+        let service_y = area.y.saturating_add(1);
         let mut service_x = area.x.saturating_add(2);
         for (i, svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
             let width = svc.chars().count() as u16 + 3;
@@ -5000,34 +4938,10 @@ impl App {
         }
         f.render_widget(
             Paragraph::new({
-                let mut v = vec![
-                section("Require eyes open"),
-                Line::from(vec![Span::raw("  state  "), onoff(self.eyes_open)]),
-                Line::from(Span::styled(
-                    "  Never unlock unless both eyes read open (IR-glint heuristic).",
-                    Style::new().dim(),
-                )),
-                // OFF is this setting's terminal state: the daemon refuses to
-                // enable it (#386, it admits 1 of 12 bare-eyed eyes-open
-                // frames), so advertising "[enter] toggle" offered an action
-                // whose only outcome was an error modal. The hint appears only
-                // while there is something to do: turn a legacy ON back off.
-                if self.eyes_open {
-                    Line::from(vec![
-                        Span::styled("  [enter]", Style::new().fg(th().accent)),
-                        Span::styled(" turn off", Style::new().dim()),
-                    ])
-                } else {
-                    Line::from(Span::styled(
-                        "  Cannot be enabled: the gate refuses eyes-open users (#386).",
-                        Style::new().dim(),
-                    ))
-                },
-                Line::raw(""),
-                ];
+                let mut v = Vec::new();
                 v.extend(self.service_gesture_lines());
                 v.extend(vec![
-                section("Gesture before keyring release"),
+                section("Head gesture before keyring release"),
                 {
                     // Tri-state, not a bool: settings.conf is root-only, so an
                     // unprivileged TUI genuinely cannot read this. Off is the
@@ -5063,7 +4977,7 @@ impl App {
                 // ONE line: this panel does not scroll and the per-service section
                 // above needs the room. THREAT_MODEL.md carries the numbers.
                 Line::from(Span::styled(
-                    "  Off by default (a cold login releases with no nod). On adds a nod (or an eye closure).",
+                    "  Off by default (a cold login releases with no nod). On adds a nod.",
                     Style::new().dim(),
                 )),
                 Line::from(vec![
@@ -6429,32 +6343,6 @@ impl App {
             "Wire app prompts",
             "opt-in; face approves Bitwarden and pkexec",
         ));
-        // What [c] teaches is only USEFUL in the modes that accept it, so the row
-        // reads the configured mode instead of always calling the closure an
-        // optional extra. Under `closure` the nod is refused and this calibration
-        // is the only way any gesture passes; under `nod` the closure is refused
-        // and teaching it changes nothing. Naming the nod first in the default
-        // mode still matches the prompts: it needs no calibration and is
-        // unaffected by lighting, while this is stored as absolute eye
-        // measurements that shift as the room changes.
-        lines.push(act(
-            "[c]",
-            "Calibrate gesture",
-            match irlume_common::config::consent_gesture_mode() {
-                irlume_common::config::ConsentGesture::Closure => {
-                    "REQUIRED: consent_gesture=closure accepts only the eye closure"
-                }
-                irlume_common::config::ConsentGesture::Nod => {
-                    "not accepted: consent_gesture=nod accepts only the head nod"
-                }
-                irlume_common::config::ConsentGesture::Either => {
-                    "optional eye-closure alternative; the head nod needs no calibration"
-                }
-                irlume_common::config::ConsentGesture::Misconfigured => {
-                    "no gesture is accepted until consent_gesture is fixed"
-                }
-            },
-        ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
         if matches!(
@@ -6532,10 +6420,6 @@ impl App {
                     scans,
                     self.live_scans(),
                 ),
-            ]),
-            Line::from(vec![
-                Span::raw("  eyes-open gate    "),
-                onoff(self.eyes_open),
             ]),
             Line::from(vec![
                 Span::raw("  keyring unlock    "),
@@ -6781,15 +6665,13 @@ impl App {
                 ("w", "Connect Login…"),
                 ("u", "Configure Sudo…"),
                 ("p", "Configure App Prompts…"),
-                ("c", "Calibrate Gesture…"),
                 ("b", "Configure App Unlock…"),
                 ("x", "Disconnect…"),
                 ("s", "Show Status"),
             ],
             SC_SETTINGS => &[
-                ("enter", "Turn Eyes-Open Check Off…"),
                 ("↑/↓", "Select Service"),
-                ("c", "Toggle Gesture…"),
+                ("c", "Toggle Per-service Head Gesture…"),
                 ("g", "Wallet Gesture…"),
                 ("b", "Biopolicy…"),
                 ("m", "Third-Party Model…"),
@@ -7292,32 +7174,6 @@ fn map_sealed(resp: Response) -> (bool, String) {
         ),
         Response::Error(e) => (false, format!("arm failed: {e}")),
         o => (false, format!("arm failed: {o:?}")),
-    }
-}
-
-/// Settings toggles reply with the updated `Enrollment`; report the resulting
-/// state the daemon actually applied (poll() then refreshes the display).
-fn map_settings(resp: Response) -> (bool, String) {
-    match resp {
-        Response::Enrollment {
-            require_eyes_open, ..
-        } => (
-            true,
-            format!(
-                "require-eyes-open {}",
-                if require_eyes_open {
-                    "ENABLED"
-                } else {
-                    "disabled"
-                }
-            ),
-        ),
-        // The daemon's SetRequire* handlers go through mutate_enrollment, which
-        // acks with Ok(msg), not Enrollment. Without this arm every toggle fell
-        // to the "unexpected" fallback and raised a spurious error modal.
-        Response::Ok(m) => (true, m),
-        Response::Error(e) => (false, e),
-        o => (false, format!("unexpected: {o:?}")),
     }
 }
 
@@ -8022,7 +7878,6 @@ mod tests {
             screen: SC_WELCOME,
             sel: 0,
             profiles: Vec::new(),
-            eyes_open: false,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -8234,27 +8089,6 @@ mod tests {
         }
     }
 
-    // Regression: f00f316. The daemon acks SetRequireEyesOpen with
-    // Response::Ok (via mutate_enrollment), not Response::Enrollment; before
-    // the fix map_settings routed Ok to the "unexpected" fallback and every
-    // eyes-open toggle raised a false error modal.
-    #[test]
-    fn eyes_open_toggle_accepts_ok_response() {
-        let (ok, msg) = map_settings(Response::Ok("require-eyes-open ENABLED".into()));
-        assert!(ok, "Response::Ok must be a success, not an error modal");
-        assert_eq!(msg, "require-eyes-open ENABLED");
-        // The updated-Enrollment reply and genuine errors keep working.
-        let (ok, _) = map_settings(Response::Enrollment {
-            profiles: Vec::new(),
-            require_eyes_open: true,
-            closure_calibrated: false,
-            ir_ratio_calibrated: false,
-        });
-        assert!(ok);
-        let (ok, _) = map_settings(Response::Error("boom".into()));
-        assert!(!ok);
-    }
-
     // Regression: f00f316. modal() had a fixed height of 5, so any body longer
     // than three wrapped lines was clipped. The wrap math must match what the
     // renderer does: explicit newlines count, and words wrap at the width.
@@ -8315,7 +8149,7 @@ mod tests {
         // opt-in with no confirm.
         let text = draw_text(&app);
         assert!(
-            text.contains("Gesture before keyring release") && text.contains("off (default)"),
+            text.contains("Head gesture before keyring release") && text.contains("off (default)"),
             "the default must render as off:\n{text}"
         );
         app.on_key(KeyCode::Char('g'));
@@ -8357,7 +8191,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The per-service consent-gesture toggle: ↑/↓ pick a service, [c] toggles
+    /// The per-service head-gesture toggle: ↑/↓ pick a service, [c] toggles
     /// it. Disabling a high-privilege service (all four in the list are) asks
     /// first and acts on the confirm, not the keypress; enabling one that is off
     /// goes straight through. The write shells out to the CLI (settings.conf is
@@ -8379,7 +8213,7 @@ mod tests {
 
         // The section renders with the service names.
         let text = draw_text(&app);
-        assert!(text.contains("Per-service consent gesture"), "{text}");
+        assert!(text.contains("Per-service head gesture"), "{text}");
         assert!(text.contains("sudo") && text.contains("polkit-1"), "{text}");
 
         // Default (no key): sudo defaults gesture ON, so [c] DISABLES it and must
@@ -8510,9 +8344,6 @@ mod tests {
         app.suspend = None;
         app.on_key(KeyCode::Char('p'));
         assert!(matches!(app.suspend, Some(Suspend::LoginEnablePolkit)));
-        app.suspend = None;
-        app.on_key(KeyCode::Char('c'));
-        assert!(matches!(app.suspend, Some(Suspend::CalibrateClosure)));
         app.suspend = None;
         // Un-wire: confirm first, nothing suspended yet; [y] flips it over.
         app.on_key(KeyCode::Char('x'));
@@ -9722,62 +9553,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_enter_refuses_to_enable_eyes_open_and_sends_nothing() {
-        // #386: the daemon refuses to turn this gate on, so Enter from OFF must
-        // not fire a request whose only outcome is an error modal. The refusal
-        // still lives in the daemon, which is the choke point the CLI shares;
-        // this is about not offering the user a dead action.
-        let _sock = dead_socket();
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        assert!(!app.eyes_open, "the fixture starts with the gate off");
-        app.on_key(KeyCode::Enter);
-        assert!(
-            app.op.is_none(),
-            "no request may be sent for an enable the daemon refuses"
-        );
-        // The row no longer advertises Enter while off, so a bare keypress
-        // logs quietly instead of raising a modal about a hint nobody saw.
-        assert!(
-            app.error.is_none(),
-            "no modal for an action the screen does not offer"
-        );
-        let logged = app.activity.last().map(|e| e.1.as_str()).unwrap_or("");
-        assert!(logged.contains("cannot be enabled"), "{logged}");
-        assert!(
-            logged.contains("#386"),
-            "the refusal must name the issue: {logged}"
-        );
-        // The old literal spanned continuation lines without `\`, burying
-        // 26-space runs mid-sentence in the rendered message.
-        assert!(
-            !logged.contains("  "),
-            "the message must not carry embedded space runs: {logged:?}"
-        );
-    }
-
-    #[test]
-    fn settings_enter_still_turns_eyes_open_off_via_the_daemon() {
-        // The OFF direction is the one an enrollment already carrying the flag
-        // needs, so it must still reach the daemon.
-        let _sock = dead_socket();
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        app.eyes_open = true;
-        app.on_key(KeyCode::Enter);
-        assert_eq!(
-            app.op.as_ref().map(|o| o.label.as_str()),
-            Some("toggle require-eyes-open"),
-            "turning the gate OFF must still fire the request"
-        );
-        wait_op_done(&mut app);
-        assert!(
-            app.error.is_some(),
-            "a failed toggle must raise the error banner, not vanish"
-        );
-    }
-
-    #[test]
     fn repair_ir_selftest_suspends_to_sudo_not_a_direct_daemon_call() {
         // The daemon root-gates SelfTest (spoof-tuning oracle), so [l] must run
         // it via sudo like every other root action, not fail on a peer-uid
@@ -10665,13 +10440,11 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["s1"])],
-            eyes_open: true,
         })
         .unwrap();
         app.poll();
         assert!(app.profiles_load.is_none(), "the landed load must clear");
         assert_eq!(app.profiles.len(), 1);
-        assert!(app.eyes_open);
 
         // A daemon-side error is STATE (corrupt enrollment): it lands on
         // enroll_error so Repair can flag it, exactly as the sync path did.
@@ -10708,7 +10481,6 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: Vec::new(),
-            eyes_open: false,
         })
         .unwrap();
         app.poll();
@@ -11083,43 +10855,6 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("TPM-unseal password"));
         assert!(text.contains("always fail-safe to the password"));
-    }
-
-    #[test]
-    fn settings_screen_renders_sections_and_the_eyes_open_state() {
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        let text = draw_text(&app);
-        assert!(text.contains("Require eyes open"));
-        assert!(text.contains("○ no"), "eyes-open starts off");
-        // OFF is terminal (#386): the section must say why instead of
-        // advertising a toggle whose only outcome used to be an error modal.
-        assert!(
-            text.contains("Cannot be enabled"),
-            "the off state must explain itself"
-        );
-        assert!(
-            !text.contains("turn off"),
-            "no turn-off hint while already off"
-        );
-        assert!(text.contains("Biopolicy operation-class gate"));
-        assert!(text.contains("Third-party models"));
-        assert!(
-            !text.contains("Third-party liveness models"),
-            "the heading must not claim every model is a liveness cue"
-        );
-        assert!(text.contains("Match thresholds (read-only)"));
-        app.eyes_open = true;
-        let text = draw_text(&app);
-        assert!(text.contains("● yes"), "the toggled state must show");
-        assert!(
-            text.contains("turn off"),
-            "a legacy ON must offer the one action that works"
-        );
-        assert!(
-            !text.contains("Cannot be enabled"),
-            "the refusal note belongs to the off state only"
-        );
     }
 
     #[test]
@@ -11689,7 +11424,11 @@ mod tests {
             (SC_RECOVERY, "Set Recovery", "Forget"),
             (SC_FINGERPRINT, "Enroll Finger", "Reset"),
             (SC_PAM, "Connect Login", "Disconnect"),
-            (SC_SETTINGS, "Turn Eyes-Open", "Third-Party Model"),
+            (
+                SC_SETTINGS,
+                "Toggle Per-service Head Gesture",
+                "Third-Party Model",
+            ),
             (SC_DONE, "Connect Login", "Refresh Status"),
         ];
         for (screen, primary, in_overlay) in cases {
@@ -12912,75 +12651,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A privileged step must not re-`sudo` when the TUI is already root: the
-    /// inner sudo resets SUDO_USER to "root", and every per-user command
-    /// resolves its target from it, so `sudo irlume tui` -> `[c]` stored the eye
-    /// calibration for root instead of the person who ran the TUI.
-    #[test]
-    fn a_root_tui_runs_privileged_steps_without_a_second_sudo() {
-        let args = ["/usr/bin/irlume", "calibrate-closure"];
-
-        // Already root: run the binary directly, so the OUTER sudo's SUDO_USER
-        // survives and names the real user.
-        let cmd = App::privileged_cmd(&args, true);
-        assert_eq!(cmd.get_program(), "/usr/bin/irlume");
-        assert_eq!(
-            cmd.get_args().collect::<Vec<_>>(),
-            vec!["calibrate-closure"],
-            "no sudo, and the arguments are unchanged"
-        );
-
-        // Unprivileged: sudo is how the step gets its privilege at all.
-        let cmd = App::privileged_cmd(&args, false);
-        assert_eq!(cmd.get_program(), "sudo");
-        assert_eq!(
-            cmd.get_args().collect::<Vec<_>>(),
-            vec!["/usr/bin/irlume", "calibrate-closure"]
-        );
-    }
-
-    /// The one-release compatibility facade maps absent/nod to head-only and
-    /// legacy/malformed values to fail-closed. Task 8 removes this row; until
-    /// then it must not present retired closure/either modes as reachable.
-    #[test]
-    fn calibrate_row_describes_head_only_and_fail_closed_modes() {
-        let _g = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("irlume-tui-calibmode-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::var_os("IRLUME_CONFIG_DIR");
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-        std::env::remove_var("IRLUME_CONSENT_GESTURE");
-
-        let mut app = test_app();
-        app.screen = SC_PAM;
-        for (conf, expect) in [
-            ("", "not accepted"),
-            (
-                "consent_gesture=closure\n",
-                "until consent_gesture is fixed",
-            ),
-            ("consent_gesture=nod\n", "not accepted"),
-            ("consent_gesture=banana\n", "until consent_gesture is fixed"),
-        ] {
-            std::fs::write(dir.join("settings.conf"), conf).unwrap();
-            let text = draw_text(&app);
-            let row = row_with(&text, "Calibrate gesture");
-            assert!(
-                row.contains(expect),
-                "mode {conf:?} must say {expect:?}, got: {row}"
-            );
-        }
-
-        match old {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// The Settings tab must name BOTH halves of the gesture. A user told only
     /// how to approve does not know a head shake is a deliberate decline the
     /// daemon acts on (it cancels the request, and on a polkit prompt it ends the
@@ -12998,18 +12668,61 @@ mod tests {
     }
 
     #[test]
-    fn gesture_explainer_uses_the_right_article() {
+    fn tui_contains_only_head_gesture_controls() {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
-        // The explainer offers the eye closure as the alternative to nodding; the
-        // article before "eye" must be "an", and the phrase is kept on one line so
-        // it cannot render as "(or a / eye closure)".
+        assert!(text.contains("Keep nodding to approve; shake your head to decline."));
+        for retired in ["Require eyes open", "Calibrate gesture", "eye-closure"] {
+            assert!(
+                !text.contains(retired),
+                "retired TUI text remains: {retired}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_gesture_keys_do_not_dispatch_and_service_toggle_stays_confirmed() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-tui-head-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=1\n").unwrap();
+        let old = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char('c'));
         assert!(
-            row_with(&text, "or an eye closure").contains("or an eye closure"),
-            "{text}"
+            app.suspend.is_none(),
+            "PAM [c] must not dispatch calibration"
         );
-        assert!(!text.contains("or a eye closure"), "{text}");
+
+        app.screen = SC_SETTINGS;
+        let activity_len = app.activity.len();
+        app.on_key(KeyCode::Enter);
+        assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
+        assert_eq!(
+            app.activity.len(),
+            activity_len,
+            "settings Enter must be inert"
+        );
+
+        app.on_key(KeyCode::Char('c'));
+        assert!(matches!(
+            app.confirm,
+            Some((_, _, ConfirmAct::Sus(Suspend::ServiceGesture { ref service, on: false })))
+                if service == "sudo"
+        ));
+
+        match old {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

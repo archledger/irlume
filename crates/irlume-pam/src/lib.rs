@@ -11,6 +11,8 @@
 //!   * default (`auth sufficient pam_irlume.so`): VERIFY only. Sends
 //!     `Authenticate`; a live match grants WITHOUT touching the password. Use for
 //!     `sudo`, polkit, and in-session unlocks where the keyring is already open.
+//!     Shared privileged services first require one hidden literal `yes` through
+//!     the PAM conversation; any other response falls through without a scan.
 //!   * `unseal` (`auth sufficient pam_irlume.so unseal`): VERIFY + KEYRING
 //!     UNLOCK. Sends `UnsealPassword`; on a live match the daemon releases the
 //!     TPM-sealed login password, which we set as `PAM_AUTHTOK` so a downstream
@@ -29,7 +31,8 @@
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
 //! log a failure; the password is always the floor).
 
-use irlume_common::{Request, Response, SecretBytes};
+use irlume_common::pam_service::ServiceKind;
+use irlume_common::{IntentAttestation, Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::ffi::CString;
 use std::time::{Duration, Instant};
@@ -39,6 +42,40 @@ const WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// Pause between attempts in `wait` mode: lets the daemon release the camera
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
+const FACE_INTENT_PROMPT: &str =
+    "Face authentication: type yes and press Enter (input hidden), or press Enter for password:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentConfirmation {
+    Confirmed,
+    Fallback,
+}
+
+fn classify_intent_response(response: Option<&[u8]>) -> IntentConfirmation {
+    let Some(response) = response else {
+        return IntentConfirmation::Fallback;
+    };
+    if response.len() > 16 || !response.is_ascii() {
+        return IntentConfirmation::Fallback;
+    }
+    match std::str::from_utf8(response) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("yes") => IntentConfirmation::Confirmed,
+        _ => IntentConfirmation::Fallback,
+    }
+}
+
+fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
+    if !service.requires_face_intent_confirmation() {
+        return IntentConfirmation::Fallback;
+    }
+    match pamh.conv(
+        Some(FACE_INTENT_PROMPT),
+        pamsm::PamMsgStyle::PROMPT_ECHO_OFF,
+    ) {
+        Ok(Some(response)) => classify_intent_response(Some(response.to_bytes())),
+        _ => IntentConfirmation::Fallback,
+    }
+}
 
 /// PAM-data key under which the `reseal` AUTH line stashes the typed password for
 /// the `reseal` SESSION line to pick up. Namespaced to this module.
@@ -256,9 +293,9 @@ impl PamServiceModule for IrlumePam {
             //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
             //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
             //    biometric device (kde-fingerprint) and cancels us natively the moment
-            //    a key is pressed, so an echo-off prompt from us would hijack the
-            //    password field; and a TTY `sudo` should keep "just look at the camera"
-            //    working without forcing the user to press Enter past a prompt first.
+            //    a key is pressed, so an echo-off password probe here would hijack the
+            //    password field. A privileged one-shot service receives its separate
+            //    bounded intent prompt only after this password-first check.
             let typed = if unseal && !wait && !facefirst {
                 pamh.get_authtok(Some("Password: "))
             } else {
@@ -270,26 +307,37 @@ impl PamServiceModule for IrlumePam {
                 }
             }
 
-            // On a polkit prompt the daemon requires a deliberate head gesture,
-            // which is not discoverable from the dialog, so tell the user what to do.
-            // Best-effort text info (the KDE/GNOME agent shows it inline); shown
-            // once, before the capture, only for the polkit service so sudo / lock
-            // screen are unaffected.
-            //
-            // The text comes from the same head-consent policy the engine gates on,
-            // exactly as the credential-release probe below does.
-            // From the shared table, so this cannot drift from the class the
-            // daemon enforces or the window the grace loop uses (#362). Out of
-            // step, this produces the worst version of the bug: a mandatory
-            // gesture the user is never told to make.
-            let is_polkit = pamh
+            let service = pamh
                 .get_service()
                 .ok()
                 .flatten()
-                .and_then(|c| c.to_str().ok().map(str::to_string))
-                .and_then(|s| irlume_common::pam_service::classify(&s))
-                .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
-            if is_polkit && !unseal {
+                .and_then(|value| value.to_str().ok().map(str::to_string));
+            let service_kind = service
+                .as_deref()
+                .and_then(irlume_common::pam_service::classify);
+            let intent_confirmation = match service_kind {
+                Some(kind) if kind.requires_face_intent_confirmation() => {
+                    // A single response cannot authorize a retry loop or the
+                    // structurally different credential-release request.
+                    if wait || unseal {
+                        return PamError::IGNORE;
+                    }
+                    match confirm_face_intent(&pamh, kind) {
+                        IntentConfirmation::Confirmed => Some(IntentAttestation::PamConversation),
+                        IntentConfirmation::Fallback => return PamError::IGNORE,
+                    }
+                }
+                _ => None,
+            };
+
+            // An explicitly enabled head gesture is an additional gate after
+            // conventional confirmation. Tell the user only when the shared
+            // policy says that extra gate will actually run.
+            if intent_confirmation.is_some()
+                && service
+                    .as_deref()
+                    .is_some_and(irlume_common::config::service_gesture_required)
+            {
                 let policy = irlume_common::config::head_consent_policy();
                 let msg = match policy {
                     irlume_common::config::HeadConsentPolicy::Ready => {
@@ -352,7 +400,10 @@ impl PamServiceModule for IrlumePam {
                 let (mut attempt, mut delivered) = if unseal {
                     try_unseal(&pamh, &user)
                 } else {
-                    (try_verify(&pamh, &user), Released::Failed)
+                    (
+                        try_verify(&pamh, &user, intent_confirmation),
+                        Released::Failed,
+                    )
                 };
                 // GDM and cosmic-greeter each drive BOTH the cold greeter and the
                 // live lock screen through one service. Unsealing is refused on the
@@ -362,7 +413,7 @@ impl PamServiceModule for IrlumePam {
                 // a cold login on a convenience tier still returns Deny here: the
                 // fallback only rescues the identity-only warm-unlock case.
                 if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
-                    attempt = try_verify(&pamh, &user);
+                    attempt = try_verify(&pamh, &user, None);
                     delivered = Released::Failed; // identity only, nothing released
                 }
                 // A polkit shake-decline is terminal: try_verify returned ABORT, so
@@ -735,7 +786,7 @@ fn read_stdout_bounded(
 /// window; and `IGNORE` on anything else so the password fallback survives. Passes
 /// the PAM service so the daemon can apply tier×operation-class gating (an RGB-only
 /// convenience device honours only a screen-unlock service).
-fn try_verify(pamh: &Pam, user: &str) -> PamError {
+fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestation>) -> PamError {
     let service = pamh
         .get_service()
         .ok()
@@ -755,7 +806,7 @@ fn try_verify(pamh: &Pam, user: &str) -> PamError {
     match request(&Request::Authenticate {
         user: user.to_string(),
         service,
-        intent_confirmation: None,
+        intent_confirmation,
     }) {
         Ok(Response::AuthResult {
             granted: true,
@@ -998,6 +1049,42 @@ mod tests {
     fn firewall_passes_normal_returns_through() {
         assert_eq!(firewall(|| PamError::SUCCESS), PamError::SUCCESS);
         assert_eq!(firewall(|| PamError::IGNORE), PamError::IGNORE);
+    }
+
+    /// A response outside this exact bounded ASCII allowlist must never start a
+    /// privileged face attempt. In particular, a password typed reflexively at
+    /// the hidden prompt is fallback input, not an authentication token.
+    #[test]
+    fn classify_intent_response_accepts_only_bounded_ascii_yes() {
+        for accepted in [
+            b"yes".as_slice(),
+            b" YES ",
+            b"\tyEs\r\n",
+            b"      yes       ",
+        ] {
+            assert_eq!(
+                classify_intent_response(Some(accepted)),
+                IntentConfirmation::Confirmed
+            );
+        }
+
+        let rejected: [Option<&[u8]>; 8] = [
+            None,
+            Some(b""),
+            Some(b"no"),
+            Some(b"password"),
+            Some(b"yes\0"),
+            Some(&[0xff]),
+            Some(b"yes             x"),
+            Some(b"                 "),
+        ];
+        for rejected in rejected {
+            assert_eq!(
+                classify_intent_response(rejected),
+                IntentConfirmation::Fallback,
+                "unexpectedly accepted {rejected:?}"
+            );
+        }
     }
 
     #[test]

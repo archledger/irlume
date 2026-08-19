@@ -36,7 +36,7 @@
 //! greeter-buffered conversations of a real display manager. Everything else
 //! (authenticate in every module mode, open_session, close_session) is covered.
 
-use irlume_common::{Request, Response};
+use irlume_common::{IntentAttestation, Request, Response};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -53,6 +53,12 @@ struct Harness {
     /// pam_wrapper's pam_set_items.so: pre-sets PAM items (e.g. PAM_AUTHTOK)
     /// from pamtester's environment, standing in for a greeter/earlier module.
     set_items: PathBuf,
+    /// Exports PAM items to the PAM environment so a required child can assert
+    /// that the confirmation response never became PAM_AUTHTOK.
+    get_items: PathBuf,
+    /// pam_wrapper's plaintext test authenticator. It provides a real second
+    /// password prompt so the intent response cannot masquerade as PAM_AUTHTOK.
+    matrix: PathBuf,
     /// The freshly built pam_irlume.so under test.
     module: PathBuf,
     /// Directory of per-service stack files (PAM_WRAPPER_SERVICE_DIR).
@@ -83,9 +89,27 @@ impl Harness {
             .parent()
             .expect("wrapper lib has a parent dir")
             .join("pam_wrapper/pam_set_items.so");
+        let matrix = wrapper
+            .parent()
+            .expect("wrapper lib has a parent dir")
+            .join("pam_wrapper/pam_matrix.so");
+        let get_items = wrapper
+            .parent()
+            .expect("wrapper lib has a parent dir")
+            .join("pam_wrapper/pam_get_items.so");
         assert!(
             set_items.exists(),
             "pam_set_items.so not next to {}; pam_wrapper installs both",
+            wrapper.display()
+        );
+        assert!(
+            matrix.exists(),
+            "pam_matrix.so not next to {}; pam_wrapper installs both",
+            wrapper.display()
+        );
+        assert!(
+            get_items.exists(),
+            "pam_get_items.so not next to {}; pam_wrapper installs both",
             wrapper.display()
         );
         if !pamtester_available() {
@@ -110,6 +134,8 @@ impl Harness {
         Some(Harness {
             wrapper,
             set_items,
+            get_items,
+            matrix,
             module: built_module(),
             socket: root.join("irlumed.sock"),
             service_dir,
@@ -408,6 +434,246 @@ fn pamwrap_granting_daemon_face_path() {
     }
 }
 
+const FACE_INTENT_PROMPT: &str =
+    "Face authentication: type yes and press Enter (input hidden), or press Enter for password:";
+
+/// Every privileged spelling comes from the shared service table. A hidden
+/// `yes` authorizes exactly one request, and that request carries the typed
+/// assertion rather than relying on its service string alone.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_privileged_yes_prompts_once_and_attests_every_service() {
+    let Some(h) = Harness::try_new("intent-yes") else {
+        return;
+    };
+    let log = serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => grant(),
+        _ => Response::Error("unexpected request".into()),
+    });
+    let services = [
+        "sudo",
+        "sudo-i",
+        "su",
+        "su-l",
+        "runuser",
+        "runuser-l",
+        "doas",
+        "polkit-1",
+        "polkit",
+    ];
+
+    for service in services {
+        h.write_service(service, &[h.auth_line("required", "")]);
+        let (ok, out) = h.run(service, &["authenticate"], "yes\n", None);
+        assert!(ok, "{service} confirmed face path must grant: {out}");
+        assert_eq!(
+            out.matches(FACE_INTENT_PROMPT).count(),
+            1,
+            "{service} must show exactly one hidden confirmation: {out}"
+        );
+    }
+
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), services.len(), "one request per service");
+    for (request, expected_service) in reqs.iter().zip(services) {
+        match request {
+            Request::Authenticate {
+                user,
+                service,
+                intent_confirmation,
+            } => {
+                assert_eq!(user, "tester");
+                assert_eq!(service.as_deref(), Some(expected_service));
+                assert_eq!(
+                    *intent_confirmation,
+                    Some(IntentAttestation::PamConversation)
+                );
+            }
+            other => panic!("expected Authenticate, daemon saw {other:?}"),
+        }
+    }
+}
+
+/// Any response other than bounded ASCII `yes`, including EOF/conversation
+/// failure, chooses the ordinary fallback and never contacts the daemon.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_privileged_fallback_responses_send_no_request() {
+    let Some(h) = Harness::try_new("intent-fallback") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| grant());
+    h.write_service(
+        "sudo",
+        &[
+            h.auth_line("sufficient", ""),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+
+    for input in ["\n", "no\n", "junk\n", ""] {
+        let (ok, out) = h.run("sudo", &["authenticate"], input, None);
+        assert!(
+            ok,
+            "fallback must reach the password-module stand-in: {out}"
+        );
+        assert!(out.contains(FACE_INTENT_PROMPT), "prompt missing: {out}");
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "fallback responses must not start a face request"
+    );
+}
+
+/// Privileged PAM stacks must never turn one response into a retry loop or a
+/// credential-release request, even when an administrator miswires arguments.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_privileged_wait_and_unseal_send_no_request() {
+    let Some(h) = Harness::try_new("intent-miswired") else {
+        return;
+    };
+    let log = serve(&h.socket, |request| match request {
+        Request::Authenticate { .. } => grant(),
+        Request::UnsealPassword { .. } => unsealed("hunter2"),
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    for (args, input) in [("wait", "yes\n"), ("unseal", "\n")] {
+        h.write_service(
+            "sudo",
+            &[
+                h.auth_line("sufficient", args),
+                "auth required pam_permit.so".into(),
+            ],
+        );
+        let (ok, out) = h.run("sudo", &["authenticate"], input, None);
+        assert!(ok, "{args} must fall through without face auth: {out}");
+    }
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "miswired privileged modes must not reach the daemon"
+    );
+}
+
+/// A password typed at the new hidden confirmation is discarded. pam_get_items
+/// plus a required checker proves PAM_AUTHTOK is still empty; pam_matrix then
+/// provides a real fresh password prompt before the fallback stack completes.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_confirmation_response_is_hidden_and_never_becomes_authtok() {
+    let Some(h) = Harness::try_new("intent-authtok") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::Error("must not be called".into()));
+    let passdb = h.root.join("matrix.passdb");
+    std::fs::write(&passdb, "tester:real-password:sudo\n").unwrap();
+    let no_authtok = h.root.join("no-authtok.sh");
+    std::fs::write(&no_authtok, "#!/bin/sh\n[ -z \"${PAM_AUTHTOK:-}\" ]\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&no_authtok, std::fs::Permissions::from_mode(0o700)).unwrap();
+    h.write_service(
+        "sudo",
+        &[
+            h.auth_line("sufficient", ""),
+            format!("auth required {}", h.get_items.display()),
+            format!("auth required pam_exec.so {}", no_authtok.display()),
+            format!(
+                "auth optional {} passdb={}",
+                h.matrix.display(),
+                passdb.display()
+            ),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+
+    let (ok, out) = h.run(
+        "sudo",
+        &["authenticate"],
+        "not-the-real-password\nreal-password\n",
+        None,
+    );
+    assert!(ok, "fallback stack must complete after a fresh prompt: {out}");
+    assert!(out.contains(FACE_INTENT_PROMPT), "prompt missing: {out}");
+    assert!(
+        !out.contains("not-the-real-password") && !out.contains("real-password"),
+        "echo-off conversations must not display either secret: {out}"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a non-yes response must not contact the daemon"
+    );
+}
+
+/// Login, lock, credential-release helpers, and remote services keep their
+/// existing behavior. None may inherit the privileged confirmation merely
+/// because all of them share the same PAM module.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_nonprivileged_modes_never_show_privileged_confirmation() {
+    let Some(h) = Harness::try_new("intent-scope") else {
+        return;
+    };
+    let log = serve(&h.socket, |request| match request {
+        Request::Authenticate { .. } => grant(),
+        Request::UnsealPassword { .. } | Request::UnsealKeyring { .. } => unsealed("hunter2"),
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    h.write_service("kde", &[h.auth_line("required", "")]);
+    let (ok, out) = h.run("kde", &["authenticate"], "", None);
+    assert!(ok, "lock verify must keep working: {out}");
+    assert!(!out.contains(FACE_INTENT_PROMPT), "{out}");
+
+    h.write_service("sddm", &[h.auth_line("required", "unseal")]);
+    let (ok, out) = h.run("sddm", &["authenticate"], "\n", None);
+    assert!(ok, "greeter unseal must keep working: {out}");
+    assert!(!out.contains(FACE_INTENT_PROMPT), "{out}");
+
+    for mode in ["keyring", "reseal"] {
+        h.write_service(
+            "sddm",
+            &[
+                h.auth_line("sufficient", mode),
+                "auth required pam_permit.so".into(),
+            ],
+        );
+        let (ok, out) = h.run("sddm", &["authenticate"], "", None);
+        assert!(ok, "{mode} must keep fallback: {out}");
+        assert!(!out.contains(FACE_INTENT_PROMPT), "{mode}: {out}");
+    }
+
+    h.write_service(
+        "sshd",
+        &[
+            h.auth_line("sufficient", ""),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("sshd", &["authenticate"], "", None);
+    assert!(ok, "remote face path must fall through: {out}");
+    assert!(!out.contains(FACE_INTENT_PROMPT), "{out}");
+
+    let reqs = log.lock().unwrap();
+    assert!(matches!(
+        &reqs[0],
+        Request::Authenticate {
+            service: Some(service),
+            intent_confirmation: None,
+            ..
+        } if service == "kde"
+    ));
+    assert!(matches!(
+        &reqs[1],
+        Request::UnsealPassword { service: Some(service), .. } if service == "sddm"
+    ));
+    assert!(matches!(
+        &reqs[2],
+        Request::UnsealKeyring { service: Some(service), .. } if service == "sddm"
+    ));
+    assert_eq!(reqs.len(), 3, "reseal and sshd must send nothing: {reqs:?}");
+}
+
 /// The login path (`unseal`): submitting an EMPTY password is the face
 /// gesture. The module asks the daemon to release the TPM-sealed password,
 /// sets it as PAM_AUTHTOK, and returns success.
@@ -538,14 +804,11 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
     assert!(!out.contains(READY), "verify must stay silent: {out}");
 }
 
-/// A ready polkit dialog names BOTH supported head gestures: nod approves and
-/// shake declines. Retired closure and malformed settings print only the
-/// actionable blocker; the daemon then fails closed. The service is named
-/// `polkit-1` on purpose: pam_irlume classifies the service NAME, and only
-/// AppConsent (polkit-1) is a consent dialog.
+/// Conventional confirmation always comes first on polkit. The optional head
+/// instruction appears only after `yes` and only when explicitly enabled.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_polkit_prompt_names_approve_and_decline() {
+fn pamwrap_polkit_confirmation_precedes_the_optional_gesture() {
     const APPROVE: &str = "keep nodding your head to approve";
     const DECLINE: &str = "shake your head to decline";
     let Some(h) = Harness::try_new("polkit-consent") else {
@@ -565,25 +828,32 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
     // A plain verify (no `unseal`) on the polkit service.
     h.write_service("polkit-1", &[h.auth_line("required", "")]);
 
-    // Default and explicit legacy `nod` settings are both ready: the prompt
-    // names the nod AND the shake.
-    for settings in [None, Some("consent_gesture=nod\n")] {
-        h.write_settings(settings);
-        let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
-        assert!(
-            out.contains(APPROVE),
-            "the polkit prompt must say how to approve: {out}"
-        );
-        assert!(
-            out.contains(DECLINE),
-            "the polkit prompt must name the shake decline: {out}"
-        );
-    }
+    // Default off: `yes` reaches face auth without claiming a gesture is needed.
+    h.write_settings(None);
+    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
+    assert!(
+        out.contains(FACE_INTENT_PROMPT),
+        "confirmation missing: {out}"
+    );
+    assert!(
+        !out.contains(APPROVE) && !out.contains(DECLINE),
+        "default-off gesture must stay silent: {out}"
+    );
+
+    // Explicit opt-in: confirmation is followed by both gesture instructions.
+    h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=nod\n"));
+    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
+    assert!(
+        out.contains(FACE_INTENT_PROMPT),
+        "confirmation missing: {out}"
+    );
+    assert!(out.contains(APPROVE), "approval instruction missing: {out}");
+    assert!(out.contains(DECLINE), "decline instruction missing: {out}");
 
     // Misconfigured mode: the instruction is a diagnostic sentence naming the bad
     // setting; the decline clause is suppressed so it does not bury the fix.
-    h.write_settings(Some("consent_gesture=banana\n"));
-    let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
+    h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=banana\n"));
+    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(
         out.contains(
             "consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod"
@@ -596,8 +866,10 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
     );
 
     // Retired closure is blocked: print only the migration action and no gesture.
-    h.write_settings(Some("consent_gesture=closure\n"));
-    let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
+    h.write_settings(Some(
+        "service_gesture.polkit-1=1\nconsent_gesture=closure\n",
+    ));
+    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(
         out.contains(
             "eye closure is retired; remove consent_gesture from settings.conf or set it to nod"
@@ -609,15 +881,11 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
         "closure mode must print only its blocker: {out}"
     );
 
-    // Scoping: a plain elevation service (sudo) is not a consent dialog, so it
-    // gets neither half of the gesture instruction.
-    h.write_settings(None);
+    // Elevation uses the same explicit additional-gesture contract.
+    h.write_settings(Some("service_gesture.sudo=1\n"));
     h.write_service("sudo", &[h.auth_line("required", "")]);
-    let (_, out) = h.run("sudo", &["authenticate"], "", None);
-    assert!(
-        !out.contains(APPROVE) && !out.contains(DECLINE),
-        "a non-polkit service must show no gesture instruction: {out}"
-    );
+    let (_, out) = h.run("sudo", &["authenticate"], "yes\n", None);
+    assert!(out.contains(APPROVE) && out.contains(DECLINE), "{out}");
 }
 
 #[test]
@@ -635,7 +903,7 @@ fn pamwrap_polkit_migration_remedy_tracks_the_environment_override() {
         refused_by_policy: false,
     });
     h.write_service("polkit-1", &[h.auth_line("required", "")]);
-    h.write_settings(Some("consent_gesture=nod\n"));
+    h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=nod\n"));
 
     for (value, expected) in [
         (
@@ -650,7 +918,7 @@ fn pamwrap_polkit_migration_remedy_tracks_the_environment_override() {
         let (_, out) = h.run_with_consent_env(
             "polkit-1",
             &["authenticate"],
-            "",
+            "yes\n",
             None,
             Some(value),
         );
@@ -697,6 +965,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
         declined_by_gesture: d.load(Ordering::SeqCst),
         refused_by_policy: false,
     });
+    h.write_settings(Some("service_gesture.polkit-1=1\nservice_gesture.sudo=1\n"));
 
     // pam_irlume under a control line, then pam_permit as the distro
     // password-module stand-in: reached only if pam_irlume did NOT abort. BOTH
@@ -720,7 +989,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
     // (1) polkit + deliberate shake: ABORT under abort=die, so pam_permit is never reached.
     declined.store(true, Ordering::SeqCst);
     permit_after("polkit-1", POLKIT_CONTROL);
-    let (ok, out) = h.run("polkit-1", &["authenticate"], "", None);
+    let (ok, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(
         !ok,
         "a polkit shake must abort before the password module: {out}"
@@ -732,7 +1001,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
     // this assertion. That is the mutation this case exists to kill.
     declined.store(true, Ordering::SeqCst);
     permit_after("sudo", POLKIT_CONTROL);
-    let (ok, out) = h.run("sudo", &["authenticate"], "", None);
+    let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
     assert!(
         ok,
         "a non-polkit shake must IGNORE (keep the password), not ABORT: {out}"
@@ -742,7 +1011,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
     // permit even under abort=die (only a PAM_ABORT dies; IGNORE does not).
     declined.store(false, Ordering::SeqCst);
     permit_after("polkit-1", POLKIT_CONTROL);
-    let (ok, out) = h.run("polkit-1", &["authenticate"], "", None);
+    let (ok, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(
         ok,
         "a non-shake polkit denial must keep the password fallback: {out}"
@@ -758,6 +1027,13 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
         3,
         "each case must reach the daemon: {reqs:?}"
     );
+    assert!(reqs.iter().all(|request| matches!(
+        request,
+        Request::Authenticate {
+            intent_confirmation: Some(IntentAttestation::PamConversation),
+            ..
+        }
+    )));
 }
 
 /// THE fail-safe that makes the challenge acceptable when it is on: when the
@@ -857,7 +1133,7 @@ fn pamwrap_typed_password_never_fires_the_camera() {
     // control neutralizes pam_set_items' own SUCCESS verdict so the stack
     // outcome is decided solely by our module (IGNORE ⇒ nobody granted).
     h.write_service(
-        "irlume-typed-sudo",
+        "sudo",
         &[
             format!(
                 "auth [success=ignore default=bad] {}",
@@ -866,7 +1142,7 @@ fn pamwrap_typed_password_never_fires_the_camera() {
             h.auth_line("required", ""),
         ],
     );
-    let (ok, out) = h.run("irlume-typed-sudo", &["authenticate"], "", Some("hunter2"));
+    let (ok, out) = h.run("sudo", &["authenticate"], "", Some("hunter2"));
     assert!(!ok, "module must IGNORE on a cached password: {out}");
 
     let reqs = log.lock().unwrap();

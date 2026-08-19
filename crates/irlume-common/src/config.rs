@@ -558,7 +558,7 @@ impl HeadConsentPolicy {
     }
 }
 
-/// One-release compatibility adapter for callers awaiting migration to
+/// One-release compile-compatibility adapter for callers awaiting migration to
 /// [`HeadConsentPolicy`]. Authorization code must use [`head_consent_policy`]
 /// directly; this type never maps retired closure configuration to an accepted
 /// gesture.
@@ -571,18 +571,21 @@ pub enum ConsentGesture {
     /// Exhaustiveness-only legacy variant; [`consent_gesture_mode`] never returns it.
     Either,
     /// Compatibility result for every blocked policy.
-    Misconfigured(HeadConsentSource),
+    Misconfigured,
 }
 
 impl ConsentGesture {
     /// Compatibility prompt; legacy closure remains a repair instruction.
     pub fn instruction(self, what: &str) -> String {
         match self {
-            Self::Nod | Self::Either => HeadConsentPolicy::Ready,
-            Self::Closure => HeadConsentPolicy::LegacyClosure(HeadConsentSource::Settings),
-            Self::Misconfigured(source) => HeadConsentPolicy::Misconfigured(source),
+            Self::Nod | Self::Either => format!("keep nodding your head to {what}"),
+            Self::Closure => format!(
+                "cannot {what}: eye closure is retired; unset IRLUME_CONSENT_GESTURE or remove consent_gesture from settings.conf, or set whichever source wins to nod"
+            ),
+            Self::Misconfigured => format!(
+                "cannot {what}: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or remove consent_gesture from settings.conf, or set whichever source wins to nod"
+            ),
         }
-        .instruction(what)
     }
 }
 
@@ -599,14 +602,14 @@ pub fn head_consent_policy() -> HeadConsentPolicy {
     head_consent_policy_reporting(std::io::stderr())
 }
 
-/// One-release adapter for callers not yet migrated to
+/// One-release compile adapter for callers not yet migrated to
 /// [`head_consent_policy`]. Retired or malformed configuration always maps to
 /// the fail-closed compatibility result.
 pub fn consent_gesture_mode() -> ConsentGesture {
     match head_consent_policy() {
         HeadConsentPolicy::Ready => ConsentGesture::Nod,
-        HeadConsentPolicy::LegacyClosure(source) | HeadConsentPolicy::Misconfigured(source) => {
-            ConsentGesture::Misconfigured(source)
+        HeadConsentPolicy::LegacyClosure(_) | HeadConsentPolicy::Misconfigured(_) => {
+            ConsentGesture::Misconfigured
         }
     }
 }
@@ -1513,6 +1516,24 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_gesture_keeps_the_original_unit_variant_shape() {
+        fn unchanged_consumer(value: ConsentGesture) -> &'static str {
+            match value {
+                ConsentGesture::Nod => "nod",
+                ConsentGesture::Closure => "closure",
+                ConsentGesture::Either => "either",
+                ConsentGesture::Misconfigured => "blocked",
+            }
+        }
+
+        assert_eq!(unchanged_consumer(ConsentGesture::Misconfigured), "blocked");
+        assert_eq!(
+            ConsentGesture::Misconfigured.instruction("approve"),
+            "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or remove consent_gesture from settings.conf, or set whichever source wins to nod"
+        );
+    }
+
+    #[test]
     fn compatibility_gesture_mode_maps_ready_policy_to_nod() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-cg-compat-{}", std::process::id()));
@@ -1542,16 +1563,13 @@ mod tests {
             write_kv("settings.conf", "consent_gesture", value).unwrap();
             assert_eq!(
                 consent_gesture_mode(),
-                ConsentGesture::Misconfigured(HeadConsentSource::Settings),
+                ConsentGesture::Misconfigured,
                 "consent_gesture={value:?}"
             );
         }
 
         std::env::set_var("IRLUME_CONSENT_GESTURE", "closure");
-        assert_eq!(
-            consent_gesture_mode(),
-            ConsentGesture::Misconfigured(HeadConsentSource::Environment)
-        );
+        assert_eq!(consent_gesture_mode(), ConsentGesture::Misconfigured);
 
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
         std::env::remove_var("IRLUME_CONFIG_DIR");

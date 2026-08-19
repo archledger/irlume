@@ -10606,17 +10606,14 @@ mod engine_tests {
     }
 
     fn wide_shake_poses(len: usize) -> Vec<irlume_liveness::PoseSample> {
-        let fifth = len / 5;
         (0..len)
             .map(|idx| irlume_liveness::PoseSample {
                 idx,
                 pitch_frac: Some(0.5),
-                yaw_signed: Some(if idx < fifth || idx >= 4 * fifth {
-                    -0.9
-                } else if idx < 2 * fifth || idx >= 3 * fifth {
-                    0.0
-                } else {
-                    0.9
+                yaw_signed: Some(match idx * 7 / len {
+                    0 | 4 => -0.9,
+                    2 | 6 => 0.9,
+                    _ => 0.0,
                 }),
                 bri: 60.0,
             })
@@ -10624,7 +10621,7 @@ mod engine_tests {
     }
 
     fn trailing_shake_poses(tail: usize) -> Vec<irlume_liveness::PoseSample> {
-        let trailing = [-0.9, 0.0, 0.9, 0.0, -0.9];
+        let trailing = [-0.9, 0.0, 0.9, 0.0, -0.9, 0.0, 0.9];
         (0..18 + tail)
             .map(|idx| irlume_liveness::PoseSample {
                 idx,
@@ -10653,7 +10650,7 @@ mod engine_tests {
 
     #[test]
     fn completed_head_take_catches_a_repeated_trailing_shake() {
-        let poses = trailing_shake_poses(5);
+        let poses = trailing_shake_poses(7);
         assert_eq!(
             head_consent_from_poses(&poses[..18]),
             HeadConsentVerdict::NoGesture,

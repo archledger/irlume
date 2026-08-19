@@ -971,13 +971,12 @@ pub const SHAKE_PITCH_MAX: f32 = 0.18;
 /// Minimum yaw MEDIAN-CROSSINGS for a shake: the yaw must OSCILLATE, not merely
 /// span a range. Measured 2026-08-11 on the ASUS FHD IR module, a STILL face
 /// carries yaw_range 0.48-0.61 (above the 0.45 floor) with ZERO yaw crossings,
-/// while a deliberate shake shows 6-7; a floor of 2 (one full there-and-back)
-/// sits safely between and rejects the still-face drift that range alone read as
-/// a Shake. The 2026-08-19 final matrix measured five deliberate shakes at 2-3
-/// crossings, while a casual look-around at yaw 1.62 had exactly one. Requiring
-/// two therefore preserves every measured deliberate decline and rejects the
-/// observed one-way turn. Overridable via `IRLUME_SHAKE_MIN_CROSSINGS`.
-pub const SHAKE_MIN_CROSSINGS: usize = 2;
+/// while a deliberate shake shows 6-7. The 2026-08-19 final matrix then exposed
+/// a casual look-around with two crossings (yaw range 0.86). Requiring three
+/// rejects that motion. Offline replay still detects the measured sitting shake
+/// at frame 30 with three crossings and the reclining shake at frame 42 with
+/// four. Overridable via `IRLUME_SHAKE_MIN_CROSSINGS`.
+pub const SHAKE_MIN_CROSSINGS: usize = 3;
 
 // A temporal consent take from the ASUS module alternates emitter-off/on IR
 // frames. Usually the detector sees a face only on the bright phase, but the
@@ -1174,9 +1173,9 @@ pub fn detect_head_gesture_with_evidence(samples: &[PoseSample]) -> (HeadGesture
         // cancel the consent watch of a user who did nothing; the crossing count
         // separates them cleanly. Non-oscillating drift in the band fails CLOSED
         // to None. SHAKE_YAW_MAX excludes idle looking-around.
-        // A casual one-way look-around reached yaw 1.62 with one crossing in the
-        // final matrix. Width alone cannot distinguish that from a one-sweep
-        // shake, so every explicit decline needs the full there-and-back floor.
+        // Casual look-around reached two crossings at yaw range 0.86 in the
+        // final matrix. Width alone cannot distinguish that from a partial
+        // shake, so every explicit decline needs a third direction change.
         if evidence.pitch_range <= shake_pitch_max() && yaw_crossings >= shake_min_crossings() {
             HeadGesture::Shake
         } else {
@@ -2087,13 +2086,14 @@ mod nod_evidence_tests {
     #[test]
     fn dark_strobe_landmarks_do_not_poison_a_lit_phase_shake() {
         let lit_yaw = [
-            0.45, 0.13, 0.00, -0.18, -0.14, -0.15, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62,
+            0.45, 0.13, 0.00, -0.30, -0.30, -0.30, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62, -0.30,
+            -0.30, -0.30, -0.30,
         ];
         // Reproduces the current-host sitting-shake failure: the detector
         // briefly reports a face on the dark strobe phase with an impossible
         // landmark-derived yaw.
         let samples =
-            alternating_strobe_poses(&[0.52; 12], &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
+            alternating_strobe_poses(&[0.52; 16], &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
 
         assert_eq!(detect_head_gesture(&samples), HeadGesture::Shake);
     }
@@ -2101,10 +2101,11 @@ mod nod_evidence_tests {
     #[test]
     fn bright_strobe_phase_is_selected_from_frame_identity_not_fixed_parity() {
         let lit_yaw = [
-            0.45, 0.13, 0.00, -0.18, -0.14, -0.15, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62,
+            0.45, 0.13, 0.00, -0.30, -0.30, -0.30, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62, -0.30,
+            -0.30, -0.30, -0.30,
         ];
         let mut samples =
-            alternating_strobe_poses(&[0.52; 12], &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
+            alternating_strobe_poses(&[0.52; 16], &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
         for sample in &mut samples {
             sample.idx += 1;
         }
@@ -2230,7 +2231,7 @@ mod nod_evidence_tests {
         // The final current-host matrix reproduced a casual look-around at yaw
         // 1.62 with exactly one crossing. Width cannot distinguish it from the
         // earlier one-sweep shake fixture, so only a repeated back-and-forth
-        // motion (two crossings) is an explicit decline.
+        // motion (at least three crossings) is an explicit decline.
         let yaw: Vec<f32> = std::iter::repeat_n(-0.9, 8)
             .chain(std::iter::repeat_n(0.0, 4))
             .chain(std::iter::repeat_n(0.9, 8))
@@ -2251,6 +2252,32 @@ mod nod_evidence_tests {
     }
 
     #[test]
+    fn a_two_crossing_look_around_is_not_a_decline() {
+        // The final current-host matrix observed a casual look-around with a
+        // 0.86 yaw range and exactly two crossings. Two direction changes are
+        // not enough to establish the repeated "no" gesture.
+        let yaw: Vec<f32> = std::iter::repeat_n(-0.43, 4)
+            .chain(std::iter::repeat_n(0.0, 4))
+            .chain(std::iter::repeat_n(0.43, 4))
+            .chain(std::iter::repeat_n(0.0, 4))
+            .chain(std::iter::repeat_n(-0.43, 4))
+            .collect();
+        let pitch = vec![0.5f32; yaw.len()];
+        let (verdict, ev) = detect_head_gesture_with_evidence(&poses(&pitch, &yaw));
+        assert!(
+            (ev.yaw_range - 0.86).abs() < 0.01,
+            "premise: fixture reproduces the observed yaw range, got {}",
+            ev.yaw_range
+        );
+        assert_eq!(
+            signal_crossings(&yaw, ev.yaw_range, NOD_CROSSING_AMP_FRAC),
+            2,
+            "premise: the observed look-around changes direction twice"
+        );
+        assert_eq!(verdict, HeadGesture::None);
+    }
+
+    #[test]
     fn a_vigorous_shake_above_the_old_ceiling_is_still_a_decline() {
         // The live session's shakes reached yaw 2.81 and 2.99, above the OLD 2.5
         // ceiling, so they fell out of the band entirely and could never register:
@@ -2261,6 +2288,8 @@ mod nod_evidence_tests {
             .chain(std::iter::repeat_n(1.495, 4))
             .chain(std::iter::repeat_n(0.0, 4))
             .chain(std::iter::repeat_n(-1.495, 4))
+            .chain(std::iter::repeat_n(0.0, 4))
+            .chain(std::iter::repeat_n(1.495, 4))
             .collect();
         let pitch = vec![0.5f32; yaw.len()];
         let (verdict, ev) = detect_head_gesture_with_evidence(&poses(&pitch, &yaw));
@@ -2276,7 +2305,7 @@ mod nod_evidence_tests {
         );
         assert!(
             signal_crossings(&yaw, ev.yaw_range, NOD_CROSSING_AMP_FRAC) >= SHAKE_MIN_CROSSINGS,
-            "premise: a repeated vigorous shake must cross at least twice"
+            "premise: a repeated vigorous shake must cross at least three times"
         );
         assert_eq!(
             verdict,

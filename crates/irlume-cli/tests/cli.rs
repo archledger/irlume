@@ -2153,6 +2153,25 @@ fn gesturecap_replays_pose_only_recordings() {
 }
 
 #[test]
+fn gesturecap_replays_explicit_null_pose_fields() {
+    let sandbox = Sandbox::new("gesturecap-null-pose");
+    let file = sandbox.path("work/no-face.jsonl");
+    std::fs::write(
+        &file,
+        "{\"posecap\":true,\"label\":\"no-face\",\"frames\":1}\n\
+         {\"idx\":0,\"pitch_frac\":null,\"yaw_signed\":null,\"bri\":100.0}\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run(sandbox
+        .cmd(&["gesturecap", "replay", file.to_str().unwrap()])
+        .env("IRLUME_DEV", "1"));
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("NoFace"), "{stdout}");
+}
+
+#[test]
 fn retired_blinkcap_is_not_dispatchable() {
     let sandbox = Sandbox::new("blinkcap-retired");
     let (code, _, stderr) = run(&mut sandbox.cmd(&["blinkcap", "replay", "anything"]));
@@ -2209,6 +2228,10 @@ fn gesturecap_strictly_validates_pose_headers_records_counts_and_indices() {
              {\"idx\":0,\"yaw_signed\":0.0,\"bri\":100.0}\n"
                 .to_string(),
             "missing field `pitch_frac`",
+        ),
+        (
+            "{\"posecap\":true,\"label\":\"nod\",\"frames\":0}\nBROKEN\n".to_string(),
+            "contains more records than declared 0 frames",
         ),
         (
             format!(

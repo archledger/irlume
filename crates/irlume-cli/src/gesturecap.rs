@@ -205,32 +205,51 @@ fn replay(args: &[String]) -> ExitCode {
 fn recording_files(path: &Path) -> Result<Vec<PathBuf>, String> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut files = if metadata.file_type().is_file() {
-        vec![path.to_path_buf()]
+    if metadata.file_type().is_file() {
+        Ok(vec![path.to_path_buf()])
     } else if metadata.file_type().is_dir() {
-        std::fs::read_dir(path)
+        let entries = std::fs::read_dir(path)
             .map_err(|error| format!("{}: {error}", path.display()))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("{}: {error}", path.display()))?
-            .into_iter()
-            .filter(|entry| {
+            .map(|entry| {
                 entry
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-            })
-            .collect()
+                    .map(|entry| entry.path())
+                    .map_err(|error| format!("{}: {error}", path.display()))
+            });
+        collect_recording_candidates(path, entries)
     } else {
-        return Err(format!(
+        Err(format!(
             "{}: recording must be a regular file",
             path.display()
-        ));
-    };
+        ))
+    }
+}
+
+fn collect_recording_candidates(
+    directory: &Path,
+    entries: impl Iterator<Item = Result<PathBuf, String>>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+        {
+            continue;
+        }
+        if files.len() == MAX_RECORDINGS {
+            return Err(format!(
+                "{}: expected 1..={MAX_RECORDINGS} JSONL recordings",
+                directory.display()
+            ));
+        }
+        files.push(entry);
+    }
     files.sort();
-    if !(1..=MAX_RECORDINGS).contains(&files.len()) {
+    if files.is_empty() {
         return Err(format!(
             "{}: expected 1..={MAX_RECORDINGS} JSONL recordings",
-            path.display()
+            directory.display()
         ));
     }
     Ok(files)
@@ -313,6 +332,14 @@ fn load_recording(path: &Path) -> Result<Recording, String> {
     for (line_index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
+        }
+        if samples.len() == header.frames {
+            return Err(format!(
+                "{}:{}: contains more records than declared {} frames",
+                path.display(),
+                line_index + 2,
+                header.frames
+            ));
         }
         let record: RecordedPose = serde_json::from_str(line).map_err(|error| {
             format!(
@@ -424,5 +451,32 @@ fn csv_cell(value: &str) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn gesturecap_directory_limit_stops_before_reading_later_entries() {
+        let yielded = Cell::new(0usize);
+        let entries = (0..=MAX_RECORDINGS + 1).map(|index| {
+            yielded.set(yielded.get() + 1);
+            if index > MAX_RECORDINGS {
+                Err("walked past the recording limit".to_string())
+            } else {
+                Ok(PathBuf::from(format!("{index:03}.jsonl")))
+            }
+        });
+
+        let error = collect_recording_candidates(Path::new("corpus"), entries).unwrap_err();
+
+        assert!(
+            error.contains("expected 1..=512 JSONL recordings"),
+            "{error}"
+        );
+        assert_eq!(yielded.get(), MAX_RECORDINGS + 1);
     }
 }

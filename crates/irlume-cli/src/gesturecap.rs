@@ -381,10 +381,17 @@ fn write_pose_jsonl(
 
 fn install_capture(output: &str, contents: &[u8]) -> irlume_common::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let io = |error: std::io::Error| irlume_common::Error::Io(error.to_string());
     let temporary = format!("{output}.tmp");
-    let mut file = std::fs::File::create(&temporary).map_err(io)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&temporary)
+        .map_err(io)?;
     file.write_all(contents).map_err(io)?;
     file.sync_all().map_err(io)?;
     std::fs::rename(&temporary, output).map_err(io)?;
@@ -664,6 +671,52 @@ fn csv_cell(value: &str) -> String {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn capture_install_is_owner_only_at_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "irlume-gesturecap-mode-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let output = directory.join("pose.jsonl");
+
+        install_capture(output.to_str().unwrap(), b"pose\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn capture_install_does_not_follow_a_precreated_temporary_symlink() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "irlume-gesturecap-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let output = directory.join("pose.jsonl");
+        let target = directory.join("outside");
+        std::fs::write(&target, b"sentinel\n").unwrap();
+        std::os::unix::fs::symlink(&target, format!("{}.tmp", output.display())).unwrap();
+
+        assert!(install_capture(output.to_str().unwrap(), b"pose\n").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"sentinel\n");
+        assert!(!output.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn camera_pair_digest_has_a_frozen_role_ordered_encoding() {

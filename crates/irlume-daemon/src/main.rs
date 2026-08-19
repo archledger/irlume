@@ -16,7 +16,8 @@
 //! flushes) run on their own threads. The serialization guarantee lives at
 //! the worker, not the process.
 
-use irlume_common::{Request, Response, SOCKET_PATH};
+use irlume_common::pam_service::ServiceKind;
+use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use zeroize::Zeroize;
@@ -2746,6 +2747,47 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
     Response::Error(format!("not authorized to {verb} '{user}'"))
 }
 
+/// Validate the PAM assertion before startup routing, worker queueing, or any
+/// camera path. The field carries no prompt bytes and is trusted only from a
+/// root peer for a recognized privileged service.
+fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
+    let Request::Authenticate {
+        service,
+        intent_confirmation,
+        ..
+    } = req
+    else {
+        return None;
+    };
+
+    let requires_confirmation = service
+        .as_deref()
+        .and_then(irlume_common::pam_service::classify)
+        .is_some_and(ServiceKind::requires_face_intent_confirmation);
+    let has_trusted_confirmation = peer.uid == 0
+        && matches!(
+            intent_confirmation,
+            Some(IntentAttestation::PamConversation)
+        );
+    let valid = if requires_confirmation {
+        has_trusted_confirmation
+    } else {
+        intent_confirmation.is_none()
+    };
+    if valid {
+        return None;
+    }
+
+    Some(Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: "privileged face authentication requires PAM conversation confirmation".into(),
+        declined_by_gesture: false,
+        refused_by_policy: true,
+    })
+}
+
 /// The gate every request passes before any arm runs, shared by the worker
 /// dispatch and the connection-thread status dispatch: the username the
 /// request names is screened for traversal, then the privilege the [`posture`]
@@ -2759,6 +2801,9 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
         if !valid_username(u) {
             return Some(Response::Error("invalid username".into()));
         }
+    }
+    if let Some(response) = intent_confirmation_gate(req, peer) {
+        return Some(response);
     }
     match posture.privilege {
         Privilege::AnyPeer => None,
@@ -5733,7 +5778,7 @@ mod tests {
         u, secret;
         Authenticate => Request::Authenticate {
             user: u(),
-            service: Some("sudo".into()),
+            service: Some("kde".into()),
             intent_confirmation: None,
         },
         Enroll => Request::Enroll {
@@ -6011,6 +6056,91 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// The service table decides whether conventional confirmation is required;
+    /// the peer credentials decide whether its typed assertion is trusted.
+    #[test]
+    fn privileged_auth_requires_root_pam_attestation() {
+        let _g = env_lock();
+        let root = peer(0);
+        let nobody = peer(NOBODY);
+        let auth = |service: Option<&str>, intent_confirmation| Request::Authenticate {
+            user: "root".into(),
+            service: service.map(str::to_string),
+            intent_confirmation,
+        };
+
+        for request in [
+            auth(Some("sudo"), Some(IntentAttestation::PamConversation)),
+            auth(Some("polkit-1"), Some(IntentAttestation::PamConversation)),
+            auth(Some("kde"), None),
+            auth(None, None),
+        ] {
+            assert!(
+                pregate(&request, &root).is_none(),
+                "valid request was refused: {request:?}"
+            );
+        }
+
+        for (request, request_peer) in [
+            (auth(Some("sudo"), None), &root),
+            (
+                auth(Some("sudo"), Some(IntentAttestation::PamConversation)),
+                &nobody,
+            ),
+            (auth(None, Some(IntentAttestation::PamConversation)), &root),
+            (
+                auth(Some("kde"), Some(IntentAttestation::PamConversation)),
+                &root,
+            ),
+        ] {
+            match pregate(&request, request_peer) {
+                Some(Response::AuthResult {
+                    granted,
+                    score,
+                    live,
+                    reason,
+                    declined_by_gesture,
+                    refused_by_policy,
+                }) => {
+                    assert!(!granted && !live && !declined_by_gesture);
+                    assert_eq!(score, 0.0);
+                    assert!(refused_by_policy);
+                    assert_eq!(
+                        reason,
+                        "privileged face authentication requires PAM conversation confirmation"
+                    );
+                }
+                other => panic!("invalid intent assertion was not typed refusal: {other:?}"),
+            }
+        }
+    }
+
+    /// Model startup cannot weaken the gate: an old PAM request missing the
+    /// field gets the same typed fallback before an engine or worker exists.
+    #[test]
+    fn startup_privileged_auth_refuses_missing_confirmation() {
+        let _g = env_lock();
+        let response = dispatch_before_engine(
+            Request::Authenticate {
+                user: "root".into(),
+                service: Some("sudo".into()),
+                intent_confirmation: None,
+            },
+            &peer(0),
+        );
+        assert!(matches!(
+            response,
+            Response::AuthResult {
+                granted: false,
+                score: 0.0,
+                live: false,
+                declined_by_gesture: false,
+                refused_by_policy: true,
+                ..
+            }
+        ));
     }
 
     /// The refusal has to name the thing the operator typed, not the wire
@@ -6414,6 +6544,156 @@ mod tests {
         assert_eq!(snapshot.events().len(), 1);
         arbiter.close();
         assert!(arbiter.take().is_none(), "snapshot must never queue");
+    }
+
+    /// Exercise the production socket route: invalid intent is a recorded typed
+    /// denial before the arbiter, while a root-attested privileged request
+    /// is the only one allowed to cross the worker boundary.
+    #[test]
+    fn intent_refusal_is_recorded_without_queue_or_camera() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationClass, ShareSafeEventKind};
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let _g = env_lock();
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let refused = arbiter::Arbiter::<Queued>::new();
+        refused.close();
+
+        for (request, request_peer) in [
+            (
+                Request::Authenticate {
+                    user: "root".into(),
+                    service: Some("sudo".into()),
+                    intent_confirmation: None,
+                },
+                peer(0),
+            ),
+            (
+                Request::Authenticate {
+                    user: "root".into(),
+                    service: Some("sudo".into()),
+                    intent_confirmation: Some(IntentAttestation::PamConversation),
+                },
+                peer(NOBODY),
+            ),
+        ] {
+            let mut wire = serde_json::to_string(&request).unwrap();
+            wire.push('\n');
+            let response = with_serve_as_peer_and_diagnostics(
+                &refused,
+                &ready,
+                &diagnostic_state,
+                request_peer,
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            );
+            match response {
+                Response::AuthResult {
+                    granted: false,
+                    score,
+                    live: false,
+                    reason,
+                    declined_by_gesture: false,
+                    refused_by_policy: true,
+                } => {
+                    assert_eq!(score, 0.0);
+                    assert_eq!(
+                        reason,
+                        "privileged face authentication requires PAM conversation confirmation"
+                    );
+                }
+                other => panic!("intent refusal changed shape: {other:?}"),
+            }
+        }
+        assert!(refused.take().is_none(), "intent refusals must never queue");
+
+        let events = || {
+            diagnostic_state
+                .snapshot(std::time::Duration::from_secs(60))
+                .events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ShareSafeEventKind::OperationFinished { outcome } => {
+                        Some((event.operation, outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            events(),
+            vec![
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+            ]
+        );
+
+        let authorized = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let authorized = std::sync::Arc::clone(&authorized);
+            std::thread::spawn(move || {
+                let job = authorized.take().expect("attested request queued");
+                let Queued {
+                    req,
+                    reply,
+                    link,
+                    scope,
+                    ..
+                } = job.payload;
+                assert!(matches!(
+                    req,
+                    Request::Authenticate {
+                        service: Some(ref service),
+                        intent_confirmation: Some(IntentAttestation::PamConversation),
+                        ..
+                    } if service == "sudo"
+                ));
+                assert!(link.claim());
+                let response = Response::Ok("queued".into());
+                scope.finish(categorical_outcome(&response));
+                link.released();
+                authorized.finish(job.class, job.uid);
+                reply.send(response).unwrap();
+            })
+        };
+        let request = Request::Authenticate {
+            user: "root".into(),
+            service: Some("sudo".into()),
+            intent_confirmation: Some(IntentAttestation::PamConversation),
+        };
+        let mut wire = serde_json::to_string(&request).unwrap();
+        wire.push('\n');
+        let response = with_serve_as_peer_and_diagnostics(
+            &authorized,
+            &ready,
+            &diagnostic_state,
+            peer(0),
+            |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            },
+        );
+        assert!(matches!(response, Response::Ok(ref message) if message == "queued"));
+        authorized.close();
+        worker.join().unwrap();
+        assert_eq!(
+            events(),
+            vec![
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (OperationClass::Authentication, CategoricalOutcome::Denied),
+                (
+                    OperationClass::Authentication,
+                    CategoricalOutcome::Completed,
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -8041,7 +8321,8 @@ mod tests {
                 Request::Authenticate {
                     user: "carol".into(),
                     service: Some(service.into()),
-                    intent_confirmation: None,
+                    intent_confirmation: (service == "sudo")
+                        .then_some(IntentAttestation::PamConversation),
                 },
                 &peer(0),
                 &mut e,

@@ -16,7 +16,7 @@
 //!   <det.onnx> <blaze.onnx> <mesh.onnx> <corpus_root> > out.csv
 
 use irlume_vision::align::RgbView;
-use irlume_vision::{BlazeRescue, Detector, FaceMesh, EAR_LEFT, EAR_RIGHT};
+use irlume_vision::{BlazeRescue, Detector, FaceMesh};
 use std::path::Path;
 
 fn read_ascii_header(data: &[u8], magic: &str) -> Option<(usize, usize, usize)> {
@@ -122,7 +122,7 @@ fn main() {
     let mut mesh = FaceMesh::load_from_file(mesh_p).expect("mesh");
 
     println!(
-        "segment,kind,frame,yunet_n,yunet_score,yunet_fsize,mesh_ok,ear_l,ear_r,span_x,span_y,\
+        "segment,kind,frame,yunet_n,yunet_score,yunet_fsize,mesh_ok,span_x,span_y,\
          blaze_score,blaze_fsize,mean"
     );
     let mut segs: Vec<_> = std::fs::read_dir(root)
@@ -175,14 +175,11 @@ fn main() {
                 .detect(&view)
                 .unwrap_or_else(|e| panic!("{seg_name}/{name}: YuNet inference failed: {e}"));
             let top = dets.iter().max_by(|a, b| a.score.total_cmp(&b.score));
-            let (mut mesh_ok, mut ear_l, mut ear_r, mut span_x, mut span_y) =
-                (false, None, None, None, None);
+            let (mut mesh_ok, mut span_x, mut span_y) = (false, None, None);
             if let Some(t) = top {
                 match mesh.landmarks(&view, &t.bbox, 0.25) {
                     Ok(lm) => {
                         mesh_ok = true;
-                        ear_l = Some(irlume_vision::eye_ear(&lm, &EAR_LEFT));
-                        ear_r = Some(irlume_vision::eye_ear(&lm, &EAR_RIGHT));
                         span_x = Some(central_span(lm.iter().map(|&(x, _)| x).collect()));
                         span_y = Some(central_span(lm.iter().map(|&(_, y)| y).collect()));
                     }
@@ -194,13 +191,11 @@ fn main() {
                 .unwrap_or_else(|e| panic!("{seg_name}/{name}: BlazeFace inference failed: {e}"));
             let kind = if name.starts_with("rgb") { "rgb" } else { "ir" };
             println!(
-                "{seg_name},{kind},{name},{},{},{},{},{},{},{},{},{},{},{mean:.1}",
+                "{seg_name},{kind},{name},{},{},{},{},{},{},{},{},{mean:.1}",
                 dets.len(),
                 fmt(top.map(|t| t.score)),
                 fmt(top.map(|t| t.bbox[2] - t.bbox[0])),
                 mesh_ok,
-                fmt(ear_l),
-                fmt(ear_r),
                 fmt(span_x),
                 fmt(span_y),
                 fmt(bl.map(|(_, s)| s)),

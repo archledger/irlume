@@ -16,7 +16,7 @@ fn held_concurrent_failure_is_returned_to_the_pair_owner() {
     let assess = function(
         &source,
         "    fn assess_full_with(",
-        "\n    fn run_passive_liveness(",
+        "\n    pub fn capture_pose_samples(",
     );
 
     assert!(assess.contains("CapturePathError::ConcurrentPair"));

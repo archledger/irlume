@@ -135,7 +135,7 @@ def frames():
                 kind = "empty-scene" if cond.startswith("empty") else "genuine"
                 yield (f"stage3-{cam}", kind, cond,
                        fp, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), "rgb")
-    # GENUINE RGB: blink corpus zenbook.
+    # GENUINE RGB: dated 2026-08-07 corpus, retained as a genuine-frame source.
     bc = RESEARCH / "2026-08-07-blink-corpus" / "zenbook"
     for cond in sorted(p.name for p in bc.iterdir() if p.is_dir()):
         for fp in sorted((bc / cond / "rgb").glob("*.ppm")):

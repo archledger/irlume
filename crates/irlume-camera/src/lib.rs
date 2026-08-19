@@ -5799,14 +5799,12 @@ pub fn capture_ir_streaming<B>(
     Ok(None)
 }
 
-/// Capture a time-ordered SEQUENCE of IR frames in a single stream session, for
-/// temporal liveness cues (per-frame head pose for the nod gesture, per-frame
-/// EAR for the eye-closure calibration). Unlike [`capture_ir`], the eyes-closed
-/// dip of a closure must survive, so this returns every sample rather than only
-/// the brightest. Each of `samples` frames is the brightest of a `burst`-frame
+/// Capture a time-ordered sequence of IR frames in a single stream session for
+/// temporal head-pose evidence. Unlike [`capture_ir`], head movement across the
+/// window must survive, so this returns every sample rather than only the
+/// brightest. Each of `samples` frames is the brightest of a `burst`-frame
 /// mini-burst: `burst=1` yields raw frames (to reveal whether the emitter
-/// strobes); `burst>=2` de-strobes locally while keeping enough temporal
-/// resolution for a blink (the IR node is ~15 fps, so a mini-burst of 2 ≈ 133 ms).
+/// strobes); `burst>=2` de-strobes locally while retaining temporal resolution.
 ///
 /// This keeps its own burst/de-strobe loop rather than delegating to
 /// [`capture_ir_streaming`], which delivers raw single frames; the consent
@@ -5978,14 +5976,13 @@ pub fn capture_ir_sequence(
     }
     // A short return is a CAPTURE fault, not a quiet fact about the scene: the
     // attempt budget ran out because frames arrived blown out or too
-    // slowly. Callers read this sequence as temporal evidence, so a silent
-    // shortfall reads downstream as "the user did not blink" when the truth is
-    // "the camera did not deliver a window to look at". Say so; the caller
-    // decides whether a partial window is still worth judging.
+    // slowly. Callers read this sequence as temporal head-pose evidence, so a
+    // silent shortfall leaves the downstream head-pose window incomplete. Say
+    // so; the caller decides whether a partial window is still worth judging.
     if frames.len() < samples {
         irlume_common::dlog!(
             "{device}: IR sequence delivered {}/{samples} frames in {max_attempts} attempts; \
-             temporal evidence is incomplete",
+             temporal head-pose evidence is incomplete",
             frames.len()
         );
     }

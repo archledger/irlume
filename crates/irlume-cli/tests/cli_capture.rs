@@ -2,7 +2,7 @@
 // Copyright the irlume contributors.
 
 //! Black-box tests of the IRLUME_DEV camera/benchmark subcommands (`capture`,
-//! `liveness`, `meshprobe`, `calcapture`, `padcapture`, `genuine`, `suncal`)
+//! `liveness`, `calcapture`, `padcapture`, `genuine`, `suncal`)
 //! against the v4l2loopback virtual-camera harness CI provides.
 //!
 //! The feeder nodes carry ffmpeg test patterns (YUYV 640x480 RGB, GREY 640x400
@@ -245,58 +245,6 @@ fn loopback_liveness_probe_gates_a_faceless_feed_as_not_live() {
     assert!(
         !out.contains("[GATE] Live"),
         "a faceless feed must never gate Live: {out}"
-    );
-}
-
-// ------------------------------------------------------------------ meshprobe
-
-#[test]
-#[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
-fn loopback_meshprobe_reports_spoof_when_no_eyes_are_found() {
-    let (rgb, ir) = loopback_pair();
-    let sb = Sandbox::new("meshprobe");
-    let det = model("face_detection_yunet_2023mar.onnx");
-    let mesh = model("face_landmark.onnx");
-    let (code, out, err) = run_timeboxed(
-        "meshprobe",
-        &mut sb.dev_cmd(
-            &[
-                "meshprobe",
-                "--det",
-                &det,
-                "--mesh",
-                &mesh,
-                "--ir",
-                &ir,
-                "--n",
-                "2",
-                "--burst",
-                "1",
-                "--reps",
-                "1",
-            ],
-            &rgb,
-            &ir,
-        ),
-    );
-    assert_eq!(code, 0, "a faceless run completes cleanly\n{out}\n{err}");
-    // No face in any IR frame means zero EAR samples; detect_blink maps that
-    // to NoEyes, which meshprobe prints as the Spoof verdict.
-    assert!(
-        out.contains("[rep  1/1]"),
-        "the single rep must report: {out}"
-    );
-    assert!(
-        out.contains("(n=0)"),
-        "no EAR samples on a faceless feed: {out}"
-    );
-    assert!(
-        out.contains("-> Spoof"),
-        "NoEyes maps to the Spoof verdict: {out}"
-    );
-    assert!(
-        !out.contains("[meshprobe] appended"),
-        "without --species/--kind/--out nothing is recorded: {out}"
     );
 }
 

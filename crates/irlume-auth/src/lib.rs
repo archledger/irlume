@@ -69,9 +69,8 @@ pub struct Engine {
     /// measurements yet. RGB-only matching stays; the dark path refuses with
     /// its own reason and falls back to the password.
     ir_matching: bool,
-    /// Optional MediaPipe FaceMesh: dense landmarks for the passive EAR blink
-    /// liveness (ADR-0002). Loaded iff the model file is present; `None` disables
-    /// the opt-in passive-liveness gate (it can't run without landmarks).
+    /// Optional MediaPipe FaceMesh: dense landmarks used to refine a BlazeFace
+    /// rescue box into alignment points. Loaded iff the model file is present.
     mesh: Option<irlume_vision::FaceMesh>,
     /// Optional BlazeFace short-range RESCUE detector: runs only when YuNet
     /// finds no face (saturated outdoor backgrounds; 2026-07-15 bench: 96.9%
@@ -495,23 +494,16 @@ fn completed_consent_take_hit(
     hit_in_loop: bool,
     allow_nod: bool,
     poses: &[irlume_liveness::PoseSample],
-    ears: &[irlume_liveness::EarSample],
-    closure_cal: Option<&irlume_liveness::ClosureCalibration>,
 ) -> bool {
-    hit_in_loop
-        || (allow_nod && head_consent_from_poses(poses) == HeadConsentVerdict::Approve)
-        || closure_cal.is_some_and(|cal| {
-            irlume_liveness::detect_deliberate_closure(ears, cal)
-                == irlume_liveness::BlinkResult::Blinked
-        })
+    hit_in_loop || (allow_nod && head_consent_from_poses(poses) == HeadConsentVerdict::Approve)
 }
 
 /// Resolve a consent watch's verdict from what the stream reported.
 ///
 /// `stream_hit` is `capture_ir_streaming`'s break value: `Some(true)` an accepted
-/// nod/closure, `Some(false)` a head-shake decline, `None` the budget ran out with
+/// nod, `Some(false)` a head-shake decline, `None` the budget ran out with
 /// no in-loop verdict. A `Some(_)` outcome is TERMINAL and returned as-is; the
-/// decline in particular must never be re-examined, or a completed-take nod/closure
+/// decline in particular must never be re-examined, or a completed-take nod
 /// reading would overturn it into a grant. `completed_take_hit` is consulted, and
 /// evaluated, ONLY for `None`: it is what closes the trailing-poses boundary the
 /// in-loop cadence leaves (#101). Kept pure so a test can prove a decline stays a
@@ -2733,10 +2725,9 @@ impl Engine {
         )
     }
 
-    /// Load MediaPipe FaceMesh for detection-rescue alignment and the retained
-    /// explicit EAR calibration/diagnostic captures. Head consent does not use
-    /// this model. If the file is absent this is a no-op; the mesh-dependent
-    /// rescue and diagnostic paths are skipped, so face auth keeps working.
+    /// Load MediaPipe FaceMesh for detection-rescue alignment. Head consent does
+    /// not use this model. If the file is absent this is a no-op; the
+    /// mesh-dependent rescue path is skipped, so face auth keeps working.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_mesh(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
@@ -2748,9 +2739,8 @@ impl Engine {
     /// [`Self::with_mesh`], except a LOAD failure leaves the mesh off and
     /// hands the error back beside the engine instead of consuming it, so the
     /// caller can apply its own policy (the daemon degrades outside strict
-    /// mode: head consent needs no mesh, and killing the daemon over a retained
-    /// rescue/diagnostic model would turn "optional paths off" into "face auth
-    /// dead").
+    /// mode: head consent needs no mesh, and killing the daemon over an optional
+    /// rescue model would turn "rescue off" into "face auth dead").
     #[must_use]
     pub fn with_mesh_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
         if std::path::Path::new(path).exists() {
@@ -2853,6 +2843,8 @@ impl Engine {
         if lm.len() < irlume_vision::MESH_N {
             return None;
         }
+        const RESCUE_LEFT_EYE_RING: [usize; 6] = [33, 160, 158, 133, 153, 144];
+        const RESCUE_RIGHT_EYE_RING: [usize; 6] = [362, 385, 387, 263, 373, 380];
         let center = |idx: &[usize; 6]| {
             let (mut x, mut y) = (0.0f32, 0.0f32);
             for &i in idx {
@@ -2861,8 +2853,8 @@ impl Engine {
             }
             (x / 6.0, y / 6.0)
         };
-        let e1 = center(&irlume_vision::EAR_LEFT);
-        let e2 = center(&irlume_vision::EAR_RIGHT);
+        let e1 = center(&RESCUE_LEFT_EYE_RING);
+        let e2 = center(&RESCUE_RIGHT_EYE_RING);
         let (le, re) = if e1.0 <= e2.0 { (e1, e2) } else { (e2, e1) };
         let (m1, m2) = (lm[61], lm[291]);
         let (ml, mr) = if m1.0 <= m2.0 { (m1, m2) } else { (m2, m1) };
@@ -4016,107 +4008,11 @@ impl Engine {
         })
     }
 
-    /// Passive blink liveness (opt-in, ADR-0002): capture a short IR sequence and
-    /// look for a NATURAL blink via EAR: no prompt, no deliberate action. Per frame
-    /// we run FaceMesh (from the detected face crop) and take the smaller eye's EAR;
-    /// [`irlume_liveness::detect_blink`] then finds a dip below the open baseline. A
-    /// static print holds EAR flat and never dips. Live-validated 2026-07-01: genuine
-    /// natural blink → Blinked, static vinyl banner → NoBlink.
-    // Production-dead since the blink `require_challenge` gate was removed (nod/
-    // shake supersede it). Kept for its tests and because it is the worked
-    // example of the EAR path `capture_ear_samples` drives.
-    #[allow(dead_code)]
-    fn run_passive_liveness(&mut self) -> irlume_common::Result<irlume_liveness::BlinkResult> {
-        // ~5s window at the raw ~15 fps rate.
-        const SAMPLES: usize = 75;
-        // No landmark model → no samples → `detect_blink` reads NoEyes, which is
-        // the historical no-mesh result (the caller decides what to do with it).
-        let samples = self.capture_ear_samples(SAMPLES)?;
-        // A window this short is a capture fault, not evidence about the user:
-        // the camera returned frozen or unusable frames until the attempt budget
-        // ran out. Judging it would report "no blink" for a hardware problem, so
-        // separate the two in the log; the verdict itself stays fail-closed
-        // because too few samples cannot show a dip either way.
-        if !samples.is_empty() && samples.len() < SAMPLES / 3 {
-            irlume_common::dlog!(
-                "liveness(blink): only {}/{SAMPLES} usable frames arrived; treating as \
-                 inconclusive capture, not as a missing blink",
-                samples.len()
-            );
-        }
-        Ok(irlume_liveness::detect_blink(&samples))
-    }
-
-    /// Capture a temporal IR sequence and compute the per-frame [`irlume_liveness::EarSample`]s
-    /// that the blink / deliberate-closure detectors consume. Public so the
-    /// blink-tuning capture tool records the EXACT samples the live gate sees.
-    ///
-    /// Raw frame rate (~15 fps, no de-strobe burst): the detector separates
-    /// emitter-lit from ambient-only frames itself, and a ~150 ms natural blink
-    /// spans only 2-3 raw frames; halving the rate loses it (measured
-    /// 2026-07-01). Frames with no detected face carry `ear = None` (a missed
-    /// detection must not masquerade as a blink) but keep their brightness so the
-    /// detector can classify the emitter strobe. Returns an empty vec when the
-    /// FaceMesh model is not loaded (the gate cannot run).
-    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: the `self.mesh.is_none()` guard above returns early, \
-                  so `expect(\"mesh present\")` runs only when it is Some"
-    )]
-    pub fn capture_ear_samples(
-        &mut self,
-        samples: usize,
-    ) -> irlume_common::Result<Vec<irlume_liveness::EarSample>> {
-        if self.mesh.is_none() {
-            return Ok(Vec::new());
-        }
-        let frames = irlume_camera::capture_ir_sequence(&self.ir_dev, samples, 1)?;
-        let mesh = self.mesh.as_mut().expect("mesh present (checked above)");
-        let mut out = Vec::with_capacity(frames.len());
-        for (i, f) in frames.iter().enumerate() {
-            let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
-            let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
-            let view = align::RgbView {
-                data: &grey_rgb,
-                width: f.width,
-                height: f.height,
-            };
-            let mut ear = None;
-            let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
-            let faces = self.det.detect(&view)?;
-            if let Some(t) = top_detection(&faces) {
-                cx = (t.bbox[0] + t.bbox[2]) * 0.5;
-                cy = (t.bbox[1] + t.bbox[3]) * 0.5;
-                fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
-                // A mesh refusal is one MISSING observation (ear stays None),
-                // never an abort: `?` here turned a single refused frame into
-                // the loss of the whole capture window.
-                if let Some(e) = irlume_vision::mesh_min_ear(mesh, &view, &t.bbox) {
-                    ear = Some(e);
-                    // Corneal specular contrast from the IR frame at the eye
-                    // landmarks (the second liveness cue: collapses on a real blink).
-                    contrast = eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
-                }
-            }
-            out.push(irlume_liveness::EarSample {
-                idx: i,
-                ear,
-                bri,
-                cx,
-                cy,
-                fsize,
-                contrast,
-            });
-        }
-        Ok(out)
-    }
-
     /// Capture a temporal IR sequence and record per-frame HEAD POSE (pitch and
     /// yaw from the DETECTOR's 5-point landmarks) for the head-nod consent
-    /// gesture. Needs only the detector, not the FaceMesh, so it works at head
-    /// angles and in IR-only light where the eye-based EAR gesture collapses. A
-    /// frame with no detected face carries `None` pose.
+    /// gesture. Needs only the detector, not the FaceMesh, so it works across
+    /// head angles and in IR-only light. A frame with no detected face carries
+    /// `None` pose.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn capture_pose_samples(
         &mut self,
@@ -4398,12 +4294,9 @@ impl Engine {
         // No gesture is demanded here. Releasing the keyring with no nod is the
         // DEFAULT now (a greeter cold login and logout release after the face
         // match; the gesture is intent, not the anti-print layer, so there is
-        // nothing to warn about on every release). The blink `require_challenge`
-        // gate is gone; the consent gesture gate above covers the AppConsent and
-        // CredentialRelease paths when their policy asks for it, and the Verify
-        // path is gated per service. `capture_ear_samples` stays for the closure
-        // calibration and `run_passive_liveness` is production-dead (its own
-        // doc says why it is kept).
+        // nothing to warn about on every release). The consent gesture gate
+        // above covers the AppConsent and CredentialRelease paths when their
+        // policy asks for it, and the Verify path is gated per service.
         Ok(outcome)
     }
 
@@ -7116,55 +7009,6 @@ pub fn eye_glint_of(
     }
 }
 
-/// Specular contrast at the eyes = peak − local-mean brightness, max over both
-/// eyes. A live OPEN eye makes a sharp corneal specular spike (high contrast); a
-/// CLOSED lid (or a printed/vinyl "eye") is diffuse (low). This is the basis of
-/// the ADR-0002 blink challenge and has far better SNR than raw peak glint: a
-/// closed lid still reflects 850nm, so peak alone barely drops, but the specular
-/// spike (hence contrast) collapses. Live-validated 2026-06-30: genuine open-eye
-/// contrast ≈120, a static vinyl banner ≈70 (flat).
-pub fn eye_glint_contrast(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
-    // See eye_glint: guard the w*h invariant so a truncated IR frame returns 0.0
-    // (flat contrast, fail-closed) rather than indexing past the slice.
-    if grey.len() < (w as usize).saturating_mul(h as usize) {
-        return 0.0;
-    }
-    // Whole-set rule, same as eye_glint: one unplaceable eye means the set's
-    // producer got it wrong, and `.max()` over the two eyes would let the
-    // valid one vouch for it (#293 review).
-    if !landmarks[0..2]
-        .iter()
-        .all(|&(x, y)| x.is_finite() && y.is_finite())
-    {
-        return 0.0;
-    }
-    let iod = ((landmarks[1].0 - landmarks[0].0).powi(2)
-        + (landmarks[1].1 - landmarks[0].1).powi(2))
-    .sqrt();
-    let r = (iod * 0.20).max(2.0) as i32;
-    let at = |(ex, ey): (f32, f32)| -> f32 {
-        let (cx, cy) = (ex as i32, ey as i32);
-        let (mut peak, mut sum, mut cnt) = (0u8, 0u64, 0u64);
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let (x, y) = (cx + dx, cy + dy);
-                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-                    let v = grey[(y as u32 * w + x as u32) as usize];
-                    peak = peak.max(v);
-                    sum += v as u64;
-                    cnt += 1;
-                }
-            }
-        }
-        if cnt == 0 {
-            0.0
-        } else {
-            peak as f32 - sum as f32 / cnt as f32
-        }
-    };
-    at(landmarks[0]).max(at(landmarks[1]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9115,13 +8959,10 @@ mod tests {
         // Rust's saturating float→int cast turns NaN into 0, so before the
         // finite guards a NaN eye sampled pixel (0,0). With a bright corner
         // (emitter bloom is a realistic stand-in) the probe measured
-        // eye_glint=255 from landmarks that do not exist. Both glint cues must
+        // eye_glint=255 from landmarks that do not exist. The glint cue must
         // fail closed instead.
         let (mut grey, _) = ir_frame_with_glints(false, false);
         // A SPIKE over darker neighbors, not a uniform block: the contrast
-        // cue is peak minus local mean, so a uniform corner reads 0.0 with or
-        // without the guard and the assertion below would not discriminate
-        // (the mutant that removes the guard survived exactly that way).
         for y in 0..4u32 {
             for x in 0..4u32 {
                 grey[(y * 64 + x) as usize] = 60;
@@ -9130,8 +8971,7 @@ mod tests {
         grey[0] = 255;
         let nan: Landmarks5 = [(f32::NAN, f32::NAN); 5];
         assert_eq!(eye_glint(&grey, 64, 48, &nan), 0.0);
-        assert_eq!(eye_glint_contrast(&grey, 64, 48, &nan), 0.0);
-        // One placeable eye is still not enough: the glint helpers score the
+        // One placeable eye is still not enough: the glint helper scores the
         // whole set 0.0 rather than letting the valid eye vouch
         // for a set whose producer emitted a non-finite point (#293 review:
         // per-eye skipping let a bright valid eye carry the score). The
@@ -9146,24 +8986,10 @@ mod tests {
         bright[0] = 255;
         let one: Landmarks5 = [lm[0], (f32::NAN, 20.0), lm[2], lm[3], lm[4]];
         assert_eq!(eye_glint(&bright, 64, 48, &one), 0.0);
-        assert_eq!(eye_glint_contrast(&bright, 64, 48, &one), 0.0);
-    }
-
-    #[test]
-    fn eye_glint_contrast_collapses_without_a_specular_spike() {
-        // Sharp corneal spike on a diffuse background: high contrast.
-        let (grey, lm) = ir_frame_with_glints(true, true);
-        let sharp = eye_glint_contrast(&grey, 64, 48, &lm);
-        assert!(sharp > 100.0, "specular contrast {sharp}");
-        // Uniform lid/print: peak == mean -> contrast 0.
-        let (flat, lm) = ir_frame_with_glints(false, false);
-        let dull = eye_glint_contrast(&flat, 64, 48, &lm);
-        assert_eq!(dull, 0.0);
-        assert!(sharp > dull, "blink/liveness signal must be monotonic");
     }
 
     /// A truncated IR frame (buffer shorter than w*h, from a driver reporting a
-    /// short sizeimage) must degrade both glint cues to 0.0, not panic the root
+    /// short sizeimage) must degrade the glint cue to 0.0, not panic the root
     /// daemon on an out-of-bounds index. The landmarks sit deep in the frame, so
     /// an unguarded index would run past the short slice.
     #[test]
@@ -9171,7 +8997,6 @@ mod tests {
         let (grey, lm) = ir_frame_with_glints(true, true);
         let short = &grey[..grey.len() / 4]; // buffer well under w*h
         assert_eq!(eye_glint(short, 64, 48, &lm), 0.0);
-        assert_eq!(eye_glint_contrast(short, 64, 48, &lm), 0.0);
     }
 }
 
@@ -10484,16 +10309,6 @@ mod engine_tests {
     }
 
     #[test]
-    fn passive_liveness_without_mesh_reports_no_eyes() {
-        let _g = env_guard();
-        let mut s = shared();
-        let mesh = s.engine.mesh.take();
-        let r = s.engine.run_passive_liveness().unwrap();
-        assert_eq!(r, irlume_liveness::BlinkResult::NoEyes);
-        s.engine.mesh = mesh;
-    }
-
-    #[test]
     fn rescue_detect_declines_faceless_frames_and_missing_models() {
         let _g = env_guard();
         let mut s = shared();
@@ -10860,7 +10675,7 @@ mod engine_tests {
         );
         // The full take carries the gesture, and the completed-take evaluation
         // must find it even though no in-loop check fired.
-        assert!(completed_consent_take_hit(false, true, &poses, &[], None));
+        assert!(completed_consent_take_hit(false, true, &poses));
         // Removing the completed-take evaluation reduces the decision to
         // hit_in_loop, which is false here: that is the observation that
         // fails if the fix is reverted.
@@ -10869,12 +10684,12 @@ mod engine_tests {
     #[test]
     fn completed_take_respects_the_gesture_inputs() {
         let poses = boundary_poses();
-        // With the nod disallowed and no closure calibration, the same series
+        // With the nod disallowed, the same series
         // must NOT satisfy the gate: the final evaluation widens coverage of
         // the take, never the set of accepted gestures.
-        assert!(!completed_consent_take_hit(false, false, &poses, &[], None));
+        assert!(!completed_consent_take_hit(false, false, &poses));
         // An in-loop hit stands on its own, whatever the series holds.
-        assert!(completed_consent_take_hit(true, false, &[], &[], None));
+        assert!(completed_consent_take_hit(true, false, &[]));
     }
 
     #[test]
@@ -10889,46 +10704,6 @@ mod engine_tests {
                 bri: 60.0,
             })
             .collect();
-        assert!(!completed_consent_take_hit(false, true, &poses, &[], None));
-    }
-
-    /// The CLOSURE operand of the completed-take evaluation, which every other
-    /// completed_take_* test leaves unexercised by passing `None` for closure_cal
-    /// (pattern #75/#28). A closure-calibrated user whose eyes stayed OPEN made no
-    /// gesture, so the take must NOT fire; the fail-open mutant that drops the
-    /// `== Blinked` check (`is_some_and` -> `is_some`) returns true here and is
-    /// caught. This would otherwise release the sealed credential to a user who
-    /// never closed their eyes.
-    #[test]
-    fn completed_take_closure_operand_needs_an_actual_closure() {
-        let cal = irlume_liveness::ClosureCalibration {
-            ear_open: 0.30,
-            ear_closed: 0.05,
-        };
-        assert!(
-            cal.is_usable(),
-            "the calibration must be usable or the operand is skipped upstream"
-        );
-        // Eyes open the whole take: no closure, so no deliberate-closure gesture.
-        let open: Vec<irlume_liveness::EarSample> = (0..20)
-            .map(|idx| irlume_liveness::EarSample {
-                idx,
-                ear: Some(0.30),
-                bri: 60.0,
-                cx: 0.5,
-                cy: 0.5,
-                fsize: 0.3,
-                contrast: 40.0,
-            })
-            .collect();
-        assert_ne!(
-            irlume_liveness::detect_deliberate_closure(&open, &cal),
-            irlume_liveness::BlinkResult::Blinked,
-            "open eyes are not a closure gesture (test premise)"
-        );
-        assert!(
-            !completed_consent_take_hit(false, false, &[], &open, Some(&cal)),
-            "a usable calibration with no closure must not satisfy the take"
-        );
+        assert!(!completed_consent_take_hit(false, true, &poses));
     }
 }

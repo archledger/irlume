@@ -79,7 +79,6 @@ const DEV_CMDS: &[&str] = &[
     "gesturecap",
     "normprobe",
     "liveness",
-    "meshprobe",
     "selftest",
     "padcapture",
     "padreport",
@@ -157,7 +156,6 @@ fn main() -> std::process::ExitCode {
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("suncal"), _) => suncal::run(&args),
         (Some("liveness"), _) => liveness_probe(&args),
-        (Some("meshprobe"), _) => meshprobe(&args),
         (Some("enroll"), _) => enroll(&args),
         // Matched on PRESENCE of the subcommand, not on its position. Binding it
         // to args[1] meant a flag before it displaced it: `profiles --contract 9
@@ -2358,161 +2356,6 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("liveness probe error: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// `irlume meshprobe --det <yunet> --mesh <face_landmark.onnx> [--rgb ..] [--ir ..] [--n 30] [--burst 2]`
-/// Diagnostic for the ADR-0002 passive-EAR liveness (MediaPipe FaceMesh). First a
-/// single RGB frame as a sanity check (does the mesh give a sane open-eye EAR ~0.3
-/// at all?), then an IR sequence to see whether EAR survives the RGB→IR domain gap
-/// and whether a natural blink shows. Blink naturally a couple times during the IR
-/// capture.
-fn meshprobe(args: &[String]) -> std::process::ExitCode {
-    let ir_dev = flag(args, "--ir").unwrap_or(irlume_camera::DEFAULT_IR_DEVICE);
-    let (Some(det_path), Some(mesh_path)) = (flag(args, "--det"), flag(args, "--mesh")) else {
-        eprintln!("usage: irlume meshprobe --det <yunet.onnx> --mesh <face_landmark.onnx> [--ir ..] [--n 40] [--burst 2] [--reps 1]");
-        eprintln!("  to record a PAD-style validation run: --species NAME --kind bonafide|attack --out ear.jsonl");
-        return std::process::ExitCode::from(2);
-    };
-    let n: usize = flag(args, "--n").and_then(|s| s.parse().ok()).unwrap_or(75);
-    let burst: usize = flag(args, "--burst")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let reps: usize = flag(args, "--reps")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let trace_on = args.iter().any(|a| a == "--trace");
-    // Optional recording (reuses the padreport JSONL format: Blinked→Live,
-    // NoBlink→Uncertain/non-response, NoEyes→Spoof).
-    let record = match (
-        flag(args, "--species"),
-        flag(args, "--kind"),
-        flag(args, "--out"),
-    ) {
-        (Some(s), Some(k), Some(o)) => Some((s.to_string(), k.to_string(), o.to_string())),
-        _ => None,
-    };
-    let run = || -> irlume_common::Result<usize> {
-        use std::io::Write;
-        let mut det = irlume_vision::Detector::load_from_file(det_path)?;
-        let mut mesh = irlume_vision::FaceMesh::load_from_file(mesh_path)?;
-        let mut out_file = match &record {
-            Some((_, _, o)) => Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(o)
-                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?,
-            ),
-            None => None,
-        };
-        let mut written = 0usize;
-        for rep in 0..reps {
-            let frames = irlume_camera::capture_ir_sequence(ir_dev, n, burst)?;
-            let mut ears: Vec<f32> = Vec::new();
-            // Per-frame corneal-specular CONTRAST (the candidate 2nd cue): peak eye
-            // contrast over the window. Banner ≤70, no-glasses live ~120; the open
-            // question is where glasses-genuine lands (does it clear the floor?).
-            let mut contrast_max = 0.0f32;
-            // Full EarSample stream (index + EAR-if-face + frame brightness): the
-            // brightness column doubles as an emitter duty-cycle probe in dark rooms.
-            let mut samples: Vec<irlume_liveness::EarSample> = Vec::new();
-            for (i, f) in frames.iter().enumerate() {
-                let bri =
-                    f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
-                let ir_rgb = irlume_camera::grey_to_rgb(&f.data);
-                let iv = irlume_vision::align::RgbView {
-                    data: &ir_rgb,
-                    width: f.width,
-                    height: f.height,
-                };
-                let mut ear_i = None;
-                let (mut cx, mut cy, mut fsize, mut contrast) = (0.0, 0.0, 0.0, 0.0);
-                if let Some(t) = det
-                    .detect(&iv)?
-                    .into_iter()
-                    .max_by(|a, b| a.score.total_cmp(&b.score))
-                {
-                    let lm = mesh.landmarks(&iv, &t.bbox, 0.25)?;
-                    let ear = irlume_vision::eye_ear(&lm, &irlume_vision::EAR_LEFT)
-                        .min(irlume_vision::eye_ear(&lm, &irlume_vision::EAR_RIGHT));
-                    ears.push(ear);
-                    ear_i = Some(ear);
-                    contrast =
-                        irlume_auth::eye_glint_contrast(&f.data, f.width, f.height, &t.landmarks);
-                    contrast_max = contrast_max.max(contrast);
-                    cx = (t.bbox[0] + t.bbox[2]) * 0.5;
-                    cy = (t.bbox[1] + t.bbox[3]) * 0.5;
-                    fsize = (t.bbox[2] - t.bbox[0]).max(0.0);
-                }
-                samples.push(irlume_liveness::EarSample {
-                    idx: i,
-                    ear: ear_i,
-                    bri,
-                    cx,
-                    cy,
-                    fsize,
-                    contrast,
-                });
-            }
-            if trace_on {
-                for s in &samples {
-                    match s.ear {
-                        Some(e) => {
-                            println!("    trace {:>3}  ear {e:.3}  bri {:>5.1}", s.idx, s.bri)
-                        }
-                        None => println!(
-                            "    trace {:>3}  ear   -    bri {:>5.1}  (no face)",
-                            s.idx, s.bri
-                        ),
-                    }
-                }
-            }
-            let verdict = irlume_liveness::detect_blink(&samples);
-            let (vs, live) = match verdict {
-                irlume_liveness::BlinkResult::Blinked => ("Live", true),
-                irlume_liveness::BlinkResult::NoBlink => ("Uncertain", false),
-                irlume_liveness::BlinkResult::NoEyes => ("Spoof", false),
-            };
-            let (mut mn, mut mx) = (1.0f32, 0.0f32);
-            for &e in &ears {
-                mn = mn.min(e);
-                mx = mx.max(e);
-            }
-            let flag_note = match (&record, live) {
-                (Some((_, k, _)), true) if k == "attack" => " ‼ ACCEPTED (breach!)",
-                (Some((_, k, _)), false) if k == "bonafide" => " ✗ live user not confirmed",
-                _ => "",
-            };
-            let (_, mot_med, _) = irlume_liveness::face_speeds(&samples);
-            let (open_c, dip_c) = irlume_liveness::contrast_signature(&samples);
-            let drop = if dip_c > 0.0 { open_c / dip_c } else { 0.0 };
-            println!("  [rep {:>2}/{reps}] EAR open {mx:.3} min {mn:.3}  contrast open {open_c:>4.0} dip {dip_c:>4.0} drop {drop:.2}  motion med {mot_med:.3}  (n={}) -> {vs}{flag_note}", rep + 1, ears.len());
-            if let (Some(f), Some((sp, kind, _))) = (out_file.as_mut(), &record) {
-                let rec = serde_json::json!({
-                    "species": sp, "kind": kind, "path": "ear", "idx": rep,
-                    "verdict": vs, "reason": format!("passive EAR ({verdict:?})"),
-                    "ear_open": json_f32(mx), "ear_min": json_f32(mn), "ear_samples": ears.len(),
-                    "contrast_max": json_f32(contrast_max),
-                    "caught": Vec::<String>::new(),
-                });
-                writeln!(f, "{rec}").map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-                written += 1;
-            }
-        }
-        Ok(written)
-    };
-    match run() {
-        Ok(w) => {
-            if let Some((_, _, o)) = &record {
-                println!("[meshprobe] appended {w} presentations to {o}; run `irlume padreport --in {o}`");
-            }
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("meshprobe error: {e}");
             std::process::ExitCode::FAILURE
         }
     }

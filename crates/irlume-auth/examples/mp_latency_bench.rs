@@ -12,7 +12,7 @@
 //! Usage: cargo run --release -p irlume-auth --example mp_latency_bench -- \
 //!   <yunet.onnx> <face_landmark.onnx> <blaze_face_short_range.onnx> \
 //!   <blaze_face_short_range.tflite> <blaze_face_full_range.tflite> \
-//!   <face_landmarks_detector.tflite> <face_blendshapes.tflite> <frame.ppm>
+//!   <face_landmarks_detector.tflite> <frame.ppm>
 
 use irlume_vision::align::RgbView;
 use irlume_vision::blaze_full::FullRangeBlaze;
@@ -34,8 +34,6 @@ const NATIVE_BLAZE_SHA256: &str =
     "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f";
 const LANDMARKER_MESH_SHA256: &str =
     "c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5";
-const BLENDSHAPES_SHA256: &str = "4f36dded049db18d76048567439b2a7f58f1daabc00d78bfe8f3ad396a2d2082";
-
 const MESH_MARGIN: f32 = 0.25;
 const WARMUP: usize = 10;
 const ITERS: usize = 100;
@@ -144,13 +142,13 @@ fn native_mesh_run(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [yunet_path, mesh_onnx_path, blaze_onnx_path, blaze_tfl_path, full_tfl_path, mesh_tfl_path, blend_tfl_path, frame_path] =
+    let [yunet_path, mesh_onnx_path, blaze_onnx_path, blaze_tfl_path, full_tfl_path, mesh_tfl_path, frame_path] =
         args.as_slice()
     else {
         panic!(
             "usage: mp_latency_bench <yunet.onnx> <face_landmark.onnx> \
              <blaze_short.onnx> <blaze_short.tflite> <blaze_full_range.tflite> \
-             <face_landmarks_detector.tflite> <face_blendshapes.tflite> <frame.ppm>"
+             <face_landmarks_detector.tflite> <frame.ppm>"
         );
     };
 
@@ -176,7 +174,6 @@ fn main() {
     let full_bytes = std::fs::read(full_tfl_path).expect("read fullrange");
     let mut full = FullRangeBlaze::from_pinned_bytes(&full_bytes).expect("load fullrange");
     let mesh_tfl_bytes = std::fs::read(mesh_tfl_path).expect("read tflite mesh");
-    let blend_bytes = std::fs::read(blend_tfl_path).expect("read blendshapes");
 
     // The frame must actually carry a face: a mesh timed on a non-face crop
     // or a detector timed into its miss path measures a different code path.
@@ -244,7 +241,6 @@ fn main() {
             .expect("onnx mesh");
         assert!(!lm.is_empty());
     });
-    let mut mesh_for_blend = None;
     for threads in [1i32, 2, 4] {
         let mut s =
             TfliteSession::from_pinned_bytes(&mesh_tfl_bytes, LANDMARKER_MESH_SHA256, threads)
@@ -261,40 +257,5 @@ fn main() {
                 assert!(lm.len() >= MESH_N_IRIS);
             },
         );
-        if mesh_for_blend.is_none() {
-            mesh_for_blend = Some(native_mesh_run(&mut s, mesh_side, &view, &top.bbox));
-        }
     }
-    let lm = mesh_for_blend.expect("mesh landmarks for blendshapes");
-    let mut blend = TfliteSession::from_pinned_bytes(&blend_bytes, BLENDSHAPES_SHA256, 1)
-        .expect("load blendshapes");
-    // Same 146-subset order as blendshapes_probe.
-    const SUBSET: [usize; 146] = [
-        0, 1, 4, 5, 6, 7, 8, 10, 13, 14, 17, 21, 33, 37, 39, 40, 46, 52, 53, 54, 55, 58, 61, 63,
-        65, 66, 67, 70, 78, 80, 81, 82, 84, 87, 88, 91, 93, 95, 103, 105, 107, 109, 127, 132, 133,
-        136, 144, 145, 146, 148, 149, 150, 152, 153, 154, 155, 157, 158, 159, 160, 161, 162, 163,
-        168, 172, 173, 176, 178, 181, 185, 191, 195, 197, 234, 246, 249, 251, 263, 267, 269, 270,
-        276, 282, 283, 284, 285, 288, 291, 293, 295, 296, 297, 300, 308, 310, 311, 312, 314, 317,
-        318, 321, 323, 324, 332, 334, 336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379,
-        380, 381, 382, 384, 385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454,
-        466, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
-    ];
-    bench("blendshapes", "face_blendshapes", "tflite", 1, || {
-        // Input construction is per-frame work in production, so it stays
-        // inside the timed closure (#314 review: the module contract says
-        // preprocessing included, and the upstream graph rebuilds this
-        // tensor on every invocation).
-        let mut input = Vec::with_capacity(SUBSET.len() * 2);
-        for &i in &SUBSET {
-            input.push(lm[i].0);
-            input.push(lm[i].1);
-        }
-        let outputs = blend.run_f32(&input).expect("blendshapes");
-        let s = outputs
-            .iter()
-            .map(|(_, d)| d)
-            .find(|d| d.len() == 52)
-            .expect("52 scores");
-        assert!(s.iter().all(|v| v.is_finite()));
-    });
 }

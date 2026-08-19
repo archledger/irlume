@@ -242,6 +242,14 @@ fn retired_closure_calibration_is_not_dispatched() {
 }
 
 #[test]
+fn retired_meshprobe_is_not_dispatched() {
+    let sandbox = Sandbox::new("retired-meshprobe");
+    let (code, _, stderr) = run(sandbox.cmd(&["meshprobe"]).env("IRLUME_DEV", "1"));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("unknown command 'meshprobe'"), "{stderr}");
+}
+
+#[test]
 fn unknown_command_errors_with_exit_2() {
     let sb = Sandbox::new("unknown");
     let (code, _, err) = run(&mut sb.cmd(&["frobnicate"]));
@@ -264,7 +272,6 @@ const DEV_CMDS: &[&str] = &[
     "gesturecap",
     "normprobe",
     "liveness",
-    "meshprobe",
     "selftest",
     "padcapture",
     "padreport",
@@ -312,7 +319,6 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         ),
         (&["normprobe"], 2, "usage: irlume normprobe --dir"),
         (&["liveness"], 2, "usage: irlume liveness --det"),
-        (&["meshprobe"], 2, "usage: irlume meshprobe --det"),
         (&["verify"], 2, "usage: irlume verify --user U --det"),
         (&["enrolldev"], 2, "usage: irlume enrolldev --user U --det"),
         (&["padcapture"], 2, "usage: irlume padcapture --species"),

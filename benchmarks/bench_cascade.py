@@ -8,9 +8,7 @@ What changed in irlume and what this measures:
      the Rust implementation exactly (same anchors, letterbox, clip).
   2. Mesh swap: the shipped face_landmark.onnx is now the 256px/478pt
      generation. Measures eye NME on CBSR (YuNet-bbox crop, the shipped
-     pipeline shape) old vs new, and the EAR distribution shift on
-     open-eyed burst frames (passive-blink thresholds were calibrated on
-     the old mesh; a large shift would need re-validation).
+     pipeline shape) old vs new.
 
 Usage: ~/mp-venv/bin/python bench_cascade.py --out bench_cascade.json
 """
@@ -41,8 +39,6 @@ SUNCAL_GROUPS = {
 }
 RIGHT_EYE = [33, 133, 160, 159, 158, 144, 145, 153]
 LEFT_EYE = [362, 263, 387, 386, 385, 373, 374, 380]
-EAR_LEFT = [33, 160, 158, 133, 153, 144]
-EAR_RIGHT = [362, 385, 387, 263, 373, 380]
 
 
 def lit_frames(d):
@@ -166,14 +162,6 @@ def eye_nme_pts(pts, gt_le, gt_re):
     return float(d / iod)
 
 
-def ear(pts, idx):
-    d = lambda a, b: float(np.hypot(*(pts[a] - pts[b])))
-    horiz = d(idx[0], idx[3])
-    if horiz < 1e-6:
-        return 0.0
-    return (d(idx[1], idx[5]) + d(idx[2], idx[4])) / (2 * horiz)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=Path("bench_cascade.json"))
@@ -216,7 +204,6 @@ def main():
     names = sorted(gt)[::4]
     for tag, m in meshes.items():
         nmes = []
-        ears = []
         for nm in names:
             img = cv2.imread(str(CBSR / "NIR_face_dataset" / "NIR_face_dataset" / nm))
             if img is None:
@@ -228,12 +215,10 @@ def main():
             if pts is None:
                 continue
             nmes.append(eye_nme_pts(pts, *gt[nm]))
-            ears.append((ear(pts, EAR_LEFT) + ear(pts, EAR_RIGHT)) / 2)
         out["mesh"][tag] = {"eye_nme": float(np.mean(nmes)),
-                            "ear_mean": float(np.mean(ears)),
-                            "ear_std": float(np.std(ears)), "n": len(nmes)}
+                            "n": len(nmes)}
         print(f"[mesh] {tag}: eye_nme {np.mean(nmes):.4f} "
-              f"EAR {np.mean(ears):.3f}±{np.std(ears):.3f} (open eyes, n={len(nmes)})",
+              f"(n={len(nmes)})",
               flush=True)
 
     a.out.write_text(json.dumps(out, indent=2))

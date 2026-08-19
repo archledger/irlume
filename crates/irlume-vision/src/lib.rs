@@ -649,9 +649,8 @@ mod onnx {
     }
 
     /// MediaPipe FaceMesh (`face_landmark.onnx`, Apache-2.0): dense facial
-    /// landmarks. Used for passive blink liveness (eye-aspect-ratio, ADR-0002)
-    /// and to refine a BlazeFace rescue box into 5 alignment points, never
-    /// recognition. The shipped model is the 478-point (468 + iris)
+    /// landmarks used to refine a BlazeFace rescue box into 5 alignment points,
+    /// never recognition. The shipped model is the 478-point (468 + iris)
     /// FaceLandmarker mesh at NHWC `[1,256,256,3]` (unlike the NCHW recognizer);
     /// the loader reads the input side from the model and accepts either
     /// generation (468 legacy or 478), returning landmarks in the input space
@@ -688,7 +687,7 @@ mod onnx {
     pub const MESH_INPUT: u32 = 192;
     /// Number of dense landmarks in the legacy topology. The newer mesh emits
     /// 478 (the same 468 plus 10 iris points); both are accepted and the
-    /// shared indices (EAR rings, nose, mouth corners) are identical.
+    /// shared nose and mouth-corner indices are identical.
     pub const MESH_N: usize = 468;
     /// Landmark count of the face_landmarker-generation mesh.
     pub const MESH_N_IRIS: usize = 478;
@@ -750,12 +749,8 @@ mod onnx {
         ///
         /// Errors when the box is not a meaningful face region
         /// ([`mesh_box_valid`]) or the model's output fails the geometric
-        /// plausibility check ([`mesh_output_plausible`]). A refusal must
-        /// reach the cues as ABSENT landmarks, never abort a capture window:
-        /// the EAR pipelines consume it through [`mesh_min_ear`], and the
-        /// alignment refine through `.ok()`. A new caller that `?`s this
-        /// error re-creates the #293 defect (one refused frame costing the
-        /// whole consent watch).
+        /// plausibility check ([`mesh_output_plausible`]). Rescue alignment
+        /// treats a refusal as absent landmarks through `.ok()`.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn landmarks(
             &mut self,
@@ -840,27 +835,6 @@ mod onnx {
         }
         mesh_output_plausible(&out, x0, y0, side)?;
         Ok(out)
-    }
-
-    /// The smaller of the two eye-aspect-ratios from a mesh run, or `None`
-    /// when the mesh refuses the detector box or its own output.
-    ///
-    /// `None` is a MISSING OBSERVATION, the per-frame fail-closed answer for
-    /// the EAR pipelines (`EarSample.ear = None`): the bounded capture window
-    /// continues and the stream consumers deny on absent eyes. The callers
-    /// used to propagate a mesh error with `?`, which was dormant while the
-    /// mesh could only fail on runtime errors; the validity refusals made it
-    /// live, so one refused frame aborted an entire consent watch instead of
-    /// costing one observation (#293 review). Returning `Option` here removes
-    /// the operator: a caller cannot re-introduce the abort without
-    /// reimplementing the mesh call.
-    pub fn mesh_min_ear(
-        mesh: &mut FaceMesh,
-        frame: &align::RgbView,
-        bbox: &[f32; 4],
-    ) -> Option<f32> {
-        let lm = mesh.landmarks(frame, bbox, 0.25).ok()?;
-        Some(eye_ear(&lm, &EAR_LEFT).min(eye_ear(&lm, &EAR_RIGHT)))
     }
 
     /// Is `bbox` a face region the mesh can meaningfully run on?
@@ -957,24 +931,6 @@ mod onnx {
             return Err("landmarks collapsed to a point".into());
         }
         Ok(())
-    }
-
-    /// 6-point eye-aspect-ratio landmark indices (MediaPipe 468 topology): the two
-    /// horizontal corners + two upper + two lower lid points, per eye.
-    pub const EAR_LEFT: [usize; 6] = [33, 160, 158, 133, 153, 144];
-    pub const EAR_RIGHT: [usize; 6] = [362, 385, 387, 263, 373, 380];
-
-    /// Eye-aspect-ratio for one eye from its 6 landmarks: `(|p2−p6| + |p3−p5|) /
-    /// (2·|p1−p4|)`. Scale-invariant (a ratio): ~0.3 open, →0 closed. This is the
-    /// clean blink signal: collapses on closure, unlike the noisy IR-glint metric.
-    pub fn eye_ear(lm: &[(f32, f32)], idx: &[usize; 6]) -> f32 {
-        let d = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
-        let p = |k: usize| lm[idx[k]];
-        let horiz = d(p(0), p(3));
-        if horiz < 1e-6 {
-            return 0.0;
-        }
-        (d(p(1), p(5)) + d(p(2), p(4))) / (2.0 * horiz)
     }
 
     /// YuNet detector (ONNX). Loaded once in the daemon.
@@ -1614,11 +1570,10 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    blaze_anchors, blaze_letterbox_input, decode_short_range_best, eye_ear,
-    map_checked_mesh_output, mesh_box_valid, mesh_min_ear, mesh_output_plausible,
-    runtime_resolution, selftest_alignment_identity, Adapter, BlazeRescue, Detector, Embedder,
-    FaceMesh, PadIr, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD, EAR_LEFT, EAR_RIGHT, MESH_INPUT, MESH_N,
-    MESH_N_IRIS,
+    blaze_anchors, blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output,
+    mesh_box_valid, mesh_output_plausible, runtime_resolution, selftest_alignment_identity,
+    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD,
+    MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Pure decode tests for the short-range head: the reject half (floor, NaN)
@@ -1979,31 +1934,6 @@ mod model_tests {
     }
 
     #[test]
-    fn a_refused_box_is_a_missing_ear_observation_not_an_error() {
-        // The EAR pipelines consume mesh refusals through `mesh_min_ear`,
-        // which has no error to propagate: one refused frame is one missing
-        // observation, never a lost capture window (#293 review found the
-        // old `?` callers turning the new refusals into authentication-stack
-        // errors).
-        let mut m = facemesh();
-        let (w, h) = (256u32, 256u32);
-        let frame = gradient_frame(w, h);
-        let view = align::RgbView {
-            data: &frame,
-            width: w,
-            height: h,
-        };
-        assert_eq!(mesh_min_ear(&mut m, &view, &[f32::NAN; 4]), None);
-        assert_eq!(
-            mesh_min_ear(&mut m, &view, &[-900.0, -900.0, -700.0, -700.0]),
-            None
-        );
-        // A nominal box still measures: Some, and finite.
-        let ear = mesh_min_ear(&mut m, &view, &[64.0, 64.0, 192.0, 192.0]);
-        assert!(matches!(ear, Some(e) if e.is_finite()), "{ear:?}");
-    }
-
-    #[test]
     fn facemesh_refuses_garbage_detector_boxes_through_the_real_model() {
         // The pure gates have their own unit tests; this pins the BOX-gate
         // WIRING, so a refactor that drops that call from `landmarks()`
@@ -2301,61 +2231,5 @@ mod model_tests {
              make the build green; find what changed (ort version, libonnxruntime version, \
              session options) and decide whether enrollments must be rebuilt."
         );
-    }
-}
-
-#[cfg(all(test, feature = "onnx"))]
-mod ear_tests {
-    use super::{eye_ear, EAR_LEFT};
-
-    /// EAR = (|p2−p6| + |p3−p5|) / (2·|p1−p4|). Build a 468-point array with only
-    /// the left-eye indices set to a known shape and check the ratio.
-    fn lm_with(idx: &[usize; 6], pts: [(f32, f32); 6]) -> Vec<(f32, f32)> {
-        let mut lm = vec![(0.0, 0.0); 468];
-        for (k, &i) in idx.iter().enumerate() {
-            lm[i] = pts[k];
-        }
-        lm
-    }
-
-    #[test]
-    fn open_eye_has_normal_ear() {
-        // corners 10 apart; lids ±2 => EAR = (4+4)/(2*10) = 0.4.
-        let lm = lm_with(
-            &EAR_LEFT,
-            [
-                (0.0, 0.0),
-                (3.0, -2.0),
-                (7.0, -2.0),
-                (10.0, 0.0),
-                (7.0, 2.0),
-                (3.0, 2.0),
-            ],
-        );
-        assert!((eye_ear(&lm, &EAR_LEFT) - 0.4).abs() < 1e-5);
-    }
-
-    #[test]
-    fn closed_eye_ear_near_zero() {
-        // lids collapse onto the horizontal line => vertical distances 0 => EAR 0.
-        let lm = lm_with(
-            &EAR_LEFT,
-            [
-                (0.0, 0.0),
-                (3.0, 0.0),
-                (7.0, 0.0),
-                (10.0, 0.0),
-                (7.0, 0.0),
-                (3.0, 0.0),
-            ],
-        );
-        assert!(eye_ear(&lm, &EAR_LEFT) < 1e-5);
-    }
-
-    #[test]
-    fn degenerate_horizontal_is_safe() {
-        // Coincident corners (no width) must not divide by zero.
-        let lm = lm_with(&EAR_LEFT, [(5.0, 0.0); 6]);
-        assert_eq!(eye_ear(&lm, &EAR_LEFT), 0.0);
     }
 }

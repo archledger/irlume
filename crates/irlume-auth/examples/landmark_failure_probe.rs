@@ -20,21 +20,15 @@
 //! - `collapsed`   every point identical (a saturated/stuck output head)
 //! - `nan`         non-finite outputs (a converted model with a broken op)
 //! - `tiny`        a face box shrunk to a few pixels (bad detector scale)
-//! - `mis-indexed` a 468-point set whose topology is rotated by one index
-//!   (the Face Landmarker 478-point successor has a DIFFERENT point count, so
-//!   an index-contract mismatch is exactly what a swap-in risks)
 //!
 //! Usage: cargo run -p irlume-auth --example landmark_failure_probe
-//!   [mesh.onnx]   (default models/face_landmark.onnx; section D is skipped
+//!   [mesh.onnx]   (default models/face_landmark.onnx; section C is skipped
 //!                  if the file is missing)
 
-use irlume_auth::{eye_glint, eye_glint_contrast};
-use irlume_liveness::{
-    calibrate_open_ear, detect_blink, detect_deliberate_closure, detect_nod, BlinkResult,
-    ClosureCalibration, EarSample, PoseSample,
-};
+use irlume_auth::eye_glint;
+use irlume_liveness::{detect_head_gesture, PoseSample};
 use irlume_vision::align::{align_to_arcface, RgbView};
-use irlume_vision::{eye_ear, head_pose, FaceMesh, Landmarks5, EAR_LEFT};
+use irlume_vision::{head_pose, FaceMesh, Landmarks5};
 
 const W: u32 = 400;
 const H: u32 = 300;
@@ -123,29 +117,6 @@ fn pathologies5() -> Vec<(&'static str, Landmarks5)> {
     ]
 }
 
-/// A 468-point set whose EAR_LEFT hexagon is an open eye; everything else sits
-/// at the face center. `rot` shifts every index by one, modeling a topology
-/// whose point numbering does not match the shipped mesh's.
-fn mesh468(open: bool, rot: bool) -> Vec<(f32, f32)> {
-    let mut lm = vec![(160.0f32, 150.0f32); 468];
-    let lid = if open { 2.0 } else { 0.2 };
-    let hex = [
-        (114.0, 120.0),
-        (118.0, 120.0 - lid),
-        (122.0, 120.0 - lid),
-        (126.0, 120.0),
-        (122.0, 120.0 + lid),
-        (118.0, 120.0 + lid),
-    ];
-    for (k, p) in EAR_LEFT.iter().zip(hex) {
-        lm[*k] = p;
-    }
-    if rot {
-        lm.rotate_right(1);
-    }
-    lm
-}
-
 fn fmt(v: f32) -> String {
     if v.is_nan() {
         "NaN".into()
@@ -164,10 +135,8 @@ fn main() {
     };
 
     println!("## A. Five-point consumers (IR frame {W}x{H}, eye disks at (120,120)/(200,120), corner hotspot)\n");
-    println!(
-        "| pathology | eye_glint | glint_contrast | yaw_asym | pitch_frac | align_to_arcface |"
-    );
-    println!("|---|---|---|---|---|---|");
+    println!("| pathology | eye_glint | yaw_asym | pitch_frac | align_to_arcface |");
+    println!("|---|---|---|---|---|");
     for (name, lm) in pathologies5() {
         let pose = head_pose(&lm);
         let align = match align_to_arcface(&view, &lm) {
@@ -181,66 +150,14 @@ fn main() {
             Err(e) => format!("Err ({e})"),
         };
         println!(
-            "| {name} | {} | {} | {} | {} | {align} |",
+            "| {name} | {} | {} | {} | {align} |",
             fmt(eye_glint(&ir, W, H, &lm)),
-            fmt(eye_glint_contrast(&ir, W, H, &lm)),
             fmt(pose.yaw_asym),
             fmt(pose.pitch_frac),
         );
     }
 
-    println!("\n## B. eye_ear over a 468-point set (EAR_LEFT hexagon)\n");
-    println!("| pathology | eye_ear(EAR_LEFT) |");
-    println!("|---|---|");
-    let ear_cases: Vec<(&str, Vec<(f32, f32)>)> = vec![
-        ("open eye", mesh468(true, false)),
-        ("closed eye", mesh468(false, false)),
-        ("mis-indexed (rotated by 1)", mesh468(true, true)),
-        ("collapsed", vec![(160.0, 150.0); 468]),
-        ("nan", vec![(f32::NAN, f32::NAN); 468]),
-        (
-            "offframe",
-            mesh468(true, false)
-                .into_iter()
-                .map(|(x, y)| (x - 500.0, y - 500.0))
-                .collect(),
-        ),
-    ];
-    for (name, lm) in &ear_cases {
-        println!("| {name} | {} |", fmt(eye_ear(lm, &EAR_LEFT)));
-    }
-
-    println!("\n## C. Stream consumers (what a WINDOW of bad values decides)\n");
-    let ear_stream = |ear: Option<f32>| -> Vec<EarSample> {
-        (0..40)
-            .map(|i| EarSample {
-                idx: i,
-                ear,
-                bri: 120.0,
-                cx: 160.0,
-                cy: 150.0,
-                fsize: 90.0,
-                contrast: 40.0,
-            })
-            .collect()
-    };
-    let nan_ears = ear_stream(Some(f32::NAN));
-    println!(
-        "- detect_blink over 40 frames of EAR=NaN: **{:?}**",
-        detect_blink(&nan_ears)
-    );
-    println!(
-        "- calibrate_open_ear over 40 frames of EAR=NaN: **{:?}**",
-        calibrate_open_ear(&nan_ears)
-    );
-    let cal = ClosureCalibration {
-        ear_open: 0.30,
-        ear_closed: 0.10,
-    };
-    println!(
-        "- detect_deliberate_closure (valid calibration) over EAR=NaN: **{:?}**",
-        detect_deliberate_closure(&nan_ears, &cal)
-    );
+    println!("\n## B. Head-pose stream consumer\n");
     let pose_stream = |p: Option<f32>| -> Vec<PoseSample> {
         (0..40)
             .map(|i| PoseSample {
@@ -252,27 +169,11 @@ fn main() {
             .collect()
     };
     println!(
-        "- detect_nod over pitch=NaN: **{:?}**  ·  over pitch=0.5 constant (degenerate-geometry default): **{:?}**",
-        detect_nod(&pose_stream(Some(f32::NAN))),
-        detect_nod(&pose_stream(Some(0.5))),
+        "- detect_head_gesture over pitch=NaN: **{:?}**  ·  over pitch=0.5 constant (degenerate-geometry default): **{:?}**",
+        detect_head_gesture(&pose_stream(Some(f32::NAN))),
+        detect_head_gesture(&pose_stream(Some(0.5))),
     );
-    let is_blinked = matches!(detect_blink(&nan_ears), BlinkResult::Blinked);
-    println!("- (NaN window read as a completed blink: {is_blinked})");
-    // A mis-indexed topology reads EAR 0.0 forever (section B). The consent
-    // gate compares EAR to an absolute per-user threshold, so the question a
-    // stuck-closed signal poses is whether a WINDOW that never opens counts
-    // as a deliberate closure.
-    for stuck in [0.0f32, 0.05] {
-        let s = ear_stream(Some(stuck));
-        println!(
-            "- detect_blink over EAR={stuck} constant (mis-indexed topology): **{:?}**  ·  \
-             detect_deliberate_closure (valid calibration): **{:?}**",
-            detect_blink(&s),
-            detect_deliberate_closure(&s, &cal)
-        );
-    }
-
-    println!("\n## D. FaceMesh.landmarks() against pathological detector boxes\n");
+    println!("\n## C. FaceMesh.landmarks() against pathological detector boxes\n");
     let mesh_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "models/face_landmark.onnx".into());

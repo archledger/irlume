@@ -17,6 +17,9 @@ import time
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_LINE_BYTES = 4096
 MAX_RECORDS = 512
+# Must track irlume_liveness::NOD_MIN_FACE_FRAMES: every detector cell needs a
+# judged face, including negative gestures that would otherwise pass faceless.
+MIN_FACE_FRAMES = 12
 HOSTS = {"current", "archhost", "minihost", "thinkpad"}
 GESTURES = {"nod", "shake", "still", "look-around", "look-down-and-hold"}
 SERVICES = {
@@ -573,6 +576,10 @@ def qualify(records):
                 reasons.append(f"{host}/{gesture}: expected at least five detector attempts, got {count}")
             expected_outcome = {"nod": "approved", "shake": "declined"}.get(gesture, "no-gesture")
             for record in cell_records:
+                if record["detector_evidence"]["face_frames"] < MIN_FACE_FRAMES:
+                    reasons.append(
+                        f"{record['trial_id']}: too few face frames for detector qualification"
+                    )
                 if record["typed_outcome"] != expected_outcome:
                     reasons.append(
                         f"{record['trial_id']}: expected {expected_outcome}, observed {record['typed_outcome']}"

@@ -397,14 +397,19 @@ except (OSError, RuntimeError, SyntaxError, ValueError):
     raise SystemExit(70)
 
 if phase == "preflight":
-    adapter_arguments = ["--preflight", "--expected-camera-identity-digest", camera]
+    adapter_arguments = [
+        "--preflight",
+        "--expected-camera-identity-digest", camera,
+        "--candidate-binary", sys.argv[10],
+    ]
 elif phase == "attempt":
     adapter_arguments = [
-        "--service", sys.argv[15],
-        "--purpose", sys.argv[16],
-        "--expected-gesture", sys.argv[19],
+        "--service", sys.argv[16],
+        "--purpose", sys.argv[17],
+        "--expected-gesture", sys.argv[20],
         "--expected-camera-identity-digest", camera,
         "--timeout-seconds", "20",
+        "--candidate-binary", sys.argv[10],
     ]
 else:
     raise SystemExit(70)
@@ -438,7 +443,7 @@ if phase == "preflight":
 (
     evidence_root, oid, binary_digest, adapter_digest, host, service, purpose,
     policy, trial_id, gesture, timestamp,
-) = sys.argv[10:21]
+) = sys.argv[11:22]
 zero = {
     "frames": 0,
     "face_frames": 0,
@@ -612,7 +617,7 @@ run_adapter() {
     timeout --foreground --kill-after=2s "${outer_seconds}s" \
         python3 -I -c "$supervisor_code" "$phase" "$seconds" "$test_mode" \
         "${containment_cmd:--}" "$unit" "$adapter_bound" "$validator" \
-        "$expected_camera_digest" "$validator_source" "$@"
+        "$expected_camera_digest" "$validator_source" "$binary_bound" "$@"
     status=$?
     set -e
     case "$status" in

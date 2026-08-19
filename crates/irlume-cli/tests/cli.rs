@@ -315,7 +315,7 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         (
             &["gesturecap"],
             2,
-            "usage: irlume gesturecap <capture|replay>",
+            "usage: irlume gesturecap <capture|replay|identity|attempt>",
         ),
         (&["normprobe"], 2, "usage: irlume normprobe --dir"),
         (&["liveness"], 2, "usage: irlume liveness --det"),
@@ -2156,6 +2156,36 @@ fn gesturecap_replays_pose_only_recordings() {
         .env("IRLUME_DEV", "1"));
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("nod.jsonl"), "{stdout}");
+}
+
+#[test]
+fn gesturecap_hardware_adapter_surfaces_fail_closed_offline() {
+    let sandbox = Sandbox::new("gesturecap-hardware-adapter");
+
+    let mut identity = sandbox.cmd(&[
+        "gesturecap",
+        "identity",
+        "--expected-camera-identity-digest",
+        &"a".repeat(64),
+    ]);
+    identity.env("IRLUME_DEV", "1");
+    let (code, stdout, stderr) = run(&mut identity);
+    assert_ne!(code, 0);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("no configured RGB+IR camera pair"),
+        "{stderr}"
+    );
+
+    let mut attempt = sandbox.cmd(&["gesturecap", "attempt"]);
+    attempt.env("IRLUME_DEV", "1");
+    let (code, stdout, stderr) = run(&mut attempt);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("usage: irlume gesturecap attempt"),
+        "{stderr}"
+    );
 }
 
 #[test]

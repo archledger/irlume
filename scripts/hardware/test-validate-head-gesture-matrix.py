@@ -173,6 +173,23 @@ class ValidatorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 3)
                 self.assertEqual(json.loads(result.stdout)["qualified"], False)
 
+    def test_faceless_negative_cell_is_schema_valid_but_unqualified(self):
+        records = valid_records()
+        record = next(
+            record
+            for record in records
+            if record["host_label"] == "current" and record["expected_gesture"] == "still"
+        )
+        record["detector_evidence"] = evidence(0) | {"frames": 75}
+
+        self.assertEqual(
+            self.run_raw("".join(json.dumps(item) + "\n" for item in records), "--schema-only").returncode,
+            0,
+        )
+        result = self.run_records(records)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("too few face frames", result.stdout)
+
     def test_exact_service_purpose_policy_gesture_cells_are_enforced(self):
         allowed = [
             ("sudo", "authentication", "required", "shake", "declined"),
@@ -631,6 +648,8 @@ esac
         captured_args = self.attempt_args.read_text(encoding="utf-8").splitlines()
         self.assertIn("--expected-camera-identity-digest", captured_args)
         self.assertIn(self.CAMERA_DIGEST, captured_args)
+        candidate_index = captured_args.index("--candidate-binary")
+        self.assertRegex(captured_args[candidate_index + 1], r"^/proc/[0-9]+/fd/[0-9]+$")
         trial_record = next(record for record in self.records() if record["record_type"] == "trial")
         observed = calendar.timegm(time.strptime(trial_record["timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
         self.assertGreaterEqual(observed, ready_at - 1)

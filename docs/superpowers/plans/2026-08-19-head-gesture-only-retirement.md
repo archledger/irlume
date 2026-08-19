@@ -115,7 +115,7 @@ Expected: PASS. These are compatibility characterizations; production behavior c
 
 ```bash
 git add crates/irlume-core/src/storage.rs crates/irlume-common/src/lib.rs
-git commit -m "test(compat): pin eye retirement boundaries"
+git commit -s -m "test(compat): pin eye retirement boundaries"
 ```
 
 ---
@@ -253,7 +253,7 @@ Expected: PASS without threshold or fixture changes.
 
 ```bash
 git add crates/irlume-liveness/src/lib.rs crates/irlume-auth/src/lib.rs
-git commit -m "refactor(auth): type head consent verdicts"
+git commit -s -m "refactor(auth): type head consent verdicts"
 ```
 
 ---
@@ -350,7 +350,7 @@ Expected: PASS; no test depends on closure for a grant.
 
 ```bash
 git add crates/irlume-auth/src/lib.rs crates/irlume-auth/tests/no_probe_on_the_auth_path.rs
-git commit -m "refactor(auth): make consent watch head-only"
+git commit -s -m "refactor(auth): make consent watch head-only"
 ```
 
 ---
@@ -445,7 +445,7 @@ Expected: absent/nod work; closure/malformed fall back to password and never cal
 
 ```bash
 git add crates/irlume-common/src/config.rs crates/irlume-auth/src/lib.rs
-git commit -m "fix(auth): block retired closure policy"
+git commit -s -m "fix(auth): block retired closure policy"
 ```
 
 ---
@@ -531,7 +531,7 @@ Expected: only migration/blocker tests remain under eyes-open names; glint tests
 
 ```bash
 git add crates/irlume-auth/src/lib.rs crates/irlume-daemon/src/main.rs
-git commit -m "refactor(auth): retire eyes-open enforcement"
+git commit -s -m "refactor(auth): retire eyes-open enforcement"
 ```
 
 ---
@@ -651,7 +651,7 @@ Expected: all pass; contract 1 keeps both false booleans.
 git add crates/irlume-core/src/storage.rs crates/irlume-common/src/lib.rs crates/irlume-daemon/src/main.rs \
   crates/irlume-daemon/src/arbiter.rs crates/irlume-cli/src/machine.rs \
   schemas/fixtures/v1/profiles-list.json
-git commit -m "fix(protocol): tombstone retired eye requests"
+git commit -s -m "fix(protocol): tombstone retired eye requests"
 ```
 
 ---
@@ -731,7 +731,7 @@ Expected: all runnable tests pass; ignored PAM wrapper tests are exercised again
 git add crates/irlume-cli/src/main.rs crates/irlume-cli/src/commands.rs \
   crates/irlume-cli/src/pamwire.rs crates/irlume-cli/tests \
   crates/irlume-pam/src/lib.rs crates/irlume-pam/tests/pamwrap.rs
-git commit -m "refactor(cli): expose head-only consent"
+git commit -s -m "refactor(cli): expose head-only consent"
 ```
 
 ---
@@ -790,7 +790,7 @@ Expected: every screen/key/size test passes; no retired action is advertised.
 
 ```bash
 git add crates/irlume-cli/src/tui.rs
-git commit -m "refactor(tui): remove eye challenge setup"
+git commit -s -m "refactor(tui): remove eye challenge setup"
 ```
 
 ---
@@ -876,7 +876,7 @@ Expected: pose capture/replay remains developer-gated and uses the same camera a
 ```bash
 git add crates/irlume-cli/src crates/irlume-cli/tests/cli.rs \
   crates/irlume-auth/examples scripts
-git commit -m "refactor(dev): replace blinkcap with gesturecap"
+git commit -s -m "refactor(dev): replace blinkcap with gesturecap"
 ```
 
 ---
@@ -934,7 +934,7 @@ Expected: `rg` returns no active symbols; tests and clippy pass.
 
 ```bash
 git add crates benchmarks
-git commit -m "refactor(liveness): delete retired eye detectors"
+git commit -s -m "refactor(liveness): delete retired eye detectors"
 ```
 
 ---
@@ -1007,7 +1007,7 @@ Expected: all pass.
 
 ```bash
 git add CHANGELOG.md docs models packaging nix crates scripts/README.md
-git commit -m "docs: publish head-only consent policy"
+git commit -s -m "docs: publish head-only consent policy"
 ```
 
 ---
@@ -1080,7 +1080,7 @@ Write the verification report with commit OID, command, result, ignored-test rea
 
 ```bash
 git add docs/research/2026-08-19-head-gesture-only-software-verification.md
-git commit -m "docs: record head-only software verification"
+git commit -s -m "docs: record head-only software verification"
 ```
 
 ---
@@ -1184,7 +1184,7 @@ git add scripts/hardware/run-head-gesture-matrix.sh \
   docs/research/2026-08-19-head-gesture-only-hardware-evidence.jsonl \
   docs/research/2026-08-19-head-gesture-only-hardware-matrix.md \
   docs/research/2026-08-19-head-gesture-only-codebase-audit.md
-git commit -m "docs: record head-only hardware and audit evidence"
+git commit -s -m "docs: record head-only hardware and audit evidence"
 ```
 
 ---

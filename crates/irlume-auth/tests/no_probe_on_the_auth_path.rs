@@ -169,3 +169,53 @@ fn qualification_lookup_uses_the_actual_open_pair() {
         "temporary cameras opened under the same lease still leave a path-to-fd race"
     );
 }
+
+#[test]
+fn production_consent_watch_is_pose_only() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("read irlume-auth/src/lib.rs");
+    let converter_start = text
+        .find("    fn frame_to_head_pose(")
+        .expect("pose-only frame converter exists");
+    let converter_end = text[converter_start..]
+        .find("\n    /// Total frames the consent gesture")
+        .map(|offset| converter_start + offset)
+        .expect("consent budget follows the frame converter");
+    let converter = &text[converter_start..converter_end];
+
+    let watch_start = text
+        .find("    fn head_consent_watch(")
+        .expect("typed head consent watch exists");
+    let watch_end = text[watch_start..]
+        .find("\n    fn challenge_if_required(")
+        .map(|offset| watch_start + offset)
+        .expect("challenge gate follows the head consent watch");
+    let watch = &text[watch_start..watch_end];
+
+    assert!(converter.contains("Result<irlume_liveness::PoseSample>"));
+    assert!(watch.contains("max_frames: usize"));
+    assert!(watch.contains("Result<HeadConsentVerdict>"));
+    assert!(watch.contains("self.frame_to_head_pose"));
+    assert!(watch.contains("head_consent_from_poses"));
+
+    for (name, body) in [
+        ("frame converter", converter),
+        ("head consent watch", watch),
+    ] {
+        for forbidden in [
+            "Enrollment",
+            "self.mesh",
+            "EarSample",
+            "ClosureCalibration",
+            "BlinkResult",
+            "detect_deliberate_closure",
+            "frame_to_consent_samples",
+            "consent_gesture_inputs",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the production {name} must not reference {forbidden}"
+            );
+        }
+    }
+}

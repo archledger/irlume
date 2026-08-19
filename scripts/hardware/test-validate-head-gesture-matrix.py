@@ -162,7 +162,7 @@ class ValidatorTests(unittest.TestCase):
         self.assert_rejected(lambda records: records[1].__setitem__("timestamp", "yesterday"))
 
     def test_misclassification_and_attempt_failure_are_schema_valid_but_unqualified(self):
-        for outcome in ["approved", "attempt-failed", "attempt-timeout", "adapter-exited", "adapter-output-invalid"]:
+        for outcome in ["approved", "attempt-failed", "attempt-timeout"]:
             records = valid_records()
             records[6]["typed_outcome"] = outcome
             raw = "".join(json.dumps(record) + "\n" for record in records)
@@ -316,9 +316,56 @@ case "${FAKE_ADAPTER_MODE-good}" in
   invalid) printf 'arbitrary prose\\n'; exit 7 ;;
   unknown-outcome) printf '{"typed_outcome":"surprise","detector_evidence":%s}\\n' "$normal" ;;
   bad-evidence) printf '%s\\n' '{"typed_outcome":"approved","detector_evidence":{"frames":999,"face_frames":999,"pitch_range":0,"yaw_range":0,"pitch_crossings":0,"yaw_crossings":0,"mean_step":0}}' ;;
+  success-hang) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CONTAINED_PID"; wait "$child" ;;
+  success-nonzero) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; exit 9 ;;
+  escape)
+    setsid sh -c 'setsid sh -c '\''sleep 60 & child=$!; printf "%s\\n" "$child" >"$FAKE_ESCAPE_PID"; wait "$child"'\'' &' &
+    deadline=50
+    while [ ! -s "$FAKE_ESCAPE_PID" ] && [ "$deadline" -gt 0 ]; do sleep 0.02; deadline=$((deadline - 1)); done
+    printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"
+    ;;
   oversize) head -c 5000 /dev/zero ;;
   oversize-stderr) head -c 5000 /dev/zero >&2 ;;
   hang-child) sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CHILD_PID"; wait "$child" ;;
+esac
+""")
+        self.containment = self.make_fake("containment", """#!/bin/sh
+operation=$1
+shift
+case "$operation" in
+  check)
+    printf '%s\\n' containment-check >>"$FAKE_LOG"
+    [ "${FAKE_CONTAINMENT_CHECK_FAIL-0}" -eq 0 ]
+    ;;
+  run)
+    unit=$1
+    shift
+    printf 'containment-run %s\\n' "$unit" >>"$FAKE_LOG"
+    exec "$@"
+    ;;
+  term|kill)
+    unit=$1
+    printf 'containment-%s %s\\n' "$operation" "$unit" >>"$FAKE_LOG"
+    signal=TERM
+    [ "$operation" = kill ] && signal=KILL
+    for pid_file in "${FAKE_ESCAPE_PID-}" "${FAKE_CHILD_PID-}" "${FAKE_CONTAINED_PID-}"; do
+      if [ -n "$pid_file" ] && [ -s "$pid_file" ]; then
+        kill -"$signal" "$(cat "$pid_file")" 2>/dev/null || true
+      fi
+    done
+    ;;
+  verify-empty)
+    unit=$1
+    printf 'containment-verify %s\\n' "$unit" >>"$FAKE_LOG"
+    for pid_file in "${FAKE_ESCAPE_PID-}" "${FAKE_CHILD_PID-}" "${FAKE_CONTAINED_PID-}"; do
+      if [ -n "$pid_file" ] && [ -s "$pid_file" ]; then
+        pid=$(cat "$pid_file")
+        tries=100
+        while kill -0 "$pid" 2>/dev/null && [ "$tries" -gt 0 ]; do sleep 0.02; tries=$((tries - 1)); done
+        ! kill -0 "$pid" 2>/dev/null || exit 1
+      fi
+    done
+    ;;
 esac
 """)
         self.binary_digest = self.sha256(self.binary)
@@ -355,6 +402,7 @@ esac
             "FAKE_CAMERA_DIGEST": self.CAMERA_DIGEST,
             "FAKE_ATTEMPT_ARGS": str(self.attempt_args),
             "FAKE_ADAPTER_PATH": str(self.adapter),
+            "FAKE_CONTAINED_PID": str(self.root / "contained.pid"),
             "TMPDIR": str(self.root),
             "IRLUME_HEAD_GESTURE_ROOT": str(self.repo),
             "IRLUME_HEAD_GESTURE_BINARY": str(self.binary),
@@ -365,6 +413,7 @@ esac
                 "IRLUME_HEAD_GESTURE_TEST_MODE": "1",
                 "IRLUME_HEAD_GESTURE_STATUS_CMD": str(self.status),
                 "IRLUME_HEAD_GESTURE_DOCTOR_CMD": str(self.doctor),
+                "IRLUME_HEAD_GESTURE_CONTAINMENT_CMD": str(self.containment),
             })
         if extra_env:
             for key, value in extra_env.items():
@@ -397,7 +446,11 @@ esac
     def test_preflight_precedes_literal_ready_and_attempt_timestamp_follows_it(self):
         refused = self.run_runner(stdin="Ready\n")
         self.assertNotEqual(refused.returncode, 0)
-        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), ["status", "doctor", "preflight"])
+        refused_calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertLess(refused_calls.index("containment-check"), refused_calls.index("status"))
+        self.assertLess(refused_calls.index("status"), refused_calls.index("doctor"))
+        self.assertLess(refused_calls.index("doctor"), refused_calls.index("preflight"))
+        self.assertNotIn("attempt", refused_calls)
         self.assertEqual(self.records(), [])
 
         self.log.write_text("", encoding="utf-8")
@@ -407,7 +460,10 @@ esac
         ready_at = time.time()
         stdout, stderr = process.communicate("ready\n", timeout=10)
         self.assertEqual(process.returncode, 0, stderr)
-        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), ["status", "doctor", "preflight", "attempt"])
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertLess(calls.index("status"), calls.index("doctor"))
+        self.assertLess(calls.index("doctor"), calls.index("preflight"))
+        self.assertLess(calls.index("preflight"), calls.index("attempt"))
         captured_args = self.attempt_args.read_text(encoding="utf-8").splitlines()
         self.assertIn("--expected-camera-identity-digest", captured_args)
         self.assertIn(self.CAMERA_DIGEST, captured_args)
@@ -455,9 +511,15 @@ esac
         })
         self.assertNotEqual(production.returncode, 0)
         self.log.write_text("", encoding="utf-8")
-        production = self.run_runner(test_mode=False)
-        self.assertEqual(production.returncode, 0, production.stderr)
-        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), ["candidate-status", "candidate-doctor", "preflight", "attempt"])
+        candidate = self.run_runner(extra_env={
+            "IRLUME_HEAD_GESTURE_STATUS_CMD": None,
+            "IRLUME_HEAD_GESTURE_DOCTOR_CMD": None,
+        })
+        self.assertEqual(candidate.returncode, 0, candidate.stderr)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertLess(calls.index("candidate-status"), calls.index("candidate-doctor"))
+        self.assertLess(calls.index("candidate-doctor"), calls.index("preflight"))
+        self.assertLess(calls.index("preflight"), calls.index("attempt"))
 
     def test_verified_adapter_inode_is_bound_across_preflight_and_attempt(self):
         replacement = self.make_fake("replacement-adapter", """#!/bin/sh
@@ -492,6 +554,42 @@ exit 99
         trial_record = next(record for record in self.records(second_root) if record["record_type"] == "trial")
         self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
 
+    def test_timeout_and_nonzero_override_success_shaped_adapter_json(self):
+        cases = [("success-hang", "attempt-timeout"), ("success-nonzero", "attempt-failed")]
+        for mode, expected_outcome in cases:
+            root = self.root / f"status-authority-{mode}"
+            root.mkdir(mode=0o700)
+            env = {"FAKE_ADAPTER_MODE": mode}
+            if mode == "success-hang":
+                env["IRLUME_HEAD_GESTURE_TEST_TIMEOUT_SECONDS"] = "1"
+            result = self.run_runner(evidence_root=root, extra_env=env)
+            with self.subTest(mode=mode):
+                self.assertNotEqual(result.returncode, 0)
+                trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
+                self.assertEqual(trial_record["typed_outcome"], expected_outcome)
+
+    def test_containment_authority_is_required_and_kills_setsid_double_fork(self):
+        refused = self.run_runner(extra_env={"FAKE_CONTAINMENT_CHECK_FAIL": "1"})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertNotIn("preflight", self.log.read_text(encoding="utf-8"))
+
+        self.log.write_text("", encoding="utf-8")
+        escaped_pid = self.root / "escaped.pid"
+        result = self.run_runner(extra_env={"FAKE_ADAPTER_MODE": "escape", "FAKE_ESCAPE_PID": str(escaped_pid)})
+        child = int(escaped_pid.read_text(encoding="utf-8"))
+        try:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+            calls = self.log.read_text(encoding="utf-8")
+            self.assertIn("containment-kill", calls)
+            self.assertIn("containment-verify", calls)
+        finally:
+            try:
+                os.kill(child, 9)
+            except ProcessLookupError:
+                pass
+
     def test_timeout_oversize_and_invalid_adapter_output_are_bounded_and_persisted(self):
         child_pid = self.root / "child.pid"
         result = self.run_runner(extra_env={
@@ -512,7 +610,7 @@ exit 99
             result = self.run_runner(evidence_root=root, extra_env={"FAKE_ADAPTER_MODE": mode})
             self.assertNotEqual(result.returncode, 0)
             trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
-            self.assertIn(trial_record["typed_outcome"], {"adapter-output-invalid", "adapter-exited"})
+            self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
             self.assertEqual(list(self.root.glob("irlume-head-gesture.*")), [])
 
     def test_capability_absence_is_published_but_never_qualified(self):
@@ -579,6 +677,36 @@ exit 99
         self.assertNotEqual(process.returncode, 0, stderr)
         self.assertEqual(list(moved.glob("*.json")), [])
         self.assertEqual(list(replacement.glob("*.json")), [])
+
+    def test_ancestor_swap_between_component_binding_steps_is_rejected(self):
+        container = self.root / "evidence-container"
+        container.mkdir(mode=0o700)
+        authorized = container / "authorized"
+        authorized.mkdir(mode=0o700)
+        pause = self.root / "open-pause"
+        args, env = self.invocation(
+            evidence_root=authorized,
+            extra_env={"IRLUME_HEAD_GESTURE_TEST_PAUSE_BEFORE_DIRECTORY_OPEN": str(pause)},
+        )
+        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        deadline = time.monotonic() + 3
+        while not pause.with_suffix(".ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not pause.with_suffix(".ready").exists():
+            process.terminate()
+            process.communicate(timeout=5)
+        self.assertTrue(pause.with_suffix(".ready").exists(), "directory traversal did not expose the tested bind boundary")
+        moved = self.root / "moved-container"
+        container.rename(moved)
+        replacement = self.root / "replacement-container"
+        replacement.mkdir(mode=0o700)
+        (replacement / "authorized").mkdir(mode=0o700)
+        container.symlink_to(replacement, target_is_directory=True)
+        pause.with_suffix(".continue").write_text("go", encoding="utf-8")
+        _, stderr = process.communicate("ready\n", timeout=10)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertEqual(list((moved / "authorized").glob("*.json")), [])
+        self.assertEqual(list((replacement / "authorized").glob("*.json")), [])
 
     def test_concurrent_writers_publish_without_loss(self):
         invocations = [self.invocation() for _ in range(2)]

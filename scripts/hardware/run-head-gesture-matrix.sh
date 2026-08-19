@@ -71,11 +71,16 @@ test_mode=${IRLUME_HEAD_GESTURE_TEST_MODE:-0}
 if [[ $test_mode != 1 && ( -n ${IRLUME_HEAD_GESTURE_STATUS_CMD:-} || -n ${IRLUME_HEAD_GESTURE_DOCTOR_CMD:-} ) ]]; then
     die "status/doctor overrides require explicit test mode"
 fi
+if [[ $test_mode != 1 && -n ${IRLUME_HEAD_GESTURE_CONTAINMENT_CMD:-} ]]; then
+    die "containment override requires explicit test mode"
+fi
 status_cmd=$binary
 doctor_cmd=$binary
 if [[ $test_mode == 1 ]]; then
     status_cmd=${IRLUME_HEAD_GESTURE_STATUS_CMD:-"$binary"}
     doctor_cmd=${IRLUME_HEAD_GESTURE_DOCTOR_CMD:-"$binary"}
+    containment_cmd=${IRLUME_HEAD_GESTURE_CONTAINMENT_CMD:-}
+    [[ -n $containment_cmd && -f $containment_cmd && ! -L $containment_cmd && -x $containment_cmd ]] || die "test containment command must be an executable regular file"
 fi
 attempt_seconds=20
 if [[ -n ${IRLUME_HEAD_GESTURE_TEST_TIMEOUT_SECONDS:-} ]]; then
@@ -117,6 +122,40 @@ PY
 [[ $(sha256_file "$binary_bound") == "$expected_binary_sha256" ]] || die "release binary digest mismatch"
 [[ $(sha256_file "$adapter_bound") == "$expected_adapter_sha256" ]] || die "attempt adapter digest mismatch"
 
+containment_check() {
+    if [[ $test_mode == 1 ]]; then
+        "$containment_cmd" check
+        return
+    fi
+    command -v systemd-run >/dev/null || return 1
+    command -v systemctl >/dev/null || return 1
+    systemctl --user show-environment >/dev/null 2>&1
+}
+
+containment_cleanup() {
+    local unit=$1 state control_group
+    if [[ $test_mode == 1 ]]; then
+        "$containment_cmd" term "$unit" || return 1
+        "$containment_cmd" kill "$unit" || return 1
+        "$containment_cmd" verify-empty "$unit"
+        return
+    fi
+    systemctl --user kill --kill-whom=all --signal=TERM "$unit" >/dev/null 2>&1 || true
+    systemctl --user kill --kill-whom=all --signal=KILL "$unit" >/dev/null 2>&1 || true
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    state=$(systemctl --user show --property=ActiveState --value "$unit" 2>/dev/null) || return 1
+    case "$state" in
+        inactive|failed) ;;
+        *) return 1 ;;
+    esac
+    control_group=$(systemctl --user show --property=ControlGroup --value "$unit" 2>/dev/null) || return 1
+    if [[ -n $control_group && -e /sys/fs/cgroup$control_group/cgroup.procs ]]; then
+        [[ ! -s /sys/fs/cgroup$control_group/cgroup.procs ]] || return 1
+    fi
+}
+
+containment_check || die "containment authority is unavailable"
+
 root_real=$(cd -- "$root" && pwd -P)
 evidence_real=$(cd -- "$evidence_root" && pwd -P)
 case "$evidence_real/" in
@@ -126,10 +165,15 @@ python3 "$validator" --check-root "$evidence_root" || die "unsafe evidence root"
 
 scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/irlume-head-gesture.XXXXXX") || die "cannot create scratch directory"
 scratch_files=()
+active_unit=
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
     local status=$?
     trap - EXIT
+    if [[ -n $active_unit ]]; then
+        containment_cleanup "$active_unit" || status=1
+        active_unit=
+    fi
     if ((${#scratch_files[@]})); then
         rm -f -- "${scratch_files[@]}"
     fi
@@ -247,28 +291,31 @@ run_adapter() {
     shift 2
     local stdout_file="$scratch_dir/$phase.stdout" stderr_file="$scratch_dir/$phase.stderr"
     local stdout_fifo="$scratch_dir/$phase.stdout.fifo" stderr_fifo="$scratch_dir/$phase.stderr.fifo"
-    local pid_file="$scratch_dir/$phase.pgid"
     : >"$stdout_file"
     : >"$stderr_file"
-    : >"$pid_file"
     mkfifo "$stdout_fifo" "$stderr_fifo"
-    scratch_files+=("$stdout_file" "$stderr_file" "$pid_file" "$stdout_fifo" "$stderr_fifo")
+    scratch_files+=("$stdout_file" "$stderr_file" "$stdout_fifo" "$stderr_fifo")
     head -c 4097 <"$stdout_fifo" >"$stdout_file" &
     local stdout_reader=$!
     head -c 4097 <"$stderr_fifo" >"$stderr_file" &
     local stderr_reader=$!
+    local unit="irlume-head-gesture-$phase-$$-$RANDOM.scope"
+    active_unit=$unit
     set +e
-    # shellcheck disable=SC2016 # the child shell, not this shell, expands $$/$@
-    timeout --foreground --kill-after=2s "${seconds}s" \
-        setsid bash -c 'printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
-        adapter-session "$pid_file" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+    if [[ $test_mode == 1 ]]; then
+        timeout --foreground --kill-after=2s "${seconds}s" \
+            "$containment_cmd" run "$unit" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+    else
+        timeout --foreground --kill-after=2s "${seconds}s" \
+            systemd-run --user --scope --quiet --unit="$unit" -- \
+            "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+    fi
     local status=$?
     set -e
-    local process_group
-    process_group=$(sed -n '1p' "$pid_file")
-    if [[ $process_group =~ ^[1-9][0-9]*$ ]]; then
-        kill -KILL -- "-$process_group" 2>/dev/null || true
+    if ! containment_cleanup "$unit"; then
+        status=125
     fi
+    active_unit=
     wait "$stdout_reader" 2>/dev/null || true
     wait "$stderr_reader" 2>/dev/null || true
     RUN_STDOUT=$stdout_file
@@ -349,9 +396,11 @@ if stdout.stat().st_size <= 4096 and stderr.stat().st_size <= 4096:
                 result = candidate
     except (UnicodeError, json.JSONDecodeError):
         pass
-if result is None:
-    outcome = "attempt-timeout" if status in {124, 137} else "adapter-output-invalid" if stdout.stat().st_size > 4096 or stderr.stat().st_size > 4096 else "adapter-exited"
-    result = {"typed_outcome": outcome, "detector_evidence": zero}
+evidence = result["detector_evidence"] if result is not None else zero
+if status in {124, 137}:
+    result = {"typed_outcome": "attempt-timeout", "detector_evidence": evidence}
+elif status != 0 or result is None:
+    result = {"typed_outcome": "attempt-failed", "detector_evidence": evidence}
 record = {
     "schema_version": 1,
     "record_type": "trial",
@@ -381,6 +430,6 @@ make_capability_record capability-present "$expected_adapter_sha256" "$expected_
 python3 "$validator" --publish-record "$evidence_root" "$capability_record" || die "cannot publish capability record"
 printf 'head-gesture-matrix: recorded host=%s trial=%s outcome=%s\n' "$host_label" "$trial_id" "$normalization"
 case "$normalization" in
-    attempt-failed|attempt-timeout|adapter-exited|adapter-output-invalid) exit 4 ;;
+    attempt-failed|attempt-timeout) exit 4 ;;
     *) [[ $RUN_STATUS -eq 0 ]] && exit 0 || exit 4 ;;
 esac

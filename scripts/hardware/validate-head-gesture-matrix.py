@@ -45,10 +45,8 @@ OUTCOMES = {
     "no-gesture",
     "attempt-failed",
     "attempt-timeout",
-    "adapter-exited",
-    "adapter-output-invalid",
 }
-FAILURE_OUTCOMES = {"attempt-failed", "attempt-timeout", "adapter-exited", "adapter-output-invalid"}
+FAILURE_OUTCOMES = {"attempt-failed", "attempt-timeout"}
 POLICY_SERVICE_PURPOSES = {
     "sudo": "authentication",
     "su": "authentication",
@@ -242,45 +240,76 @@ def validate_record(record, index):
         fail(f"{label}: service/purpose/policy/gesture combination is not allowlisted")
 
 
-def path_snapshot(path):
-    if not path.is_absolute():
-        fail("evidence directory must be absolute")
-    snapshots = []
-    current = pathlib.Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        try:
-            info = current.lstat()
-        except OSError as error:
-            fail(f"cannot inspect evidence directory ancestry: {error}")
-        if stat.S_ISLNK(info.st_mode):
-            fail(f"evidence directory ancestry contains a symlink: {current}")
-        snapshots.append((current, info.st_dev, info.st_ino))
-    return snapshots
+def wait_at_test_boundary(variable):
+    if os.environ.get("IRLUME_HEAD_GESTURE_TEST_MODE") != "1":
+        return
+    pause_raw = os.environ.get(variable)
+    if not pause_raw:
+        return
+    pause = pathlib.Path(pause_raw)
+    ready = pause.with_suffix(".ready")
+    proceed = pause.with_suffix(".continue")
+    ready.write_text("ready\n", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not proceed.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not proceed.exists():
+        fail(f"timed out waiting at injected boundary: {variable}")
 
 
 def open_evidence_directory(path):
-    snapshot = path_snapshot(path)
+    if not path.is_absolute():
+        fail("evidence directory must be absolute")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors = []
+    edges = []
     try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        fail(f"cannot open evidence directory: {error}")
+        descriptors.append(os.open(path.anchor, flags))
+        parts = path.parts[1:]
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1:
+                wait_at_test_boundary("IRLUME_HEAD_GESTURE_TEST_PAUSE_BEFORE_DIRECTORY_OPEN")
+            parent = descriptors[-1]
+            descriptor = os.open(part, flags, dir_fd=parent)
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(descriptor)
+                fail(f"evidence path component is not a directory: {part!r}")
+            edges.append((parent, part, info.st_dev, info.st_ino))
+            descriptors.append(descriptor)
+    except (OSError, SchemaError) as error:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        if isinstance(error, SchemaError):
+            raise
+        fail(f"cannot bind evidence directory ancestry: {error}")
+    descriptor = descriptors[-1]
     info = os.fstat(descriptor)
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
-        os.close(descriptor)
+        for opened in reversed(descriptors):
+            os.close(opened)
         fail("evidence directory must be owned by the caller and inaccessible to group/other")
-    return descriptor, snapshot
+    binding = {"descriptors": descriptors, "edges": edges, "final": (info.st_dev, info.st_ino)}
+    verify_binding(binding)
+    return descriptor, binding
 
 
-def verify_snapshot(snapshot):
-    for path, device, inode in snapshot:
+def verify_binding(binding):
+    for parent, name, device, inode in binding["edges"]:
         try:
-            info = path.lstat()
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
         except OSError as error:
-            fail(f"evidence directory ancestry changed: {error}")
+            fail(f"bound evidence directory ancestry changed: {error}")
         if stat.S_ISLNK(info.st_mode) or (info.st_dev, info.st_ino) != (device, inode):
-            fail("evidence directory ancestry changed during operation")
+            fail("bound evidence directory ancestry changed during operation")
+    final = os.fstat(binding["descriptors"][-1])
+    if (final.st_dev, final.st_ino) != binding["final"]:
+        fail("bound final evidence directory identity changed")
+
+
+def close_binding(binding):
+    for descriptor in reversed(binding["descriptors"]):
+        os.close(descriptor)
 
 
 def open_lock(directory_fd):
@@ -319,11 +348,11 @@ def decode_record(raw, label):
 
 
 def load_directory_records(path):
-    directory_fd, snapshot = open_evidence_directory(path)
+    directory_fd, binding = open_evidence_directory(path)
     lock_fd = open_lock(directory_fd)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        verify_snapshot(snapshot)
+        verify_binding(binding)
         names = os.listdir(directory_fd)
         unexpected = [name for name in names if name != ".head-gesture.lock" and not name.startswith(".tmp-") and not name.endswith(".json")]
         if unexpected:
@@ -350,10 +379,10 @@ def load_directory_records(path):
             records.append(decode_record(raw, name))
             if len(records) > MAX_RECORDS:
                 fail(f"evidence exceeds {MAX_RECORDS} records")
-        verify_snapshot(snapshot)
+        verify_binding(binding)
     finally:
         os.close(lock_fd)
-        os.close(directory_fd)
+        close_binding(binding)
     if not records:
         fail("evidence contains no records")
     return records
@@ -406,12 +435,12 @@ def publish_record(root, source):
     validate_record(record, 1)
     encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
-    directory_fd, snapshot = open_evidence_directory(root)
+    directory_fd, binding = open_evidence_directory(root)
     lock_fd = open_lock(directory_fd)
     temporary = None
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        verify_snapshot(snapshot)
+        verify_binding(binding)
         test_mode = os.environ.get("IRLUME_HEAD_GESTURE_TEST_MODE") == "1"
         forced = os.environ.get("IRLUME_HEAD_GESTURE_TEST_TOKEN") if test_mode else None
         token = forced or secrets.token_hex(16)
@@ -429,18 +458,8 @@ def publish_record(root, source):
             os.close(descriptor)
         if test_mode and os.environ.get("IRLUME_HEAD_GESTURE_TEST_FAIL_BEFORE_PUBLISH") == "1":
             fail("injected failure before publication")
-        pause_raw = os.environ.get("IRLUME_HEAD_GESTURE_TEST_PAUSE_BEFORE_PUBLISH") if test_mode else None
-        if pause_raw:
-            pause = pathlib.Path(pause_raw)
-            ready = pause.with_suffix(".ready")
-            proceed = pause.with_suffix(".continue")
-            ready.write_text("ready\n", encoding="utf-8")
-            deadline = time.monotonic() + 10
-            while not proceed.exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            if not proceed.exists():
-                fail("timed out waiting at injected publication boundary")
-        verify_snapshot(snapshot)
+        wait_at_test_boundary("IRLUME_HEAD_GESTURE_TEST_PAUSE_BEFORE_PUBLISH")
+        verify_binding(binding)
         try:
             os.link(
                 temporary,
@@ -457,7 +476,7 @@ def publish_record(root, source):
         os.unlink(temporary, dir_fd=directory_fd)
         temporary = None
         os.fsync(directory_fd)
-        verify_snapshot(snapshot)
+        verify_binding(binding)
     finally:
         if temporary is not None:
             try:
@@ -466,7 +485,7 @@ def publish_record(root, source):
             except OSError:
                 pass
         os.close(lock_fd)
-        os.close(directory_fd)
+        close_binding(binding)
     return root / target
 
 
@@ -569,10 +588,10 @@ def main(argv):
     if argv[1:2] == ["--check-root"]:
         if len(argv) != 3:
             fail("usage: validate-head-gesture-matrix.py --check-root EVIDENCE_ROOT")
-        descriptor, _ = open_evidence_directory(pathlib.Path(argv[2]))
+        descriptor, binding = open_evidence_directory(pathlib.Path(argv[2]))
         lock = open_lock(descriptor)
         os.close(lock)
-        os.close(descriptor)
+        close_binding(binding)
         return 0
     if argv[1:2] == ["--check-cell"]:
         if len(argv) != 6:

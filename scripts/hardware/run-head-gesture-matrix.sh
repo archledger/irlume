@@ -93,6 +93,7 @@ fi
 [[ -n $adapter && -f $adapter && ! -L $adapter && -x $adapter ]] || die "attempt adapter must be an executable regular file, not a symlink"
 [[ -f $validator && ! -L $validator ]] || die "validator is missing"
 [[ -x $status_cmd && -x $doctor_cmd ]] || die "readiness commands are not executable"
+validator_source=$(<"$validator") || die "cannot bind validator source"
 exec {binary_fd}<"$binary" || die "cannot bind release binary"
 exec {adapter_fd}<"$adapter" || die "cannot bind attempt adapter"
 binary_bound="/proc/$$/fd/$binary_fd"
@@ -190,11 +191,25 @@ scratch_file() {
     printf -v "$variable" '%s' "$path"
 }
 
+publish_cached_record() {
+    python3 -I -c '
+import json
+import pathlib
+import sys
+
+validator_path, validator_source, source, root = sys.argv[1:]
+validator = {"__name__": "irlume_matrix_validator"}
+exec(compile(validator_source, validator_path, "exec"), validator)
+record = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
+validator["publish_record_value"](pathlib.Path(root), record)
+' "$validator" "$validator_source" "$1" "$evidence_root"
+}
+
 read -r -d '' supervisor_code <<'PY' || true
-import base64
 import ctypes
 import json
 import os
+import pathlib
 import selectors
 import subprocess
 import sys
@@ -203,22 +218,6 @@ import time
 MAX_STREAM_BYTES = 4096
 PR_GET_DUMPABLE = 3
 PR_SET_DUMPABLE = 4
-
-
-def emit(*, protected, started, timed_out, returncode, output_overflow, stdout, stderr, error):
-    payload = {
-        "error": error,
-        "output_overflow": output_overflow,
-        "protected": protected,
-        "returncode": returncode,
-        "started": started,
-        "stderr_b64": base64.b64encode(stderr[:MAX_STREAM_BYTES]).decode("ascii"),
-        "stdout_b64": base64.b64encode(stdout[:MAX_STREAM_BYTES]).decode("ascii"),
-        "timed_out": timed_out,
-        "version": 1,
-    }
-    sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
 
 
 def disable_dumpability():
@@ -233,120 +232,278 @@ def disable_dumpability():
     return prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0
 
 
+def cleanup_containment(test_mode, containment, unit):
+    if test_mode:
+        results = []
+        for operation in ("term", "kill", "verify-empty"):
+            results.append(subprocess.run(
+                [containment, operation, unit],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                check=False,
+            ).returncode == 0)
+        return all(results)
+    for signal in ("TERM", "KILL"):
+        subprocess.run(
+            ["systemctl", "--user", "kill", "--kill-whom=all", f"--signal={signal}", unit],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            check=False,
+        )
+    subprocess.run(
+        ["systemctl", "--user", "stop", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        check=False,
+    )
+    state = subprocess.run(
+        ["systemctl", "--user", "show", "--property=ActiveState", "--value", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        check=False,
+    )
+    if state.returncode != 0 or state.stdout.strip() not in {b"inactive", b"failed"}:
+        return False
+    control_group = subprocess.run(
+        ["systemctl", "--user", "show", "--property=ControlGroup", "--value", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        check=False,
+    )
+    if control_group.returncode != 0:
+        return False
+    group = control_group.stdout.decode("utf-8", errors="strict").strip()
+    processes = pathlib.Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs"
+    return not processes.exists() or processes.stat().st_size == 0
+
+
+def capture(command, timeout_seconds):
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            bufsize=0,
+        )
+    except OSError:
+        return {
+            "error": "spawn-failed",
+            "output_overflow": False,
+            "returncode": None,
+            "started": False,
+            "stderr": b"",
+            "stdout": b"",
+            "timed_out": False,
+        }
+
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    selector = selectors.DefaultSelector()
+    for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr)):
+        os.set_blocking(pipe.fileno(), False)
+        selector.register(pipe, selectors.EVENT_READ, name)
+
+    def read_ready(events):
+        for key, _ in events:
+            name = key.data
+            room = MAX_STREAM_BYTES + 1 - len(buffers[name])
+            if room <= 0:
+                return True
+            try:
+                data = os.read(key.fileobj.fileno(), room)
+            except BlockingIOError:
+                continue
+            if not data:
+                selector.unregister(key.fileobj)
+                continue
+            buffers[name].extend(data)
+            if len(buffers[name]) > MAX_STREAM_BYTES:
+                return True
+        return False
+
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    output_overflow = False
+    error = None
+    try:
+        while child.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(min(remaining, 0.05)) if selector.get_map() else ()
+            if not selector.get_map():
+                time.sleep(min(remaining, 0.05))
+            if read_ready(events):
+                output_overflow = True
+                break
+        if not timed_out and not output_overflow:
+            while selector.get_map():
+                events = selector.select(0)
+                if not events:
+                    break
+                if read_ready(events):
+                    output_overflow = True
+                    break
+    except (OSError, ValueError):
+        error = "internal-error"
+    finally:
+        if child.poll() is None:
+            child.kill()
+        raw_returncode = child.wait()
+        selector.close()
+        child.stdout.close()
+        child.stderr.close()
+
+    return {
+        "error": error,
+        "output_overflow": output_overflow,
+        "returncode": raw_returncode if raw_returncode >= 0 else 128 - raw_returncode,
+        "started": True,
+        "stderr": bytes(buffers["stderr"][:MAX_STREAM_BYTES]),
+        "stdout": bytes(buffers["stdout"][:MAX_STREAM_BYTES]),
+        "timed_out": timed_out,
+    }
+
+
 try:
     protected = disable_dumpability()
 except (AttributeError, OSError):
     protected = False
 if not protected:
-    emit(
-        protected=False,
-        started=False,
-        timed_out=False,
-        returncode=None,
-        output_overflow=False,
-        stdout=b"",
-        stderr=b"",
-        error="protection-unavailable",
-    )
-    raise SystemExit(0)
+    raise SystemExit(70)
 
-timeout_seconds = int(sys.argv[1])
-command = sys.argv[2:]
+(
+    phase, timeout_raw, test_mode_raw, containment, unit, adapter,
+    validator_path, camera, validator_source,
+) = sys.argv[1:10]
+timeout_seconds = int(timeout_raw)
+test_mode = test_mode_raw == "1"
+validator = {"__name__": "irlume_matrix_validator"}
 try:
-    child = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        bufsize=0,
-    )
-except OSError:
-    emit(
-        protected=True,
-        started=False,
-        timed_out=False,
-        returncode=None,
-        output_overflow=False,
-        stdout=b"",
-        stderr=b"",
-        error="spawn-failed",
-    )
-    raise SystemExit(0)
+    exec(compile(validator_source, validator_path, "exec"), validator)
+except (OSError, RuntimeError, SyntaxError, ValueError):
+    raise SystemExit(70)
 
-buffers = {"stdout": bytearray(), "stderr": bytearray()}
-selector = selectors.DefaultSelector()
-for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr)):
-    os.set_blocking(pipe.fileno(), False)
-    selector.register(pipe, selectors.EVENT_READ, name)
+if phase == "preflight":
+    adapter_arguments = ["--preflight", "--expected-camera-identity-digest", camera]
+elif phase == "attempt":
+    adapter_arguments = [
+        "--service", sys.argv[15],
+        "--purpose", sys.argv[16],
+        "--expected-gesture", sys.argv[19],
+        "--expected-camera-identity-digest", camera,
+        "--timeout-seconds", "20",
+    ]
+else:
+    raise SystemExit(70)
 
-
-def read_ready(events):
-    for key, _ in events:
-        name = key.data
-        room = MAX_STREAM_BYTES + 1 - len(buffers[name])
-        if room <= 0:
-            return True
-        try:
-            data = os.read(key.fileobj.fileno(), room)
-        except BlockingIOError:
-            continue
-        if not data:
-            selector.unregister(key.fileobj)
-            continue
-        buffers[name].extend(data)
-        if len(buffers[name]) > MAX_STREAM_BYTES:
-            return True
-    return False
-
-
-deadline = time.monotonic() + timeout_seconds
-timed_out = False
-output_overflow = False
-error = None
-try:
-    while child.poll() is None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            break
-        if selector.get_map():
-            events = selector.select(min(remaining, 0.05))
-        else:
-            time.sleep(min(remaining, 0.05))
-            events = ()
-        if read_ready(events):
-            output_overflow = True
-            break
-    if not timed_out and not output_overflow:
-        while selector.get_map():
-            events = selector.select(0)
-            if not events:
-                break
-            if read_ready(events):
-                output_overflow = True
-                break
-except (OSError, ValueError):
-    error = "internal-error"
-finally:
-    if child.poll() is None:
-        child.kill()
-    raw_returncode = child.wait()
-    selector.close()
-    child.stdout.close()
-    child.stderr.close()
-
-returncode = raw_returncode if raw_returncode >= 0 else 128 - raw_returncode
-emit(
-    protected=True,
-    started=True,
-    timed_out=timed_out,
-    returncode=returncode,
-    output_overflow=output_overflow,
-    stdout=bytes(buffers["stdout"]),
-    stderr=bytes(buffers["stderr"]),
-    error=error,
+contained = (
+    [containment, "run", unit, adapter, *adapter_arguments]
+    if test_mode
+    else ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--", adapter, *adapter_arguments]
 )
+captured = capture(contained, timeout_seconds)
+cleanup_ok = cleanup_containment(test_mode, containment, unit) if captured["started"] else True
+
+if phase == "preflight":
+    try:
+        document = json.loads(captured["stdout"].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise SystemExit(70)
+    if (
+        not cleanup_ok
+        or captured["error"] is not None
+        or captured["timed_out"]
+        or captured["output_overflow"]
+        or captured["returncode"] != 0
+        or not isinstance(document, dict)
+        or set(document) != {"camera_identity_digest"}
+        or document["camera_identity_digest"] != camera
+    ):
+        raise SystemExit(70)
+    raise SystemExit(0)
+
+(
+    evidence_root, oid, binary_digest, adapter_digest, host, service, purpose,
+    policy, trial_id, gesture, timestamp,
+) = sys.argv[10:21]
+zero = {
+    "frames": 0,
+    "face_frames": 0,
+    "pitch_range": 0,
+    "yaw_range": 0,
+    "pitch_crossings": 0,
+    "yaw_crossings": 0,
+    "mean_step": 0,
+}
+result = None
+try:
+    candidate = json.loads(captured["stdout"].decode("utf-8"))
+    adapter_outcomes = validator["OUTCOMES"] - {
+        "attempt-timeout", "capability-present", "capability-not-present",
+    }
+    if (
+        isinstance(candidate, dict)
+        and set(candidate) == {"typed_outcome", "detector_evidence"}
+        and isinstance(candidate["typed_outcome"], str)
+        and candidate["typed_outcome"] in adapter_outcomes
+    ):
+        validator["validate_evidence"](
+            candidate["detector_evidence"],
+            "adapter.detector_evidence",
+            candidate["typed_outcome"] in validator["FAILURE_OUTCOMES"],
+        )
+        result = candidate
+except (UnicodeError, ValueError, json.JSONDecodeError, validator["SchemaError"]):
+    pass
+
+evidence = result["detector_evidence"] if result is not None else zero
+if cleanup_ok and captured["started"] and captured["error"] is None and captured["timed_out"]:
+    result = {"typed_outcome": "attempt-timeout", "detector_evidence": evidence}
+elif (
+    not cleanup_ok
+    or not captured["started"]
+    or captured["error"] is not None
+    or captured["output_overflow"]
+    or captured["returncode"] != 0
+    or result is None
+):
+    result = {"typed_outcome": "attempt-failed", "detector_evidence": evidence}
+
+record = {
+    "schema_version": 1,
+    "record_type": "trial",
+    "frozen_commit_oid": oid,
+    "release_binary_sha256": binary_digest,
+    "attempt_adapter_sha256": adapter_digest,
+    "host_label": host,
+    "camera_identity_digest": camera,
+    "service": service,
+    "purpose": purpose,
+    "resolved_policy": policy,
+    "trial_id": trial_id,
+    "expected_gesture": gesture,
+    "typed_outcome": result["typed_outcome"],
+    "detector_evidence": result["detector_evidence"],
+    "timestamp": timestamp,
+}
+try:
+    validator["publish_record_value"](pathlib.Path(evidence_root), record)
+except (OSError, validator["SchemaError"]):
+    raise SystemExit(70)
+raise SystemExit(4 if result["typed_outcome"] in validator["FAILURE_OUTCOMES"] else 0)
 PY
 
 status_json=
@@ -408,7 +565,7 @@ if [[ $camera_state == absent ]]; then
     scratch_file capability_record capability.json
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     make_capability_record capability-not-present "" "" "$capability_record" "$timestamp"
-    python3 "$validator" --publish-record "$evidence_root" "$capability_record" || die "cannot publish capability record"
+    publish_cached_record "$capability_record" || die "cannot publish capability record"
     printf '{"schema_valid":true,"qualified":false,"reason":"capability-not-present","host_label":"%s"}\n' "$host_label"
     exit 3
 fi
@@ -449,78 +606,26 @@ run_adapter() {
     local phase=$1 seconds=$2
     shift 2
     local unit="irlume-head-gesture-$phase-$$-$RANDOM.scope"
-    local outer_seconds=$((seconds + 3)) supervisor_result status
+    local outer_seconds=$((seconds + 3)) status containment_ok=1
     active_unit=$unit
     set +e
-    if [[ $test_mode == 1 ]]; then
-        supervisor_result=$(
-            timeout --foreground --kill-after=2s "${outer_seconds}s" \
-                "$containment_cmd" run "$unit" \
-                python3 -I -c "$supervisor_code" "$seconds" "$adapter_bound" "$@" |
-                head -c 16385
-        )
-    else
-        supervisor_result=$(
-            timeout --foreground --kill-after=2s "${outer_seconds}s" \
-                systemd-run --user --scope --quiet --unit="$unit" -- \
-                python3 -I -c "$supervisor_code" "$seconds" "$adapter_bound" "$@" |
-                head -c 16385
-        )
-    fi
+    timeout --foreground --kill-after=2s "${outer_seconds}s" \
+        python3 -I -c "$supervisor_code" "$phase" "$seconds" "$test_mode" \
+        "${containment_cmd:--}" "$unit" "$adapter_bound" "$validator" \
+        "$expected_camera_digest" "$validator_source" "$@"
     status=$?
     set -e
-    local containment_ok=1
-    containment_cleanup "$unit" || containment_ok=0
+    case "$status" in
+        0|4) ;;
+        *) containment_cleanup "$unit" || containment_ok=0 ;;
+    esac
     active_unit=
-    RUN_SUPERVISOR_RESULT=$supervisor_result
-    RUN_OUTER_STATUS=$status
+    RUN_SUPERVISOR_STATUS=$status
     RUN_CONTAINMENT_OK=$containment_ok
 }
 
-run_adapter preflight 5 --preflight --expected-camera-identity-digest "$expected_camera_digest"
-preflight_digest=$(python3 - "$RUN_SUPERVISOR_RESULT" "$RUN_OUTER_STATUS" "$RUN_CONTAINMENT_OK" <<'PY'
-import base64
-import json
-import sys
-
-raw, outer_status, containment_ok = sys.argv[1:]
-keys = {
-    "error", "output_overflow", "protected", "returncode", "started",
-    "stderr_b64", "stdout_b64", "timed_out", "version",
-}
-try:
-    supervisor = json.loads(raw)
-    if (
-        outer_status != "0"
-        or containment_ok != "1"
-        or not isinstance(supervisor, dict)
-        or set(supervisor) != keys
-        or type(supervisor["version"]) is not int
-        or supervisor["version"] != 1
-        or supervisor["protected"] is not True
-        or supervisor["started"] is not True
-        or supervisor["timed_out"] is not False
-        or supervisor["output_overflow"] is not False
-        or type(supervisor["returncode"]) is not int
-        or supervisor["returncode"] != 0
-        or supervisor["error"] is not None
-        or not isinstance(supervisor["stdout_b64"], str)
-        or not isinstance(supervisor["stderr_b64"], str)
-    ):
-        raise ValueError
-    stdout = base64.b64decode(supervisor["stdout_b64"], validate=True)
-    stderr = base64.b64decode(supervisor["stderr_b64"], validate=True)
-    if len(stdout) > 4096 or len(stderr) > 4096:
-        raise ValueError
-    doc = json.loads(stdout.decode("utf-8"))
-except (UnicodeError, ValueError, json.JSONDecodeError):
-    raise SystemExit("invalid supervisor/preflight result")
-if not isinstance(doc, dict) or set(doc) != {"camera_identity_digest"} or not isinstance(doc["camera_identity_digest"], str):
-    raise SystemExit("invalid preflight result")
-print(doc["camera_identity_digest"])
-PY
-) || die "adapter preflight result was invalid"
-[[ $preflight_digest == "$expected_camera_digest" ]] || die "adapter preflight camera digest mismatch"
+run_adapter preflight 5
+[[ $RUN_SUPERVISOR_STATUS == 0 && $RUN_CONTAINMENT_OK == 1 ]] || die "adapter preflight result was invalid"
 
 printf 'head-gesture-matrix: service=%s purpose=%s expected-pose=%s resolved-policy=%s\n' \
     "$service" "$purpose" "$expected_gesture" "$resolved_policy"
@@ -529,122 +634,24 @@ IFS= read -r confirmation || die "readiness confirmation ended"
 [[ $confirmation == ready ]] || die "literal ready was not received; no attempt started"
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-run_adapter attempt "$attempt_seconds" \
-    --service "$service" \
-    --purpose "$purpose" \
-    --expected-gesture "$expected_gesture" \
-    --expected-camera-identity-digest "$expected_camera_digest" \
-    --timeout-seconds 20
-
-trial_record=
-scratch_file trial_record trial.json
 trial_id="$host_label:$service:$expected_gesture:$(date -u +%Y%m%d%H%M%S):$$"
-normalization=$(python3 - "$RUN_SUPERVISOR_RESULT" "$RUN_OUTER_STATUS" "$RUN_CONTAINMENT_OK" "$trial_record" \
-    "$expected_oid" "$expected_binary_sha256" "$expected_adapter_sha256" "$expected_camera_digest" \
-    "$host_label" "$service" "$purpose" "$resolved_policy" "$trial_id" "$expected_gesture" "$timestamp" "$validator" <<'PY'
-import base64
+run_adapter attempt "$attempt_seconds" \
+    "$evidence_root" "$expected_oid" "$expected_binary_sha256" "$expected_adapter_sha256" \
+    "$host_label" "$service" "$purpose" "$resolved_policy" "$trial_id" "$expected_gesture" "$timestamp"
+attempt_status=$RUN_SUPERVISOR_STATUS
+
+if [[ $attempt_status != 0 && $attempt_status != 4 ]]; then
+    [[ $RUN_CONTAINMENT_OK == 1 ]] || die "attempt coordinator failed and containment cleanup was not verified"
+    trial_record=
+    scratch_file trial_record trial.json
+    python3 - "$trial_record" "$expected_oid" "$expected_binary_sha256" "$expected_adapter_sha256" \
+        "$expected_camera_digest" "$host_label" "$service" "$purpose" "$resolved_policy" \
+        "$trial_id" "$expected_gesture" "$timestamp" <<'PY'
 import json
 import pathlib
-import runpy
 import sys
 
-(
-    supervisor_raw, outer_status_raw, containment_raw, destination_raw, oid, binary, adapter,
-    camera, host, service, purpose, policy, trial_id, gesture, timestamp, validator_raw,
-) = sys.argv[1:]
-zero = {"frames": 0, "face_frames": 0, "pitch_range": 0, "yaw_range": 0, "pitch_crossings": 0, "yaw_crossings": 0, "mean_step": 0}
-result = None
-supervisor = None
-stdout = b""
-validator = runpy.run_path(validator_raw)
-supervisor_keys = {
-    "error", "output_overflow", "protected", "returncode", "started",
-    "stderr_b64", "stdout_b64", "timed_out", "version",
-}
-try:
-    if len(supervisor_raw.encode("utf-8")) > 16384:
-        raise ValueError
-    candidate_supervisor = json.loads(supervisor_raw)
-    if (
-        not isinstance(candidate_supervisor, dict)
-        or set(candidate_supervisor) != supervisor_keys
-        or type(candidate_supervisor["version"]) is not int
-        or candidate_supervisor["version"] != 1
-        or any(
-            type(candidate_supervisor[name]) is not bool
-            for name in ("output_overflow", "protected", "started", "timed_out")
-        )
-        or not isinstance(candidate_supervisor["stdout_b64"], str)
-        or not isinstance(candidate_supervisor["stderr_b64"], str)
-        or candidate_supervisor["error"] not in {None, "protection-unavailable", "spawn-failed", "internal-error"}
-    ):
-        raise ValueError
-    returncode = candidate_supervisor["returncode"]
-    if returncode is not None and (type(returncode) is not int or not 0 <= returncode <= 255):
-        raise ValueError
-    stdout = base64.b64decode(candidate_supervisor["stdout_b64"], validate=True)
-    stderr = base64.b64decode(candidate_supervisor["stderr_b64"], validate=True)
-    if len(stdout) > 4096 or len(stderr) > 4096:
-        raise ValueError
-    if candidate_supervisor["started"]:
-        if returncode is None or not candidate_supervisor["protected"]:
-            raise ValueError
-    elif (
-        returncode is not None
-        or candidate_supervisor["timed_out"]
-        or candidate_supervisor["output_overflow"]
-        or stdout
-        or stderr
-    ):
-        raise ValueError
-    if candidate_supervisor["timed_out"] and candidate_supervisor["output_overflow"]:
-        raise ValueError
-    supervisor = candidate_supervisor
-except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
-    pass
-
-if supervisor is not None:
-    try:
-        candidate = json.loads(stdout.decode("utf-8"))
-        adapter_outcomes = validator["OUTCOMES"] - {
-            "attempt-timeout", "capability-present", "capability-not-present",
-        }
-        if (
-            isinstance(candidate, dict)
-            and set(candidate) == {"typed_outcome", "detector_evidence"}
-            and isinstance(candidate["typed_outcome"], str)
-            and candidate["typed_outcome"] in adapter_outcomes
-        ):
-            try:
-                validator["validate_evidence"](
-                    candidate["detector_evidence"],
-                    "adapter.detector_evidence",
-                    candidate["typed_outcome"] in validator["FAILURE_OUTCOMES"],
-                )
-            except validator["SchemaError"]:
-                pass
-            else:
-                result = candidate
-    except (UnicodeError, json.JSONDecodeError):
-        pass
-evidence = result["detector_evidence"] if result is not None else zero
-trusted_supervisor = (
-    supervisor is not None
-    and outer_status_raw == "0"
-    and containment_raw == "1"
-    and supervisor["protected"]
-    and supervisor["started"]
-    and supervisor["error"] is None
-)
-if trusted_supervisor and supervisor["timed_out"]:
-    result = {"typed_outcome": "attempt-timeout", "detector_evidence": evidence}
-elif (
-    not trusted_supervisor
-    or supervisor["output_overflow"]
-    or supervisor["returncode"] != 0
-    or result is None
-):
-    result = {"typed_outcome": "attempt-failed", "detector_evidence": evidence}
+destination, oid, binary, adapter, camera, host, service, purpose, policy, trial_id, gesture, timestamp = sys.argv[1:]
 record = {
     "schema_version": 1,
     "record_type": "trial",
@@ -658,22 +665,19 @@ record = {
     "resolved_policy": policy,
     "trial_id": trial_id,
     "expected_gesture": gesture,
-    "typed_outcome": result["typed_outcome"],
-    "detector_evidence": result["detector_evidence"],
+    "typed_outcome": "attempt-failed",
+    "detector_evidence": {"frames": 0, "face_frames": 0, "pitch_range": 0, "yaw_range": 0, "pitch_crossings": 0, "yaw_crossings": 0, "mean_step": 0},
     "timestamp": timestamp,
 }
-pathlib.Path(destination_raw).write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-print(record["typed_outcome"])
+pathlib.Path(destination).write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
-) || die "cannot normalize bounded attempt result"
+    publish_cached_record "$trial_record" || die "cannot publish failed attempt record"
+    attempt_status=4
+fi
 
-python3 "$validator" --publish-record "$evidence_root" "$trial_record" || die "cannot publish trial record"
 capability_record=
 scratch_file capability_record capability.json
 make_capability_record capability-present "$expected_adapter_sha256" "$expected_camera_digest" "$capability_record" "$timestamp"
-python3 "$validator" --publish-record "$evidence_root" "$capability_record" || die "cannot publish capability record"
-printf 'head-gesture-matrix: recorded host=%s trial=%s outcome=%s\n' "$host_label" "$trial_id" "$normalization"
-case "$normalization" in
-    attempt-failed|attempt-timeout) exit 4 ;;
-    *) exit 0 ;;
-esac
+publish_cached_record "$capability_record" || die "cannot publish capability record"
+printf 'head-gesture-matrix: recorded host=%s trial=%s\n' "$host_label" "$trial_id"
+exit "$attempt_status"

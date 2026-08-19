@@ -432,6 +432,10 @@ def publish_record(root, source):
     except OSError as error:
         fail(f"cannot read record for publication: {error}")
     record = decode_record(raw, "publication record")
+    return publish_record_value(root, record)
+
+
+def publish_record_value(root, record):
     validate_record(record, 1)
     encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -344,6 +345,41 @@ elif action == "probe-result-fd":
     else:
         os.close(descriptor)
         found = result_fd
+elif action == "probe-ancestor-result-fds":
+    forged = (
+        b'{"error":null,"output_overflow":false,"protected":true,'
+        b'"returncode":0,"started":true,"stderr_b64":"",'
+        b'"stdout_b64":"e30K","timed_out":false,"version":1}\\n'
+    )
+    pid = int(parent_pid)
+    stop_pid = int(pathlib.Path(os.environ["FAKE_RUNNER_PID"]).read_text(encoding="utf-8"))
+    opened = []
+    for depth in range(32):
+        status = pathlib.Path(f"/proc/{pid}/status")
+        try:
+            fields = dict(
+                line.split(":", 1)
+                for line in status.read_text(encoding="utf-8").splitlines()
+                if ":" in line
+            )
+        except OSError:
+            break
+        result_fd = pathlib.Path(f"/proc/{pid}/fd/1")
+        try:
+            descriptor = os.open(result_fd, os.O_WRONLY | os.O_CLOEXEC)
+        except OSError:
+            pass
+        else:
+            os.write(descriptor, forged)
+            os.close(descriptor)
+            opened.append(f"{depth}:{pid}:{os.readlink(result_fd)}")
+        if pid == stop_pid:
+            break
+        next_pid = int(fields["PPid"].strip())
+        if next_pid <= 1 or next_pid == pid:
+            break
+        pid = next_pid
+    found = ",".join(opened) if opened else None
 else:
     raise SystemExit(2)
 with pathlib.Path(os.environ["FAKE_LEGACY_ATTACK_LOG"]).open("a", encoding="utf-8") as log:
@@ -358,6 +394,9 @@ if [ "$1" = --preflight ]; then
   printf '{"camera_identity_digest":"%s"}\\n' "${FAKE_CAMERA_DIGEST}"
   if [ -n "${FAKE_ADAPTER_REPLACEMENT-}" ]; then
     mv "$FAKE_ADAPTER_REPLACEMENT" "$FAKE_ADAPTER_PATH"
+  fi
+  if [ -n "${FAKE_VALIDATOR_REPLACEMENT-}" ]; then
+    cp "$FAKE_VALIDATOR_REPLACEMENT" "$FAKE_VALIDATOR_PATH"
   fi
   exit 0
 fi
@@ -400,6 +439,14 @@ case "${FAKE_ADAPTER_MODE-good}" in
     python3 "$FAKE_LEGACY_ATTACK" probe-result-fd "$PPID" "$FAKE_REPLACEMENT_SUPERVISOR"
     printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"
     ;;
+  ancestor-forge-exit-124|ancestor-forge-exit-137|ancestor-forge-hang)
+    python3 "$FAKE_LEGACY_ATTACK" probe-ancestor-result-fds "$PPID" "$FAKE_REPLACEMENT_SUPERVISOR"
+    case "$FAKE_ADAPTER_MODE" in
+      ancestor-forge-exit-124) exit 124 ;;
+      ancestor-forge-exit-137) exit 137 ;;
+      ancestor-forge-hang) sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CONTAINED_PID"; wait "$child" ;;
+    esac
+    ;;
   supervisor-kill-victim) printf '%s\\n' "$$" >"$FAKE_ADAPTER_PID"; exec sleep 60 ;;
   escape)
     setsid sh -c 'setsid sh -c '\''sleep 60 & child=$!; printf "%s\\n" "$child" >"$FAKE_ESCAPE_PID"; wait "$child"'\'' &' &
@@ -430,6 +477,7 @@ shift
 case "$operation" in
   check)
     printf '%s\\n' containment-check >>"$FAKE_LOG"
+    printf '%s\\n' "$PPID" >"$FAKE_RUNNER_PID"
     [ "${FAKE_CONTAINMENT_CHECK_FAIL-0}" -eq 0 ]
     ;;
   run)
@@ -517,6 +565,8 @@ esac
             "FAKE_LEGACY_ATTACK": str(self.legacy_attack),
             "FAKE_LEGACY_ATTACK_LOG": str(self.root / "legacy-attack.log"),
             "FAKE_REPLACEMENT_SUPERVISOR": str(self.malicious_supervisor),
+            "FAKE_RUNNER_PID": str(self.root / "runner.pid"),
+            "FAKE_VALIDATOR_PATH": str(VALIDATOR),
             "TMPDIR": str(self.root),
             "IRLUME_HEAD_GESTURE_ROOT": str(self.repo),
             "IRLUME_HEAD_GESTURE_BINARY": str(self.binary),
@@ -645,6 +695,34 @@ exit 99
         self.assertIn("attempt", self.log.read_text(encoding="utf-8").splitlines())
         self.assertNotIn("replaced-adapter", self.log.read_text(encoding="utf-8").splitlines())
 
+    def test_validator_source_is_bound_before_preflight(self):
+        copied_scripts = self.root / "copied-scripts" / "hardware"
+        copied_scripts.mkdir(parents=True)
+        copied_runner = copied_scripts / RUNNER.name
+        copied_validator = copied_scripts / VALIDATOR.name
+        shutil.copy2(RUNNER, copied_runner)
+        shutil.copy2(VALIDATOR, copied_validator)
+        replacement = self.root / "replacement-validator.py"
+        replacement.write_text("raise SystemExit(99)\n", encoding="utf-8")
+
+        args, env = self.invocation(extra_env={
+            "FAKE_VALIDATOR_PATH": str(copied_validator),
+            "FAKE_VALIDATOR_REPLACEMENT": str(replacement),
+        })
+        args[1] = str(copied_runner)
+        result = subprocess.run(
+            args,
+            input="ready\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(copied_validator.read_text(encoding="utf-8"), "raise SystemExit(99)\n")
+        self.assertEqual(len(self.records()), 2)
+
     def test_policy_is_observed_only_through_verified_candidate(self):
         result = self.run_runner(trial="sudo:shake")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -738,6 +816,35 @@ exit 99
         self.assertEqual(result.returncode, 0, result.stderr)
         attacks = (self.root / "legacy-attack.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(attacks, ["probe-result-fd:none"])
+
+    def test_ancestor_fd_writes_cannot_forge_independent_exit_or_timeout_status(self):
+        cases = [
+            ("ancestor-forge-exit-124", "attempt-failed"),
+            ("ancestor-forge-exit-137", "attempt-failed"),
+            ("ancestor-forge-hang", "attempt-timeout"),
+        ]
+        for mode, expected_outcome in cases:
+            root = self.root / mode
+            root.mkdir(mode=0o700)
+            env = {"FAKE_ADAPTER_MODE": mode}
+            if mode == "ancestor-forge-hang":
+                env["IRLUME_HEAD_GESTURE_TEST_TIMEOUT_SECONDS"] = "1"
+            result = self.run_runner(evidence_root=root, extra_env=env)
+            with self.subTest(mode=mode):
+                self.assertNotEqual(result.returncode, 0)
+                record = next(record for record in self.records(root) if record["record_type"] == "trial")
+                self.assertEqual(record["typed_outcome"], expected_outcome)
+                qualification = subprocess.run(
+                    ["python3", str(VALIDATOR), str(root)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(qualification.returncode, 3)
+        attacks = (self.root / "legacy-attack.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(attacks), len(cases))
+        self.assertTrue(all(line.startswith("probe-ancestor-result-fds:") for line in attacks))
+        self.assertTrue(all(not line.endswith(":none") for line in attacks))
 
     def test_missing_or_malformed_supervisor_result_is_failure_not_timeout(self):
         cases = [

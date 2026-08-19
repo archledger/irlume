@@ -106,6 +106,13 @@ pub fn classify(service: &str) -> Option<ServiceKind> {
 }
 
 impl ServiceKind {
+    /// Whether a face attempt for this service needs an explicit conventional
+    /// PAM response before it may reach the camera.
+    #[must_use]
+    pub fn requires_face_intent_confirmation(self) -> bool {
+        matches!(self, Self::Elevation | Self::AppConsent)
+    }
+
     /// Whether this service should get the SHORT grace window.
     ///
     /// Elevation and consent prompts are both "the user is already at the
@@ -185,6 +192,21 @@ mod tests {
                     "{name}: only the consent path prompts for a gesture"
                 );
             }
+        }
+    }
+
+    /// Removing the optional gesture default must not remove the mandatory
+    /// conventional-confirmation classification. Every privileged spelling in
+    /// the shared table gets the same answer, while login, lock, and remote
+    /// services never inherit the privileged prompt.
+    #[test]
+    fn only_privileged_services_require_face_intent_confirmation() {
+        for (name, kind) in SERVICES {
+            assert_eq!(
+                kind.requires_face_intent_confirmation(),
+                matches!(kind, ServiceKind::Elevation | ServiceKind::AppConsent),
+                "{name}"
+            );
         }
     }
 

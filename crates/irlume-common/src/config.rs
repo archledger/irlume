@@ -378,13 +378,8 @@ pub fn credential_release_challenge() -> bool {
 /// Each key is `service_gesture.<service_name>`, where `<service_name>` is the
 /// PAM service name (e.g. `sudo`, `polkit-1`) or the special token
 /// `credential_release` for the cold-login keyring-unlock path. Values are `1`
-/// (gesture required) or `0` (no gesture). An absent key falls through to the
-/// per-service default.
-///
-/// The defaults: elevation services (sudo, su, doas) require the gesture.
-/// Everything else, including the credential-release path, does not. The user
-/// can override any service; a warning is printed when disabling a
-/// high-privilege service.
+/// (gesture required) or `0` (no gesture). An absent key is off: the gesture is
+/// an experimental additional gate, never the privileged intent boundary.
 pub const SERVICE_GESTURE_KEY: &str = "service_gesture";
 
 /// Read the per-service consent-gesture override from settings.conf.
@@ -396,37 +391,28 @@ pub fn service_gesture(service: &str) -> Option<bool> {
     read_kv("settings.conf", &format!("{SERVICE_GESTURE_KEY}.{service}")).map(|v| !falsy(&v))
 }
 
-/// The per-service default for the consent gesture, when no override is set.
-/// Elevation defaults to ON; everything else defaults to OFF.
-///
-/// The elevation set is read from the shared [`crate::pam_service`] table, not
-/// a private list here: that table already carries every spelling
-/// (`sudo`, `sudo-i`, `su`, `su-l`, `runuser`, `runuser-l`, `doas`) and trims
-/// and case-folds the name. A local `matches!("sudo" | "su" | "doas")` is the
-/// exact three-consumer drift #362 unified, and it silently defaulted `su -`
-/// (service `su-l`) and `sudo -i` (service `sudo-i`) to OFF.
-pub fn service_gesture_default(service: &str) -> bool {
-    matches!(
-        crate::pam_service::classify(service),
-        Some(crate::pam_service::ServiceKind::Elevation)
-    )
+/// The compatibility default for a service with no explicit gesture setting.
+/// Conventional PAM confirmation carries privileged intent, so every optional
+/// head gesture defaults off regardless of service class.
+pub fn service_gesture_default(_service: &str) -> bool {
+    false
 }
 
 /// Is the polkit (app-consent) gesture switched on at all?
 ///
-/// `IRLUME_POLKIT_GESTURE`, else `polkit_gesture` in settings.conf, else on.
-/// Turning it off drops an app-consent request to a plain verify, so the
-/// per-service default below stops applying to polkit.
+/// `IRLUME_POLKIT_GESTURE`, else `polkit_gesture` in settings.conf, else off.
+/// Only a recognized truthy value opts in; malformed or non-UTF-8 environment
+/// values stay off rather than inheriting a file value.
 ///
 /// Lives HERE rather than in the engine because three surfaces answer "does
 /// this service need a gesture" and they must not answer it differently: the
 /// engine enforces it, `credential-release-challenge status` reports it, and
 /// the TUI renders a badge for it.
 pub fn polkit_gesture_enabled() -> bool {
-    if let Ok(v) = std::env::var("IRLUME_POLKIT_GESTURE") {
-        return !falsy(&v);
+    if let Some(value) = std::env::var_os("IRLUME_POLKIT_GESTURE") {
+        return value.to_str().is_some_and(truthy);
     }
-    !read_kv("settings.conf", "polkit_gesture").is_some_and(|v| falsy(&v))
+    read_kv("settings.conf", "polkit_gesture").is_some_and(|value| truthy(&value))
 }
 
 /// [`service_gesture_required`] when the answer can be KNOWN, `None` when the
@@ -443,20 +429,19 @@ pub fn service_gesture_required_visible(service: &str) -> Option<bool> {
     match observe_kv("settings.conf", &format!("{SERVICE_GESTURE_KEY}.{service}")) {
         KvObservation::Value(v) => Some(!falsy(&v)),
         KvObservation::Unknown(_) => None,
-        // No override: the default applies, and for an app-consent service that
-        // default is itself conditional on `polkit_gesture`, which lives in the
-        // same unreadable file. Ask about that key the same honest way.
+        // No per-service override: app consent can still opt in through the
+        // legacy polkit switch, which lives in the same root-only file.
         KvObservation::Absent => {
             if matches!(
                 crate::pam_service::classify(service),
                 Some(crate::pam_service::ServiceKind::AppConsent)
             ) {
                 if std::env::var_os("IRLUME_POLKIT_GESTURE").is_some() {
-                    return Some(polkit_gesture_enabled() || service_gesture_default(service));
+                    return Some(polkit_gesture_enabled());
                 }
                 match observe_kv("settings.conf", "polkit_gesture") {
-                    KvObservation::Value(v) => Some(!falsy(&v) || service_gesture_default(service)),
-                    KvObservation::Absent => Some(true),
+                    KvObservation::Value(value) => Some(truthy(&value)),
+                    KvObservation::Absent => Some(false),
                     KvObservation::Unknown(_) => None,
                 }
             } else {
@@ -469,11 +454,8 @@ pub fn service_gesture_required_visible(service: &str) -> Option<bool> {
 /// The EFFECTIVE consent-gesture state for a PAM service: what the engine will
 /// actually do, not what one config key says.
 ///
-/// The engine's rule has two defaults, not one. An app-consent service (polkit)
-/// defaults ON while the polkit gesture is enabled; an elevation service
-/// (sudo/su/doas and their `-i`/`-l` spellings) defaults ON through
-/// [`service_gesture_default`]; everything else defaults off. An explicit
-/// `service_gesture.<service>` override beats both.
+/// Every service defaults off. An explicit `service_gesture.<service>` override
+/// wins; app-consent services also retain the explicit legacy polkit switch.
 ///
 /// Written because the three surfaces had drifted: the TUI applied the
 /// elevation default to polkit and rendered `polkit-1: no` on a default install
@@ -488,10 +470,7 @@ pub fn service_gesture_required(service: &str) -> bool {
         crate::pam_service::classify(service),
         Some(crate::pam_service::ServiceKind::AppConsent)
     ) {
-        // Mirrors irlume-auth: AppConsent defaults ON, but `polkit_gesture=0`
-        // turns the consent purpose off entirely, and the request then falls
-        // back to the plain-verify rule below.
-        return polkit_gesture_enabled() || service_gesture_default(service);
+        return polkit_gesture_enabled();
     }
     service_gesture_default(service)
 }
@@ -694,13 +673,12 @@ mod camera_pin_tests {
 mod service_gesture_default_tests {
     use super::service_gesture_default;
 
-    /// The elevation default must cover every spelling the shared pam_service
-    /// table calls Elevation, not the three literals `sudo`/`su`/`doas` the
-    /// first cut used. `su -` reaches PAM as `su-l` and `sudo -i` as `sudo-i`;
-    /// under the private list both defaulted the consent gesture OFF, so a print
-    /// that clears the single-frame cues could elevate to root ungated.
+    /// Conventional confirmation now carries privileged intent, so no service
+    /// may acquire an optional head-gesture gate merely because its setting is
+    /// absent. The compatibility helper remains, but its only safe default is
+    /// false for every normalized or unknown spelling.
     #[test]
-    fn every_elevation_spelling_defaults_on() {
+    fn every_service_gesture_default_is_off() {
         for svc in [
             "sudo",
             "sudo-i",
@@ -709,36 +687,16 @@ mod service_gesture_default_tests {
             "runuser",
             "runuser-l",
             "doas",
-        ] {
-            assert!(
-                service_gesture_default(svc),
-                "elevation service {svc} must default the consent gesture ON"
-            );
-        }
-        // Case and surrounding whitespace are folded by the shared classifier.
-        assert!(
-            service_gesture_default(" SUDO "),
-            "the classifier trims and case-folds; a padded name must still match"
-        );
-    }
-
-    /// Non-elevation services default OFF. polkit's gesture comes from the
-    /// AppConsent purpose, not this default, so `polkit-1` is OFF here too; an
-    /// unrecognised name is not elevation and defaults OFF.
-    #[test]
-    fn non_elevation_defaults_off() {
-        for svc in [
             "kde",
-            "swaylock",
             "sddm",
-            "gdm-password",
             "sshd",
             "polkit-1",
             "totally-made-up",
+            " SUDO ",
         ] {
             assert!(
                 !service_gesture_default(svc),
-                "non-elevation service {svc} must default the consent gesture OFF"
+                "service {svc:?} must default the optional head gesture OFF"
             );
         }
     }
@@ -1083,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn the_effective_service_gesture_matches_what_the_engine_enforces() {
+    fn explicit_service_gestures_are_opt_in() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-cfg-svcgest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1091,45 +1049,66 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_POLKIT_GESTURE");
 
-        // No overrides. polkit is the case the TUI got wrong: AppConsent defaults
-        // ON in the engine, while the elevation-only default reports OFF.
+        // No overrides: every service is off, including elevation and polkit.
         std::fs::write(config_path("settings.conf"), "").unwrap();
-        assert!(
-            service_gesture_required("polkit-1"),
-            "polkit defaults ON, as the engine's AppConsent arm does"
-        );
-        assert!(!service_gesture_default("polkit-1"), "premise: the elevation-only default says otherwise, which is the bug this helper fixes");
-        for svc in ["sudo", "su", "doas", "sudo-i", "su-l", "runuser"] {
-            assert!(service_gesture_required(svc), "{svc} is elevation: ON");
+        for svc in [
+            "sudo",
+            "sudo-i",
+            "su",
+            "su-l",
+            "runuser",
+            "runuser-l",
+            "doas",
+            "polkit-1",
+            "kde",
+        ] {
+            assert!(!service_gesture_required(svc), "{svc} must default off");
+            assert_eq!(
+                service_gesture_required_visible(svc),
+                Some(false),
+                "{svc} must visibly default off"
+            );
         }
-        assert!(
-            !service_gesture_required("kde"),
-            "a screen unlock stays off"
-        );
 
-        // An explicit override beats both defaults, in both directions.
+        // Per-service settings remain the highest-precedence explicit opt-in.
         std::fs::write(
             config_path("settings.conf"),
-            "service_gesture.polkit-1=0\nservice_gesture.kde=1\n",
+            "service_gesture.sudo=1\nservice_gesture.polkit-1=1\n",
         )
         .unwrap();
-        assert!(
-            !service_gesture_required("polkit-1"),
-            "an explicit off wins"
-        );
-        assert!(service_gesture_required("kde"), "an explicit on wins");
+        assert!(service_gesture_required("sudo"));
+        assert!(service_gesture_required("polkit-1"));
 
-        // `polkit_gesture=0` turns the consent purpose off entirely, so polkit
-        // falls back to the plain-verify rule and stops demanding a gesture.
-        std::fs::write(config_path("settings.conf"), "polkit_gesture=0\n").unwrap();
-        assert!(
-            !service_gesture_required("polkit-1"),
-            "polkit_gesture=0 disables the AppConsent default"
+        // The legacy polkit switch is also an explicit opt-in, but malformed
+        // values do not accidentally enable it.
+        std::fs::write(config_path("settings.conf"), "polkit_gesture=1\n").unwrap();
+        assert!(service_gesture_required("polkit-1"));
+        assert!(!service_gesture_required("sudo"));
+        std::fs::write(config_path("settings.conf"), "polkit_gesture=banana\n").unwrap();
+        assert!(!service_gesture_required("polkit-1"));
+        assert_eq!(service_gesture_required_visible("polkit-1"), Some(false));
+
+        // The environment wins over the file and uses the same strict truthy
+        // parser in both the enforcement and visible readers.
+        std::env::set_var("IRLUME_POLKIT_GESTURE", "yes");
+        assert!(service_gesture_required("polkit-1"));
+        assert_eq!(service_gesture_required_visible("polkit-1"), Some(true));
+        std::env::set_var("IRLUME_POLKIT_GESTURE", "banana");
+        assert!(!service_gesture_required("polkit-1"));
+        assert_eq!(service_gesture_required_visible("polkit-1"), Some(false));
+        std::env::remove_var("IRLUME_POLKIT_GESTURE");
+
+        // A present but non-UTF-8 environment value still wins over a truthy
+        // file value and fails closed to the optional gate being off.
+        use std::os::unix::ffi::OsStringExt as _;
+        std::fs::write(config_path("settings.conf"), "polkit_gesture=1\n").unwrap();
+        std::env::set_var(
+            "IRLUME_POLKIT_GESTURE",
+            std::ffi::OsString::from_vec(vec![0xff]),
         );
-        assert!(
-            service_gesture_required("sudo"),
-            "and leaves elevation untouched"
-        );
+        assert!(!service_gesture_required("polkit-1"));
+        assert_eq!(service_gesture_required_visible("polkit-1"), Some(false));
+        std::env::remove_var("IRLUME_POLKIT_GESTURE");
 
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

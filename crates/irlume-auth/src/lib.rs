@@ -443,16 +443,6 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
     }
 }
 
-/// Escape hatch for the forced polkit head-consent gate: default ON; disable with
-/// `IRLUME_POLKIT_GESTURE=0` or `polkit_gesture=0` in settings.conf. Verify
-/// stays face-gated either way; this only controls the extra head gesture.
-fn consent_gesture_enabled() -> bool {
-    // One definition, in irlume_common, because the TUI badge and the CLI status
-    // listing answer the same question and a private copy here is how they came
-    // to disagree with the engine about polkit.
-    irlume_common::config::polkit_gesture_enabled()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadConsentVerdict {
     Approve,
@@ -532,20 +522,6 @@ fn resolve_consent_watch(
     }
 }
 
-/// Whether this PAM service forces the head-consent gate (polkit prompts; see
-/// `biopolicy::requires_consent_gesture`). The gate FAILS CLOSED when it can't
-/// run (no IR). Computed per
-/// [`Engine::authenticate`] call and threaded down explicitly, so a polkit
-/// verify can never leak the flag into a later login/lock verify.
-fn forced_consent_for(service: Option<&str>) -> bool {
-    service.is_some_and(|s| {
-        irlume_core::biopolicy::requires_consent_gesture(irlume_core::biopolicy::classify(
-            s,
-            irlume_core::biopolicy::SessionState::Cold,
-        )) && consent_gesture_enabled()
-    })
-}
-
 /// What this authentication is FOR, which decides what has to happen on top of
 /// the face match before the outcome is granted.
 ///
@@ -557,12 +533,10 @@ fn forced_consent_for(service: Option<&str>) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationPurpose {
     /// Prove identity for a session (login, lock screen, sudo). A gesture is
-    /// demanded only when the service's own policy asks for it (elevation
-    /// defaults on; see `demands_gesture`).
+    /// demanded only when the service explicitly opts in.
     Verify,
-    /// Approve one application request (a polkit prompt). Requires the deliberate
-    /// consent gesture, because the user is answering a prompt they did not type
-    /// a password into.
+    /// Approve one application request (a polkit prompt). Conventional PAM
+    /// confirmation carries intent; a head gesture is an optional extra gate.
     AppConsent,
     /// Release a stored credential: the TPM-sealed login-keyring password. A spoof
     /// here yields a reusable secret rather than one session, so the same
@@ -584,38 +558,25 @@ impl AuthenticationPurpose {
     /// The purpose a plain [`Engine::authenticate`] runs under: consent-class
     /// services (polkit) get [`Self::AppConsent`], everything else [`Self::Verify`].
     fn for_service(service: Option<&str>) -> Self {
-        if forced_consent_for(service) {
+        if matches!(
+            service.and_then(irlume_common::pam_service::classify),
+            Some(irlume_common::pam_service::ServiceKind::AppConsent)
+        ) {
             Self::AppConsent
         } else {
             Self::Verify
         }
     }
 
-    /// Whether the deliberate consent gesture is required regardless of the
-    /// user's per-enrollment opt-in.
+    /// Whether the deliberate consent gesture is explicitly required.
     ///
     /// `service` is the PAM service name when available (e.g. `sudo`, `polkit-1`).
     /// It is consulted for per-service overrides in `settings.conf` under
     /// `service_gesture.<service>`. When absent, the per-purpose default is used.
     fn demands_gesture(self, service: Option<&str>) -> bool {
         match self {
-            Self::Verify => {
-                // Elevation services (sudo, su, doas) default to gesture ON.
-                // The user can override per-service in settings.conf.
-                service.is_some_and(|s| {
-                    irlume_common::config::service_gesture(s)
-                        .unwrap_or_else(|| irlume_common::config::service_gesture_default(s))
-                })
-            }
-            Self::AppConsent => {
-                // App-consent services (polkit) default to gesture ON, but honor
-                // an explicit per-service override so `service_gesture.polkit-1=0`
-                // actually disables it. Before this, the arm was an unconditional
-                // `true`, so the CLI could write and report `polkit-1 off` while
-                // the engine still forced the gesture.
-                service
-                    .and_then(irlume_common::config::service_gesture)
-                    .unwrap_or(true)
+            Self::Verify | Self::AppConsent => {
+                service.is_some_and(irlume_common::config::service_gesture_required)
             }
             Self::CredentialRelease { temporal_challenge } => {
                 // Per-service override for the credential-release path
@@ -9778,7 +9739,7 @@ mod engine_tests {
         ] {
             std::fs::write(
                 dir.join("settings.conf"),
-                format!("consent_gesture={configured}\n"),
+                format!("service_gesture.sudo=1\nconsent_gesture={configured}\n"),
             )
             .unwrap();
             let out = s
@@ -9790,7 +9751,11 @@ mod engine_tests {
             assert_eq!(out.reason, expected, "{configured}");
         }
 
-        std::fs::write(dir.join("settings.conf"), "consent_gesture=nod\n").unwrap();
+        std::fs::write(
+            dir.join("settings.conf"),
+            "service_gesture.sudo=1\nconsent_gesture=nod\n",
+        )
+        .unwrap();
         for (configured, expected) in [
             (
                 "closure",
@@ -9850,21 +9815,20 @@ mod engine_tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
 
         for configured in [None, Some("nod")] {
-            if let Some(value) = configured {
-                std::fs::write(
-                    dir.join("settings.conf"),
-                    format!("consent_gesture={value}\n"),
-                )
-                .unwrap();
-            } else {
-                let _ = std::fs::remove_file(dir.join("settings.conf"));
-            }
+            let consent = configured
+                .map(|value| format!("consent_gesture={value}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("service_gesture.polkit-1=1\n{consent}"),
+            )
+            .unwrap();
             s.engine.head_consent_before_match = HeadConsentVerdict::Approve;
             let out = s
                 .engine
                 .challenge_if_required(
                     AuthenticationPurpose::AppConsent,
-                    None,
+                    Some("polkit-1"),
                     Outcome::grant(0.9, "match"),
                 )
                 .unwrap();
@@ -9877,17 +9841,14 @@ mod engine_tests {
     }
 
     #[test]
-    fn polkit_service_forces_the_consent_gesture_and_it_fails_closed() {
+    fn polkit_service_classification_is_independent_of_optional_gesture_policy() {
         let _g = env_guard();
         let mut s = shared();
         let dir = state_sandbox("consent");
 
-        // authenticate() derives the purpose from the service class, fresh per
-        // call, via forced_consent_for: polkit-1 is AppConsent, sudo (and None)
-        // are plain Verify.
-        assert!(forced_consent_for(Some("polkit-1")));
-        assert!(!forced_consent_for(Some("sudo")));
-        assert!(!forced_consent_for(None));
+        // Purpose comes from the service class, not from whether the optional
+        // gesture is enabled. Otherwise turning the gesture off changes the
+        // operation's meaning instead of only removing an additional gate.
         assert_eq!(
             AuthenticationPurpose::for_service(Some("polkit-1")),
             AuthenticationPurpose::AppConsent
@@ -9896,31 +9857,45 @@ mod engine_tests {
             AuthenticationPurpose::for_service(Some("sudo")),
             AuthenticationPurpose::Verify
         );
-        // Escape hatch: IRLUME_POLKIT_GESTURE=0 turns the forcing off.
-        std::env::set_var("IRLUME_POLKIT_GESTURE", "0");
-        assert!(!forced_consent_for(Some("polkit-1")));
         assert_eq!(
-            AuthenticationPurpose::for_service(Some("polkit-1")),
+            AuthenticationPurpose::for_service(None),
             AuthenticationPurpose::Verify
         );
-        std::env::remove_var("IRLUME_POLKIT_GESTURE");
 
-        // The shared engine runs IR-less (IRLUME_FORCE_NO_IR), where the head
-        // gate cannot run. A forced gate must withdraw the grant (fail closed
-        // to the password).
+        // Default off: AppConsent remains the purpose, but the optional gate
+        // does not withdraw an otherwise valid match.
         let granted = || Outcome::grant(0.9, "match");
         let out = s
             .engine
-            .challenge_if_required(AuthenticationPurpose::AppConsent, None, granted())
+            .challenge_if_required(
+                AuthenticationPurpose::AppConsent,
+                Some("polkit-1"),
+                granted(),
+            )
             .unwrap();
-        assert!(!out.granted, "forced gate must fail closed without IR");
-        assert!(out.reason.contains("consent gesture"), "{}", out.reason);
-        // A plain Verify with no service demands no gesture, so it grants.
+        assert!(
+            out.granted,
+            "default-off gesture must not gate: {}",
+            out.reason
+        );
+
+        // Explicit opt-in keeps the old fail-closed behavior on this IR-less
+        // engine, without changing the service's AppConsent classification.
+        std::env::set_var("IRLUME_POLKIT_GESTURE", "1");
+        assert_eq!(
+            AuthenticationPurpose::for_service(Some("polkit-1")),
+            AuthenticationPurpose::AppConsent
+        );
         let out = s
             .engine
-            .challenge_if_required(AuthenticationPurpose::Verify, None, granted())
+            .challenge_if_required(
+                AuthenticationPurpose::AppConsent,
+                Some("polkit-1"),
+                granted(),
+            )
             .unwrap();
-        assert!(out.granted, "plain Verify must not gate: {}", out.reason);
+        assert!(!out.granted, "explicit gesture must fail closed without IR");
+        std::env::remove_var("IRLUME_POLKIT_GESTURE");
 
         teardown_sandbox(&dir);
     }
@@ -10030,17 +10005,15 @@ mod engine_tests {
 
         // demands_gesture is the whole policy surface; pin it.
         assert!(!AuthenticationPurpose::Verify.demands_gesture(None));
-        assert!(AuthenticationPurpose::AppConsent.demands_gesture(None));
+        assert!(!AuthenticationPurpose::AppConsent.demands_gesture(None));
         assert!(release(true).demands_gesture(None));
         assert!(!release(false).demands_gesture(None));
 
         teardown_sandbox(&dir);
     }
 
-    /// polkit is app-consent, which defaults the gesture ON, but an explicit
-    /// `service_gesture.polkit-1=0` must turn it OFF: the CLI writes that key and
-    /// reports it disabled, and before the fix the AppConsent arm was an
-    /// unconditional `true` that ignored it. Absent or `=1` keeps the gesture.
+    /// App consent is a purpose, while its experimental head gesture is an
+    /// explicit-only additional gate. The per-service key keeps precedence.
     #[test]
     fn app_consent_honors_the_polkit_service_override() {
         let _g = env_guard();
@@ -10051,10 +10024,7 @@ mod engine_tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
 
         let ac = AuthenticationPurpose::AppConsent;
-        assert!(
-            ac.demands_gesture(Some("polkit-1")),
-            "no override: app-consent must default the gesture ON"
-        );
+        assert!(!ac.demands_gesture(Some("polkit-1")), "default must be off");
         std::fs::write(dir.join("settings.conf"), "service_gesture.polkit-1=0\n").unwrap();
         assert!(
             !ac.demands_gesture(Some("polkit-1")),
@@ -10089,25 +10059,19 @@ mod engine_tests {
             temporal_challenge: on,
         };
 
-        // Verify arm: an elevation service demands the gesture by default, a
-        // non-elevation service does not, and the per-service override wins.
-        assert!(
-            verify.demands_gesture(Some("sudo")),
-            "sudo (elevation) must default the gesture ON"
-        );
-        assert!(
-            verify.demands_gesture(Some("su-l")),
-            "su - (service su-l) must default ON via the shared classifier"
-        );
+        // Verify arm: elevation and lock services both default OFF; an explicit
+        // per-service opt-in is the only way to add the gesture.
+        assert!(!verify.demands_gesture(Some("sudo")), "sudo defaults off");
+        assert!(!verify.demands_gesture(Some("su-l")), "su-l defaults off");
         assert!(
             !verify.demands_gesture(Some("kde")),
             "a lock screen must default OFF"
         );
         assert!(!verify.demands_gesture(None), "no service demands nothing");
-        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=0\n").unwrap();
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=1\n").unwrap();
         assert!(
-            !verify.demands_gesture(Some("sudo")),
-            "service_gesture.sudo=0 must disable it"
+            verify.demands_gesture(Some("sudo")),
+            "service_gesture.sudo=1 must enable the additional gate"
         );
 
         // CredentialRelease arm: the per-service credential_release override

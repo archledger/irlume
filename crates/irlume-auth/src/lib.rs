@@ -9889,8 +9889,16 @@ mod engine_tests {
             ir_calib: None,
             ir_calibs: Default::default(),
         });
-        e.require_eyes_open = true;
-        write_enrollment(&dir, &e);
+        let mut legacy = serde_json::to_value(&e).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("require_eyes_open".into(), serde_json::Value::Bool(true));
+        std::fs::write(
+            dir.join(format!("{}.json", e.user)),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
         let o = s
             .engine
             .authenticate("irlume-test-legacy-eyes-open", None)

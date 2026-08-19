@@ -900,8 +900,16 @@ pub enum HeadGesture {
 pub const NOD_PITCH_MIN: f32 = 0.075;
 /// ...and maximum yaw RANGE, so idle LOOKING-AROUND (which swings yaw a lot) and
 /// a head SHAKE are not read as a nod. Campaign: nods ranged ≤0.46 in yaw while
-/// look-around ranged 0.87-6.95, so 0.6 separates them cleanly.
+/// completed look-around takes ranged 0.87-6.95, so 0.6 separates them. A
+/// rolling prefix can approve before that horizontal range accumulates; the
+/// relative-axis guard below covers that case.
 pub const NOD_YAW_MAX: f32 = 0.6;
+/// Maximum horizontal-to-vertical range ratio for a nod. The 2026-08-19 live
+/// look-around false approval carried yaw/pitch = 5.05 at its frame-24 prefix.
+/// Nine preserved approved nods ranged 0.88-2.53, and the weakest reclining raw
+/// corpus reached 3.45. A ceiling of 4 keeps those nods while requiring the
+/// approving motion to remain vertically dominant.
+const NOD_YAW_TO_PITCH_MAX: f32 = 4.0;
 /// Minimum pitch oscillation crossings (the pitch signal must cross above AND
 /// below its median): 1 = a single deliberate down-up nod. A drift that looks
 /// down and HOLDS never crosses back, so it stays 0 and is rejected. Set to 1
@@ -1183,6 +1191,7 @@ pub fn detect_head_gesture_with_evidence(samples: &[PoseSample]) -> (HeadGesture
         }
     } else if evidence.pitch_range >= evidence.pitch_min
         && evidence.yaw_range <= NOD_YAW_MAX
+        && evidence.yaw_range <= evidence.pitch_range * NOD_YAW_TO_PITCH_MAX
         && evidence.crossings >= NOD_MIN_CROSSINGS
     {
         HeadGesture::Nod
@@ -2275,6 +2284,44 @@ mod nod_evidence_tests {
             "premise: the observed look-around changes direction twice"
         );
         assert_eq!(verdict, HeadGesture::None);
+    }
+
+    #[test]
+    fn look_around_with_incidental_vertical_motion_never_approves() {
+        // Live detector-only evidence at the production frame-24 prefix:
+        // pitch 0.07844, yaw 0.39590, one pitch crossing. The old independent
+        // pitch/yaw limits read this diagonal look-around motion as a nod.
+        let pitch = [
+            0.46078, 0.46078, 0.46078, 0.46078, 0.5, 0.5, 0.5, 0.5, 0.53922, 0.53922, 0.53922,
+            0.53922,
+        ];
+        let yaw = [
+            -0.19795, -0.19795, 0.0, 0.19795, 0.19795, 0.0, -0.19795, -0.19795, 0.0, 0.19795,
+            0.19795, 0.0,
+        ];
+        let (verdict, ev) = detect_head_gesture_with_evidence(&poses(&pitch, &yaw));
+        assert!((ev.pitch_range - 0.07844).abs() < 0.00001);
+        assert!((ev.yaw_range - 0.39590).abs() < 0.00001);
+        assert_eq!(ev.crossings, 1);
+        assert_eq!(verdict, HeadGesture::None);
+    }
+
+    #[test]
+    fn weakest_reclining_nod_remains_an_approval() {
+        // The preserved reclining corpus's decisive production window carried
+        // pitch 0.084 and yaw 0.29: yaw/pitch = 3.45, the closest measured nod
+        // to the relative-axis ceiling.
+        let pitch = [
+            0.458, 0.458, 0.458, 0.458, 0.5, 0.5, 0.5, 0.5, 0.542, 0.542, 0.542, 0.542,
+        ];
+        let yaw = [
+            -0.145, -0.145, 0.0, 0.145, 0.145, 0.0, -0.145, -0.145, 0.0, 0.145, 0.145, 0.0,
+        ];
+        let (verdict, ev) = detect_head_gesture_with_evidence(&poses(&pitch, &yaw));
+        assert!((ev.pitch_range - 0.084).abs() < 0.00001);
+        assert!((ev.yaw_range - 0.29).abs() < 0.00001);
+        assert_eq!(ev.crossings, 1);
+        assert_eq!(verdict, HeadGesture::Nod);
     }
 
     #[test]

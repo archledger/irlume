@@ -94,11 +94,12 @@ fn camera_pair_identity_digest(
     irlume_common::thirdparty::sha256_hex(material.as_bytes())
 }
 
-fn configured_camera_pair_identity() -> Result<(String, String, String), String> {
-    let (rgb, ir) = irlume_camera::configured_pair_no_probe().ok_or_else(|| {
-        "no configured RGB+IR camera pair; configure the pair before hardware qualification"
-            .to_string()
-    })?;
+fn selected_camera_pair_identity() -> Result<(String, String, String), String> {
+    let (rgb, ir) = irlume_camera::configured_pair_no_probe()
+        .or_else(irlume_camera::select_pair)
+        .ok_or_else(|| {
+            "no RGB+IR camera pair is available for hardware qualification".to_string()
+        })?;
     camera_pair_identity(&rgb, &ir).map(|digest| (rgb, ir, digest))
 }
 
@@ -128,7 +129,7 @@ fn valid_digest(value: &str) -> bool {
 
 fn identity(args: &[String]) -> ExitCode {
     let result = || -> Result<String, String> {
-        let (_, _, digest) = configured_camera_pair_identity()?;
+        let (_, _, digest) = selected_camera_pair_identity()?;
         if let Some(expected) = flag(args, "--expected-camera-identity-digest") {
             if !valid_digest(expected) {
                 return Err("expected camera identity digest must be lowercase SHA-256".into());
@@ -188,7 +189,7 @@ fn attempt(args: &[String]) -> ExitCode {
 
     let result = || -> irlume_common::Result<serde_json::Value> {
         let (rgb, ir, before) =
-            configured_camera_pair_identity().map_err(irlume_common::Error::Hardware)?;
+            selected_camera_pair_identity().map_err(irlume_common::Error::Hardware)?;
         if before != expected_digest {
             return Err(irlume_common::Error::Hardware(
                 "configured camera identity digest does not match the frozen expectation".into(),

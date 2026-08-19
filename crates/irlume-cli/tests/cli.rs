@@ -2168,12 +2168,15 @@ fn gesturecap_hardware_adapter_surfaces_fail_closed_offline() {
         "--expected-camera-identity-digest",
         &"a".repeat(64),
     ]);
-    identity.env("IRLUME_DEV", "1");
+    identity
+        .env("IRLUME_DEV", "1")
+        .env("IRLUME_RGB_DEVICE", "/dev/irlume-test-rgb")
+        .env("IRLUME_IR_DEVICE", "/dev/irlume-test-ir");
     let (code, stdout, stderr) = run(&mut identity);
     assert_ne!(code, 0);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
-        stderr.contains("no configured RGB+IR camera pair"),
+        stderr.contains("cannot resolve configured RGB camera identity"),
         "{stderr}"
     );
 

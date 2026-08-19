@@ -324,8 +324,8 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     // No settings.conf at all: defaults shown, and status never fails.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
     assert_eq!(code, 0);
-    assert!(out.contains("sudo: REQUIRED"), "{out}");
-    assert!(out.contains("polkit-1: REQUIRED"), "{out}");
+    assert!(out.contains("sudo: off (default)"), "{out}");
+    assert!(out.contains("polkit-1: off (default)"), "{out}");
     assert!(out.contains("credential_release: off (default)"), "{out}");
     assert!(
         out.contains("global credential_release_challenge: off (default)"),
@@ -343,7 +343,7 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     // `<svc> on|off`: the exact command four surfaces recommended exited 2.
     let (code, out, _) = run(&mut sb.cmd(&[cmd, "sudo", "status"]), cmd);
     assert_eq!(code, 0, "the taught per-service form must work: {out}");
-    assert!(out.contains("sudo: REQUIRED"), "{out}");
+    assert!(out.contains("sudo: off (default)"), "{out}");
     assert!(
         !out.contains("polkit-1:"),
         "one service asked, one service answered: {out}"

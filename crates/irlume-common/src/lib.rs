@@ -500,15 +500,14 @@ pub enum Request {
         scan: String,
         new_name: String,
     },
-    /// Toggle the per-user "require eyes open to unlock" gate. PRIVILEGED.
+    /// Retired eyes-open policy. Kept parseable for one release; OFF performs
+    /// legacy cleanup and ON returns a retired error. PRIVILEGED.
     SetRequireEyesOpen { user: String, on: bool },
-    /// Capture a short IR sequence and return the MEDIAN eye-aspect-ratio over
-    /// it: one phase of the deliberate-closure consent calibration. The caller
-    /// prompts the user (eyes open, then eyes closed) and sends this once per
-    /// phase. Fires the camera; PRIVILEGED.
+    /// Retired eye-closure calibration capture tombstone. Kept parseable for
+    /// one release and returns a retired error. PRIVILEGED.
     CaptureEarMedian { user: String },
-    /// Store the per-user eye-closure calibration `(ear_open, ear_closed)` from
-    /// the two `CaptureEarMedian` phases into the enrollment. PRIVILEGED.
+    /// Retired eye-closure calibration storage tombstone. Kept parseable for
+    /// one release and returns a retired error. PRIVILEGED.
     SetClosureCalibration {
         user: String,
         ear_open: f32,
@@ -830,13 +829,12 @@ pub enum Response {
         live: bool,
         reason: String,
     },
-    /// Structured enrollment listing: profiles (each with its scan names) plus
-    /// the per-user require-eyes-open setting.
+    /// Structured enrollment listing. The retired eye fields remain required
+    /// on the wire and are frozen at false for compatibility.
     Enrollment {
         profiles: Vec<ProfileSummary>,
         require_eyes_open: bool,
-        /// Whether a usable eye-closure consent calibration is stored (for the
-        /// polkit gesture); surfaced so `doctor` can flag wired-but-uncalibrated.
+        /// Retired eye-closure signal, frozen at false for compatibility.
         #[serde(default)]
         closure_calibrated: bool,
         /// Whether this enrollment has a per-user floor fitted on the IR
@@ -1309,20 +1307,35 @@ mod tests {
     }
 
     #[test]
+    fn retired_eye_requests_still_parse_as_tombstones() {
+        for wire in [
+            r#"{"SetRequireEyesOpen":{"user":"u","on":false}}"#,
+            r#"{"CaptureEarMedian":{"user":"u"}}"#,
+            r#"{"SetClosureCalibration":{"user":"u","ear_open":0.2,"ear_closed":0.1}}"#,
+        ] {
+            serde_json::from_str::<Request>(wire).expect("old request remains parseable");
+        }
+    }
+
+    #[test]
     fn enrollment_response_is_compatible_in_both_reader_directions() {
         #[derive(serde::Deserialize)]
         enum OldResponse {
             Enrollment {
                 profiles: Vec<ProfileSummary>,
                 require_eyes_open: bool,
+                #[serde(default)]
+                closure_calibrated: bool,
+                #[serde(default)]
+                ir_ratio_calibrated: bool,
             },
         }
 
         let new = Response::Enrollment {
             profiles: Vec::new(),
-            require_eyes_open: true,
-            closure_calibrated: true,
-            ir_ratio_calibrated: true,
+            require_eyes_open: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
         };
         let old: OldResponse = serde_json::from_value(
             serde_json::to_value(new).expect("serialize current enrollment response"),
@@ -1331,9 +1344,13 @@ mod tests {
         let OldResponse::Enrollment {
             profiles,
             require_eyes_open,
+            closure_calibrated,
+            ir_ratio_calibrated,
         } = old;
         assert!(profiles.is_empty());
-        assert!(require_eyes_open);
+        assert!(!require_eyes_open);
+        assert!(!closure_calibrated);
+        assert!(!ir_ratio_calibrated);
 
         let old = r#"{"Enrollment":{"profiles":[],"require_eyes_open":true}}"#;
         let current: Response =

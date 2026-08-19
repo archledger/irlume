@@ -103,7 +103,6 @@ pub fn classify(req: &Request) -> Class {
         | Identify
         | Enroll { .. }
         | AddScan { .. }
-        | CaptureEarMedian { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
         | CaptureModeStatus
@@ -133,8 +132,9 @@ pub fn classify(req: &Request) -> Class {
         | RenameProfile { .. }
         | RenameScan { .. }
         | SetRequireEyesOpen { .. }
-        // Stores the numbers CaptureEarMedian already captured; the capture
-        // was the camera work, and it is classified Camera above.
+        // Retired calibration requests keep their privilege gates and worker
+        // ordering, but the tombstones open no camera and write no storage.
+        | CaptureEarMedian { .. }
         | SetClosureCalibration { .. } => Class::Plain,
 
         // TPM work. These are Plain rather than Status for the reason

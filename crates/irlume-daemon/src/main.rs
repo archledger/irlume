@@ -2343,8 +2343,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
         | RenameScan { user, .. }
-        | SetRequireEyesOpen { user, .. }
-        | SetClosureCalibration { user, .. } => RequestPosture {
+        | SetRequireEyesOpen { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
             enrollment: Mutates,
@@ -2391,6 +2390,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: Reads,
         },
+        // Retains the old root-or-target posture, but the retired tombstone
+        // neither reads nor rewrites the enrollment.
+        SetClosureCalibration { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "modify" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
         HasSealedPassword { user } | KeyringInfo { user } | RecoveryStatus { user } => {
             RequestPosture {
                 privilege: RootOrTarget { verb: "query" },
@@ -2427,7 +2433,8 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
         },
         // Root-only and account-naming: the sealed credential is released to a
-        // root peer alone, and the calibration capture fires the camera.
+        // root peer alone. The retired calibration request keeps its historical
+        // root-only posture before returning its tombstone.
         UnsealPassword { user, .. } => RequestPosture {
             privilege: RootOnly {
                 command: "unseal_password",
@@ -2635,17 +2642,8 @@ fn summarize_enrollment(
                     }
                 })
                 .collect(),
-            require_eyes_open: enr.require_eyes_open,
-            closure_calibrated: enr
-                .closure_calibration
-                .map(|(o, c)| {
-                    irlume_liveness::ClosureCalibration {
-                        ear_open: o,
-                        ear_closed: c,
-                    }
-                    .is_usable()
-                })
-                .unwrap_or(false),
+            require_eyes_open: false,
+            closure_calibrated: false,
             ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
         },
         // A successful load that found nothing IS an observation: publishing
@@ -3173,6 +3171,11 @@ fn enroll_with_capture_probe(
     enroll()
 }
 
+const CAPTURE_EAR_MEDIAN_RETIRED: &str =
+    "capture-ear-median is retired; eye-closure calibration is no longer used";
+const SET_CLOSURE_CALIBRATION_RETIRED: &str =
+    "set-closure-calibration is retired; eye-closure calibration is no longer used";
+
 fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::OperationClass {
     use irlume_common::diagnostics::OperationClass;
     use Request::*;
@@ -3180,9 +3183,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
             OperationClass::Authentication
         }
-        Enroll { .. } | AddScan { .. } | CaptureEarMedian { .. } | PositionSample { .. } => {
-            OperationClass::Enrollment
-        }
+        Enroll { .. } | AddScan { .. } | PositionSample { .. } => OperationClass::Enrollment,
         Identify => OperationClass::Identification,
         TuneCaptureMode { .. } => OperationClass::CaptureQualification,
         SupportProbe { .. } => OperationClass::SupportProbe,
@@ -3199,6 +3200,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | RenameProfile { .. }
         | RenameScan { .. }
         | SetRequireEyesOpen { .. }
+        | CaptureEarMedian { .. }
         | SetClosureCalibration { .. }
         | Ping
         | Health
@@ -3229,6 +3231,12 @@ fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::Categ
             ProbeOutcome::Unavailable => CategoricalOutcome::Unavailable,
             ProbeOutcome::Failed => CategoricalOutcome::Failed,
         },
+        Response::Error(message)
+            if message == CAPTURE_EAR_MEDIAN_RETIRED
+                || message == SET_CLOSURE_CALIBRATION_RETIRED =>
+        {
+            CategoricalOutcome::Completed
+        }
         Response::Error(_) | Response::OperationError { .. } => CategoricalOutcome::Failed,
         _ => CategoricalOutcome::Completed,
     }
@@ -4218,29 +4226,10 @@ fn dispatch_scoped(
         Request::SetRequireEyesOpen { user, .. } => {
             set_require_eyes_open_off(&user, engine.embed_space())
         }
-        Request::CaptureEarMedian { user: _ } => {
-            // Fires the camera, so the table root-gates it like the other
-            // camera-bearing requests. The socket is world-connectable, so that
-            // gate is what keeps other uids out.
-            //
-            // ~3s window: enough frames for a stable median of the current eye
-            // state (open or closed, whichever the caller is prompting).
-            const CAL_FRAMES: usize = 45;
-            match engine.capture_ear_samples(CAL_FRAMES) {
-                Ok(samples) => Response::EarMedian(irlume_liveness::calibrate_open_ear(&samples)),
-                Err(e) => Response::Error(e.to_string()),
-            }
+        Request::CaptureEarMedian { .. } => Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
+        Request::SetClosureCalibration { .. } => {
+            Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into())
         }
-        Request::SetClosureCalibration {
-            user,
-            ear_open,
-            ear_closed,
-        } => mutate_enrollment(&user, |enr| {
-            enr.closure_calibration = Some((ear_open, ear_closed));
-            Ok(format!(
-                "closure calibration stored (open {ear_open:.3}, closed {ear_closed:.3})"
-            ))
-        }),
         Request::SelfTest { kind } => {
             // Fires the camera and returns raw liveness/alignment measurements
             // (IR brightness, center/edge, glint), which are a spoof-tuning
@@ -6477,6 +6466,21 @@ mod tests {
         // one command at a time, so it serves from the worker with the
         // other TPM users, not from a connection thread.
         assert_eq!(classify(&Request::KeyringInfo { user: u() }), Class::Plain);
+        for req in [
+            Request::CaptureEarMedian { user: u() },
+            Request::SetClosureCalibration {
+                user: u(),
+                ear_open: 0.3,
+                ear_closed: 0.1,
+            },
+        ] {
+            assert_eq!(classify(&req), Class::Plain, "{req:?}");
+            assert_eq!(
+                diagnostic_operation_class(&req),
+                irlume_common::diagnostics::OperationClass::Status,
+                "{req:?}"
+            );
+        }
         // Mutating requests stay serialized on the worker: reclassifying one
         // as Status would let it race captures and other writers.
         for req in [
@@ -6530,7 +6534,7 @@ mod tests {
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
                 }],
-                require_eyes_open: true,
+                require_eyes_open: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: true,
             },
@@ -6539,11 +6543,12 @@ mod tests {
             Some(Response::Enrollment {
                 profiles,
                 require_eyes_open,
+                closure_calibrated,
                 ir_ratio_calibrated,
-                ..
             }) => {
                 assert_eq!(profiles.len(), 1);
-                assert!(require_eyes_open);
+                assert!(!require_eyes_open);
+                assert!(!closure_calibrated);
                 assert!(ir_ratio_calibrated);
             }
             other => panic!("expected the cached enrollment, got {other:?}"),
@@ -6574,7 +6579,6 @@ mod tests {
             "RenameProfile",
             "RenameScan",
             "SetRequireEyesOpen",
-            "SetClosureCalibration",
             "RecoverySetup",
             "RecoveryRestore",
             "RecoveryForget",
@@ -6619,7 +6623,7 @@ mod tests {
             SAMPLE_USER,
             EnrollmentSummary {
                 profiles: Vec::new(),
-                require_eyes_open: true,
+                require_eyes_open: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
@@ -7981,6 +7985,7 @@ mod tests {
         let sb = sandbox("list");
         let mut enr = enrollment_with("carol", &["Face Scan 1", "Face Scan 2"]);
         enr.require_eyes_open = true;
+        enr.closure_calibration = Some((0.3, 0.1));
         write_enrollment(&sb.dir, &enr);
         match dispatch(
             Request::ListProfiles {
@@ -7993,6 +7998,7 @@ mod tests {
             Response::Enrollment {
                 profiles,
                 require_eyes_open,
+                closure_calibrated,
                 ..
             } => {
                 assert_eq!(profiles.len(), 1);
@@ -8001,7 +8007,8 @@ mod tests {
                     profiles[0].scans,
                     vec!["Face Scan 1".to_string(), "Face Scan 2".to_string()]
                 );
-                assert!(require_eyes_open);
+                assert!(!require_eyes_open);
+                assert!(!closure_calibrated);
             }
             other => panic!("expected Response::Enrollment, got {other:?}"),
         }
@@ -8405,6 +8412,92 @@ mod tests {
     }
 
     #[test]
+    fn retired_eye_tombstones_are_diagnostic_completed_not_failures() {
+        use irlume_common::diagnostics::CategoricalOutcome;
+
+        for message in [
+            "capture-ear-median is retired; eye-closure calibration is no longer used",
+            "set-closure-calibration is retired; eye-closure calibration is no longer used",
+        ] {
+            assert_eq!(
+                categorical_outcome(&Response::Error(message.into())),
+                CategoricalOutcome::Completed
+            );
+        }
+        assert_eq!(
+            categorical_outcome(&Response::Error(
+                "capture_ear_median requires root (peer uid 65534)".into()
+            )),
+            CategoricalOutcome::Failed,
+            "the privilege refusal is not the successfully served tombstone"
+        );
+    }
+
+    #[test]
+    fn retired_eye_calibration_requests_keep_privilege_and_have_no_side_effects() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("retired-eye-calibration");
+        let _ = &sb;
+        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        let profile_path = irlume_core::storage::profile_path("carol");
+        let stored = std::fs::read(&profile_path).expect("stored enrollment fixture");
+        let cases = [
+            (
+                Request::CaptureEarMedian {
+                    user: "carol".into(),
+                },
+                format!("capture_ear_median requires root (peer uid {NOBODY})"),
+                "capture-ear-median is retired; eye-closure calibration is no longer used",
+            ),
+            (
+                Request::SetClosureCalibration {
+                    user: "carol".into(),
+                    ear_open: 0.3,
+                    ear_closed: 0.1,
+                },
+                "not authorized to modify 'carol'".into(),
+                "set-closure-calibration is retired; eye-closure calibration is no longer used",
+            ),
+        ];
+
+        for (request, privilege_error, retired_error) in cases {
+            assert_eq!(arbiter::classify(&request), arbiter::Class::Plain);
+            assert_eq!(
+                diagnostic_operation_class(&request),
+                irlume_common::diagnostics::OperationClass::Status
+            );
+            publish_enrollment_summary(
+                "carol",
+                EnrollmentSummary {
+                    profiles: Vec::new(),
+                    require_eyes_open: false,
+                    closure_calibrated: false,
+                    ir_ratio_calibrated: false,
+                },
+            );
+            match dispatch(request.clone(), &peer(NOBODY), &mut e) {
+                Response::Error(message) => assert_eq!(message, privilege_error),
+                other => panic!("privilege gate must run before tombstone, got {other:?}"),
+            }
+            let response = dispatch(request, &peer(0), &mut e);
+            match response {
+                Response::Error(message) => assert_eq!(message, retired_error),
+                other => panic!("retired request must return its tombstone, got {other:?}"),
+            }
+            assert!(
+                cached_enrollment_summary("carol").is_some(),
+                "a tombstone must not invalidate the enrollment summary"
+            );
+            assert_eq!(
+                std::fs::read(&profile_path).expect("enrollment remains present"),
+                stored,
+                "a tombstone must not mutate enrollment storage"
+            );
+        }
+    }
+
+    #[test]
     fn require_eyes_open_is_refused_at_the_dispatch_choke_point() {
         // #386 retired the gate because it cannot reliably admit the user it
         // exists to admit under ordinary eyewear and lighting changes.
@@ -8560,10 +8653,10 @@ mod tests {
             "a refused enable must leave the stored flag alone"
         );
         assert!(
-            cached_enrollment_summary("carol")
+            !cached_enrollment_summary("carol")
                 .expect("refused ON must preserve the summary")
                 .require_eyes_open,
-            "refused ON must not invalidate or mutate the summary"
+            "the preserved summary must keep the retired field frozen false"
         );
 
         for attempt in 1..=2 {

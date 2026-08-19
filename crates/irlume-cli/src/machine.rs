@@ -2243,7 +2243,7 @@ fn third_party_data(stage: irlume_common::thirdparty::Stage) -> Value {
     json!({ "enabled": enabled, "catalog": catalog })
 }
 
-fn profiles_data(profiles: Vec<ProfileSummary>, require_eyes_open: bool) -> Value {
+fn profiles_data(profiles: Vec<ProfileSummary>, _require_eyes_open: bool) -> Value {
     // The current enrollment store identifies profiles and scans by their
     // names. Do not falsely present those names as opaque stable IDs. A later
     // contract capability can add mutation-safe IDs after the store owns them.
@@ -2292,7 +2292,9 @@ fn profiles_data(profiles: Vec<ProfileSummary>, require_eyes_open: bool) -> Valu
         .collect::<Vec<_>>();
     json!({
         "profiles": profiles,
-        "require_eyes_open": require_eyes_open,
+        // FROZEN at false for contract 1. Old daemons may still report true;
+        // the retired policy is not part of the current machine semantics.
+        "require_eyes_open": false,
         // FROZEN at false for contract 1. The blink gate this reported was
         // retired (ADR-0002), but the field was published in the contract-1
         // schema as REQUIRED, and MACHINE-API.md promises no documented field
@@ -3220,7 +3222,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_listing_does_not_claim_unimplemented_opaque_ids() {
+    fn profile_listing_freezes_retired_contract_fields_from_an_old_daemon() {
         let data = profiles_data(
             vec![ProfileSummary {
                 name: "Face Profile 1".into(),
@@ -3235,7 +3237,8 @@ mod tests {
         assert_eq!(data["profiles"][0]["scans"][0]["display_name"], "Scan 1");
         assert!(data["profiles"][0].get("profile_id").is_none());
         assert!(data["profiles"][0]["scans"][0].get("scan_id").is_none());
-        assert_eq!(data["require_eyes_open"], true);
+        assert_eq!(data["require_eyes_open"], false);
+        assert_eq!(data["require_challenge"], false);
     }
 
     #[test]

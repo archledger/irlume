@@ -261,6 +261,7 @@ const DEV_CMDS: &[&str] = &[
     "irbench",
     "genuine",
     "calcapture",
+    "gesturecap",
     "normprobe",
     "liveness",
     "meshprobe",
@@ -304,6 +305,11 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         (&["irbench"], 2, "usage: irlume irbench --dir"),
         (&["genuine"], 2, "usage: irlume genuine --det"),
         (&["calcapture"], 2, "--out <cal.jsonl>"),
+        (
+            &["gesturecap"],
+            2,
+            "usage: irlume gesturecap <capture|replay>",
+        ),
         (&["normprobe"], 2, "usage: irlume normprobe --dir"),
         (&["liveness"], 2, "usage: irlume liveness --det"),
         (&["meshprobe"], 2, "usage: irlume meshprobe --det"),
@@ -2110,501 +2116,209 @@ fn write_pose_recording(path: &std::path::Path, label: &str, pitches: &[f32]) {
     std::fs::write(path, s).unwrap();
 }
 
-/// A blink recording exactly as `blinkcap capture` writes it.
-fn write_blink_recording(path: &std::path::Path, label: &str, ears: &[f32]) {
-    let mut s = format!(
-        "{{\"blinkcap\":true,\"label\":\"{label}\",\"frames\":{}}}\n",
-        ears.len()
-    );
-    for (i, ear) in ears.iter().enumerate() {
-        s.push_str(&format!(
-            "{{\"idx\":{i},\"ear\":{ear},\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0}}\n"
-        ));
-    }
-    std::fs::write(path, s).unwrap();
-}
-
-fn write_selector_manifest(path: &std::path::Path, profiles: serde_json::Value) {
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&serde_json::json!({ "profiles": profiles })).unwrap(),
-    )
-    .unwrap();
-}
-
 #[test]
-fn blinkcap_selector_locks_one_profile_and_discards_the_prefix() {
-    let sb = Sandbox::new("bc-selector-unique");
-    let dir = sb.path("work");
-    for (file, label, ears) in [
-        ("bare-open-1.jsonl", "bare-open", vec![0.24; 3]),
-        ("bare-open-2.jsonl", "bare-open", vec![0.25; 3]),
-        ("bare-closed-1.jsonl", "bare-closed", vec![0.02; 3]),
-        ("bare-closed-2.jsonl", "bare-closed", vec![0.03; 3]),
-        ("glasses-open-1.jsonl", "glasses-open", vec![0.27; 3]),
-        ("glasses-open-2.jsonl", "glasses-open", vec![0.29; 3]),
-        ("glasses-closed-1.jsonl", "glasses-closed", vec![0.10; 3]),
-        ("glasses-closed-2.jsonl", "glasses-closed", vec![0.12; 3]),
+fn gesturecap_replays_pose_only_recordings() {
+    let sandbox = Sandbox::new("gesturecap-replay");
+    let file = sandbox.path("work/nod.jsonl");
+    write_pose_recording(
+        &file,
+        "nod",
+        &[
+            0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
+            0.50, 0.50, 0.50, 0.50, 0.60, 0.40,
+        ],
+    );
+    let mut command = sandbox.cmd(&["gesturecap", "replay", file.to_str().unwrap()]);
+    command.env("IRLUME_DEV", "1");
+    let (code, stdout, stderr) = run(&mut command);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("Nod"), "{stdout}");
+    for field in [
+        "pitch_range",
+        "yaw_range",
+        "pitch_crossings",
+        "yaw_crossings",
+        "mean_step",
+        "verdict",
     ] {
-        write_blink_recording(&dir.join(file), label, &ears);
+        assert!(stdout.contains(field), "missing {field}: {stdout}");
     }
-    let manifest = dir.join("profiles.json");
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([
-            {
-                "name": "bare",
-                "open": ["bare-open-1.jsonl", "bare-open-2.jsonl"],
-                "closed": ["bare-closed-1.jsonl", "bare-closed-2.jsonl"]
-            },
-            {
-                "name": "glasses",
-                "open": ["glasses-open-1.jsonl", "glasses-open-2.jsonl"],
-                "closed": ["glasses-closed-1.jsonl", "glasses-closed-2.jsonl"]
-            }
-        ]),
-    );
-    let mut attempt = vec![0.28, 0.281, 0.279];
-    attempt.extend([0.11; 11]);
-    attempt.extend([0.28; 4]);
-    let attempt_file = dir.join("attempt.jsonl");
-    write_blink_recording(&attempt_file, "held-closure-glasses", &attempt);
 
-    let (code, out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempt_file.to_str().unwrap(),
-            "--prefix-frames",
-            "3",
-        ])
+    let directory = sandbox.path("work");
+    let (code, stdout, stderr) = run(sandbox
+        .cmd(&["gesturecap", "replay", directory.to_str().unwrap()])
         .env("IRLUME_DEV", "1"));
-
-    assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("SHADOW ONLY"), "{out}");
-    assert!(out.contains("selector=unique:glasses"), "{out}");
-    assert!(out.contains("prefix=3 remaining=15"), "{out}");
-    assert!(out.contains("shadow-consent=Blinked"), "{out}");
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("nod.jsonl"), "{stdout}");
 }
 
 #[test]
-fn blinkcap_selector_prefix_cannot_supply_closure_frames() {
-    let sb = Sandbox::new("bc-selector-prefix-discard");
-    let dir = sb.path("work");
-    for (file, label, ears) in [
-        ("open-low.jsonl", "open", vec![0.10; 3]),
-        ("open-high-1.jsonl", "open", vec![0.30; 3]),
-        ("open-high-2.jsonl", "open", vec![0.30; 3]),
-        ("closed-1.jsonl", "closed", vec![0.04; 3]),
-        ("closed-2.jsonl", "closed", vec![0.05; 3]),
-    ] {
-        write_blink_recording(&dir.join(file), label, &ears);
-    }
-    let manifest = dir.join("profiles.json");
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([{
-            "name": "wide-open-range",
-            "open": ["open-low.jsonl", "open-high-1.jsonl", "open-high-2.jsonl"],
-            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
-        }]),
-    );
-    // Derived calibration: open 0.30, closed 0.045, threshold 0.1215. The
-    // prefix at 0.11 is closure-like to the detector while remaining inside
-    // the observed open selector range. If it leaks into detection, 3 + 8
-    // frames reaches the 11-frame consent floor; discarding it leaves only 8.
-    let mut attempt = vec![0.11; 3];
-    attempt.extend([0.11; 8]);
-    attempt.extend([0.30; 4]);
-    let attempt_file = dir.join("attempt.jsonl");
-    write_blink_recording(&attempt_file, "prefix-sabotage", &attempt);
-
-    let (code, out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempt_file.to_str().unwrap(),
-            "--prefix-frames",
-            "3",
-        ])
-        .env("IRLUME_DEV", "1"));
-
-    assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("selector=unique:wide-open-range"), "{out}");
-    assert!(out.contains("prefix=3 remaining=12"), "{out}");
-    assert!(out.contains("shadow-consent=NoBlink"), "{out}");
+fn retired_blinkcap_is_not_dispatchable() {
+    let sandbox = Sandbox::new("blinkcap-retired");
+    let (code, _, stderr) = run(&mut sandbox.cmd(&["blinkcap", "replay", "anything"]));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("unknown command 'blinkcap'"), "{stderr}");
 }
 
 #[test]
-fn blinkcap_selector_never_runs_consent_for_ambiguous_or_closed_like_prefixes() {
-    let sb = Sandbox::new("bc-selector-refuse");
-    let dir = sb.path("work");
-    for (file, label, ears) in [
-        ("a-open-1.jsonl", "a-open", vec![0.24; 3]),
-        ("a-open-2.jsonl", "a-open", vec![0.28; 3]),
-        ("a-closed-1.jsonl", "a-closed", vec![0.02; 3]),
-        ("a-closed-2.jsonl", "a-closed", vec![0.03; 3]),
-        ("b-open-1.jsonl", "b-open", vec![0.25; 3]),
-        ("b-open-2.jsonl", "b-open", vec![0.29; 3]),
-        ("b-closed-1.jsonl", "b-closed", vec![0.10; 3]),
-        ("b-closed-2.jsonl", "b-closed", vec![0.12; 3]),
-    ] {
-        write_blink_recording(&dir.join(file), label, &ears);
-    }
-    let manifest = dir.join("profiles.json");
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([
-            {
-                "name": "a",
-                "open": ["a-open-1.jsonl", "a-open-2.jsonl"],
-                "closed": ["a-closed-1.jsonl", "a-closed-2.jsonl"]
-            },
-            {
-                "name": "b",
-                "open": ["b-open-1.jsonl", "b-open-2.jsonl"],
-                "closed": ["b-closed-1.jsonl", "b-closed-2.jsonl"]
-            }
-        ]),
-    );
-    let attempts = dir.join("attempts");
-    std::fs::create_dir(&attempts).unwrap();
-    write_blink_recording(&attempts.join("ambiguous.jsonl"), "ambiguous", &[0.26; 6]);
-    write_blink_recording(
-        &attempts.join("closed-first.jsonl"),
-        "closed-first",
-        &[0.11; 6],
-    );
-
-    let (code, out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempts.to_str().unwrap(),
-            "--prefix-frames",
-            "3",
-        ])
-        .env("IRLUME_DEV", "1"));
-
-    assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("ambiguous.jsonl label=ambiguous prefix=3 remaining=3 selector=ambiguous shadow-consent=not-run"),
-        "{out}"
-    );
-    assert!(
-        out.contains("closed-first.jsonl label=closed-first prefix=3 remaining=3 selector=out-of-range shadow-consent=not-run"),
-        "{out}"
-    );
-}
-
-#[test]
-fn blinkcap_selector_rejects_duplicate_profiles_and_partial_recordings() {
-    let sb = Sandbox::new("bc-selector-invalid");
-    let dir = sb.path("work");
-    let manifest = dir.join("profiles.json");
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([
-            {"name": "same", "open": ["x", "y"], "closed": ["z", "q"]},
-            {"name": "same", "open": ["x", "y"], "closed": ["z", "q"]}
-        ]),
-    );
-    let attempt = dir.join("attempt.jsonl");
-    write_blink_recording(&attempt, "attempt", &[0.25; 6]);
-
-    let (code, _out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempt.to_str().unwrap(),
-            "--prefix-frames",
-            "3",
-        ])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1);
-    assert!(err.contains("duplicate profile name 'same'"), "{err}");
-
-    write_blink_recording(&dir.join("open-1.jsonl"), "open", &[0.24; 3]);
-    write_blink_recording(&dir.join("open-2.jsonl"), "open", &[0.25; 3]);
-    write_blink_recording(&dir.join("closed-1.jsonl"), "closed", &[0.02; 3]);
-    write_blink_recording(&dir.join("closed-2.jsonl"), "closed", &[0.03; 3]);
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([{
-            "name": "profile",
-            "open": ["open-1.jsonl", "./open-1.jsonl"],
-            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
-        }]),
-    );
-    let (code, _out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempt.to_str().unwrap(),
-            "--prefix-frames",
-            "3",
-        ])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1);
-    assert!(err.contains("distinct recording files"), "{err}");
-
-    std::fs::write(
-        dir.join("closed-2.jsonl"),
-        "{\"blinkcap\":true,\"label\":\"closed\",\"frames\":2}\n\
-         {\"idx\":0,\"ear\":0.03,\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0}\n",
-    )
-    .unwrap();
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([{
-            "name": "profile",
-            "open": ["open-1.jsonl", "open-2.jsonl"],
-            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
-        }]),
-    );
-    let (code, _out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempt.to_str().unwrap(),
-            "--prefix-frames",
-            "3",
-        ])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1);
-    assert!(err.contains("declares 2 frames but 1 were read"), "{err}");
-}
-
-#[test]
-fn blinkcap_selector_strictly_validates_attempt_headers_records_and_indices() {
-    let sb = Sandbox::new("bc-selector-strict-attempt");
-    let dir = sb.path("work");
-    for (file, label, ears) in [
-        ("open-1.jsonl", "open", vec![0.24; 3]),
-        ("open-2.jsonl", "open", vec![0.25; 3]),
-        ("closed-1.jsonl", "closed", vec![0.02; 3]),
-        ("closed-2.jsonl", "closed", vec![0.03; 3]),
-    ] {
-        write_blink_recording(&dir.join(file), label, &ears);
-    }
-    let manifest = dir.join("profiles.json");
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([{
-            "name": "profile",
-            "open": ["open-1.jsonl", "open-2.jsonl"],
-            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
-        }]),
-    );
-    let attempt = dir.join("attempt.jsonl");
-    let record = |idx: usize, ear_field: &str, extra: &str| {
-        format!(
-            "{{\"idx\":{idx},{ear_field}\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0{extra}}}\n"
-        )
+fn gesturecap_strictly_validates_pose_headers_records_counts_and_indices() {
+    let sandbox = Sandbox::new("gesturecap-strict");
+    let file = sandbox.path("work/attempt.jsonl");
+    let record = |idx: usize, fields: &str| {
+        format!("{{\"idx\":{idx},\"pitch_frac\":0.5,\"yaw_signed\":0.0,\"bri\":100.0{fields}}}\n")
     };
     let cases = [
+        (String::new(), "empty recording"),
+        ("not json\n".to_string(), "invalid posecap header"),
         (
-            format!(
-                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":1}}\n{}",
-                record(0, "\"ear\":0.25,", ",\"extra\":true")
-            ),
+            "{\"posecap\":false,\"label\":\"nod\",\"frames\":0}\n".to_string(),
+            "not a posecap recording",
+        ),
+        (
+            "{\"blinkcap\":true,\"label\":\"blink\",\"frames\":0}\n".to_string(),
+            "invalid posecap header",
+        ),
+        (
+            "{\"posecap\":true,\"label\":\"nod\",\"frames\":0,\"extra\":true}\n".to_string(),
             "unknown field",
         ),
         (
-            format!(
-                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":1}}\n{}",
-                record(0, "", "")
-            ),
-            "missing field `ear`",
+            "{\"posecap\":true,\"label\":7,\"frames\":0}\n".to_string(),
+            "invalid posecap header",
         ),
         (
             format!(
-                "{{\"blinkcap\":true,\"label\":7,\"frames\":1}}\n{}",
-                record(0, "\"ear\":0.25,", "")
-            ),
-            "invalid blinkcap header",
-        ),
-        (
-            format!(
-                "{{\"blinkcap\":true,\"label\":\"{}\",\"frames\":1}}\n{}",
-                "x".repeat(257),
-                record(0, "\"ear\":0.25,", "")
+                "{{\"posecap\":true,\"label\":\"{}\",\"frames\":0}}\n",
+                "x".repeat(257)
             ),
             "label must be 1..=256 bytes",
         ),
         (
+            "{\"posecap\":true,\"label\":\"nod\",\"frames\":65537}\n".to_string(),
+            "frames must be 0..=65536",
+        ),
+        (
             format!(
-                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":2}}\n{}{}",
-                record(0, "\"ear\":0.25,", ""),
-                record(0, "\"ear\":0.25,", "")
+                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":1}}\n{}",
+                record(0, ",\"extra\":true")
+            ),
+            "unknown field",
+        ),
+        (
+            "{\"posecap\":true,\"label\":\"nod\",\"frames\":1}\n\
+             {\"idx\":0,\"yaw_signed\":0.0,\"bri\":100.0}\n"
+                .to_string(),
+            "missing field `pitch_frac`",
+        ),
+        (
+            format!(
+                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":2}}\n{}{}",
+                record(0, ""),
+                record(0, "")
             ),
             "expected frame index 1",
         ),
         (
             format!(
-                "{{\"blinkcap\":true,\"label\":\"attempt\",\"frames\":2}}\n{}{}",
-                record(0, "\"ear\":0.25,", ""),
-                record(2, "\"ear\":0.25,", "")
+                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":2}}\n{}{}",
+                record(0, ""),
+                record(2, "")
             ),
             "expected frame index 1",
+        ),
+        (
+            format!(
+                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":2}}\n{}",
+                record(0, "")
+            ),
+            "declares 2 frames but 1 were read",
         ),
     ];
 
     for (contents, expected) in cases {
-        std::fs::write(&attempt, contents).unwrap();
-        let (code, _out, err) = run(sb
-            .cmd(&[
-                "blinkcap",
-                "select",
-                "--profiles",
-                manifest.to_str().unwrap(),
-                "--attempts",
-                attempt.to_str().unwrap(),
-                "--prefix-frames",
-                "1",
-            ])
+        std::fs::write(&file, contents).unwrap();
+        let (code, stdout, stderr) = run(sandbox
+            .cmd(&["gesturecap", "replay", file.to_str().unwrap()])
             .env("IRLUME_DEV", "1"));
-        assert_eq!(code, 1, "expected {expected}; stderr: {err}");
-        assert!(err.contains(expected), "expected {expected}; stderr: {err}");
+        assert_eq!(code, 1, "expected {expected}; stderr: {stderr}");
+        assert!(stdout.is_empty(), "partial report leaked: {stdout}");
+        assert!(
+            stderr.contains(expected),
+            "expected {expected}; stderr: {stderr}"
+        );
     }
 }
 
 #[test]
-fn blinkcap_selector_emits_no_partial_report_when_a_later_attempt_is_damaged() {
-    let sb = Sandbox::new("bc-selector-atomic-report");
-    let dir = sb.path("work");
-    for (file, label, ears) in [
-        ("open-1.jsonl", "open", vec![0.24; 3]),
-        ("open-2.jsonl", "open", vec![0.25; 3]),
-        ("closed-1.jsonl", "closed", vec![0.02; 3]),
-        ("closed-2.jsonl", "closed", vec![0.03; 3]),
-    ] {
-        write_blink_recording(&dir.join(file), label, &ears);
-    }
-    let manifest = dir.join("profiles.json");
-    write_selector_manifest(
-        &manifest,
-        serde_json::json!([{
-            "name": "profile",
-            "open": ["open-1.jsonl", "open-2.jsonl"],
-            "closed": ["closed-1.jsonl", "closed-2.jsonl"]
-        }]),
-    );
-    let attempts = dir.join("attempts");
-    std::fs::create_dir(&attempts).unwrap();
-    write_blink_recording(&attempts.join("a-valid.jsonl"), "valid", &[0.25; 3]);
-    std::fs::write(
-        attempts.join("z-damaged.jsonl"),
-        "{\"blinkcap\":true,\"label\":\"damaged\",\"frames\":2}\n\
-         {\"idx\":0,\"ear\":0.25,\"bri\":60.0,\"cx\":100.0,\"cy\":100.0,\"fsize\":100.0,\"contrast\":50.0}\n",
-    )
-    .unwrap();
-
-    let (code, out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "select",
-            "--profiles",
-            manifest.to_str().unwrap(),
-            "--attempts",
-            attempts.to_str().unwrap(),
-            "--prefix-frames",
-            "1",
-        ])
+fn gesturecap_bounds_recording_size_count_and_file_type() {
+    let oversized = Sandbox::new("gesturecap-oversized");
+    let file = oversized.path("work/oversized.jsonl");
+    std::fs::File::create(&file)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 + 1)
+        .unwrap();
+    let (code, _, stderr) = run(oversized
+        .cmd(&["gesturecap", "replay", file.to_str().unwrap()])
         .env("IRLUME_DEV", "1"));
-
-    assert_eq!(code, 1);
-    assert!(out.is_empty(), "partial report leaked to stdout: {out}");
-    assert!(err.contains("declares 2 frames but 1 were read"), "{err}");
-}
-
-#[test]
-fn blinkcap_replay_accepts_a_single_pose_file_and_a_pose_only_dir() {
-    let sb = Sandbox::new("bc-pose-ok");
-    let file = sb.path("work").join("nod-01.jsonl");
-    // Steps 0.02, 0.03, 0.01 over consecutive idx: mean_step 0.0200. The
-    // exact figure in stdout pins the whole path (parse, idx pairing, tally).
-    write_pose_recording(&file, "nod", &[0.50, 0.52, 0.55, 0.54]);
-
-    // One pose FILE: the usage line advertises <file.jsonl | dir>, and a
-    // file used to bypass the pose replay entirely and then exit 1.
-    let (code, out, err) = run(sb
-        .cmd(&["blinkcap", "replay", file.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(
-        code, 0,
-        "single pose file must replay and exit 0; stderr: {err}"
-    );
-    assert!(out.contains("mean_step 0.0200..0.0200"), "{out}");
-
-    // A pose-only directory: the summary used to print and the exit code
-    // still said FAILURE, so a script could not trust a successful replay.
-    let dir = sb.path("work");
-    let (code, out, err) = run(sb
-        .cmd(&["blinkcap", "replay", dir.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 0, "pose-only dir must exit 0; stderr: {err}");
-    assert!(out.contains("head-nod acceptance"), "{out}");
-}
-
-#[test]
-fn blinkcap_replay_refuses_damaged_pose_recordings_loudly() {
-    let sb = Sandbox::new("bc-pose-bad");
-    let dir = sb.path("work");
-    write_pose_recording(&dir.join("nod-01.jsonl"), "nod", &[0.50, 0.52, 0.55]);
-
-    // A crash-truncated capture: valid header, no body. Replaying it would
-    // score an unread observation as a perfectly still head (mean_step 0.0)
-    // in the same summary as real sessions, so the whole replay must refuse,
-    // even though a healthy recording sits in the same directory.
-    std::fs::write(
-        dir.join("trunc.jsonl"),
-        "{\"posecap\":true,\"label\":\"nod\",\"frames\":3}\n",
-    )
-    .unwrap();
-    let (code, out, err) = run(sb
-        .cmd(&["blinkcap", "replay", dir.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1, "a truncated pose recording must fail the replay");
-    assert!(err.contains("declares 3 frames"), "stderr: {err}");
+    assert_eq!(code, 1, "{stderr}");
     assert!(
-        !out.contains("head-nod acceptance"),
-        "no summary may print over a damaged corpus: {out}"
+        stderr.contains("exceeds the 8388608-byte limit"),
+        "{stderr}"
     );
 
-    // A malformed record inside a file that declares the right count.
+    let non_file = Sandbox::new("gesturecap-non-file");
+    let real_file = non_file.path("work/real.jsonl");
     std::fs::write(
-        dir.join("trunc.jsonl"),
-        "{\"posecap\":true,\"label\":\"nod\",\"frames\":2}\n\
-         {\"idx\":0,\"pitch_frac\":0.5,\"yaw_signed\":0.0,\"bri\":100.0}\n\
-         {\"idx\":1,\"pitch_frac\":BROKEN\n",
+        &real_file,
+        "{\"posecap\":true,\"label\":\"nod\",\"frames\":0}\n",
     )
     .unwrap();
-    let (code, _out, err) = run(sb
-        .cmd(&[
-            "blinkcap",
-            "replay",
-            dir.join("trunc.jsonl").to_str().unwrap(),
-        ])
+    let directory_entry = non_file.path("work/not-a-file.jsonl");
+    std::os::unix::fs::symlink(&real_file, &directory_entry).unwrap();
+    let (code, _, stderr) = run(non_file
+        .cmd(&["gesturecap", "replay", directory_entry.to_str().unwrap()])
         .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1, "a malformed pose record must fail the replay");
-    assert!(err.contains("invalid pose record"), "stderr: {err}");
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("must be a regular file"), "{stderr}");
+
+    let too_many = Sandbox::new("gesturecap-too-many");
+    for index in 0..513 {
+        std::fs::write(
+            too_many.path(&format!("work/{index:03}.jsonl")),
+            "{\"posecap\":true,\"label\":\"nod\",\"frames\":0}\n",
+        )
+        .unwrap();
+    }
+    let directory = too_many.path("work");
+    let (code, _, stderr) = run(too_many
+        .cmd(&["gesturecap", "replay", directory.to_str().unwrap()])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("expected 1..=512 JSONL recordings"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn gesturecap_emits_no_partial_report_when_a_later_recording_is_damaged() {
+    let sandbox = Sandbox::new("gesturecap-atomic-report");
+    let directory = sandbox.path("work");
+    write_pose_recording(&directory.join("a-valid.jsonl"), "nod", &[0.50, 0.52, 0.55]);
+    std::fs::write(
+        directory.join("z-damaged.jsonl"),
+        "{\"posecap\":true,\"label\":\"damaged\",\"frames\":2}\n\
+         {\"idx\":0,\"pitch_frac\":0.5,\"yaw_signed\":0.0,\"bri\":100.0}\n",
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run(sandbox
+        .cmd(&["gesturecap", "replay", directory.to_str().unwrap()])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stdout.is_empty(), "partial report leaked: {stdout}");
+    assert!(
+        stderr.contains("declares 2 frames but 1 were read"),
+        "{stderr}"
+    );
 }

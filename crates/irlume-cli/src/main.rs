@@ -19,10 +19,10 @@
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 
 mod bitwarden;
-mod blinkcap;
 mod commands;
 mod doctor_report;
 mod fingerprint;
+mod gesturecap;
 mod logintx;
 mod logs;
 mod machine;
@@ -76,7 +76,7 @@ const DEV_CMDS: &[&str] = &[
     "irbench",
     "genuine",
     "calcapture",
-    "blinkcap",
+    "gesturecap",
     "normprobe",
     "liveness",
     "meshprobe",
@@ -152,7 +152,7 @@ fn main() -> std::process::ExitCode {
         (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
         (Some("calcapture"), _) => calcapture(&args),
-        (Some("blinkcap"), _) => blinkcap::run(&args),
+        (Some("gesturecap"), _) => gesturecap::run(&args),
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("suncal"), _) => suncal::run(&args),
@@ -1547,7 +1547,7 @@ fn enrolldev(args: &[String]) -> std::process::ExitCode {
 /// Either flag ALONE overrides its half; the partner comes from `selected`
 /// (in production [`irlume_camera::select_pair`]: the persisted pair with
 /// identity resolution, then discovery), because a lone flag used to be
-/// SILENTLY IGNORED: `blinkcap capture --ir /dev/video6` captured against
+/// SILENTLY IGNORED: `gesturecap capture --ir /dev/video6` captured against
 /// the built-in default node and failed with "no camera found", saying
 /// nothing about the dropped flag (#209). `selected` runs only when needed,
 /// since it can probe devices.

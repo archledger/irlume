@@ -42,7 +42,6 @@ Run by a maintainer against a specific box, usually while chasing a report.
 | `tpm-pcr-race-swtpm.sh` | Reproduces `TPM2_RC_PCR_CHANGED` in a software TPM and proves the retry rescues it. |
 | `timing-report.py` | Summarises camera capture timings from daemon debug logs. |
 | `deploy-keyring-unlock.sh` | Stages a rebuilt daemon, PAM module and CLI onto a test box, with the SELinux policy the greeter needs. |
-| `deploy-passive-ear.sh` | Stages the passive-EAR liveness build and wires the FaceMesh model into the daemon unit. |
 
 ## `hardware/`: manual procedures that need a real camera
 
@@ -75,4 +74,3 @@ document in `docs/pad-results/` or `docs/recognition-results/`, not from here.
 | `compare-blaze-parity.py` | The fail-closed parity gate for the full-range BlazeFace decoder against Google's own runtime. |
 | `mp-face-detector-bench.py` | Runs Google's MediaPipe FaceDetector over the stage-3 corpus, so no hand-rolled decode can flatter itself. |
 | `capture-stage3-segment.sh` | Captures one stage-3 corpus segment: positioning lead-in, then paired RGB and IR frames. |
-| `blinkcap-campaign.sh` | Records one labelled IR `EarSample` sequence per invocation, for the consent-gesture dataset. |

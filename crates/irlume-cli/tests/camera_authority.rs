@@ -35,7 +35,7 @@ fn exempt_file(file: &str) -> bool {
     // resolving a node is the first step of using it, not a lookup.
     matches!(
         file,
-        "blinkcap.rs" | "pad.rs" | "suncal.rs" | "capture.rs" | "calibrate.rs"
+        "gesturecap.rs" | "pad.rs" | "suncal.rs" | "capture.rs" | "calibrate.rs"
     )
 }
 

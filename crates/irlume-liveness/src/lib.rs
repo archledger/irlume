@@ -850,8 +850,9 @@ pub struct PoseSample {
     /// Signed horizontal turn: ~0 frontal, sign = nose toward image-left/right. A
     /// shake swings this side-to-side.
     pub yaw_signed: Option<f32>,
-    /// Frame mean brightness (IR strobe phase); the pose detector does not
-    /// currently gate on it.
+    /// Frame mean brightness. When a take has a clear alternating IR strobe,
+    /// gesture evidence uses only the brighter phase; otherwise brightness does
+    /// not change the pose decision.
     pub bri: f32,
 }
 
@@ -991,6 +992,36 @@ pub const SHAKE_WIDE_YAW: f32 = 1.5;
 /// Crossings required once the yaw range is [`SHAKE_WIDE_YAW`] or wider.
 pub const SHAKE_WIDE_MIN_CROSSINGS: usize = 1;
 
+// A temporal consent take from the ASUS module alternates emitter-off/on IR
+// frames. Usually the detector sees a face only on the bright phase, but the
+// 2026-08-19 sitting-shake corpus produced dark-phase false detections with yaw
+// spikes from -3 to -8 that poisoned every later prefix. Select a parity only
+// when BOTH the relative and absolute separation are clear; non-strobe cameras
+// and ambiguous lighting retain every sample. Six observations per parity are
+// available before a gesture can satisfy the 12-face-frame floor.
+const STROBE_PHASE_MIN_SAMPLES: usize = 6;
+const STROBE_PHASE_MIN_RATIO: f32 = 1.5;
+const STROBE_PHASE_MIN_GAP: f32 = 20.0;
+
+fn bright_strobe_parity(samples: &[PoseSample]) -> Option<usize> {
+    let mut sums = [0.0f32; 2];
+    let mut counts = [0usize; 2];
+    for sample in samples.iter().filter(|sample| sample.bri.is_finite()) {
+        let parity = sample.idx % 2;
+        sums[parity] += sample.bri;
+        counts[parity] += 1;
+    }
+    if counts.iter().any(|&count| count < STROBE_PHASE_MIN_SAMPLES) {
+        return None;
+    }
+    let means = [sums[0] / counts[0] as f32, sums[1] / counts[1] as f32];
+    let bright = usize::from(means[1] > means[0]);
+    let dark = 1 - bright;
+    (means[bright] - means[dark] >= STROBE_PHASE_MIN_GAP
+        && means[bright] >= means[dark] * STROBE_PHASE_MIN_RATIO)
+        .then_some(bright)
+}
+
 /// Detect a deliberate head consent gesture from a pose sequence.
 ///
 /// A nod approves, a shake declines, and a tracked face without either gesture
@@ -1057,8 +1088,19 @@ pub struct NodEvidence {
 /// report is never missing the one number that would have explained it; the
 /// extra work lands only on the failure path.
 pub fn detect_head_gesture_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvidence) {
-    let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
-    let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
+    let bright_parity = bright_strobe_parity(samples);
+    let selected =
+        |sample: &&PoseSample| bright_parity.is_none_or(|parity| sample.idx % 2 == parity);
+    let pitch: Vec<f32> = samples
+        .iter()
+        .filter(selected)
+        .filter_map(|s| s.pitch_frac)
+        .collect();
+    let yaw: Vec<f32> = samples
+        .iter()
+        .filter(selected)
+        .filter_map(|s| s.yaw_signed)
+        .collect();
     let range = |v: &[f32]| -> f32 {
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for &x in v {
@@ -1092,6 +1134,7 @@ pub fn detect_head_gesture_with_evidence(samples: &[PoseSample]) -> (HeadGesture
     // nod 0.0116 against still 0.0018.
     let usable: Vec<(usize, f32)> = samples
         .iter()
+        .filter(selected)
         .filter_map(|s| s.pitch_frac.filter(|p| p.is_finite()).map(|p| (s.idx, p)))
         .collect();
     let (step_sum, step_n) = usable.windows(2).fold((0.0f32, 0usize), |acc, w| {
@@ -2073,6 +2116,126 @@ mod nod_evidence_tests {
                 bri: 100.0,
             })
             .collect()
+    }
+
+    fn alternating_strobe_poses(
+        lit_pitch: &[f32],
+        lit_yaw: &[f32],
+        dark_brightness: f32,
+        dark_poison: Option<(usize, f32, f32)>,
+    ) -> Vec<PoseSample> {
+        assert_eq!(lit_pitch.len(), lit_yaw.len());
+        (0..lit_pitch.len() * 2)
+            .map(|idx| {
+                if idx % 2 == 1 {
+                    PoseSample {
+                        idx,
+                        pitch_frac: Some(lit_pitch[idx / 2]),
+                        yaw_signed: Some(lit_yaw[idx / 2]),
+                        bri: 120.0,
+                    }
+                } else if dark_poison.is_some_and(|(poisoned, _, _)| poisoned == idx) {
+                    let (_, pitch, yaw) = dark_poison.unwrap();
+                    PoseSample {
+                        idx,
+                        pitch_frac: Some(pitch),
+                        yaw_signed: Some(yaw),
+                        bri: dark_brightness,
+                    }
+                } else {
+                    PoseSample {
+                        idx,
+                        pitch_frac: None,
+                        yaw_signed: None,
+                        bri: dark_brightness,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dark_strobe_landmarks_do_not_poison_a_lit_phase_shake() {
+        let lit_yaw = [
+            0.45, 0.13, 0.00, -0.18, -0.14, -0.15, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62,
+        ];
+        // Reproduces the current-host sitting-shake failure: the detector
+        // briefly reports a face on the dark strobe phase with an impossible
+        // landmark-derived yaw.
+        let samples =
+            alternating_strobe_poses(&[0.52; 12], &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
+
+        assert_eq!(detect_head_gesture(&samples), HeadGesture::Shake);
+    }
+
+    #[test]
+    fn bright_strobe_phase_is_selected_from_frame_identity_not_fixed_parity() {
+        let lit_yaw = [
+            0.45, 0.13, 0.00, -0.18, -0.14, -0.15, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62,
+        ];
+        let mut samples =
+            alternating_strobe_poses(&[0.52; 12], &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
+        for sample in &mut samples {
+            sample.idx += 1;
+        }
+
+        assert_eq!(detect_head_gesture(&samples), HeadGesture::Shake);
+    }
+
+    #[test]
+    fn dark_strobe_landmarks_do_not_poison_a_lit_phase_nod() {
+        let lit_pitch = [
+            0.50, 0.50, 0.50, 0.50, 0.60, 0.40, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
+        ];
+        let samples =
+            alternating_strobe_poses(&lit_pitch, &[0.0; 12], 50.0, Some((12, 0.48, -3.04)));
+
+        assert_eq!(detect_head_gesture(&samples), HeadGesture::Nod);
+    }
+
+    #[test]
+    fn ambiguous_phase_brightness_does_not_discard_yaw_evidence() {
+        let lit_yaw = [
+            0.45, 0.13, 0.00, -0.18, -0.14, -0.15, -0.05, 0.13, 0.30, 0.61, 0.65, 0.62,
+        ];
+        let samples =
+            alternating_strobe_poses(&[0.52; 12], &lit_yaw, 90.0, Some((12, 0.48, -3.04)));
+
+        assert_eq!(detect_head_gesture(&samples), HeadGesture::None);
+    }
+
+    #[test]
+    fn strobe_filtered_vertical_shake_motion_never_approves() {
+        let lit_pitch = [
+            0.40, 0.43, 0.48, 0.55, 0.62, 0.58, 0.50, 0.43, 0.39, 0.44, 0.52, 0.61,
+        ];
+        let lit_yaw = [
+            -0.25, -0.15, 0.00, 0.15, 0.25, 0.15, 0.00, -0.15, -0.25, -0.10, 0.10, 0.25,
+        ];
+        let samples = alternating_strobe_poses(&lit_pitch, &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
+
+        assert_ne!(detect_head_gesture(&samples), HeadGesture::Nod);
+    }
+
+    #[test]
+    fn strobe_filtered_still_head_remains_no_gesture() {
+        let samples =
+            alternating_strobe_poses(&[0.50; 12], &[0.05; 12], 50.0, Some((12, 0.48, -3.04)));
+
+        assert_eq!(detect_head_gesture(&samples), HeadGesture::None);
+    }
+
+    #[test]
+    fn strobe_filtered_look_around_is_neither_approval_nor_decline() {
+        let lit_pitch = [
+            0.52, 0.58, 0.63, 0.55, 0.60, 0.51, 0.57, 0.62, 0.54, 0.59, 0.53, 0.61,
+        ];
+        let lit_yaw = [
+            -2.05, 2.05, -2.05, 2.05, -2.05, 2.05, -2.05, 2.05, -2.05, 2.05, -2.05, 2.05,
+        ];
+        let samples = alternating_strobe_poses(&lit_pitch, &lit_yaw, 50.0, Some((12, 0.48, -3.04)));
+
+        assert_eq!(detect_head_gesture(&samples), HeadGesture::None);
     }
 
     /// A head-shake with a little vertical bob must NEVER approve. Its yaw range

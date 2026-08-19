@@ -190,49 +190,162 @@ scratch_file() {
     printf -v "$variable" '%s' "$path"
 }
 
-supervisor=
-scratch_file supervisor supervise.py
-chmod 0700 "$supervisor"
-python3 - "$supervisor" <<'PY'
-import pathlib
-import sys
-
-pathlib.Path(sys.argv[1]).write_text(
-    """#!/usr/bin/env python3
+read -r -d '' supervisor_code <<'PY' || true
+import base64
+import ctypes
+import json
 import os
-import stat
+import selectors
 import subprocess
 import sys
+import time
 
-marker, *command = sys.argv[1:]
+MAX_STREAM_BYTES = 4096
+PR_GET_DUMPABLE = 3
+PR_SET_DUMPABLE = 4
+
+
+def emit(*, protected, started, timed_out, returncode, output_overflow, stdout, stderr, error):
+    payload = {
+        "error": error,
+        "output_overflow": output_overflow,
+        "protected": protected,
+        "returncode": returncode,
+        "started": started,
+        "stderr_b64": base64.b64encode(stderr[:MAX_STREAM_BYTES]).decode("ascii"),
+        "stdout_b64": base64.b64encode(stdout[:MAX_STREAM_BYTES]).decode("ascii"),
+        "timed_out": timed_out,
+        "version": 1,
+    }
+    sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def disable_dumpability():
+    if not sys.platform.startswith("linux"):
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        return False
+    return prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0
+
+
 try:
-    child = subprocess.Popen(command)
-    returncode = child.wait()
-    status = returncode if returncode >= 0 else 128 - returncode
+    protected = disable_dumpability()
+except (AttributeError, OSError):
+    protected = False
+if not protected:
+    emit(
+        protected=False,
+        started=False,
+        timed_out=False,
+        returncode=None,
+        output_overflow=False,
+        stdout=b"",
+        stderr=b"",
+        error="protection-unavailable",
+    )
+    raise SystemExit(0)
+
+timeout_seconds = int(sys.argv[1])
+command = sys.argv[2:]
+try:
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        bufsize=0,
+    )
 except OSError:
-    status = 127
+    emit(
+        protected=True,
+        started=False,
+        timed_out=False,
+        returncode=None,
+        output_overflow=False,
+        stdout=b"",
+        stderr=b"",
+        error="spawn-failed",
+    )
+    raise SystemExit(0)
 
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-descriptor = os.open(marker, flags, 0o600)
+buffers = {"stdout": bytearray(), "stderr": bytearray()}
+selector = selectors.DefaultSelector()
+for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr)):
+    os.set_blocking(pipe.fileno(), False)
+    selector.register(pipe, selectors.EVENT_READ, name)
+
+
+def read_ready(events):
+    for key, _ in events:
+        name = key.data
+        room = MAX_STREAM_BYTES + 1 - len(buffers[name])
+        if room <= 0:
+            return True
+        try:
+            data = os.read(key.fileobj.fileno(), room)
+        except BlockingIOError:
+            continue
+        if not data:
+            selector.unregister(key.fileobj)
+            continue
+        buffers[name].extend(data)
+        if len(buffers[name]) > MAX_STREAM_BYTES:
+            return True
+    return False
+
+
+deadline = time.monotonic() + timeout_seconds
+timed_out = False
+output_overflow = False
+error = None
 try:
-    info = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or info.st_nlink != 1
-    ):
-        raise SystemExit(125)
-    payload = f"{status}\\n".encode("ascii")
-    view = memoryview(payload)
-    while view:
-        view = view[os.write(descriptor, view):]
-    os.fsync(descriptor)
+    while child.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        if selector.get_map():
+            events = selector.select(min(remaining, 0.05))
+        else:
+            time.sleep(min(remaining, 0.05))
+            events = ()
+        if read_ready(events):
+            output_overflow = True
+            break
+    if not timed_out and not output_overflow:
+        while selector.get_map():
+            events = selector.select(0)
+            if not events:
+                break
+            if read_ready(events):
+                output_overflow = True
+                break
+except (OSError, ValueError):
+    error = "internal-error"
 finally:
-    os.close(descriptor)
-raise SystemExit(status)
-""",
-    encoding="utf-8",
+    if child.poll() is None:
+        child.kill()
+    raw_returncode = child.wait()
+    selector.close()
+    child.stdout.close()
+    child.stderr.close()
+
+returncode = raw_returncode if raw_returncode >= 0 else 128 - raw_returncode
+emit(
+    protected=True,
+    started=True,
+    timed_out=timed_out,
+    returncode=returncode,
+    output_overflow=output_overflow,
+    stdout=bytes(buffers["stdout"]),
+    stderr=bytes(buffers["stderr"]),
+    error=error,
 )
 PY
 
@@ -335,99 +448,74 @@ python3 "$validator" --check-cell "$service" "$purpose" "$resolved_policy" "$exp
 run_adapter() {
     local phase=$1 seconds=$2
     shift 2
-    local stdout_file="$scratch_dir/$phase.stdout" stderr_file="$scratch_dir/$phase.stderr"
-    local stdout_fifo="$scratch_dir/$phase.stdout.fifo" stderr_fifo="$scratch_dir/$phase.stderr.fifo"
-    local completion_file="$scratch_dir/$phase.completion"
-    : >"$stdout_file"
-    : >"$stderr_file"
-    mkfifo "$stdout_fifo" "$stderr_fifo"
-    scratch_files+=("$stdout_file" "$stderr_file" "$stdout_fifo" "$stderr_fifo" "$completion_file")
-    if [[ $test_mode == 1 && $phase == attempt && -n ${IRLUME_HEAD_GESTURE_TEST_COMPLETION_SYMLINK:-} ]]; then
-        ln -s -- "$IRLUME_HEAD_GESTURE_TEST_COMPLETION_SYMLINK" "$completion_file"
-    fi
-    head -c 4097 <"$stdout_fifo" >"$stdout_file" &
-    local stdout_reader=$!
-    head -c 4097 <"$stderr_fifo" >"$stderr_file" &
-    local stderr_reader=$!
     local unit="irlume-head-gesture-$phase-$$-$RANDOM.scope"
+    local outer_seconds=$((seconds + 3)) supervisor_result status
     active_unit=$unit
     set +e
     if [[ $test_mode == 1 ]]; then
-        timeout --foreground --kill-after=2s "${seconds}s" \
-            "$containment_cmd" run "$unit" python3 "$supervisor" "$completion_file" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+        supervisor_result=$(
+            timeout --foreground --kill-after=2s "${outer_seconds}s" \
+                "$containment_cmd" run "$unit" \
+                python3 -I -c "$supervisor_code" "$seconds" "$adapter_bound" "$@" |
+                head -c 16385
+        )
     else
-        timeout --foreground --kill-after=2s "${seconds}s" \
-            systemd-run --user --scope --quiet --unit="$unit" -- \
-            python3 "$supervisor" "$completion_file" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+        supervisor_result=$(
+            timeout --foreground --kill-after=2s "${outer_seconds}s" \
+                systemd-run --user --scope --quiet --unit="$unit" -- \
+                python3 -I -c "$supervisor_code" "$seconds" "$adapter_bound" "$@" |
+                head -c 16385
+        )
     fi
-    local status=$?
+    status=$?
     set -e
     local containment_ok=1
     containment_cleanup "$unit" || containment_ok=0
     active_unit=
-    wait "$stdout_reader" 2>/dev/null || true
-    wait "$stderr_reader" 2>/dev/null || true
-    RUN_STDOUT=$stdout_file
-    RUN_STDERR=$stderr_file
+    RUN_SUPERVISOR_RESULT=$supervisor_result
+    RUN_OUTER_STATUS=$status
     RUN_CONTAINMENT_OK=$containment_ok
-    RUN_ADAPTER_COMPLETED=0
-    RUN_ADAPTER_STATUS=
-    if [[ -e $completion_file || -L $completion_file ]]; then
-        local completion_status
-        if completion_status=$(python3 - "$completion_file" <<'PY'
-import os
-import stat
-import sys
-
-flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-descriptor = os.open(sys.argv[1], flags)
-try:
-    info = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) != 0o600
-        or info.st_nlink != 1
-        or not 2 <= info.st_size <= 4
-    ):
-        raise SystemExit(1)
-    raw = os.read(descriptor, 5)
-finally:
-    os.close(descriptor)
-try:
-    text = raw.decode("ascii")
-    if not text.endswith("\n") or not text[:-1].isdigit():
-        raise ValueError
-    status = int(text[:-1])
-except (UnicodeError, ValueError):
-    raise SystemExit(1)
-if not 0 <= status <= 255:
-    raise SystemExit(1)
-print(status)
-PY
-        ); then
-            RUN_ADAPTER_COMPLETED=1
-            RUN_ADAPTER_STATUS=$completion_status
-        fi
-    fi
-    RUN_WATCHDOG_EXPIRED=0
-    if [[ $RUN_ADAPTER_COMPLETED -eq 0 && ( $status -eq 124 || $status -eq 137 ) ]]; then
-        RUN_WATCHDOG_EXPIRED=1
-    fi
 }
 
 run_adapter preflight 5 --preflight --expected-camera-identity-digest "$expected_camera_digest"
-[[ $RUN_CONTAINMENT_OK -eq 1 && $RUN_ADAPTER_COMPLETED -eq 1 && $RUN_ADAPTER_STATUS -eq 0 ]] || die "adapter preflight failed"
-preflight_digest=$(python3 - "$RUN_STDOUT" "$RUN_STDERR" <<'PY'
+preflight_digest=$(python3 - "$RUN_SUPERVISOR_RESULT" "$RUN_OUTER_STATUS" "$RUN_CONTAINMENT_OK" <<'PY'
+import base64
 import json
-import pathlib
 import sys
 
-stdout, stderr = map(pathlib.Path, sys.argv[1:])
-if stdout.stat().st_size > 4096 or stderr.stat().st_size > 4096:
-    raise SystemExit("oversized preflight output")
-doc = json.loads(stdout.read_text(encoding="utf-8"))
-if not isinstance(doc, dict) or set(doc) != {"camera_identity_digest"}:
+raw, outer_status, containment_ok = sys.argv[1:]
+keys = {
+    "error", "output_overflow", "protected", "returncode", "started",
+    "stderr_b64", "stdout_b64", "timed_out", "version",
+}
+try:
+    supervisor = json.loads(raw)
+    if (
+        outer_status != "0"
+        or containment_ok != "1"
+        or not isinstance(supervisor, dict)
+        or set(supervisor) != keys
+        or type(supervisor["version"]) is not int
+        or supervisor["version"] != 1
+        or supervisor["protected"] is not True
+        or supervisor["started"] is not True
+        or supervisor["timed_out"] is not False
+        or supervisor["output_overflow"] is not False
+        or type(supervisor["returncode"]) is not int
+        or supervisor["returncode"] != 0
+        or supervisor["error"] is not None
+        or not isinstance(supervisor["stdout_b64"], str)
+        or not isinstance(supervisor["stderr_b64"], str)
+    ):
+        raise ValueError
+    stdout = base64.b64decode(supervisor["stdout_b64"], validate=True)
+    stderr = base64.b64decode(supervisor["stderr_b64"], validate=True)
+    if len(stdout) > 4096 or len(stderr) > 4096:
+        raise ValueError
+    doc = json.loads(stdout.decode("utf-8"))
+except (UnicodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit("invalid supervisor/preflight result")
+if not isinstance(doc, dict) or set(doc) != {"camera_identity_digest"} or not isinstance(doc["camera_identity_digest"], str):
     raise SystemExit("invalid preflight result")
 print(doc["camera_identity_digest"])
 PY
@@ -451,34 +539,81 @@ run_adapter attempt "$attempt_seconds" \
 trial_record=
 scratch_file trial_record trial.json
 trial_id="$host_label:$service:$expected_gesture:$(date -u +%Y%m%d%H%M%S):$$"
-normalization=$(python3 - "$RUN_STDOUT" "$RUN_STDERR" "$RUN_WATCHDOG_EXPIRED" "$RUN_ADAPTER_COMPLETED" "$RUN_ADAPTER_STATUS" "$RUN_CONTAINMENT_OK" "$trial_record" \
+normalization=$(python3 - "$RUN_SUPERVISOR_RESULT" "$RUN_OUTER_STATUS" "$RUN_CONTAINMENT_OK" "$trial_record" \
     "$expected_oid" "$expected_binary_sha256" "$expected_adapter_sha256" "$expected_camera_digest" \
     "$host_label" "$service" "$purpose" "$resolved_policy" "$trial_id" "$expected_gesture" "$timestamp" "$validator" <<'PY'
+import base64
 import json
 import pathlib
 import runpy
 import sys
 
 (
-    stdout_raw, stderr_raw, watchdog_raw, completed_raw, adapter_status_raw, containment_raw, destination_raw, oid, binary, adapter,
+    supervisor_raw, outer_status_raw, containment_raw, destination_raw, oid, binary, adapter,
     camera, host, service, purpose, policy, trial_id, gesture, timestamp, validator_raw,
 ) = sys.argv[1:]
-stdout = pathlib.Path(stdout_raw)
-stderr = pathlib.Path(stderr_raw)
-watchdog_expired = watchdog_raw == "1"
-completed = completed_raw == "1"
-adapter_status = int(adapter_status_raw) if completed else None
-containment_ok = containment_raw == "1"
 zero = {"frames": 0, "face_frames": 0, "pitch_range": 0, "yaw_range": 0, "pitch_crossings": 0, "yaw_crossings": 0, "mean_step": 0}
 result = None
+supervisor = None
+stdout = b""
 validator = runpy.run_path(validator_raw)
-if stdout.stat().st_size <= 4096 and stderr.stat().st_size <= 4096:
+supervisor_keys = {
+    "error", "output_overflow", "protected", "returncode", "started",
+    "stderr_b64", "stdout_b64", "timed_out", "version",
+}
+try:
+    if len(supervisor_raw.encode("utf-8")) > 16384:
+        raise ValueError
+    candidate_supervisor = json.loads(supervisor_raw)
+    if (
+        not isinstance(candidate_supervisor, dict)
+        or set(candidate_supervisor) != supervisor_keys
+        or type(candidate_supervisor["version"]) is not int
+        or candidate_supervisor["version"] != 1
+        or any(
+            type(candidate_supervisor[name]) is not bool
+            for name in ("output_overflow", "protected", "started", "timed_out")
+        )
+        or not isinstance(candidate_supervisor["stdout_b64"], str)
+        or not isinstance(candidate_supervisor["stderr_b64"], str)
+        or candidate_supervisor["error"] not in {None, "protection-unavailable", "spawn-failed", "internal-error"}
+    ):
+        raise ValueError
+    returncode = candidate_supervisor["returncode"]
+    if returncode is not None and (type(returncode) is not int or not 0 <= returncode <= 255):
+        raise ValueError
+    stdout = base64.b64decode(candidate_supervisor["stdout_b64"], validate=True)
+    stderr = base64.b64decode(candidate_supervisor["stderr_b64"], validate=True)
+    if len(stdout) > 4096 or len(stderr) > 4096:
+        raise ValueError
+    if candidate_supervisor["started"]:
+        if returncode is None or not candidate_supervisor["protected"]:
+            raise ValueError
+    elif (
+        returncode is not None
+        or candidate_supervisor["timed_out"]
+        or candidate_supervisor["output_overflow"]
+        or stdout
+        or stderr
+    ):
+        raise ValueError
+    if candidate_supervisor["timed_out"] and candidate_supervisor["output_overflow"]:
+        raise ValueError
+    supervisor = candidate_supervisor
+except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+    pass
+
+if supervisor is not None:
     try:
-        candidate = json.loads(stdout.read_text(encoding="utf-8"))
+        candidate = json.loads(stdout.decode("utf-8"))
+        adapter_outcomes = validator["OUTCOMES"] - {
+            "attempt-timeout", "capability-present", "capability-not-present",
+        }
         if (
             isinstance(candidate, dict)
             and set(candidate) == {"typed_outcome", "detector_evidence"}
-            and candidate["typed_outcome"] in validator["OUTCOMES"] - {"capability-present", "capability-not-present"}
+            and isinstance(candidate["typed_outcome"], str)
+            and candidate["typed_outcome"] in adapter_outcomes
         ):
             try:
                 validator["validate_evidence"](
@@ -493,9 +628,22 @@ if stdout.stat().st_size <= 4096 and stderr.stat().st_size <= 4096:
     except (UnicodeError, json.JSONDecodeError):
         pass
 evidence = result["detector_evidence"] if result is not None else zero
-if watchdog_expired:
+trusted_supervisor = (
+    supervisor is not None
+    and outer_status_raw == "0"
+    and containment_raw == "1"
+    and supervisor["protected"]
+    and supervisor["started"]
+    and supervisor["error"] is None
+)
+if trusted_supervisor and supervisor["timed_out"]:
     result = {"typed_outcome": "attempt-timeout", "detector_evidence": evidence}
-elif not containment_ok or not completed or adapter_status != 0 or result is None:
+elif (
+    not trusted_supervisor
+    or supervisor["output_overflow"]
+    or supervisor["returncode"] != 0
+    or result is None
+):
     result = {"typed_outcome": "attempt-failed", "detector_evidence": evidence}
 record = {
     "schema_version": 1,

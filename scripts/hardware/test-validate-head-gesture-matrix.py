@@ -289,9 +289,72 @@ case "$1" in
   *) exit 2 ;;
 esac
 """)
+        self.malicious_supervisor = self.make_fake("malicious-supervisor.py", """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+marker = pathlib.Path(sys.argv[1])
+descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(descriptor, b"0\\n")
+os.close(descriptor)
+with pathlib.Path(os.environ["FAKE_LOG"]).open("a", encoding="utf-8") as log:
+    log.write("malicious-supervisor\\n")
+print('{"typed_outcome":"approved","detector_evidence":{"frames":75,"face_frames":75,"pitch_range":0.25,"yaw_range":18.0,"pitch_crossings":2,"yaw_crossings":0,"mean_step":0.03}}')
+""")
+        self.legacy_attack = self.make_fake("legacy-authority-attack.py", """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+action, parent_pid, replacement = sys.argv[1:]
+arguments = pathlib.Path(f"/proc/{parent_pid}/cmdline").read_bytes().split(b"\\0")
+paths = [pathlib.Path(raw.decode(errors="surrogateescape")) for raw in arguments if raw.startswith(b"/")]
+found = None
+if action == "forge-marker":
+    found = next((path for path in paths if path.name.endswith(".completion")), None)
+    if found is None:
+        scratch_dirs = list(pathlib.Path(os.environ["TMPDIR"]).glob("irlume-head-gesture.*"))
+        if scratch_dirs:
+            found = max(scratch_dirs, key=lambda path: path.stat().st_mtime_ns) / "attempt.completion"
+    if found is not None:
+        descriptor = os.open(found, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(descriptor, b"0\\n")
+        os.close(descriptor)
+elif action == "replace-supervisor":
+    found = next((path for path in paths if path.name == "supervise.py"), None)
+    if found is None:
+        found = next(
+            (
+                path / "supervise.py"
+                for path in pathlib.Path(os.environ["TMPDIR"]).glob("irlume-head-gesture.*")
+                if (path / "supervise.py").is_file()
+            ),
+            None,
+        )
+    if found is not None:
+        found.write_bytes(pathlib.Path(replacement).read_bytes())
+        found.chmod(0o700)
+elif action == "probe-result-fd":
+    result_fd = pathlib.Path(f"/proc/{parent_pid}/fd/1")
+    try:
+        descriptor = os.open(result_fd, os.O_WRONLY | os.O_CLOEXEC)
+    except OSError:
+        pass
+    else:
+        os.close(descriptor)
+        found = result_fd
+else:
+    raise SystemExit(2)
+with pathlib.Path(os.environ["FAKE_LEGACY_ATTACK_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(f"{action}:{found if found is not None else 'none'}\\n")
+""")
         self.adapter = self.make_fake("attempt-adapter", """#!/bin/sh
 if [ "$1" = --preflight ]; then
   printf '%s\\n' preflight >>"$FAKE_LOG"
+  if [ "${FAKE_REPLACE_SUPERVISOR-0}" -eq 1 ]; then
+    python3 "$FAKE_LEGACY_ATTACK" replace-supervisor "$PPID" "$FAKE_REPLACEMENT_SUPERVISOR"
+  fi
   printf '{"camera_identity_digest":"%s"}\\n' "${FAKE_CAMERA_DIGEST}"
   if [ -n "${FAKE_ADAPTER_REPLACEMENT-}" ]; then
     mv "$FAKE_ADAPTER_REPLACEMENT" "$FAKE_ADAPTER_PATH"
@@ -313,7 +376,9 @@ case "${FAKE_ADAPTER_MODE-good}" in
     ;;
   misclassified) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal" ;;
   fail-json) printf '{"typed_outcome":"attempt-failed","detector_evidence":%s}\\n' "$zero"; exit 9 ;;
+  fake-timeout) printf '{"typed_outcome":"attempt-timeout","detector_evidence":%s}\\n' "$zero" ;;
   invalid) printf 'arbitrary prose\\n'; exit 7 ;;
+  invalid-types) printf '%s\\n' '{"typed_outcome":[],"detector_evidence":{}}' ;;
   unknown-outcome) printf '{"typed_outcome":"surprise","detector_evidence":%s}\\n' "$normal" ;;
   bad-evidence) printf '%s\\n' '{"typed_outcome":"approved","detector_evidence":{"frames":999,"face_frames":999,"pitch_range":0,"yaw_range":0,"pitch_crossings":0,"yaw_crossings":0,"mean_step":0}}' ;;
   success-hang) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CONTAINED_PID"; wait "$child" ;;
@@ -322,6 +387,20 @@ case "${FAKE_ADAPTER_MODE-good}" in
   exit-137) exit 137 ;;
   success-exit-124) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; exit 124 ;;
   success-exit-137) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; exit 137 ;;
+  forge-exit-124|forge-exit-137|forge-hang)
+    python3 "$FAKE_LEGACY_ATTACK" forge-marker "$PPID" "$FAKE_REPLACEMENT_SUPERVISOR"
+    printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"
+    case "$FAKE_ADAPTER_MODE" in
+      forge-exit-124) exit 124 ;;
+      forge-exit-137) exit 137 ;;
+      forge-hang) sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CONTAINED_PID"; wait "$child" ;;
+    esac
+    ;;
+  probe-result-fd)
+    python3 "$FAKE_LEGACY_ATTACK" probe-result-fd "$PPID" "$FAKE_REPLACEMENT_SUPERVISOR"
+    printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"
+    ;;
+  supervisor-kill-victim) printf '%s\\n' "$$" >"$FAKE_ADAPTER_PID"; exec sleep 60 ;;
   escape)
     setsid sh -c 'setsid sh -c '\''sleep 60 & child=$!; printf "%s\\n" "$child" >"$FAKE_ESCAPE_PID"; wait "$child"'\'' &' &
     deadline=50
@@ -330,6 +409,18 @@ case "${FAKE_ADAPTER_MODE-good}" in
     ;;
   oversize) head -c 5000 /dev/zero ;;
   oversize-stderr) head -c 5000 /dev/zero >&2 ;;
+  overflow-hang|overflow-stderr-hang)
+    python3 - "$FAKE_CHILD_PID" "$FAKE_ADAPTER_MODE" <<'PY'
+import os
+import pathlib
+import sys
+import time
+
+pathlib.Path(sys.argv[1]).write_text(f"{os.getpid()}\\n", encoding="utf-8")
+os.write(2 if sys.argv[2] == "overflow-stderr-hang" else 1, b"x" * 4097)
+time.sleep(60)
+PY
+    ;;
   hang-child) sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CHILD_PID"; wait "$child" ;;
 esac
 """)
@@ -345,6 +436,21 @@ case "$operation" in
     unit=$1
     shift
     printf 'containment-run %s\\n' "$unit" >>"$FAKE_LOG"
+    case "$unit:${FAKE_SUPERVISOR_FAULT-}" in
+      *-attempt-*:malformed) printf '%s\\n' '{malformed'; exit 0 ;;
+      *-attempt-*:malformed-types)
+        printf '%s\\n' '{"error":[],"output_overflow":false,"protected":true,"returncode":0,"started":true,"stderr_b64":"","stdout_b64":"","timed_out":false,"version":1}'
+        exit 0
+        ;;
+      *-attempt-*:killed)
+        "$@" & supervisor=$!
+        tries=100
+        while [ ! -s "$FAKE_ADAPTER_PID" ] && [ "$tries" -gt 0 ]; do sleep 0.02; tries=$((tries - 1)); done
+        kill -KILL "$supervisor" 2>/dev/null || true
+        wait "$supervisor"
+        exit $?
+        ;;
+    esac
     exec "$@"
     ;;
   term|kill)
@@ -352,7 +458,7 @@ case "$operation" in
     printf 'containment-%s %s\\n' "$operation" "$unit" >>"$FAKE_LOG"
     signal=TERM
     [ "$operation" = kill ] && signal=KILL
-    for pid_file in "${FAKE_ESCAPE_PID-}" "${FAKE_CHILD_PID-}" "${FAKE_CONTAINED_PID-}"; do
+    for pid_file in "${FAKE_ESCAPE_PID-}" "${FAKE_CHILD_PID-}" "${FAKE_CONTAINED_PID-}" "${FAKE_ADAPTER_PID-}"; do
       if [ -n "$pid_file" ] && [ -s "$pid_file" ]; then
         kill -"$signal" "$(cat "$pid_file")" 2>/dev/null || true
       fi
@@ -361,7 +467,7 @@ case "$operation" in
   verify-empty)
     unit=$1
     printf 'containment-verify %s\\n' "$unit" >>"$FAKE_LOG"
-    for pid_file in "${FAKE_ESCAPE_PID-}" "${FAKE_CHILD_PID-}" "${FAKE_CONTAINED_PID-}"; do
+    for pid_file in "${FAKE_ESCAPE_PID-}" "${FAKE_CHILD_PID-}" "${FAKE_CONTAINED_PID-}" "${FAKE_ADAPTER_PID-}"; do
       if [ -n "$pid_file" ] && [ -s "$pid_file" ]; then
         pid=$(cat "$pid_file")
         tries=100
@@ -407,6 +513,10 @@ esac
             "FAKE_ATTEMPT_ARGS": str(self.attempt_args),
             "FAKE_ADAPTER_PATH": str(self.adapter),
             "FAKE_CONTAINED_PID": str(self.root / "contained.pid"),
+            "FAKE_ADAPTER_PID": str(self.root / "adapter.pid"),
+            "FAKE_LEGACY_ATTACK": str(self.legacy_attack),
+            "FAKE_LEGACY_ATTACK_LOG": str(self.root / "legacy-attack.log"),
+            "FAKE_REPLACEMENT_SUPERVISOR": str(self.malicious_supervisor),
             "TMPDIR": str(self.root),
             "IRLUME_HEAD_GESTURE_ROOT": str(self.repo),
             "IRLUME_HEAD_GESTURE_BINARY": str(self.binary),
@@ -589,11 +699,76 @@ exit 99
                 )
                 self.assertEqual(qualification.returncode, 3)
 
+    def test_forged_legacy_completion_marker_cannot_authorize_an_attempt(self):
+        for mode, expected_outcome in [
+            ("forge-exit-124", "attempt-failed"),
+            ("forge-exit-137", "attempt-failed"),
+            ("forge-hang", "attempt-timeout"),
+        ]:
+            root = self.root / f"forged-legacy-marker-{mode}"
+            root.mkdir(mode=0o700)
+            env = {"FAKE_ADAPTER_MODE": mode}
+            if mode == "forge-hang":
+                env["IRLUME_HEAD_GESTURE_TEST_TIMEOUT_SECONDS"] = "1"
+            result = self.run_runner(evidence_root=root, extra_env=env)
+            with self.subTest(mode=mode):
+                self.assertNotEqual(result.returncode, 0)
+                trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
+                self.assertEqual(trial_record["typed_outcome"], expected_outcome)
+        attacks = (self.root / "legacy-attack.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(attacks), 3)
+        self.assertTrue(all(line.endswith("/attempt.completion") for line in attacks))
+
+    def test_preflight_cannot_replace_supervisor_or_bypass_real_attempt_exit(self):
+        result = self.run_runner(extra_env={
+            "FAKE_REPLACE_SUPERVISOR": "1",
+            "FAKE_ADAPTER_MODE": "success-exit-124",
+        })
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertIn("attempt", calls)
+        self.assertNotIn("malicious-supervisor", calls)
+        attacks = (self.root / "legacy-attack.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(attacks, ["replace-supervisor:none"])
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
+
+    def test_adapter_does_not_inherit_or_reopen_supervisor_result_fd(self):
+        result = self.run_runner(extra_env={"FAKE_ADAPTER_MODE": "probe-result-fd"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        attacks = (self.root / "legacy-attack.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(attacks, ["probe-result-fd:none"])
+
+    def test_missing_or_malformed_supervisor_result_is_failure_not_timeout(self):
+        cases = [
+            ("killed", "supervisor-kill-victim"),
+            ("malformed", "good"),
+            ("malformed-types", "good"),
+        ]
+        for fault, adapter_mode in cases:
+            root = self.root / f"supervisor-{fault}"
+            root.mkdir(mode=0o700)
+            result = self.run_runner(evidence_root=root, extra_env={
+                "FAKE_SUPERVISOR_FAULT": fault,
+                "FAKE_ADAPTER_MODE": adapter_mode,
+            })
+            with self.subTest(fault=fault):
+                self.assertNotEqual(result.returncode, 0)
+                trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
+                self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
+
+    def test_adapter_cannot_self_report_a_supervisor_timeout(self):
+        result = self.run_runner(extra_env={"FAKE_ADAPTER_MODE": "fake-timeout"})
+        self.assertNotEqual(result.returncode, 0)
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
+
     def test_completion_marker_symlink_is_not_followed_or_trusted(self):
         outside = self.root / "outside-marker-target"
         outside.write_text("sentinel\n", encoding="utf-8")
         result = self.run_runner(extra_env={
             "IRLUME_HEAD_GESTURE_TEST_COMPLETION_SYMLINK": str(outside),
+            "FAKE_ADAPTER_MODE": "success-exit-124",
         })
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
@@ -636,7 +811,22 @@ exit 99
         with self.assertRaises(ProcessLookupError):
             os.kill(child, 0)
 
-        for mode in ["oversize", "oversize-stderr", "invalid", "unknown-outcome", "bad-evidence"]:
+        for mode in ["overflow-hang", "overflow-stderr-hang"]:
+            overflow_root = self.root / f"evidence-{mode}"
+            overflow_root.mkdir(mode=0o700)
+            overflow_pid = self.root / f"{mode}.pid"
+            result = self.run_runner(evidence_root=overflow_root, extra_env={
+                "FAKE_ADAPTER_MODE": mode,
+                "FAKE_CHILD_PID": str(overflow_pid),
+                "IRLUME_HEAD_GESTURE_TEST_TIMEOUT_SECONDS": "3",
+            })
+            self.assertNotEqual(result.returncode, 0)
+            trial_record = next(record for record in self.records(overflow_root) if record["record_type"] == "trial")
+            self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(overflow_pid.read_text(encoding="utf-8")), 0)
+
+        for mode in ["oversize", "oversize-stderr", "invalid", "invalid-types", "unknown-outcome", "bad-evidence"]:
             root = self.root / f"evidence-{mode}"
             root.mkdir(mode=0o700)
             result = self.run_runner(evidence_root=root, extra_env={"FAKE_ADAPTER_MODE": mode})

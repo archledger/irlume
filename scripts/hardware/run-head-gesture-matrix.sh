@@ -531,7 +531,7 @@ if data.get("daemon") != "running":
 camera = data.get("camera")
 if not isinstance(camera, dict) or type(camera.get("rgb")) is not bool or type(camera.get("ir")) is not bool:
     raise SystemExit("invalid camera capability")
-print("present" if camera["rgb"] else "absent")
+print("present" if camera["rgb"] and camera["ir"] else "absent")
 PY
 ) || die "daemon/camera status is not ready"
 

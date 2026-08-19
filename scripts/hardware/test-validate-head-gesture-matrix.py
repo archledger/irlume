@@ -273,6 +273,7 @@ printf '%s\\n' status >>"$FAKE_LOG"
 case "${FAKE_STATUS_MODE-good}" in
   good) printf '%s\\n' '{"ok":true,"data":{"daemon":"running","camera":{"rgb":true,"ir":true}}}' ;;
   absent) printf '%s\\n' '{"ok":true,"data":{"daemon":"running","camera":{"rgb":false,"ir":false}}}' ;;
+  rgb-only) printf '%s\\n' '{"ok":true,"data":{"daemon":"running","camera":{"rgb":true,"ir":false}}}' ;;
   starting) printf '%s\\n' '{"ok":true,"data":{"daemon":"starting","camera":{"rgb":true,"ir":true}}}' ;;
   malformed) printf '%s\\n' '{broken' ;;
 esac
@@ -962,24 +963,34 @@ exit 99
             self.assertEqual(list(self.root.glob("irlume-head-gesture.*")), [])
 
     def test_capability_absence_is_published_but_never_qualified(self):
-        result = self.run_runner(stdin="", extra_env={"FAKE_STATUS_MODE": "absent"})
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertNotIn("preflight", self.log.read_text(encoding="utf-8"))
-        self.assertEqual([record["typed_outcome"] for record in self.records()], ["capability-not-present"])
-        schema = subprocess.run(
-            ["python3", str(VALIDATOR), "--schema-only", str(self.evidence_root)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        qualified = subprocess.run(
-            ["python3", str(VALIDATOR), str(self.evidence_root)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(schema.returncode, 0)
-        self.assertEqual(qualified.returncode, 3)
+        for mode in ["absent", "rgb-only"]:
+            root = self.root / f"capability-{mode}"
+            root.mkdir(mode=0o700)
+            self.log.write_text("", encoding="utf-8")
+            result = self.run_runner(
+                stdin="", evidence_root=root, extra_env={"FAKE_STATUS_MODE": mode}
+            )
+            with self.subTest(mode=mode):
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertNotIn("preflight", self.log.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    [record["typed_outcome"] for record in self.records(root)],
+                    ["capability-not-present"],
+                )
+                schema = subprocess.run(
+                    ["python3", str(VALIDATOR), "--schema-only", str(root)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                qualified = subprocess.run(
+                    ["python3", str(VALIDATOR), str(root)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(schema.returncode, 0)
+                self.assertEqual(qualified.returncode, 3)
 
     def test_publication_rejects_unsafe_roots_existing_targets_and_precommit_failure(self):
         unsafe = self.root / "unsafe"

@@ -28,7 +28,7 @@
 //!   [mesh.onnx]   (default models/face_landmark.onnx; section D is skipped
 //!                  if the file is missing)
 
-use irlume_auth::{both_eyes_open, eye_glint, eye_glint_contrast};
+use irlume_auth::{eye_glint, eye_glint_contrast};
 use irlume_liveness::{
     calibrate_open_ear, detect_blink, detect_deliberate_closure, detect_nod, BlinkResult,
     ClosureCalibration, EarSample, PoseSample,
@@ -164,8 +164,10 @@ fn main() {
     };
 
     println!("## A. Five-point consumers (IR frame {W}x{H}, eye disks at (120,120)/(200,120), corner hotspot)\n");
-    println!("| pathology | eye_glint | glint_contrast | both_eyes_open | yaw_asym | pitch_frac | align_to_arcface |");
-    println!("|---|---|---|---|---|---|---|");
+    println!(
+        "| pathology | eye_glint | glint_contrast | yaw_asym | pitch_frac | align_to_arcface |"
+    );
+    println!("|---|---|---|---|---|---|");
     for (name, lm) in pathologies5() {
         let pose = head_pose(&lm);
         let align = match align_to_arcface(&view, &lm) {
@@ -179,13 +181,9 @@ fn main() {
             Err(e) => format!("Err ({e})"),
         };
         println!(
-            "| {name} | {} | {} | {} | {} | {} | {align} |",
+            "| {name} | {} | {} | {} | {} | {align} |",
             fmt(eye_glint(&ir, W, H, &lm)),
             fmt(eye_glint_contrast(&ir, W, H, &lm)),
-            // `None`: these are synthetic pathology frames with no negotiated
-            // format behind them, so there is no ceiling to honour. The probe
-            // measures landmark failure, not clipping (#386).
-            both_eyes_open(&ir, W, H, &lm, None),
             fmt(pose.yaw_asym),
             fmt(pose.pitch_frac),
         );

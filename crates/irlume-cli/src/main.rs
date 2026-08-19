@@ -3442,20 +3442,6 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 );
                 rec.insert("ir_iod_px".into(), json_f32(iod_px(&t.landmarks)));
                 rec.insert(
-                    "ir_eyes_open".into(),
-                    // Same raw frame and ceiling the daemon passes, so a corpus
-                    // recorded here answers the question production answers. A
-                    // railed eye window reads the lens, not the cornea (#386).
-                    irlume_auth::both_eyes_open(
-                        ir_stats.saturation_frame.as_deref().unwrap_or(&irf.data),
-                        irf.width,
-                        irf.height,
-                        &t.landmarks,
-                        ir_stats.white_level,
-                    )
-                    .into(),
-                );
-                rec.insert(
                     "ir_center_edge_ratio".into(),
                     json_f32(ir_center_edge_ratio),
                 );

@@ -3261,16 +3261,8 @@ fn dispatch_scoped(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
-    // Refuses to turn ON, and this is deliberate (#386). The gate cannot admit
-    // the user it exists for: replaying the committed blink corpus through the
-    // shipped `both_eyes_open`, 12 detected frames per state, bare-eyed with
-    // eyes genuinely OPEN reads open 1 time in 12 and with glasses 0 times in
-    // 12, so no eyewear or lighting state in the record leaves it usable.
-    //
-    // Refused rather than warned because there is no configuration that works:
-    // a warning implies a tradeoff the measurement does not offer. Turning it
-    // OFF is always allowed, so an enrollment already carrying the flag is
-    // never trapped.
+    // Eyes-open enforcement is retired (#386). Turning it OFF remains available
+    // so a legacy enrollment carrying the flag is never trapped.
     //
     // Placed HERE, above the invalidation below, rather than in the match: this
     // is a refusal, and the invariant in that comment is that a request about
@@ -3284,9 +3276,8 @@ fn dispatch_scoped(
     // landing inside another session's open/closed separation window.
     if matches!(req, Request::SetRequireEyesOpen { on: true, .. }) {
         return Response::Error(
-            "require-eyes-open cannot be enabled: it refuses the user it exists to admit \
-             (measured 1 of 12 bare-eyed frames with eyes open, 0 of 12 with glasses). \
-             See issue #386; `irlume profiles eyes-open off` still works."
+            "require-eyes-open is retired and cannot be enabled; see issue #386; \
+             `irlume profiles eyes-open off` still works."
                 .into(),
         );
     }
@@ -4224,13 +4215,9 @@ fn dispatch_scoped(
             s.name = new_name.clone();
             Ok(format!("renamed scan to '{new_name}'"))
         }),
-        Request::SetRequireEyesOpen { user, on } => mutate_enrollment(&user, |enr| {
-            enr.require_eyes_open = on;
-            Ok(format!(
-                "require-eyes-open {}",
-                if on { "ENABLED" } else { "disabled" }
-            ))
-        }),
+        Request::SetRequireEyesOpen { user, .. } => {
+            set_require_eyes_open_off(&user, engine.embed_space())
+        }
         Request::CaptureEarMedian { user: _ } => {
             // Fires the camera, so the table root-gates it like the other
             // camera-bearing requests. The socket is world-connectable, so that
@@ -4363,6 +4350,23 @@ fn mutate_enrollment(
             }
         }
         Err(e) => Response::Error(e),
+    }
+}
+
+fn set_require_eyes_open_off(user: &str, embed_space: &str) -> Response {
+    let mut enrollment = match irlume_core::storage::load(user) {
+        Ok(Some(enrollment)) => enrollment,
+        Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
+        Err(error) => return Response::Error(error.to_string()),
+    };
+    enrollment.require_eyes_open = false;
+    match irlume_core::storage::save(&enrollment) {
+        Ok(()) => {
+            let summary = summarize_enrollment(Some(&enrollment), embed_space);
+            publish_enrollment_summary(user, summary);
+            Response::Ok("require-eyes-open disabled".into())
+        }
+        Err(error) => Response::Error(error.to_string()),
     }
 }
 
@@ -8402,10 +8406,8 @@ mod tests {
 
     #[test]
     fn require_eyes_open_is_refused_at_the_dispatch_choke_point() {
-        // #386. The gate refuses the user it exists to admit: replaying the
-        // committed blink corpus through the shipped `both_eyes_open` reads
-        // eyes-open 1 time in 12 bare-eyed and 0 times in 12 with glasses, so
-        // no eyewear or lighting state in the record leaves it usable.
+        // #386 retired the gate because it cannot reliably admit the user it
+        // exists to admit under ordinary eyewear and lighting changes.
         //
         // Asserted at DISPATCH because that is the one choke point: `irlume
         // profiles eyes-open on` and the TUI toggle both send this request, so
@@ -8517,7 +8519,7 @@ mod tests {
     }
 
     #[test]
-    fn refusing_require_eyes_open_writes_nothing_and_off_still_works() {
+    fn require_eyes_open_off_is_idempotent_and_on_is_retired() {
         // The storage half of the refusal, which does need a TPM-free host
         // because the off arm ends in storage::save. Same convention as the
         // other save-touching tests here.
@@ -8529,37 +8531,63 @@ mod tests {
         let mut e = engine();
         let sb = sandbox("eyes-open-refusal");
         let _ = &sb;
-        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        let mut enrollment = enrollment_with("carol", &["Face Scan 1"]);
+        enrollment.require_eyes_open = true;
+        write_enrollment(&sb.dir, &enrollment);
         let root = peer(0);
 
-        let _ = dispatch(
+        publish_enrollment_summary(
+            "carol",
+            summarize_enrollment(Some(&enrollment), e.embed_space()),
+        );
+
+        match dispatch(
             Request::SetRequireEyesOpen {
                 user: "carol".into(),
                 on: true,
             },
             &root,
             &mut e,
-        );
-        // A refused enable that persisted anyway would be the worst of both:
-        // told no, locked out regardless.
+        ) {
+            Response::Error(msg) => assert!(msg.contains("retired"), "{msg}"),
+            other => panic!("enabling the retired policy must fail, got {other:?}"),
+        }
         let enr = irlume_core::storage::load("carol")
             .expect("load")
             .expect("the enrollment exists");
         assert!(
-            !enr.require_eyes_open,
+            enr.require_eyes_open,
             "a refused enable must leave the stored flag alone"
         );
+        assert!(
+            cached_enrollment_summary("carol")
+                .expect("refused ON must preserve the summary")
+                .require_eyes_open,
+            "refused ON must not invalidate or mutate the summary"
+        );
 
-        match dispatch(
-            Request::SetRequireEyesOpen {
-                user: "carol".into(),
-                on: false,
-            },
-            &root,
-            &mut e,
-        ) {
-            Response::Ok(msg) => assert_eq!(msg, "require-eyes-open disabled"),
-            other => panic!("disabling must still work, got {other:?}"),
+        for attempt in 1..=2 {
+            match dispatch(
+                Request::SetRequireEyesOpen {
+                    user: "carol".into(),
+                    on: false,
+                },
+                &root,
+                &mut e,
+            ) {
+                Response::Ok(msg) => assert_eq!(msg, "require-eyes-open disabled"),
+                other => panic!("OFF attempt {attempt} must succeed, got {other:?}"),
+            }
+            let enr = irlume_core::storage::load("carol")
+                .expect("load")
+                .expect("the enrollment exists");
+            assert!(!enr.require_eyes_open, "OFF attempt {attempt} must persist");
+            assert!(
+                !cached_enrollment_summary("carol")
+                    .expect("OFF must publish the saved summary")
+                    .require_eyes_open,
+                "OFF attempt {attempt} must publish the cleared flag"
+            );
         }
     }
 

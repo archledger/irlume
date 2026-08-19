@@ -10606,14 +10606,14 @@ mod engine_tests {
     }
 
     fn wide_shake_poses(len: usize) -> Vec<irlume_liveness::PoseSample> {
-        let third = len / 3;
+        let fifth = len / 5;
         (0..len)
             .map(|idx| irlume_liveness::PoseSample {
                 idx,
                 pitch_frac: Some(0.5),
-                yaw_signed: Some(if idx < third {
+                yaw_signed: Some(if idx < fifth || idx >= 4 * fifth {
                     -0.9
-                } else if idx < 2 * third {
+                } else if idx < 2 * fifth || idx >= 3 * fifth {
                     0.0
                 } else {
                     0.9
@@ -10624,17 +10624,12 @@ mod engine_tests {
     }
 
     fn trailing_shake_poses(tail: usize) -> Vec<irlume_liveness::PoseSample> {
+        let trailing = [-0.9, 0.0, 0.9, 0.0, -0.9];
         (0..18 + tail)
             .map(|idx| irlume_liveness::PoseSample {
                 idx,
                 pitch_frac: Some(0.5),
-                yaw_signed: Some(if idx >= 18 {
-                    1.1
-                } else if idx.is_multiple_of(2) {
-                    -0.44
-                } else {
-                    0.0
-                }),
+                yaw_signed: Some(if idx < 18 { 0.0 } else { trailing[idx - 18] }),
                 bri: 60.0,
             })
             .collect()
@@ -10657,20 +10652,18 @@ mod engine_tests {
     }
 
     #[test]
-    fn completed_head_take_classifies_every_trailing_boundary() {
-        for tail in 1..=5 {
-            let poses = trailing_shake_poses(tail);
-            assert_eq!(
-                head_consent_from_poses(&poses[..18]),
-                HeadConsentVerdict::NoGesture,
-                "the last in-loop check must not already contain the shake (tail={tail})"
-            );
-            assert_eq!(
-                resolve_head_consent(None, || head_consent_from_poses(&poses)),
-                HeadConsentVerdict::Decline,
-                "the trailing {tail} frame(s) must complete a typed decline"
-            );
-        }
+    fn completed_head_take_catches_a_repeated_trailing_shake() {
+        let poses = trailing_shake_poses(5);
+        assert_eq!(
+            head_consent_from_poses(&poses[..18]),
+            HeadConsentVerdict::NoGesture,
+            "the last in-loop check must not already contain the shake"
+        );
+        assert_eq!(
+            resolve_head_consent(None, || head_consent_from_poses(&poses)),
+            HeadConsentVerdict::Decline,
+            "the trailing frames must complete a repeated typed decline"
+        );
     }
 
     #[test]

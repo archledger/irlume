@@ -150,6 +150,17 @@ impl Harness {
         stdin: &str,
         authtok_env: Option<&str>,
     ) -> (bool, String) {
+        self.run_with_consent_env(service, ops, stdin, authtok_env, None)
+    }
+
+    fn run_with_consent_env(
+        &self,
+        service: &str,
+        ops: &[&str],
+        stdin: &str,
+        authtok_env: Option<&str>,
+        consent_env: Option<&str>,
+    ) -> (bool, String) {
         let mut cmd = Command::new("pamtester");
         cmd.arg(service).arg("tester").args(ops);
         cmd.env("LD_PRELOAD", &self.wrapper)
@@ -158,6 +169,7 @@ impl Harness {
             .env("IRLUME_SOCKET", &self.socket)
             .env("IRLUME_CONFIG_DIR", &self.config_dir)
             .env_remove("IRLUME_CREDENTIAL_RELEASE_CHALLENGE")
+            .env_remove("IRLUME_CONSENT_GESTURE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -165,6 +177,9 @@ impl Harness {
             Some(tok) => cmd.env("PAM_AUTHTOK", tok),
             None => cmd.env_remove("PAM_AUTHTOK"),
         };
+        if let Some(value) = consent_env {
+            cmd.env("IRLUME_CONSENT_GESTURE", value);
+        }
         let mut child = cmd.spawn().expect("spawn pamtester");
         child.stdin.take().unwrap().write_all(stdin.as_bytes()).ok();
         let out = child.wait_with_output().expect("wait for pamtester");
@@ -483,18 +498,18 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
     for (settings, blocker) in [
         (
             "credential_release_challenge=1\nconsent_gesture=closure\n",
-            "eye closure is retired",
+            "eye closure is retired; remove consent_gesture from settings.conf or set it to nod",
         ),
         (
             "credential_release_challenge=1\nconsent_gesture=banana\n",
-            "consent_gesture is invalid",
+            "consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod",
         ),
     ] {
         h.write_settings(Some(settings));
         let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
         assert!(ok, "a blocked release must keep password fallback: {out}");
         assert!(
-            out.contains(blocker) && (out.contains("remove") || out.contains("set it to nod")),
+            out.contains(blocker),
             "a blocked gate must name its migration: {out}"
         );
         assert!(
@@ -570,8 +585,9 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
     h.write_settings(Some("consent_gesture=banana\n"));
     let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
     assert!(
-        out.contains("consent_gesture is invalid")
-            && (out.contains("remove it") || out.contains("set it to nod")),
+        out.contains(
+            "consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod"
+        ),
         "a misconfigured mode must name the bad setting: {out}"
     );
     assert!(
@@ -583,8 +599,9 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
     h.write_settings(Some("consent_gesture=closure\n"));
     let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
     assert!(
-        out.contains("eye closure is retired")
-            && (out.contains("remove consent_gesture") || out.contains("set it to nod")),
+        out.contains(
+            "eye closure is retired; remove consent_gesture from settings.conf or set it to nod"
+        ),
         "closure mode must name the migration action: {out}"
     );
     assert!(
@@ -601,6 +618,48 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
         !out.contains(APPROVE) && !out.contains(DECLINE),
         "a non-polkit service must show no gesture instruction: {out}"
     );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_polkit_migration_remedy_tracks_the_environment_override() {
+    let Some(h) = Harness::try_new("polkit-consent-env") else {
+        return;
+    };
+    serve(&h.socket, |_| Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: "face not granted".into(),
+        declined_by_gesture: false,
+        refused_by_policy: false,
+    });
+    h.write_service("polkit-1", &[h.auth_line("required", "")]);
+    h.write_settings(Some("consent_gesture=nod\n"));
+
+    for (value, expected) in [
+        (
+            "closure",
+            "cannot approve: eye closure is retired; unset IRLUME_CONSENT_GESTURE or set it to nod",
+        ),
+        (
+            "banana",
+            "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or set it to nod",
+        ),
+    ] {
+        let (_, out) = h.run_with_consent_env(
+            "polkit-1",
+            &["authenticate"],
+            "",
+            None,
+            Some(value),
+        );
+        assert!(out.contains(expected), "{value}: {out}");
+        assert!(!out.contains("from settings.conf"), "{out}");
+        if value == "banana" {
+            assert!(!out.contains(value), "arbitrary value was echoed: {out}");
+        }
+    }
 }
 
 /// A head-shake on a polkit dialog ABORTS the PAM stack, so the password module

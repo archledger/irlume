@@ -3089,8 +3089,8 @@ fn report_credential_release(
     }
     if matches!(
         policy,
-        irlume_common::config::HeadConsentPolicy::LegacyClosure
-            | irlume_common::config::HeadConsentPolicy::Misconfigured
+        irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+            | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
     ) {
         dout!(
             report,
@@ -4109,8 +4109,8 @@ fn doctor_run(
     // fix.
     if matches!(
         head_policy,
-        irlume_common::config::HeadConsentPolicy::LegacyClosure
-            | irlume_common::config::HeadConsentPolicy::Misconfigured
+        irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+            | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
     ) {
         dout!(
             report,
@@ -4157,8 +4157,8 @@ fn doctor_run(
         Some(true)
             if matches!(
                 head_policy,
-                irlume_common::config::HeadConsentPolicy::LegacyClosure
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured
+                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
             ) =>
         {
             dout!(

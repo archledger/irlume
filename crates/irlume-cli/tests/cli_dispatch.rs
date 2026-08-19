@@ -83,6 +83,7 @@ impl Sandbox {
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
             .env_remove("IRLUME_DEV")
+            .env_remove("IRLUME_CONSENT_GESTURE")
             .env_remove("ORT_DYLIB_PATH")
             .env_remove("IRLUME_MODEL")
             .env_remove("IRLUME_DET_MODEL")
@@ -406,6 +407,57 @@ fn credential_release_challenge_reports_defaults_and_toggles() {
     assert_eq!(code, 0);
     assert!(out.contains("off (the default)"), "{out}");
     assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
+}
+
+#[test]
+fn credential_release_status_names_the_winning_gesture_migration_source() {
+    let sb = Sandbox::new("crc-source");
+    let cfg = sb.path("cfg/settings.conf");
+    let cmd = "credential-release-challenge";
+
+    for (value, expected) in [
+        (
+            "closure",
+            "cannot approve: eye closure is retired; remove consent_gesture from settings.conf or set it to nod",
+        ),
+        (
+            "banana",
+            "cannot approve: consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod",
+        ),
+    ] {
+        std::fs::write(&cfg, format!("consent_gesture={value}\n")).unwrap();
+        let (code, out, err) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains(expected), "{value}: {out}");
+        assert!(!out.contains("unset IRLUME_CONSENT_GESTURE"), "{out}");
+        if value == "banana" {
+            assert!(!err.contains(value), "arbitrary value was echoed: {err}");
+        }
+    }
+
+    std::fs::write(&cfg, "consent_gesture=nod\n").unwrap();
+    for (value, expected) in [
+        (
+            "closure",
+            "cannot approve: eye closure is retired; unset IRLUME_CONSENT_GESTURE or set it to nod",
+        ),
+        (
+            "banana",
+            "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or set it to nod",
+        ),
+    ] {
+        let (code, out, err) = run(
+            sb.cmd(&[cmd, "status"])
+                .env("IRLUME_CONSENT_GESTURE", value),
+            cmd,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains(expected), "{value}: {out}");
+        assert!(!out.contains("from settings.conf"), "{out}");
+        if value == "banana" {
+            assert!(!err.contains(value), "arbitrary value was echoed: {err}");
+        }
+    }
 }
 
 // enrollment-query error is a distinct arm from "none"/populated; and when the

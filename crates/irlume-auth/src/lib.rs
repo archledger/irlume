@@ -639,7 +639,7 @@ fn blocking_head_consent_policy(
     }
     match irlume_common::config::head_consent_policy() {
         HeadConsentPolicy::Ready => None,
-        policy @ (HeadConsentPolicy::LegacyClosure | HeadConsentPolicy::Misconfigured) => {
+        policy @ (HeadConsentPolicy::LegacyClosure(_) | HeadConsentPolicy::Misconfigured(_)) => {
             Some(policy)
         }
     }
@@ -4262,8 +4262,8 @@ impl Engine {
     /// [`AuthenticationPurpose::AppConsent`] (polkit), by
     /// elevation services under [`AuthenticationPurpose::Verify`], and by
     /// [`AuthenticationPurpose::CredentialRelease`] when the user has opted in
-    /// (it defaults off). A gesture is intent, not just liveness, and it fails
-    /// closed.
+    /// (it defaults off). A gesture records intent, not liveness; automatic PAD
+    /// remains separate.
     ///
     /// Every failure downgrades to a non-grant with an Uncertain-style reason, so
     /// PAM cascades to the typed password; nothing here can lock a user out. When
@@ -6923,8 +6923,9 @@ pub fn center_edge_ratio(grey: &[u8], w: u32, h: u32, bbox: &[f32; 4]) -> f32 {
 
 /// Half-width (pixels) of the square search window around each eye landmark
 /// for the corneal glint peak. A fixed radius, not IOD-scaled: the glint is a
-/// point highlight near the landmark at typical login distances, and the gate
-/// consuming this cue (`GLINT_MIN`) was calibrated against it.
+/// point highlight near the landmark at typical login distances. `GLINT_MIN`
+/// is a reporting/reference threshold for supporting evidence, not an
+/// independent gate.
 const GLINT_SEARCH_RADIUS_PX: i32 = 8;
 
 /// Peak grey level (0-255) near the eye landmarks of an IR frame: the
@@ -6933,8 +6934,9 @@ const GLINT_SEARCH_RADIUS_PX: i32 = 8;
 pub fn eye_glint(grey: &[u8], w: u32, h: u32, landmarks: &Landmarks5) -> f32 {
     // The in-bounds test below is against the logical w/h, so a frame buffer
     // shorter than w*h would still index past the slice. Same guard as
-    // mean_in_bbox: a truncated IR frame degrades to 0.0 (no glint cue, a safe
-    // fail-closed for liveness) instead of panicking the root daemon.
+    // mean_in_bbox: a truncated IR frame degrades to 0.0 instead of panicking
+    // the root daemon. This removes supporting glint evidence; it does not fail
+    // authentication on its own.
     if grey.len() < (w as usize).saturating_mul(h as usize) {
         return 0.0;
     }
@@ -9764,7 +9766,16 @@ mod engine_tests {
         });
         write_enrollment(&dir, &enrollment);
 
-        for configured in ["closure", "clousure"] {
+        for (configured, expected) in [
+            (
+                "closure",
+                "cannot approve: eye closure is retired; remove consent_gesture from settings.conf or set it to nod",
+            ),
+            (
+                "clousure",
+                "cannot approve: consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod",
+            ),
+        ] {
             std::fs::write(
                 dir.join("settings.conf"),
                 format!("consent_gesture={configured}\n"),
@@ -9776,13 +9787,31 @@ mod engine_tests {
                 .expect("retired policy must deny before the missing camera is opened");
             assert!(!out.granted, "{configured} granted: {}", out.reason);
             assert_eq!(out.kind, OutcomeKind::OtherDeny, "{configured}");
-            assert!(
-                out.reason.contains("remove") || out.reason.contains("set it to nod"),
-                "{configured}: {}",
-                out.reason
-            );
+            assert_eq!(out.reason, expected, "{configured}");
         }
 
+        std::fs::write(dir.join("settings.conf"), "consent_gesture=nod\n").unwrap();
+        for (configured, expected) in [
+            (
+                "closure",
+                "cannot approve: eye closure is retired; unset IRLUME_CONSENT_GESTURE or set it to nod",
+            ),
+            (
+                "clousure",
+                "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or set it to nod",
+            ),
+        ] {
+            std::env::set_var("IRLUME_CONSENT_GESTURE", configured);
+            let out = s
+                .engine
+                .authenticate("irlume-test-legacy-gesture", Some("sudo"))
+                .expect("environment policy must deny before the missing camera is opened");
+            assert!(!out.granted, "{configured} granted: {}", out.reason);
+            assert_eq!(out.kind, OutcomeKind::OtherDeny, "{configured}");
+            assert_eq!(out.reason, expected, "{configured}");
+        }
+
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
         std::env::remove_var("IRLUME_CONFIG_DIR");
         teardown_sandbox(&dir);
     }

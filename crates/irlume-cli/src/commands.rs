@@ -1583,8 +1583,8 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
             let policy = irlume_common::config::head_consent_policy();
             if matches!(
                 policy,
-                irlume_common::config::HeadConsentPolicy::LegacyClosure
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured
+                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
             ) {
                 println!(
                     "{TAG} WARNING: {}. Required gates fall back to the password.",

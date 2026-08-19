@@ -50,7 +50,9 @@ This retirement is fail closed for one minor release:
   consent;
 - legacy `consent_gesture=closure`, `IRLUME_CONSENT_GESTURE=closure`, malformed
   values, and stored `require_eyes_open=true` block the face path with migration
-  instructions rather than being reinterpreted;
+  instructions rather than being reinterpreted. If the environment variable
+  won, unset `IRLUME_CONSENT_GESTURE` or set it to `nod`; if the settings file
+  won, remove `consent_gesture` from `settings.conf` or set it to `nod`;
 - `SetRequireEyesOpen`, `CaptureEarMedian`, and `SetClosureCalibration` remain
   wire-compatible tombstones. Only `SetRequireEyesOpen { on: false }` may change
   state, to clear the legacy blocker; calibration tombstones do not capture or

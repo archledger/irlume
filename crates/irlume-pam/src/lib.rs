@@ -296,8 +296,8 @@ impl PamServiceModule for IrlumePam {
                         "irlume: keep nodding your head to approve; shake your head to decline"
                             .to_string()
                     }
-                    irlume_common::config::HeadConsentPolicy::LegacyClosure
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured => {
+                    irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_) => {
                         format!("irlume: {}", policy.instruction("approve"))
                     }
                 };
@@ -329,8 +329,8 @@ impl PamServiceModule for IrlumePam {
                         "{}; shake your head to decline",
                         policy.instruction("unlock your keyring")
                     ),
-                    irlume_common::config::HeadConsentPolicy::LegacyClosure
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured => {
+                    irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_) => {
                         policy.instruction("unlock your keyring")
                     }
                 };

@@ -483,14 +483,11 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
     assert!(!out.contains(HINT), "verify must stay silent: {out}");
 }
 
-/// The polkit dialog names BOTH halves of the consent gesture: how to approve,
-/// AND that a head shake declines. A user told only to nod does not know a shake
-/// is a deliberate "no"; the decline is the half this change added. The
-/// shake-cancel is mode-independent in the daemon, so the decline clause is
-/// truthful in every real mode, and it is suppressed only for `Misconfigured`,
-/// whose instruction is already a full diagnostic sentence naming the bad
-/// setting. The service is named `polkit-1` on purpose: pam_irlume classifies
-/// the service NAME, and only AppConsent (polkit-1) is a consent dialog.
+/// A ready polkit dialog names BOTH supported head gestures: nod approves and
+/// shake declines. Retired closure and malformed settings print only the
+/// actionable blocker; the daemon then fails closed. The service is named
+/// `polkit-1` on purpose: pam_irlume classifies the service NAME, and only
+/// AppConsent (polkit-1) is a consent dialog.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_polkit_prompt_names_approve_and_decline() {
@@ -513,24 +510,28 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
     // A plain verify (no `unseal`) on the polkit service.
     h.write_service("polkit-1", &[h.auth_line("required", "")]);
 
-    // Default settings (Either mode): the prompt names the nod AND the shake.
-    h.write_settings(None);
-    let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
-    assert!(
-        out.contains(APPROVE),
-        "the polkit prompt must say how to approve: {out}"
-    );
-    assert!(
-        out.contains(DECLINE),
-        "the polkit prompt must name the shake decline: {out}"
-    );
+    // Default and explicit legacy `nod` settings are both ready: the prompt
+    // names the nod AND the shake.
+    for settings in [None, Some("consent_gesture=nod\n")] {
+        h.write_settings(settings);
+        let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
+        assert!(
+            out.contains(APPROVE),
+            "the polkit prompt must say how to approve: {out}"
+        );
+        assert!(
+            out.contains(DECLINE),
+            "the polkit prompt must name the shake decline: {out}"
+        );
+    }
 
     // Misconfigured mode: the instruction is a diagnostic sentence naming the bad
     // setting; the decline clause is suppressed so it does not bury the fix.
     h.write_settings(Some("consent_gesture=banana\n"));
     let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
     assert!(
-        out.contains("consent_gesture is set to a value irlume does not recognise"),
+        out.contains("consent_gesture is invalid")
+            && (out.contains("remove it") || out.contains("set it to nod")),
         "a misconfigured mode must name the bad setting: {out}"
     );
     assert!(
@@ -538,19 +539,17 @@ fn pamwrap_polkit_prompt_names_approve_and_decline() {
         "a misconfigured diagnostic must not carry a decline clause: {out}"
     );
 
-    // Closure mode: a head-shake is never detected (the consent watch reads a Shake
-    // only in nod-capable modes), so the decline clause is suppressed rather than
-    // promising a gesture that does nothing. The approve instruction is the closure
-    // one. This is the case the review flagged as a false instruction.
+    // Retired closure is blocked: print only the migration action and no gesture.
     h.write_settings(Some("consent_gesture=closure\n"));
     let (_, out) = h.run("polkit-1", &["authenticate"], "", None);
     assert!(
-        out.contains("close your eyes"),
-        "closure mode must name the closure approve gesture: {out}"
+        out.contains("eye closure is retired")
+            && (out.contains("remove consent_gesture") || out.contains("set it to nod")),
+        "closure mode must name the migration action: {out}"
     );
     assert!(
-        !out.contains(DECLINE),
-        "closure mode must NOT promise a shake decline it cannot detect: {out}"
+        !out.contains(APPROVE) && !out.contains(DECLINE) && !out.contains("close your eyes"),
+        "closure mode must print only its blocker: {out}"
     );
 
     // Scoping: a plain elevation service (sudo) is not a consent dialog, so it

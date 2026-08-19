@@ -711,14 +711,16 @@ pub fn status(args: &[String]) -> ExitCode {
         }) if !profiles.is_empty() => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
             println!(
-                "  enrollment    : {} profile(s), {scans} scan(s) {OK}{}",
+                "  enrollment    : {} profile(s), {scans} scan(s) {}",
                 profiles.len(),
-                if require_eyes_open {
-                    " · eyes-open required"
-                } else {
-                    ""
-                }
+                if require_eyes_open { WARN } else { OK }
             );
+            if require_eyes_open {
+                println!(
+                    "                  legacy policy blocks authentication; run: sudo irlume profiles eyes-open off --user {}",
+                    crate::shell_single_quote(&user)
+                );
+            }
             for p in &profiles {
                 println!("                  - {} ({} scan(s))", p.name, p.scans.len());
             }
@@ -1501,7 +1503,7 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 }
 
 /// `irlume credential-release-challenge [<service>] <on|off|status>`: the
-/// per-service consent-gesture toggle, plus the global credential-release gate on
+/// per-service head-gesture toggle, plus the global credential-release gate on
 /// releasing the sealed login-keyring password (`credential_release_challenge` in
 /// settings.conf). The daemon reads all of it live per request, so no restart is
 /// needed.
@@ -1514,7 +1516,7 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
 /// fallback). Turning any gesture on adds a deliberate step; disabling it for a
 /// high-privilege escalation service (sudo, su, doas, polkit) asks for
 /// confirmation first.
-/// One service's effective consent-gesture line, shared by the all-services
+/// One service's effective head-gesture line, shared by the all-services
 /// `status` and the per-service `<svc> status` so the two can never disagree.
 fn print_service_gesture_status(tag: &str, svc: &str) {
     let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
@@ -1577,18 +1579,15 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                     "{TAG} global credential_release_challenge: root-only setting, re-run with sudo"
                 ),
             }
-            // A REQUIRED gesture that no gesture can satisfy is not a healthy
-            // state, and every line above reads as one. The mode decides WHICH
-            // gesture is accepted, so an unreadable `consent_gesture` leaves the
-            // requirement standing with nothing able to meet it, and every prompt
-            // falls to the password.
-            if irlume_common::config::consent_gesture_mode()
-                == irlume_common::config::ConsentGesture::Misconfigured
-            {
+            let policy = irlume_common::config::head_consent_policy();
+            if matches!(
+                policy,
+                irlume_common::config::HeadConsentPolicy::LegacyClosure
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured
+            ) {
                 println!(
-                    "{TAG} WARNING: `consent_gesture` is set to a value irlume cannot read \
-                     (expected nod or closure), so NO gesture is accepted and every \
-                     REQUIRED line above falls back to the password until it is fixed."
+                    "{TAG} WARNING: {}. Required gates fall back to the password.",
+                    policy.instruction("approve")
                 );
             }
             ExitCode::SUCCESS
@@ -1663,9 +1662,9 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                     match irlume_common::config::write_kv("settings.conf", &key, val) {
                         Ok(()) => {
                             if v == "on" {
-                                println!("{TAG} {svc}: consent gesture REQUIRED {OK}");
+                                println!("{TAG} {svc}: head gesture REQUIRED {OK}");
                             } else {
-                                eprintln!("{TAG} {svc}: consent gesture off {WARN}");
+                                eprintln!("{TAG} {svc}: head gesture off {WARN}");
                             }
                             ExitCode::SUCCESS
                         }
@@ -1706,10 +1705,10 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
                 Ok(()) => {
                     if v == "on" {
                         println!(
-                            "{TAG} consent gesture REQUIRED {OK}: releasing your keyring \
+                            "{TAG} head gesture REQUIRED {OK}: releasing your keyring \
                              password now needs {} after the face match. Takes effect on the \
                              next face auth.",
-                            irlume_common::config::consent_gesture_mode().instruction("approve")
+                            irlume_common::config::head_consent_policy().instruction("approve")
                         );
                     } else {
                         println!(
@@ -1734,11 +1733,11 @@ pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitC
     }
 }
 
-/// Confirmation for disabling the consent gesture on a high-privilege service.
+/// Confirmation for disabling the head gesture on a high-privilege service.
 fn confirm_high_privilege_disable(service: &str) -> bool {
     use std::io::Write as _;
     println!(
-        "WARNING: Disabling the consent gesture for '{service}' means a face match alone\n\
+        "WARNING: Disabling the head gesture for '{service}' means a face match alone\n\
          approves this service. If someone holds a print of your face to the camera,\n\
          they can use '{service}' without your knowledge."
     );
@@ -2098,9 +2097,7 @@ fn yes_no(q: &str, default_yes: bool) -> bool {
     // by `setup_walks_every_step_noninteractively`: `setup` is the SCRIPTED
     // onboarding path, so a piped run is expected to complete rather than stall
     // on a prompt nobody can answer. Commands where the default would be
-    // destructive refuse instead: `calibrate-closure` will not overwrite an
-    // existing calibration without a terminal, and `models enable` refuses
-    // outright.
+    // destructive refuse instead: `models enable` refuses outright.
     if !std::io::stdin().is_terminal() {
         return default_yes;
     }
@@ -2142,17 +2139,9 @@ SETUP & STATUS
 ENROLLMENT & AUTH
   enroll [--name N] [--scans K] [--reset]   capture a face profile
   profiles [list|add-scan|rename|delete|forget-model|eyes-open off]   manage profiles
-                        (eyes-open can only be turned OFF: the gate refuses the
-                        users it exists to admit, see issue #386)
+                        (one-release migration only: clears the retired gate;
+                        it cannot be turned on, see issue #386)
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
-  calibrate-closure [--rounds N] [--force]   teach the eye-closure gesture for app
-                        prompts; captures N rounds (default 3) and stores the median
-                        (sudo; the head nod is the default and needs no calibration)
-  calibrate-closure --measure-only [--rounds N] [--pose LABEL]
-                        print labelled EAR readings and their median WITHOUT
-                        replacing the stored calibration (sudo; for comparing
-                        states such as glasses on/off before re-calibrating)
-
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet
                         (forget takes --force to erase without re-keying back)
@@ -2192,8 +2181,8 @@ SYSTEM INTEGRATION
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   credential-release-challenge [<service>] <on|off|status>
-                        the consent gesture: keep nodding to approve, shake your
-                        head to decline. Named with a service (sudo, su, doas,
+                        the head gesture: keep nodding to approve;
+                        shake your head to decline. Named with a service (sudo, su, doas,
                         polkit-1) it sets that service's gesture; sudo-style
                         elevation and polkit require one by default. Bare, it
                         sets the gate on releasing your keyring password, which

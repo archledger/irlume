@@ -270,17 +270,14 @@ impl PamServiceModule for IrlumePam {
                 }
             }
 
-            // On a polkit prompt the daemon requires a deliberate consent gesture,
+            // On a polkit prompt the daemon requires a deliberate head gesture,
             // which is not discoverable from the dialog, so tell the user what to do.
             // Best-effort text info (the KDE/GNOME agent shows it inline); shown
             // once, before the capture, only for the polkit service so sudo / lock
             // screen are unaffected.
             //
-            // The text comes from the same `consent_gesture_mode` parse the engine
-            // gates on, exactly as the credential-release probe below does. It used
-            // to be a hardcoded string naming both gestures, which told a
-            // `closure`-only user to nod at a gate that would not accept a nod: the
-            // failure `ConsentGesture` was introduced to prevent.
+            // The text comes from the same head-consent policy the engine gates on,
+            // exactly as the credential-release probe below does.
             // From the shared table, so this cannot drift from the class the
             // daemon enforces or the window the grace loop uses (#362). Out of
             // step, this produces the worst version of the bug: a mandatory
@@ -293,31 +290,15 @@ impl PamServiceModule for IrlumePam {
                 .and_then(|s| irlume_common::pam_service::classify(&s))
                 .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
             if is_polkit && !unseal {
-                let mode = irlume_common::config::consent_gesture_mode();
-                let how = mode.instruction("approve");
-                // Name how to approve, and, ONLY in the modes where a shake is
-                // actually detected, that a head shake declines and closes the
-                // window. The shake-cancel is NOT mode-independent: the daemon's
-                // consent watch reads a Shake only inside `if allow_nod`
-                // (irlume-auth consent_watch), and `gestures_permitted_by` grants
-                // `allow_nod` to Nod and Either only. In Closure mode a shake is
-                // never seen, so the clause is suppressed rather than promising a
-                // gesture that does nothing. Misconfigured already returns a full
-                // diagnostic sentence, so it gets no clause either.
-                let msg = match mode {
-                    irlume_common::config::ConsentGesture::Nod
-                    | irlume_common::config::ConsentGesture::Either => {
-                        // "decline", NOT "closes the window". A shake ends THIS
-                        // attempt; polkit-kde then decides whether to re-prompt, and
-                        // measured on Plasma 6 (2026-08-11) it closes only after its
-                        // own retry count, about three failed attempts. Promising an
-                        // immediate close would be the same false instruction the
-                        // closure-mode clause was corrected for.
-                        format!("irlume: {how}; shake your head to decline")
+                let policy = irlume_common::config::head_consent_policy();
+                let msg = match policy {
+                    irlume_common::config::HeadConsentPolicy::Ready => {
+                        "irlume: keep nodding your head to approve; shake your head to decline"
+                            .to_string()
                     }
-                    irlume_common::config::ConsentGesture::Closure
-                    | irlume_common::config::ConsentGesture::Misconfigured => {
-                        format!("irlume: {how}")
+                    irlume_common::config::HeadConsentPolicy::LegacyClosure
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured => {
+                        format!("irlume: {}", policy.instruction("approve"))
                     }
                 };
                 let _ = pamh.conv(Some(&msg), pamsm::PamMsgStyle::TEXT_INFO);
@@ -331,10 +312,9 @@ impl PamServiceModule for IrlumePam {
             // a parallel biometric device where an unsolicited message competes with
             // the password field.
             //
-            // The instruction names the gesture the daemon will actually accept,
-            // from the same `consent_gesture` parse the engine gates on: telling a
-            // `closure`-only user to nod would cost them the whole watch window and
-            // then the password.
+            // The instruction comes from the same head-consent policy the engine
+            // gates on, so retired or malformed configuration prints its migration
+            // blocker instead of promising a gesture the daemon will refuse.
             //
             // Reading a root-only setting here is best-effort by design. Greeter and
             // lock stacks run as root, so the read normally succeeds; a non-root PAM
@@ -343,8 +323,8 @@ impl PamServiceModule for IrlumePam {
             // credential either way, since the daemon refuses a non-root
             // UnsealPassword.
             if unseal && !wait && irlume_common::config::credential_release_gesture_required() {
-                let how = irlume_common::config::consent_gesture_mode()
-                    .instruction("unlock your keyring");
+                let how =
+                    irlume_common::config::head_consent_policy().instruction("unlock your keyring");
                 let _ = pamh.conv(
                     Some(&format!("irlume: {how}")),
                     pamsm::PamMsgStyle::TEXT_INFO,

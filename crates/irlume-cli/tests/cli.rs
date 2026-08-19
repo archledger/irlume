@@ -216,6 +216,32 @@ fn help_lists_every_public_command_and_hides_dev_tools() {
 }
 
 #[test]
+fn help_exposes_no_eye_challenge_or_calibration() {
+    let sandbox = Sandbox::new("head-only-help");
+    let (code, help, stderr) = run(&mut sandbox.cmd(&["--help"]));
+    assert_eq!(code, 0, "{stderr}");
+    for retired in ["calibrate-closure", "eyes-open on", "eye-closure gesture"] {
+        assert!(
+            !help.contains(retired),
+            "retired surface remains: {retired}"
+        );
+    }
+    assert!(help.contains("keep nodding to approve"));
+    assert!(help.contains("shake your head to decline"));
+}
+
+#[test]
+fn retired_closure_calibration_is_not_dispatched() {
+    let sandbox = Sandbox::new("retired-calibration");
+    let (code, _, stderr) = run(&mut sandbox.cmd(&["calibrate-closure"]));
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("unknown command 'calibrate-closure'"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn unknown_command_errors_with_exit_2() {
     let sb = Sandbox::new("unknown");
     let (code, _, err) = run(&mut sb.cmd(&["frobnicate"]));
@@ -497,7 +523,7 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
             "--name",
             "N",
         ],
-        &["profiles", "eyes-open", "on"],
+        &["profiles", "eyes-open", "off"],
         &["profiles", "forget-model", "shipped"],
     ];
     for argv in cases {
@@ -509,6 +535,15 @@ fn profiles_valid_subcommands_build_requests_and_fail_without_a_daemon() {
         );
         assert!(!err.contains("usage:"), "{argv:?} parsed fine: {err}");
     }
+}
+
+#[test]
+fn profiles_eyes_open_on_rejects_before_the_daemon() {
+    let sb = Sandbox::new("eyes-open-on");
+    let (code, _, err) = run(&mut sb.cmd(&["profiles", "eyes-open", "on"]));
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("can only be turned off"), "{err}");
+    assert!(!err.contains("irlumed is not running"), "{err}");
 }
 
 #[test]
@@ -1576,20 +1611,24 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
             closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
-        Request::SetRequireEyesOpen { .. } => Response::Ok("eyes-open now ON".into()),
+        Request::SetRequireEyesOpen { on: false, .. } => Response::Ok("eyes-open now off".into()),
         _ => Response::Error("unexpected request".into()),
     });
 
     let (code, out, _) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
     assert_eq!(code, 0);
-    assert!(out.contains("require-eyes-open: ON"), "{out}");
+    assert!(
+        out.contains("legacy policy blocks authentication")
+            && out.contains("profiles eyes-open off"),
+        "{out}"
+    );
     assert!(out.contains("Face Profile 1 (2 scans)"), "{out}");
     assert!(out.contains("- Scan 1"), "{out}");
     assert!(out.contains("- Glasses"), "{out}");
 
-    let (code, out, _) = run(&mut sb.cmd(&["profiles", "eyes-open", "on", "--user", "tester"]));
+    let (code, out, _) = run(&mut sb.cmd(&["profiles", "eyes-open", "off", "--user", "tester"]));
     assert_eq!(code, 0);
-    assert!(out.contains("[profiles] eyes-open now ON"), "{out}");
+    assert!(out.contains("[profiles] eyes-open now off"), "{out}");
 }
 
 #[test]

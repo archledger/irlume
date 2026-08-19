@@ -259,7 +259,11 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
     let (code, out, _) = run(&mut sb.cmd(&["status", "--user", "tester"]), "status");
     assert_eq!(code, 0, "status always reports, never gates");
     assert!(out.contains("daemon        : running"), "{out}");
-    assert!(out.contains("eyes-open required"), "{out}");
+    assert!(
+        out.contains("legacy policy blocks authentication")
+            && out.contains("profiles eyes-open off"),
+        "{out}"
+    );
     assert!(out.contains("keyring unlock: not armed"), "{out}");
     assert!(out.contains("templates     : plaintext"), "{out}");
     assert!(out.contains("recovery pass : not set"), "{out}");

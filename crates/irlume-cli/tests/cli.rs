@@ -2146,6 +2146,14 @@ fn gesturecap_replays_pose_only_recordings() {
         "yaw_crossings",
         "mean_step",
         "verdict",
+        "production_window_frames",
+        "production_face_frames",
+        "production_pitch_range",
+        "production_yaw_range",
+        "production_pitch_crossings",
+        "production_yaw_crossings",
+        "production_mean_step",
+        "production_verdict",
     ] {
         assert!(stdout.contains(field), "missing {field}: {stdout}");
     }

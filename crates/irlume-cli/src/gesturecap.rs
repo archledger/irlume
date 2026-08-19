@@ -630,7 +630,9 @@ fn parse_nullable_float(
 
 fn report_recordings(recordings: &[Recording]) {
     println!(
-        "file,label,frames,pitch_range,yaw_range,pitch_crossings,yaw_crossings,mean_step,verdict"
+        "file,label,frames,pitch_range,yaw_range,pitch_crossings,yaw_crossings,mean_step,verdict,\
+         production_window_frames,production_face_frames,production_pitch_range,production_yaw_range,\
+         production_pitch_crossings,production_yaw_crossings,production_mean_step,production_verdict"
     );
     for recording in recordings {
         let (verdict, evidence) =
@@ -645,8 +647,19 @@ fn report_recordings(recordings: &[Recording]) {
             evidence.yaw_range,
             irlume_liveness::NOD_CROSSING_AMP_FRAC,
         );
+        let (production_verdict, production_evidence, production_frames) =
+            classify_production_gesture_window(&recording.samples);
+        let production_yaw: Vec<f32> = recording.samples[..production_frames]
+            .iter()
+            .filter_map(|sample| sample.yaw_signed)
+            .collect();
+        let production_yaw_crossings = irlume_liveness::signal_crossings(
+            &production_yaw,
+            production_evidence.yaw_range,
+            irlume_liveness::NOD_CROSSING_AMP_FRAC,
+        );
         println!(
-            "{},{},{},{:.3},{:.2},{},{},{:.4},{verdict:?}",
+            "{},{},{},{:.3},{:.2},{},{},{:.4},{verdict:?},{},{},{:.3},{:.2},{},{},{:.4},{production_verdict:?}",
             csv_cell(&recording.file),
             csv_cell(&recording.label),
             evidence.frames,
@@ -655,6 +668,13 @@ fn report_recordings(recordings: &[Recording]) {
             evidence.crossings,
             yaw_crossings,
             evidence.mean_step,
+            production_frames,
+            production_evidence.frames,
+            production_evidence.pitch_range,
+            production_evidence.yaw_range,
+            production_evidence.crossings,
+            production_yaw_crossings,
+            production_evidence.mean_step,
         );
     }
 }

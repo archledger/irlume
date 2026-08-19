@@ -2,12 +2,17 @@
 """Validate privacy-bounded JSONL evidence for the head-gesture matrix."""
 
 import datetime
+import errno
+import fcntl
 import json
 import math
+import os
 import pathlib
 import re
+import secrets
 import stat
 import sys
+import time
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_LINE_BYTES = 4096
@@ -30,7 +35,7 @@ SERVICES = {
     "plasmalogin",
     "credential_release",
 }
-PURPOSES = {"capability", "detector", "authentication", "policy", "credential-release"}
+PURPOSES = {"capability", "detector", "authentication", "credential-release"}
 POLICIES = {"required", "off", "not-applicable"}
 OUTCOMES = {
     "capability-present",
@@ -38,22 +43,41 @@ OUTCOMES = {
     "approved",
     "declined",
     "no-gesture",
-    "policy-required",
-    "policy-off",
-    "fallback-preserved",
-    "prompt-once",
-    "prompt-zero",
+    "attempt-failed",
+    "attempt-timeout",
+    "adapter-exited",
+    "adapter-output-invalid",
+}
+FAILURE_OUTCOMES = {"attempt-failed", "attempt-timeout", "adapter-exited", "adapter-output-invalid"}
+POLICY_SERVICE_PURPOSES = {
+    "sudo": "authentication",
+    "su": "authentication",
+    "doas": "authentication",
+    "sudo-i": "authentication",
+    "su-l": "authentication",
+    "runuser": "authentication",
+    "polkit-1": "authentication",
+    "kde": "authentication",
+    "gdm-password": "authentication",
+    "sddm": "authentication",
+    "plasmalogin": "authentication",
+    "credential_release": "credential-release",
+}
+CELL_TABLE = {("gesturecap", "detector", "not-applicable"): GESTURES} | {
+    (service, purpose, policy): {"nod", "shake"} if policy == "required" else {"none"}
+    for service, purpose in POLICY_SERVICE_PURPOSES.items()
+    for policy in ("required", "off")
 }
 RECORD_KEYS = {
     "schema_version",
     "record_type",
     "frozen_commit_oid",
     "release_binary_sha256",
+    "attempt_adapter_sha256",
     "host_label",
     "camera_identity_digest",
     "service",
     "purpose",
-    "requested_policy",
     "resolved_policy",
     "trial_id",
     "expected_gesture",
@@ -76,8 +100,12 @@ TRIAL_ID = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,95}\Z")
 FORBIDDEN_KEYS = ("serial", "username", "embedding", "template", "image", "raw_frame", "frame_path")
 
 
+class SchemaError(Exception):
+    pass
+
+
 def fail(message):
-    raise SystemExit(f"head-gesture-matrix: {message}")
+    raise SchemaError(f"head-gesture-matrix: {message}")
 
 
 def object_without_duplicates(pairs):
@@ -132,18 +160,18 @@ def validate_timestamp(value, label):
         fail(f"{label}: expected UTC RFC3339 seconds")
 
 
-def validate_evidence(value, label, capability):
+def validate_evidence(value, label, allow_zero):
     if not isinstance(value, dict) or set(value) != EVIDENCE_KEYS:
         fail(f"{label}: unexpected detector evidence keys")
-    frames = integer(value["frames"], f"{label}.frames", 0 if capability else 1, 300)
+    frames = integer(value["frames"], f"{label}.frames", 0 if allow_zero else 1, 300)
     face_frames = integer(value["face_frames"], f"{label}.face_frames", 0, frames)
     finite(value["pitch_range"], f"{label}.pitch_range", 0, 4)
     finite(value["yaw_range"], f"{label}.yaw_range", 0, 360)
     integer(value["pitch_crossings"], f"{label}.pitch_crossings", 0, frames)
     integer(value["yaw_crossings"], f"{label}.yaw_crossings", 0, frames)
     finite(value["mean_step"], f"{label}.mean_step", 0, 10)
-    if capability and (frames != 0 or face_frames != 0 or any(value[key] != 0 for key in EVIDENCE_KEYS - {"frames", "face_frames"})):
-        fail(f"{label}: capability records carry zero detector evidence")
+    if frames == 0 and (face_frames != 0 or any(value[key] != 0 for key in EVIDENCE_KEYS - {"frames", "face_frames"})):
+        fail(f"{label}: zero-frame records carry zero detector evidence")
 
 
 def validate_record(record, index):
@@ -161,6 +189,9 @@ def validate_record(record, index):
         fail(f"{label}: invalid frozen commit OID")
     if not isinstance(record["release_binary_sha256"], str) or not HEX64.fullmatch(record["release_binary_sha256"]):
         fail(f"{label}: invalid release binary digest")
+    adapter_digest = record["attempt_adapter_sha256"]
+    if adapter_digest is not None and (not isinstance(adapter_digest, str) or not HEX64.fullmatch(adapter_digest)):
+        fail(f"{label}: invalid attempt-adapter digest")
     if record["host_label"] not in HOSTS:
         fail(f"{label}: unknown host label")
     digest = record["camera_identity_digest"]
@@ -170,19 +201,22 @@ def validate_record(record, index):
         fail(f"{label}: unknown service")
     if record["purpose"] not in PURPOSES:
         fail(f"{label}: unknown purpose")
-    if record["requested_policy"] not in POLICIES or record["resolved_policy"] not in POLICIES:
+    if record["resolved_policy"] not in POLICIES:
         fail(f"{label}: unknown policy")
     if record["typed_outcome"] not in OUTCOMES:
         fail(f"{label}: unknown typed outcome")
     validate_timestamp(record["timestamp"], f"{label}.timestamp")
 
     capability = record["record_type"] == "capability"
-    validate_evidence(record["detector_evidence"], f"{label}.detector_evidence", capability)
+    validate_evidence(
+        record["detector_evidence"],
+        f"{label}.detector_evidence",
+        capability or record["typed_outcome"] in FAILURE_OUTCOMES,
+    )
     if capability:
         if (
             record["service"] != "capability"
             or record["purpose"] != "capability"
-            or record["requested_policy"] != "not-applicable"
             or record["resolved_policy"] != "not-applicable"
             or record["trial_id"] is not None
             or record["expected_gesture"] != "none"
@@ -191,30 +225,143 @@ def validate_record(record, index):
             fail(f"{label}: malformed capability record")
         if (record["typed_outcome"] == "capability-present") != (digest is not None):
             fail(f"{label}: capability outcome and camera digest disagree")
+        if (record["typed_outcome"] == "capability-present") != (adapter_digest is not None):
+            fail(f"{label}: capability outcome and adapter digest disagree")
         return
 
     if digest is None:
         fail(f"{label}: a trial requires a camera digest")
+    if adapter_digest is None:
+        fail(f"{label}: a trial requires an adapter digest")
     if not isinstance(record["trial_id"], str) or not TRIAL_ID.fullmatch(record["trial_id"]):
         fail(f"{label}: invalid trial ID")
-    if record["expected_gesture"] not in GESTURES:
-        fail(f"{label}: unknown expected gesture")
     if record["service"] == "capability" or record["purpose"] == "capability":
         fail(f"{label}: capability is not a trial service or purpose")
-    if record["purpose"] == "detector":
-        expected_outcome = {"nod": "approved", "shake": "declined"}.get(record["expected_gesture"], "no-gesture")
-        if (
-            record["service"] != "gesturecap"
-            or record["requested_policy"] != "not-applicable"
-            or record["resolved_policy"] != "not-applicable"
-            or record["typed_outcome"] != expected_outcome
-        ):
-            fail(f"{label}: detector trial outcome or policy disagrees with its cell")
-    elif record["service"] == "gesturecap":
-        fail(f"{label}: gesturecap is only valid for detector trials")
+    cell = (record["service"], record["purpose"], record["resolved_policy"])
+    if cell not in CELL_TABLE or record["expected_gesture"] not in CELL_TABLE[cell]:
+        fail(f"{label}: service/purpose/policy/gesture combination is not allowlisted")
+
+
+def path_snapshot(path):
+    if not path.is_absolute():
+        fail("evidence directory must be absolute")
+    snapshots = []
+    current = pathlib.Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as error:
+            fail(f"cannot inspect evidence directory ancestry: {error}")
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"evidence directory ancestry contains a symlink: {current}")
+        snapshots.append((current, info.st_dev, info.st_ino))
+    return snapshots
+
+
+def open_evidence_directory(path):
+    snapshot = path_snapshot(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open evidence directory: {error}")
+    info = os.fstat(descriptor)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(descriptor)
+        fail("evidence directory must be owned by the caller and inaccessible to group/other")
+    return descriptor, snapshot
+
+
+def verify_snapshot(snapshot):
+    for path, device, inode in snapshot:
+        try:
+            info = path.lstat()
+        except OSError as error:
+            fail(f"evidence directory ancestry changed: {error}")
+        if stat.S_ISLNK(info.st_mode) or (info.st_dev, info.st_ino) != (device, inode):
+            fail("evidence directory ancestry changed during operation")
+
+
+def open_lock(directory_fd):
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(".head-gesture.lock", flags, 0o600, dir_fd=directory_fd)
+    except OSError as error:
+        fail(f"cannot open evidence lock: {error}")
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
+        os.close(descriptor)
+        fail("evidence lock has unsafe type, ownership, mode, or link count")
+    return descriptor
+
+
+def decode_record(raw, label):
+    if len(raw) > MAX_LINE_BYTES:
+        fail(f"{label} exceeds {MAX_LINE_BYTES} bytes")
+    try:
+        text = raw.decode("utf-8")
+        record = json.loads(
+            text,
+            object_pairs_hook=object_without_duplicates,
+            parse_constant=reject_constant,
+        )
+    except UnicodeError as error:
+        fail(f"{label}: invalid UTF-8: {error}")
+    except json.JSONDecodeError as error:
+        fail(f"{label}: malformed JSON: {error}")
+    return record
+
+
+def load_directory_records(path):
+    directory_fd, snapshot = open_evidence_directory(path)
+    lock_fd = open_lock(directory_fd)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        verify_snapshot(snapshot)
+        names = os.listdir(directory_fd)
+        unexpected = [name for name in names if name != ".head-gesture.lock" and not name.startswith(".tmp-") and not name.endswith(".json")]
+        if unexpected:
+            fail(f"unexpected evidence directory entries: {sorted(unexpected)}")
+        records = []
+        for name in sorted(name for name in names if name.endswith(".json")):
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+            except OSError as error:
+                fail(f"cannot open evidence record {name!r}: {error}")
+            try:
+                info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_nlink != 1
+                    or info.st_size > MAX_LINE_BYTES
+                ):
+                    fail(f"unsafe evidence record: {name!r}")
+                raw = os.read(descriptor, MAX_LINE_BYTES + 1)
+            finally:
+                os.close(descriptor)
+            records.append(decode_record(raw, name))
+            if len(records) > MAX_RECORDS:
+                fail(f"evidence exceeds {MAX_RECORDS} records")
+        verify_snapshot(snapshot)
+    finally:
+        os.close(lock_fd)
+        os.close(directory_fd)
+    if not records:
+        fail("evidence contains no records")
+    return records
 
 
 def load_records(path):
+    if path.is_dir():
+        return load_directory_records(path)
     try:
         info = path.lstat()
     except OSError as error:
@@ -250,16 +397,92 @@ def load_records(path):
     return records
 
 
-def validate_matrix(records):
+def publish_record(root, source):
+    try:
+        raw = source.read_bytes()
+    except OSError as error:
+        fail(f"cannot read record for publication: {error}")
+    record = decode_record(raw, "publication record")
+    validate_record(record, 1)
+    encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+    directory_fd, snapshot = open_evidence_directory(root)
+    lock_fd = open_lock(directory_fd)
+    temporary = None
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        verify_snapshot(snapshot)
+        test_mode = os.environ.get("IRLUME_HEAD_GESTURE_TEST_MODE") == "1"
+        forced = os.environ.get("IRLUME_HEAD_GESTURE_TEST_TOKEN") if test_mode else None
+        token = forced or secrets.token_hex(16)
+        target = f"{record['record_type']}-{token}.json"
+        temporary = f".tmp-{secrets.token_hex(16)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if test_mode and os.environ.get("IRLUME_HEAD_GESTURE_TEST_FAIL_BEFORE_PUBLISH") == "1":
+            fail("injected failure before publication")
+        pause_raw = os.environ.get("IRLUME_HEAD_GESTURE_TEST_PAUSE_BEFORE_PUBLISH") if test_mode else None
+        if pause_raw:
+            pause = pathlib.Path(pause_raw)
+            ready = pause.with_suffix(".ready")
+            proceed = pause.with_suffix(".continue")
+            ready.write_text("ready\n", encoding="utf-8")
+            deadline = time.monotonic() + 10
+            while not proceed.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not proceed.exists():
+                fail("timed out waiting at injected publication boundary")
+        verify_snapshot(snapshot)
+        try:
+            os.link(
+                temporary,
+                target,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                fail(f"evidence target already exists: {target}")
+            fail(f"cannot publish evidence record: {error}")
+        os.fsync(directory_fd)
+        os.unlink(temporary, dir_fd=directory_fd)
+        temporary = None
+        os.fsync(directory_fd)
+        verify_snapshot(snapshot)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+        os.close(lock_fd)
+        os.close(directory_fd)
+    return root / target
+
+
+def validate_schema(records):
     for index, record in enumerate(records, 1):
         validate_record(record, index)
 
     oids = {record["frozen_commit_oid"] for record in records}
     binaries = {record["release_binary_sha256"] for record in records}
+    adapters = {record["attempt_adapter_sha256"] for record in records if record["attempt_adapter_sha256"] is not None}
     if len(oids) != 1:
         fail("mixed frozen commit OIDs")
     if len(binaries) != 1:
         fail("mixed release binary digests")
+    if len(adapters) > 1:
+        fail("mixed attempt-adapter digests")
 
     capabilities = {}
     trials = []
@@ -267,50 +490,119 @@ def validate_matrix(records):
     for record in records:
         host = record["host_label"]
         if record["record_type"] == "capability":
-            if host in capabilities:
-                fail(f"duplicate capability record for {host}")
-            capabilities[host] = record
+            capabilities.setdefault(host, []).append(record)
             continue
         if record["trial_id"] in trial_ids:
             fail(f"duplicate trial ID: {record['trial_id']}")
         trial_ids.add(record["trial_id"])
         trials.append(record)
 
-    if set(capabilities) != HOSTS:
-        fail(f"missing host capability records: {sorted(HOSTS - set(capabilities))}")
+    for host, host_capabilities in capabilities.items():
+        facts = {
+            (
+                record["typed_outcome"],
+                record["camera_identity_digest"],
+                record["attempt_adapter_sha256"],
+            )
+            for record in host_capabilities
+        }
+        if len(facts) != 1:
+            fail(f"{host}: conflicting capability records")
+    for host in HOSTS:
+        camera_digests = {
+            record["camera_identity_digest"]
+            for record in records
+            if record["host_label"] == host and record["camera_identity_digest"] is not None
+        }
+        if len(camera_digests) > 1:
+            fail(f"{host}: mixed camera identity digests")
+    return capabilities, trials, next(iter(oids))
+
+
+def qualify(records):
+    capabilities, trials, oid = validate_schema(records)
+    reasons = []
     for host in HOSTS:
         host_trials = [record for record in trials if record["host_label"] == host]
-        capability = capabilities[host]
+        if host not in capabilities:
+            reasons.append(f"{host}: missing capability record")
+            continue
+        capability = capabilities[host][0]
         if capability["typed_outcome"] == "capability-not-present":
             if host_trials:
-                fail(f"{host}: capability-not-present must not have trials")
+                reasons.append(f"{host}: capability-not-present has trials")
+            reasons.append(f"{host}: capability-not-present")
             continue
         digest = capability["camera_identity_digest"]
         if any(record["camera_identity_digest"] != digest for record in host_trials):
             fail(f"{host}: mixed camera identity digests")
         for gesture in GESTURES:
-            count = sum(
-                record["service"] == "gesturecap"
-                and record["purpose"] == "detector"
-                and record["expected_gesture"] == gesture
+            cell_records = [
+                record
                 for record in host_trials
-            )
+                if record["service"] == "gesturecap"
+                and record["purpose"] == "detector"
+                and record["resolved_policy"] == "not-applicable"
+                and record["expected_gesture"] == gesture
+            ]
+            count = len(cell_records)
             if count < 5:
-                fail(f"{host}/{gesture}: expected at least five detector attempts, got {count}")
+                reasons.append(f"{host}/{gesture}: expected at least five detector attempts, got {count}")
+            expected_outcome = {"nod": "approved", "shake": "declined"}.get(gesture, "no-gesture")
+            for record in cell_records:
+                if record["typed_outcome"] != expected_outcome:
+                    reasons.append(
+                        f"{record['trial_id']}: expected {expected_outcome}, observed {record['typed_outcome']}"
+                    )
 
-    absent = sum(record["typed_outcome"] == "capability-not-present" for record in capabilities.values())
-    return next(iter(oids)), len(trials), absent
+    return {
+        "schema_valid": True,
+        "qualified": not reasons,
+        "records": len(records),
+        "trials": len(trials),
+        "frozen_commit_oid": oid,
+        "reasons": reasons,
+    }
 
 
 def main(argv):
-    if len(argv) != 2:
-        fail("usage: validate-head-gesture-matrix.py EVIDENCE.jsonl")
-    oid, trials, absent = validate_matrix(load_records(pathlib.Path(argv[1])))
-    print(
-        "head-gesture-matrix: valid "
-        f"hosts={len(HOSTS)} trials={trials} capability-not-present={absent} oid={oid}"
-    )
+    if argv[1:2] == ["--check-root"]:
+        if len(argv) != 3:
+            fail("usage: validate-head-gesture-matrix.py --check-root EVIDENCE_ROOT")
+        descriptor, _ = open_evidence_directory(pathlib.Path(argv[2]))
+        lock = open_lock(descriptor)
+        os.close(lock)
+        os.close(descriptor)
+        return 0
+    if argv[1:2] == ["--check-cell"]:
+        if len(argv) != 6:
+            fail("usage: validate-head-gesture-matrix.py --check-cell SERVICE PURPOSE POLICY GESTURE")
+        cell = tuple(argv[2:5])
+        if cell not in CELL_TABLE or argv[5] not in CELL_TABLE[cell]:
+            fail("service/purpose/policy/gesture combination is not allowlisted")
+        return 0
+    if argv[1:2] == ["--publish-record"]:
+        if len(argv) != 4:
+            fail("usage: validate-head-gesture-matrix.py --publish-record EVIDENCE_ROOT RECORD")
+        print(publish_record(pathlib.Path(argv[2]), pathlib.Path(argv[3])))
+        return 0
+    schema_only = argv[1:2] == ["--schema-only"]
+    expected_length = 3 if schema_only else 2
+    if len(argv) != expected_length:
+        fail("usage: validate-head-gesture-matrix.py [--schema-only] EVIDENCE")
+    records = load_records(pathlib.Path(argv[-1]))
+    if schema_only:
+        _, trials, oid = validate_schema(records)
+        print(json.dumps({"schema_valid": True, "qualified": None, "records": len(records), "trials": len(trials), "frozen_commit_oid": oid}))
+        return 0
+    verdict = qualify(records)
+    print(json.dumps(verdict, sort_keys=True))
+    return 0 if verdict["qualified"] else 3
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    try:
+        sys.exit(main(sys.argv))
+    except SchemaError as error:
+        print(error, file=sys.stderr)
+        sys.exit(2)

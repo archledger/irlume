@@ -2,6 +2,7 @@
 """Offline fixture tests for the privacy-bounded head-gesture matrix tools."""
 
 import copy
+import calendar
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import pathlib
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -18,6 +20,7 @@ HOSTS = ("current", "archhost", "minihost", "thinkpad")
 GESTURES = ("nod", "shake", "still", "look-around", "look-down-and-hold")
 OID = "a" * 40
 BINARY_SHA256 = "b" * 64
+ADAPTER_SHA256 = "c" * 64
 
 
 def camera_digest(host):
@@ -42,11 +45,11 @@ def capability(host, present=True):
         "record_type": "capability",
         "frozen_commit_oid": OID,
         "release_binary_sha256": BINARY_SHA256,
+        "attempt_adapter_sha256": ADAPTER_SHA256 if present else None,
         "host_label": host,
         "camera_identity_digest": (camera_digest(host) if present else None),
         "service": "capability",
         "purpose": "capability",
-        "requested_policy": "not-applicable",
         "resolved_policy": "not-applicable",
         "trial_id": None,
         "expected_gesture": "none",
@@ -63,11 +66,11 @@ def trial(host, gesture, attempt):
         "record_type": "trial",
         "frozen_commit_oid": OID,
         "release_binary_sha256": BINARY_SHA256,
+        "attempt_adapter_sha256": ADAPTER_SHA256,
         "host_label": host,
         "camera_identity_digest": camera_digest(host),
         "service": "gesturecap",
         "purpose": "detector",
-        "requested_policy": "not-applicable",
         "resolved_policy": "not-applicable",
         "trial_id": f"{host}:{gesture}:{attempt}",
         "expected_gesture": gesture,
@@ -87,12 +90,12 @@ def valid_records():
 
 
 class ValidatorTests(unittest.TestCase):
-    def run_raw(self, raw):
+    def run_raw(self, raw, *extra):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "evidence.jsonl"
             path.write_text(raw, encoding="utf-8")
             return subprocess.run(
-                ["python3", str(VALIDATOR), str(path)],
+                ["python3", str(VALIDATOR), *extra, str(path)],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -111,14 +114,18 @@ class ValidatorTests(unittest.TestCase):
     def test_complete_matrix_passes(self):
         result = self.run_records(valid_records())
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["qualified"], True)
 
     def test_capability_not_present_is_not_a_pass_or_trial(self):
         records = valid_records()
         records = [record for record in records if record["host_label"] != "thinkpad"]
         records.append(capability("thinkpad", present=False))
         result = self.run_records(records)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("capability-not-present=1", result.stdout)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        verdict = json.loads(result.stdout)
+        self.assertEqual(verdict["schema_valid"], True)
+        self.assertEqual(verdict["qualified"], False)
+        self.assertEqual(self.run_raw("".join(json.dumps(record) + "\n" for record in records), "--schema-only").returncode, 0)
 
         records.append(trial("thinkpad", "nod", 1))
         self.assertNotEqual(self.run_records(records).returncode, 0)
@@ -142,14 +149,60 @@ class ValidatorTests(unittest.TestCase):
         self.assert_rejected(lambda records: records.__setitem__(0, {**records[0], "host_label": "unknown-host"}))
         self.assert_rejected(lambda records: records.pop(5))
         self.assert_rejected(lambda records: records.append(copy.deepcopy(records[1])))
+        records = valid_records()
+        records[1]["camera_identity_digest"] = "e" * 64
+        raw = "".join(json.dumps(record) + "\n" for record in records)
+        self.assertNotEqual(self.run_raw(raw, "--schema-only").returncode, 0)
 
     def test_outcomes_and_detector_bounds_are_enforced(self):
         self.assert_rejected(lambda records: records[1].__setitem__("typed_outcome", "granted"))
-        self.assert_rejected(lambda records: records[6].__setitem__("typed_outcome", "approved"))
         self.assert_rejected(lambda records: records[1]["detector_evidence"].__setitem__("pitch_range", float("inf")))
         self.assert_rejected(lambda records: records[1]["detector_evidence"].__setitem__("yaw_range", -1))
         self.assert_rejected(lambda records: records[1]["detector_evidence"].__setitem__("face_frames", 76))
         self.assert_rejected(lambda records: records[1].__setitem__("timestamp", "yesterday"))
+
+    def test_misclassification_and_attempt_failure_are_schema_valid_but_unqualified(self):
+        for outcome in ["approved", "attempt-failed", "attempt-timeout", "adapter-exited", "adapter-output-invalid"]:
+            records = valid_records()
+            records[6]["typed_outcome"] = outcome
+            raw = "".join(json.dumps(record) + "\n" for record in records)
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self.run_raw(raw, "--schema-only").returncode, 0)
+                result = self.run_raw(raw)
+                self.assertEqual(result.returncode, 3)
+                self.assertEqual(json.loads(result.stdout)["qualified"], False)
+
+    def test_exact_service_purpose_policy_gesture_cells_are_enforced(self):
+        allowed = [
+            ("sudo", "authentication", "required", "shake", "declined"),
+            ("sudo", "authentication", "off", "none", "no-gesture"),
+            ("kde", "authentication", "off", "none", "no-gesture"),
+            ("kde", "authentication", "required", "nod", "approved"),
+            ("credential_release", "credential-release", "off", "none", "no-gesture"),
+            ("credential_release", "credential-release", "required", "nod", "approved"),
+        ]
+        records = valid_records()
+        for index, (service, purpose, policy, gesture, outcome) in enumerate(allowed):
+            policy_record = copy.deepcopy(records[1])
+            policy_record.update({
+                "service": service,
+                "purpose": purpose,
+                "resolved_policy": policy,
+                "expected_gesture": gesture,
+                "typed_outcome": outcome,
+                "trial_id": f"current:policy:{index}",
+            })
+            records.append(policy_record)
+        self.assertEqual(self.run_records(records).returncode, 0)
+        for key, value in [
+            ("purpose", "detector"),
+            ("resolved_policy", "not-applicable"),
+            ("expected_gesture", "look-around"),
+        ]:
+            broken = copy.deepcopy(records)
+            broken[-1][key] = value
+            with self.subTest(key=key):
+                self.assertNotEqual(self.run_records(broken).returncode, 0)
 
     def test_privacy_sensitive_names_values_and_prose_are_rejected(self):
         sensitive = [
@@ -177,19 +230,19 @@ class ValidatorTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    CAMERA_DIGEST = "d" * 64
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name)
-        self.binary = self.root / "irlume"
-        self.binary.write_bytes(b"reviewed release binary\n")
-        self.binary.chmod(0o755)
-        self.oid = "c" * 40
-        self.digest = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+        self.repo = self.root / "repo"
+        self.repo.mkdir(mode=0o700)
         self.log = self.root / "calls.log"
         self.log.write_text("", encoding="utf-8")
-        self.output = self.root / "evidence.jsonl"
-        self.policy_state = self.root / "policy.state"
-        self.policy_state.write_text("required\n", encoding="utf-8")
+        self.attempt_args = self.root / "attempt.args"
+        self.evidence_root = self.root / "external-evidence"
+        self.evidence_root.mkdir(mode=0o700)
+        self.oid = "c" * 40
         self.make_fake("git", """#!/bin/sh
 case "$*" in
   *"rev-parse HEAD"*) printf '%s\\n' "$FAKE_OID" ;;
@@ -197,31 +250,79 @@ case "$*" in
   *) exit 2 ;;
 esac
 """)
-        self.make_fake("status", """#!/bin/sh
+        self.status = self.make_fake("status", """#!/bin/sh
 printf '%s\\n' status >>"$FAKE_LOG"
-printf '{"ok":true,"data":{"daemon":"running","camera":{"rgb":%s,"ir":true}}}\\n' "${FAKE_RGB-true}"
+case "${FAKE_STATUS_MODE-good}" in
+  good) printf '%s\\n' '{"ok":true,"data":{"daemon":"running","camera":{"rgb":true,"ir":true}}}' ;;
+  absent) printf '%s\\n' '{"ok":true,"data":{"daemon":"running","camera":{"rgb":false,"ir":false}}}' ;;
+  starting) printf '%s\\n' '{"ok":true,"data":{"daemon":"starting","camera":{"rgb":true,"ir":true}}}' ;;
+  malformed) printf '%s\\n' '{broken' ;;
+esac
 """)
-        self.make_fake("doctor", """#!/bin/sh
+        self.doctor = self.make_fake("doctor", """#!/bin/sh
 printf '%s\\n' doctor >>"$FAKE_LOG"
-printf '%s\\n' '{"ok":true,"data":{"checks":[{"id":"camera-nodes","state":"pass"},{"id":"models","state":"pass"},{"id":"stage-detection-model","state":"pass"},{"id":"stage-recognition-model","state":"pass"}]}}'
+case "${FAKE_DOCTOR_MODE-good}" in
+  good) printf '%s\\n' '{"ok":true,"data":{"checks":[{"id":"camera-nodes","state":"pass"},{"id":"models","state":"pass"},{"id":"stage-detection-model","state":"pass"},{"id":"stage-recognition-model","state":"pass"}]}}' ;;
+  unknown) printf '%s\\n' '{"ok":true,"data":{"checks":[{"id":"camera-nodes","state":"unknown"}]}}' ;;
+  failed) printf '%s\\n' '{"ok":false,"error":{"code":"operation-failed"}}' ;;
+esac
 """)
-        self.make_fake("attempt", """#!/bin/sh
-printf 'attempt' >>"$FAKE_LOG"
-printf ' %s' "$@" >>"$FAKE_LOG"
-printf '\\n' >>"$FAKE_LOG"
-[ "${FAKE_ATTEMPT_FAIL-0}" -eq 0 ] || exit "$FAKE_ATTEMPT_FAIL"
-printf '%s\\n' '{"camera_identity_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","typed_outcome":"approved","detector_evidence":{"frames":75,"face_frames":75,"pitch_range":0.25,"yaw_range":18.0,"pitch_crossings":2,"yaw_crossings":0,"mean_step":0.03}}'
+        self.binary = self.make_fake("repo/irlume", """#!/bin/sh
+case "$1" in
+  status)
+    printf '%s\\n' candidate-status >>"$FAKE_LOG"
+    printf '%s\\n' '{"ok":true,"data":{"daemon":"running","camera":{"rgb":true,"ir":true}}}'
+    ;;
+  doctor)
+    printf '%s\\n' candidate-doctor >>"$FAKE_LOG"
+    printf '%s\\n' '{"ok":true,"data":{"checks":[{"id":"camera-nodes","state":"pass"},{"id":"models","state":"pass"},{"id":"stage-detection-model","state":"pass"},{"id":"stage-recognition-model","state":"pass"}]}}'
+    ;;
+  credential-release-challenge)
+    [ "$3" = status ] || exit 99
+    printf 'policy-observe %s\\n' "$2" >>"$FAKE_LOG"
+    case "$2" in
+      kde|gdm-password|sddm|plasmalogin) printf '[credential-release-challenge] %s: off (default)\\n' "$2" ;;
+      credential_release) printf '[credential-release-challenge] %s: %s (explicit)\\n' "$2" "${FAKE_CREDENTIAL_POLICY-REQUIRED}" ;;
+      *) printf '[credential-release-challenge] %s: REQUIRED (default)\\n' "$2" ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
 """)
-        self.make_fake("policy", """#!/bin/sh
-if [ "$3" = status ]; then
-  printf 'get %s\\n' "$2" >>"$FAKE_LOG"
-  cat "$FAKE_POLICY_STATE"
-else
-  printf 'set %s %s\\n' "$2" "$3" >>"$FAKE_LOG"
-  [ "${FAKE_POLICY_IGNORE-0}" -eq 1 ] || printf '%s\\n' "$3" >"$FAKE_POLICY_STATE"
-  [ "${FAKE_POLICY_SET_FAIL-}" != "$3" ] || exit 8
+        self.adapter = self.make_fake("attempt-adapter", """#!/bin/sh
+if [ "$1" = --preflight ]; then
+  printf '%s\\n' preflight >>"$FAKE_LOG"
+  printf '{"camera_identity_digest":"%s"}\\n' "${FAKE_CAMERA_DIGEST}"
+  if [ -n "${FAKE_ADAPTER_REPLACEMENT-}" ]; then
+    mv "$FAKE_ADAPTER_REPLACEMENT" "$FAKE_ADAPTER_PATH"
+  fi
+  exit 0
 fi
+printf '%s\\n' attempt >>"$FAKE_LOG"
+printf '%s\\n' "$@" >"$FAKE_ATTEMPT_ARGS"
+expected=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --expected-gesture ]; then expected=$2; shift 2; else shift; fi
+done
+zero='{"frames":0,"face_frames":0,"pitch_range":0,"yaw_range":0,"pitch_crossings":0,"yaw_crossings":0,"mean_step":0}'
+normal='{"frames":75,"face_frames":75,"pitch_range":0.25,"yaw_range":18.0,"pitch_crossings":2,"yaw_crossings":0,"mean_step":0.03}'
+case "${FAKE_ADAPTER_MODE-good}" in
+  good)
+    case "$expected" in nod) outcome=approved ;; shake) outcome=declined ;; *) outcome=no-gesture ;; esac
+    printf '{"typed_outcome":"%s","detector_evidence":%s}\\n' "$outcome" "$normal"
+    ;;
+  misclassified) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal" ;;
+  fail-json) printf '{"typed_outcome":"attempt-failed","detector_evidence":%s}\\n' "$zero"; exit 9 ;;
+  invalid) printf 'arbitrary prose\\n'; exit 7 ;;
+  unknown-outcome) printf '{"typed_outcome":"surprise","detector_evidence":%s}\\n' "$normal" ;;
+  bad-evidence) printf '%s\\n' '{"typed_outcome":"approved","detector_evidence":{"frames":999,"face_frames":999,"pitch_range":0,"yaw_range":0,"pitch_crossings":0,"yaw_crossings":0,"mean_step":0}}' ;;
+  oversize) head -c 5000 /dev/zero ;;
+  oversize-stderr) head -c 5000 /dev/zero >&2 ;;
+  hang-child) sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CHILD_PID"; wait "$child" ;;
+esac
 """)
+        self.binary_digest = self.sha256(self.binary)
+        self.adapter_digest = self.sha256(self.adapter)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -230,105 +331,265 @@ fi
         path = self.root / name
         path.write_text(source, encoding="utf-8")
         path.chmod(0o755)
+        return path
 
-    def run_runner(self, trial="gesturecap:nod:not-applicable", stdin="ready\n", extra_env=None, extra_args=None):
+    @staticmethod
+    def sha256(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def invocation(
+        self,
+        trial="gesturecap:nod",
+        evidence_root=None,
+        extra_env=None,
+        extra_args=None,
+        test_mode=True,
+        expected_binary_sha256=None,
+        expected_adapter_sha256=None,
+    ):
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.root}:{env['PATH']}",
             "FAKE_LOG": str(self.log),
             "FAKE_OID": self.oid,
-            "FAKE_POLICY_STATE": str(self.policy_state),
+            "FAKE_CAMERA_DIGEST": self.CAMERA_DIGEST,
+            "FAKE_ATTEMPT_ARGS": str(self.attempt_args),
+            "FAKE_ADAPTER_PATH": str(self.adapter),
             "TMPDIR": str(self.root),
-            "IRLUME_HEAD_GESTURE_ROOT": str(self.root),
+            "IRLUME_HEAD_GESTURE_ROOT": str(self.repo),
             "IRLUME_HEAD_GESTURE_BINARY": str(self.binary),
-            "IRLUME_HEAD_GESTURE_STATUS_CMD": str(self.root / "status"),
-            "IRLUME_HEAD_GESTURE_DOCTOR_CMD": str(self.root / "doctor"),
-            "IRLUME_HEAD_GESTURE_ATTEMPT_CMD": str(self.root / "attempt"),
-            "IRLUME_HEAD_GESTURE_POLICY_CMD": str(self.root / "policy"),
+            "IRLUME_HEAD_GESTURE_ATTEMPT_CMD": str(self.adapter),
         })
+        if test_mode:
+            env.update({
+                "IRLUME_HEAD_GESTURE_TEST_MODE": "1",
+                "IRLUME_HEAD_GESTURE_STATUS_CMD": str(self.status),
+                "IRLUME_HEAD_GESTURE_DOCTOR_CMD": str(self.doctor),
+            })
         if extra_env:
-            env.update(extra_env)
+            for key, value in extra_env.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
         args = [
             "bash", str(RUNNER),
             "--host-label", "current",
             "--expected-oid", self.oid,
-            "--expected-binary-sha256", self.digest,
-            "--output", str(self.output),
+            "--expected-binary-sha256", expected_binary_sha256 or self.binary_digest,
+            "--expected-adapter-sha256", expected_adapter_sha256 or self.adapter_digest,
+            "--expected-camera-identity-digest", self.CAMERA_DIGEST,
+            "--evidence-root", str(evidence_root or self.evidence_root),
             "--trial", trial,
         ]
         if extra_args:
             args.extend(extra_args)
+        return args, env
+
+    def run_runner(self, **kwargs):
+        stdin = kwargs.pop("stdin", "ready\n")
+        args, env = self.invocation(**kwargs)
         return subprocess.run(args, input=stdin, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
 
-    def test_runner_waits_for_literal_ready_then_publishes_0600(self):
+    def records(self, root=None):
+        return [json.loads(path.read_text(encoding="utf-8")) for path in sorted((root or self.evidence_root).glob("*.json"))]
+
+    def test_preflight_precedes_literal_ready_and_attempt_timestamp_follows_it(self):
         refused = self.run_runner(stdin="Ready\n")
         self.assertNotEqual(refused.returncode, 0)
-        self.assertNotIn("attempt", self.log.read_text(encoding="utf-8"))
-        self.assertFalse(self.output.exists())
+        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), ["status", "doctor", "preflight"])
+        self.assertEqual(self.records(), [])
 
         self.log.write_text("", encoding="utf-8")
-        result = self.run_runner()
+        args, env = self.invocation()
+        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        time.sleep(1.1)
+        ready_at = time.time()
+        stdout, stderr = process.communicate("ready\n", timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), ["status", "doctor", "preflight", "attempt"])
+        captured_args = self.attempt_args.read_text(encoding="utf-8").splitlines()
+        self.assertIn("--expected-camera-identity-digest", captured_args)
+        self.assertIn(self.CAMERA_DIGEST, captured_args)
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        observed = calendar.timegm(time.strptime(trial_record["timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertGreaterEqual(observed, ready_at - 1)
+        self.assertNotIn("/dev/video", "".join(path.read_text(encoding="utf-8") for path in self.evidence_root.glob("*.json")))
+
+    def test_repeated_unknown_and_unfrozen_inputs_are_refused_before_preflight(self):
+        cases = [
+            {"trial": "unknown:nod"},
+            {"extra_args": ["--trial", "gesturecap:nod"]},
+            {"extra_args": ["--mystery", "x"]},
+            {"extra_env": {"FAKE_OID": "e" * 40}},
+            {"extra_env": {"FAKE_DIRTY": " M file\n"}},
+            {"extra_args": ["--expected-adapter-sha256", "e" * 64]},
+            {"expected_binary_sha256": "e" * 64},
+            {"expected_adapter_sha256": "e" * 64},
+        ]
+        for kwargs in cases:
+            self.log.write_text("", encoding="utf-8")
+            with self.subTest(kwargs=kwargs):
+                self.assertNotEqual(self.run_runner(**kwargs).returncode, 0)
+                self.assertNotIn("preflight", self.log.read_text(encoding="utf-8"))
+        link = self.root / "adapter-link"
+        link.symlink_to(self.adapter)
+        self.assertNotEqual(self.run_runner(extra_env={"IRLUME_HEAD_GESTURE_ATTEMPT_CMD": str(link)}).returncode, 0)
+
+    def test_status_doctor_test_gate_and_camera_preflight_fail_closed(self):
+        for variable, value in [
+            ("FAKE_STATUS_MODE", "starting"),
+            ("FAKE_STATUS_MODE", "malformed"),
+            ("FAKE_DOCTOR_MODE", "unknown"),
+            ("FAKE_DOCTOR_MODE", "failed"),
+        ]:
+            self.log.write_text("", encoding="utf-8")
+            with self.subTest(variable=variable, value=value):
+                self.assertNotEqual(self.run_runner(extra_env={variable: value}).returncode, 0)
+                self.assertNotIn("attempt", self.log.read_text(encoding="utf-8"))
+        self.assertNotEqual(self.run_runner(extra_env={"FAKE_CAMERA_DIGEST": "e" * 64}).returncode, 0)
+
+        production = self.run_runner(test_mode=False, extra_env={
+            "IRLUME_HEAD_GESTURE_STATUS_CMD": str(self.status),
+            "IRLUME_HEAD_GESTURE_DOCTOR_CMD": str(self.doctor),
+        })
+        self.assertNotEqual(production.returncode, 0)
+        self.log.write_text("", encoding="utf-8")
+        production = self.run_runner(test_mode=False)
+        self.assertEqual(production.returncode, 0, production.stderr)
+        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), ["candidate-status", "candidate-doctor", "preflight", "attempt"])
+
+    def test_verified_adapter_inode_is_bound_across_preflight_and_attempt(self):
+        replacement = self.make_fake("replacement-adapter", """#!/bin/sh
+printf '%s\\n' replaced-adapter >>"$FAKE_LOG"
+exit 99
+""")
+        result = self.run_runner(extra_env={"FAKE_ADAPTER_REPLACEMENT": str(replacement)})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("status\ndoctor\nattempt --service gesturecap", self.log.read_text(encoding="utf-8"))
-        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
-        records = [json.loads(line) for line in self.output.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([record["record_type"] for record in records], ["capability", "trial"])
-        self.assertNotIn("/dev/video", self.output.read_text(encoding="utf-8"))
-        self.assertEqual(list(self.root.glob("irlume-head-gesture.*")), [])
+        self.assertIn("attempt", self.log.read_text(encoding="utf-8").splitlines())
+        self.assertNotIn("replaced-adapter", self.log.read_text(encoding="utf-8").splitlines())
 
-    def test_runner_refuses_unknown_arguments_identity_and_dirty_checkout(self):
-        self.assertNotEqual(self.run_runner(trial="unknown:nod:required").returncode, 0)
-        self.assertNotEqual(self.run_runner(extra_args=["--mystery"]).returncode, 0)
-        self.assertNotEqual(self.run_runner(extra_env={"FAKE_OID": "e" * 40}).returncode, 0)
-        self.assertNotEqual(self.run_runner(extra_env={"FAKE_DIRTY": " M file\n"}).returncode, 0)
-        self.assertNotEqual(self.run_runner(extra_env={"IRLUME_HEAD_GESTURE_BINARY": str(self.root / "attempt")}).returncode, 0)
-
-    def test_runner_records_capability_not_present_without_attempt(self):
-        result = self.run_runner(extra_env={"FAKE_RGB": "false"}, stdin="")
+    def test_policy_is_observed_only_through_verified_candidate(self):
+        result = self.run_runner(trial="sudo:shake")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("attempt", self.log.read_text(encoding="utf-8"))
-        records = [json.loads(line) for line in self.output.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["typed_outcome"], "capability-not-present")
+        calls = self.log.read_text(encoding="utf-8")
+        self.assertIn("policy-observe sudo", calls)
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        self.assertEqual((trial_record["purpose"], trial_record["resolved_policy"]), ("authentication", "required"))
 
-    def test_runner_restores_temporary_policy_when_attempt_fails(self):
-        result = self.run_runner(trial="sudo:nod:off", extra_env={"FAKE_ATTEMPT_FAIL": "9"})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), [
-            "status",
-            "doctor",
-            "get sudo",
-            "set sudo off",
-            "get sudo",
-            "attempt --service sudo --purpose authentication --expected-gesture nod --timeout-seconds 20",
-            "set sudo required",
-        ])
-        self.assertFalse(self.output.exists())
+    def test_observed_misclassification_and_attempt_failures_are_persisted(self):
+        result = self.run_runner(trial="gesturecap:shake", extra_env={"FAKE_ADAPTER_MODE": "misclassified"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        self.assertEqual(trial_record["typed_outcome"], "approved")
+        qualified = subprocess.run(["python3", str(VALIDATOR), str(self.evidence_root)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        self.assertEqual(qualified.returncode, 3)
 
-    def test_runner_refuses_to_record_an_unresolved_policy_write(self):
-        result = self.run_runner(trial="sudo:nod:off", extra_env={"FAKE_POLICY_IGNORE": "1"})
+        second_root = self.root / "second-evidence"
+        second_root.mkdir(mode=0o700)
+        result = self.run_runner(evidence_root=second_root, extra_env={"FAKE_ADAPTER_MODE": "fail-json"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), [
-            "status",
-            "doctor",
-            "get sudo",
-            "set sudo off",
-            "get sudo",
-            "set sudo required",
-        ])
-        self.assertFalse(self.output.exists())
+        trial_record = next(record for record in self.records(second_root) if record["record_type"] == "trial")
+        self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
 
-    def test_runner_attempts_restore_when_policy_set_reports_failure(self):
-        result = self.run_runner(trial="sudo:nod:off", extra_env={"FAKE_POLICY_SET_FAIL": "off"})
+    def test_timeout_oversize_and_invalid_adapter_output_are_bounded_and_persisted(self):
+        child_pid = self.root / "child.pid"
+        result = self.run_runner(extra_env={
+            "FAKE_ADAPTER_MODE": "hang-child",
+            "FAKE_CHILD_PID": str(child_pid),
+            "IRLUME_HEAD_GESTURE_TEST_TIMEOUT_SECONDS": "1",
+        })
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.log.read_text(encoding="utf-8").splitlines(), [
-            "status",
-            "doctor",
-            "get sudo",
-            "set sudo off",
-            "set sudo required",
-        ])
-        self.assertFalse(self.output.exists())
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        self.assertEqual(trial_record["typed_outcome"], "attempt-timeout")
+        child = int(child_pid.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child, 0)
+
+        for mode in ["oversize", "oversize-stderr", "invalid", "unknown-outcome", "bad-evidence"]:
+            root = self.root / f"evidence-{mode}"
+            root.mkdir(mode=0o700)
+            result = self.run_runner(evidence_root=root, extra_env={"FAKE_ADAPTER_MODE": mode})
+            self.assertNotEqual(result.returncode, 0)
+            trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
+            self.assertIn(trial_record["typed_outcome"], {"adapter-output-invalid", "adapter-exited"})
+            self.assertEqual(list(self.root.glob("irlume-head-gesture.*")), [])
+
+    def test_capability_absence_is_published_but_never_qualified(self):
+        result = self.run_runner(stdin="", extra_env={"FAKE_STATUS_MODE": "absent"})
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn("preflight", self.log.read_text(encoding="utf-8"))
+        self.assertEqual([record["typed_outcome"] for record in self.records()], ["capability-not-present"])
+        schema = subprocess.run(
+            ["python3", str(VALIDATOR), "--schema-only", str(self.evidence_root)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        qualified = subprocess.run(
+            ["python3", str(VALIDATOR), str(self.evidence_root)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(schema.returncode, 0)
+        self.assertEqual(qualified.returncode, 3)
+
+    def test_publication_rejects_unsafe_roots_existing_targets_and_precommit_failure(self):
+        unsafe = self.root / "unsafe"
+        unsafe.mkdir(mode=0o755)
+        self.assertNotEqual(self.run_runner(evidence_root=unsafe).returncode, 0)
+        real = self.root / "real-evidence"
+        real.mkdir(mode=0o700)
+        link = self.root / "evidence-link"
+        link.symlink_to(real, target_is_directory=True)
+        self.assertNotEqual(self.run_runner(evidence_root=link).returncode, 0)
+        inside = self.repo / "evidence"
+        inside.mkdir(mode=0o700)
+        self.assertNotEqual(self.run_runner(evidence_root=inside).returncode, 0)
+        self.assertFalse((inside / ".head-gesture.lock").exists())
+
+        (self.evidence_root / "trial-deadbeef.json").write_text("occupied", encoding="utf-8")
+        self.assertNotEqual(self.run_runner(extra_env={"IRLUME_HEAD_GESTURE_TEST_TOKEN": "deadbeef"}).returncode, 0)
+        (self.evidence_root / "trial-deadbeef.json").unlink()
+        (self.evidence_root / "trial-deadbeef.json").symlink_to(self.root / "outside")
+        self.assertNotEqual(self.run_runner(extra_env={"IRLUME_HEAD_GESTURE_TEST_TOKEN": "deadbeef"}).returncode, 0)
+        (self.evidence_root / "trial-deadbeef.json").unlink()
+        result = self.run_runner(extra_env={"IRLUME_HEAD_GESTURE_TEST_FAIL_BEFORE_PUBLISH": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.records(), [])
+
+    def test_directory_symlink_swap_before_commit_is_rejected(self):
+        pause = self.root / "publish-pause"
+        args, env = self.invocation(extra_env={"IRLUME_HEAD_GESTURE_TEST_PAUSE_BEFORE_PUBLISH": str(pause)})
+        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        process.stdin.write("ready\n")
+        process.stdin.flush()
+        deadline = time.monotonic() + 5
+        while not pause.with_suffix(".ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(pause.with_suffix(".ready").exists(), "publisher did not reach the commit boundary")
+        moved = self.root / "moved-evidence"
+        self.evidence_root.rename(moved)
+        replacement = self.root / "replacement-evidence"
+        replacement.mkdir(mode=0o700)
+        self.evidence_root.symlink_to(replacement, target_is_directory=True)
+        pause.with_suffix(".continue").write_text("go", encoding="utf-8")
+        _, stderr = process.communicate(timeout=10)
+        self.assertNotEqual(process.returncode, 0, stderr)
+        self.assertEqual(list(moved.glob("*.json")), [])
+        self.assertEqual(list(replacement.glob("*.json")), [])
+
+    def test_concurrent_writers_publish_without_loss(self):
+        invocations = [self.invocation() for _ in range(2)]
+        processes = [subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env) for args, env in invocations]
+        results = [process.communicate("ready\n", timeout=10) for process in processes]
+        for process, (_, stderr) in zip(processes, results):
+            self.assertEqual(process.returncode, 0, stderr)
+        records = self.records()
+        self.assertEqual(sum(record["record_type"] == "trial" for record in records), 2)
+        self.assertEqual(sum(record["record_type"] == "capability" for record in records), 2)
+        self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in self.evidence_root.glob("*.json")))
 
 
 if __name__ == "__main__":

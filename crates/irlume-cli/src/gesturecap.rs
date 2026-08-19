@@ -155,6 +155,28 @@ fn identity(args: &[String]) -> ExitCode {
     }
 }
 
+fn classify_production_gesture_window(
+    samples: &[PoseSample],
+) -> (
+    irlume_liveness::HeadGesture,
+    irlume_liveness::NodEvidence,
+    usize,
+) {
+    const CHECK_EVERY: usize = 6;
+    for end in (CHECK_EVERY..=samples.len()).step_by(CHECK_EVERY) {
+        let (verdict, evidence) =
+            irlume_liveness::detect_head_gesture_with_evidence(&samples[..end]);
+        if matches!(
+            verdict,
+            irlume_liveness::HeadGesture::Nod | irlume_liveness::HeadGesture::Shake
+        ) {
+            return (verdict, evidence, end);
+        }
+    }
+    let (verdict, evidence) = irlume_liveness::detect_head_gesture_with_evidence(samples);
+    (verdict, evidence, samples.len())
+}
+
 fn attempt(args: &[String]) -> ExitCode {
     let (Some(expected_digest), Some(expected_gesture), Some(detector), Some(recognizer)) = (
         flag(args, "--expected-camera-identity-digest"),
@@ -205,8 +227,8 @@ fn attempt(args: &[String]) -> ExitCode {
                 "configured camera identity changed during the attempt".into(),
             ));
         }
-        let (verdict, evidence) = irlume_liveness::detect_head_gesture_with_evidence(&samples);
-        let yaw: Vec<f32> = samples
+        let (verdict, evidence, window_frames) = classify_production_gesture_window(&samples);
+        let yaw: Vec<f32> = samples[..window_frames]
             .iter()
             .filter_map(|sample| sample.yaw_signed)
             .collect();
@@ -225,7 +247,7 @@ fn attempt(args: &[String]) -> ExitCode {
         Ok(serde_json::json!({
             "typed_outcome": typed_outcome,
             "detector_evidence": {
-                "frames": samples.len(),
+                "frames": window_frames,
                 "face_frames": evidence.frames,
                 "pitch_range": evidence.pitch_range,
                 "yaw_range": evidence.yaw_range,
@@ -669,6 +691,38 @@ mod tests {
                 "/sys/devices/rgb",
             )
         );
+    }
+
+    #[test]
+    fn hardware_attempt_keeps_a_terminal_rolling_nod_despite_later_yaw_noise() {
+        let mut samples: Vec<PoseSample> = [
+            0.50, 0.50, 0.50, 0.50, 0.60, 0.40, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(idx, pitch_frac)| PoseSample {
+            idx,
+            pitch_frac: Some(pitch_frac),
+            yaw_signed: Some(0.0),
+            bri: 80.0,
+        })
+        .collect();
+        samples.extend((12..18).map(|idx| PoseSample {
+            idx,
+            pitch_frac: Some(0.50),
+            yaw_signed: Some(if idx == 17 { 3.0 } else { 0.0 }),
+            bri: 80.0,
+        }));
+        assert_eq!(
+            irlume_liveness::detect_head_gesture(&samples),
+            irlume_liveness::HeadGesture::None,
+            "the fixture must reproduce the full-take regression"
+        );
+
+        let (verdict, _, frames) = classify_production_gesture_window(&samples);
+
+        assert_eq!(verdict, irlume_liveness::HeadGesture::Nod);
+        assert_eq!(frames, 12);
     }
 
     #[test]

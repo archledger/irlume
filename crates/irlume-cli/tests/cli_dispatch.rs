@@ -261,13 +261,53 @@ fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {
     assert!(out.contains("daemon        : running"), "{out}");
     assert!(
         out.contains("legacy policy blocks authentication")
-            && out.contains("profiles eyes-open off"),
+            && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
         "{out}"
     );
     assert!(out.contains("keyring unlock: not armed"), "{out}");
     assert!(out.contains("templates     : plaintext"), "{out}");
     assert!(out.contains("recovery pass : not set"), "{out}");
     assert!(out.contains("biopolicy     : ENFORCING"), "{out}");
+}
+
+#[test]
+fn status_empty_legacy_enrollment_keeps_the_targeted_cleanup() {
+    let sb = Sandbox::new("status-empty-legacy");
+    serve(&sb.sock(), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::ListProfiles { .. } => Response::Enrollment {
+            profiles: Vec::new(),
+            require_eyes_open: true,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
+        },
+        Request::KeyringInfo { .. } => Response::KeyringInfo {
+            armed: false,
+            policy: None,
+            pcrs: vec![],
+            drifted: None,
+            kind: None,
+        },
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: false,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (code, out, _) = run(
+        &mut sb.cmd(&["status", "--user", "tester"]),
+        "status-empty-legacy",
+    );
+    assert_eq!(code, 0, "status always reports");
+    assert!(out.contains("enrollment    : none"), "{out}");
+    assert!(
+        out.contains("legacy policy blocks authentication")
+            && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
+        "{out}"
+    );
 }
 
 // The credential-release challenge command: DEFAULT-OFF reporting, the root gate,

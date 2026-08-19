@@ -395,6 +395,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
     let user = user_arg(args);
+    let quoted_user = shell_single_quote(&user);
     let req = match sub {
         None | Some("list") => Request::ListProfiles {
             user,
@@ -509,14 +510,14 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             require_eyes_open,
             ..
         }) => {
+            if require_eyes_open {
+                println!(
+                    "[profiles] legacy policy blocks authentication; run: sudo irlume profiles eyes-open off --user {quoted_user}"
+                );
+            }
             if profiles.is_empty() {
                 println!("[profiles] none enrolled");
             } else {
-                if require_eyes_open {
-                    println!(
-                        "[profiles] legacy policy blocks authentication; run: sudo irlume profiles eyes-open off"
-                    );
-                }
                 for p in &profiles {
                     println!("  {} ({} scans)", p.name, p.scans.len());
                     // Per-recognizer breakdown when a profile holds more than
@@ -1264,7 +1265,7 @@ fn toggle_value(args: &[String], sub: &str) -> Option<bool> {
     match value {
         Some(v) if !contradicted => Some(v),
         _ => {
-            eprintln!("usage: irlume profiles {sub} <on|off> [--user U]");
+            eprintln!("usage: irlume profiles {sub} off [--user U] (one-release migration only)");
             None
         }
     }

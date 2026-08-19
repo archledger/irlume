@@ -708,44 +708,45 @@ pub fn status(args: &[String]) -> ExitCode {
             profiles,
             require_eyes_open,
             ..
-        }) if !profiles.is_empty() => {
-            let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
-            println!(
-                "  enrollment    : {} profile(s), {scans} scan(s) {}",
-                profiles.len(),
-                if require_eyes_open { WARN } else { OK }
-            );
+        }) => {
+            if profiles.is_empty() {
+                println!("  enrollment    : none {WARN} (run `irlume enroll`)");
+            } else {
+                let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
+                println!(
+                    "  enrollment    : {} profile(s), {scans} scan(s) {}",
+                    profiles.len(),
+                    if require_eyes_open { WARN } else { OK }
+                );
+                for p in &profiles {
+                    println!("                  - {} ({} scan(s))", p.name, p.scans.len());
+                }
+                // A scan can only match the recognizer it was captured with, which is
+                // what `scans_by_recognizer`'s own doc says: "how many scans" has no
+                // single answer worth reporting on its own. The line above reports
+                // exactly that number with a tick, so a profile whose templates all
+                // belong to a recognizer that is no longer loaded (a third-party model
+                // disabled, or swapped) read as healthy while no face could match.
+                //
+                // Silent when the daemon sent no counts at all: that is an older
+                // daemon, and unknown is not zero.
+                let usable = usable_scans(&profiles);
+                if let Some(0) = usable {
+                    if scans > 0 {
+                        println!(
+                            "                  {WARN} none of those scans belong to the recognizer \
+                             that is loaded now, so no face can match: re-enable the model it was \
+                             enrolled with, or run `irlume enroll` again"
+                        );
+                    }
+                }
+            }
             if require_eyes_open {
                 println!(
                     "                  legacy policy blocks authentication; run: sudo irlume profiles eyes-open off --user {}",
                     crate::shell_single_quote(&user)
                 );
             }
-            for p in &profiles {
-                println!("                  - {} ({} scan(s))", p.name, p.scans.len());
-            }
-            // A scan can only match the recognizer it was captured with, which is
-            // what `scans_by_recognizer`'s own doc says: "how many scans" has no
-            // single answer worth reporting on its own. The line above reports
-            // exactly that number with a tick, so a profile whose templates all
-            // belong to a recognizer that is no longer loaded (a third-party model
-            // disabled, or swapped) read as healthy while no face could match.
-            //
-            // Silent when the daemon sent no counts at all: that is an older
-            // daemon, and unknown is not zero.
-            let usable = usable_scans(&profiles);
-            if let Some(0) = usable {
-                if scans > 0 {
-                    println!(
-                        "                  {WARN} none of those scans belong to the recognizer \
-                         that is loaded now, so no face can match: re-enable the model it was \
-                         enrolled with, or run `irlume enroll` again"
-                    );
-                }
-            }
-        }
-        Ok(Response::Enrollment { .. }) => {
-            println!("  enrollment    : none {WARN} (run `irlume enroll`)")
         }
         Ok(Response::Error(e)) => println!("  enrollment    : error: {e}"),
         _ => println!("  enrollment    : unknown (daemon unreachable)"),

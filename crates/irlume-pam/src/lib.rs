@@ -323,8 +323,17 @@ impl PamServiceModule for IrlumePam {
             // credential either way, since the daemon refuses a non-root
             // UnsealPassword.
             if unseal && !wait && irlume_common::config::credential_release_gesture_required() {
-                let how =
-                    irlume_common::config::head_consent_policy().instruction("unlock your keyring");
+                let policy = irlume_common::config::head_consent_policy();
+                let how = match policy {
+                    irlume_common::config::HeadConsentPolicy::Ready => format!(
+                        "{}; shake your head to decline",
+                        policy.instruction("unlock your keyring")
+                    ),
+                    irlume_common::config::HeadConsentPolicy::LegacyClosure
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured => {
+                        policy.instruction("unlock your keyring")
+                    }
+                };
                 let _ = pamh.conv(
                     Some(&format!("irlume: {how}")),
                     pamsm::PamMsgStyle::TEXT_INFO,

@@ -436,7 +436,8 @@ fn pamwrap_unseal_face_login_releases_sealed_password() {
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
-    const HINT: &str = "keep nodding your head to unlock your keyring";
+    const READY: &str = "keep nodding your head to unlock your keyring; shake your head to decline";
+    const DECLINE: &str = "shake your head to decline";
     let Some(h) = Harness::try_new("crc-hint") else {
         return;
     };
@@ -446,41 +447,80 @@ fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
         Response::Error("face not granted: nod your head to approve".into())
     });
 
-    h.write_service("irlume-crc-login", &[h.auth_line("required", "unseal")]);
+    h.write_service(
+        "irlume-crc-login",
+        &[
+            h.auth_line("sufficient", "unseal"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
 
     // Default (no settings.conf): the gate is OFF, so the greeter stays silent.
     h.write_settings(None);
-    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    assert!(ok, "a refused release must keep password fallback: {out}");
     assert!(
-        !out.contains(HINT),
+        !out.contains(READY),
         "the default (off) must stay silent: {out}"
     );
 
-    // Opted in: the gesture is required, so the greeter is instructed.
-    h.write_settings(Some("credential_release_challenge=1\n"));
-    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-    assert!(
-        out.contains(HINT),
-        "an opted-in gate must be explained: {out}"
-    );
+    // Opted in with absent or explicit legacy `nod`: name both supported head
+    // gestures and preserve the password fallback after the daemon refusal.
+    for settings in [
+        "credential_release_challenge=1\n",
+        "credential_release_challenge=1\nconsent_gesture=nod\n",
+    ] {
+        h.write_settings(Some(settings));
+        let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+        assert!(ok, "a refused release must keep password fallback: {out}");
+        assert!(
+            out.contains(READY),
+            "a ready gate must name nod + shake: {out}"
+        );
+    }
+
+    // Retired closure and malformed settings get only their actionable blocker.
+    for (settings, blocker) in [
+        (
+            "credential_release_challenge=1\nconsent_gesture=closure\n",
+            "eye closure is retired",
+        ),
+        (
+            "credential_release_challenge=1\nconsent_gesture=banana\n",
+            "consent_gesture is invalid",
+        ),
+    ] {
+        h.write_settings(Some(settings));
+        let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+        assert!(ok, "a blocked release must keep password fallback: {out}");
+        assert!(
+            out.contains(blocker) && (out.contains("remove") || out.contains("set it to nod")),
+            "a blocked gate must name its migration: {out}"
+        );
+        assert!(
+            !out.contains(READY) && !out.contains(DECLINE) && !out.contains("close your eyes"),
+            "a blocked gate must print only its migration blocker: {out}"
+        );
+    }
 
     // Explicitly off: silent, the same as the default. Telling the user to nod
     // would be a lie that costs them a login attempt.
     h.write_settings(Some("credential_release_challenge=0\n"));
-    let (_, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-    assert!(!out.contains(HINT), "opted out must stay silent: {out}");
+    let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
+    assert!(ok, "an opted-out release must keep fallback: {out}");
+    assert!(!out.contains(READY), "opted out must stay silent: {out}");
 
     // Opted in, but `wait` (the KDE lock screen runs us as a parallel biometric
     // device): an unsolicited message there competes with the password field.
     h.write_settings(Some("credential_release_challenge=1\n"));
     h.write_service("irlume-crc-lock", &[h.auth_line("required", "unseal wait")]);
     let (_, out) = h.run("irlume-crc-lock", &["authenticate"], "", None);
-    assert!(!out.contains(HINT), "wait mode must stay silent: {out}");
+    assert!(!out.contains(READY), "wait mode must stay silent: {out}");
 
     // Plain verify (sudo): releases no credential, so no gesture and no message.
     h.write_service("irlume-crc-verify", &[h.auth_line("required", "")]);
     let (_, out) = h.run("irlume-crc-verify", &["authenticate"], "", None);
-    assert!(!out.contains(HINT), "verify must stay silent: {out}");
+    assert!(!out.contains(READY), "verify must stay silent: {out}");
 }
 
 /// A ready polkit dialog names BOTH supported head gestures: nod approves and

@@ -479,6 +479,25 @@ fn profiles_usage_errors_exit_2() {
 }
 
 #[test]
+fn profiles_eyes_open_usage_is_off_only_migration() {
+    let sb = Sandbox::new("eyes-open-usage");
+    for argv in [
+        &["profiles", "eyes-open"][..],
+        &["profiles", "eyes-open", "yes"],
+        &["profiles", "eyes-open", "off", "on"],
+    ] {
+        let (code, _, err) = run(&mut sb.cmd(argv));
+        assert_eq!(code, 2, "{argv:?}: {err}");
+        assert!(
+            err.contains("usage: irlume profiles eyes-open off [--user U]")
+                && err.contains("one-release migration"),
+            "{argv:?}: {err}"
+        );
+        assert!(!err.contains("<on|off>"), "{argv:?}: {err}");
+    }
+}
+
+#[test]
 fn add_scan_rejects_a_non_positive_or_unparseable_count() {
     // A state-changing biometric command must refuse an invalid count rather
     // than silently capturing one scan instead (#290 review). Exit 2 is the
@@ -1619,7 +1638,7 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
     assert_eq!(code, 0);
     assert!(
         out.contains("legacy policy blocks authentication")
-            && out.contains("profiles eyes-open off"),
+            && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
         "{out}"
     );
     assert!(out.contains("Face Profile 1 (2 scans)"), "{out}");
@@ -1649,6 +1668,26 @@ fn profiles_empty_listing_says_none_enrolled() {
     let (code, out, _) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
     assert_eq!(code, 0);
     assert!(out.contains("[profiles] none enrolled"), "{out}");
+}
+
+#[test]
+fn profiles_empty_legacy_listing_keeps_the_targeted_cleanup() {
+    let sb = Sandbox::new("profempty-legacy");
+    serve(&sock(&sb), |_| Response::Enrollment {
+        profiles: Vec::new(),
+        require_eyes_open: true,
+        closure_calibrated: false,
+        ir_ratio_calibrated: false,
+    });
+
+    let (code, out, _) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
+    assert_eq!(code, 0);
+    assert!(out.contains("[profiles] none enrolled"), "{out}");
+    assert!(
+        out.contains("legacy policy blocks authentication")
+            && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
+        "{out}"
+    );
 }
 
 #[test]

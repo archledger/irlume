@@ -7032,8 +7032,8 @@ mod tests {
 
     /// A head-shake decline is TERMINAL: `resolve_consent_watch` returns the
     /// stream's `Some(false)` verdict without evaluating the completed-take
-    /// closure, so a completed-take nod or closure reading can never overturn a
-    /// decline into a grant. The panicking closures prove the completed take is
+    /// nod check, so a completed-take nod can never overturn a decline into a
+    /// grant. The panicking callbacks prove the completed take is
     /// not consulted for either `Some` outcome; before the fix a shake fell
     /// through to it and a take carrying the shake motion could be re-read as an
     /// approval. Only a budget-exhausted `None` consults the boundary check.

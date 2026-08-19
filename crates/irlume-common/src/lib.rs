@@ -901,7 +901,7 @@ pub enum Response {
         tier: String,
         rgb_dev: Option<String>,
         ir_dev: Option<String>,
-        /// FaceMesh (passive blink liveness) model loaded.
+        /// FaceMesh dense-landmark model loaded for BlazeFace rescue alignment.
         mesh: bool,
         /// IR domain adapter loaded.
         adapter: bool,
@@ -943,8 +943,8 @@ pub enum Response {
     Position(PositionReport),
     /// Delivered-rate diagnostic report (`CameraDiagnostics`).
     CameraDiagnostics(Box<CameraDiagnosticsReport>),
-    /// Median eye-aspect-ratio over a capture (`CaptureEarMedian`); `None` if no
-    /// eye was detected in any frame.
+    /// Retired `CaptureEarMedian` response tombstone. No current request
+    /// produces it; retained for one-release wire compatibility.
     EarMedian(Option<f32>),
     Error(String),
     /// A failure the caller can act on, sent ONLY to a request that opted in

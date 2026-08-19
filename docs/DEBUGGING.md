@@ -209,23 +209,14 @@ or bbox jitter can override them on the daemon unit without a rebuild:
 | `IRLUME_RGB_MOIRE_MAX` | screen-replay moiré ceiling (also listed in [SETUP.md](SETUP.md)) | 28 |
 | `IRLUME_NO_ILLUM_META=1` | disable the IR illumination-metadata reader entirely, for isolating whether the metadata node itself is what a camera trips over | off |
 
-`IRLUME_BLINK_MOTION_MAX`, `IRLUME_BLINK_CONTRAST_DROP` and
-`IRLUME_BLINK_CONTRAST_MOTION_FLOOR` tune `detect_blink`, which since the
-blink gate was retired ([ADR-0002](adr/0002-challenge-response-liveness.md))
-is reached only by the `IRLUME_DEV=1` tools `blinkcap` and `meshprobe`.
-Setting them on the daemon unit changes nothing an authentication does.
-
 A value that does not parse, is not finite, or sits outside the range its
 setting accepts is ignored: the default above stays in force and irlumed prints
 one line to the journal naming the variable and the reason. Check for that line
 before concluding a tuned threshold took effect. The same holds for
-`IRLUME_NOD_PITCH_MIN` and the two consent-closure settings.
-
-`IRLUME_CONSENT_CLOSURE_FRAMES` and `IRLUME_CONSENT_CLOSURE_MAX` are resolved as
-a pair, and the resulting window is always satisfiable. A maximum below the
-minimum in force is refused, and a minimum above the built-in maximum of 25
-carries the maximum up with it rather than leaving a window no closure can fall
-inside.
+`IRLUME_NOD_PITCH_MIN` and the retained head-shake thresholds. These are
+hardware-calibration overrides; the head-only retirement did not retune their
+defaults. `gesturecap` is the developer capture/replay tool for inspecting the
+same pose classifier.
 
 `IRLUME_DEBUG_IR` (any value) additionally logs the IR burst's
 ambient-subtraction decisions frame by frame.

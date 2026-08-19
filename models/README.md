@@ -27,7 +27,7 @@ model. Regenerating with `*.onnx` alone drops the line and breaks both.
 |---|---|---|---|---|
 | `face_detection_yunet_2023mar.onnx` | detection | [OpenCV Zoo](https://github.com/opencv/opencv_zoo) | **MIT** | bbox + 5 landmarks; int8 variant also fine |
 | `glintr100.onnx` | recognition | [fal/AuraFace-v1](https://huggingface.co/fal/AuraFace-v1) | **Apache-2.0** | 512-D ArcFace; use ONLY this file from the repo |
-| `face_landmark.onnx` | liveness (EAR) + rescue alignment | Google MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite` from `face_landmarker.task`) | **Apache-2.0** | 478 landmarks (468 + iris); input `[1,256,256,3]` RGB → `1434` + face flag. Replaced the legacy 192px/468pt FaceMesh 2026-07-15 (measured 28% better eye accuracy on CBSR ground truth, NME 0.0378 → 0.0273 through the YuNet-crop pipeline); the loader auto-detects either generation, legacy banked as `.legacy-192`. |
+| `face_landmark.onnx` | dense landmarks + rescue alignment | Google MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite` from `face_landmarker.task`) | **Apache-2.0** | 478 landmarks (468 + iris); input `[1,256,256,3]` RGB → `1434` + face flag. Refines BlazeFace rescue boxes into alignment points. Replaced the legacy 192px/468pt FaceMesh 2026-07-15 (measured 28% better eye accuracy on CBSR ground truth, NME 0.0378 → 0.0273 through the YuNet-crop pipeline); the loader auto-detects either generation, legacy banked as `.legacy-192`. |
 | `blaze_face_short_range.onnx` | detection rescue | Google MediaPipe BlazeFace short-range (`blaze_face_short_range.tflite`) | **Apache-2.0** | Cascade stage 2: runs only when YuNet finds no face. 2026-07-15 bench: on saturated outdoor-walking frames the cascade (YuNet→BlazeFace) detects 98.5% vs YuNet-alone's 76.9%; BlazeFace-alone weakens to 40% on shaded faces where YuNet holds 99%, so it is a rescue, never a YuNet replacement. Box refined by FaceMesh before alignment. |
 
 Every file above is MIT or Apache-2.0 with first-party or commercially
@@ -76,9 +76,9 @@ custom op onnxruntime rejected), which is why the 468-point model shipped
 first; the `face_landmarker.task` mesh converts without that op. Non-license
 caveats to document at use: the card's out-of-scope notes ("not for
 facial recognition/identification", "not for life-critical decisions") are
-**advisory**: irlume uses it for LIVENESS (EAR/blink) plus rescue-path
-alignment, never recognition, with a mandatory password fallback; and it is
-RGB/selfie-trained, so IR-grey performance must be validated (see ADR-0002).
+**advisory**: irlume uses it for dense landmarks and rescue-path alignment,
+never recognition or head consent, with a mandatory password fallback; and it
+is RGB/selfie-trained, so rescue behavior on IR-grey frames must be validated.
 
 ## Do NOT use
 
@@ -92,9 +92,10 @@ RGB/selfie-trained, so IR-grey performance must be validated (see ADR-0002).
   and no documented training data** (verified 2026-06-30; the re-export disclaims
   training and gives no warranty). Weights ≠ code: an Apache `LICENSE` on the source
   does not license weights whose provenance is unwarrantable. **Fails the clean-BOM
-  bar**; do not bundle. Anti-spoofing stays algorithmic (IR physics + challenge-
-  response, [`../docs/adr/0002-challenge-response-liveness.md`](../docs/adr/0002-challenge-response-liveness.md))
-  until a clean-licensed PAD model or own-IR-rig data exists.
+  bar**; do not bundle. Built-in anti-spoofing stays algorithmic IR physics;
+  head consent is a separate intent gate
+  ([ADR-0009](../docs/adr/0009-head-gesture-only-consent.md)) until a
+  clean-licensed PAD model or own-IR-rig data exists.
 
 ## Verification
 

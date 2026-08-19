@@ -306,10 +306,10 @@ fn resolve_override<T: OverrideValue>(
 
 /// True the first time `name` is refused in this process.
 ///
-/// The moiré ceiling is read on every authentication and the blink thresholds
-/// on every capture window, so printing per call would repeat the same line for
-/// as long as the bad value stays in the unit file. One line per variable is
-/// what makes it findable in the journal.
+/// Retained threshold overrides may be read more than once per process, so
+/// printing per call would repeat the same line for as long as the bad value
+/// stays in the unit file. One line per variable is what makes it findable in
+/// the journal.
 fn first_refusal(name: &'static str) -> bool {
     static REFUSED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
     // A panic under this lock elsewhere must not turn a logging decision into a

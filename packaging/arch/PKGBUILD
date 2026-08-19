@@ -2,7 +2,7 @@
 pkgname=irlume
 pkgver=0.10.0
 pkgrel=1
-pkgdesc="Windows Hello-style face login for Linux"
+pkgdesc="Face authentication for Linux with head-gesture consent and passive PAD"
 arch=('x86_64')
 url="https://github.com/archledger/irlume"
 license=('GPL-3.0-or-later')
@@ -69,8 +69,8 @@ package() {
     # and was simply forgotten: the unit pointed IRLUME_MESH_MODEL at a file
     # this package never shipped (#360). Being absent is silent, because
     # Engine::with_mesh treats a missing path as a no-op and returns Ok, so the
-    # daemon starts and passive liveness, the closure gesture and the BlazeFace
-    # rescue just stop working. Spelled out, each model is one line to add and
+    # daemon starts but BlazeFace rescue alignment stops working. Spelled out,
+    # each model is one line to add and
     # check-packaging-parity.sh can see every name.
     install -Dm0644 models/glintr100.onnx \
         "$pkgdir/usr/share/irlume/models/glintr100.onnx"

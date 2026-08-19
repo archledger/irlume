@@ -36,8 +36,7 @@ Conventions that apply everywhere:
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user; the deliberate counterpart to `models disable`, which deletes weights but keeps templates. `<model>` is `shipped`, a catalog name, or an `embed:<sha256>` tag as `profiles list` prints it. A profile left with no scans is deleted with them |
-| `irlume profiles eyes-open off` | turn off the eyes-open check. It cannot be turned ON: the gate refuses the user it exists to admit, so the daemon declines (#386) |
-| `sudo irlume calibrate-closure [--rounds N] [--force] [--measure-only [--pose L]]` | teach the eye-closure consent gesture for app prompts. Captures eyes-open/closed EAR over N rounds (default 3) and stores the median, because a single capture varies enough to leave the threshold sitting on top of your own closures; it then reports how many of your readings the result would actually accept. Replacing an existing calibration asks first, and `--force` is required to do it with no terminal. `--measure-only` prints the EAR readings and stores nothing, and `--pose L` labels what you are holding in that data (e.g. `glasses-on-open`). The head nod is the default and needs no calibration |
+| `irlume profiles eyes-open off` | one-release migration command: clear a stored legacy eyes-open blocker. It cannot be turned on |
 | `irlume identify` | 1:N "who is this?"; as root it checks all users, otherwise scoped to you |
 
 ## Keyring, TPM, and recovery
@@ -80,29 +79,20 @@ Hidden unless `IRLUME_DEV=1` is set, because they open the camera directly and
 bypass the daemon. Not needed for normal use.
 
 `capture`, `eval`, `irbench`, `genuine`, `calcapture`, `normprobe`,
-`liveness`, `meshprobe`, `selftest align`, `padcapture`, `padreport`,
-`verify`, `enrolldev`, `suncal`, `blinkcap`
+`liveness`, `selftest align`, `padcapture`, `padreport`, `verify`,
+`enrolldev`, `suncal`, `gesturecap`
 
 Each prints its own usage line when run without arguments. `padcapture` /
 `padreport` are the presentation-attack self-test pair documented in
 [PAD_SELFTEST.md](PAD_SELFTEST.md); `suncal` is the outdoor/sunlight
 calibration analyzer.
 
-`blinkcap select` evaluates the issue #173 multi-calibration selector without
-changing authentication or enrollment:
+`gesturecap` captures or replays head-pose evidence with the shipped classifier:
 
 ```console
-IRLUME_DEV=1 irlume blinkcap select \
-  --profiles profiles.json --attempts attempts/ --prefix-frames 6
+IRLUME_DEV=1 irlume gesturecap capture --label nod --det models/face_detection_yunet_2023mar.onnx --model models/glintr100.onnx --out nod.jsonl
+IRLUME_DEV=1 irlume gesturecap replay nod.jsonl
 ```
-
-The manifest contains one or more named profiles, each referencing at least two
-existing blinkcap JSONL recordings for its `open` phase and two for its `closed`
-phase. Relative paths resolve beside the manifest. The command derives observed
-ranges from per-recording medians, classifies only the explicit prefix, discards
-that prefix, and runs the existing detector only when exactly one profile is
-eligible. Its output is marked `SHADOW ONLY`; ambiguous, closed-like,
-out-of-range, malformed, or incomplete evidence can never become consent.
 
 ## Where to go next
 

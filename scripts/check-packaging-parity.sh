@@ -84,8 +84,8 @@ done
 # RUNTIME, and never installed the MODEL; the filename was present twice, so a
 # name grep was satisfied while `IRLUME_MESH_MODEL` pointed at a file the
 # package did not ship (#360). Being absent is silent: Engine::with_mesh treats
-# a missing path as a no-op and returns Ok, so the daemon starts and passive
-# liveness, the closure gesture and the BlazeFace rescue just stop working.
+# a missing path as a no-op and returns Ok, so the daemon starts but BlazeFace
+# rescue alignment stops working.
 #
 # So this looks for the filename next to the lane's INSTALL DESTINATION, within
 # a two-line window because two lanes wrap the install across a continuation,

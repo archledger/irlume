@@ -66,7 +66,9 @@ machine has: an infrared (Windows Hello) camera enables the secure tier
 while a regular RGB webcam enables convenient screen unlock, and a
 fingerprint reader can join as a companion factor. A thin PAM module talks
 to a privileged daemon that owns the camera and runs a clean-license model
-stack (YuNet + AuraFace). Password is always the fallback; no lockout.
+stack. Gesture-gated requests use head nodding to approve and a head shake to
+decline; passive PAD remains separate. Password is always the fallback; no
+lockout.
 
 %package selinux
 Summary:        SELinux policy module for irlume

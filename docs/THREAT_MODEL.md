@@ -162,9 +162,9 @@ here is a claim about those.
 
 ## Liveness: algorithmic single-frame gate (no trained weights)
 
-The default gate uses no trained weights. (The consent-gesture stage does run
-a trained model, MediaPipe FaceMesh, for eye landmarks; it is a landmarker,
-not a spoof classifier, and is Apache-2.0, so the clean-BOM claim holds.)
+The default PAD gate uses no trained weights. MediaPipe FaceMesh remains a
+dense landmarker for BlazeFace rescue alignment, not a spoof classifier or a
+consent detector; it is Apache-2.0, so the clean-BOM claim holds.
 
 Physically-grounded cues, hard gate (any failure rejects):
 
@@ -245,7 +245,7 @@ requires a daemon-verified live biometric even against root).
 **Fingerprint presentation attacks: scope.** The fingerprint path's
 anti-spoofing is whatever the sensor and `fprintd` provide, which for common
 match-on-host readers is **none**. irlume's IR liveness gates (emitter
-ratio/glint/center-edge cues, eyes-open) apply to the **face path
+ratio/glint/center-edge cues) apply to the **face path
 only** and do not transfer. For reference, Windows Hello certification
 *requires* fingerprint anti-spoofing; irlume's fingerprint companion makes no
 equivalent claim. Treat it as convenience-tier against a determined attacker
@@ -275,39 +275,31 @@ with a fabricated print.
 
 ## Intent, throttling, and privilege elevation
 
-- **Face never fires passively.** The camera powers on only when the user
-  submits an empty password field and presses Enter; typing a password never
-  starts a scan. In FIDO terms, that deliberate gesture is the User Presence /
-  intent signal and the face match is User Verification. This is the same shape
-  as macOS Touch ID for `sudo`, where the deliberate fingerprint touch is both
-  the intent act and the verification. It is the specific gap that a passive
-  face-auth tool has for privilege elevation (a face silently approving `sudo`
-  just by being in frame, cf. Howdy issue #1079); irlume does not have it,
-  because presence alone triggers nothing. face-`sudo` therefore requires no
-  extra challenge beyond the gesture and the default IR liveness gate: adding
-  one would impose latency and false rejects on a factor whose fallback (the
-  password) is always one keystroke away.
-- **Credential release can require a temporal gesture (default OFF, opt-in).**
+- **Head consent is a separate intent gate.** Repeated nodding approves and a
+  head shake declines. Elevation and polkit require it by default; lock-screen
+  and greeter policy keep their existing defaults. Per-service overrides remain.
+  A nod never bypasses face matching or automatic passive PAD, and a shake is
+  not evidence that the presentation is live. On polkit a shake retains the
+  existing `PAM_ABORT`; other services deny the face attempt and keep password
+  or fingerprint fallback. At greeters that support on-demand face auth, an
+  empty password plus Enter starts the camera; typing a password does not.
+- **Cold-keyring credential release can require head consent (default OFF,
+  opt-in).**
   Releasing the TPM-sealed login-keyring password happens on a greeter cold login
   (from reboot) and after logout. It defaults to releasing after the face match
-  with no gesture, because the gesture was measured to be intent, not liveness (it
+  with no gesture, because the gesture is intent, not liveness (it
   fired on a hand-held print 2 times in 24 on 2026-07-27, so it never stood
   between a photograph and the credential; the cross-spectrum liveness and PAD
   cues do, and the typed password is always the fallback). A user who wants the
   extra deliberate-intent step turns it on with
   `sudo irlume credential-release-challenge on`: the `UnsealPassword` match is
-  then followed by a deliberate gesture performed on request, a head nod or a
-  calibrated eye closure (the same gate polkit prompts use). Login, the lock
-  screen, `sudo` and polkit are decided by their own service policy. A nod needs
-  no calibration, so existing enrollments keep working without re-enrolling. When
-  the gesture is on, every way it can fail to happen (no gesture in the window, no
-  IR camera, FaceMesh not deployed, camera busy, closure-only mode without a
-  calibration) ends in the typed-password path, never a lockout, and the keyring
-  then unlocks from the typed password exactly as it would have from a released
-  one. `irlume doctor` reports the state and flags a gate that is enabled but
-  cannot run. When on, this is a replay-resistance measure, not proof of physical
-  liveness: it raises the cost of a static-presentation attack on the credential
-  path, and it does not make a face grant equivalent to a live person.
+  then followed by repeated head nodding; a shake declines. Login, lock screen,
+  `sudo`, and polkit are decided by their own service policy. When the gesture
+  is on, every way it can fail to happen (no gesture in the window, no IR
+  camera, or a busy camera) ends in the typed-password path, never a lockout,
+  and the keyring then unlocks from the typed password exactly as it would have
+  from a released one. `irlume doctor` reports the state. This remains an intent
+  step, not proof of physical liveness.
 
   **What it was measured to do (2026-07-25, one camera, seated user, 17 attempts
   against the real greeter stack).** Nodding continuously released 4 times out of

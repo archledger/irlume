@@ -321,11 +321,9 @@ sudo irlume login enable --with-polkit --apply
 
 The daemon treats polkit as verify-only (it never releases the TPM-sealed
 credential to it) and requires a deliberate consent gesture before approving,
-because the prompt starts scanning without any action from you. The default
-gesture is a **head nod** (no calibration; works at any angle or lighting). If
-you prefer to approve by closing your eyes for about a second, run `sudo irlume
-calibrate-closure` once and either gesture is accepted; calibrate in the light
-you actually use, because the stored eye measurements shift as the room changes.
+because the prompt starts scanning without any action from you. Keep nodding to
+approve; shake your head to decline. This is an intent step, not liveness:
+automatic passive PAD remains mandatory and separate.
 Full walkthrough, Bitwarden setup, and the security stance:
 [APP-INTEGRATION.md](APP-INTEGRATION.md).
 
@@ -479,11 +477,15 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a gesture before your keyring password is released (default: off, so a greeter cold login and logout release with no nod); `service_gesture.<service>=0\|1` overrides the consent gesture per PAM service (`sudo`, `polkit-1`, …) or the special token `credential_release`; `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in PAD model; `third_party_recognizer=<name>` names an enabled opt-in recognizer (`models add buffalo` writes it); `consent_gesture=nod\|closure` restricts the consent gesture (unset = either) | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off`; `sudo irlume models enable/add/disable` |
+| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before your keyring password is released (default: off, so a greeter cold login and logout release with no nod); `service_gesture.<service>=0\|1` overrides the head-consent gate per PAM service (`sudo`, `polkit-1`, …) or the special token `credential_release`; `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` names an enabled opt-in PAD model; `third_party_recognizer=<name>` names an enabled opt-in recognizer (`models add buffalo` writes it). For one release, legacy `consent_gesture=nod` is accepted but redundant; `closure` fails closed until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off`; `sudo irlume models enable/add/disable` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
 | `/var/lib/irlume/ir-emitter-journal/` | one record per camera, holding the bytes a control held before `ir-setup` changed it. Written before the change and removed once the control reads back as restored, so a crash, a kill or a power loss mid-setup leaves something that can undo it. Root-only | `irlume ir-setup`, cleared by it or by the next capture |
+
+During the one-release migration window, a stored legacy eyes-open policy also
+fails closed. Clear it with `irlume profiles eyes-open off`; no current setup
+path enables it.
 
 Camera selection precedence: the `IRLUME_RGB_DEVICE`+`IRLUME_IR_DEVICE` env
 pair (both set), then `cameras.conf`, then auto-detection, then the compiled
@@ -511,7 +513,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user | `0x81010002` |
 | `IRLUME_METHOD_CONF` | alternate path for the method file | `/etc/irlume/method` |
 
-Liveness-cue tuning knobs (blink thresholds, IR capture debug) are in
+Liveness-cue tuning knobs and IR capture debug settings are in
 [DEBUGGING.md](DEBUGGING.md); development sandbox overrides (state/config/socket
 paths) are in [DEVELOPMENT.md](DEVELOPMENT.md).
 

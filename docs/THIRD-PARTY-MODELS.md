@@ -204,24 +204,19 @@ rescue slot feeds the grant path, and no corpus yet covers prints,
 screens or other faces on the frames where a rescue fires. That corpus is
 issue #440.
 
-**Landmarks: not directly swappable, and the migration is narrower than
-it first looks.** The InsightFace 106-point model (`2d106det.onnx`) emits a single `fc1[1,212]` tensor: 106
-two-dimensional points. irlume's eye-aspect-ratio and deliberate-closure
-cues index the MediaPipe mesh topology by number (`EAR_LEFT` and
-`EAR_RIGHT`), so adopting a 106-point model means defining a new eye
-mapping and re-measuring those gates against the calibration corpora.
+**Landmarks: not directly swappable.** The InsightFace 106-point model
+(`2d106det.onnx`) emits a single `fc1[1,212]` tensor. irlume retains private
+MediaPipe topology indices to derive alignment eye centers from a BlazeFace
+rescue box, so a replacement must preserve that rescue-alignment contract and
+be remeasured on rescue frames.
 
-Head pose and the nod and head-shake consent gestures are NOT part of
-that migration: they read the detector's five landmarks
-(`head_pose(&Landmarks5)`), not the mesh, so a mesh swap leaves them
-untouched. The review round on this PR corrected an earlier draft here
-that claimed otherwise; the iris points are likewise not implicated,
-since every EAR index is below 468. What remains is real but bounded:
-an eye-landmark mapping and a re-measured closure gate.
+Head pose and the nod and head-shake consent gestures are not part of that
+migration: they read the primary detector's five landmarks
+(`head_pose(&Landmarks5)`), not the mesh.
 
-The stage stays closed regardless, because a mesh feeds cues that
-produce confident numbers from wrong pixels rather than erroring, and
-nothing has measured what this model's landmarks do to those cues.
+The stage stays closed because rescue alignment feeds the grant path and wrong
+landmarks can produce a confidently misaligned recognition chip rather than an
+error. Nothing has measured this model on the rescue corpus.
 
 Whether a given licence permits **your** use of a model is your determination.
 irlume prints the licence before enabling anything and distributes no weights.

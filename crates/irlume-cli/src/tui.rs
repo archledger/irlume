@@ -1539,16 +1539,16 @@ impl App {
             // The mesh ships as a .tflite (#295) and the packaged unit points
             // IRLUME_MESH_MODEL at it, so a running daemon reporting the mesh
             // is the ground truth that the TFLite runtime loaded, the same way
-            // Health answers for ONNX. A daemon running WITHOUT the mesh is
-            // not fine: passive blink liveness is off, and with the release
-            // challenge on, a face login leaves the keyring locked.
+            // Health answers for ONNX. A daemon running WITHOUT the mesh loses
+            // BlazeFace rescue alignment; head consent uses the primary
+            // detector's five landmarks and remains available.
             v.push(mk(
                 "TFLite runtime",
                 if h.mesh { Sev::Ok } else { Sev::Warn },
                 if h.mesh {
                     "loaded (the daemon reports FaceMesh, which ships as a .tflite)".into()
                 } else {
-                    "FaceMesh is not loaded: passive blink liveness is off".into()
+                    "FaceMesh is not loaded: BlazeFace rescue alignment is unavailable".into()
                 },
                 if h.mesh {
                     Fix::None

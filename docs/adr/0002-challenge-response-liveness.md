@@ -1,14 +1,15 @@
 # ADR-0002: Challenge-response temporal liveness for IR-reflective print attacks
 
-**Status:** SUPERSEDED. The per-enrollment blink `require_challenge` gate this ADR
-describes was retired: it collapsed in field conditions (11 of 11 genuine sudo
-attempts got no blink verdict, 2026-07-01 daemon path) and, measured against a
-hand-held print, fired 2 times in 24, so it was intent rather than the anti-print
-layer. It is replaced by deliberate NOD (approve) and HEAD-SHAKE (decline) consent
-gestures, gated per service; `require_challenge`, the `profiles challenge` command,
-and the `SetRequireChallenge` request are removed. The passive-liveness capture
-infrastructure stays for `require_eyes_open`. The history below is kept for the
-reasoning and the measurements.
+**Status:** SUPERSEDED by [ADR-0009](0009-head-gesture-only-consent.md). The
+per-enrollment blink `require_challenge` gate this ADR describes was retired: it
+collapsed in field conditions (11 of 11 genuine sudo attempts got no blink
+verdict, 2026-07-01 daemon path) and, measured against a hand-held print, fired 2
+times in 24, so it was intent rather than the anti-print layer. All
+user-performed eye mechanisms are now retired. Deliberate nod approval and
+head-shake decline are gated per service and remain separate from passive PAD;
+see the approved
+[retirement design](../superpowers/specs/2026-08-19-head-gesture-only-retirement-design.md).
+The history below is kept for its reasoning and measurements.
 
 Original status: Accepted. The shipped design was **passive EAR** liveness
 (MediaPipe FaceMesh), opt-in/off, implemented & validated 2026-07-01 (APCER 0% /

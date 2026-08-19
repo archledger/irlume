@@ -5,6 +5,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Eye-based user challenges are retired. Gesture-gated requests now use only
+  repeated head nodding to approve and a head shake to decline. Existing
+  per-service defaults are unchanged; passive PAD remains mandatory.
+- Legacy `consent_gesture=closure` and `require_eyes_open=true` fail closed with
+  migration instructions for one release. Contract-1 eye fields remain present
+  and frozen at `false`.
+
 ### Added
 
 - **Camera discovery and opens now cross one process-owned backend boundary.**

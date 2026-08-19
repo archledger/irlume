@@ -3,6 +3,12 @@
 **Status:** Accepted (V1.0)
 **Date:** 2026-06-28
 
+> **Current disposition (2026-08-19):** The dated PAD evidence and threshold
+> conclusions below remain authoritative. User-performed eye mechanisms are
+> retired by [ADR-0009](0009-head-gesture-only-consent.md); current consent is
+> head-only and remains separate from passive PAD. See the approved
+> [retirement design](../superpowers/specs/2026-08-19-head-gesture-only-retirement-design.md).
+
 ## Context
 
 Presentation Attack Detection (PAD) can be approached two ways: single-frame

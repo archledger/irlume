@@ -47,8 +47,7 @@ pub enum OperationClass {
     /// credential is NEVER released to it: the polkit agent starts the PAM
     /// conversation the moment its dialog opens, with no user gesture, so this
     /// class must not be able to pull anything out of the TPM. The engine also
-    /// forces the passive-liveness blink gate for it (see
-    /// [`requires_consent_gesture`]).
+    /// forces head consent for it (see [`requires_consent_gesture`]).
     AppConsent,
     /// Remote access (sshd, etc.); face auth must never satisfy this.
     Remote,
@@ -127,12 +126,10 @@ pub fn decide(class: OperationClass, tier: Tier) -> Action {
     }
 }
 
-/// True for classes where a face grant must additionally pass the passive
-/// blink gate even when the user's enrollment did not opt in. polkit agents
-/// (KDE, GNOME Shell) start the PAM conversation as soon as their dialog
-/// opens, so without this a face match completes with no user action at all;
-/// requiring a natural blink guarantees a live person is looking at the
-/// dialog that names what is being approved.
+/// True for classes where a face grant must additionally pass head consent.
+/// polkit agents (KDE, GNOME Shell) start the PAM conversation as soon as their
+/// dialog opens, so without this a face match completes with no user action at
+/// all. Consent records intent; passive PAD remains a separate gate.
 pub fn requires_consent_gesture(class: OperationClass) -> bool {
     matches!(class, OperationClass::AppConsent)
 }

@@ -2,6 +2,13 @@
 
 Date: 2026-08-18
 
+> **Superseded (2026-08-19):** Eye-based consent was retired before this
+> evidence-only selector became an authorization feature. Current consent is
+> head-only under [ADR-0009](../adr/0009-head-gesture-only-consent.md) and the
+> approved [retirement design](../superpowers/specs/2026-08-19-head-gesture-only-retirement-design.md).
+> The research, measurements, hashes, and conclusions below remain historical
+> evidence for that decision.
+
 Issue: [#173 — Closure calibration is one snapshot per user, but glasses change
 the eye it measured](https://github.com/archledger/irlume/issues/173)
 

@@ -227,7 +227,7 @@ fn write_test_seal_without_pcr_snapshot(path: &Path) {
 // ---------------------------------------------------------------- status arms
 
 // status renders one arm per daemon answer; cli.rs pins the all-green dashboard,
-// so these pin the OTHER branches: eyes-open-required enrollment, an un-armed
+// so these pin the OTHER branches: a legacy eyes-open blocker, an un-armed
 // KeyringInfo, plaintext/not-set recovery, and the opt-in biopolicy gate ON.
 #[test]
 fn status_eyes_open_unarmed_plaintext_and_biopolicy_enforcing() {

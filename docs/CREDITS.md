@@ -7,7 +7,7 @@ The bundled models:
 
 - **[YuNet](https://github.com/opencv/opencv_zoo)** (OpenCV Zoo, MIT) detects faces in both streams.
 - **[AuraFace](https://huggingface.co/fal/AuraFace-v1)** by fal (Apache-2.0) is the 512-D ArcFace recognizer; irlume ships only its `glintr100.onnx`.
-- **[MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** and **[BlazeFace short-range](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)** (Google, Apache-2.0) supply the dense landmarks behind the eye-closure consent gesture and its calibration, and the detection-rescue stage for saturated frames.
+- **[MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** and **[BlazeFace short-range](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)** (Google, Apache-2.0) supply dense landmarks and the detection-rescue stage for saturated frames; FaceLandmarker refines BlazeFace rescue boxes for alignment.
 
 The TPM and camera code builds on:
 

@@ -287,8 +287,9 @@ in
         IRLUME_MODEL = "${models}/glintr100.onnx";
         # Nix does not yet package libtensorflowlite_c.so (docs/NIXOS.md), so
         # this lane keeps the pinned ONNX conversion as its production mesh
-        # until the runtime and its closure are wired together. Every FHS
-        # lane runs the native default.
+        # until the runtime dependency is wired. The mesh remains dense-landmark
+        # infrastructure for BlazeFace rescue alignment; every FHS lane runs the
+        # native default.
         IRLUME_MESH_MODEL = "${models}/face_landmark.onnx";
         IRLUME_BLAZE_MODEL = "${models}/blaze_face_short_range.onnx";
         IRLUME_SOCKET = "/run/irlume.sock";

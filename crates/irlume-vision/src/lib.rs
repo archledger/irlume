@@ -1906,8 +1906,8 @@ mod model_tests {
         };
         let bbox = [64.0, 64.0, 192.0, 192.0];
         let lm = m.landmarks(&view, &bbox, 0.25).expect("landmarks");
-        // Either mesh generation is acceptable; the EAR/mouth indices used by
-        // the blink gate exist in both.
+        // Either mesh generation is acceptable; both carry the private eye-ring
+        // indices used to derive alignment points for BlazeFace rescue boxes.
         assert!(
             lm.len() == MESH_N || lm.len() == MESH_N_IRIS,
             "unexpected landmark count {}",

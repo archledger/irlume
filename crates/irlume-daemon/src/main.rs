@@ -557,10 +557,9 @@ fn main() {
                     // entirely dead" on any host where the bundled runtime
                     // does not load (a GLIBCXX below the .deb build's 3.4.30
                     // floor, a failed unpack); 0.9.0 pointed the unit at the
-                    // ONNX mesh and started fine on the same host. The nod
-                    // path needs no mesh; the eye-closure gesture and the
-                    // rescue alignment are off and every consent prompt still
-                    // works by nod. IRLUME_MODELS_STRICT keeps the refusal
+                    // ONNX mesh and started fine on the same host. Head consent
+                    // needs no mesh; rescue alignment is unavailable, while
+                    // every consent prompt still works. IRLUME_MODELS_STRICT keeps the refusal
                     // for operators who asked for it. An ABSENT mesh file was
                     // already a silent no-op inside with_mesh.
                     .and_then(|e| {
@@ -574,9 +573,9 @@ fn main() {
                         if let Some(err) = err {
                             eprintln!(
                                 "irlumed: FaceMesh did not load ({err}); continuing WITHOUT \
-                                 the mesh: the eye-closure consent gesture and the \
-                                 detection-rescue alignment are off, the head nod still \
-                                 works. Fix the TFLite runtime (doctor: tflite-runtime) or \
+                                 the mesh: BlazeFace detection-rescue alignment is unavailable; \
+                                 head nod approval and head-shake decline still work. Fix the \
+                                 TFLite runtime (doctor: tflite-runtime) or \
                                  set IRLUME_MESH_MODEL to the ONNX mesh."
                             );
                         }

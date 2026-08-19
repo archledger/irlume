@@ -2055,6 +2055,16 @@ fn serve(
     diagnostic_state: &diagnostics::DiagnosticState,
 ) -> std::io::Result<()> {
     let peer = peer_cred(&stream)?;
+    serve_peer(stream, arbiter, engine_ready, diagnostic_state, peer)
+}
+
+fn serve_peer(
+    stream: UnixStream,
+    arbiter: &arbiter::Arbiter<Queued>,
+    engine_ready: &std::sync::atomic::AtomicBool,
+    diagnostic_state: &diagnostics::DiagnosticState,
+    peer: Peer,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
     match read_request(&stream)? {
@@ -2090,6 +2100,10 @@ fn serve(
                 return respond(stream, &dispatch_before_engine(req, &peer));
             }
             if let Some(resp) = pregate(&req, &peer) {
+                // This is a completed production request even though it never
+                // queues: retain its failed Status diagnostic before replying.
+                let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
+                scope.finish(categorical_outcome(&resp));
                 return respond(stream, &resp);
             }
             let class = arbiter::classify(&req);
@@ -5312,6 +5326,24 @@ mod tests {
         })
     }
 
+    fn with_serve_as_peer_and_diagnostics<R>(
+        arbiter: &arbiter::Arbiter<Queued>,
+        ready: &std::sync::atomic::AtomicBool,
+        diagnostic_state: &diagnostics::DiagnosticState,
+        peer: Peer,
+        client: impl FnOnce(&UnixStream) -> R,
+    ) -> R {
+        std::thread::scope(|scope| {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let server =
+                scope.spawn(|| serve_peer(theirs, arbiter, ready, diagnostic_state, peer).unwrap());
+            let out = client(&ours);
+            drop(ours);
+            server.join().unwrap();
+            out
+        })
+    }
+
     /// Exclusive. For a test that MUTATES the environment.
     fn env_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         crate::test_support::env_write()
@@ -6382,6 +6414,138 @@ mod tests {
         assert_eq!(snapshot.events().len(), 1);
         arbiter.close();
         assert!(arbiter.take().is_none(), "snapshot must never queue");
+    }
+
+    #[test]
+    fn serve_records_eye_privilege_failures_and_tombstone_completion() {
+        use irlume_common::diagnostics::{CategoricalOutcome, OperationClass, ShareSafeEventKind};
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let _g = env_lock();
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+
+        // Closed on purpose: a regression that queues either unauthorized
+        // request gets an arbiter refusal instead of the exact privilege reply.
+        let refused = arbiter::Arbiter::<Queued>::new();
+        refused.close();
+        for (wire, expected) in [
+            (
+                "{\"CaptureEarMedian\":{\"user\":\"root\"}}\n".to_string(),
+                format!("capture_ear_median requires root (peer uid {NOBODY})"),
+            ),
+            (
+                "{\"SetClosureCalibration\":{\"user\":\"root\",\"ear_open\":0.3,\"ear_closed\":0.1}}\n"
+                    .into(),
+                "not authorized to modify 'root'".into(),
+            ),
+        ] {
+            let response = with_serve_as_peer_and_diagnostics(
+                &refused,
+                &ready,
+                &diagnostic_state,
+                peer(NOBODY),
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            );
+            match response {
+                Response::Error(message) => assert_eq!(message, expected),
+                other => panic!("privilege refusal changed: {other:?}"),
+            }
+        }
+        assert!(
+            refused.take().is_none(),
+            "privilege refusals must never queue"
+        );
+
+        let terminal_events = || {
+            diagnostic_state
+                .snapshot(std::time::Duration::from_secs(60))
+                .events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    ShareSafeEventKind::OperationFinished { outcome } => {
+                        Some((event.operation, outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            terminal_events(),
+            vec![
+                (OperationClass::Status, CategoricalOutcome::Failed),
+                (OperationClass::Status, CategoricalOutcome::Failed),
+            ]
+        );
+
+        // The worker is outside `serve`; stand in only for that boundary and
+        // finish the real queued scope exactly as the production worker does.
+        let authorized = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let authorized = std::sync::Arc::clone(&authorized);
+            std::thread::spawn(move || {
+                let mut engine = engine();
+                for _ in 0..2 {
+                    let job = authorized.take().expect("authorized tombstone queued");
+                    let Queued {
+                        req,
+                        peer,
+                        reply,
+                        link,
+                        scope,
+                    } = job.payload;
+                    assert!(link.claim());
+                    let response = dispatch_scoped(req, &peer, &mut engine, &scope);
+                    scope.finish(categorical_outcome(&response));
+                    link.released();
+                    authorized.finish(job.class, job.uid);
+                    reply.send(response).unwrap();
+                }
+            })
+        };
+        for (wire, expected) in [
+            (
+                "{\"CaptureEarMedian\":{\"user\":\"carol\"}}\n",
+                CAPTURE_EAR_MEDIAN_RETIRED,
+            ),
+            (
+                "{\"SetClosureCalibration\":{\"user\":\"carol\",\"ear_open\":0.3,\"ear_closed\":0.1}}\n",
+                SET_CLOSURE_CALIBRATION_RETIRED,
+            ),
+        ] {
+            let response = with_serve_as_peer_and_diagnostics(
+                &authorized,
+                &ready,
+                &diagnostic_state,
+                peer(0),
+                |client| {
+                    (&*client).write_all(wire.as_bytes()).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str::<Response>(line.trim()).unwrap()
+                },
+            );
+            match response {
+                Response::Error(message) => assert_eq!(message, expected),
+                other => panic!("authorized tombstone changed: {other:?}"),
+            }
+        }
+        authorized.close();
+        worker.join().unwrap();
+        assert_eq!(
+            terminal_events(),
+            vec![
+                (OperationClass::Status, CategoricalOutcome::Failed),
+                (OperationClass::Status, CategoricalOutcome::Failed),
+                (OperationClass::Status, CategoricalOutcome::Completed),
+                (OperationClass::Status, CategoricalOutcome::Completed),
+            ]
+        );
     }
 
     #[test]

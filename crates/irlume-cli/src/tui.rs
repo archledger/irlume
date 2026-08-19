@@ -12939,15 +12939,11 @@ mod tests {
         );
     }
 
-    /// The PAM tab's [c] row must describe the calibration the CONFIGURED mode
-    /// actually uses. It was one fixed string calling the eye closure an optional
-    /// alternative, which is true only in the default mode: under
-    /// `consent_gesture=closure` the nod is refused and this calibration is the
-    /// only way any gesture passes (the old text sent that user to nod at a gate
-    /// that would deny them), and under `consent_gesture=nod` the closure is
-    /// refused, so teaching it changes nothing.
+    /// The one-release compatibility facade maps absent/nod to head-only and
+    /// legacy/malformed values to fail-closed. Task 8 removes this row; until
+    /// then it must not present retired closure/either modes as reachable.
     #[test]
-    fn calibrate_row_describes_the_configured_gesture_mode() {
+    fn calibrate_row_describes_head_only_and_fail_closed_modes() {
         let _g = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12961,8 +12957,11 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_PAM;
         for (conf, expect) in [
-            ("", "optional eye-closure alternative"),
-            ("consent_gesture=closure\n", "REQUIRED"),
+            ("", "not accepted"),
+            (
+                "consent_gesture=closure\n",
+                "until consent_gesture is fixed",
+            ),
             ("consent_gesture=nod\n", "not accepted"),
             ("consent_gesture=banana\n", "until consent_gesture is fixed"),
         ] {

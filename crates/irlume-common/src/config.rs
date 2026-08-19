@@ -511,125 +511,68 @@ pub fn credential_release_gesture_required() -> bool {
     service_gesture("credential_release").unwrap_or_else(credential_release_challenge)
 }
 
-/// Which deliberate gesture the consent gate accepts.
-///
-/// Lives here, not in the auth engine, because two crates must agree on it: the
-/// engine decides which detector may fire, and the PAM module tells the user which
-/// gesture to perform. Two copies of the parse would eventually disagree, and the
-/// user-visible symptom of that is being told to nod at a gate that only accepts an
-/// eye closure.
+/// Whether the configured consent gesture is ready for the head-only gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsentGesture {
-    /// Head nod only.
-    Nod,
-    /// Eye closure only. The one mode that needs a per-user EAR calibration.
-    Closure,
-    /// Accept either (the default): the user does whichever suits their position.
-    Either,
-    /// The setting was present and unreadable. Enables NEITHER gesture (#365).
-    ///
-    /// Not a synonym for the default. `Nod` and `Closure` are incomparable
-    /// policies, so no valid choice is a safe fallback for a value the operator
-    /// typed and we could not parse: falling back to `Either` widened the gate
-    /// an operator was trying to narrow, and `clousure` for `closure` then
-    /// licensed a nod to release the sealed keyring secret. Enabling nothing is
-    /// the only answer that cannot be looser than what was asked for, and it is
-    /// loud: the gate stops passing and the warning says why.
+pub enum HeadConsentPolicy {
+    /// The setting is absent or explicitly selects the supported head nod.
+    Ready,
+    /// The setting still selects the retired eye-closure method.
+    LegacyClosure,
+    /// The setting is present but is neither `nod` nor `closure`.
     Misconfigured,
 }
 
-impl ConsentGesture {
-    /// One line telling the user what to do, for a PAM conversation or a prompt.
-    /// `what` names the thing being unlocked, e.g. "unlock your keyring".
-    /// The nod wording says KEEP nodding, because that is what actually works.
-    /// Measured on hardware 2026-07-25, seated, 17 attempts against the real
-    /// greeter stack: nodding continuously released 4 times out of 4, while a
-    /// single nod released 0 times out of 3. The detector needs a run of frames
-    /// showing the motion, and a user who nods once has stopped before it has
-    /// enough. Telling someone to "nod" and then refusing them is the failure in
-    /// issue #101; this describes the gesture the engine can actually see.
+impl HeadConsentPolicy {
+    /// One line telling the user how to satisfy or repair the consent gate.
     pub fn instruction(self, what: &str) -> String {
         match self {
-            // Deliberately not a gesture instruction: no gesture can satisfy
-            // this state, so telling the user to nod would be advising an act
-            // that cannot work. Name the setting instead, because the person
-            // who can fix it is the one who set it.
-            Self::Misconfigured => format!(
-                "cannot {what}: consent_gesture is set to a value irlume does not \
-                 recognise (expected nod or closure)"
+            Self::Ready => format!("keep nodding your head to {what}"),
+            Self::LegacyClosure => format!(
+                "cannot {what}: eye closure is retired; remove consent_gesture or set it to nod"
             ),
-            Self::Nod => format!("keep nodding your head to {what}"),
-            Self::Closure => {
-                format!("close your eyes for about a second, then open, to {what}")
+            Self::Misconfigured => {
+                format!("cannot {what}: consent_gesture is invalid; remove it or set it to nod")
             }
-            // `Either` accepts both, but the instruction names ONLY the nod. A
-            // one-line prompt at a greeter or a polkit dialog is read once, under
-            // time pressure, and the two gestures are not equally reliable: the nod
-            // needs no calibration at all, while the closure gate depends on a
-            // per-user EAR calibration that can be thin enough to miss. Measured
-            // 2026-07-27 on the maintainer's hardware, 20 self-paced readings:
-            // glasses HALVE the open-eye EAR (0.109-0.120 with, 0.249-0.255
-            // without), so one calibration spanning both conditions left a margin of
-            // 0.0095 EAR. Offering a gesture that thin, in the line someone reads
-            // while trying to log in, costs them the release window and then the
-            // password. Closure stays accepted, and stays documented in `irlume
-            // doctor` where there is room to explain the calibration it needs.
-            Self::Either => format!("keep nodding your head to {what}"),
         }
     }
 }
 
-/// The configured consent-gesture mode: `consent_gesture=nod|closure` in
-/// settings.conf (or `IRLUME_CONSENT_GESTURE`) restricts to one; unset accepts
-/// EITHER.
-///
-/// An unrecognised spelling is REPORTED and returns
-/// [`ConsentGesture::Misconfigured`], which enables NEITHER gesture (#365).
-/// It used to fall back silently to `Either`, which is the wrong direction
-/// twice over:
-/// `Either` is the widest of the three, so an operator writing
-/// `consent_gesture=blink` to tighten the gate got a looser one, and
-/// `Either::instruction` then told them to nod, so the misconfiguration had no
-/// visible symptom at all. Compare `credential_release_challenge` twenty lines
-/// up, which documents the opposite choice for its own key.
-///
-/// Adding a `ConsentGesture` variant breaks `instruction`, which is exhaustive,
-/// but would NOT break this parser, so a new mode would be unreachable while
-/// appearing configured. The warning is what surfaces that.
-pub fn consent_gesture_mode() -> ConsentGesture {
-    consent_gesture_mode_reporting(std::io::stderr())
+fn parse_head_consent_policy(value: Option<&str>) -> HeadConsentPolicy {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("nod") => HeadConsentPolicy::Ready,
+        Some("closure") => HeadConsentPolicy::LegacyClosure,
+        Some(_) => HeadConsentPolicy::Misconfigured,
+    }
 }
 
-/// [`consent_gesture_mode`] with the warning stream injected, so a test can
-/// read what an operator would see rather than trusting that it was written.
-fn consent_gesture_mode_reporting(mut out: impl std::io::Write) -> ConsentGesture {
-    let mut parse = |v: &str, source: &str| match v.trim().to_ascii_lowercase().as_str() {
-        "nod" => ConsentGesture::Nod,
-        "closure" => ConsentGesture::Closure,
-        other => {
-            // Says what actually happens. This line used to end "accepting
-            // either gesture", describing the fallback #365 removed, so an
-            // operator who typed `clousure` was told the gate had WIDENED at
-            // the moment it stopped accepting anything, and the one diagnostic
-            // this state has pointed away from the cause. The long run of
-            // spaces came from a line join written without a continuation, and
-            // rustfmt does not reflow string literals, so the fmt gate never
-            // saw it (#365 review).
-            let _ = writeln!(
-                out,
-                "irlume: ignoring {source}={other:?} (expected nod or closure); \
-                 NO consent gesture is accepted until this is fixed, so every \
-                 face prompt falls back to the password"
-            );
-            ConsentGesture::Misconfigured
+/// Resolve the head-consent policy using the environment-over-settings precedence.
+pub fn head_consent_policy() -> HeadConsentPolicy {
+    head_consent_policy_reporting(std::io::stderr())
+}
+
+fn head_consent_policy_reporting(mut out: impl std::io::Write) -> HeadConsentPolicy {
+    let configured = std::env::var("IRLUME_CONSENT_GESTURE")
+        .ok()
+        .map(|value| (value, "IRLUME_CONSENT_GESTURE"))
+        .or_else(|| {
+            read_kv("settings.conf", "consent_gesture").map(|value| (value, "consent_gesture"))
+        });
+    let policy = parse_head_consent_policy(configured.as_ref().map(|(value, _)| value.as_str()));
+    if let Some((_, source)) = configured {
+        let message = match policy {
+            HeadConsentPolicy::Ready => None,
+            HeadConsentPolicy::LegacyClosure => {
+                Some("configures retired eye closure; remove consent_gesture or set it to nod")
+            }
+            HeadConsentPolicy::Misconfigured => {
+                Some("is invalid; remove consent_gesture or set it to nod")
+            }
+        };
+        if let Some(message) = message {
+            let _ = writeln!(out, "irlume: {source} {message}");
         }
-    };
-    if let Ok(v) = std::env::var("IRLUME_CONSENT_GESTURE") {
-        return parse(&v, "IRLUME_CONSENT_GESTURE");
     }
-    read_kv("settings.conf", "consent_gesture")
-        .map(|v| parse(&v, "consent_gesture"))
-        .unwrap_or(ConsentGesture::Either)
+    policy
 }
 
 #[cfg(test)]
@@ -728,70 +671,59 @@ mod service_gesture_default_tests {
 
 #[cfg(test)]
 mod consent_gesture_tests {
-    use super::{consent_gesture_mode_reporting, ConsentGesture};
+    use super::{head_consent_policy_reporting, HeadConsentPolicy};
 
-    /// An unrecognised spelling must SAY so. Silence is what made this a bug
-    /// worth filing: the operator asked for a narrower gate, got the widest
-    /// one, and `Either::instruction` then told them to nod, so nothing about
-    /// the running system looked wrong (#365).
     #[test]
-    fn an_unrecognised_gesture_is_reported_and_enables_neither_gesture() {
+    fn an_unrecognised_gesture_reports_its_source_and_remedy() {
         let _g = crate::testenv::lock();
         std::env::set_var("IRLUME_CONSENT_GESTURE", "blink");
         let mut out = Vec::new();
-        let mode = consent_gesture_mode_reporting(&mut out);
+        let policy = head_consent_policy_reporting(&mut out);
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
 
-        assert_eq!(
-            mode,
-            ConsentGesture::Misconfigured,
-            "an unreadable value must not resolve to a gesture policy at all"
-        );
+        assert_eq!(policy, HeadConsentPolicy::Misconfigured);
 
         let warned = String::from_utf8_lossy(&out);
         assert!(warned.contains("IRLUME_CONSENT_GESTURE"), "{warned}");
-        assert!(warned.contains("blink"), "must name the value: {warned}");
-        // The message is the whole justification for this state: the variant
-        // doc rests on "it is loud: the gate stops passing and the warning says
-        // why". It used to end "accepting either gesture" and this test could
-        // not tell, because it only looked for the key and the value, both of
-        // which the wrong tail also satisfied (#365 review).
         assert!(
-            !warned.contains("either"),
-            "the warning still describes the removed Either fallback: {warned}"
+            warned.contains("remove consent_gesture") || warned.contains("set it to nod"),
+            "the warning must give an explicit remedy: {warned}"
         );
-        assert!(
-            warned.contains("NO consent gesture is accepted"),
-            "the warning must say the gate now accepts nothing: {warned}"
-        );
-        // Two assertions were dropped from here: `!matches!(mode, Nod|Either)`
-        // and its Closure twin. On a fieldless PartialEq enum they are entailed
-        // by the assert_eq! above, so they could not fail, and they read as
-        // coverage of the gate while testing only the parser. What the gate
-        // does with this value is pinned in irlume-auth by
-        // `misconfigured_enables_no_gesture`, which is where the decision is.
     }
 
-    /// A recognised spelling is honoured in either case and says nothing.
     #[test]
-    fn a_recognised_gesture_is_silent() {
+    fn nod_policy_is_silent() {
         let _g = crate::testenv::lock();
-        for (raw, want) in [
-            ("nod", ConsentGesture::Nod),
-            ("NOD", ConsentGesture::Nod),
-            (" closure ", ConsentGesture::Closure),
-        ] {
+        for raw in ["nod", "NOD", " nod "] {
             std::env::set_var("IRLUME_CONSENT_GESTURE", raw);
             let mut out = Vec::new();
-            let mode = consent_gesture_mode_reporting(&mut out);
+            let policy = head_consent_policy_reporting(&mut out);
             std::env::remove_var("IRLUME_CONSENT_GESTURE");
-            assert_eq!(mode, want, "{raw}");
+            assert_eq!(policy, HeadConsentPolicy::Ready, "{raw}");
             assert!(
                 out.is_empty(),
                 "{raw} warned: {}",
                 String::from_utf8_lossy(&out)
             );
         }
+    }
+
+    #[test]
+    fn legacy_closure_reports_its_source_and_retirement_remedy() {
+        let _g = crate::testenv::lock();
+        std::env::set_var("IRLUME_CONSENT_GESTURE", " closure ");
+        let mut out = Vec::new();
+        let policy = head_consent_policy_reporting(&mut out);
+        std::env::remove_var("IRLUME_CONSENT_GESTURE");
+
+        assert_eq!(policy, HeadConsentPolicy::LegacyClosure);
+        let warned = String::from_utf8_lossy(&out);
+        assert!(warned.contains("IRLUME_CONSENT_GESTURE"), "{warned}");
+        assert!(warned.contains("retired"), "{warned}");
+        assert!(
+            warned.contains("remove consent_gesture") || warned.contains("set it to nod"),
+            "the warning must give an explicit remedy: {warned}"
+        );
     }
 }
 
@@ -1336,12 +1268,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The gesture mode and the sentence the user is shown must come from one
-    /// parse: the engine decides which detector may fire, the PAM module tells the
-    /// user what to do, and a disagreement means a `closure`-only user is told to
-    /// nod, nods for the whole window, and is refused.
     #[test]
-    fn consent_gesture_mode_parses_and_names_the_gesture_it_accepts() {
+    fn legacy_gesture_config_never_silently_widens_to_nod() {
+        assert_eq!(parse_head_consent_policy(None), HeadConsentPolicy::Ready);
+        assert_eq!(
+            parse_head_consent_policy(Some("nod")),
+            HeadConsentPolicy::Ready
+        );
+        assert_eq!(
+            parse_head_consent_policy(Some("closure")),
+            HeadConsentPolicy::LegacyClosure
+        );
+        assert_eq!(
+            parse_head_consent_policy(Some(" CLOSURE ")),
+            HeadConsentPolicy::LegacyClosure
+        );
+        assert_eq!(
+            parse_head_consent_policy(Some("clousure")),
+            HeadConsentPolicy::Misconfigured
+        );
+    }
+
+    #[test]
+    fn legacy_closure_instruction_is_actionable_and_names_no_eye_action() {
+        let message = HeadConsentPolicy::LegacyClosure.instruction("approve");
+        assert!(message.contains("remove consent_gesture") || message.contains("set it to nod"));
+        assert!(!message.contains("close your eyes"));
+    }
+
+    #[test]
+    fn head_consent_policy_preserves_environment_over_settings_precedence() {
         let _g = testenv::lock();
         let dir = std::env::temp_dir().join(format!("irlume-cg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1349,47 +1305,21 @@ mod tests {
         std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
 
-        // UNSET accepts either, which is the documented default. An unreadable
-        // value does NOT: it used to land here too, so `clousure` for `closure`
-        // silently widened a gate the operator was narrowing (#365).
-        assert_eq!(consent_gesture_mode(), ConsentGesture::Either);
-        for (v, want) in [
-            ("nod", ConsentGesture::Nod),
-            ("closure", ConsentGesture::Closure),
-            ("CLOSURE", ConsentGesture::Closure),
-            (" nod ", ConsentGesture::Nod),
-            ("wink", ConsentGesture::Misconfigured),
-        ] {
-            write_kv("settings.conf", "consent_gesture", v).unwrap();
-            assert_eq!(consent_gesture_mode(), want, "consent_gesture={v:?}");
-        }
-        // The env override wins over the file.
+        assert_eq!(head_consent_policy(), HeadConsentPolicy::Ready);
         write_kv("settings.conf", "consent_gesture", "closure").unwrap();
+        assert_eq!(
+            head_consent_policy(),
+            HeadConsentPolicy::LegacyClosure,
+            "the settings file remains the fallback source"
+        );
         std::env::set_var("IRLUME_CONSENT_GESTURE", "nod");
-        assert_eq!(consent_gesture_mode(), ConsentGesture::Nod);
+        assert_eq!(
+            head_consent_policy(),
+            HeadConsentPolicy::Ready,
+            "the environment override must continue to win"
+        );
+
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
-
-        // An instruction must never name a gesture its mode would REFUSE; naming
-        // fewer than it accepts is a deliberate choice, not a defect.
-        let nod = ConsentGesture::Nod.instruction("unlock your keyring");
-        assert!(nod.contains("nod") && !nod.contains("eyes"), "{nod}");
-        let closure = ConsentGesture::Closure.instruction("unlock your keyring");
-        assert!(
-            closure.contains("eyes") && !closure.contains("nod"),
-            "closure-only must not tell the user to nod: {closure}"
-        );
-        // `Either` accepts both and names only the nod: it is the gesture that
-        // needs no calibration, and a prompt is read once under time pressure.
-        // Offering the closure here would send an uncalibrated user after the one
-        // gesture that cannot work for them.
-        let either = ConsentGesture::Either.instruction("unlock your keyring");
-        assert!(
-            either.contains("nod") && !either.contains("eyes"),
-            "the either-mode prompt must name the no-calibration gesture only: {either}"
-        );
-        // The subject is interpolated, so one wording serves keyring and polkit.
-        assert!(nod.ends_with("unlock your keyring"), "{nod}");
-
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

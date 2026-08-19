@@ -8,6 +8,7 @@
 //! and run the liveness gate on the cross-spectrum signals → on Live, match the
 //! embedding against the user's enrolled templates at the fixed threshold.
 
+use irlume_common::config::HeadConsentPolicy;
 use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
 
@@ -542,11 +543,6 @@ fn resolve_consent_watch(
     }
 }
 
-// The consent-gesture mode is defined in irlume_common::config so the PAM module
-// can name the SAME gesture it tells the user to perform; see `ConsentGesture`.
-#[cfg(test)]
-use irlume_common::config::ConsentGesture;
-
 /// Whether this PAM service forces the head-consent gate (polkit prompts; see
 /// `biopolicy::requires_consent_gesture`). The gate FAILS CLOSED when it can't
 /// run (no IR). Computed per
@@ -641,6 +637,21 @@ impl AuthenticationPurpose {
                 }
                 temporal_challenge
             }
+        }
+    }
+}
+
+fn blocking_head_consent_policy(
+    purpose: AuthenticationPurpose,
+    service: Option<&str>,
+) -> Option<HeadConsentPolicy> {
+    if !purpose.demands_gesture(service) {
+        return None;
+    }
+    match irlume_common::config::head_consent_policy() {
+        HeadConsentPolicy::Ready => None,
+        policy @ (HeadConsentPolicy::LegacyClosure | HeadConsentPolicy::Misconfigured) => {
+            Some(policy)
         }
     }
 }
@@ -746,26 +757,6 @@ fn emit_trace_match(
         },
         measurements,
     });
-}
-
-/// Which gestures a consent mode permits: `(nod, closure)`.
-///
-/// Extracted so the decision can be tested. It is written as POSITIVE
-/// membership, never `!= Closure` / `!= Nod`: those read as YES for any state
-/// that is neither, so `Misconfigured` would enable BOTH gestures, which is the
-/// exact failure that state exists to prevent. A nod would then release the
-/// TPM-sealed keyring secret on a system whose operator asked for eye closure
-/// and mistyped it (#365).
-///
-/// This lived inline in `consent_gesture_inputs`, which needs an `Engine` and an
-/// `Enrollment` to call, so nothing in the workspace tested it and reverting the
-/// two lines left the whole suite green (#365 review).
-#[cfg(test)]
-const fn gestures_permitted_by(mode: ConsentGesture) -> (bool, bool) {
-    (
-        matches!(mode, ConsentGesture::Nod | ConsentGesture::Either),
-        matches!(mode, ConsentGesture::Closure | ConsentGesture::Either),
-    )
 }
 
 /// Calibration-aware IR match result (see [`ir_match_in`]).
@@ -4411,6 +4402,15 @@ impl Engine {
         if !outcome.granted {
             return Ok(outcome);
         }
+        if let Some(policy) = blocking_head_consent_policy(purpose, service) {
+            return Ok(Outcome {
+                granted: false,
+                live: outcome.live,
+                score: outcome.score,
+                reason: policy.instruction("approve"),
+                kind: OutcomeKind::OtherDeny,
+            });
+        }
         if purpose.demands_gesture(service) {
             let verdict = self.head_consent_before_match;
             return self.consent_gesture_gate(outcome, verdict);
@@ -4596,6 +4596,12 @@ impl Engine {
             if let Some(reason) = self.binding_mismatch(bind) {
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
+        }
+        if let Some(policy) = blocking_head_consent_policy(purpose, service) {
+            return Ok(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                policy.instruction("approve"),
+            ));
         }
         let (rgb_dev, ir_dev) = (self.rgb_dev.clone(), self.ir_dev.clone());
         let endpoints: Vec<&str> = if self.ir_available {
@@ -7348,50 +7354,6 @@ mod tests {
         assert!(
             !resolve_consent_watch(None, || false),
             "budget exhausted with no completed-take gesture is a miss"
-        );
-    }
-
-    /// `Misconfigured` permits NO gesture, which is the entire reason the
-    /// variant exists.
-    ///
-    /// This had no test. The decision lived inline in `consent_gesture_inputs`,
-    /// which needs an `Engine` and an `Enrollment` to call, so restoring the old
-    /// `mode != ConsentGesture::Closure` left `cargo test --workspace` green
-    /// while a head nod alone released the TPM-sealed keyring password on a
-    /// system configured for eye closure by an operator who typed `clousure`
-    /// (#365 review).
-    #[test]
-    fn misconfigured_enables_no_gesture() {
-        use irlume_common::config::ConsentGesture;
-
-        assert_eq!(
-            gestures_permitted_by(ConsentGesture::Misconfigured),
-            (false, false),
-            "an unreadable setting must not permit a nod OR a closure"
-        );
-
-        // Every other mode is unchanged, so the fail-closed state cannot have
-        // been bought by breaking the working ones.
-        assert_eq!(gestures_permitted_by(ConsentGesture::Nod), (true, false));
-        assert_eq!(
-            gestures_permitted_by(ConsentGesture::Closure),
-            (false, true)
-        );
-        assert_eq!(gestures_permitted_by(ConsentGesture::Either), (true, true));
-
-        // The negative form this function must never be written in. `!= Closure`
-        // answers YES for Misconfigured, and that is the whole defect; asserting
-        // the two disagree pins the difference rather than the spelling.
-        let negative_form_would_allow_nod =
-            ConsentGesture::Misconfigured != ConsentGesture::Closure;
-        assert!(
-            negative_form_would_allow_nod,
-            "precondition: the negative form really does permit a nod here"
-        );
-        assert_ne!(
-            gestures_permitted_by(ConsentGesture::Misconfigured).0,
-            negative_form_would_allow_nod,
-            "the decision has been rewritten in the negative form the comment forbids"
         );
     }
 
@@ -10212,6 +10174,104 @@ mod engine_tests {
         let err = s.engine.authenticate("irlume-test-cam", None).unwrap_err();
         assert!(err.to_string().contains("no camera found"), "{err}");
 
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn legacy_and_malformed_gesture_config_block_gated_auth_before_camera() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("legacy-gesture");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let mut enrollment = Enrollment::new("irlume-test-legacy-gesture");
+        enrollment.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &enrollment);
+
+        for configured in ["closure", "clousure"] {
+            std::fs::write(
+                dir.join("settings.conf"),
+                format!("consent_gesture={configured}\n"),
+            )
+            .unwrap();
+            let out = s
+                .engine
+                .authenticate("irlume-test-legacy-gesture", Some("sudo"))
+                .expect("retired policy must deny before the missing camera is opened");
+            assert!(!out.granted, "{configured} granted: {}", out.reason);
+            assert_eq!(out.kind, OutcomeKind::OtherDeny, "{configured}");
+            assert!(
+                out.reason.contains("remove") || out.reason.contains("set it to nod"),
+                "{configured}: {}",
+                out.reason
+            );
+        }
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn legacy_gesture_config_does_not_block_non_gated_authentication() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("legacy-non-gated");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::fs::write(dir.join("settings.conf"), "consent_gesture=closure\n").unwrap();
+
+        let out = s
+            .engine
+            .challenge_if_required(
+                AuthenticationPurpose::Verify,
+                None,
+                Outcome::grant(0.9, "match"),
+            )
+            .unwrap();
+        assert!(
+            out.granted,
+            "a non-gated verify was blocked: {}",
+            out.reason
+        );
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn legacy_migration_keeps_absent_and_nod_policies_ready() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("legacy-ready");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+
+        for configured in [None, Some("nod")] {
+            if let Some(value) = configured {
+                std::fs::write(
+                    dir.join("settings.conf"),
+                    format!("consent_gesture={value}\n"),
+                )
+                .unwrap();
+            } else {
+                let _ = std::fs::remove_file(dir.join("settings.conf"));
+            }
+            s.engine.head_consent_before_match = HeadConsentVerdict::Approve;
+            let out = s
+                .engine
+                .challenge_if_required(
+                    AuthenticationPurpose::AppConsent,
+                    None,
+                    Outcome::grant(0.9, "match"),
+                )
+                .unwrap();
+            assert!(out.granted, "{configured:?} was not ready: {}", out.reason);
+        }
+        s.engine.head_consent_before_match = HeadConsentVerdict::NoGesture;
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
         teardown_sandbox(&dir);
     }
 

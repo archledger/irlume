@@ -4,7 +4,8 @@ irlume can satisfy polkit authentication prompts, which is how desktop apps on
 Linux ask the OS to verify you. Bitwarden's "unlock with biometrics" is a
 polkit prompt; so are `pkexec`, GNOME Software's install dialog, and systemd
 unit operations from your desktop. Wire it once and every polkit prompt in
-your session accepts your face, with your password as the unchanged fallback.
+your session can offer face verification after explicit confirmation, with
+your password as the unchanged fallback.
 
 ## How it works
 
@@ -18,20 +19,24 @@ pieces:
 2. Your desktop's polkit agent (KDE or GNOME) opens its dialog, which names
    the app and the action being approved, and starts a PAM conversation on the
    `polkit-1` service.
-3. `pam_irlume` in that stack asks `irlumed` to verify your face. For a polkit
-   prompt the daemon also requires a deliberate consent gesture: **keep nodding
-   your head to approve**, or **shake your head to decline**. It then answers yes
-   or no; the app learns only the verdict.
+3. `pam_irlume` asks for hidden literal `yes`. Enter, cancellation, or any other
+   response selects password/fingerprint without opening the camera. `yes`
+   authorizes exactly one face attempt.
+4. `irlumed` verifies the face and automatic passive PAD. If the user explicitly
+   enabled the experimental head gesture, repeated nodding is an additional
+   approval gate and a head shake declines the face attempt. The app learns only
+   the final verdict.
 
 Both the KDE and GNOME agents start the PAM conversation the moment the dialog
-appears, so the camera fires immediately. The dialog shows "irlume: keep
-nodding your head to approve; shake your head to decline"; do that and it
-approves, no typing or clicking.
+appears, but irlume does not open the camera until it receives the hidden `yes`.
+This conventional response is mandatory and cannot be disabled. The optional
+head gesture defaults off.
 
 ### Declining with a head shake
 
-A head shake is a deliberate "no". It cancels the face authentication at once,
-and irlume's PAM line for `polkit-1` carries the control
+A head shake is a deliberate "no" when the optional gesture is enabled. It
+cancels face authentication at once, and irlume's PAM line for `polkit-1`
+carries the control
 `[success=done new_authtok_reqd=done abort=die default=ignore]`, so a shake ends
 the whole attempt instead of dropping you to the password box.
 
@@ -42,13 +47,12 @@ agent re-prompts and closes its window after about three failed attempts, so a
 shake declines every time but does not close the dialog on the first one. Press
 Escape or the window's close button to dismiss it immediately.
 
-A shake only ends the attempt on polkit prompts. On the login screen, the lock
-screen and `sudo`, and whenever no gesture is made at all, the password prompt
-still follows as usual, so a misread gesture can never lock you out.
+A shake only ends the PAM attempt on polkit prompts. On login, lock, and sudo,
+a gesture decline or miss keeps the password/fingerprint fallback.
 
 ## Enabling
 
-One step; the head gesture needs no calibration.
+One wiring step; keyboard confirmation needs no calibration.
 
 ```console
 sudo irlume login enable --with-polkit --apply   # wire pam_irlume into polkit-1
@@ -59,16 +63,16 @@ This adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
 edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable --apply`
 removes it along with everything else, flag or no flag.
 
-The consent action is fixed: keep nodding to approve and shake to decline. The
-head pose comes from the primary detector's five landmarks, so FaceMesh is not
-part of this gate. The gesture records intent; automatic PAD still runs as a
+Privileged intent is fixed: type hidden literal `yes` for one face attempt.
+Optional head pose comes from the primary detector's five landmarks, so
+FaceMesh is not part of that experimental gate. Automatic PAD remains a
 separate mandatory boundary before a face grant.
 
-For the first retirement release, an existing `consent_gesture=closure` setting
-fails closed instead of changing meaning. Remove the key or set it to `nod`.
-Likewise, a stored legacy eyes-open policy blocks face authentication until
-`irlume profiles eyes-open off` clears it. Password and fingerprint fallback
-remain available during either migration.
+For the first retirement release, an explicitly gesture-gated request with
+`consent_gesture=closure` fails closed instead of changing meaning. Remove the
+key or set it to `nod`. Likewise, a stored legacy eyes-open policy blocks face
+authentication until `irlume profiles eyes-open off` clears it. Password and
+fingerprint fallback remain available during either migration.
 
 Check the state any time:
 
@@ -124,8 +128,9 @@ authentication**. `irlume doctor` confirms the action is registered.
 
 - Unlock the vault once with your master password (Bitwarden holds the vault
   key in protected memory; biometrics never replace the first unlock).
-- "Unlock with system authentication" then pops the polkit dialog, which your
-  nod satisfies. Verified on the 2026.6.1 flatpak. Flatpak builds before
+- "Unlock with system authentication" then pops the polkit dialog. Type `yes`
+  at irlume's hidden confirmation, then complete face verification. Verified on
+  the 2026.6.1 flatpak. Flatpak builds before
   Bitwarden 2026.5 failed here with polkit's "Unix process subject does not
   have uid set"; if you hit that, update the flatpak or use the `.deb`/`.rpm`.
 - Browser-extension biometric unlock rides the same desktop app via native
@@ -141,19 +146,25 @@ works the same day it ships.
   config-dependent. A polkit prompt gets a yes/no and nothing else, so a
   misconfigured or malicious stack cannot use a polkit dialog to extract a
   credential.
-- **Deliberate gesture required.** polkit agents run the PAM conversation with
-  no user action, so a bare face match would approve a prompt the user never
-  acknowledged. For polkit-class services the daemon requires a deliberate
-  head gesture and fails closed if it cannot run. Disable the forced gesture
-  with `polkit_gesture=0` in `settings.conf` if you accept that trade. This
-  changes the intent policy only; it does not disable automatic PAD.
+- **Conventional confirmation required.** polkit agents can begin PAM without a
+  user action, so `pam_irlume` requires hidden literal `yes` before contacting
+  the daemon. Production `pam_irlume` sends a typed `PamConversation` assertion;
+  the daemon accepts it only from a root peer and for a recognized privileged
+  service. Missing, non-root, or irrelevant assertions are refused before
+  camera work. Root can forge it, so it is not cryptographic proof against root
+  or a compromised PAM conversation provider.
+- **Head gesture is optional and additional.** It defaults off. Explicit
+  `service_gesture.polkit-1=1`, `polkit_gesture=1`, or
+  `IRLUME_POLKIT_GESTURE=1` adds the experimental nod/shake gate after `yes`.
+  It is not population-qualified and may reject valid attempts; disabling it
+  does not weaken mandatory keyboard confirmation or automatic PAD.
 - **IR tier only.** RGB-only (convenience) devices never satisfy polkit
   prompts; a printed photo in front of a webcam must not approve app actions.
 - **What this does not protect against.** Any process in your active session
-  can pop a polkit prompt at any time; the dialog itself is your notice of
-  what is being approved. Read it. This matches the Windows Hello model, where
-  the consent is your attention to the prompt on screen. The password prompt
-  remains for anything you decline or the camera cannot verify.
+  can pop a polkit prompt at any time; read the dialog before typing `yes`.
+  Root or a compromised desktop authentication agent remains inside the trust
+  boundary. The password prompt remains for anything you decline or the camera
+  cannot verify.
 
 ## Troubleshooting
 
@@ -161,9 +172,10 @@ works the same day it ships.
   the polkit row, then `sudo ausearch -m avc -ts recent | grep irlume` on
   SELinux systems; the shipped policy (1.1.0) grants the polkit helper domain
   access to the daemon socket.
-- Face matches but the prompt stays: it wants the consent gesture. Nod your
-  head (a firm chin-down-and-back, a couple of times). Shake to decline.
-  `irlume logs` shows the deny reason.
+- Confirmation appears but the camera stays off: type literal `yes`; Enter or
+  any other response intentionally chooses the password/fingerprint path.
+- With the optional gesture enabled, a face match can still wait for repeated
+  nodding; shake to decline. `irlume logs` shows the categorical deny reason.
 - Bitwarden says biometrics are unavailable: its polkit action file is
   missing (`irlume doctor` reports this) or the desktop app needs the
   Secret Service (GNOME Keyring / KWallet) running. `irlume doctor` also

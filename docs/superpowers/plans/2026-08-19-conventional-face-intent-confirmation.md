@@ -429,7 +429,7 @@ and populate the new request field. Do not expose a CLI flag or module argument 
 
 ```bash
 cargo test -p irlume-pam --lib --locked
-./scripts/run-tests-guarded.sh --min 16 -- \
+./scripts/run-tests-guarded.sh --min 21 -- \
   cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
 git diff --check
 ```
@@ -483,7 +483,7 @@ Response::AuthResult {
 
 - [ ] **Step 2: Add a real socket/closed-arbiter RED test**
 
-Using `with_serve_as_peer_and_diagnostics`, send missing and non-root attestations to a ready daemon with a closed arbiter. Assert the exact typed response, `arbiter.take().is_none()`, and one failed `OperationClass::Authentication` terminal event per refusal. Send a root-attested sudo request to an open worker boundary and prove it is the only case queued.
+Using `with_serve_as_peer_and_diagnostics`, send missing and non-root attestations to a ready daemon with a closed arbiter. Assert the exact typed response, `arbiter.take().is_none()`, and one denied `OperationClass::Authentication` terminal event per refusal. Send a root-attested sudo request to an open worker boundary and prove it is the only case queued.
 
 - [ ] **Step 3: Run focused daemon tests and record RED**
 
@@ -751,7 +751,7 @@ Expected: all pass.
 - [ ] **Step 2: Run PAM, machine, and packaging gates**
 
 ```bash
-./scripts/run-tests-guarded.sh --min 16 -- \
+./scripts/run-tests-guarded.sh --min 21 -- \
   cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
 python3 scripts/machine-api-conformance.py --irlume target/release/irlume --strict
 ./scripts/check-packaging-parity.sh

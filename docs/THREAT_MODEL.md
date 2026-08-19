@@ -275,14 +275,21 @@ with a fabricated print.
 
 ## Intent, throttling, and privilege elevation
 
-- **Head consent is a separate intent gate.** Repeated nodding approves and a
-  head shake declines. Elevation and polkit require it by default; lock-screen
-  and greeter policy keep their existing defaults. Per-service overrides remain.
-  A nod never bypasses face matching or automatic passive PAD, and a shake is
-  not evidence that the presentation is live. On polkit a shake retains the
-  existing `PAM_ABORT`; other services deny the face attempt and keep password
-  or fingerprint fallback. At greeters that support on-demand face auth, an
-  empty password plus Enter starts the camera; typing a password does not.
+- **Privileged intent requires conventional PAM confirmation.** For every
+  shared elevation/app-consent service, hidden literal `yes` authorizes one
+  face attempt; any other input, cancellation, or conversation failure falls
+  through without camera work. The PAM client sends a typed assertion, and the
+  daemon accepts it only from a root peer for that privileged service before
+  queueing. Root or a compromised conversation provider can forge the
+  assertion, so it is not cryptographic proof of physical input. Login, greeter,
+  lock, and credential-release flows do not gain this extra prompt.
+- **Head gesture is an optional additional intent gate.** Every service defaults
+  off. Explicit opt-in adds repeated-nod approval and head-shake decline after
+  privileged keyboard confirmation; it can never replace or bypass that
+  confirmation. A nod never bypasses face matching or automatic passive PAD,
+  and a shake is not evidence that the presentation is live. On polkit a shake
+  retains `PAM_ABORT`; other services preserve password/fingerprint fallback.
+  The classifier is experimental and not population-qualified.
 - **Cold-keyring credential release can require head consent (default OFF,
   opt-in).**
   Releasing the TPM-sealed login-keyring password happens on a greeter cold login
@@ -294,7 +301,8 @@ with a fabricated print.
   extra deliberate-intent step turns it on with
   `sudo irlume credential-release-challenge on`: the `UnsealPassword` match is
   then followed by repeated head nodding; a shake declines. Login, lock screen,
-  `sudo`, and polkit are decided by their own service policy. When the gesture
+  `sudo`, and polkit are decided by their own policy: privileged services always
+  require keyboard confirmation and optionally add a gesture. When the gesture
   is on, every way it can fail to happen (no gesture in the window, no IR
   camera, or a busy camera) ends in the typed-password path, never a lockout,
   and the keyring then unlocks from the typed password exactly as it would have
@@ -332,8 +340,8 @@ with a fabricated print.
   the honest limit is that a present, non-consenting user can still satisfy it by
   moving. Tracked in [#101](https://github.com/archledger/irlume/issues/101).
 - **Consecutive-failure throttle.** After a run of failed face attempts (5 by
-  default, `IRLUME_RATE_LIMIT`), the daemon stops firing the camera on the
-  gesture for a cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls
+  default, `IRLUME_RATE_LIMIT`), the daemon stops starting face capture for a
+  cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls
   straight to the password; a grant resets it, and an empty frame (nobody
   present) never counts. This satisfies the NIST SP 800-63B-4 §3.2.3 intent
   (an attacker cannot cheaply grind presentation attacks against the gate)

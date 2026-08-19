@@ -55,9 +55,10 @@ irlume adopted the methodology rather than the certificate:
   attacks accepted) but collapsed in field conditions
   ([same day, daemon path](pad-results/2026-07-01-passive-ear-realworld-nonresponse.md):
   11 of 11 genuine sudo attempts got no blink verdict), so it was retired. This
-  is historical PAD evidence, not a current user action. Head nod approval and
-  shake decline prove intent and remain separate from passive PAD
-  ([ADR-0009](adr/0009-head-gesture-only-consent.md)).
+  is historical PAD evidence, not a current user action. Privileged intent now
+  requires conventional PAM keyboard confirmation; optional nod approval and
+  shake decline remain experimental and separate from passive PAD
+  ([ADR-0010](adr/0010-conventional-face-intent-confirmation.md)).
 
 What that adds up to, stated plainly: in the default configuration the
 credential-releasing gate is single-frame IR physics. It stopped every emissive

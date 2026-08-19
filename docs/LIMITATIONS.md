@@ -19,15 +19,18 @@ summary lives on the [README](../README.md); this is the detail.
   430-sample field session it was reliable below ambient ~120 on the 0-255 IR
   scale and rejected 129 of 129 genuine samples above ~170. The rejection names
   the condition and the fix.
-- **A head gesture proves intent, not that a face is live.** Repeated nodding
-  approves a gesture-gated request and a head shake declines it, but incidental
-  motion and a hand-held print have triggered the detector in measured trials.
-  Automatic passive PAD remains the separate security boundary
-  ([ADR-0009](adr/0009-head-gesture-only-consent.md)).
+- **The optional head gesture is experimental, not a privileged confirmation
+  substitute.** Repeated nodding approves a gesture-gated request and a head
+  shake declines it, but incidental motion and a hand-held print have triggered
+  the detector in measured trials. It defaults off and is not
+  population-qualified. Privileged face auth always requires hidden literal
+  `yes` first; automatic passive PAD remains the separate anti-spoof boundary
+  ([ADR-0010](adr/0010-conventional-face-intent-confirmation.md)).
 - **Legacy eye-policy state blocks rather than weakens.** For one release,
-  `consent_gesture=closure` and stored `require_eyes_open=true` fail closed with
-  migration instructions. Use `irlume profiles eyes-open off` to clear the
-  stored blocker; remove `consent_gesture` or set it to `nod`.
+  stored `require_eyes_open=true` blocks face authentication, while
+  `consent_gesture=closure` blocks an explicitly gesture-gated request. Both
+  provide migration instructions. Use `irlume profiles eyes-open off` to clear
+  the stored blocker; remove `consent_gesture` or set it to `nod`.
 - **RGB-only laptops get screen unlock only**, never `sudo`, login, or the
   keyring. By design.
 - **Not lab-certified.** Self-tested against ISO/IEC 30107-3, with no iBeta pass.

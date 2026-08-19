@@ -141,13 +141,19 @@ Per-model provenance, license verification notes, and the models this project
 refuses to bundle are documented in [`models/README.md`](../models/README.md);
 demographic-fairness measurements are in [FAIRNESS.md](FAIRNESS.md).
 
-Head consent is a separate policy gate. When the resolved service policy
-requires it, repeated nodding approves and a head shake declines. It uses the
-primary detector's five landmarks, proves intent rather than liveness, and
-cannot bypass capture, matching, passive PAD, camera binding, rate limiting, or
-biopolicy. Elevation and polkit keep their default-on policy; greeter, lock, and
-the default-off cold-keyring release policy are unchanged. See
-[ADR-0009](adr/0009-head-gesture-only-consent.md).
+Privileged intent is established through a conventional PAM conversation before
+camera work: hidden literal `yes` authorizes one face attempt, and the root PAM
+client carries an additive typed assertion that the daemon validates against
+the shared service class and `SO_PEERCRED`. The assertion is not cryptographic
+proof against root or a compromised conversation provider.
+
+Head gesture is a separate, optional policy gate. Every service defaults off;
+an explicit opt-in adds repeated-nod approval and head-shake decline after
+privileged keyboard confirmation. It uses the primary detector's five
+landmarks, is experimental rather than population-qualified, and cannot bypass
+capture, matching, passive PAD, camera binding, rate limiting, or biopolicy.
+Greeter, lock, and cold-keyring release keep their separate default-off gesture
+policy. See [ADR-0010](adr/0010-conventional-face-intent-confirmation.md).
 
 ## IR capture: strobe and ambient subtraction
 

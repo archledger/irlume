@@ -94,9 +94,11 @@ when isolating a camera problem, whatever the stored mode says.
 The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
 
-Authentication also has a presence grace window: after the consent gesture,
-capture attempts repeat while no usable face is in frame, so walking up or
-settling into position still works (`grace:` debug lines show the attempts).
+Authentication also has a presence grace window. On privileged services it
+starts only after hidden literal `yes`; an explicitly enabled head gesture is a
+later additional gate. Capture attempts repeat while no usable face is in frame,
+so walking up or settling into position still works (`grace:` debug lines show
+the attempts).
 The window is per-service: ~15 seconds for login and lock screens (you may be
 walking up), ~5 seconds for `sudo`/`su` (you're already at the terminal, so it
 drops to the password prompt quickly). Only presence-class failures retry (no
@@ -214,9 +216,8 @@ setting accepts is ignored: the default above stays in force and irlumed prints
 one line to the journal naming the variable and the reason. Check for that line
 before concluding a tuned threshold took effect. The same holds for
 `IRLUME_NOD_PITCH_MIN` and the retained head-shake thresholds. These are
-hardware-calibration overrides; the head-only retirement did not retune their
-defaults. `gesturecap` is the developer capture/replay tool for inspecting the
-same pose classifier.
+hardware-calibration overrides for the optional experimental gesture;
+`gesturecap capture` and `gesturecap replay` inspect the same pose classifier.
 
 `IRLUME_DEBUG_IR` (any value) additionally logs the IR burst's
 ambient-subtraction decisions frame by frame.

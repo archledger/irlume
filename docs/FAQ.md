@@ -116,7 +116,7 @@ meantime, so nothing locks you out.
 </details>
 
 <details>
-<summary><b>How fast is a face login, and when does it ask for a gesture?</b></summary>
+<summary><b>How fast is face authentication, and when does it ask for confirmation or a gesture?</b></summary>
 
 A normal face login takes about **2.5 seconds** on an integrated IR camera
 (measured on an ASUS Zenbook, CPU inference). Most of that is opening the
@@ -125,18 +125,17 @@ IR captures run in parallel, which cuts the capture stage by about a third;
 [docs/DEBUGGING.md](DEBUGGING.md) shows how to time every stage on your
 own hardware.
 
-Some operations add a deliberate **consent gesture** after the face match: a
-head nod approves, a head shake declines. What the dialog does afterwards is
-the desktop agent's call: on Plasma 6 the KDE agent re-prompts and closes its
-window after about three declined attempts, so a shake declines every time
-without closing the dialog on the first one
-([details](APP-INTEGRATION.md)). It gates
-app-consent prompts (polkit) and terminal elevation (sudo, su, doas) by default,
-and the keyring-release path only if you opt in with `irlume
-credential-release-challenge on`. A greeter cold login, logout and lock-screen
-unlock need no gesture. The gesture proves intent, not liveness; the
-IR-structure gate is what rejects a print (it stopped the tested screens, video
-replays and matte-paper photos, though a glossy vinyl print of the enrolled face
-passed it; see [Limits](LIMITATIONS.md)), and a missed gesture always falls back
-to typing the password.
+Privileged services—polkit and terminal elevation such as sudo, su, and
+doas—first ask for hidden literal `yes`. Enter or any other response chooses
+password/fingerprint without opening the camera; `yes` authorizes one face
+attempt. Login, logout, lock-screen, and credential-release flows do not gain
+this extra irlume prompt.
+
+An experimental **head gesture** can be explicitly added as a second gate and
+defaults off everywhere. Repeated nodding approves and a head shake declines;
+on Plasma 6 the KDE polkit agent may re-prompt before closing its window
+([details](APP-INTEGRATION.md)). The gesture is not population-qualified and
+proves neither liveness nor privileged intent on its own. Automatic passive PAD
+is the anti-spoof boundary, and every miss preserves password/fingerprint
+fallback.
 </details>

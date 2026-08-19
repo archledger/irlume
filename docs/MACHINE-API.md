@@ -332,6 +332,13 @@ wiring recipe for.
 needs root, so an ordinary caller gets `unknown`, which is not a synonym for
 `not-loaded`.
 
+Privileged face confirmation is fixed service policy, not mutable machine
+state. PAM and the daemon enforce it from the shared normalized service table;
+CLI/TUI render the same rule. Contract 1 therefore adds no confirmation or
+attestation field. Optional head-gesture configuration also remains outside the
+machine JSON contract. See
+[ADR-0010](adr/0010-conventional-face-intent-confirmation.md).
+
 ### `irlume profiles list --json [--user USER]`
 
 Capability: `profiles-list-json`.

@@ -1210,50 +1210,8 @@ pub fn detect_head_gesture_with_evidence(samples: &[PoseSample]) -> (HeadGesture
     } else {
         HeadGesture::None
     };
-    // When the shake check nearly fires but doesn't, say why. The caller
-    // has no other way to know whether a shake was close.
-    if verdict == HeadGesture::None
-        && evidence.frames >= NOD_MIN_FACE_FRAMES
-        && evidence.yaw_range >= shake_yaw_min()
-    {
-        // Calibration aid: print to stderr so the daemon's journal captures
-        // it even without IRLUME_LOG. The format string is deliberately
-        // simple so it can't be dead-code eliminated.
-        // Names the FIRST unmet condition. The earlier version always printed the
-        // crossing floor, so a shake rejected by the yaw CEILING was reported as if
-        // it lacked oscillation, and a live session spent its diagnosis on the wrong
-        // knob. A diagnostic that points away from the cause is worse than none.
-        let need_crossings = if evidence.yaw_range >= shake_wide_yaw() {
-            SHAKE_WIDE_MIN_CROSSINGS
-        } else {
-            shake_min_crossings()
-        };
-        let why = if evidence.yaw_range > SHAKE_YAW_MAX {
-            format!(
-                "yaw {:.2} ABOVE max {:.2} (reads as look-around)",
-                evidence.yaw_range, SHAKE_YAW_MAX
-            )
-        } else if evidence.pitch_range > shake_pitch_max() {
-            format!(
-                "pitch {:.3} above max {:.3} (nodding while shaking)",
-                evidence.pitch_range,
-                shake_pitch_max()
-            )
-        } else {
-            format!("yaw_crossings {yaw_crossings} below need {need_crossings}")
-        };
-        let msg = format!(
-            "irlumed-shake-check REJECTED: {why} [yaw={:.2} in {:.2}..{:.2}, pitch={:.3} max {:.3}, yaw_crossings={} need {}]",
-            evidence.yaw_range,
-            shake_yaw_min(),
-            SHAKE_YAW_MAX,
-            evidence.pitch_range,
-            shake_pitch_max(),
-            yaw_crossings,
-            need_crossings
-        );
-        eprintln!("{msg}");
-    }
+    // Pure by design: rolling callers invoke this every few frames. They own
+    // diagnostics and receive the complete evidence without repeated stderr.
     (verdict, evidence)
 }
 

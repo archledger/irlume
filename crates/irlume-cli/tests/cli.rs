@@ -2122,6 +2122,25 @@ fn write_pose_recording(path: &std::path::Path, label: &str, pitches: &[f32]) {
     std::fs::write(path, s).unwrap();
 }
 
+fn write_pose_recording_with_yaw(
+    path: &std::path::Path,
+    label: &str,
+    pitches: &[f32],
+    yaw: &[f32],
+) {
+    assert_eq!(pitches.len(), yaw.len());
+    let mut contents = format!(
+        "{{\"posecap\":true,\"label\":\"{label}\",\"frames\":{}}}\n",
+        pitches.len()
+    );
+    for (idx, (&pitch, &yaw)) in pitches.iter().zip(yaw).enumerate() {
+        contents.push_str(&format!(
+            "{{\"idx\":{idx},\"pitch_frac\":{pitch},\"yaw_signed\":{yaw},\"bri\":100.0}}\n"
+        ));
+    }
+    std::fs::write(path, contents).unwrap();
+}
+
 #[test]
 fn gesturecap_replays_pose_only_recordings() {
     let sandbox = Sandbox::new("gesturecap-replay");
@@ -2164,6 +2183,26 @@ fn gesturecap_replays_pose_only_recordings() {
         .env("IRLUME_DEV", "1"));
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("nod.jsonl"), "{stdout}");
+}
+
+#[test]
+fn gesturecap_replay_keeps_rejection_evidence_in_csv_not_stderr() {
+    let sandbox = Sandbox::new("gesturecap-quiet-replay");
+    let file = sandbox.path("work/look-around.jsonl");
+    let pitch = [0.5; 24];
+    let yaw: Vec<f32> = (0..24)
+        .map(|idx| if idx % 2 == 0 { -2.05 } else { 2.05 })
+        .collect();
+    write_pose_recording_with_yaw(&file, "look-around", &pitch, &yaw);
+
+    let mut command = sandbox.cmd(&["gesturecap", "replay", file.to_str().unwrap()]);
+    command.env("IRLUME_DEV", "1");
+    let (code, stdout, stderr) = run(&mut command);
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("look-around.jsonl"), "{stdout}");
+    assert!(stdout.contains("None"), "{stdout}");
 }
 
 #[test]

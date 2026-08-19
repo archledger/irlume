@@ -3027,8 +3027,8 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
 /// TPM-sealed keyring password is released, and can that gesture actually run here?
 ///
 /// Kept separate from the polkit block because the failure MEANING differs. A
-/// polkit prompt that cannot run the gesture falls back to a password dialog the
-/// user is already looking at; a credential release that cannot run it leaves the
+/// polkit prompt with the optional gesture enabled falls back to its password
+/// dialog when that gesture cannot run; a credential release failure leaves the
 /// keyring locked after an otherwise successful face login, which reads as "face
 /// login is broken" unless doctor names it.
 ///
@@ -3139,6 +3139,26 @@ fn report_credential_release(
              it your\n     \
              login still succeeds and only the keyring falls back to the typed password."
         );
+    }
+}
+
+fn polkit_doctor_message(
+    gesture: Option<bool>,
+    policy: irlume_common::config::HeadConsentPolicy,
+) -> String {
+    match gesture {
+        Some(false) => "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required; additional head gesture: off)".into(),
+        Some(true)
+            if matches!(
+                policy,
+                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
+                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
+            ) => format!(
+                "[doctor] polkit app prompts: wired ✓; keyboard confirmation remains required; additional gesture blocked: {}",
+                policy.instruction("approve")
+            ),
+        Some(true) => "[doctor] polkit app prompts: wired ✓ (type yes, then KEEP NODDING to approve Bitwarden unlock, pkexec, …; shake your head to decline)".into(),
+        None => "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required; additional gesture state is root-only—re-run doctor with sudo)".into(),
     }
 }
 
@@ -4134,43 +4154,13 @@ fn doctor_run(
         },
     );
     match crate::pamwire::polkit_wired() {
-        // "KEEP nodding", matching the prompt the user will actually see: a
-        // single nod released 0 times out of 3 on hardware, because the detector
-        // needs a run of frames showing the motion.
-        // The gesture can be turned off for polkit alone, and then no gesture is
-        // asked for at all; saying "KEEP NODDING" there describes a prompt the
-        // user will never see.
-        // The VISIBLE read: settings.conf is 0600, and the plain read collapses
-        // "could not read" into the permissive default, so an unprivileged
-        // doctor asserted face-alone-approves about a policy it never saw.
-        // Unknown falls through to the gesture arms below, which describe the
-        // default-on behaviour that holds unless someone turned it off.
-        Some(true)
-            if irlume_common::config::service_gesture_required_visible("polkit-1")
-                == Some(false) =>
-        {
-            dout!(report,
-            "[doctor] polkit app prompts: wired ✓ (face alone approves Bitwarden unlock, pkexec, …;\n     \
-             the head gesture is OFF for polkit: sudo irlume credential-release-challenge polkit-1 on)"
-            )
-        }
-        Some(true)
-            if matches!(
+        Some(true) => dout!(
+            report,
+            "{}",
+            polkit_doctor_message(
+                irlume_common::config::service_gesture_required_visible("polkit-1"),
                 head_policy,
-                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
-            ) =>
-        {
-            dout!(
-                report,
-                "[doctor] polkit app prompts: wired ✓ but blocked: {}; the daemon refuses \
-                 face approval and PAM keeps the password fallback",
-                head_policy.instruction("approve")
             )
-        }
-        Some(true) => dout!(report,
-            "[doctor] polkit app prompts: wired ✓ (KEEP NODDING to approve Bitwarden unlock,\n     \
-             pkexec, …; shake your head to decline)"
         ),
         Some(false) if bitwarden_action => dout!(report,
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
@@ -4551,6 +4541,40 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn doctor_polkit_copy_keeps_keyboard_confirmation_primary() {
+        use irlume_common::config::{HeadConsentPolicy, HeadConsentSource};
+
+        let off = polkit_doctor_message(Some(false), HeadConsentPolicy::Ready);
+        assert!(off.contains("keyboard confirmation required"), "{off}");
+        assert!(off.contains("additional head gesture: off"), "{off}");
+        assert!(!off.contains("face alone approves"), "{off}");
+
+        let on = polkit_doctor_message(Some(true), HeadConsentPolicy::Ready);
+        assert!(on.contains("type yes, then KEEP NODDING"), "{on}");
+        assert!(on.contains("shake your head to decline"), "{on}");
+
+        let blocked = polkit_doctor_message(
+            Some(true),
+            HeadConsentPolicy::LegacyClosure(HeadConsentSource::Settings),
+        );
+        assert!(blocked.contains("additional gesture blocked"), "{blocked}");
+        assert!(
+            blocked.contains("keyboard confirmation remains required"),
+            "{blocked}"
+        );
+
+        let unknown = polkit_doctor_message(None, HeadConsentPolicy::Ready);
+        assert!(
+            unknown.contains("keyboard confirmation required"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("additional gesture state is root-only"),
+            "{unknown}"
+        );
     }
 
     #[test]

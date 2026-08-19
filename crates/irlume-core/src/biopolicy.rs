@@ -44,10 +44,9 @@ pub enum OperationClass {
     Elevation,
     /// A polkit prompt approving an action for an application (Bitwarden vault
     /// unlock, pkexec, systemd unit control). Verify-only, and the sealed
-    /// credential is NEVER released to it: the polkit agent starts the PAM
-    /// conversation the moment its dialog opens, with no user gesture, so this
-    /// class must not be able to pull anything out of the TPM. The engine also
-    /// forces head consent for it (see [`requires_consent_gesture`]).
+    /// credential is NEVER released to it. A polkit agent can start PAM before
+    /// irlume collects conventional confirmation, and the class must never be
+    /// able to pull anything out of the TPM.
     AppConsent,
     /// Remote access (sshd, etc.); face auth must never satisfy this.
     Remote,
@@ -126,10 +125,9 @@ pub fn decide(class: OperationClass, tier: Tier) -> Action {
     }
 }
 
-/// True for classes where a face grant must additionally pass head consent.
-/// polkit agents (KDE, GNOME Shell) start the PAM conversation as soon as their
-/// dialog opens, so without this a face match completes with no user action at
-/// all. Consent records intent; passive PAD remains a separate gate.
+/// Legacy classification retained for callers that distinguish app consent.
+/// Current gesture policy does not use this as a default: every head gesture is
+/// explicit-only, while privileged intent comes from PAM keyboard confirmation.
 pub fn requires_consent_gesture(class: OperationClass) -> bool {
     matches!(class, OperationClass::AppConsent)
 }
@@ -256,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn polkit_requires_the_consent_gesture_and_others_do_not() {
+    fn legacy_consent_classifier_marks_only_polkit() {
         assert!(requires_consent_gesture(classify(
             "polkit-1",
             SessionState::Cold

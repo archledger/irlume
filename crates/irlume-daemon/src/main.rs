@@ -3933,8 +3933,8 @@ fn dispatch_scoped(
             }
             // ALWAYS-ON: a polkit prompt never releases the sealed credential,
             // independent of the tier and the opt-in biopolicy below. The
-            // polkit agent runs its PAM conversation with no user gesture, so a
-            // `unseal`-arg line (mis)wired into polkit-1 must not be able to
+            // A polkit agent can start PAM before conventional confirmation, so
+            // an `unseal`-arg line (mis)wired into polkit-1 must not be able to
             // pull the login password out of the TPM; polkit gets verify-only
             // (Authenticate).
             {
@@ -9459,8 +9459,8 @@ mod tests {
             other => panic!("convenience tier must refuse unseal, got {other:?}"),
         }
         // A polkit service NEVER releases the credential, on any tier, with or
-        // without the opt-in biopolicy: the polkit agent starts its PAM
-        // conversation with no user gesture, so this fires before every other
+        // without the opt-in biopolicy: a polkit agent can start PAM before
+        // conventional confirmation, so this fires before every other
         // consideration except root and method.
         for svc in ["polkit-1", "polkit"] {
             match dispatch(

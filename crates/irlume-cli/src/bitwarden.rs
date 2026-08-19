@@ -438,7 +438,7 @@ fn print_app_steps() {
     println!("  1. File > Settings > Security > \"Unlock with system authentication\"");
     println!("  2. unlock the vault once with your master password (biometrics never replace");
     println!("     the first unlock; Bitwarden keeps the vault key in memory)");
-    println!("  then the unlock prompt is a polkit dialog your consent gesture satisfies.");
+    println!("  then type yes at irlume's hidden confirmation and complete face verification.");
 }
 
 #[cfg(test)]

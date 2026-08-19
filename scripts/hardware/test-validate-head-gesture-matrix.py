@@ -318,6 +318,10 @@ case "${FAKE_ADAPTER_MODE-good}" in
   bad-evidence) printf '%s\\n' '{"typed_outcome":"approved","detector_evidence":{"frames":999,"face_frames":999,"pitch_range":0,"yaw_range":0,"pitch_crossings":0,"yaw_crossings":0,"mean_step":0}}' ;;
   success-hang) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; sleep 60 & child=$!; printf '%s\\n' "$child" >"$FAKE_CONTAINED_PID"; wait "$child" ;;
   success-nonzero) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; exit 9 ;;
+  exit-124) exit 124 ;;
+  exit-137) exit 137 ;;
+  success-exit-124) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; exit 124 ;;
+  success-exit-137) printf '{"typed_outcome":"approved","detector_evidence":%s}\\n' "$normal"; exit 137 ;;
   escape)
     setsid sh -c 'setsid sh -c '\''sleep 60 & child=$!; printf "%s\\n" "$child" >"$FAKE_ESCAPE_PID"; wait "$child"'\'' &' &
     deadline=50
@@ -567,6 +571,34 @@ exit 99
                 self.assertNotEqual(result.returncode, 0)
                 trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
                 self.assertEqual(trial_record["typed_outcome"], expected_outcome)
+
+    def test_independent_124_and_137_are_failures_not_watchdog_timeouts(self):
+        for mode in ["exit-124", "exit-137", "success-exit-124", "success-exit-137"]:
+            root = self.root / f"independent-{mode}"
+            root.mkdir(mode=0o700)
+            result = self.run_runner(evidence_root=root, extra_env={"FAKE_ADAPTER_MODE": mode})
+            with self.subTest(mode=mode):
+                self.assertNotEqual(result.returncode, 0)
+                trial_record = next(record for record in self.records(root) if record["record_type"] == "trial")
+                self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
+                qualification = subprocess.run(
+                    ["python3", str(VALIDATOR), str(root)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(qualification.returncode, 3)
+
+    def test_completion_marker_symlink_is_not_followed_or_trusted(self):
+        outside = self.root / "outside-marker-target"
+        outside.write_text("sentinel\n", encoding="utf-8")
+        result = self.run_runner(extra_env={
+            "IRLUME_HEAD_GESTURE_TEST_COMPLETION_SYMLINK": str(outside),
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
+        trial_record = next(record for record in self.records() if record["record_type"] == "trial")
+        self.assertEqual(trial_record["typed_outcome"], "attempt-failed")
 
     def test_containment_authority_is_required_and_kills_setsid_double_fork(self):
         refused = self.run_runner(extra_env={"FAKE_CONTAINMENT_CHECK_FAIL": "1"})

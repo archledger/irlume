@@ -190,6 +190,52 @@ scratch_file() {
     printf -v "$variable" '%s' "$path"
 }
 
+supervisor=
+scratch_file supervisor supervise.py
+chmod 0700 "$supervisor"
+python3 - "$supervisor" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_text(
+    """#!/usr/bin/env python3
+import os
+import stat
+import subprocess
+import sys
+
+marker, *command = sys.argv[1:]
+try:
+    child = subprocess.Popen(command)
+    returncode = child.wait()
+    status = returncode if returncode >= 0 else 128 - returncode
+except OSError:
+    status = 127
+
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+descriptor = os.open(marker, flags, 0o600)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+    ):
+        raise SystemExit(125)
+    payload = f"{status}\\n".encode("ascii")
+    view = memoryview(payload)
+    while view:
+        view = view[os.write(descriptor, view):]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+raise SystemExit(status)
+""",
+    encoding="utf-8",
+)
+PY
+
 status_json=
 scratch_file status_json status.json
 "$status_cmd" status --json --contract 1 >"$status_json" || die "status API failed"
@@ -291,10 +337,14 @@ run_adapter() {
     shift 2
     local stdout_file="$scratch_dir/$phase.stdout" stderr_file="$scratch_dir/$phase.stderr"
     local stdout_fifo="$scratch_dir/$phase.stdout.fifo" stderr_fifo="$scratch_dir/$phase.stderr.fifo"
+    local completion_file="$scratch_dir/$phase.completion"
     : >"$stdout_file"
     : >"$stderr_file"
     mkfifo "$stdout_fifo" "$stderr_fifo"
-    scratch_files+=("$stdout_file" "$stderr_file" "$stdout_fifo" "$stderr_fifo")
+    scratch_files+=("$stdout_file" "$stderr_file" "$stdout_fifo" "$stderr_fifo" "$completion_file")
+    if [[ $test_mode == 1 && $phase == attempt && -n ${IRLUME_HEAD_GESTURE_TEST_COMPLETION_SYMLINK:-} ]]; then
+        ln -s -- "$IRLUME_HEAD_GESTURE_TEST_COMPLETION_SYMLINK" "$completion_file"
+    fi
     head -c 4097 <"$stdout_fifo" >"$stdout_file" &
     local stdout_reader=$!
     head -c 4097 <"$stderr_fifo" >"$stderr_file" &
@@ -304,27 +354,70 @@ run_adapter() {
     set +e
     if [[ $test_mode == 1 ]]; then
         timeout --foreground --kill-after=2s "${seconds}s" \
-            "$containment_cmd" run "$unit" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+            "$containment_cmd" run "$unit" python3 "$supervisor" "$completion_file" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
     else
         timeout --foreground --kill-after=2s "${seconds}s" \
             systemd-run --user --scope --quiet --unit="$unit" -- \
-            "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+            python3 "$supervisor" "$completion_file" "$adapter_bound" "$@" >"$stdout_fifo" 2>"$stderr_fifo"
     fi
     local status=$?
     set -e
-    if ! containment_cleanup "$unit"; then
-        status=125
-    fi
+    local containment_ok=1
+    containment_cleanup "$unit" || containment_ok=0
     active_unit=
     wait "$stdout_reader" 2>/dev/null || true
     wait "$stderr_reader" 2>/dev/null || true
     RUN_STDOUT=$stdout_file
     RUN_STDERR=$stderr_file
-    RUN_STATUS=$status
+    RUN_CONTAINMENT_OK=$containment_ok
+    RUN_ADAPTER_COMPLETED=0
+    RUN_ADAPTER_STATUS=
+    if [[ -e $completion_file || -L $completion_file ]]; then
+        local completion_status
+        if completion_status=$(python3 - "$completion_file" <<'PY'
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+descriptor = os.open(sys.argv[1], flags)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != 1
+        or not 2 <= info.st_size <= 4
+    ):
+        raise SystemExit(1)
+    raw = os.read(descriptor, 5)
+finally:
+    os.close(descriptor)
+try:
+    text = raw.decode("ascii")
+    if not text.endswith("\n") or not text[:-1].isdigit():
+        raise ValueError
+    status = int(text[:-1])
+except (UnicodeError, ValueError):
+    raise SystemExit(1)
+if not 0 <= status <= 255:
+    raise SystemExit(1)
+print(status)
+PY
+        ); then
+            RUN_ADAPTER_COMPLETED=1
+            RUN_ADAPTER_STATUS=$completion_status
+        fi
+    fi
+    RUN_WATCHDOG_EXPIRED=0
+    if [[ $RUN_ADAPTER_COMPLETED -eq 0 && ( $status -eq 124 || $status -eq 137 ) ]]; then
+        RUN_WATCHDOG_EXPIRED=1
+    fi
 }
 
 run_adapter preflight 5 --preflight --expected-camera-identity-digest "$expected_camera_digest"
-[[ $RUN_STATUS -eq 0 ]] || die "adapter preflight failed"
+[[ $RUN_CONTAINMENT_OK -eq 1 && $RUN_ADAPTER_COMPLETED -eq 1 && $RUN_ADAPTER_STATUS -eq 0 ]] || die "adapter preflight failed"
 preflight_digest=$(python3 - "$RUN_STDOUT" "$RUN_STDERR" <<'PY'
 import json
 import pathlib
@@ -358,7 +451,7 @@ run_adapter attempt "$attempt_seconds" \
 trial_record=
 scratch_file trial_record trial.json
 trial_id="$host_label:$service:$expected_gesture:$(date -u +%Y%m%d%H%M%S):$$"
-normalization=$(python3 - "$RUN_STDOUT" "$RUN_STDERR" "$RUN_STATUS" "$trial_record" \
+normalization=$(python3 - "$RUN_STDOUT" "$RUN_STDERR" "$RUN_WATCHDOG_EXPIRED" "$RUN_ADAPTER_COMPLETED" "$RUN_ADAPTER_STATUS" "$RUN_CONTAINMENT_OK" "$trial_record" \
     "$expected_oid" "$expected_binary_sha256" "$expected_adapter_sha256" "$expected_camera_digest" \
     "$host_label" "$service" "$purpose" "$resolved_policy" "$trial_id" "$expected_gesture" "$timestamp" "$validator" <<'PY'
 import json
@@ -367,12 +460,15 @@ import runpy
 import sys
 
 (
-    stdout_raw, stderr_raw, status_raw, destination_raw, oid, binary, adapter,
+    stdout_raw, stderr_raw, watchdog_raw, completed_raw, adapter_status_raw, containment_raw, destination_raw, oid, binary, adapter,
     camera, host, service, purpose, policy, trial_id, gesture, timestamp, validator_raw,
 ) = sys.argv[1:]
 stdout = pathlib.Path(stdout_raw)
 stderr = pathlib.Path(stderr_raw)
-status = int(status_raw)
+watchdog_expired = watchdog_raw == "1"
+completed = completed_raw == "1"
+adapter_status = int(adapter_status_raw) if completed else None
+containment_ok = containment_raw == "1"
 zero = {"frames": 0, "face_frames": 0, "pitch_range": 0, "yaw_range": 0, "pitch_crossings": 0, "yaw_crossings": 0, "mean_step": 0}
 result = None
 validator = runpy.run_path(validator_raw)
@@ -397,9 +493,9 @@ if stdout.stat().st_size <= 4096 and stderr.stat().st_size <= 4096:
     except (UnicodeError, json.JSONDecodeError):
         pass
 evidence = result["detector_evidence"] if result is not None else zero
-if status in {124, 137}:
+if watchdog_expired:
     result = {"typed_outcome": "attempt-timeout", "detector_evidence": evidence}
-elif status != 0 or result is None:
+elif not containment_ok or not completed or adapter_status != 0 or result is None:
     result = {"typed_outcome": "attempt-failed", "detector_evidence": evidence}
 record = {
     "schema_version": 1,
@@ -431,5 +527,5 @@ python3 "$validator" --publish-record "$evidence_root" "$capability_record" || d
 printf 'head-gesture-matrix: recorded host=%s trial=%s outcome=%s\n' "$host_label" "$trial_id" "$normalization"
 case "$normalization" in
     attempt-failed|attempt-timeout) exit 4 ;;
-    *) [[ $RUN_STATUS -eq 0 ]] && exit 0 || exit 4 ;;
+    *) exit 0 ;;
 esac

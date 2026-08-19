@@ -138,7 +138,7 @@ const ACTIVITY_EXPANDED_ROWS: u16 = 7;
 /// (login greeters / TTYs / SSH at 80 columns).
 const SIDEBAR_MIN_COLS: u16 = 90;
 
-/// The services the Settings tab lets the user toggle the consent gesture for,
+/// The services the Settings tab lets the user toggle the head gesture for,
 /// with arrow keys + `c`. All four are high-privilege (elevation or app-consent),
 /// so disabling any of them asks for confirmation first. The keyring-release path
 /// has its own `g` toggle, so it is not repeated here.
@@ -309,7 +309,7 @@ enum Suspend {
     /// credential release, so the TUI confirms first and the CLI still prints its
     /// own warning in the cooked terminal.
     CredentialReleaseChallenge(bool),
-    /// Toggle the consent gesture for one PAM service (the bool is the target
+    /// Toggle the head gesture for one PAM service (the bool is the target
     /// state). Root op; runs `sudo irlume credential-release-challenge <service>
     /// on|off --yes`. Disabling a high-privilege service is confirmed by the TUI
     /// first (the `--yes` then skips the CLI's own prompt).
@@ -2587,8 +2587,7 @@ impl App {
                 match event::read()? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => {
                         // A Ctrl-modified letter (Ctrl-C…) must not alias to
-                        // that letter's action; found live when Ctrl-C fired
-                        // the [c] calibrate binding. Plain keys pass through.
+                        // that letter's action. Plain keys pass through.
                         let ctrl = k
                             .modifiers
                             .contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
@@ -2858,9 +2857,8 @@ impl App {
         // `irlume tui --user bob` shows bob everywhere and sends bob in every
         // daemon request, but a step that shells out re-resolves its own subject
         // from SUDO_USER/$USER, which names whoever launched the TUI: an admin
-        // setting bob up calibrated the gesture onto their own enrollment, and
-        // "delete ALL enrolled fingerprints" deleted their own. Built here so
-        // every per-user arm passes the same thing.
+        // managing bob could otherwise change their own enrolled fingerprints.
+        // Built here so every per-user arm passes the same target.
         let for_user: [String; 2] = ["--user".to_string(), self.user.clone()];
         // A local copy for the shell-out slices: `sudo_step` takes `&mut self`,
         // so they cannot hold a borrow of `self.user` across the call.
@@ -2986,9 +2984,9 @@ impl App {
             ),
             Suspend::ServiceGesture { service, on } => self.sudo_step(
                 &if on {
-                    format!("require a consent gesture for '{service}'")
+                    format!("require a head gesture for '{service}'")
                 } else {
-                    format!("stop requiring a consent gesture for '{service}'")
+                    format!("stop requiring a head gesture for '{service}'")
                 },
                 &[
                     "irlume",
@@ -3608,11 +3606,11 @@ impl App {
             // Opt-in wiring extras; each logs the exact command then suspends,
             // so nothing needs to be copied out of the TUI to be run.
             (SC_PAM, KeyCode::Char('u')) => {
-                self.log('→', "sudo irlume login enable --with-sudo --apply: face approves sudo prompts (password still works)");
+                self.log('→', "sudo irlume login enable --with-sudo --apply: nod to approve and shake your head to decline sudo prompts (password still works)");
                 self.suspend = Some(Suspend::LoginEnableSudo);
             }
             (SC_PAM, KeyCode::Char('p')) => {
-                self.log('→', "sudo irlume login enable --with-polkit --apply: face + consent gesture approve app prompts (Bitwarden, pkexec)");
+                self.log('→', "sudo irlume login enable --with-polkit --apply: face + head gesture approves app prompts (Bitwarden, pkexec)");
                 self.suspend = Some(Suspend::LoginEnablePolkit);
             }
             // Un-wiring is destructive-ish (face login stops working until
@@ -3666,7 +3664,7 @@ impl App {
                     ));
                 }
             }
-            // Per-service consent gesture: ↑/↓ pick the service, [c] toggles it.
+            // Per-service head gesture: ↑/↓ pick the service, [c] toggles it.
             // settings.conf is root-only, so this shells out to the CLI, the one
             // place the write and its high-privilege confirmation live. Every
             // service in the list is elevation or app-consent, so disabling the
@@ -3694,7 +3692,7 @@ impl App {
                     self.log(
                         '·',
                         format!(
-                            "the consent gesture for '{svc}' is a root-only setting; \
+                            "the head gesture for '{svc}' is a root-only setting; \
                              run the TUI with sudo, or check it with: \
                              sudo irlume credential-release-challenge {svc} status"
                         ),
@@ -3711,14 +3709,14 @@ impl App {
                         '→',
                         format!(
                             "sudo irlume credential-release-challenge {svc} on: \
-                             require a consent gesture for '{svc}'"
+                             require a head gesture for '{svc}' (nod to approve; shake to decline)"
                         ),
                     );
                     self.suspend = Some(sus);
                 } else {
                     self.confirm = Some((
                         format!(
-                            "Disable the consent gesture for '{svc}'? A face match alone would \
+                            "Disable the head gesture for '{svc}'? A face match alone would \
                              then approve it: a print of your face held to the camera could use \
                              '{svc}'. Your typed password still works."
                         ),
@@ -3745,8 +3743,8 @@ impl App {
                     Some(false) | None => {
                         self.log(
                             '→',
-                            "sudo irlume credential-release-challenge on: add a gesture before \
-                             keyring release",
+                            "sudo irlume credential-release-challenge on: add a head gesture \
+                             (nod to approve; shake to decline) before keyring release",
                         );
                         self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
                     }
@@ -5902,7 +5900,7 @@ impl App {
         } else if self.enrolled_known() == Some(true) {
             (
                 "Face unlock is ready",
-                "Enrollment and system integration update automatically.",
+                "Keep nodding to approve; shake your head to decline.",
                 th().ok,
             )
         } else {
@@ -6336,12 +6334,12 @@ impl App {
         lines.push(act(
             "[u]",
             "Wire face-sudo",
-            "opt-in; face + a consent gesture approve sudo prompts",
+            "opt-in; nod to approve and shake your head to decline sudo prompts",
         ));
         lines.push(act(
             "[p]",
             "Wire app prompts",
-            "opt-in; face approves Bitwarden and pkexec",
+            "opt-in; nod to approve and shake your head to decline app prompts",
         ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
@@ -6374,7 +6372,7 @@ impl App {
                     Span::raw("  Bitwarden   "),
                     Span::styled("● polkit action installed", Style::new().fg(th().ok)),
                     Span::styled(
-                        "  (turn on \"unlock with system authentication\" in its settings)",
+                        "  (turn on \"unlock with system authentication\"; nod to approve, shake to decline)",
                         Style::new().dim(),
                     ),
                 ]));
@@ -10831,9 +10829,40 @@ mod tests {
             text.contains("tier unknown (daemon unreachable)"),
             "no tier claim without the daemon"
         );
-        // The aligned action list: the primary wire action plus the un-wire.
+        // The aligned action list retains its current head-gated actions.
         assert!(text.contains("[w]") && text.contains("Wire login + lock"));
+        assert!(text.contains("[u]") && text.contains("Wire face-sudo"));
+        assert!(text.contains("[p]") && text.contains("Wire app prompts"));
+        assert!(text.contains("[s]") && text.contains("Show full status"));
         assert!(text.contains("[x]") && text.contains("Un-wire everything"));
+        assert!(
+            text.contains("nod to approve and shake your head to decline"),
+            "{text}"
+        );
+        for retired in [
+            "Calibrate gesture",
+            "Calibrate Gesture",
+            "eye-closure",
+            "eyes-open",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "retired PAM text remains: {retired}"
+            );
+        }
+        let help = app.help_body();
+        assert!(help.contains("Connect Login") && help.contains("Configure Sudo"));
+        for retired in [
+            "Calibrate gesture",
+            "Calibrate Gesture",
+            "eye-closure",
+            "eyes-open",
+        ] {
+            assert!(
+                !help.contains(retired),
+                "retired PAM help remains: {retired}"
+            );
+        }
         app.health = Some(HealthInfo {
             tier: "convenience".into(),
             rgb_dev: Some("/dev/video0".into()),
@@ -12027,7 +12056,12 @@ mod tests {
         app.profiles_loaded = true;
         assert!(draw_text(&app).contains("Set up face unlock while keeping password access"));
         app.profiles = vec![profile("a", &["s1"])];
-        assert!(draw_text(&app).contains("Face unlock is ready"));
+        let text = draw_text(&app);
+        assert!(text.contains("Face unlock is ready"));
+        assert!(
+            text.contains("Keep nodding to approve; shake your head to decline."),
+            "the ready state must explain head approval and decline: {text}"
+        );
 
         // Keyring: keyring_armed is already tri-state.
         app.screen = SC_KEYRING;

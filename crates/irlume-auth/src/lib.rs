@@ -462,6 +462,30 @@ fn consent_gesture_enabled() -> bool {
     irlume_common::config::polkit_gesture_enabled()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadConsentVerdict {
+    Approve,
+    Decline,
+    NoGesture,
+}
+
+fn head_consent_from_poses(poses: &[irlume_liveness::PoseSample]) -> HeadConsentVerdict {
+    match irlume_liveness::detect_head_gesture(poses) {
+        irlume_liveness::HeadGesture::Nod => HeadConsentVerdict::Approve,
+        irlume_liveness::HeadGesture::Shake => HeadConsentVerdict::Decline,
+        irlume_liveness::HeadGesture::None | irlume_liveness::HeadGesture::NoFace => {
+            HeadConsentVerdict::NoGesture
+        }
+    }
+}
+
+fn resolve_head_consent(
+    stream: Option<HeadConsentVerdict>,
+    completed: impl FnOnce() -> HeadConsentVerdict,
+) -> HeadConsentVerdict {
+    stream.unwrap_or_else(completed)
+}
+
 /// The consent verdict once the watch's stream has ended: what the in-loop
 /// cadence already found, or a gesture visible only on the COMPLETE take.
 ///
@@ -482,7 +506,7 @@ fn completed_consent_take_hit(
     closure_cal: Option<&irlume_liveness::ClosureCalibration>,
 ) -> bool {
     hit_in_loop
-        || (allow_nod && irlume_liveness::detect_nod(poses) == irlume_liveness::HeadGesture::Nod)
+        || (allow_nod && head_consent_from_poses(poses) == HeadConsentVerdict::Approve)
         || closure_cal.is_some_and(|cal| {
             irlume_liveness::detect_deliberate_closure(ears, cal)
                 == irlume_liveness::BlinkResult::Blinked
@@ -503,9 +527,22 @@ fn resolve_consent_watch(
     stream_hit: Option<bool>,
     completed_take_hit: impl FnOnce() -> bool,
 ) -> bool {
-    match stream_hit {
-        Some(accepted) => accepted,
-        None => completed_take_hit(),
+    let stream = stream_hit.map(|accepted| {
+        if accepted {
+            HeadConsentVerdict::Approve
+        } else {
+            HeadConsentVerdict::Decline
+        }
+    });
+    match resolve_head_consent(stream, || {
+        if completed_take_hit() {
+            HeadConsentVerdict::Approve
+        } else {
+            HeadConsentVerdict::NoGesture
+        }
+    }) {
+        HeadConsentVerdict::Approve => true,
+        HeadConsentVerdict::Decline | HeadConsentVerdict::NoGesture => false,
     }
 }
 
@@ -11064,6 +11101,63 @@ mod engine_tests {
                 bri: 60.0,
             })
             .collect()
+    }
+
+    fn still_poses() -> Vec<irlume_liveness::PoseSample> {
+        (0..20)
+            .map(|idx| irlume_liveness::PoseSample {
+                idx,
+                pitch_frac: Some(0.5),
+                yaw_signed: Some(0.0),
+                bri: 60.0,
+            })
+            .collect()
+    }
+
+    fn wide_shake_poses(len: usize) -> Vec<irlume_liveness::PoseSample> {
+        let third = len / 3;
+        (0..len)
+            .map(|idx| irlume_liveness::PoseSample {
+                idx,
+                pitch_frac: Some(0.5),
+                yaw_signed: Some(if idx < third {
+                    -0.9
+                } else if idx < 2 * third {
+                    0.0
+                } else {
+                    0.9
+                }),
+                bri: 60.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completed_take_reports_nod_and_shake_as_distinct_terminal_verdicts() {
+        assert_eq!(
+            head_consent_from_poses(&boundary_poses()),
+            HeadConsentVerdict::Approve
+        );
+        assert_eq!(
+            head_consent_from_poses(&wide_shake_poses(20)),
+            HeadConsentVerdict::Decline
+        );
+        assert_eq!(
+            head_consent_from_poses(&still_poses()),
+            HeadConsentVerdict::NoGesture
+        );
+    }
+
+    #[test]
+    fn stream_verdict_is_terminal_before_completed_take() {
+        assert_eq!(
+            resolve_head_consent(Some(HeadConsentVerdict::Decline), || panic!("must not run")),
+            HeadConsentVerdict::Decline
+        );
+        assert_eq!(
+            resolve_head_consent(Some(HeadConsentVerdict::Approve), || panic!("must not run")),
+            HeadConsentVerdict::Approve
+        );
     }
 
     #[test]

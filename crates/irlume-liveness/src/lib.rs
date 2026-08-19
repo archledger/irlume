@@ -1139,21 +1139,21 @@ pub const SHAKE_WIDE_YAW: f32 = 1.5;
 /// Crossings required once the yaw range is [`SHAKE_WIDE_YAW`] or wider.
 pub const SHAKE_WIDE_MIN_CROSSINGS: usize = 1;
 
-/// Detect a deliberate head-NOD consent gesture from a pose sequence: the head
-/// pitch swings through a range of at least [`NOD_PITCH_MIN`] while the yaw stays
-/// within [`NOD_YAW_MAX`] (not a look-around or shake), oscillating up-and-down
-/// at least [`NOD_MIN_CROSSINGS`] times (not a single drift). Pose-DEFINED, so
-/// unlike the eye-closure gesture it reads the same at any head angle or
-/// lighting, which is why it survives a reclined user where EAR collapses.
+/// Detect a deliberate head consent gesture from a pose sequence.
 ///
-/// `Nod` = the gesture was seen; `None` = a face was tracked but no nod;
-/// `NoFace` = too few face frames to judge. `Shake` is not yet detected (returns
-/// `None` for a shake) pending its own tuning data.
-pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
-    detect_nod_with_evidence(samples).0
+/// A nod approves, a shake declines, and a tracked face without either gesture
+/// returns [`HeadGesture::None`]. Pose-defined detection reads the same at any
+/// head angle or lighting.
+pub fn detect_head_gesture(samples: &[PoseSample]) -> HeadGesture {
+    detect_head_gesture_with_evidence(samples).0
 }
 
-/// Why [`detect_nod`] reached its answer, for diagnosis.
+#[doc(hidden)]
+pub fn detect_nod(samples: &[PoseSample]) -> HeadGesture {
+    detect_head_gesture(samples)
+}
+
+/// Why [`detect_head_gesture`] reached its answer, for diagnosis.
 ///
 /// A nod that is not detected leaves no trace otherwise: the caller simply waits
 /// out its deadline and denies, which is indistinguishable from a user who never
@@ -1200,16 +1200,16 @@ pub struct NodEvidence {
     pub mean_step: f32,
 }
 
-/// [`detect_nod`], plus the measurements behind the verdict.
+/// [`detect_head_gesture`], plus the measurements behind the verdict.
 ///
-/// This holds the whole decision: [`detect_nod`] is a thin wrapper over it, so
-/// the evidence cannot describe one rule while the gate applies another. It is
-/// the single place the nod is judged.
+/// This holds the whole decision: [`detect_head_gesture`] is a thin wrapper over
+/// it, so the evidence cannot describe one rule while the gate applies another.
+/// It is the single place the gesture is judged.
 ///
 /// `crossings` is computed even when the range gate has already failed, so a
 /// report is never missing the one number that would have explained it; the
 /// extra work lands only on the failure path.
-pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvidence) {
+pub fn detect_head_gesture_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvidence) {
     let pitch: Vec<f32> = samples.iter().filter_map(|s| s.pitch_frac).collect();
     let yaw: Vec<f32> = samples.iter().filter_map(|s| s.yaw_signed).collect();
     let range = |v: &[f32]| -> f32 {
@@ -1365,6 +1365,11 @@ pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvid
         eprintln!("{msg}");
     }
     (verdict, evidence)
+}
+
+#[doc(hidden)]
+pub fn detect_nod_with_evidence(samples: &[PoseSample]) -> (HeadGesture, NodEvidence) {
+    detect_head_gesture_with_evidence(samples)
 }
 
 /// Count median crossings of a signal, the rhythmic oscillation of a deliberate

@@ -396,7 +396,7 @@ fn pamwrap_granting_daemon_face_path() {
     let reqs = log.lock().unwrap();
     assert_eq!(reqs.len(), 1, "one capture, no retries: {reqs:?}");
     match &reqs[0] {
-        Request::Authenticate { user, service } => {
+        Request::Authenticate { user, service, .. } => {
             assert_eq!(user, "tester");
             assert_eq!(
                 service.as_deref(),

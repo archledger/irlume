@@ -755,6 +755,7 @@ fn try_verify(pamh: &Pam, user: &str) -> PamError {
     match request(&Request::Authenticate {
         user: user.to_string(),
         service,
+        intent_confirmation: None,
     }) {
         Ok(Response::AuthResult {
             granted: true,

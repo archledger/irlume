@@ -395,6 +395,15 @@ pub fn write_atomic_reporting(
     }
 }
 
+/// How a privileged face request claims explicit user intent was collected.
+/// The daemon still validates the service class and peer credentials; this is
+/// an assertion, not cryptographic proof of physical input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentAttestation {
+    /// A root PAM client reports collecting the conventional confirmation.
+    PamConversation,
+}
+
 /// Request from an (untrusted) client to the (privileged) daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -407,6 +416,10 @@ pub enum Request {
         user: String,
         #[serde(default)]
         service: Option<String>,
+        /// Root PAM's assertion that it collected conventional confirmation.
+        /// The daemon rejects it from untrusted peers and irrelevant services.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent_confirmation: Option<IntentAttestation>,
     },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
@@ -1717,7 +1730,7 @@ mod tests {
         // must default to None, not fail the parse (login would break).
         let r: Request = serde_json::from_str(r#"{"Authenticate":{"user":"alice"}}"#).unwrap();
         match r {
-            Request::Authenticate { user, service } => {
+            Request::Authenticate { user, service, .. } => {
                 assert_eq!(user, "alice");
                 assert_eq!(service, None);
             }
@@ -1748,6 +1761,67 @@ mod tests {
             }
             other => panic!("expected Health, got {other:?}"),
         }
+    }
+
+    /// `Authenticate` crosses a live-upgrade boundary in both directions: an
+    /// old PAM omits the attestation, while a new PAM can meet an old daemon
+    /// whose reader knows only `user` and `service`.
+    #[test]
+    fn authenticate_intent_attestation_is_compatible_in_both_directions() {
+        let old: Request =
+            serde_json::from_str(r#"{"Authenticate":{"user":"alice","service":"sudo"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Request::Authenticate {
+                user,
+                service: Some(service),
+                intent_confirmation: None,
+            } if user == "alice" && service == "sudo"
+        ));
+
+        let without_attestation = Request::Authenticate {
+            user: "alice".into(),
+            service: Some("kde".into()),
+            intent_confirmation: None,
+        };
+        let value = serde_json::to_value(without_attestation).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"Authenticate":{"user":"alice","service":"kde"}}),
+            "None must be omitted so the ordinary wire shape stays unchanged"
+        );
+
+        let new = Request::Authenticate {
+            user: "alice".into(),
+            service: Some("sudo".into()),
+            intent_confirmation: Some(IntentAttestation::PamConversation),
+        };
+        let wire = serde_json::to_string(&new).unwrap();
+        let round_trip: Request = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            round_trip,
+            Request::Authenticate {
+                user,
+                service: Some(service),
+                intent_confirmation: Some(IntentAttestation::PamConversation),
+            } if user == "alice" && service == "sudo"
+        ));
+
+        #[derive(serde::Deserialize)]
+        struct OldAuthenticate {
+            user: String,
+            #[serde(default)]
+            service: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        enum OldRequest {
+            Authenticate(OldAuthenticate),
+        }
+
+        let parsed: OldRequest = serde_json::from_str(&wire).unwrap();
+        let OldRequest::Authenticate(old) = parsed;
+        assert_eq!(old.user, "alice");
+        assert_eq!(old.service.as_deref(), Some("sudo"));
     }
 
     #[test]

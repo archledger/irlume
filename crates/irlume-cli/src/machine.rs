@@ -1919,6 +1919,7 @@ pub fn auth_test(args: &[String]) -> ExitCode {
         // No PAM service: this is a diagnostic, not an authentication for a
         // surface, so it must not inherit any surface's tier allowances.
         service: None,
+        intent_confirmation: None,
     }) {
         Ok(Response::AuthResult {
             granted,

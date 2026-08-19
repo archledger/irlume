@@ -549,6 +549,7 @@ mod tests {
             classify(&Request::Authenticate {
                 user: "u".into(),
                 service: None,
+                intent_confirmation: None,
             }),
             Class::Auth
         );

@@ -3408,7 +3408,7 @@ fn dispatch_scoped(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::Authenticate { user, service } => {
+        Request::Authenticate { user, service, .. } => {
             // Root (PAM stacks) or the account owner only, from the posture
             // table. Without that gate any local peer could probe
             // Authenticate{other_user} and read the raw similarity score, a
@@ -5734,6 +5734,7 @@ mod tests {
         Authenticate => Request::Authenticate {
             user: u(),
             service: Some("sudo".into()),
+            intent_confirmation: None,
         },
         Enroll => Request::Enroll {
             user: u(),
@@ -7043,6 +7044,7 @@ mod tests {
         let mut wire = serde_json::to_value(Request::Authenticate {
             user: "carol".into(),
             service: Some("sudo".into()),
+            intent_confirmation: None,
         })
         .unwrap();
         wire.get_mut("Authenticate")
@@ -7906,6 +7908,7 @@ mod tests {
             Request::Authenticate {
                 user: "a/b".into(),
                 service: None,
+                intent_confirmation: None,
             },
             Request::UnsealPassword {
                 user: "-flag".into(),
@@ -7976,6 +7979,7 @@ mod tests {
             Request::Authenticate {
                 user: "carol".into(),
                 service: None,
+                intent_confirmation: None,
             },
             &peer(NOBODY),
             &mut e,
@@ -7996,6 +8000,7 @@ mod tests {
             Request::Authenticate {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,
@@ -8036,6 +8041,7 @@ mod tests {
                 Request::Authenticate {
                     user: "carol".into(),
                     service: Some(service.into()),
+                    intent_confirmation: None,
                 },
                 &peer(0),
                 &mut e,
@@ -8072,6 +8078,7 @@ mod tests {
             Request::Authenticate {
                 user: "irlume-test-ghost".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,
@@ -8102,6 +8109,7 @@ mod tests {
             Request::Authenticate {
                 user: "carol".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,
@@ -9666,6 +9674,7 @@ mod tests {
             Request::Authenticate {
                 user: "lbuser".into(),
                 service: Some("kde".into()),
+                intent_confirmation: None,
             },
             &peer(0),
             &mut e,

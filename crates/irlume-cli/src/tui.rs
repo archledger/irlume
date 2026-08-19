@@ -8189,14 +8189,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The per-service head-gesture toggle: ↑/↓ pick a service, [c] toggles
-    /// it. Disabling a high-privilege service (all four in the list are) asks
-    /// first and acts on the confirm, not the keypress; enabling one that is off
-    /// goes straight through. The write shells out to the CLI (settings.conf is
-    /// root-only), so the action is a suspend to
-    /// `credential-release-challenge <service> on|off --yes`.
+    /// The per-service head-gesture toggle follows the effective shared policy:
+    /// absent is off, so the first press enables; an explicit on makes the next
+    /// press take the disable-confirmation path.
     #[test]
-    fn settings_per_service_gesture_toggle_picks_and_confirms() {
+    fn settings_per_service_gesture_toggle_uses_the_effective_opt_in_state() {
         let _g = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -8214,24 +8211,14 @@ mod tests {
         assert!(text.contains("Per-service head gesture"), "{text}");
         assert!(text.contains("sudo") && text.contains("polkit-1"), "{text}");
 
-        // Default (no key): sudo defaults gesture ON, so [c] DISABLES it and must
-        // confirm first (high-privilege), acting on the confirm, not the keypress.
+        // Default (no key): sudo is off, so [c] enables it directly.
         assert_eq!(app.settings_svc_sel, 0, "sudo is first");
         app.on_key(KeyCode::Char('c'));
-        assert!(
-            app.suspend.is_none(),
-            "disabling a high-priv service must not act on the keypress alone"
-        );
-        match app.confirm.take() {
-            Some((q, verb, ConfirmAct::Sus(Suspend::ServiceGesture { service, on }))) => {
-                assert_eq!(service, "sudo");
-                assert!(!on, "the confirm must target DISABLE");
-                assert_eq!(verb, "Disable");
-                assert!(q.contains("sudo"), "the confirm must name the service: {q}");
-            }
-            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
-            None => panic!("disabling a high-priv service must raise a confirm"),
-        }
+        assert!(app.confirm.is_none(), "enabling needs no confirmation");
+        assert!(matches!(
+            app.suspend.take(),
+            Some(Suspend::ServiceGesture { ref service, on: true }) if service == "sudo"
+        ));
 
         // ↑/↓ move the picked service.
         app.on_key(KeyCode::Down);
@@ -8239,11 +8226,7 @@ mod tests {
         app.on_key(KeyCode::Up);
         assert_eq!(app.settings_svc_sel, 0);
 
-        // polkit-1 with no override. It is AppConsent, which the ENGINE defaults
-        // to gesture-ON, so the first [c] must offer to DISABLE it. Only sudo
-        // (index 0) was ever driven here, so the elevation-only default read
-        // polkit as already-off and the first press wrote an `on` that changed
-        // nothing, with no confirmation, and every test still passed.
+        // polkit-1 also defaults off and the first press enables it.
         std::fs::write(dir.join("settings.conf"), "").unwrap();
         let polkit_i = SETTINGS_GESTURE_SERVICES
             .iter()
@@ -8252,38 +8235,26 @@ mod tests {
         app.settings_svc_sel = polkit_i;
         let text = draw_text(&app);
         assert!(
-            text.contains("polkit-1: ● yes"),
-            "polkit must render as REQUIRED, matching the daemon: {text}"
+            text.contains("polkit-1: ○ no"),
+            "polkit must visibly default off: {text}"
         );
         app.on_key(KeyCode::Char('c'));
-        assert!(
-            app.suspend.is_none(),
-            "disabling polkit must not act on the keypress alone"
-        );
-        match app.confirm.take() {
-            Some((q, verb, ConfirmAct::Sus(Suspend::ServiceGesture { service, on }))) => {
-                assert_eq!(service, "polkit-1");
-                assert!(!on, "the first press on a default-ON polkit must DISABLE");
-                assert_eq!(verb, "Disable");
-                assert!(q.contains("polkit-1"), "the confirm must name it: {q}");
-            }
-            Some((q, verb, _)) => panic!("wrong confirm action: {verb} / {q}"),
-            None => panic!("disabling polkit must raise a confirm"),
-        }
+        assert!(app.confirm.is_none());
+        assert!(matches!(
+            app.suspend.take(),
+            Some(Suspend::ServiceGesture { ref service, on: true }) if service == "polkit-1"
+        ));
         app.settings_svc_sel = 0;
 
-        // A service explicitly OFF: [c] ENABLES it and goes straight through
-        // (turning a gesture ON only adds friction, so no confirm).
-        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=0\n").unwrap();
+        // A service explicitly ON currently asks before disabling it.
+        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=1\n").unwrap();
         app.on_key(KeyCode::Char('c'));
-        assert!(app.confirm.is_none(), "enabling needs no confirm");
-        assert!(
-            matches!(
-                app.suspend.take(),
-                Some(Suspend::ServiceGesture { ref service, on: true }) if service == "sudo"
-            ),
-            "enabling must suspend to the on toggle"
-        );
+        assert!(app.suspend.is_none());
+        assert!(matches!(
+            app.confirm.take(),
+            Some((_, _, ConfirmAct::Sus(Suspend::ServiceGesture { ref service, on: false })))
+                if service == "sudo"
+        ));
 
         match old {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),

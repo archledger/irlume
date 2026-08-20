@@ -135,3 +135,57 @@ are on record in the session logs.
 - Fork bump policy: a new fork checkpoint requires a new signed tag, delta
   review, and a PR that updates the rev in lockstep with the nix outputHash;
   `check-packaging-parity.sh` fails any selector that moves.
+
+## Task 13: installed artifact and live KDE acceptance
+
+Performed 2026-08-20 18:40-18:57 EDT on the ASUS KDE host
+(Fedora 44, Plasma 6.7.4, Wayland, `polkit-kde-authentication-agent-1`).
+
+### Install inventory and transaction
+
+- Installed-before PAM module: `4a1833c19c3d222a903b3dda68b14be104c7b3ba9642167965a6a31c063bc805`
+  (`lib_t`, 0644→installed 0755, root) — the PR #502-era module, matching the
+  recorded state with no drift.
+- `polkit-1` stack unchanged throughout: `976de9516df78e2d6d578e3b40d0e1e0e4c56ba88049fc31089990f08a7ae0d3`.
+- Running daemon: the established `/usr/local/bin/irlumed-mesh-test` override
+  (`3cf00098…`), active with 1 profile / 11 scans, keyring armed
+  (pcrlock Tier 2), templates encrypted. Task 13 installs only the PAM
+  artifact; the daemon is untouched.
+- Candidate rebuilt from merged `main` `c9e66b51` (tree `4fb4ba5e`) with
+  `cargo build --workspace --release --locked`: workspace artifact
+  `21c8235030c6b4eafc03d4d9fe3aedc14de7df5beca9372486f6a23cdf0c877d`,
+  byte-identical to the Task 12 report hash across worktrees (a
+  `-p irlume-pam`-only build differs by feature unification and is NOT the
+  shipped artifact; packaging lanes build the workspace).
+- Rollback snapshot (0700, root): `/home/wisbfime/irlume-system-backups/2026-08-20-fork-pamsm-c9e66b51/`
+  with byte-for-byte copies of the old module plus `polkit-1`, `sudo`,
+  `plasmalogin` stacks, `SHA256SUMS`, and the shellchecked rollback-on-error
+  installer.
+- Transactional install verified: staged beside target, hash-pinned
+  (`21c82350…` expected before and after), atomic rename, `restorecon` →
+  `system_u:object_r:lib_t:s0`, stack hash re-verified unchanged, services
+  active, enrollment intact.
+
+### Five fresh-grant KDE cases
+
+Temporary polkit authorizations cleared (polkitd restart) before each case;
+each case ran `pkexec /usr/bin/true`. No credentials were observed or
+recorded; human-visible observations were collected from the user separately
+from backend evidence.
+
+| # | Case | Backend evidence | User-visible (reported) |
+| --- | --- | --- | --- |
+| 1 | `yes` face | one `pam_irlume` grant via `polkit-agent-helper-1` (18:50:54); one daemon request, IR-only match 0.782 vs 0.602, granted; exit 0 | info line + exactly one hidden field; granted on face alone |
+| 2 | one-entry password | exactly one `PAM:authentication`, grantors `pam_usertype,pam_localuser,pam_unix`; zero daemon entries; exit 0 | one field, real password once, granted, no camera |
+| 3 | wrong then correct | 18:53:05 `pam_unix` failure (`res=failed`), 18:53:19 success through `pam_unix`; zero daemon entries; exit 0 | same single field re-prompted; granted; no camera |
+| 4 | empty then cancel | exit 127 "Not authorized"; one failed helper attempt; zero daemon entries | no camera at any point; first two Enter presses produced no visible change, third showed the re-prompt (Plasma dialog quirk, recorded verbatim); Cancel dismissed |
+| 5 | camera-busy fallback | 18:56:51 daemon logged `/dev/video0: camera busy`; 18:56:57 the `yes` submit failed through `pam_unix` (`yes` is not a password — correct fallthrough); 18:57:06 one real password granted via `pam_unix`; exit 0 | typed `yes`+Enter twice, then real password once in the re-prompted field |
+
+All five cases match the PR #502 contract under the fork-migrated module.
+
+### Post-case state
+
+- Installed module remains `21c8235030c6b4eafc03d4d9fe3aedc14de7df5beca9372486f6a23cdf0c877d`, `lib_t`.
+- Daemon/socket active; enrollment, keyring arm state, and templates unchanged.
+- Rollback path: restore `pam_irlume.so` from the snapshot above and
+  `restorecon`; no stack or daemon changes to undo.

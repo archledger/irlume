@@ -2,7 +2,12 @@
 
 Date: 2026-08-20
 
-Status: approved; implementation plan at
+Status: implemented; irlume pins fork rev
+`ac9f644240e95c49246cb6b55adce2f2aea12a77` (tag `irlume-0.5.5-patch.1`,
+merged in PR #505 as `aef04e6653cd91c5af843bf6c155a38e0729b629`);
+verification at
+[`../../research/2026-08-20-maintained-pamsm-fork-verification.md`](../../research/2026-08-20-maintained-pamsm-fork-verification.md);
+implementation plan at
 `../plans/2026-08-20-github-maintained-pamsm-fork.md`
 
 Related decisions and evidence:

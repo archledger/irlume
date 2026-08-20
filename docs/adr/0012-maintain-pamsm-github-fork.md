@@ -2,7 +2,17 @@
 
 **Status:** Accepted
 **Date:** 2026-08-20
-**Implementation:** Pending
+**Implementation:** Complete. Fork repository
+<https://github.com/archledger/pam_sm_rust>, branch `irlume-patches` at
+`ac9f644240e95c49246cb6b55adce2f2aea12a77` (signed annotated tag
+`irlume-0.5.5-patch.1`, GPG `F35053398E3C80FE20891B82C10B8492BD7F30C6`;
+the governance PR #1 squash-merged as the GitHub-signed, DCO-carrying commit
+`ac9f644240e95c49246cb6b55adce2f2aea12a77`). irlume consumes exactly that
+rev: PR #505, merged as `aef04e6653cd91c5af843bf6c155a38e0729b629` (tree
+`c8d39511fee27957fb02cf6a9708853363123044`); the vendored
+`third_party/pamsm-0.5.5` copy is deleted and forbidden to return by
+`scripts/check-packaging-parity.sh`. Evidence:
+[`docs/research/2026-08-20-maintained-pamsm-fork-verification.md`](../research/2026-08-20-maintained-pamsm-fork-verification.md)
 
 ## Context
 

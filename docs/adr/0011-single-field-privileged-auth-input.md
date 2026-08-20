@@ -6,7 +6,11 @@
 (verified and merged in PR #502 as
 `308f26fe271d80ec55b91fbf3369bcb12504a3ac`)
 **Dependency ownership:** Superseded by
-[ADR-0012](0012-maintain-pamsm-github-fork.md)
+[ADR-0012](0012-maintain-pamsm-github-fork.md). The superseding fork is now
+live: irlume pins `archledger/pam_sm_rust` at
+`ac9f644240e95c49246cb6b55adce2f2aea12a77` (merged in PR #505 as
+`aef04e6653cd91c5af843bf6c155a38e0729b629`); the interim in-tree patch this
+ADR originally carried has been removed.
 
 ## Context
 

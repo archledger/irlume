@@ -2,7 +2,7 @@
 
 Date: 2026-08-19
 
-Status: exact software candidate and installed KDE acceptance pass
+Status: exact software candidate, installed KDE acceptance, and PR review remediation pass
 
 Design: [Single-field privileged authentication input](../superpowers/specs/2026-08-19-single-field-privileged-auth-input-design.md)
 
@@ -204,10 +204,54 @@ irlume units were active, and health still reported the original enrollment,
 encrypted templates, armed keyring, and recovery state. The candidate remains
 installed; rollback was not needed.
 
+## PR #502 review remediation
+
+GitHub's stable test, aggregate CI, and ASan jobs failed on the same daemon
+test. The test assigned `require_eyes_open = true` and then used normal
+serialization, which deliberately omits that retired field. A no-TPM runner
+therefore reloaded `false`; this laptop's real-TPM early return had hidden the
+invalid fixture. Commit `4e41082cd8fc812714b0fbf31faf8b6b6c653e5e`
+now writes the pre-retirement wire shape as literal JSON and adds a
+host-independent assertion that the legacy `true` value is present.
+
+GitHub Advanced Security alerts 27 and 28 identified two invalid-pointer
+dereferences in the vendored pamsm conversation helper. Commit
+`a4e6ba59548dd427632c0c2d8f80a52ef96a7a39` removes the generic
+borrowed-response `conv` facade entirely. Irlume now displays informational
+text through response-free `pam_prompt(PAM_TEXT_INFO, NULL, "%s", message)`;
+password and intent input remain solely on Linux-PAM's owned `pam_get_authtok`
+path. The commit tree is
+`a8894fe5480888d5d548b468ee8657ef4b228a24`.
+
+Fresh remediation gates passed:
+
+- host-independent legacy fixture: 1/1;
+- daemon: 133 passed, four hardware/TPM-dependent tests ignored;
+- real pam_wrapper lane: 38/38;
+- stable guarded workspace: 1,765/1,765;
+- exact CI ASan/LeakSanitizer workspace command: 1,765/1,765;
+- strict all-target Clippy, release workspace build, formatting, diff check,
+  packaging parity, and cargo-deny policies.
+
+The physical ASUS sequential gate ran against temporary snapshot
+`38ca2cfdce02cecb3325a847b066cd73cdb4babf`. Its tree is byte-for-byte the
+product commit tree above. RGB delivered 13.7186 Hz over 824 frames and IR
+delivered 13.9478 Hz over 837 frames; both recorded zero cumulative drops and
+zero sequence gaps. Bounded recovery completed in 8.99 seconds, and the runner
+restored both irlume units to active. The private evidence and log are retained
+under `target/pr502-hardware-38ca2cf/`; evidence SHA-256 is `cdb615ed…` and log
+SHA-256 is `e51a81c4…`.
+
+Both remediation commits carry valid EDDSA signatures and exactly one DCO
+trailer. The installed PAM remains the earlier frozen candidate; review fixes
+were tested from the source tree and have not been installed system-wide.
+
 ## Conclusion
 
 Candidate `efddb9fe` meets the approved single-field contract on real KDE:
 `yes` deliberately selects face, a correct password works once in the same
 field, wrong and empty input are camera-free, and a failed face attempt does
 not test `yes` as the Unix password. Passive PAD and optional default-off head
-gesture policy remain unchanged.
+gesture policy remain unchanged. Product commit `a4e6ba59` additionally fixes
+the PR's invalid legacy fixture and removes the flagged unsafe response-pointer
+path without changing that user-visible contract.

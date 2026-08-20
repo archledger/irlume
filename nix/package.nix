@@ -70,15 +70,18 @@ rustPlatform.buildRustPackage {
   inherit src;
 
   # Vendored via importCargoLock. The two tss-esapi crates come from our
-  # fork (branch irlume-patches, rev 7567f60); everything else is crates.io.
-  # Both git crates share one repo/rev, so importCargoLock fetches it once and
-  # both keys carry the same hash. Bump both hashes together when Cargo.lock
-  # moves the fork rev (nix build prints the correct hash on mismatch).
+  # fork (branch irlume-patches, rev 7567f60); pamsm comes from the
+  # archledger/pam_sm_rust fork (irlume-patches, tag irlume-0.5.5-patch.1);
+  # everything else is crates.io. The tss crates share one repo/rev, so
+  # importCargoLock fetches it once and both keys carry the same hash.
+  # Bump hashes together with their Cargo.lock revs (nix build prints the
+  # correct hash on mismatch).
   cargoLock = {
     lockFile = ../Cargo.lock;
     outputHashes = {
       "tss-esapi-7.7.0" = "sha256-DMSoJtwvVIUK++Ych15C6EM0hMk15w5oEAkUQoWhJ+A=";
       "tss-esapi-sys-0.6.0" = "sha256-DMSoJtwvVIUK++Ych15C6EM0hMk15w5oEAkUQoWhJ+A=";
+      "pamsm-0.5.5" = "sha256-00+xvNseESHveWKYJjSieqVPdD9G320ApSXxYH14dtg=";
     };
   };
 

@@ -28,26 +28,40 @@ LANES=(
 
 fail=0
 
-echo "== local dependency patches are source-complete =="
-PAMSM_PATCH_FILES=(
-  third_party/pamsm-0.5.5/Cargo.toml
-  third_party/pamsm-0.5.5/License
-  third_party/pamsm-0.5.5/IRLUME-PATCH.md
-  third_party/pamsm-0.5.5/src/libpam.rs
-)
-for file in "${PAMSM_PATCH_FILES[@]}"; do
-  if [[ -f "$file" ]]; then
-    printf '  ok    %s\n' "$file"
-  else
-    printf '  MISS  %s\n' "$file"
-    fail=1
-  fi
-done
-if grep -Fqx 'pamsm = { path = "third_party/pamsm-0.5.5" }' Cargo.toml; then
-  printf '  ok    %s\n' 'Cargo.toml pamsm local patch'
+echo "== pamsm consumed from the maintained fork only =="
+# pamsm comes from the archledger/pam_sm_rust fork at an exact commit. The
+# in-tree vendored copy is gone; a source-complete build means Cargo can fetch
+# that exact rev offline once vendored. A moving selector (branch =) would
+# make "exact" a lie, so the rev is asserted, not just the URL.
+PAMSM_URL='https://github.com/archledger/pam_sm_rust'
+PAMSM_REV="$(sed -n "s|^pamsm = { git = \"$PAMSM_URL\", rev = \"\([0-9a-f]\{40\}\)\" }$|\1|p" Cargo.toml)"
+if [ -n "$PAMSM_REV" ]; then
+  printf '  ok    %s\n' "Cargo.toml pamsm fork pin ${PAMSM_REV:0:10}"
 else
-  printf '  MISS  %s\n' 'Cargo.toml pamsm local patch'
+  printf '  MISS  %s\n' 'Cargo.toml pamsm exact 40-char fork rev'
   fail=1
+fi
+if grep -qF "git+$PAMSM_URL?rev=$PAMSM_REV#$PAMSM_REV" Cargo.lock; then
+  printf '  ok    %s\n' 'Cargo.lock pamsm resolves to the same rev'
+else
+  printf '  MISS  %s\n' 'Cargo.lock pamsm fork rev'
+  fail=1
+fi
+if grep -Eq 'pamsm = \{ git = "[^"]*", branch = ' Cargo.toml; then
+  printf '  MISS  %s\n' 'pamsm must not use a moving branch selector'
+  fail=1
+fi
+if [ -e third_party/pamsm-0.5.5 ]; then
+  printf '  MISS  %s\n' 'third_party/pamsm-0.5.5 must be absent (fork replaces it)'
+  fail=1
+else
+  printf '  ok    %s\n' 'third_party/pamsm-0.5.5 absent'
+fi
+if grep -q 'pamsm' .gitattributes; then
+  printf '  MISS  %s\n' '.gitattributes still carries a pamsm exception'
+  fail=1
+else
+  printf '  ok    %s\n' '.gitattributes has no pamsm exception'
 fi
 echo
 

@@ -17,7 +17,7 @@ allow = [
     "Unicode-3.0",
     "0BSD",
     "LGPL-2.1-or-later",
-    "GPL-3.0",         # deprecated SPDX form declared by pamsm 0.5.5
+    "GPL-3.0-only",    # pamsm fork (archledger/pam_sm_rust); canonical SPDX form
     "GPL-3.0-or-later", # irlume's own crates
 ]
 # Do not fail when an allowed license happens to be unused after a dep bump.

@@ -62,7 +62,7 @@ Everything irlume's messy build needs, so you don't hunt distro packages:
 | `pkg-config` + `tpm2-tss` | the `tss-esapi` crate finds the TPM libs |
 | `clang` + `libclang` (`LIBCLANG_PATH`) | `v4l2-sys-mit`'s bindgen needs it |
 | kernel headers (`BINDGEN_EXTRA_CLANG_ARGS`) | bindgen parses `<linux/videodev2.h>` |
-| `linux-pam` | the `pamsm` crate links `libpam` |
+| `linux-pam` | the `pamsm` crate links `libpam`; `pamsm` itself comes from the irlume-maintained fork [`archledger/pam_sm_rust`](https://github.com/archledger/pam_sm_rust), pinned by exact commit in `Cargo.toml`/`Cargo.lock` (ADR-0012). Offline builds vendor it like any other git dependency: `cargo vendor --locked vendor` then `--offline` builds resolve it from the vendor dir. |
 | onnxruntime **1.24.4** (`ORT_DYLIB_PATH`) | irlume needs the `api-24` ABI; nixpkgs' is older |
 
 To bump the toolchain or nixpkgs later: edit the version string in `flake.nix`

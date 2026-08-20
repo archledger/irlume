@@ -8125,6 +8125,21 @@ mod tests {
         .unwrap();
     }
 
+    /// Write the pre-retirement wire shape. Normal serialization deliberately
+    /// omits this field, so a legacy fixture must insert it as literal JSON.
+    fn write_legacy_eyes_open_enrollment(dir: &std::path::Path, e: &Enrollment) {
+        let mut legacy = serde_json::to_value(e).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("require_eyes_open".into(), serde_json::Value::Bool(true));
+        std::fs::write(
+            dir.join(format!("{}.json", e.user)),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn unit512(seed: usize) -> Vec<f32> {
         let mut v: Vec<f32> = (0..512)
             .map(|j| (j as f32 * 0.7).sin() + 0.05 * (seed as f32 * 1.3 + j as f32).sin())
@@ -9064,6 +9079,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_eyes_open_fixture_writes_the_retired_true_literal() {
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-legacy-eyes-open-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let enrollment = enrollment_with("carol", &["Face Scan 1"]);
+
+        write_legacy_eyes_open_enrollment(&dir, &enrollment);
+
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("carol.json")).expect("legacy fixture exists"),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.get("require_eyes_open"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn require_eyes_open_off_is_idempotent_and_on_is_retired() {
         // The storage half of the refusal, which does need a TPM-free host
         // because the off arm ends in storage::save. Same convention as the
@@ -9078,7 +9116,7 @@ mod tests {
         let _ = &sb;
         let mut enrollment = enrollment_with("carol", &["Face Scan 1"]);
         enrollment.require_eyes_open = true;
-        write_enrollment(&sb.dir, &enrollment);
+        write_legacy_eyes_open_enrollment(&sb.dir, &enrollment);
         let root = peer(0);
 
         publish_enrollment_summary(

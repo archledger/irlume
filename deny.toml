@@ -52,9 +52,13 @@ ignore = [
 multiple-versions = "warn"
 
 [sources]
-# The workspace intentionally has exactly one git dependency: the tss-esapi
-# fork. Any other git or non-crates.io source appearing in the tree should
-# fail CI until it is reviewed and listed here.
+# The workspace intentionally has exactly two git dependencies: the tss-esapi
+# fork and the pamsm fork (archledger/pam_sm_rust, ADR-0012). Any other git
+# or non-crates.io source appearing in the tree should fail CI until it is
+# reviewed and listed here.
 unknown-git = "deny"
 unknown-registry = "deny"
-allow-git = ["https://github.com/archledger/rust-tss-esapi"]
+allow-git = [
+    "https://github.com/archledger/rust-tss-esapi",
+    "https://github.com/archledger/pam_sm_rust",
+]

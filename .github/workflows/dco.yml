@@ -1,0 +1,50 @@
+# DCO validation: every commit in the pull-request range carries exactly one
+# Signed-off-by trailer. GitHub-signed squash merges satisfy this when the PR
+# body contains the trailer (as the repository template asks); individually
+# pushed commits must be made with `git commit -s`.
+
+name: dco
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: "DCO (exactly one trailer)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so the base-to-head range can be enumerated.
+          fetch-depth: 0
+
+      - name: Every commit carries exactly one Signed-off-by trailer
+        run: |
+          set -euo pipefail
+          base='${{ github.event.pull_request.base.sha }}'
+          head='${{ github.event.pull_request.head.sha }}'
+          if [ -z "$base" ] || [ "$base" = '' ]; then
+            base='${{ github.event.before }}'
+            head='${{ github.sha }}'
+          fi
+          range=$(git rev-list --no-merges "$base..$head" 2>/dev/null || true)
+          if [ -z "$range" ]; then
+            range=$(git rev-list --no-merges -n 1 "$head")
+          fi
+          status=0
+          for c in $range; do
+            n=$(git log -1 --format='%(trailers:only=true)' "$c" | grep -c '^Signed-off-by: .\+ <.\+@.\+>$' || true)
+            if [ "$n" -ne 1 ]; then
+              printf 'DCO: %s has %s Signed-off-by trailers (need exactly 1)\n' \
+                "$(git log -1 --format='%h %s' "$c")" "$n" >&2
+              status=1
+            fi
+          done
+          exit $status

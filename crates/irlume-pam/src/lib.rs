@@ -1045,6 +1045,16 @@ mod tests {
     }
     use super::*;
 
+    /// The local pamsm patch must expose token clearing without leaking the
+    /// opaque raw PAM handle into this module.
+    #[test]
+    fn pamsm_exposes_safe_auth_token_clearing() {
+        fn require_api(pam: &Pam) -> pamsm::PamResult<()> {
+            pam.clear_authtok()
+        }
+        let _: fn(&Pam) -> pamsm::PamResult<()> = require_api;
+    }
+
     #[test]
     fn firewall_passes_normal_returns_through() {
         assert_eq!(firewall(|| PamError::SUCCESS), PamError::SUCCESS);

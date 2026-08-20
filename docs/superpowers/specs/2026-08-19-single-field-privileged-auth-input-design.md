@@ -52,7 +52,7 @@ passwords is not acceptable.
 ## Scope
 
 Change only privileged-service PAM input handling and the minimum dependency
-surface needed to clear `PAM_AUTHTOK`.
+surface needed to clear `PAM_AUTHTOK` and display a response-free info message.
 
 Keep unchanged:
 
@@ -124,21 +124,26 @@ No branch authenticates a password inside irlume.
 ## Dependency patch
 
 Carry the exact source of `pamsm 0.5.5` in a clearly attributed third-party
-directory and select it with Cargo's local patch mechanism. Make one behavioral
-addition to `PamLibExt`:
+directory and select it with Cargo's local patch mechanism. Expose only the two
+operations irlume needs:
 
 ```rust
 fn clear_authtok(&self) -> PamResult<()>;
+fn info(&self, message: &str) -> PamResult<()>;
 ```
 
-Its implementation calls `pam_set_item(pamh, PAM_AUTHTOK, NULL)`. Preserve the
-upstream GPL-3.0 license, original source, version, and checksum/provenance in a
-small README. Keep irlume's call site on the public method; do not inspect the
-private `Pam` representation.
+The implementations call `pam_set_item(pamh, PAM_AUTHTOK, NULL)` and
+`pam_prompt(pamh, PAM_TEXT_INFO, NULL, "%s", message)`. Remove the generic
+borrowed-response `conv` method from the local facade; no irlume call site needs
+prompt responses outside `pam_get_authtok`, which owns their lifecycle.
+Preserve the upstream GPL-3.0 license, original source, version, and
+checksum/provenance in a small README. Keep irlume's call sites on the public
+methods; do not inspect the private `Pam` representation.
 
 The patch is temporary dependency debt, not a new irlume abstraction. Record
 the upstream reference if one is submitted separately, and remove the local
-copy after an audited release exposes an equivalent operation.
+copy after an audited release exposes equivalent token clearing and
+response-free informational messaging.
 
 ## Error and secret handling
 

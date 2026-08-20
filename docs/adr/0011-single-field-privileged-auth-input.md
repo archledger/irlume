@@ -57,10 +57,14 @@ response. Preserve the existing bounded `yes` classifier.
   fresh authorization request retains the password path; ambiguous token state
   is never reused as face intent.
 
-Carry a minimal, checksum-pinned local patch of `pamsm 0.5.5` that adds a safe
-`clear_authtok` operation backed by `pam_set_item(PAM_AUTHTOK, NULL)`. Preserve
-the upstream license and provenance, keep the delta isolated, and remove the
-local patch when an equivalent audited upstream release is available.
+Carry a minimal, checksum-pinned local patch of `pamsm 0.5.5` that adds safe
+`clear_authtok` and response-free `info` operations backed by
+`pam_set_item(PAM_AUTHTOK, NULL)` and `pam_prompt(PAM_TEXT_INFO, NULL, ...)`.
+The generic borrowed-response `conv` path is removed from the local facade, so
+irlume never dereferences or retains an application-supplied response pointer.
+Preserve the upstream license and provenance, keep the delta isolated, and
+remove the local patch when an equivalent audited upstream release is
+available.
 
 The daemon request and attestation contract do not change.
 

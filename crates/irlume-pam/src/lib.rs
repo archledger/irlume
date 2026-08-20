@@ -110,10 +110,7 @@ fn confirm_face_intent_with<'a>(
 fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
     confirm_face_intent_with(
         service,
-        || {
-            pamh.conv(Some(FACE_INTENT_INFO), pamsm::PamMsgStyle::TEXT_INFO)
-                .map(|_| ())
-        },
+        || pamh.info(FACE_INTENT_INFO),
         || pamh.get_authtok(None),
         || pamh.clear_authtok(),
     )
@@ -393,7 +390,7 @@ impl PamServiceModule for IrlumePam {
                         format!("irlume: {}", policy.instruction("approve"))
                     }
                 };
-                let _ = pamh.conv(Some(&msg), pamsm::PamMsgStyle::TEXT_INFO);
+                let _ = pamh.info(&msg);
             }
 
             // Same discoverability problem on the credential-release path: by
@@ -426,10 +423,7 @@ impl PamServiceModule for IrlumePam {
                         policy.instruction("unlock your keyring")
                     }
                 };
-                let _ = pamh.conv(
-                    Some(&format!("irlume: {how}")),
-                    pamsm::PamMsgStyle::TEXT_INFO,
-                );
+                let _ = pamh.info(&format!("irlume: {how}"));
             }
 
             // In `wait` mode, retry until a match or the budget runs out; otherwise

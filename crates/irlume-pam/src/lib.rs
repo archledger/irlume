@@ -11,8 +11,9 @@
 //!   * default (`auth sufficient pam_irlume.so`): VERIFY only. Sends
 //!     `Authenticate`; a live match grants WITHOUT touching the password. Use for
 //!     `sudo`, polkit, and in-session unlocks where the keyring is already open.
-//!     Shared privileged services first require one hidden literal `yes` through
-//!     the PAM conversation; any other response falls through without a scan.
+//!     Shared privileged services first offer one hidden field through PAM:
+//!     `yes` selects one face attempt, while any other non-empty value remains
+//!     the authentication token for the downstream password provider.
 //!   * `unseal` (`auth sufficient pam_irlume.so unseal`): VERIFY + KEYRING
 //!     UNLOCK. Sends `UnsealPassword`; on a live match the daemon releases the
 //!     TPM-sealed login password, which we set as `PAM_AUTHTOK` so a downstream
@@ -34,7 +35,7 @@
 use irlume_common::pam_service::ServiceKind;
 use irlume_common::{IntentAttestation, Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::time::{Duration, Instant};
 
 /// How long `wait` keeps retrying before giving up to the password fallback.
@@ -42,39 +43,80 @@ const WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// Pause between attempts in `wait` mode: lets the daemon release the camera
 /// (avoids back-to-back EBUSY) and keeps us from busy-looping.
 const WAIT_RETRY_GAP: Duration = Duration::from_millis(400);
-const FACE_INTENT_PROMPT: &str =
-    "Face authentication: type yes and press Enter (input hidden), or press Enter for password:";
+const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntentInput {
+    Confirmed,
+    Empty,
+    Password,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum IntentConfirmation {
     Confirmed,
     Fallback,
+    Abort,
 }
 
-fn classify_intent_response(response: Option<&[u8]>) -> IntentConfirmation {
+fn classify_intent_input(response: Option<&[u8]>) -> IntentInput {
     let Some(response) = response else {
+        return IntentInput::Empty;
+    };
+    if response.is_empty() {
+        return IntentInput::Empty;
+    }
+    if response.len() <= 16
+        && response.is_ascii()
+        && std::str::from_utf8(response).is_ok_and(|text| text.trim().eq_ignore_ascii_case("yes"))
+    {
+        return IntentInput::Confirmed;
+    }
+    IntentInput::Password
+}
+
+fn resolve_intent_input(
+    input: IntentInput,
+    clear: impl FnOnce() -> pamsm::PamResult<()>,
+) -> IntentConfirmation {
+    match input {
+        IntentInput::Password => IntentConfirmation::Fallback,
+        IntentInput::Empty => match clear() {
+            Ok(()) => IntentConfirmation::Fallback,
+            Err(_) => IntentConfirmation::Abort,
+        },
+        IntentInput::Confirmed => match clear() {
+            Ok(()) => IntentConfirmation::Confirmed,
+            Err(_) => IntentConfirmation::Abort,
+        },
+    }
+}
+
+fn confirm_face_intent_with<'a>(
+    service: ServiceKind,
+    show_info: impl FnOnce() -> pamsm::PamResult<()>,
+    get_token: impl FnOnce() -> pamsm::PamResult<Option<&'a CStr>>,
+    clear: impl FnOnce() -> pamsm::PamResult<()>,
+) -> IntentConfirmation {
+    if !service.requires_face_intent_confirmation() || show_info().is_err() {
+        return IntentConfirmation::Fallback;
+    }
+    let Ok(Some(token)) = get_token() else {
         return IntentConfirmation::Fallback;
     };
-    if response.len() > 16 || !response.is_ascii() {
-        return IntentConfirmation::Fallback;
-    }
-    match std::str::from_utf8(response) {
-        Ok(text) if text.trim().eq_ignore_ascii_case("yes") => IntentConfirmation::Confirmed,
-        _ => IntentConfirmation::Fallback,
-    }
+    resolve_intent_input(classify_intent_input(Some(token.to_bytes())), clear)
 }
 
 fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
-    if !service.requires_face_intent_confirmation() {
-        return IntentConfirmation::Fallback;
-    }
-    match pamh.conv(
-        Some(FACE_INTENT_PROMPT),
-        pamsm::PamMsgStyle::PROMPT_ECHO_OFF,
-    ) {
-        Ok(Some(response)) => classify_intent_response(Some(response.to_bytes())),
-        _ => IntentConfirmation::Fallback,
-    }
+    confirm_face_intent_with(
+        service,
+        || {
+            pamh.conv(Some(FACE_INTENT_INFO), pamsm::PamMsgStyle::TEXT_INFO)
+                .map(|_| ())
+        },
+        || pamh.get_authtok(None),
+        || pamh.clear_authtok(),
+    )
 }
 
 /// PAM-data key under which the `reseal` AUTH line stashes the typed password for
@@ -294,8 +336,9 @@ impl PamServiceModule for IrlumePam {
             //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
             //    biometric device (kde-fingerprint) and cancels us natively the moment
             //    a key is pressed, so an echo-off password probe here would hijack the
-            //    password field. A privileged one-shot service receives its separate
-            //    bounded intent prompt only after this password-first check.
+            //    password field. A privileged one-shot service offers its explicit
+            //    face-intent choice only after this password-first check, then obtains
+            //    the ordinary PAM token so a non-`yes` password is not asked twice.
             let typed = if unseal && !wait && !facefirst {
                 pamh.get_authtok(Some("Password: "))
             } else {
@@ -325,6 +368,7 @@ impl PamServiceModule for IrlumePam {
                     match confirm_face_intent(&pamh, kind) {
                         IntentConfirmation::Confirmed => Some(IntentAttestation::PamConversation),
                         IntentConfirmation::Fallback => return PamError::IGNORE,
+                        IntentConfirmation::Abort => return PamError::ABORT,
                     }
                 }
                 _ => None,
@@ -1061,40 +1105,79 @@ mod tests {
         assert_eq!(firewall(|| PamError::IGNORE), PamError::IGNORE);
     }
 
-    /// A response outside this exact bounded ASCII allowlist must never start a
-    /// privileged face attempt. In particular, a password typed reflexively at
-    /// the hidden prompt is fallback input, not an authentication token.
+    /// Only the existing bounded ASCII `yes` spellings are face intent. Empty
+    /// input and password-shaped bytes take separate, camera-free branches.
     #[test]
-    fn classify_intent_response_accepts_only_bounded_ascii_yes() {
+    fn intent_input_separates_confirmation_empty_and_password() {
         for accepted in [
             b"yes".as_slice(),
             b" YES ",
             b"\tyEs\r\n",
             b"      yes       ",
         ] {
-            assert_eq!(
-                classify_intent_response(Some(accepted)),
-                IntentConfirmation::Confirmed
-            );
+            assert!(matches!(
+                classify_intent_input(Some(accepted)),
+                IntentInput::Confirmed
+            ));
         }
+        assert!(matches!(classify_intent_input(None), IntentInput::Empty));
+        assert!(matches!(
+            classify_intent_input(Some(b"")),
+            IntentInput::Empty
+        ));
+        for password in [
+            b"no".as_slice(),
+            b"long-local-credential-value",
+            &[0xff, 0xfe],
+            b"yes\0",
+            b"yes             x",
+            b"                 ",
+        ] {
+            assert!(matches!(
+                classify_intent_input(Some(password)),
+                IntentInput::Password
+            ));
+        }
+    }
 
-        let rejected: [Option<&[u8]>; 8] = [
-            None,
-            Some(b""),
-            Some(b"no"),
-            Some(b"password"),
-            Some(b"yes\0"),
-            Some(&[0xff]),
-            Some(b"yes             x"),
-            Some(b"                 "),
-        ];
-        for rejected in rejected {
-            assert_eq!(
-                classify_intent_response(rejected),
-                IntentConfirmation::Fallback,
-                "unexpectedly accepted {rejected:?}"
-            );
+    #[test]
+    fn empty_and_yes_require_successful_token_clearing() {
+        for input in [IntentInput::Empty, IntentInput::Confirmed] {
+            assert!(matches!(
+                resolve_intent_input(input, || Err(PamError::SYSTEM_ERR)),
+                IntentConfirmation::Abort
+            ));
         }
+        assert!(matches!(
+            resolve_intent_input(IntentInput::Password, || panic!(
+                "must not clear password input"
+            )),
+            IntentConfirmation::Fallback
+        ));
+    }
+
+    #[test]
+    fn conversation_errors_never_confirm_or_clear() {
+        let token = CString::new("yes").unwrap();
+        let kind = ServiceKind::Elevation;
+        assert!(matches!(
+            confirm_face_intent_with(
+                kind,
+                || Err(PamError::CONV_ERR),
+                || Ok(Some(token.as_c_str())),
+                || panic!("must not clear after info error"),
+            ),
+            IntentConfirmation::Fallback
+        ));
+        assert!(matches!(
+            confirm_face_intent_with(
+                kind,
+                || Ok(()),
+                || Err(PamError::CONV_ERR),
+                || panic!("must not clear after token error"),
+            ),
+            IntentConfirmation::Fallback
+        ));
     }
 
     #[test]

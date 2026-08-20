@@ -1092,19 +1092,21 @@ mod tests {
     }
     use super::*;
 
-    /// The maintained pamsm fork must expose token clearing, response-free
-    /// informational text, and zeroizing secret module-data storage without
-    /// leaking the opaque raw PAM handle into this module.
+    /// Compile-only contract: the maintained pamsm fork must expose token
+    /// clearing, response-free informational text, and zeroizing secret
+    /// module-data storage without leaking the opaque raw PAM handle into
+    /// this module. The function is coerced to a fn pointer and never runs;
+    /// runtime behavior of these APIs is pinned by the pam_wrapper
+    /// integration cases (see tests/pamwrap.rs).
     #[test]
     fn pamsm_exposes_safe_auth_token_clearing_and_zeroizing_secrets() {
         fn require_api(pam: &Pam) -> pamsm::PamResult<()> {
             pam.clear_authtok()?;
             pam.info("pamsm test info")?;
             pam.send_secret("pamsm.test.secret", pamsm::PamSecretBytes::new(Vec::new()))?;
-            // SAFETY: the key was just registered above and is not replaced
-            // while the borrow is live; the borrow is dropped before return.
-            let secret = unsafe { pam.get_secret("pamsm.test.secret") }?;
-            assert!(secret.expose().is_empty());
+            // SAFETY: compile-only; the key was registered above and the
+            // borrow does not outlive the expression.
+            let _secret = unsafe { pam.get_secret("pamsm.test.secret") }?;
             Ok(())
         }
         let _: fn(&Pam) -> pamsm::PamResult<()> = require_api;

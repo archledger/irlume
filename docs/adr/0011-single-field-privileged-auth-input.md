@@ -3,7 +3,10 @@
 **Status:** Accepted
 **Date:** 2026-08-19
 **Implementation:** `9fdfcb09d16fefbbe89815c7d2c7ad98c3a8ef01`
-(software verification and installed rollout pending)
+(verified and merged in PR #502 as
+`308f26fe271d80ec55b91fbf3369bcb12504a3ac`)
+**Dependency ownership:** Superseded by
+[ADR-0012](0012-maintain-pamsm-github-fork.md)
 
 ## Context
 
@@ -62,9 +65,10 @@ Carry a minimal, checksum-pinned local patch of `pamsm 0.5.5` that adds safe
 `pam_set_item(PAM_AUTHTOK, NULL)` and `pam_prompt(PAM_TEXT_INFO, NULL, ...)`.
 The generic borrowed-response `conv` path is removed from the local facade, so
 irlume never dereferences or retains an application-supplied response pointer.
-Preserve the upstream license and provenance, keep the delta isolated, and
-remove the local patch when an equivalent audited upstream release is
-available.
+Preserve the upstream license and provenance and keep the delta isolated. The
+initial in-tree copy is migrated to the permanent, exact-revision GitHub fork
+defined by ADR-0012 after the fork's complete hardening and acceptance gates
+pass.
 
 The daemon request and attestation contract do not change.
 
@@ -96,7 +100,8 @@ testing.
   removed before camera work.
 - Password bytes use Linux-PAM's token lifecycle and are never sent to irlumed,
   stored in irlume transaction data, or logged.
-- The source tree temporarily carries a small audited dependency patch.
+- The first implementation carries a small audited dependency patch; ADR-0012
+  moves ownership to an irlume-maintained GitHub fork before release.
 - The literal `yes` remains a reserved face-intent response. A user whose
   actual password matches an accepted spelling can still use it at the password
   prompt after face fallback or on a fresh password-only attempt.

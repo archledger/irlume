@@ -2,13 +2,15 @@
 
 Date: 2026-08-19
 
-Status: implemented at `9fdfcb09d16fefbbe89815c7d2c7ad98c3a8ef01`;
-software verification and installed rollout pending
+Status: implemented at `9fdfcb09d16fefbbe89815c7d2c7ad98c3a8ef01`,
+verified on Fedora KDE, and merged in PR #502 as
+`308f26fe271d80ec55b91fbf3369bcb12504a3ac`
 
 Related decisions:
 
 - [ADR-0010: Require conventional confirmation for privileged face authentication](../../adr/0010-conventional-face-intent-confirmation.md)
 - [ADR-0011: Use one hidden field for privileged face intent or password](../../adr/0011-single-field-privileged-auth-input.md)
+- [ADR-0012: Maintain a GitHub-only pamsm fork](../../adr/0012-maintain-pamsm-github-fork.md)
 
 Observed evidence: Fedora 44 KDE Plasma 6.7.4 with Linux-PAM 1.7.2 and the
 exact product candidate `392d15132322e2bde29559a23540ce9fbeb25f43`.
@@ -140,10 +142,10 @@ Preserve the upstream GPL-3.0 license, original source, version, and
 checksum/provenance in a small README. Keep irlume's call sites on the public
 methods; do not inspect the private `Pam` representation.
 
-The patch is temporary dependency debt, not a new irlume abstraction. Record
-the upstream reference if one is submitted separately, and remove the local
-copy after an audited release exposes equivalent token clearing and
-response-free informational messaging.
+The authentication API contract remains intentionally small. Dependency
+ownership is superseded by ADR-0012: migrate the initial in-tree copy to the
+permanent irlume-maintained GitHub fork only after that fork passes its complete
+hardening and installed acceptance gates.
 
 ## Error and secret handling
 

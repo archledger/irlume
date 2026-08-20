@@ -2,7 +2,9 @@
 
 Date: 2026-08-19
 
-Status: approved design, awaiting implementation plan
+Status: implemented through product candidate `392d151`; single-field PAM input
+mechanics are superseded by the
+[single-field privileged authentication design](2026-08-19-single-field-privileged-auth-input-design.md)
 
 Related decision: [ADR-0010: Require conventional confirmation for privileged face authentication](../../adr/0010-conventional-face-intent-confirmation.md)
 
@@ -113,6 +115,12 @@ PAM service table. A hand-written PAM line cannot bypass it by omitting a module
 argument.
 
 ## PAM confirmation module
+
+> Historical contract: the password-discard behavior in this section describes
+> candidate `392d151`. Live KDE validation found that it forces password users
+> to type twice. ADR-0011 and the linked single-field design supersede only
+> these input mechanics; the privileged confirmation and daemon-attestation
+> boundaries remain current.
 
 Add one private, pure response classifier and one thin conversation wrapper in
 `irlume-pam`:

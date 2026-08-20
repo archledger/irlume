@@ -1,6 +1,6 @@
 # ADR-0010: Require conventional confirmation for privileged face authentication
 
-**Status:** Accepted
+**Status:** Accepted; single-field prompt mechanics refined by [ADR-0011](0011-single-field-privileged-auth-input.md)
 **Date:** 2026-08-19
 
 ## Context

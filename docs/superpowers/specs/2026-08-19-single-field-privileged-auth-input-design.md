@@ -2,7 +2,8 @@
 
 Date: 2026-08-19
 
-Status: approved design, awaiting implementation plan
+Status: implemented at `9fdfcb09d16fefbbe89815c7d2c7ad98c3a8ef01`;
+software verification and installed rollout pending
 
 Related decisions:
 
@@ -224,5 +225,6 @@ units.
 
 The user selected the exact informational text, reproduced the double-entry
 defect, validated empty-Enter safety, and approved the single-field token design
-plus the minimal pinned `pamsm` patch. Implementation remains blocked on review
-of this written design and a subsequent implementation plan.
+plus the minimal pinned `pamsm` patch. The implementation and real PAM-wrapper
+proof are committed at the OID above; full software verification and installed
+KDE acceptance remain separate gates.

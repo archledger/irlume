@@ -2,6 +2,8 @@
 
 **Status:** Accepted
 **Date:** 2026-08-19
+**Implementation:** `9fdfcb09d16fefbbe89815c7d2c7ad98c3a8ef01`
+(software verification and installed rollout pending)
 
 ## Context
 

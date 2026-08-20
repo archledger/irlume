@@ -28,6 +28,29 @@ LANES=(
 
 fail=0
 
+echo "== local dependency patches are source-complete =="
+PAMSM_PATCH_FILES=(
+  third_party/pamsm-0.5.5/Cargo.toml
+  third_party/pamsm-0.5.5/License
+  third_party/pamsm-0.5.5/IRLUME-PATCH.md
+  third_party/pamsm-0.5.5/src/libpam.rs
+)
+for file in "${PAMSM_PATCH_FILES[@]}"; do
+  if [[ -f "$file" ]]; then
+    printf '  ok    %s\n' "$file"
+  else
+    printf '  MISS  %s\n' "$file"
+    fail=1
+  fi
+done
+if grep -Fqx 'pamsm = { path = "third_party/pamsm-0.5.5" }' Cargo.toml; then
+  printf '  ok    %s\n' 'Cargo.toml pamsm local patch'
+else
+  printf '  MISS  %s\n' 'Cargo.toml pamsm local patch'
+  fail=1
+fi
+echo
+
 # Installed programs that are not the two obvious bins. A helper added to
 # three lanes and forgotten in the fourth is invisible until someone on that
 # distro logs in and their wallet silently stays locked, which is the same

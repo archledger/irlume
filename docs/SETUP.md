@@ -308,10 +308,11 @@ sudo irlume login enable --with-sudo --apply
 
 The password still works for `sudo` too; face is `sufficient`, not required.
 Test it in a fresh terminal with `sudo -k` (clear the cached credential) then
-`sudo true`. Before the camera opens, irlume asks for hidden literal `yes` through
-PAM. Enter or any other response goes directly to the password/fingerprint path;
-`yes` authorizes one face attempt. This confirmation is mandatory and has no
-disable setting.
+`sudo true`. PAM shows `Type yes to use face authentication` above the normal
+hidden field. Type `yes` for one face attempt, or type the ordinary password
+once for the password/fingerprint path. Empty Enter never starts the camera and
+falls through to the password provider. This confirmation is mandatory and has
+no disable setting.
 
 ## App prompts via polkit (optional)
 
@@ -323,12 +324,12 @@ sudo irlume login enable --with-polkit --apply
 ```
 
 The daemon treats polkit as verify-only (it never releases the TPM-sealed
-credential to it). The PAM conversation first asks for hidden literal `yes`;
-Enter, cancellation, or any other response selects password/fingerprint without
-opening the camera. `yes` authorizes one face attempt. An experimental head
-gesture can be explicitly added as a second gate, but defaults off and never
-replaces keyboard confirmation. Automatic passive PAD remains mandatory and
-separate.
+credential to it). PAM shows `Type yes to use face authentication` above the
+normal hidden field. Type `yes` for one face attempt, or type the ordinary
+password once for the password/fingerprint path. Empty Enter and cancellation
+never open the camera. An experimental head gesture can be explicitly added as
+a second gate, but defaults off and never replaces keyboard confirmation.
+Automatic passive PAD remains mandatory and separate.
 Full walkthrough, Bitwarden setup, and the security stance:
 [APP-INTEGRATION.md](APP-INTEGRATION.md).
 

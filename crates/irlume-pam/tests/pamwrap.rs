@@ -53,12 +53,6 @@ struct Harness {
     /// pam_wrapper's pam_set_items.so: pre-sets PAM items (e.g. PAM_AUTHTOK)
     /// from pamtester's environment, standing in for a greeter/earlier module.
     set_items: PathBuf,
-    /// Exports PAM items to the PAM environment so a required child can assert
-    /// that the confirmation response never became PAM_AUTHTOK.
-    get_items: PathBuf,
-    /// pam_wrapper's plaintext test authenticator. It provides a real second
-    /// password prompt so the intent response cannot masquerade as PAM_AUTHTOK.
-    matrix: PathBuf,
     /// The freshly built pam_irlume.so under test.
     module: PathBuf,
     /// Directory of per-service stack files (PAM_WRAPPER_SERVICE_DIR).
@@ -89,27 +83,9 @@ impl Harness {
             .parent()
             .expect("wrapper lib has a parent dir")
             .join("pam_wrapper/pam_set_items.so");
-        let matrix = wrapper
-            .parent()
-            .expect("wrapper lib has a parent dir")
-            .join("pam_wrapper/pam_matrix.so");
-        let get_items = wrapper
-            .parent()
-            .expect("wrapper lib has a parent dir")
-            .join("pam_wrapper/pam_get_items.so");
         assert!(
             set_items.exists(),
-            "pam_set_items.so not next to {}; pam_wrapper installs both",
-            wrapper.display()
-        );
-        assert!(
-            matrix.exists(),
-            "pam_matrix.so not next to {}; pam_wrapper installs both",
-            wrapper.display()
-        );
-        assert!(
-            get_items.exists(),
-            "pam_get_items.so not next to {}; pam_wrapper installs both",
+            "pam_set_items.so not next to {}; pam_wrapper installs it",
             wrapper.display()
         );
         if !pamtester_available() {
@@ -134,8 +110,6 @@ impl Harness {
         Some(Harness {
             wrapper,
             set_items,
-            get_items,
-            matrix,
             module: built_module(),
             socket: root.join("irlumed.sock"),
             service_dir,
@@ -217,6 +191,24 @@ impl Harness {
     /// `auth <control> <pam_irlume.so> <args>` line for this build's module.
     fn auth_line(&self, control: &str, args: &str) -> String {
         format!("auth {control} {} {args}", self.module.display())
+    }
+
+    /// Write a silent pam_exec helper that accepts exactly one fixed test
+    /// token from stdin. Test tokens are restricted to shell-safe bytes so the
+    /// helper never needs quoting logic that could obscure what it validates.
+    fn token_checker(&self, name: &str, expected: &str) -> PathBuf {
+        assert!(expected
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
+        let path = self.root.join(format!("check-{name}.sh"));
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nIFS= read -r value || :\n[ \"$value\" = '{expected}' ]\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
     }
 }
 
@@ -434,8 +426,9 @@ fn pamwrap_granting_daemon_face_path() {
     }
 }
 
-const FACE_INTENT_PROMPT: &str =
-    "Face authentication: type yes and press Enter (input hidden), or press Enter for password:";
+const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
+const FIXED_TEST_TOKEN: &str = "fixed-test-token";
+const WRONG_TEST_TOKEN: &str = "wrong-fixed-token";
 
 /// Every privileged spelling comes from the shared service table. A hidden
 /// `yes` authorizes exactly one request, and that request carries the typed
@@ -467,7 +460,7 @@ fn pamwrap_privileged_yes_prompts_once_and_attests_every_service() {
         let (ok, out) = h.run(service, &["authenticate"], "yes\n", None);
         assert!(ok, "{service} confirmed face path must grant: {out}");
         assert_eq!(
-            out.matches(FACE_INTENT_PROMPT).count(),
+            out.matches(FACE_INTENT_INFO).count(),
             1,
             "{service} must show exactly one hidden confirmation: {out}"
         );
@@ -517,7 +510,7 @@ fn pamwrap_privileged_fallback_responses_send_no_request() {
             ok,
             "fallback must reach the password-module stand-in: {out}"
         );
-        assert!(out.contains(FACE_INTENT_PROMPT), "prompt missing: {out}");
+        assert!(out.contains(FACE_INTENT_INFO), "prompt missing: {out}");
     }
     assert!(
         log.lock().unwrap().is_empty(),
@@ -556,55 +549,223 @@ fn pamwrap_privileged_wait_and_unseal_send_no_request() {
     );
 }
 
-/// A password typed at the new hidden confirmation is discarded. pam_get_items
-/// plus a required checker proves PAM_AUTHTOK is still empty; pam_matrix then
-/// provides a real fresh password prompt before the fallback stack completes.
+/// A non-yes value is the ordinary PAM token. A one-line input can therefore
+/// satisfy a required downstream module without another conversation.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_confirmation_response_is_hidden_and_never_becomes_authtok() {
+fn pamwrap_password_input_is_reused_once() {
     let Some(h) = Harness::try_new("intent-authtok") else {
         return;
     };
     let log = serve(&h.socket, |_| Response::Error("must not be called".into()));
-    let passdb = h.root.join("matrix.passdb");
-    std::fs::write(&passdb, "tester:real-password:sudo\n").unwrap();
-    let no_authtok = h.root.join("no-authtok.sh");
-    std::fs::write(&no_authtok, "#!/bin/sh\n[ -z \"${PAM_AUTHTOK:-}\" ]\n").unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&no_authtok, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let checker = h.token_checker("one-entry", FIXED_TEST_TOKEN);
     h.write_service(
         "sudo",
         &[
             h.auth_line("sufficient", ""),
-            format!("auth required {}", h.get_items.display()),
-            format!("auth required pam_exec.so {}", no_authtok.display()),
             format!(
-                "auth optional {} passdb={}",
-                h.matrix.display(),
-                passdb.display()
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
             ),
-            "auth required pam_permit.so".into(),
         ],
     );
 
     let (ok, out) = h.run(
         "sudo",
         &["authenticate"],
-        "not-the-real-password\nreal-password\n",
+        &format!("{FIXED_TEST_TOKEN}\n"),
+        None,
+    );
+    assert!(ok, "one input must reach the password verifier: {out}");
+    assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
+    assert!(
+        !out.contains(FIXED_TEST_TOKEN),
+        "echo-off input must not be displayed: {out}"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "password input must not contact the daemon"
+    );
+}
+
+/// Empty Enter is not a password and never starts face auth. Clearing it lets
+/// the downstream provider own the one fresh password prompt.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_empty_input_clears_before_password_fallback() {
+    let Some(h) = Harness::try_new("intent-empty") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::Error("must not be called".into()));
+    let checker = h.token_checker("empty", FIXED_TEST_TOKEN);
+    h.write_service(
+        "sudo",
+        &[
+            h.auth_line("sufficient", ""),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
+            ),
+        ],
+    );
+
+    let (ok, out) = h.run(
+        "sudo",
+        &["authenticate"],
+        &format!("\n{FIXED_TEST_TOKEN}\n"),
+        None,
+    );
+    assert!(ok, "empty input must reach a fresh password prompt: {out}");
+    assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
+    assert!(!out.contains(FIXED_TEST_TOKEN), "secret displayed: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "empty input must not contact the daemon"
+    );
+}
+
+/// A failed face attempt cannot leave the reserved word cached as a Unix
+/// password. The downstream provider must ask for and receive a fresh token.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_face_denial_clears_yes_before_password_fallback() {
+    let Some(h) = Harness::try_new("intent-face-denial") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: "no match".into(),
+        declined_by_gesture: false,
+        refused_by_policy: false,
+    });
+    let checker = h.token_checker("face-denial", FIXED_TEST_TOKEN);
+    h.write_service(
+        "sudo",
+        &[
+            h.auth_line("sufficient", ""),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
+            ),
+        ],
+    );
+
+    let (ok, out) = h.run(
+        "sudo",
+        &["authenticate"],
+        &format!("yes\n{FIXED_TEST_TOKEN}\n"),
         None,
     );
     assert!(
         ok,
-        "fallback stack must complete after a fresh prompt: {out}"
+        "face denial must preserve fresh password fallback: {out}"
     );
-    assert!(out.contains(FACE_INTENT_PROMPT), "prompt missing: {out}");
+    assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
+    assert!(!out.contains(FIXED_TEST_TOKEN), "secret displayed: {out}");
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 1, "exactly one face request: {requests:?}");
+    assert!(matches!(
+        &requests[0],
+        Request::Authenticate {
+            intent_confirmation: Some(IntentAttestation::PamConversation),
+            ..
+        }
+    ));
+}
+
+/// A password supplied by an earlier PAM module is not fresh face intent. It
+/// skips the info message and camera and reaches the downstream verifier.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_cached_password_skips_face_offer() {
+    let Some(h) = Harness::try_new("intent-cached") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::Error("must not be called".into()));
+    let checker = h.token_checker("cached", FIXED_TEST_TOKEN);
+    h.write_service(
+        "sudo",
+        &[
+            format!(
+                "auth [success=ignore default=bad] {}",
+                h.set_items.display()
+            ),
+            h.auth_line("sufficient", ""),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
+            ),
+        ],
+    );
+
+    let (ok, out) = h.run("sudo", &["authenticate"], "", Some(FIXED_TEST_TOKEN));
+    assert!(ok, "cached password must reach the verifier: {out}");
     assert!(
-        !out.contains("not-the-real-password") && !out.contains("real-password"),
-        "echo-off conversations must not display either secret: {out}"
+        !out.contains(FACE_INTENT_INFO),
+        "face offer was shown: {out}"
+    );
+    assert!(!out.contains(FIXED_TEST_TOKEN), "secret displayed: {out}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "cached password must not contact the daemon"
+    );
+}
+
+/// A wrong password is tested only by the downstream provider. A fresh PAM
+/// transaction can then accept the right fixed test token with no camera work.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_wrong_password_is_camera_free_and_fresh_retry_accepts() {
+    let Some(h) = Harness::try_new("intent-wrong") else {
+        return;
+    };
+    let log = serve(&h.socket, |_| Response::Error("must not be called".into()));
+    let checker = h.token_checker("wrong", FIXED_TEST_TOKEN);
+    h.write_service(
+        "sudo",
+        &[
+            h.auth_line("sufficient", ""),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
+            ),
+        ],
+    );
+
+    let (wrong_ok, wrong_out) = h.run(
+        "sudo",
+        &["authenticate"],
+        &format!("{WRONG_TEST_TOKEN}\n"),
+        None,
+    );
+    assert!(
+        !wrong_ok,
+        "wrong token unexpectedly authenticated: {wrong_out}"
+    );
+    assert!(
+        !wrong_out.contains(WRONG_TEST_TOKEN),
+        "secret displayed: {wrong_out}"
+    );
+
+    let (right_ok, right_out) = h.run(
+        "sudo",
+        &["authenticate"],
+        &format!("{FIXED_TEST_TOKEN}\n"),
+        None,
+    );
+    assert!(
+        right_ok,
+        "fresh retry must accept one right token: {right_out}"
+    );
+    assert!(
+        !right_out.contains(FIXED_TEST_TOKEN),
+        "secret displayed: {right_out}"
     );
     assert!(
         log.lock().unwrap().is_empty(),
-        "a non-yes response must not contact the daemon"
+        "password attempts must not contact the daemon"
     );
 }
 
@@ -626,12 +787,12 @@ fn pamwrap_nonprivileged_modes_never_show_privileged_confirmation() {
     h.write_service("kde", &[h.auth_line("required", "")]);
     let (ok, out) = h.run("kde", &["authenticate"], "", None);
     assert!(ok, "lock verify must keep working: {out}");
-    assert!(!out.contains(FACE_INTENT_PROMPT), "{out}");
+    assert!(!out.contains(FACE_INTENT_INFO), "{out}");
 
     h.write_service("sddm", &[h.auth_line("required", "unseal")]);
     let (ok, out) = h.run("sddm", &["authenticate"], "\n", None);
     assert!(ok, "greeter unseal must keep working: {out}");
-    assert!(!out.contains(FACE_INTENT_PROMPT), "{out}");
+    assert!(!out.contains(FACE_INTENT_INFO), "{out}");
 
     for mode in ["keyring", "reseal"] {
         h.write_service(
@@ -643,7 +804,7 @@ fn pamwrap_nonprivileged_modes_never_show_privileged_confirmation() {
         );
         let (ok, out) = h.run("sddm", &["authenticate"], "", None);
         assert!(ok, "{mode} must keep fallback: {out}");
-        assert!(!out.contains(FACE_INTENT_PROMPT), "{mode}: {out}");
+        assert!(!out.contains(FACE_INTENT_INFO), "{mode}: {out}");
     }
 
     h.write_service(
@@ -655,7 +816,7 @@ fn pamwrap_nonprivileged_modes_never_show_privileged_confirmation() {
     );
     let (ok, out) = h.run("sshd", &["authenticate"], "", None);
     assert!(ok, "remote face path must fall through: {out}");
-    assert!(!out.contains(FACE_INTENT_PROMPT), "{out}");
+    assert!(!out.contains(FACE_INTENT_INFO), "{out}");
 
     let reqs = log.lock().unwrap();
     assert!(matches!(
@@ -835,7 +996,7 @@ fn pamwrap_polkit_confirmation_precedes_the_optional_gesture() {
     h.write_settings(None);
     let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(
-        out.contains(FACE_INTENT_PROMPT),
+        out.contains(FACE_INTENT_INFO),
         "confirmation missing: {out}"
     );
     assert!(
@@ -847,7 +1008,7 @@ fn pamwrap_polkit_confirmation_precedes_the_optional_gesture() {
     h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=nod\n"));
     let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
     assert!(
-        out.contains(FACE_INTENT_PROMPT),
+        out.contains(FACE_INTENT_INFO),
         "confirmation missing: {out}"
     );
     assert!(out.contains(APPROVE), "approval instruction missing: {out}");

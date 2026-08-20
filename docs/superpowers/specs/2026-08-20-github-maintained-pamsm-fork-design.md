@@ -2,7 +2,8 @@
 
 Date: 2026-08-20
 
-Status: chat design approved; written specification awaiting user review
+Status: approved; implementation plan at
+`../plans/2026-08-20-github-maintained-pamsm-fork.md`
 
 Related decisions and evidence:
 
@@ -102,8 +103,10 @@ The repository must contain:
 
 Required branch checks are formatting, strict Clippy, MSRV build/test,
 pam_wrapper integration, ASan/LeakSanitizer, CodeQL Rust analysis, dependency
-policy, and workflow-security linting. No maintainer may merge by bypassing
-required checks.
+policy, workflow-security linting, and exactly-one-trailer DCO validation. No
+maintainer may merge by bypassing required checks. The solo-maintainer branch
+does not require an impossible self-approval; required checks, resolved
+conversations, signed commits, and DCO validation are the merge gate.
 
 Normalize only the deprecated Cargo metadata spelling from `GPL-3.0` to
 `GPL-3.0-only`. This describes the preserved upstream license accurately; it
@@ -309,13 +312,17 @@ privilege permissions. Required checks on `irlume-patches` are:
 4. `CodeQL / Analyze (rust)`;
 5. `cargo-deny (advisories · licenses · sources)`;
 6. `actionlint (workflow correctness)`;
-7. `zizmor (workflow security)`.
+7. `zizmor (workflow security)`;
+8. `DCO (exactly one trailer)`.
 
 Administrators are subject to protection. Require pull requests, linear
 history, resolved review threads, signed commits, and one DCO trailer per
-commit. Disable force pushes and branch deletion. Do not grant workflows write
-permissions or preserve checkout credentials unless a separately reviewed
-release workflow requires them; this fork has no publication workflow.
+commit. Set the approving-review count to zero because GitHub does not permit a
+pull-request author to approve their own change and this repository initially
+has one maintainer. Disable force pushes and branch deletion. Do not grant
+workflows write permissions or preserve checkout credentials unless a
+separately reviewed release workflow requires them; this fork has no
+publication workflow.
 
 Dependabot may open Cargo and Actions updates. Each update passes the complete
 required set. Automatic merging is disabled at the authentication boundary.

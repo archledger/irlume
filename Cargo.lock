@@ -1573,8 +1573,10 @@ dependencies = [
 [[package]]
 name = "pamsm"
 version = "0.5.5"
+source = "git+https://github.com/archledger/pam_sm_rust?rev=ac9f644240e95c49246cb6b55adce2f2aea12a77#ac9f644240e95c49246cb6b55adce2f2aea12a77"
 dependencies = [
- "bitflags 1.3.2",
+ "bitflags 2.13.0",
+ "zeroize",
 ]
 
 [[package]]

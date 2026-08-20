@@ -533,9 +533,9 @@ fn stash_authtok(pamh: &Pam) {
     if let Ok(Some(tok)) = pamh.get_cached_authtok() {
         let bytes = tok.to_bytes();
         if !bytes.is_empty() {
-            // send_bytes copies into PAM-owned storage; the retrieved copy in the
-            // session phase is wrapped in zeroizing SecretBytes before use.
-            let _ = pamh.send_bytes(RESEAL_STASH_KEY, bytes.to_vec(), None);
+            // The stash itself is zeroizing on the PAM side now; the copy
+            // taken in the session phase is wrapped in SecretBytes as well.
+            let _ = pamh.send_secret(RESEAL_STASH_KEY, pamsm::PamSecretBytes::new(bytes.to_vec()));
         }
     }
 }
@@ -544,8 +544,11 @@ fn stash_authtok(pamh: &Pam) {
 /// password and ask the daemon to re-seal it if the envelope is armed and stale.
 /// Best-effort and silent: a login session must never fail because of this.
 fn try_reseal_session(pamh: &Pam, user: &str) {
-    let pw = match pamh.retrieve_bytes(RESEAL_STASH_KEY) {
-        Ok(bytes) if !bytes.is_empty() => SecretBytes::new(bytes),
+    // SAFETY: the key was registered by `stash_authtok` in this same PAM
+    // transaction and is not replaced while the borrow is live; the borrow
+    // ends inside the first match arm, before `SecretBytes` copies it.
+    let pw = match unsafe { pamh.get_secret(RESEAL_STASH_KEY) } {
+        Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
         // No stash (e.g. a pure face login that submitted a blank field, or auth
         // took a path that never set a token); nothing to heal.
         _ => return,
@@ -569,8 +572,11 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
 /// round trip costs only token users, only on their stash-less logins.
 /// Best-effort and silent like everything else in the session phase.
 fn deliver_gnome_token(pamh: &Pam, user: &str) {
-    let token = match pamh.retrieve_bytes(GKR_TOKEN_STASH_KEY) {
-        Ok(bytes) if !bytes.is_empty() => SecretBytes::new(bytes),
+    // SAFETY: the key was registered by this module in the same PAM
+    // transaction and is not replaced while the borrow is live; the borrow
+    // ends inside the first match arm, before `SecretBytes` copies it.
+    let token = match unsafe { pamh.get_secret(GKR_TOKEN_STASH_KEY) } {
+        Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
         _ => {
             let service = pamh
                 .get_service()
@@ -966,7 +972,10 @@ fn release_secret(
         }
         K::GnomeKeyringToken => {
             if pamh
-                .send_bytes(GKR_TOKEN_STASH_KEY, secret.expose().to_vec(), None)
+                .send_secret(
+                    GKR_TOKEN_STASH_KEY,
+                    pamsm::PamSecretBytes::new(secret.expose().to_vec()),
+                )
                 .is_ok()
             {
                 Released::TokenStashed
@@ -1083,12 +1092,20 @@ mod tests {
     }
     use super::*;
 
-    /// The local pamsm patch must expose token clearing without leaking the
-    /// opaque raw PAM handle into this module.
+    /// The maintained pamsm fork must expose token clearing, response-free
+    /// informational text, and zeroizing secret module-data storage without
+    /// leaking the opaque raw PAM handle into this module.
     #[test]
-    fn pamsm_exposes_safe_auth_token_clearing() {
+    fn pamsm_exposes_safe_auth_token_clearing_and_zeroizing_secrets() {
         fn require_api(pam: &Pam) -> pamsm::PamResult<()> {
-            pam.clear_authtok()
+            pam.clear_authtok()?;
+            pam.info("pamsm test info")?;
+            pam.send_secret("pamsm.test.secret", pamsm::PamSecretBytes::new(Vec::new()))?;
+            // SAFETY: the key was just registered above and is not replaced
+            // while the borrow is live; the borrow is dropped before return.
+            let secret = unsafe { pam.get_secret("pamsm.test.secret") }?;
+            assert!(secret.expose().is_empty());
+            Ok(())
         }
         let _: fn(&Pam) -> pamsm::PamResult<()> = require_api;
     }

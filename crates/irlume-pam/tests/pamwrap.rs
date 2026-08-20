@@ -1672,3 +1672,70 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
         other => panic!("expected only the delivery query, got {other:?}"),
     }
 }
+
+/// A REUSED stash key must replace cleanly through the zeroizing secret
+/// storage: authenticating twice in one PAM transaction stores the dummy
+/// secret, then replaces it, then the session phase must still read exactly
+/// the replaced value — and neither the transaction output nor the daemon
+/// trace may print it. This pins the `send_secret`/`get_secret` migration:
+/// the old plain-byte API never ran a replacement through cleanup.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_secret_stash_replaces_and_completes_without_printing() {
+    let Some(h) = Harness::try_new("secret-replace") else {
+        return;
+    };
+    const STASHED: &str = "fixed-reseal-dummy";
+    let log = serve(&h.socket, |req| match req {
+        Request::ResealPassword { .. } => Response::PasswordResealed {
+            armed: false,
+            changed: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    h.write_service(
+        "irlume-secret",
+        &[
+            format!("auth required {}", h.set_items.display()),
+            h.auth_line("required", "reseal"),
+            "auth required pam_permit.so".into(),
+            format!("session required {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+
+    // Two authenticate ops in ONE pam_start transaction: the second stash
+    // replaces the first under the same module-data key (PAM_DATA_REPLACE),
+    // exercising exactly-once cleanup of the superseded secret.
+    let (ok, out) = h.run(
+        "irlume-secret",
+        &[
+            "authenticate",
+            "authenticate",
+            "open_session",
+            "close_session",
+        ],
+        "",
+        Some(STASHED),
+    );
+    assert!(ok, "replace + session must both pass: {out}");
+    assert!(
+        !out.contains(STASHED),
+        "the stashed secret must never appear in transaction output: {out}"
+    );
+
+    let reqs = log.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "one reseal (open_session reads the replaced stash) then the delivery query: {reqs:?}"
+    );
+    match &reqs[0] {
+        Request::ResealPassword { password, .. } => assert_eq!(
+            password.expose(),
+            STASHED.as_bytes(),
+            "the replaced stash must read back the exact live secret"
+        ),
+        other => panic!("expected ResealPassword, daemon saw {other:?}"),
+    }
+}

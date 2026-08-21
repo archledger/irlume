@@ -235,8 +235,5 @@ fn main() {
     println!("\n== cross-scene pairs: {}", cross128.len());
     println!("  /128.0 : mean {cm128:.4}  sd {cs128:.4}");
     println!("  /127.5 : mean {cm1275:.4}  sd {cs1275:.4}");
-    println!(
-        "\nproduction IR threshold reference: ~0.602; genuine-mean shift: {:+.5}",
-        md
-    );
+    println!("\nproduction IR threshold reference: ~0.602; genuine-mean shift: {md:+.5}");
 }

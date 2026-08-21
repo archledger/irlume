@@ -190,6 +190,107 @@ impl RgbView<'_> {
     }
 }
 
+/// A grey 8-bit frame view (the IR capture shape: width*height bytes, no
+/// RGB expansion). `sample_bilinear` returns luma replicated to RGB —
+/// arithmetically identical to sampling a `grey_to_rgb`-expanded `RgbView`,
+/// at one-third the memory traffic and no full-frame copy.
+pub struct Grey8View<'a> {
+    pub data: &'a [u8], // width*height
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Grey8View<'_> {
+    #[inline]
+    fn luma(&self, x: i32, y: i32) -> f32 {
+        if self.width == 0 || self.height == 0 {
+            return 0.0;
+        }
+        let x = x.clamp(0, self.width as i32 - 1) as usize;
+        let y = y.clamp(0, self.height as i32 - 1) as usize;
+        let i = y * self.width as usize + x;
+        self.data.get(i).map(|&p| p as f32).unwrap_or(0.0)
+    }
+
+    /// Bilinear luma at fractional (x, y), edge-clamped.
+    #[inline]
+    pub fn sample_bilinear_grey(&self, x: f32, y: f32) -> f32 {
+        let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+        let (dx, dy) = (x - x0 as f32, y - y0 as f32);
+        let p00 = self.luma(x0, y0);
+        let p10 = self.luma(x0 + 1, y0);
+        let p01 = self.luma(x0, y0 + 1);
+        let p11 = self.luma(x0 + 1, y0 + 1);
+        let top = p00 * (1.0 - dx) + p10 * dx;
+        let bot = p01 * (1.0 - dx) + p11 * dx;
+        top * (1.0 - dy) + bot * dy
+    }
+
+    /// Equivalent of [`RgbView::sample_bilinear`] for grey input: luma in all
+    /// three channels, identical arithmetic to sampling a tripled-grey RgbView.
+    #[inline]
+    pub fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 3] {
+        let g = self.sample_bilinear_grey(x, y);
+        [g, g, g]
+    }
+}
+
+/// Either frame layout, for consumers that run on both RGB and IR frames
+/// (the detector is the main one). `sample_bilinear` dispatches to the
+/// concrete view; for grey frames this avoids the `grey_to_rgb` full-frame
+/// expansion entirely.
+pub enum FrameView<'a> {
+    Rgb(RgbView<'a>),
+    Grey(Grey8View<'a>),
+}
+
+impl FrameView<'_> {
+    #[inline]
+    pub fn width(&self) -> u32 {
+        match self {
+            FrameView::Rgb(v) => v.width,
+            FrameView::Grey(v) => v.width,
+        }
+    }
+
+    #[inline]
+    pub fn height(&self) -> u32 {
+        match self {
+            FrameView::Rgb(v) => v.height,
+            FrameView::Grey(v) => v.height,
+        }
+    }
+
+    /// Same contract and arithmetic as the concrete views' method.
+    #[inline]
+    pub fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 3] {
+        match self {
+            FrameView::Rgb(v) => v.sample_bilinear(x, y),
+            FrameView::Grey(v) => v.sample_bilinear(x, y),
+        }
+    }
+
+    /// Borrow the RGB view when the frame is genuinely RGB.
+    pub fn as_rgb(&self) -> Option<&RgbView<'_>> {
+        match self {
+            FrameView::Rgb(v) => Some(v),
+            FrameView::Grey(_) => None,
+        }
+    }
+}
+
+impl<'a> From<RgbView<'a>> for FrameView<'a> {
+    fn from(v: RgbView<'a>) -> Self {
+        FrameView::Rgb(v)
+    }
+}
+
+impl<'a> From<Grey8View<'a>> for FrameView<'a> {
+    fn from(v: Grey8View<'a>) -> Self {
+        FrameView::Grey(v)
+    }
+}
+
 /// Align `frame` to the ArcFace template using `src` landmarks; return a
 /// 112x112x3 interleaved chip in **RGB** order (u8). Deterministic for fixed
 /// inputs (the property the Phase-1 identity gate relies on).

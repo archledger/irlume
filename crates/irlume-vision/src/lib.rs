@@ -997,6 +997,11 @@ mod onnx {
     /// YuNet detector (ONNX). Loaded once in the daemon.
     pub struct Detector {
         session: Session,
+        /// Reused letterbox scratch (~4.9 MB at INPUT_SIZE 640). The consent
+        /// watch feeds the detector ~120 IR frames per authentication; the
+        /// zeroed tail (letterbox bars) is re-zeroed only where the previous
+        /// frame wrote, so steady state does no full zero-fill.
+        input_scratch: Vec<f32>,
     }
 
     impl Detector {
@@ -1004,6 +1009,7 @@ mod onnx {
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model)?,
+                input_scratch: Vec::new(),
             })
         }
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -1017,18 +1023,45 @@ mod onnx {
         /// kps=10ch) per stride, decodes, NMS, and maps coords back to the frame.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn detect(&mut self, frame: &align::RgbView) -> irlume_common::Result<Vec<Detection>> {
+            self.detect_any(&align::FrameView::Rgb(align::RgbView {
+                data: frame.data,
+                width: frame.width,
+                height: frame.height,
+            }))
+        }
+
+        /// [`Self::detect`] over either frame layout; a grey (IR) frame skips
+        /// the `grey_to_rgb` full-frame expansion and samples luma directly.
+        /// The letterbox tensor reuses a scratch buffer across calls and the
+        /// SSD heads are decoded from borrowed output slices (no per-tensor
+        /// copies).
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn detect_any(
+            &mut self,
+            frame: &align::FrameView<'_>,
+        ) -> irlume_common::Result<Vec<Detection>> {
             use crate::detect::{
                 decode_stride, letterbox_scale, nms, unletterbox, INPUT_SIZE, NMS_IOU,
                 SCORE_THRESHOLD, STRIDES,
             };
-            let scale = letterbox_scale(frame.width, frame.height);
-            let input = letterbox_bgr(frame, scale, INPUT_SIZE);
-            let n = INPUT_SIZE as i64;
-            let tensor = Tensor::from_array(([1i64, 3, n, n], input)).map_err(err)?;
+            let scale = letterbox_scale(frame.width(), frame.height());
+            let n = INPUT_SIZE;
+            self.input_scratch.clear();
+            self.input_scratch.resize(3 * n * n, 0.0);
+            letterbox_bgr_into(frame, scale, n, &mut self.input_scratch);
+            let ni = n as i64;
+            // Borrow the scratch: the tensor views our buffer, the session
+            // reads it, and the buffer stays owned here for the next call.
+            let tensor = ort::value::TensorRef::<f32>::from_array_view((
+                [1i64, 3, ni, ni],
+                self.input_scratch.as_slice(),
+            ))
+            .map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
 
-            // Group every output tensor by (channels, stride) using its shape.
-            let mut by: std::collections::HashMap<(usize, usize), Vec<Vec<f32>>> =
+            // Group output tensors by (channels, stride) using shape; decode
+            // from the borrowed slices in place.
+            let mut by: std::collections::HashMap<(usize, usize), Vec<&[f32]>> =
                 std::collections::HashMap::new();
             for i in 0..outputs.len() {
                 let (shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
@@ -1040,7 +1073,7 @@ mod onnx {
                     f * f == count
                 });
                 if let Some(stride) = stride {
-                    by.entry((ch, stride)).or_default().push(raw.to_vec());
+                    by.entry((ch, stride)).or_default().push(raw);
                 }
             }
 
@@ -1058,10 +1091,10 @@ mod onnx {
                 }
                 // score = sqrt(cls·obj); the two 1-channel tensors are symmetric.
                 dets.extend(decode_stride(
-                    &ones[0],
-                    &ones[1],
-                    &bbox[0],
-                    &kps[0],
+                    ones[0],
+                    ones[1],
+                    bbox[0],
+                    kps[0],
                     stride,
                     feat_w,
                     SCORE_THRESHOLD,
@@ -1261,23 +1294,23 @@ mod onnx {
 
     /// Resize+letterbox an RGB frame into a BGR, raw 0–255, NCHW input tensor for
     /// YuNet (top-left aligned; remainder zero-padded).
-    fn letterbox_bgr(frame: &align::RgbView, scale: f32, size: usize) -> Vec<f32> {
-        let mut t = vec![0.0f32; 3 * size * size];
+    /// Write the letterboxed BGR-planar f32 tensor for `frame` into `t`
+    /// (caller-owned scratch, `3*size*size`, pre-zeroed for the bars).
+    fn letterbox_bgr_into(t_view: &align::FrameView<'_>, scale: f32, size: usize, t: &mut [f32]) {
         let plane = size * size;
         let (sw, sh) = (
-            (frame.width as f32 * scale) as usize,
-            (frame.height as f32 * scale) as usize,
+            (t_view.width() as f32 * scale) as usize,
+            (t_view.height() as f32 * scale) as usize,
         );
         for y in 0..sh.min(size) {
             for x in 0..sw.min(size) {
-                let p = frame.sample_bilinear(x as f32 / scale, y as f32 / scale);
+                let p = t_view.sample_bilinear(x as f32 / scale, y as f32 / scale);
                 let o = y * size + x;
                 t[o] = p[2]; // B
                 t[plane + o] = p[1]; // G
                 t[2 * plane + o] = p[0]; // R
             }
         }
-        t
     }
 
     /// Third-party PAD classifier (opt-in; see `irlume_common::thirdparty`).

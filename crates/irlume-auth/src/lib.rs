@@ -3637,8 +3637,10 @@ impl Engine {
             ir_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
         if ir_top.is_none() {
+            // rescue_detect needs the mesh path over RGB-shaped data; the
+            // grey view expands here only on the (rare) rescue path.
             let iv = align::RgbView {
-                data: &ir_grey_rgb,
+                data: &irlume_camera::grey_to_rgb(&ir.data),
                 width: ir.width,
                 height: ir.height,
             };
@@ -3983,14 +3985,13 @@ impl Engine {
         let mut out = Vec::with_capacity(frames.len());
         for (i, f) in frames.iter().enumerate() {
             let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
-            let grey_rgb = irlume_camera::grey_to_rgb(&f.data);
-            let view = align::RgbView {
-                data: &grey_rgb,
+            let view = align::Grey8View {
+                data: &f.data,
                 width: f.width,
                 height: f.height,
             };
             let (mut pitch_frac, mut yaw_signed) = (None, None);
-            let faces = self.det.detect(&view)?;
+            let faces = self.det.detect_any(&align::FrameView::Grey(view))?;
             if let Some(t) = top_detection(&faces) {
                 let pose = irlume_vision::head_pose(&t.landmarks);
                 pitch_frac = Some(pose.pitch_frac);
@@ -4015,14 +4016,13 @@ impl Engine {
     ) -> irlume_common::Result<irlume_liveness::PoseSample> {
         let bri =
             frame.data.iter().map(|&p| p as f32).sum::<f32>() / frame.data.len().max(1) as f32;
-        let grey_rgb = irlume_camera::grey_to_rgb(&frame.data);
-        let view = align::RgbView {
-            data: &grey_rgb,
+        let view = align::Grey8View {
+            data: &frame.data,
             width: frame.width,
             height: frame.height,
         };
         let (mut pitch_frac, mut yaw_signed) = (None, None);
-        let faces = self.det.detect(&view)?;
+        let faces = self.det.detect_any(&align::FrameView::Grey(view))?;
         if let Some(t) = top_detection(&faces) {
             let pose = irlume_vision::head_pose(&t.landmarks);
             pitch_frac = Some(pose.pitch_frac);

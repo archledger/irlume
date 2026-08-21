@@ -63,7 +63,7 @@ Everything irlume's messy build needs, so you don't hunt distro packages:
 | `clang` + `libclang` (`LIBCLANG_PATH`) | `v4l2-sys-mit`'s bindgen needs it |
 | kernel headers (`BINDGEN_EXTRA_CLANG_ARGS`) | bindgen parses `<linux/videodev2.h>` |
 | `linux-pam` | the `pamsm` crate links `libpam`; `pamsm` itself comes from the irlume-maintained fork [`archledger/pam_sm_rust`](https://github.com/archledger/pam_sm_rust), pinned by exact commit in `Cargo.toml`/`Cargo.lock` (ADR-0012). Offline builds vendor it like any other git dependency: `cargo vendor --locked vendor` then `--offline` builds resolve it from the vendor dir. |
-| onnxruntime **1.24.4** (`ORT_DYLIB_PATH`) | irlume needs the `api-24` ABI; nixpkgs' is older |
+| onnxruntime **1.28.1** (`ORT_DYLIB_PATH`) | irlume needs the `api-24` ABI; nixpkgs' is older |
 
 To bump the toolchain or nixpkgs later: edit the version string in `flake.nix`
 or run `nix flake update`, then commit the changed `flake.lock`.
@@ -110,9 +110,9 @@ distro build is older, so fetch the upstream release and point `ORT_DYLIB_PATH`
 at it:
 
 ```sh
-curl -fsSLO https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz
-tar xzf onnxruntime-linux-x64-1.24.4.tgz
-export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so"
+curl -fsSLO https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-linux-x64-1.28.1.tgz
+tar xzf onnxruntime-linux-x64-1.28.1.tgz
+export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.28.1/lib/libonnxruntime.so"
 ```
 
 ## Option C: Container (Podman/Docker)
@@ -266,7 +266,7 @@ CLI tools, they open the camera directly and hold no privileged path.
 The `irlume-auth` examples load ONNX models, so they need `ORT_DYLIB_PATH`
 set (see the ONNX runtime section above; on an installed Fedora/RPM box,
 `/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` works, on a Debian/PPA
-box `/opt/irlume/onnxruntime/lib/libonnxruntime.so.1.24.4`). Without it the
+box `/opt/irlume/onnxruntime/lib/libonnxruntime.so.1.28.1`). Without it the
 process hangs instead of erroring: an upstream `ort` bug where building the
 load-failure message re-enters the API lock being initialized.
 

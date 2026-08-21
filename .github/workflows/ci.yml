@@ -132,7 +132,7 @@ jobs:
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
-          ver=1.24.4
+          ver=1.28.1
           curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
           tar xzf "onnxruntime-linux-x64-${ver}.tgz"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
@@ -381,7 +381,7 @@ jobs:
 
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
-          ver=1.24.4
+          ver=1.28.1
           curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
           tar xzf "onnxruntime-linux-x64-${ver}.tgz"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"

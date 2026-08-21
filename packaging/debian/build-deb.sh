@@ -5,7 +5,7 @@
 #   bash packaging/debian/build-deb.sh
 set -euo pipefail
 
-ORT_VER="${ORT_VER:-1.24.4}"
+ORT_VER="${ORT_VER:-1.28.1}"
 # sha256 of onnxruntime-linux-x64-${ORT_VER}.tgz (bundled .so runs in the
 # privileged daemon); verify rather than trusting HTTPS. Update with ORT_VER.
 ORT_SHA256="${ORT_SHA256:-3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747}"
@@ -73,7 +73,7 @@ EOF
 
 cd "$REPO/packaging/debian"
 # Name the artifact after the irlume version (from nfpm.yaml), NOT the bundled
-# onnxruntime version; irlume_1.24.4.deb read like irlume itself was 1.24.4.
+# onnxruntime version; irlume_1.28.1.deb read like irlume itself was 1.28.1.
 PKG_VER="$(sed -n 's/^version:[[:space:]]*v\{0,1\}\([0-9][^[:space:]]*\).*/\1/p' nfpm.yaml)"
 nfpm package --packager deb --target "$REPO/irlume_${PKG_VER}_amd64.deb"
 echo "built irlume_${PKG_VER}_amd64.deb in $REPO"

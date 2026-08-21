@@ -1,5 +1,5 @@
 %global tflite_ver v2.19.0
-%global ort_ver 1.24.4
+%global ort_ver 1.28.1
 
 Name:           irlume
 Version:        0.10.0

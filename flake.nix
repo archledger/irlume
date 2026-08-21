@@ -47,13 +47,13 @@
         # irlume needs onnxruntime >= 1.24 (the api-24 ABI). nixpkgs ships an
         # older build, so we pin the exact upstream release the RPM/.deb bundle.
         # `ort` uses load-dynamic, so this is only needed to RUN, not to build.
-        ortVersion = "1.24.4";
+        ortVersion = "1.28.1";
         onnxruntime-bin = pkgs.stdenv.mkDerivation {
           pname = "onnxruntime-linux-x64";
           version = ortVersion;
           src = pkgs.fetchurl {
             url = "https://github.com/microsoft/onnxruntime/releases/download/v${ortVersion}/onnxruntime-linux-x64-${ortVersion}.tgz";
-            hash = "sha256-OiEfvqJSweZikGWPG3NbdyBWFJ8oMh5xwwiULNtUt0c=";
+            hash = "sha256-JSmu+WjQrQYDNlBUvEbr76fw/jvBLyjF9ynJnd/+KoE=";
           };
           # A prebuilt binary: unpack it and expose just the shared library.
           # autoPatchelf fixes its library paths so it also runs on NixOS.

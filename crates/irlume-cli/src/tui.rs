@@ -290,6 +290,9 @@ enum Suspend {
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
+    /// `irlume diag` in the cooked terminal: TPM seal + PCR-drift summary.
+    /// Unprivileged (sudo adds envelope detail; the summary is useful alone).
+    Diag,
     /// The full `irlume doctor` text readout in the cooked terminal: the
     /// complete authoritative dump (incl. the info-only lines the Repair
     /// checklist omits), copy-pasteable for a bug report.
@@ -557,6 +560,10 @@ struct App {
     /// contradicted the active-pair line right under it on a daemon that
     /// predates the request.
     pairs_known: bool,
+    /// Current capture schedule from the daemon (`CaptureModeStatus`), for
+    /// the Cameras info block — e.g. "sequential (source: measured; …)".
+    /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
+    capture_mode: Option<String>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
     confirm: Option<Confirm>,
@@ -1063,6 +1070,7 @@ impl App {
             nodes: Vec::new(),
             pairs: Vec::new(),
             pairs_known: false,
+            capture_mode: None,
             activity: Vec::new(),
             input: None,
             confirm: None,
@@ -1282,6 +1290,24 @@ impl App {
             if self.cam_sel >= n {
                 self.cam_sel = n - 1;
             }
+        }
+        // The same camera-class slot as the listing above: the arbiter
+        // serializes this against captures, and it is refreshed on screen
+        // entry (not per frame). A refusal or older daemon leaves the last
+        // answer in place — unknown is not "default".
+        if let Ok(Response::CaptureModeStatus {
+            mode,
+            source,
+            runtime_degradation,
+            ..
+        }) = crate::daemon_poll(&Request::CaptureModeStatus)
+        {
+            let mut text = format!("{mode} (source: {source})");
+            if let Some(why) = runtime_degradation {
+                text.push_str("; degraded: ");
+                text.push_str(&why);
+            }
+            self.capture_mode = Some(text);
         }
     }
 
@@ -2936,6 +2962,9 @@ impl App {
             Suspend::Update => {
                 crate::commands::update(&none);
             }
+            Suspend::Diag => {
+                let _ = crate::commands::diag(&["--user".to_string(), self.user.clone()]);
+            }
             Suspend::Doctor => {
                 // The TUI already knows its target account; pass it so doctor
                 // reports on the same user the rest of the screen does.
@@ -3394,6 +3423,20 @@ impl App {
             // including the info-only lines the Repair checklist omits, for a
             // bug report. Runs as the user (no sudo prompt); root-only lines
             // say so.
+            (SC_REPAIR, KeyCode::Char('a')) => {
+                self.log('→', "irlume diag: TPM seal + PCR-drift readout (sudo adds envelope detail)");
+                self.suspend = Some(Suspend::Diag);
+            }
+            (SC_REPAIR, KeyCode::Char('v')) => {
+                // Trace RECORD is root-only and lasts the full window, so it
+                // runs cooked under sudo; the command itself prints the
+                // output path and the `irlume trace explain` follow-up.
+                self.log('→', "irlume trace record: 60s privileged diagnostic (no frames or credentials recorded)");
+                self.sudo_step(
+                    "record a 60-second diagnostic trace",
+                    &["irlume", "trace", "record", "--duration", "60s"],
+                );
+            }
             (SC_REPAIR, KeyCode::Char('d')) => {
                 self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
                 self.suspend = Some(Suspend::Doctor);
@@ -3811,6 +3854,10 @@ impl App {
                 self.suspend = Some(Suspend::LogsDebug(!on));
             }
             // Origin-aware updater, from the dashboard.
+            (SC_WELCOME, KeyCode::Char('u')) => {
+                self.log('→', "irlume update: checks the release feed and updates via the channel this install came from");
+                self.suspend = Some(Suspend::Update);
+            }
             (SC_DONE, KeyCode::Char('u')) => {
                 self.log('→', "irlume update: checks the release feed and updates via the channel this install came from");
                 self.suspend = Some(Suspend::Update);
@@ -5439,6 +5486,21 @@ impl App {
                 ]));
             }
         }
+        // Capture schedule in force (the `irlume camera-mode` answer): a
+        // user deciding whether to run [t] tune wants the current verdict
+        // without leaving the screen. Not-fetched draws as unknown, never
+        // as the default schedule.
+        let capture = match &self.capture_mode {
+            Some(text) => Span::raw(text.clone()),
+            None => Span::styled(
+                "unknown (daemon not answering)".to_string(),
+                Style::new().dim(),
+            ),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  capture  ", Style::new().dim()),
+            capture,
+        ]));
         lines.push(Line::raw(""));
         lines.push(section("IR emitter (850nm)"));
         lines.push(Line::from(Span::styled(
@@ -6555,6 +6617,7 @@ impl App {
                 "d" => &[
                     ("d", "Open Diagnostics"),
                     ("e", "Enroll Face"),
+                    ("u", "Update…"),
                     ("r", "Refresh Status"),
                     ("enter", "Open Selected Section"),
                     ("U", "Uninstall…"),
@@ -6562,6 +6625,7 @@ impl App {
                 "e" => &[
                     ("e", "Enroll Face"),
                     ("i", "Test Recognition"),
+                    ("u", "Update…"),
                     ("r", "Refresh Status"),
                     ("enter", "Open Selected Section"),
                     ("U", "Uninstall…"),
@@ -6569,6 +6633,7 @@ impl App {
                 "w" => &[
                     ("w", "Connect Login…"),
                     ("i", "Test Recognition"),
+                    ("u", "Update…"),
                     ("r", "Refresh Status"),
                     ("enter", "Open Selected Section"),
                     ("U", "Uninstall…"),
@@ -6576,11 +6641,13 @@ impl App {
                 "i" => &[
                     ("i", "Test Recognition"),
                     ("e", "Enroll Face"),
+                    ("u", "Update…"),
                     ("r", "Refresh Status"),
                     ("enter", "Open Selected Section"),
                     ("U", "Uninstall…"),
                 ],
                 _ => &[
+                    ("u", "Update…"),
                     ("r", "Refresh Status"),
                     ("enter", "Open Selected Section"),
                     ("U", "Uninstall…"),
@@ -6590,6 +6657,8 @@ impl App {
                 ("f", "Fix Selected Issue…"),
                 ("r", "Recheck"),
                 ("d", "Full Diagnostics"),
+                ("a", "TPM Diagnostics"),
+                ("v", "Record Trace (60s)"),
                 ("s", "Create Support Report"),
                 ("l", "Test Infrared Camera"),
                 ("g", "Show Logs"),
@@ -7864,6 +7933,7 @@ mod tests {
             nodes: Vec::new(),
             pairs: Vec::new(),
             pairs_known: false,
+            capture_mode: None,
             activity: Vec::new(),
             input: None,
             confirm: None,

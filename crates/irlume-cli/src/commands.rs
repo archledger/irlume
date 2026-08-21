@@ -18,6 +18,12 @@ use std::process::ExitCode;
 /// matching manual steps, plus a pointer to the dedicated repo where one
 /// exists for the family. `--check` reports without running anything. No
 /// network library is bundled; we shell out to curl and degrade gracefully.
+/// The upstream-version part of a package version string ("0.10.0-1.fc44" →
+/// "0.10.0"), for comparing the running binary against the package.
+fn version_base(v: &str) -> &str {
+    v.split(['-', '+']).next().unwrap_or(v)
+}
+
 pub fn update(args: &[String]) -> ExitCode {
     let check_only = args.iter().any(|a| a == "--check" || a == "-n");
     let origin = install_origin();
@@ -27,6 +33,16 @@ pub fn update(args: &[String]) -> ExitCode {
     let current = installed_version(&origin);
     println!("[update] installed: {current}");
     println!("[update] install method: {}", origin.describe());
+    // A hand-installed/overlaid build (dev box) can run a binary newer than
+    // the package. `installed:` above stays the package truth — it is what
+    // the update replaces — but say so instead of letting the two versions
+    // silently disagree (doctor's install-hygiene check has the detail).
+    let bin = env!("CARGO_PKG_VERSION");
+    if version_base(&current) != bin {
+        println!(
+            "[update] note: the running binary is {bin}, not the packaged {current}; the package version above is what updating replaces (see `irlume doctor`)"
+        );
+    }
 
     let release = latest_release();
     let latest = &release.tag;
@@ -1179,9 +1195,37 @@ pub fn diag(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// True when this system plausibly runs SELinux: the policy mountpoint
+/// exists or the tooling is installed. Neither being true (plain Arch, most
+/// minimal containers) means the module questions have no meaningful answer.
+fn selinux_present() -> bool {
+    std::path::Path::new("/sys/fs/selinux").exists()
+        || std::path::Path::new("/usr/sbin/semodule").exists()
+        || std::path::Path::new("/usr/bin/semodule").exists()
+}
+
 /// `irlume selinux <status|load>`: manage the policy module that lets the
 /// confined greeter (`xdm_t`) reach the daemon socket at login.
 pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
+    // Arch and most non-Fedora distros ship no SELinux at all: there is no
+    // policy store and no semodule. On those hosts the old output ("unknown,
+    // semodule needs root" plus a bare `ls -Z` filename with no label) read
+    // like a broken setup instead of an inapplicable feature.
+    if !selinux_present() {
+        match sub {
+            None | Some("status") => {
+                println!("[selinux] SELinux is not present on this system; nothing to manage.");
+                return ExitCode::SUCCESS;
+            }
+            Some("load") => {
+                eprintln!(
+                    "[selinux] SELinux is not present on this system; there is no policy to load."
+                );
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+    }
     match sub {
         None | Some("status") => {
             // `semodule -l` needs root; as a normal user it returns nothing, so
@@ -1215,7 +1259,9 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
                 format!("not loaded {WARN} (run `sudo irlume selinux load`)")
             };
             println!("[selinux] module 'irlume': {state}");
-            if !label.is_empty() {
+            // `ls -Z` on a non-SELinux coreutils prints just the filename
+            // (or "? path"); only a real label (contains ':') is information.
+            if label.contains(':') {
                 print!("[selinux] socket label: {label}");
             }
             ExitCode::SUCCESS
@@ -2239,6 +2285,7 @@ mod reach_tests {
 #[cfg(test)]
 mod origin_tests {
     use super::ort_on_disk;
+    use super::version_base;
 
     /// A packaged install puts onnxruntime somewhere no distro path covers and
     /// exports ORT_DYLIB_PATH to the daemon only, so with irlumed stopped `deps`
@@ -2368,6 +2415,17 @@ mod origin_tests {
     // overlaid install; (b) ppa_serves must be true only when the Packages
     // index lists irlume, false on an empty index or HTTP 404; (c) a network
     // failure must be None (unknown), never "not served".
+    #[test]
+    fn version_base_strips_release_suffixes() {
+        assert_eq!(version_base("0.10.0"), "0.10.0");
+        assert_eq!(version_base("0.10.0-1.fc44"), "0.10.0");
+        assert_eq!(version_base("0.10.0-0ppa1~resolute1"), "0.10.0");
+        assert_eq!(version_base("0.7.0-2"), "0.7.0");
+        // A distro "+" revision suffix also strips, so a 0.10.0+r1 local
+        // package does not read as skewing from a 0.10.0 binary.
+        assert_eq!(version_base("0.10.0+g1"), "0.10.0");
+    }
+
     #[test]
     fn update_probes_query_the_package_manager_and_the_ppa_index() {
         // No PATH mutation, no FAKE_CURL_MODE, no ENV_LOCK, and no files: each

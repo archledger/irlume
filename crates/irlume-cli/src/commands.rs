@@ -1199,9 +1199,19 @@ pub fn diag(args: &[String]) -> ExitCode {
 /// exists or the tooling is installed. Neither being true (plain Arch, most
 /// minimal containers) means the module questions have no meaningful answer.
 fn selinux_present() -> bool {
-    std::path::Path::new("/sys/fs/selinux").exists()
-        || std::path::Path::new("/usr/sbin/semodule").exists()
-        || std::path::Path::new("/usr/bin/semodule").exists()
+    if std::path::Path::new("/sys/fs/selinux").exists() {
+        return true;
+    }
+    // Honor PATH (the integration tests inject a fake `semodule` there; a
+    // real SELinux box also may not have it in the fixed /usr slots).
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join("semodule").exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `irlume selinux <status|load>`: manage the policy module that lets the

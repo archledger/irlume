@@ -812,7 +812,11 @@ fn selinux_load_handles_missing_module_and_semodule_outcomes() {
     // No irlume.pp anywhere reachable: the not-found guard fires. Pin the
     // lookup with the env override so a host that really has the packaged
     // .pp installed (/usr/share/selinux/packages) cannot satisfy it.
-    let mut miss = sb.cmd(&["selinux", "load"]);
+    // A semodule fake keeps the SELinux-absence probe (which otherwise
+    // short-circuits `load` on hosts without SELinux) out of the way, so
+    // this still tests the .pp lookup path it was written for.
+    sb.fake_tool("semodule", "exit 0");
+    let mut miss = sb.cmd_with_fakes(&["selinux", "load"]);
     miss.env("IRLUME_SELINUX_PP", sb.path("does-not-exist.pp"));
     let (code, _, err) = run(&mut miss, "selinux load");
     assert_eq!(code, 1);

@@ -225,6 +225,9 @@ pub fn align_to_arcface(frame: &RgbView, src: &Landmarks5) -> irlume_common::Res
 
 /// Preprocess an aligned 112x112 RGB chip into the NCHW f32 tensor the net wants:
 /// planar `[1,3,112,112]`, `(px − 127.5) / 128.0`, channel order per [`INPUT_IS_RGB`].
+/// The divisor is deliberately /128.0 (not the InsightFace reference's /127.5
+/// for unbaked graphs); see the `embed` doc for the measured-acceptance record.
+/// FROZEN with the match thresholds and stored templates — do not change.
 pub fn preprocess_arcface(chip_rgb: &[u8]) -> Vec<f32> {
     let n = (OUT_SIZE * OUT_SIZE) as usize;
     debug_assert_eq!(chip_rgb.len(), n * 3);

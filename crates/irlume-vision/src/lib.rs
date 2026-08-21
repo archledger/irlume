@@ -580,9 +580,17 @@ mod onnx {
 
         /// Embed an already-aligned 112x112 RGB chip -> L2-normalized 512-D vector.
         ///
-        /// Preprocessing MUST match AuraFace/InsightFace exactly or genuine pairs
-        /// collapse (the "identical images score 0.6" trap): channel order per
-        /// [`align::INPUT_IS_RGB`], (px-127.5)/128.0, NCHW; output L2-normalized.
+        /// Preprocessing is FROZEN: channel order per [`align::INPUT_IS_RGB`],
+        /// (px-127.5)/128.0, NCHW; output L2-normalized. Note the divisor is
+        /// /128.0, while the InsightFace reference for graphs WITHOUT baked
+        /// Sub/Mul nodes (this artifact; first nodes are raw Conv/PRelu)
+        /// computes /127.5. The divergence is measured and accepted: on
+        /// 19,526 genuine pairs (suncal corpus, ORT 1.28.0, 2026-08-20;
+        /// `norm_ab_bench`) the mean cosine shift is +0.00028 with +0.0005 on
+        /// cross-scene pairs — under 0.2% of the ~0.18 match-threshold margin,
+        /// and uniform on both sides. Thresholds and every stored template are
+        /// coherent with /128.0; do NOT "correct" the constant without
+        /// re-baselining thresholds and re-enrolling.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
             Ok(self.embed_with_norm(chip_rgb)?.0)
@@ -617,8 +625,31 @@ mod onnx {
             chip_rgb: &[u8],
         ) -> irlume_common::Result<(Embedding, f32)> {
             let data = align::preprocess_arcface(chip_rgb);
+            self.embed_preprocessed_with_norm(&data)
+        }
+
+        /// Embed an ALREADY-preprocessed NCHW f32 tensor (the shape produced by
+        /// [`align::preprocess_arcface`]). A seam for benches that vary the
+        /// preprocessing constants deliberately; production paths always go
+        /// through [`Self::embed`]/[`Self::embed_tta`].
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn embed_preprocessed(&mut self, data: &[f32]) -> irlume_common::Result<Embedding> {
+            Ok(self.embed_preprocessed_with_norm(data)?.0)
+        }
+
+        fn embed_preprocessed_with_norm(
+            &mut self,
+            data: &[f32],
+        ) -> irlume_common::Result<(Embedding, f32)> {
             let n = align::OUT_SIZE as i64;
-            let tensor = Tensor::from_array(([1i64, 3, n, n], data)).map_err(err)?;
+            let expected = (3 * n * n) as usize;
+            if data.len() != expected {
+                return Err(err(format!(
+                    "preprocessed tensor len {} != expected {expected}",
+                    data.len()
+                )));
+            }
+            let tensor = Tensor::from_array(([1i64, 3, n, n], data.to_vec())).map_err(err)?;
             // Positional input (single-input model); avoids needing the input name.
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;

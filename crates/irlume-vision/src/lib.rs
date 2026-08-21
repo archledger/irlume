@@ -5,7 +5,8 @@
 //!
 //! Commercially-clean, GPL-3.0-compatible bill of materials (all permissive):
 //!   * Detection:   YuNet  (MIT)      `face_detection_yunet_2023mar.onnx`
-//!     bbox + 5 landmarks; ~1.6 ms @320x320 on a laptop CPU.
+//!     bbox + 5 landmarks; runs at the fixed 640x640 letterbox (INPUT_SIZE in
+//!     detect.rs); see `examples/mp_latency_bench.rs` for current numbers.
 //!   * Recognition: AuraFace (Apache) `glintr100.onnx`, ResNet100/ArcFace,
 //!     512-D embedding, 112x112 input, standard 5-point alignment.
 //!
@@ -244,6 +245,13 @@ mod onnx {
     use crate::align;
     use ort::session::{builder::GraphOptimizationLevel, Session};
     use ort::value::Tensor;
+
+    /// Intra-op threads per ONNX session. 2 matches the measured TFLite
+    /// XNNPACK knee for these small single-image models, and the ONNX
+    /// determinism notes (by the PINNED_EMBEDDING gate) found counts 1-8
+    /// bit-identical, so a small fixed cap only removes idle-pool contention
+    /// with capture threads.
+    const ORT_INTRA_THREADS: usize = 2;
 
     fn err<E: std::fmt::Display>(e: E) -> irlume_common::Error {
         irlume_common::Error::Hardware(format!("onnx: {e}"))
@@ -523,7 +531,29 @@ mod onnx {
                 .with_execution_providers([ort::ep::OpenVINO::default().build()])
                 .map_err(err)?;
         }
-        b.with_optimization_level(GraphOptimizationLevel::Level3)
+        #[cfg(feature = "tensorrt")]
+        {
+            b = b
+                .with_execution_providers([ort::ep::TensorRT::default().build()])
+                .map_err(err)?;
+        }
+        #[cfg(feature = "coreml")]
+        {
+            b = b
+                .with_execution_providers([ort::ep::CoreML::default().build()])
+                .map_err(err)?;
+        }
+        // Cap the intra-op pool explicitly. The runtime default sizes one pool
+        // per session to the physical-core count; this daemon holds up to four
+        // ONNX sessions plus a TFLite session, and idle pools contend with the
+        // capture and consent-watch threads inside the seconds-scale auth
+        // budget. The repo's own measurement (see the determinism notes by the
+        // PINNED_EMBEDDING gate) found intra-op thread counts 1, 2, 4 and 8
+        // bit-identical for the embedder, so capping costs nothing and removes
+        // the contention.
+        b.with_intra_threads(ORT_INTRA_THREADS)
+            .map_err(err)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(err)?
             .commit_from_memory(model)
             .map_err(err)

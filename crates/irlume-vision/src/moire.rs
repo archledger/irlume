@@ -14,8 +14,9 @@
 //! camera show weak moiré, and very sharp natural texture can read high, so this
 //! is one cue layered onto lit + frontal + glare, used only in convenience tier.
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::f32::consts::PI;
+use std::sync::OnceLock;
 
 /// Analysis grid size (square). Power-of-two keeps the FFT fast; the caller
 /// nearest-resamples the face crop to this (nearest, not bilinear, to preserve
@@ -43,8 +44,12 @@ pub fn moire_score(gray: &[u8]) -> f32 {
         }
     }
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(N);
+    // rustfft planners cache twiddle tables per length; N is a fixed constant,
+    // so the plan is built once per process instead of per score call (the
+    // convenience path runs this on every capture).
+    static PLAN: OnceLock<std::sync::Arc<dyn Fft<f32>>> = OnceLock::new();
+    let fft =
+        PLAN.get_or_init(|| std::sync::Arc::clone(&FftPlanner::<f32>::new().plan_fft_forward(N)));
     // Rows, then columns = 2D FFT.
     for y in 0..N {
         fft.process(&mut buf[y * N..(y + 1) * N]);

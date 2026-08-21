@@ -84,7 +84,7 @@ daemon socket. Only needed on SELinux-enforcing systems (Fedora default).
 # Verify the bundled onnxruntime (Source1) before unpacking: the .so runs in
 # the privileged daemon, and Copr fetches remote sources without the Fedora
 # lookaside's own integrity check. Update the digest together with ort_ver.
-echo '3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747  %{SOURCE1}' | sha256sum -c -
+echo '2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c99ddffe2a81  %{SOURCE1}' | sha256sum -c -
 # Unpack the bundled onnxruntime (Source1) next to the source tree; installed
 # below into %{_datadir}/%{name}/onnxruntime.
 tar -xzf %{SOURCE1}

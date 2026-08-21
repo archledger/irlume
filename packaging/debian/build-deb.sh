@@ -8,7 +8,7 @@ set -euo pipefail
 ORT_VER="${ORT_VER:-1.28.1}"
 # sha256 of onnxruntime-linux-x64-${ORT_VER}.tgz (bundled .so runs in the
 # privileged daemon); verify rather than trusting HTTPS. Update with ORT_VER.
-ORT_SHA256="${ORT_SHA256:-3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747}"
+ORT_SHA256="${ORT_SHA256:-2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c99ddffe2a81}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 STAGE="$REPO/.deb-staging"
 cd "$REPO"

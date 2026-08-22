@@ -5612,8 +5612,10 @@ pub mod ir_probe {
 /// Raw per-dequeue startup facts for one device, BEFORE any rate gating.
 ///
 /// The production rate gate discards the first window's frames inside
-/// [`TrackedStream::fill_rate_evidence`] (the per-role startup flush, then a
-/// 30-delta measurement), so its delivered frames say nothing about the
+/// `TrackedStream::fill_rate_evidence` (the per-role startup flush, then a
+/// 30-delta measurement; named in backticks rather than as an intra-doc
+/// link because it is private and public docs may not link to private
+/// items), so its delivered frames say nothing about the
 /// STREAMON transient those constants are sized for. This probe streams
 /// through the same validated dequeue boundary with NO tracked wrapper and
 /// records the transport facts of every attempt, so the flush and window

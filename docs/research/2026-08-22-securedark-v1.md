@@ -30,6 +30,31 @@ Branch: feat/securedark (ADR-0016 stage 1)
   with zero measured FAR inflation (1,600+ strangers); ridge λ fixed;
   unchanged by this work.
 
+## Offline sweep results (2026-08-22 night, benchmarks/securedark_sweep.py,
+CBSR 197 ids / 347,508 impostor pairs deployment-shaped best-of-11; Tufts
+109 ids, victim-calibrated impostors, the exact ir_match_in shape):
+
+- **CBSR best-of-N with PRODUCTION scaling** (+0.015*log2(11) = +0.052):
+  0.60 base -> effective 0.652: **FAR 1.38e-4 / FRR 0.62%** (better than the
+  flat-threshold 2.7e-4 the historical pairwise figure implied — best-of-N
+  inflates FAR ~2.7x over pairwise, and the shipped scaling more than pays
+  it back at N=11). 0.635 base -> 0.687: FAR 5.2e-5 / FRR 0.79%.
+- **Tufts cross-spectral, per-user calibration (λ=0.5, k=5, best-of-N)**:
+  FAR@0.60 = 1.0e-4, FRR 4.32% vs no-calibration FAR 4.9e-5 / FRR 6.64%.
+  The calibration costs ~2x FAR at equal threshold (impostor max 0.617 ->
+  0.737) while cutting FRR a third — the first quantification of that
+  trade, both arms ~1e-4-class at 0.60. k=5 fit pairs beat k=3 on FRR at
+  every λ (4.3% vs 5.3% at λ=0.5): enrollment should keep >=5 IR/RGB pairs.
+  λ=1.0 trades slightly better FAR / slightly worse FRR than λ=0.5; the
+  shipped 0.5 stays (midpoint of the measured-safe band, ADR-0004).
+- Within-session-split caveat (labeled in the script): CBSR genuine tails
+  are optimistic vs cross-session; the LIVE dark-session measurement
+  remains the gate for anything above 0.60.
+
+Net: the shipped 0.60 + scaling is STRONGER than the ADR's flat-number
+claim; no constant changes tonight. The 0.635 rung now has deployment-
+shaped support on both corpora (5.2e-5 / 4.9e-5 FAR) and stays live-gated.
+
 ## The open measurement (user-present session; blocks stages 2-4)
 
 **Live dark-session genuine distribution** — needed before any bar above

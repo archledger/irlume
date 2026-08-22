@@ -82,11 +82,27 @@ PAD stack.
 
 ## Threat analysis
 
-- **Lit-room NIR-only presentation:** closed by the scene gate (the artifact
-  can no longer choose the IR-only path in a lit room). Residual: an
-  attacker who can darken the victim's room physically — outside the
-  attacker model for a presentation attack (and the same attack then faces
-  the full dark stack: FLIR + physics + 0.60).
+- **Lit-room NIR-only presentation:** the scene gate closes the ROUTING, not
+  the species. Two disclosed residuals keep it partial:
+  - **Frame-fraction bound.** `rgb_frame_mean` is a whole-frame statistic: a
+    large visibly-dark 850nm-reflective presentation (the ADR-0002 banner
+    species, held at login distance) can fill enough of the RGB FOV to drag
+    the mean below 100 in a lit room. The gate's protection is bounded by
+    the artifact's frame fraction; what stands behind it is unchanged (FLIR
+    PAD, IR physics, the per-user floor, 0.60).
+  - **Blinded RGB sensor.** Tape over the RGB lens, an engaged RGB privacy
+    shutter, or a black-frame sensor fault reads ≈0 and passes the gate
+    (deliberately, so a sensor fault degrades to the liveness/match gates
+    rather than a lit-scene refusal). Blinding the RGB sensor is physical
+    device access — outside the presentation-attacker model — and the IR
+    node's own privacy state remains fail-closed upstream. Disclosed here as
+    the cheapest physical route onto the dark path.
+  - **Stale brightness on a skew-discarded pair.** When the concurrent pair
+    exceeds the skew limit, the stale RGB frame's mean still feeds the gate
+    (a >3s-old reading). Exploiting the gap requires lighting changes on
+    that timescale — room control, already residual.
+- **An attacker who can darken the victim's room physically** faces the full
+  dark stack (FLIR + physics + 0.60) — same posture as before, tighter bar.
 - **Life-size print (vinyl banner species):** unchanged posture — FLIR PAD
   (measured catching it at p_fake 0.99+), IR physics, per-user floor. The
   0.650 banner score clears 0.60; the threshold was never this species'
@@ -107,6 +123,10 @@ PAD stack.
   IR-only fallback: retry, then password. Disclosed trade.
 - The scene gate constant is shared with the capture-contention logic
   (`CONCLUSIVE_SCENE_BRIGHTNESS`); both semantics are "conclusively lit",
-  and the coupling is pinned by a unit test.
+  and the coupling is pinned by a unit test. Lit-room verification
+  (frame_mean_probe, 2026-08-22, current ambient): ASUS 128.2-129.2,
+  NexiGo 138.3-138.4, Brio 125.4-128.2 — three sensors clear the boundary
+  in lit rooms. The DARK-room side (<100) per host, and thinkpad entirely,
+  are part of the user-present measurement before release.
 - This PR touches the same dark-path block as PR #518's pairing-budget
   change; whichever merges second rebases.

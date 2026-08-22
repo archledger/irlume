@@ -2169,7 +2169,13 @@ pub fn models_list(args: &[String]) -> ExitCode {
 }
 
 fn models_list_data() -> Value {
-    let stages = crate::models::stage_statuses()
+    // The SHIPPED pipeline stages and where each model file resolved. The
+    // third-party tier is gone with the BYOM lane (ADR-0015), but this is a
+    // CONTRACT-1 shape: `open` stays (false on every stage, which is now
+    // simply true — no stage accepts third-party models), the PAD row stays
+    // with its built-in candidate, and `third_party` objects are absent
+    // exactly as the schema requires for closed stages.
+    let mut stages: Vec<Value> = crate::models::stage_statuses()
         .into_iter()
         .map(|s| {
             let candidate = match (s.file, &s.resolved) {
@@ -2186,62 +2192,21 @@ fn models_list_data() -> Value {
                     "observed": false,
                 }),
             };
-            let mut stage = json!({
+            json!({
                 "stage": s.stage,
-                "open": s.open,
+                "open": false,
                 "required": s.required,
                 "candidate": candidate,
-            });
-            if s.open {
-                stage["third_party"] = third_party_data(s.stage_kind);
-            }
-            stage
-        })
-        .collect::<Vec<_>>();
-    json!({ "stages": stages })
-}
-
-/// The third-party tier of the one open stage: what is enabled, and the
-/// catalog with weight states.
-///
-/// `enabled.known` is honest about observability, like `login_manager.known`,
-/// and it is keyed on WHAT THE READ ESTABLISHED, not on who asked. A missing
-/// file or key is genuine observed absence (the config directory is world-
-/// readable), so `known: true, name: null` — from any caller. A read that
-/// FAILED (EACCES on the root-only file for an unprivileged caller, a wrong
-/// SELinux label even for root) established nothing, so `known: false`; a
-/// consumer must not render that as "disabled".
-fn third_party_data(stage: irlume_common::thirdparty::Stage) -> Value {
-    use irlume_common::config::KvObservation;
-    use irlume_common::thirdparty::{self, WeightState};
-    // THIS stage's key and THIS stage's catalog entries: with two stages
-    // open, the pad object naming a recognizer (or listing its entries)
-    // would make "what is enabled where" unanswerable from the payload.
-    let enabled = match irlume_common::config::observe_kv(
-        "settings.conf",
-        thirdparty::settings_key_for(stage),
-    ) {
-        KvObservation::Value(name) => json!({ "known": true, "name": name }),
-        KvObservation::Absent => json!({ "known": true, "name": null }),
-        KvObservation::Unknown(_) => json!({ "known": false }),
-    };
-    let catalog = thirdparty::CATALOG
-        .iter()
-        .filter(|m| m.stage == stage)
-        .map(|m| {
-            json!({
-                "name": m.name,
-                "stage": m.stage.as_str(),
-                "tier": if m.url.is_some() { "fetched" } else { "user-supplied" },
-                "weights": match thirdparty::weight_state(m) {
-                    WeightState::ChecksumOk => "checksum-ok",
-                    WeightState::ChecksumMismatch => "checksum-mismatch",
-                    WeightState::Absent => "absent",
-                },
             })
         })
-        .collect::<Vec<_>>();
-    json!({ "enabled": enabled, "catalog": catalog })
+        .collect();
+    stages.push(json!({
+        "stage": "pad",
+        "open": false,
+        "required": false,
+        "candidate": { "origin": "built-in" },
+    }));
+    json!({ "stages": stages })
 }
 
 fn profiles_data(profiles: Vec<ProfileSummary>, _require_eyes_open: bool) -> Value {
@@ -2549,27 +2514,13 @@ mod tests {
     }
 
     #[test]
-    fn models_list_reports_every_stage_and_only_open_stages_carry_third_party() {
-        // Sandboxed state dir so the weight states are this test's, not the
-        // machine's. The config dir is NOT sandboxed here; `enabled.known`
-        // honesty under an unreadable config is asserted separately below.
-        let _guard = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let state = std::env::temp_dir().join(format!("irlume-mls-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).unwrap();
-        let old_state = std::env::var_os("IRLUME_STATE_DIR");
-        std::env::set_var("IRLUME_STATE_DIR", &state);
-
+    fn models_list_reports_the_shipped_stages() {
+        // Contract 1 keeps its shape after the BYOM removal (ADR-0015): the
+        // four stages remain, `open` is present and false everywhere (no
+        // stage accepts third-party models anymore), and no stage carries a
+        // third_party object — exactly what the schema requires of closed
+        // stages.
         let data = models_list_data();
-
-        match old_state {
-            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
-            None => std::env::remove_var("IRLUME_STATE_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&state);
-
         let stages = data["stages"].as_array().expect("stages array");
         let names: Vec<&str> = stages
             .iter()
@@ -2577,111 +2528,17 @@ mod tests {
             .collect();
         assert_eq!(names, ["detection", "landmarks", "recognition", "pad"]);
         for s in stages {
-            let open = s["open"].as_bool().expect("open flag");
-            // third_party appears exactly on open stages: a consumer keys the
-            // tier UI off its presence, so a closed stage carrying one (or an
-            // open stage missing one) is a contract break, not a nicety.
-            assert_eq!(
-                s.get("third_party").is_some(),
-                open,
-                "stage {}: third_party must accompany open exactly",
+            assert_eq!(s["open"], false, "stage {}: no stage is open", s["stage"]);
+            assert!(
+                s.get("third_party").is_none(),
+                "stage {}: closed stages carry no third_party",
                 s["stage"]
             );
-            match s["stage"].as_str().unwrap() {
-                "detection" | "recognition" => assert_eq!(s["required"], true),
-                "landmarks" | "pad" => assert_eq!(s["required"], false),
-                other => panic!("unexpected stage {other}"),
-            }
+            assert!(s["candidate"].get("file").is_some() || s["candidate"]["origin"] == "built-in");
         }
-        let pad = &stages[3];
-        assert_eq!(pad["candidate"]["origin"], "built-in");
-        // Sandboxed empty state dir: no weights anywhere.
-        for entry in pad["third_party"]["catalog"].as_array().unwrap() {
-            assert_eq!(entry["weights"], "absent");
-            assert!(matches!(
-                entry["tier"].as_str().unwrap(),
-                "fetched" | "user-supplied"
-            ));
-        }
-        // Each open stage's third_party lists ONLY its own entries: pad's
-        // object naming a recognizer would make "what is enabled where"
-        // unanswerable from the payload.
-        let names = |st: &serde_json::Value| {
-            st["third_party"]["catalog"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|e| e["stage"].as_str().unwrap().to_string())
-                .collect::<Vec<_>>()
-        };
-        assert!(names(pad).iter().all(|s| s == "pad"));
-        let recognition = &stages[2];
-        let rec_names = names(recognition);
-        assert!(!rec_names.is_empty() && rec_names.iter().all(|s| s == "recognition"));
+        assert_eq!(stages[0]["required"], true);
+        assert_eq!(stages[3]["candidate"]["origin"], "built-in");
     }
-
-    #[test]
-    fn models_list_enabled_state_is_honest_about_observability() {
-        // `enabled.known` is keyed on what the READ established, not on who
-        // asked: a missing file is observed absence (known:true, name:null), a
-        // readable key names the model, and a read that FAILS establishes
-        // nothing (known:false, which a consumer must not render as
-        // "disabled"). The failure case is produced deterministically by
-        // pointing the config dir at a regular file, so opening
-        // `<file>/settings.conf` fails with ENOTDIR for root and non-root
-        // alike — the review's counterexample was a root-side SELinux denial
-        // being reported as authoritative absence.
-        let _guard = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("irlume-mle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_file(&root);
-        let cfg = root.join("cfg");
-        std::fs::create_dir_all(&cfg).unwrap();
-        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
-        std::env::set_var("IRLUME_CONFIG_DIR", &cfg);
-
-        // No settings.conf at all: observed absence.
-        let absent = third_party_data(irlume_common::thirdparty::Stage::Pad);
-        // A readable enabled key — and the OTHER stage's key alongside it, so
-        // the per-stage read is proven to consult its own key, not the pad one.
-        std::fs::write(
-            cfg.join("settings.conf"),
-            "third_party_pad=flir\nthird_party_recognizer=buffalo\n",
-        )
-        .unwrap();
-        let named = third_party_data(irlume_common::thirdparty::Stage::Pad);
-        let named_rec = third_party_data(irlume_common::thirdparty::Stage::Recognition);
-        // A failing read: the config dir is a regular file.
-        let notdir = root.join("not-a-dir");
-        std::fs::write(&notdir, b"not a directory").unwrap();
-        std::env::set_var("IRLUME_CONFIG_DIR", &notdir);
-        let unreadable = third_party_data(irlume_common::thirdparty::Stage::Pad);
-
-        match old_cfg {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert_eq!(absent["enabled"], json!({"known": true, "name": null}));
-        assert_eq!(named["enabled"], json!({"known": true, "name": "flir"}));
-        assert_eq!(
-            named_rec["enabled"],
-            json!({"known": true, "name": "buffalo"}),
-            "the recognition stage must read its own key"
-        );
-        assert_eq!(
-            unreadable["enabled"],
-            json!({"known": false}),
-            "a failed read must never be reported as observed absence"
-        );
-    }
-
-    /// Collect the events a closure emits, by capturing what the stream would
-    /// serialize. The emitter writes to stdout, so these exercise the envelope
-    /// and the sequencing rules against the same `Event` the command sends.
     fn event_value(
         stream: &EventStream,
         sequence: u64,

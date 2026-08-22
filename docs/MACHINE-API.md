@@ -229,7 +229,6 @@ reused for a different meaning. The registry as of this contract:
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
-| `third-party-pad-model` | optional third-party presentation-attack weights, if installed |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
 | `recovery-passphrase` | whether a recovery passphrase is set |
@@ -388,23 +387,13 @@ authoritative loaded-model report can only ever come from the daemon itself.
 `observed: true` with `readable: false` (a directory at the path, an
 unreadable file) means the daemon's load of that same candidate would fail.
 
-Each stage also reports whether the daemon requires the file to start and
-whether the stage is open to third-party models. Stages open one at a time
-because their failure modes differ; PAD and recognition are the open ones
-today, and each open stage carries a `third_party` object with the enabled
-entry and its own measured catalog, including each entry's tier (`fetched` by
-irlume, or `user-supplied` when the license makes obtaining the file the
-user's business) and the weight file's state against its pin.
+Each stage also reports whether the daemon requires the file to start, and
+`open`, which is `false` on every stage since third-party model support was
+removed (ADR-0015): irlume ships and supports exactly the models-v1 set. A
+closed stage never carries a `third_party` object.
 
 The command needs no daemon, so it still answers when the daemon will not
 start.
-
-`third_party.enabled.known` is keyed on what the read established, not on who
-asked. Observed absence (no config file or key; the config directory is
-world-readable) is `known: true, name: null` from any caller. A read that
-failed (the root-only file denied to an unprivileged caller, or a wrong
-SELinux label denying even root) established nothing and is `known: false`,
-which a consumer must not render as disabled.
 
 ### Error codes
 

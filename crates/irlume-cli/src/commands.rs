@@ -1935,61 +1935,8 @@ pub fn setup(args: &[String]) -> ExitCode {
     // attack, so the user should have to decline it rather than discover it.
     // The license and provenance are shown either way; irlume does not warrant
     // these weights and says so before fetching them (ADR-0001).
-    println!("\n[3/7] Anti-spoof model (recommended)");
-    match pad_model_offer() {
-        PadOffer::AlreadyEnabled(name) => println!("  '{name}' already enabled {OK}"),
-        PadOffer::NoCatalog => println!("  no third-party model in the catalog; skipping"),
-        PadOffer::ConfiguredButBroken(name, why) => {
-            println!("  '{name}' is configured but the daemon will not load it ({why}),");
-            println!("  so this machine has NO trained print defence right now.");
-            // The repair differs by tier: irlume can re-fetch one it fetches,
-            // and can only ask for the file again for one it does not.
-            match irlume_common::thirdparty::by_name(&name).and_then(|m| m.url) {
-                Some(_) => println!("  repair with: sudo irlume models enable {name}"),
-                None => println!(
-                    "  repair with: sudo irlume models add {name} <path>  \
-                     (docs/THIRD-PARTY-MODELS.md)"
-                ),
-            }
-        }
-        PadOffer::Offer(m) => {
-            println!("  A printed photograph of your face passes irlume's built-in liveness");
-            println!(
-                "  gate. The '{}' model denied that attack in every measured attempt",
-                m.name
-            );
-            println!("  (docs/pad-results/); it is deny-only and can never approve a face");
-            println!("  the built-in gate rejected.");
-            println!();
-            println!("  license:    {}", m.license);
-            println!("  provenance: {}", m.provenance);
-            println!("  irlume does not distribute these weights; they download from the");
-            println!("  publisher's origin and complying with the license is on you.");
-            println!();
-            if !crate::is_root() {
-                println!(
-                    "  needs root to install; run: sudo irlume models enable {}",
-                    m.name
-                );
-            } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                // `yes_no` returns its default WITHOUT asking when stdin is not
-                // a terminal, so a default-yes question would fetch third-party
-                // weights under `setup </dev/null` with nobody having seen it.
-                // A default may only apply to someone who was actually asked.
-                println!("  not downloading without an interactive confirmation.");
-                println!("  enable later with: sudo irlume models enable {}", m.name);
-            } else if yes_no("  Download and enable it?", /* default_yes: */ true) {
-                if crate::models::fetch_and_enable(m) != ExitCode::SUCCESS {
-                    println!("  the model was NOT enabled; a printed photo will pass the gate.");
-                }
-            } else {
-                println!("  skipped; a printed photo will pass the built-in gate.");
-                println!("  enable later with: sudo irlume models enable {}", m.name);
-            }
-        }
-    }
-
-    // 4. Keyring arm.
+    // Anti-spoof coverage is shipped and default-on since ADR-0013 (ViT RGB
+    // PAD + FLIR IR PAD in models-v1), so the old opt-in offer step is gone.
     println!("\n[4/7] Keyring unlock (face login opens your wallet)");
     if yes_no(
         "  Arm keyring unlock now (you'll enter your login password)?",
@@ -2092,52 +2039,6 @@ fn run_enroll(user: &str, reset: bool) {
 /// Minimal y/N prompt (default applied on empty input or a non-tty).
 /// What `setup` should do about the third-party PAD cue on this machine.
 ///
-/// A value rather than a branch so the decision is testable: setup itself
-/// needs root, a daemon and a camera, and this is the part with cases.
-enum PadOffer {
-    /// One is already enabled; say so and change nothing.
-    AlreadyEnabled(String),
-    /// The catalog is empty, so there is nothing to offer.
-    NoCatalog,
-    /// `settings.conf` names a model the daemon will NOT load, so the machine
-    /// has no cue despite appearing configured. Carries the reason.
-    ConfiguredButBroken(String, String),
-    /// Offer this model.
-    Offer(&'static irlume_common::thirdparty::ThirdPartyModel),
-}
-
-fn pad_model_offer() -> PadOffer {
-    // A configured NAME is not an enabled CUE. The daemon refuses an unknown
-    // catalog name, missing weights, and weights whose sha256 stopped
-    // matching, and in each case authentication runs without the cue.
-    // Reporting the config key as "already enabled" would tell a user they
-    // have a print defence they do not have, which is worse than knowing they
-    // have none (#274 review). Re-check what the daemon checks.
-    if let Some(name) = crate::models::enabled_name() {
-        let Some(m) = irlume_common::thirdparty::by_name(&name) else {
-            return PadOffer::ConfiguredButBroken(name, "not in the catalog".into());
-        };
-        return match std::fs::read(irlume_common::thirdparty::model_path(m)) {
-            Err(e) => PadOffer::ConfiguredButBroken(name, format!("weights unreadable: {e}")),
-            Ok(b) if irlume_common::thirdparty::sha256_hex(&b) != m.sha256 => {
-                PadOffer::ConfiguredButBroken(name, "checksum mismatch".into())
-            }
-            Ok(_) => PadOffer::AlreadyEnabled(name),
-        };
-    }
-    // Only a FETCHABLE model can be offered here: setup cannot obtain one whose
-    // licence makes acquiring it the user's decision, and a step that asks a
-    // question it cannot act on is worse than no step. Those are documented in
-    // docs/THIRD-PARTY-MODELS.md and installed with `models add`.
-    match irlume_common::thirdparty::CATALOG
-        .iter()
-        .find(|m| m.url.is_some())
-    {
-        Some(m) => PadOffer::Offer(m),
-        None => PadOffer::NoCatalog,
-    }
-}
-
 fn yes_no(q: &str, default_yes: bool) -> bool {
     use std::io::{IsTerminal, Write};
     // No terminal takes the documented default. That is deliberate and covered
@@ -2582,79 +2483,6 @@ mod origin_tests {
         assert!(
             !src.contains(&pacman_u),
             "no pacman local-file install of a downloaded asset"
-        );
-    }
-}
-
-#[cfg(test)]
-mod setup_offer_tests {
-    use super::{pad_model_offer, PadOffer};
-
-    #[test]
-    fn the_offer_never_claims_a_defence_the_daemon_would_not_load() {
-        // Deterministic regardless of this machine's settings.conf: the
-        // catalog must be non-empty (setup offers CATALOG.first(), so an empty
-        // one makes the step dead code), and whatever the ambient state, the
-        // INVARIANT must hold: AlreadyEnabled may only be reported when the
-        // weights really are present and match their pin, because the daemon
-        // silently runs without the cue otherwise (#274 review).
-        assert!(
-            irlume_common::thirdparty::CATALOG
-                .iter()
-                .any(|m| m.url.is_some()),
-            "setup offers the first FETCHABLE entry; with none the step is dead"
-        );
-        let first = irlume_common::thirdparty::CATALOG
-            .iter()
-            .find(|m| m.url.is_some())
-            .unwrap();
-        // Everything the step prints before asking for consent must exist, or
-        // the user accepts a license and provenance the screen never showed.
-        assert!(!first.name.is_empty());
-        assert!(!first.license.is_empty(), "the offer prints the license");
-        assert!(
-            !first.provenance.is_empty(),
-            "the offer prints the provenance"
-        );
-
-        match pad_model_offer() {
-            PadOffer::NoCatalog => panic!("a fetchable entry exists but the offer said otherwise"),
-            PadOffer::Offer(m) => assert_eq!(m.name, first.name),
-            PadOffer::ConfiguredButBroken(_, why) => {
-                assert!(!why.is_empty(), "a broken state must say why");
-            }
-            PadOffer::AlreadyEnabled(name) => {
-                // The claim is auditable: re-verify it the way the daemon does.
-                let m = irlume_common::thirdparty::by_name(&name)
-                    .expect("AlreadyEnabled must name a catalog entry");
-                let bytes = std::fs::read(irlume_common::thirdparty::model_path(m))
-                    .expect("AlreadyEnabled must have readable weights");
-                assert_eq!(
-                    irlume_common::thirdparty::sha256_hex(&bytes),
-                    m.sha256,
-                    "AlreadyEnabled must mean the pin still matches"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_broken_configuration_is_not_reported_as_enabled() {
-        // The discriminating case, built directly: a configured name the
-        // catalog does not know can only be ConfiguredButBroken. Before the
-        // fix this shape returned AlreadyEnabled and setup told the user they
-        // were protected.
-        let broken = PadOffer::ConfiguredButBroken("ghost".into(), "not in the catalog".into());
-        match broken {
-            PadOffer::ConfiguredButBroken(n, w) => {
-                assert_eq!(n, "ghost");
-                assert!(w.contains("catalog"));
-            }
-            _ => panic!("constructed the wrong variant"),
-        }
-        assert!(
-            irlume_common::thirdparty::by_name("ghost").is_none(),
-            "the fixture name must be absent from the catalog for this to discriminate"
         );
     }
 }

@@ -5,6 +5,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Removed
+
+- **Third-party / bring-your-own model support (ADR-0015).** The opt-in model
+  catalog, the `irlume models enable/disable/add` flow, third-party PAD /
+  recognizer / rescue-detector engine wiring, the TUI's third-party
+  Settings section, and the `third_party_*` Health fields are gone: irlume
+  ships and supports exactly the models-v1 set it was validated with.
+  Legacy `settings.conf` selections are ignored with a startup notice
+  (an enrollment made under an external recognizer stays quarantined by its
+  embedding-space tag; re-enroll to restore face auth, password fallback
+  applies until then). `profiles forget-model` still accepts `shipped` and
+  literal `embed:<64-hex>` spaces for cleaning legacy scans; the machine
+  API's `models.list` keeps its contract-1 shape with every stage closed.
+
 ### Added
 
 - **Two PAD models ship default-on (ADR-0013).** The Adedev-W ViT RGB

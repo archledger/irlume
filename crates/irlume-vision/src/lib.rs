@@ -1504,7 +1504,7 @@ mod onnx {
         }
     }
 
-    /// Third-party PAD classifier (opt-in; see `irlume_common::thirdparty`).
+    /// IR PAD classifier (the SHIPPED FLIR liveness model, ADR-0013).
     /// Built for the DAMO FLIR IR liveness model: 112x112x3, (px-127.5)/128,
     /// NCHW, two output LOGITS where softmax index 0 is P(fake). Preprocessing
     /// replicates ModelScope's `FaceLivenessIrPipeline.align_face_padding`

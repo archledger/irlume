@@ -35,7 +35,7 @@ Conventions that apply everywhere:
 | `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded) |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
-| `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user; the deliberate counterpart to `models disable`, which deletes weights but keeps templates. `<model>` is `shipped`, a catalog name, or an `embed:<sha256>` tag as `profiles list` prints it. A profile left with no scans is deleted with them |
+| `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user. `<model>` is `shipped` or an `embed:<sha256>` tag as `profiles list` prints it (used to clean scans left by the removed third-party lane, ADR-0015). A profile left with no scans is deleted with them |
 | `irlume profiles eyes-open off` | one-release migration command: clear a stored legacy eyes-open blocker. It cannot be turned on |
 | `irlume identify` | 1:N "who is this?"; as root it checks all users, otherwise scoped to you |
 
@@ -67,9 +67,7 @@ Conventions that apply everywhere:
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume camera-tune [--rounds N]` | yes | qualify the daemon's exact RGB+IR pair, accepted stream contracts, USB connection, delivered rates, continuity, illumination provenance, and concurrent signal retention. The versioned record selects concurrent only for that exact context; missing or changed evidence stays sequential. A successful explicit tune also clears this daemon generation's runtime degradation breaker |
 | `irlume camera-mode` | no | ask the daemon which schedule is active for its exact open pair. Reports qualified concurrent, measured sequential and its reason, no authority, changed/unreadable context, an environment override, or generation-scoped runtime degradation and its cause. It also prints the exact requested/accepted stream and USB context used by v2. RGB-only hosts report `no_ir_pair` without trying to open IR. The CLI does not read legacy `capture_mode.*` entries from `cameras.conf` or open cameras itself |
-| `irlume models [list]` | no | show the opt-in third-party models (stage, tier, checksum state); `models list --json` is the [machine API](MACHINE-API.md) per-stage report |
-| `irlume models enable <name>` / `models disable [name]` | yes | fetch and enable one (checksum-pinned; a PAD entry is a deny-only cue, a recognition entry replaces the RGB matcher at its measured threshold), or turn one off; a bare `disable` errors when more than one model is enabled |
-| `irlume models add <name> <path>` | yes | enable a model whose licence means you obtain the file; verified against the pin irlume measured ([THIRD-PARTY-MODELS.md](THIRD-PARTY-MODELS.md)) |
+| `irlume models …` | — | removed (ADR-0015): third-party/bring-your-own model support is gone; irlume ships its full model set and the command answers with a notice. Check installed weights with `irlume doctor` |
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, wipe enrolled data unless `--keep-data`, then print the package-removal command |
 

@@ -58,17 +58,6 @@ pub struct Engine {
     /// value (#276), because a threshold is a property of one model's cosine
     /// scale and applying another model's number to it is a guess.
     rgb_threshold: f32,
-    /// Name of the loaded third-party recognizer (None = shipped). Display
-    /// and Health reporting only; the POLICY lives in rgb_threshold and
-    /// ir_matching.
-    thirdparty_recognizer: Option<String>,
-    /// Whether IR matching (fusion, IR fallback, calibrated centroid, dark
-    /// IR-only auth) may run. False under a third-party recognizer: the IR
-    /// thresholds and the fusion Platt calibration are measurements of the
-    /// SHIPPED model's cosine scale, and no catalog entry carries IR-side
-    /// measurements yet. RGB-only matching stays; the dark path refuses with
-    /// its own reason and falls back to the password.
-    ir_matching: bool,
     /// Optional MediaPipe FaceMesh: dense landmarks used to refine a BlazeFace
     /// rescue box into alignment points. Loaded iff the model file is present.
     mesh: Option<irlume_vision::FaceMesh>,
@@ -77,11 +66,6 @@ pub struct Engine {
     /// vs YuNet's 76.9% on the sunlight walking bursts). Needs `mesh` to
     /// refine its coarse box into alignment landmarks.
     blaze: Option<Rescue>,
-    /// Optional third-party PAD cue (opt-in via `irlume models`, catalog in
-    /// `irlume_common::thirdparty`): (classifier, threshold, catalog name).
-    /// Consulted DENY-ONLY on the lit IR strobe frame; it may downgrade a
-    /// Live verdict to Spoof, never the reverse (see `thirdparty_downgrades`).
-    tp_pad: Option<(irlume_vision::PadIr, f32, String)>,
     /// Shipped ViT RGB PAD cue (`liveness_vit.onnx`, ADR-0013, default-on
     /// with the daemon's kill switch): scores the RGB face chip whenever the
     /// gate verdicted Live and downgrades to Spoof when the rolling median of
@@ -124,30 +108,18 @@ pub struct Engine {
 }
 
 /// The rescue-slot detector (cascade stage 2): the shipped short-range
-/// BlazeFace on ONNX, or an enabled third-party full-range BlazeFace running
-/// its published .tflite unconverted on the bundled TFLite runtime (#295).
-/// One slot, one enum: a second Option field would be the two-sources-of-
-/// truth shape behind #281 and #285. The full-range variant carries its
-/// catalog entry's measured threshold rather than the shipped constant,
-/// because an operating point travels with the artifact it was measured on.
-enum Rescue {
-    ShortRange(irlume_vision::BlazeRescue),
-    FullRange {
-        det: irlume_vision::blaze_full::FullRangeBlaze,
-        threshold: f32,
-        name: String,
-    },
-}
+/// BlazeFace on ONNX. The third-party full-range variant was removed with the
+/// BYOM lane (ADR-0015); the type stays a newtype rather than collapsing to
+/// the bare BlazeRescue so the cascade-stage vocabulary and its one-slot
+/// invariant keep their name.
+struct Rescue(irlume_vision::BlazeRescue);
 
 impl Rescue {
     fn detect_top(
         &mut self,
         view: &align::RgbView<'_>,
     ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
-        match self {
-            Rescue::ShortRange(b) => b.detect_top(view),
-            Rescue::FullRange { det, threshold, .. } => det.detect_top_at(view, *threshold),
-        }
+        self.0.detect_top(view)
     }
 }
 
@@ -184,13 +156,9 @@ pub struct Assessment {
     /// statistic `CONCLUSIVE_SCENE_BRIGHTNESS` and `CONCURRENT_SIGNAL_FLOOR` were
     /// measured against (#389).
     pub rgb_frame_mean: f32,
-    /// P(fake) from the opt-in third-party PAD cue, when one is loaded and an
-    /// IR face was present. Deny-only: consulted by both the cross-spectrum
-    /// verdict (in `assess_full`) and the dark path.
-    pub thirdparty_fake: Option<f32>,
     /// P(fake) from the SHIPPED IR PAD cue (ADR-0013, `flir.onnx`), when
-    /// loaded and an IR face was present. Deny-only, same consult sites as
-    /// `thirdparty_fake`.
+    /// loaded and an IR face was present. Deny-only: consulted by both the
+    /// cross-spectrum verdict (in `assess_full`) and the dark path.
     pub shipped_ir_fake: Option<f32>,
 }
 
@@ -941,19 +909,8 @@ fn ir_match_in(
 /// clears the threshold. A non-Live verdict is never touched, and an absent
 /// score never fires, so the cue cannot rescue an attack or mask a gate
 /// rejection; enabling it can only tighten.
-pub fn thirdparty_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f32) -> bool {
+pub fn pad_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f32) -> bool {
     verdict == Verdict::Live && p_fake.is_some_and(|p| p >= threshold)
-}
-
-/// True when the cue scored in the band where neither genuine faces nor attacks
-/// were measured: above the highest genuine reading, below the deny threshold.
-///
-/// Nothing acts on this. It exists so an out-of-domain score is visible in the
-/// log instead of silently doing nothing, because the frequency of these is what
-/// says whether the cue still suits the hardware it is running on.
-pub fn thirdparty_abstains(p_fake: Option<f32>, threshold: f32) -> bool {
-    p_fake
-        .is_some_and(|p| p >= irlume_common::thirdparty::MEASURED_GENUINE_CEILING && p < threshold)
 }
 
 /// The shipped ViT PAD 5-frame-median vote (ADR-0013). Pure decision core of
@@ -2539,11 +2496,8 @@ impl Engine {
             ir_space: "raw".into(),
             embed_space,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
-            thirdparty_recognizer: None,
-            ir_matching: true,
             mesh: None,
             blaze: None,
-            tp_pad: None,
             vit_pad: None,
             vit_scores: Vec::new(),
             pad_ir: None,
@@ -2681,7 +2635,7 @@ impl Engine {
             // enrollments carry in `ir_space`; changing it would orphan them.
             let bytes = std::fs::read(path)
                 .map_err(|e| irlume_common::Error::Io(format!("{path}: {e}")))?;
-            let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+            let digest = irlume_common::sha256_hex(&bytes);
             self.ir_adapter = Some(Adapter::load_from_memory(&bytes)?);
             self.ir_space = format!("adapter:{}", &digest[..12]);
         }
@@ -2700,27 +2654,6 @@ impl Engine {
     /// The recognizer embedding space this engine produces and matches in.
     pub fn embed_space(&self) -> &str {
         &self.embed_space
-    }
-
-    /// Configure this engine for a THIRD-PARTY recognizer (#276 stage 4): the
-    /// entry's measured RGB threshold replaces the shipped constant, and IR
-    /// matching is disabled wholesale — fusion, IR fallback, the calibrated
-    /// centroid, and dark IR-only auth are all measurements of the shipped
-    /// model's cosine scale (thresholds and Platt calibration alike), and no
-    /// catalog entry carries IR-side measurements. The liveness gate is
-    /// unaffected: it reads pixels, not embeddings. Dark logins refuse with
-    /// their own reason and fall back to the password.
-    pub fn with_thirdparty_recognizer(mut self, rgb_threshold: f32, name: &str) -> Self {
-        self.rgb_threshold = rgb_threshold;
-        self.ir_matching = false;
-        self.thirdparty_recognizer = Some(name.to_string());
-        self
-    }
-
-    /// Name of the loaded third-party recognizer, if any; the daemon publishes
-    /// this in Health so an unprivileged TUI sees the authoritative state.
-    pub fn thirdparty_recognizer_name(&self) -> Option<&str> {
-        self.thirdparty_recognizer.as_deref()
     }
 
     /// The RGB grant threshold for a comparison against `n_templates`
@@ -2746,12 +2679,6 @@ impl Engine {
     /// `None` (matching then behaves exactly as before the feature).
     fn refit_profile_calib(&self, prof: &mut irlume_core::storage::FaceProfile) {
         if self.ir_adapter.is_some() {
-            return;
-        }
-        // A third-party recognizer's IR matching never runs, so fitting a
-        // calibration over its embeddings would only produce an artifact that
-        // LOOKS like dark support exists.
-        if !self.ir_matching {
             return;
         }
         let dim = self.ir_dim();
@@ -2794,19 +2721,6 @@ impl Engine {
     /// Method wrapper over [`ir_match_in`], bound to the engine's space and
     /// adapter state.
     fn ir_match(&self, enr: &irlume_core::storage::Enrollment, probe: &[f32]) -> IrMatch {
-        // The choke point for the third-party-recognizer policy: with IR
-        // matching disabled, no caller — present or future — can score an IR
-        // template, because every IR grant path funnels through here. The
-        // call sites additionally check `ir_matching` where a specific
-        // refusal reason is owed to the user (the dark path).
-        if !self.ir_matching {
-            return IrMatch {
-                best: f32::NEG_INFINITY,
-                best_who: String::new(),
-                n_templates: 0,
-                centroid: None,
-            };
-        }
         ir_match_in(
             &self.ir_space,
             &self.embed_space,
@@ -2849,73 +2763,13 @@ impl Engine {
     pub fn with_blaze_rescue(mut self, path: &str) -> irlume_common::Result<Self> {
         // Shipped short-range rescue (ONNX).
         if std::path::Path::new(path).exists() {
-            self.blaze = Some(Rescue::ShortRange(
-                irlume_vision::BlazeRescue::load_from_file(path)?,
-            ));
+            self.blaze = Some(Rescue(irlume_vision::BlazeRescue::load_from_file(path)?));
         }
-        Ok(self)
-    }
-
-    /// Wire an enabled third-party FULL-RANGE detector into the rescue slot
-    /// (#295): takes the VERIFIED bytes (the daemon checked the catalog pin;
-    /// the session constructor re-checks the same buffer), the entry's
-    /// measured operating threshold, and its catalog name for reporting.
-    /// Replaces whatever rescue was loaded: one slot, one occupant.
-    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_full_range_rescue(
-        mut self,
-        bytes: &[u8],
-        threshold: f32,
-        name: &str,
-    ) -> irlume_common::Result<Self> {
-        self.blaze = Some(Rescue::FullRange {
-            det: irlume_vision::blaze_full::FullRangeBlaze::from_pinned_bytes(bytes)?,
-            threshold,
-            name: name.to_string(),
-        });
         Ok(self)
     }
 
     pub fn has_blaze_rescue(&self) -> bool {
         self.blaze.is_some()
-    }
-
-    /// The enabled third-party detector's catalog name, or None when the
-    /// rescue slot holds the shipped short-range model (or nothing).
-    pub fn thirdparty_detector_name(&self) -> Option<&str> {
-        match &self.blaze {
-            Some(Rescue::FullRange { name, .. }) => Some(name),
-            _ => None,
-        }
-    }
-
-    /// Load an opt-in third-party PAD classifier (deny-only cue on the lit IR
-    /// frame). No-op if the file is absent, so a deleted model degrades to the
-    /// built-in gate, never to a startup failure.
-    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_thirdparty_pad(
-        mut self,
-        path: &str,
-        threshold: f32,
-        name: &str,
-    ) -> irlume_common::Result<Self> {
-        if std::path::Path::new(path).exists() {
-            self.tp_pad = Some((
-                irlume_vision::PadIr::load_from_file(path)?,
-                threshold,
-                name.to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    pub fn has_thirdparty_pad(&self) -> bool {
-        self.tp_pad.is_some()
-    }
-
-    /// Catalog name of the loaded third-party PAD cue, if any.
-    pub fn thirdparty_pad_name(&self) -> Option<&str> {
-        self.tp_pad.as_ref().map(|(_, _, n)| n.as_str())
     }
 
     /// Load the shipped ViT RGB PAD classifier (`liveness_vit.onnx`,
@@ -3380,8 +3234,7 @@ impl Engine {
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             ir_ambient_share: None, // RGB-only path: no IR burst to measure
-            thirdparty_fake: None,
-            shipped_ir_fake: None, // RGB-only path: no IR frame exists
+            shipped_ir_fake: None,  // RGB-only path: no IR frame exists
         })
     }
 
@@ -3981,8 +3834,7 @@ impl Engine {
                     ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     ir_ambient_share: None,
-                    thirdparty_fake: None,
-                    shipped_ir_fake: None,
+                            shipped_ir_fake: None,
                 });
             }
         };
@@ -4093,47 +3945,9 @@ impl Engine {
                 .ir_saturated_frac
                 .map(|f| format!("{:.1}%", f * 100.0))
                 .unwrap_or_else(|| "n/a".into()));
-        // Opt-in third-party PAD cue: score whenever an IR face is present (the
-        // `ir` frame is a LIT strobe phase, since #221 the brightest one that
-        // is not clipped, which is closer to the regime the cue was measured in
-        // than a blown exposure), so the dark path can consult the result too.
-        // DENY-ONLY: it can downgrade Live to Spoof and nothing else.
-        let thirdparty_fake = match (self.tp_pad.as_mut(), ir_top.as_ref()) {
-            (Some((pad, _, _)), Some(f)) => match pad.p_fake(&ir_view, &f.bbox) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    irlume_common::dlog!("thirdparty-pad: inference failed ({e}); cue skipped");
-                    None
-                }
-            },
-            _ => None,
-        };
-        let (verdict, reason) = if let Some((_, thr, name)) = self.tp_pad.as_ref() {
-            if thirdparty_abstains(thirdparty_fake, *thr) {
-                irlume_common::dlog!(
-                    "thirdparty-pad('{name}'): p_fake {:.3} is between the measured genuine \
-                     ceiling and the deny threshold {thr:.2}; abstaining",
-                    thirdparty_fake.unwrap_or(0.0)
-                );
-            }
-            if thirdparty_downgrades(verdict, thirdparty_fake, *thr) {
-                let pf = thirdparty_fake.unwrap_or(1.0);
-                irlume_common::dlog!(
-                    "thirdparty-pad('{name}'): p_fake {pf:.3} >= {thr:.2}; downgrading Live to Spoof"
-                );
-                (
-                    Verdict::Spoof,
-                    format!("third-party PAD cue '{name}' flags a spoof; use your password"),
-                )
-            } else {
-                (verdict, reason)
-            }
-        } else {
-            (verdict, reason)
-        };
-        // Shipped IR PAD cue (ADR-0013, default-on): same deny-only contract as
-        // the opt-in cue above on the same lit IR frame. Scored even when the
-        // gate did not say Live so the dark path can reuse it below.
+        // Shipped IR PAD cue (ADR-0013, default-on), deny-only on the lit IR
+        // frame. Scored even when the gate did not say Live so the dark path
+        // can reuse it below.
         let shipped_ir_fake = match (self.pad_ir.as_mut(), ir_top.as_ref()) {
             (Some(pad), Some(f)) => match pad.p_fake(&ir_view, &f.bbox) {
                 Ok(p) => Some(p),
@@ -4144,8 +3958,7 @@ impl Engine {
             },
             _ => None,
         };
-        let (verdict, reason) = if thirdparty_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD)
-        {
+        let (verdict, reason) = if pad_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD) {
             let pf = shipped_ir_fake.unwrap_or(1.0);
             irlume_common::dlog!(
                 "pad-ir: p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
@@ -4253,7 +4066,6 @@ impl Engine {
             ir_ambient_share: ir_stats
                 .ambient_observed
                 .then(|| ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0)),
-            thirdparty_fake,
             shipped_ir_fake,
         })
     }
@@ -5244,7 +5056,7 @@ impl Engine {
             // With a third-party recognizer the whole IR side is unmeasured
             // (thresholds AND the fusion Platt calibration are shipped-model
             // measurements), so a marginal RGB miss ends here: password.
-            if let Some(ir_probe) = a.ir_embedding.as_ref().filter(|_| self.ir_matching) {
+            if let Some(ir_probe) = a.ir_embedding.as_ref() {
                 let m = self.ir_match(enr, ir_probe);
                 if m.n_templates > 0 {
                     let (ir_score, ir_who) = (m.best, m.best_who.clone());
@@ -5340,18 +5152,6 @@ impl Engine {
         // Dark path: no RGB face, but an IR face -> IR-only liveness + IR
         // recognition (Windows-Hello-style dark operation) across all profiles.
         if let Some(probe) = a.ir_embedding {
-            // Fail-closed, with the real reason: dark unlock is an IR MATCH,
-            // and no third-party recognizer has a measured IR threshold. A
-            // generic "no match" here would send the user debugging their
-            // enrollment instead of reading the actual limitation.
-            if !self.ir_matching {
-                return Ok(Outcome::deny(
-                    OutcomeKind::OtherDeny,
-                    "dark unlock unavailable with a third-party recognizer (its IR \
-                     matching is unmeasured); use the password, or switch back to \
-                     the shipped recognizer",
-                ));
-            }
             let m = self.ir_match(enr, &probe);
             if m.n_templates == 0 {
                 let reason = if enr.ir_scans().is_empty() {
@@ -5422,26 +5222,10 @@ impl Engine {
                 }
             }
             // Opt-in third-party PAD cue, deny-only (scored in assess_full on
-            // the lit IR frame; the dark path re-derives its own gate verdict,
-            // so it must consult the cue explicitly too).
-            if let Some((_, thr, name)) = self.tp_pad.as_ref() {
-                if thirdparty_downgrades(verdict, a.thirdparty_fake, *thr) {
-                    let pf = a.thirdparty_fake.unwrap_or(1.0);
-                    irlume_common::dlog!(
-                        "thirdparty-pad('{name}'): dark path p_fake {pf:.3} >= {thr:.2}; denying"
-                    );
-                    return Ok(Outcome::deny(
-                        OutcomeKind::Spoof,
-                        format!(
-                            "dark liveness: third-party PAD cue '{name}' flags a spoof; use your password"
-                        ),
-                    ));
-                }
-            }
             // Shipped IR PAD cue (ADR-0013): the dark path's own consult of
             // the same lit-frame score computed in assess_full. Same
             // deny-only contract, same threshold.
-            if thirdparty_downgrades(verdict, a.shipped_ir_fake, IR_PAD_THRESHOLD) {
+            if pad_downgrades(verdict, a.shipped_ir_fake, IR_PAD_THRESHOLD) {
                 let pf = a.shipped_ir_fake.unwrap_or(1.0);
                 irlume_common::dlog!(
                     "pad-ir: dark path p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; denying"
@@ -9411,26 +9195,17 @@ mod tests {
 }
 
 #[cfg(test)]
-mod thirdparty_cue_tests {
-    use super::{thirdparty_abstains, thirdparty_downgrades};
-    use super::{vit_vote_denies, VIT_PAD_VOTE_N};
-    use irlume_common::thirdparty::{Stage, CATALOG, MEASURED_GENUINE_CEILING};
-
-    /// The PAD entries only: these invariants are about P(fake) scores, and a
-    /// recognition entry's threshold is a cosine in a different unit entirely.
-    /// Sweeping the whole catalog here silently asserted PAD semantics onto
-    /// the first recognition entry.
-    fn pad_entries() -> impl Iterator<Item = &'static irlume_common::thirdparty::ThirdPartyModel> {
-        CATALOG.iter().filter(|m| m.stage == Stage::Pad)
-    }
+mod pad_cue_tests {
+    use super::pad_downgrades;
+    use super::{vit_vote_denies, IR_PAD_THRESHOLD, VIT_PAD_VOTE_N};
     use irlume_liveness::Verdict;
 
     #[test]
     fn fires_only_on_live_plus_confident_fake() {
-        assert!(thirdparty_downgrades(Verdict::Live, Some(0.9), 0.5));
-        assert!(thirdparty_downgrades(Verdict::Live, Some(0.5), 0.5)); // at threshold
-        assert!(!thirdparty_downgrades(Verdict::Live, Some(0.49), 0.5));
-        assert!(!thirdparty_downgrades(Verdict::Live, None, 0.5));
+        assert!(pad_downgrades(Verdict::Live, Some(0.9), 0.5));
+        assert!(pad_downgrades(Verdict::Live, Some(0.5), 0.5)); // at threshold
+        assert!(!pad_downgrades(Verdict::Live, Some(0.49), 0.5));
+        assert!(!pad_downgrades(Verdict::Live, None, 0.5));
     }
 
     /// The ViT PAD vote (ADR-0013): abstains until N scores, median decides,
@@ -9507,68 +9282,31 @@ mod thirdparty_cue_tests {
     }
 
     #[test]
-    fn the_shipped_threshold_sits_above_every_score_a_genuine_face_produced() {
-        // The 2026-07-17 qualification measured genuine faces at 0.001-0.13 and
-        // the vinyl-print attack at 0.998-1.0000. A threshold inside that empty
-        // band denies on scores neither class was ever observed at, which is how
-        // a live face lost its keyring at 0.702 on 2026-07-27.
-        let mut seen = 0;
-        for m in pad_entries() {
-            seen += 1;
-            assert!(
-                m.threshold > MEASURED_GENUINE_CEILING,
-                "{}: threshold {} is at or below the measured genuine ceiling {}",
-                m.name,
-                m.threshold,
-                MEASURED_GENUINE_CEILING
-            );
-            assert!(
-                m.threshold >= 0.9,
-                "{}: threshold {} reaches into the band no attack was measured in",
-                m.name,
-                m.threshold
-            );
-        }
-        assert!(seen > 0, "no PAD entries swept; the loop proved nothing");
-    }
-
-    #[test]
-    fn the_threshold_stays_below_the_lowest_score_a_real_attack_produced() {
-        // 2026-07-27, same vinyl banner as the qualification, threshold 0.9:
-        // 6/6 flagged at 0.941, 0.956, 0.995, 0.999, 0.999, 1.000. The floor is
-        // 0.941, well under the 0.998-1.0000 medians the qualification reported,
-        // so raising this threshold for a feeling of safety would drop a real
-        // detection. The window is 0.702 (highest genuine) to 0.941.
+    fn the_shipped_ir_threshold_sits_in_the_measured_window() {
+        // The 2026-07-17 qualification measured genuine faces at 0.001-0.13
+        // (offline corpus) with one out-of-distribution genuine reading at
+        // 0.702 on 2026-07-27 (the reading that denied a real user when the
+        // threshold was 0.5), and the vinyl-print attack at 0.998-1.0000
+        // medians with a measured floor of 0.941 (2026-07-27, 6/6 flagged at
+        // 0.941-1.000). The operating window is 0.702-0.941; the threshold
+        // must stay inside it. Raising it "to be safer" crosses the attack
+        // floor and drops detections; lowering it crosses the genuine
+        // excursion and denies real faces.
+        const MEASURED_GENUINE_EXCURSION: f32 = 0.702;
         const MEASURED_ATTACK_FLOOR: f32 = 0.941;
-        let mut seen = 0;
-        for m in pad_entries() {
-            seen += 1;
-            assert!(
-                m.threshold < MEASURED_ATTACK_FLOOR,
-                "{}: threshold {} is at or above the lowest score a real attack \
-                 produced ({MEASURED_ATTACK_FLOOR}); that loses a detection",
-                m.name,
-                m.threshold
-            );
-        }
-        assert!(seen > 0, "no PAD entries swept; the loop proved nothing");
-    }
-
-    #[test]
-    fn a_score_in_the_unmeasured_band_abstains_instead_of_denying() {
-        let thr = 0.9;
-        // 0.702 is the real reading that denied a genuine user before this fix.
-        assert!(thirdparty_abstains(Some(0.702), thr));
-        assert!(!thirdparty_downgrades(Verdict::Live, Some(0.702), thr));
-        // Below the genuine ceiling is an ordinary pass, not an abstention.
-        assert!(!thirdparty_abstains(Some(0.05), thr));
-        // At and above the threshold the cue still denies: the attack species
-        // measured 0.998-1.0000, well clear of this line.
-        assert!(!thirdparty_abstains(Some(0.9), thr));
-        assert!(thirdparty_downgrades(Verdict::Live, Some(0.9), thr));
-        assert!(thirdparty_downgrades(Verdict::Live, Some(0.998), thr));
-        // No score at all is neither.
-        assert!(!thirdparty_abstains(None, thr));
+        const { assert!(IR_PAD_THRESHOLD > MEASURED_GENUINE_EXCURSION) };
+        const { assert!(IR_PAD_THRESHOLD < MEASURED_ATTACK_FLOOR) };
+        // Behavioral pin of both sides through the deny-only helper.
+        assert!(!pad_downgrades(
+            Verdict::Live,
+            Some(MEASURED_GENUINE_EXCURSION),
+            IR_PAD_THRESHOLD
+        ));
+        assert!(pad_downgrades(
+            Verdict::Live,
+            Some(MEASURED_ATTACK_FLOOR),
+            IR_PAD_THRESHOLD
+        ));
     }
 
     #[test]
@@ -9578,7 +9316,7 @@ mod thirdparty_cue_tests {
         // cue can tighten the gate, never loosen or reshape it.
         for v in [Verdict::Spoof, Verdict::Uncertain] {
             for p in [None, Some(0.0), Some(0.49), Some(0.5), Some(1.0)] {
-                assert!(!thirdparty_downgrades(v, p, 0.5));
+                assert!(!pad_downgrades(v, p, 0.5));
             }
         }
     }
@@ -9656,13 +9394,10 @@ mod engine_tests {
                 .unwrap()
                 .with_blaze_rescue("/nonexistent/blaze.onnx")
                 .unwrap()
-                .with_thirdparty_pad("/nonexistent/pad.onnx", 0.5, "absent")
+                .with_pad_ir("/nonexistent/pad.onnx")
                 .unwrap();
             assert!(
-                !e.has_ir_adapter()
-                    && !e.has_mesh()
-                    && !e.has_blaze_rescue()
-                    && !e.has_thirdparty_pad(),
+                !e.has_ir_adapter() && !e.has_mesh() && !e.has_blaze_rescue() && !e.has_pad_ir(),
                 "absent model files must leave the engine bare"
             );
             // A mesh file that EXISTS but will not load must hand the engine
@@ -9692,7 +9427,7 @@ mod engine_tests {
                 .unwrap()
                 .with_blaze_rescue(&blaze)
                 .unwrap()
-                .with_thirdparty_pad(&blaze, 0.75, "test-pad")
+                .with_pad_ir(&blaze)
                 .unwrap();
             // Shared baseline is the raw (no-adapter) space; tests needing an
             // adapter set one temporarily and restore.
@@ -9769,12 +9504,11 @@ mod engine_tests {
         assert_eq!(e.ir_dim(), irlume_vision::EMBED_DIM);
         assert_eq!(e.ir_space(), "raw");
         // Loaded optional models.
-        assert!(e.has_mesh() && e.has_blaze_rescue() && e.has_thirdparty_pad());
-        assert_eq!(e.thirdparty_pad_name(), Some("test-pad"));
+        assert!(e.has_mesh() && e.has_blaze_rescue() && e.has_pad_ir());
         // Adapter space naming: "adapter:" + first 12 hex of the file's sha256,
         // computed independently here from the same bytes.
         let bytes = std::fs::read(model_path("blaze_face_short_range.onnx")).unwrap();
-        let digest = irlume_common::thirdparty::sha256_hex(&bytes);
+        let digest = irlume_common::sha256_hex(&bytes);
         assert_eq!(s.adapter_space, format!("adapter:{}", &digest[..12]));
         // The engine loaded the shipped glintr100.onnx, so its embedding space
         // must BE the pinned legacy space: this ties Engine::load's full-digest
@@ -9936,62 +9670,6 @@ mod engine_tests {
     }
 
     #[test]
-    fn thirdparty_recognizer_policy_threshold_and_ir_shutdown() {
-        let _g = env_guard();
-        let mut s = shared();
-        // Default: the shipped constant, scaled; IR matching on.
-        assert_eq!(
-            s.engine.rgb_grant_threshold(1),
-            irlume_core::RGB_MATCH_THRESHOLD
-        );
-        assert!(s.engine.ir_matching);
-        // An IR-scanned enrollment the choke point can be proven against.
-        let mut enr = Enrollment::new("u");
-        enr.profiles.push(FaceProfile {
-            name: "p".into(),
-            ir_calib: None,
-            ir_calibs: Default::default(),
-            scans: (0..3).map(|i| scan512(i, true, Some("raw"))).collect(),
-        });
-        let probe = unit512(0);
-        assert_eq!(
-            s.engine.ir_match(&enr, &probe).n_templates,
-            3,
-            "control: IR matching must work before the policy flips"
-        );
-
-        // The third-party policy: measured threshold in, IR matching dead.
-        s.engine.rgb_threshold = 0.60;
-        s.engine.ir_matching = false;
-        assert_eq!(s.engine.rgb_grant_threshold(1), 0.60);
-        // Scaling still applies on top of the model's own base.
-        assert!(s.engine.rgb_grant_threshold(8) > 0.60);
-        // The choke point: no IR template is scored, whoever asks.
-        let m = s.engine.ir_match(&enr, &probe);
-        assert_eq!(m.n_templates, 0);
-        assert_eq!(m.best, f32::NEG_INFINITY);
-        assert!(m.centroid.is_none());
-        // And no calibration is fitted, so nothing on disk implies dark
-        // support that cannot exist for this model.
-        let mut prof = FaceProfile {
-            name: "p2".into(),
-            ir_calib: None,
-            ir_calibs: Default::default(),
-            scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
-        };
-        s.engine.refit_profile_calib(&mut prof);
-        assert!(prof.ir_calib.is_none());
-
-        // Restore the shared baseline; prove the restore took (a poisoned
-        // shared engine would fail every later test for the wrong reason).
-        s.engine.rgb_threshold = irlume_core::RGB_MATCH_THRESHOLD;
-        s.engine.ir_matching = true;
-        assert_eq!(s.engine.ir_match(&enr, &probe).n_templates, 3);
-        s.engine.refit_profile_calib(&mut prof);
-        assert!(prof.ir_calib.is_some(), "restored engine must fit again");
-    }
-
-    #[test]
     fn verified_recognizer_bytes_are_the_loaded_embedding_space() {
         // The weights loader exists so a caller's pin check, the
         // template-space digest, and the ONNX session all come from ONE
@@ -10001,7 +9679,7 @@ mod engine_tests {
         let _g = env_guard();
         let _s = shared(); // ensure ORT is initialized for this process
         let bytes = std::fs::read(model_path("glintr100.onnx")).unwrap();
-        let expected = format!("embed:{}", irlume_common::thirdparty::sha256_hex(&bytes));
+        let expected = format!("embed:{}", irlume_common::sha256_hex(&bytes));
         let weights = irlume_common::HashedModel::new(bytes);
         let engine = Engine::load_with_recognizer_weights(
             &model_path("face_detection_yunet_2023mar.onnx"),
@@ -10009,30 +9687,6 @@ mod engine_tests {
         )
         .expect("engine from bytes");
         assert_eq!(engine.embed_space(), expected);
-    }
-
-    #[test]
-    fn with_thirdparty_recognizer_sets_both_halves_of_the_policy() {
-        // The builder is the public face of the policy: one call, both
-        // effects. Split halves would let a future caller set the threshold
-        // and forget the IR shutdown.
-        let _g = env_guard();
-        let s = shared();
-        // Cheap structural check on a rebuilt engine is not possible without
-        // loading models again; assert via the builder on a clone of the
-        // shared engine's config instead: consume-and-rebuild is what the
-        // daemon does, so exercise exactly that shape.
-        drop(s);
-        let e = Engine::load(
-            &model_path("face_detection_yunet_2023mar.onnx"),
-            &model_path("glintr100.onnx"),
-        )
-        .expect("engine load")
-        .with_devices(NO_RGB, NO_IR)
-        .with_thirdparty_recognizer(0.6, "fixture-rec");
-        assert_eq!(e.rgb_grant_threshold(1), 0.6);
-        assert!(!e.ir_matching);
-        assert_eq!(e.thirdparty_recognizer_name(), Some("fixture-rec"));
     }
 
     #[test]

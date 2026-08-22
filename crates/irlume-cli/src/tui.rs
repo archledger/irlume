@@ -282,8 +282,6 @@ enum Suspend {
     /// interactive flow under sudo (license text, name typed back, y/N): that
     /// friction is the point of the models policy, so the TUI hosts it in the
     /// cooked terminal instead of bypassing it.
-    ModelsEnable(String),
-    ModelsDisable(String),
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
@@ -420,14 +418,6 @@ struct HealthInfo {
     mesh: bool,
     adapter: bool,
     version: String,
-    /// Loaded third-party PAD cue name (authoritative on/off, since
-    /// settings.conf is root-only and a non-root TUI can't read it).
-    third_party_pad: Option<String>,
-    /// Loaded third-party recognizer name, same authority argument.
-    third_party_recognizer: Option<String>,
-    /// The third-party DETECTOR the daemon has in its rescue slot (#295),
-    /// or None for the shipped short-range rescue.
-    third_party_detector: Option<String>,
     /// The daemon's real AppArmor confinement label ("irlumed (enforce)",
     /// "unconfined", ...), or None when AppArmor is off or the daemon predates
     /// the field. Authoritative: the on-disk profile can exist while the daemon
@@ -595,18 +585,13 @@ struct App {
     /// Settings-tab per-service consent-gesture selection (index into
     /// [`SETTINGS_GESTURE_SERVICES`]).
     settings_svc_sel: usize,
-    /// Cached third-party-model and Bitwarden state for the DRAW path, with the
-    /// moment they were taken.
-    ///
-    /// Both were computed per frame. `models::tui_state` reads and SHA-256s every
-    /// enabled weight file (1.3 MiB for the shipped PAD cue here), and
-    /// `bitwarden::tui_state` forks `getent` to resolve the invoking user's home,
-    /// measured at ~37ms a call and called twice in one draw of the login-wiring
-    /// tab. A redraw happens on every keypress and every tick, so the interface
-    /// was hashing megabytes and forking processes to paint two rows. The key
-    /// HANDLERS still read fresh: an action must act on the current state, and it
-    /// runs once per press rather than once per frame.
-    heavy: (crate::models::TuiState, Option<crate::bitwarden::TuiState>),
+    /// Cached Bitwarden state for the DRAW path, with the moment it was
+    /// taken: `bitwarden::tui_state` forks `getent` to resolve the invoking
+    /// user's home, measured at ~37ms a call and called twice in one draw of
+    /// the login-wiring tab, while a redraw happens on every keypress and
+    /// tick. The key HANDLERS still read fresh: an action must act on the
+    /// current state, and it runs once per press rather than once per frame.
+    heavy: Option<crate::bitwarden::TuiState>,
     heavy_at: std::time::Instant,
     /// A prominent, dismissible error banner (e.g. "camera busy") so failures
     /// are never silently buried in the Activity log.
@@ -875,9 +860,6 @@ impl LightState {
                 mesh,
                 adapter,
                 version,
-                third_party_pad,
-                third_party_recognizer,
-                third_party_detector,
                 apparmor,
             }) => Some(HealthInfo {
                 tier,
@@ -886,9 +868,6 @@ impl LightState {
                 mesh,
                 adapter,
                 version,
-                third_party_pad,
-                third_party_recognizer,
-                third_party_detector,
                 apparmor,
             }),
             _ => None, // older daemon / daemon down → Repair falls back to local probes
@@ -1044,7 +1023,7 @@ impl App {
             repair_sel: 0,
             cam_sel: 0,
             settings_svc_sel: 0,
-            heavy: (crate::models::tui_state(), crate::bitwarden::tui_state()),
+            heavy: crate::bitwarden::tui_state(),
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
@@ -2029,49 +2008,6 @@ impl App {
         // EXITS the daemon at startup, so the gate switched this check off in
         // exactly the state it exists to explain. With the daemon down,
         // `health` is None, `loaded` is false, and the row is emitted.
-        {
-            if let crate::models::TuiState::Enabled { entries } = &self.heavy.0 {
-                use irlume_common::thirdparty::{Stage, WeightState};
-                for entry in entries {
-                    if entry.weight_state != WeightState::ChecksumMismatch {
-                        continue;
-                    }
-                    let loaded = match entry.stage {
-                        Stage::Pad => self
-                            .health
-                            .as_ref()
-                            .is_some_and(|h| h.third_party_pad.as_deref() == Some(entry.name)),
-                        Stage::Recognition => self.health.as_ref().is_some_and(|h| {
-                            h.third_party_recognizer.as_deref() == Some(entry.name)
-                        }),
-                        _ => false,
-                    };
-                    if loaded {
-                        continue;
-                    }
-                    let effect = match entry.stage {
-                        Stage::Pad => "the deny-only cue is OFF",
-                        Stage::Recognition => {
-                            "the daemon refuses to start with it selected; face auth falls back to the password"
-                        }
-                        _ => "the daemon refuses the selected model",
-                    };
-                    v.push(mk(
-                        "Third-party model",
-                        Sev::Fail,
-                        format!(
-                            "'{}' ({} stage) weights fail their checksum; {effect}",
-                            entry.name,
-                            entry.stage.as_str()
-                        ),
-                        Fix::Manual(format!(
-                            "run `sudo irlume models disable {0}`, then re-enable {0}",
-                            entry.name
-                        )),
-                    ));
-                }
-            }
-        }
 
         if let Some(r) = self.recovery {
             if r.encrypted && !r.recovery_set {
@@ -2372,7 +2308,7 @@ impl App {
     /// immediately after any step that can change it, so a model the user just
     /// enabled does not sit invisible for up to the TTL.
     fn refresh_heavy(&mut self) {
-        self.heavy = (crate::models::tui_state(), crate::bitwarden::tui_state());
+        self.heavy = crate::bitwarden::tui_state();
         self.heavy_at = std::time::Instant::now();
     }
 
@@ -2894,14 +2830,6 @@ impl App {
             Suspend::FingerprintReset => self.sudo_step(
                 "delete ALL enrolled fingerprints",
                 &["irlume", "fingerprint", "reset", "--user", &target],
-            ),
-            Suspend::ModelsEnable(name) => self.sudo_step(
-                "enable a third-party model (license confirm follows)",
-                &["irlume", "models", "enable", &name],
-            ),
-            Suspend::ModelsDisable(name) => self.sudo_step(
-                "disable the third-party model",
-                &["irlume", "models", "disable", &name],
             ),
             Suspend::Update => {
                 crate::commands::update(&none);
@@ -3698,71 +3626,6 @@ impl App {
                              (nod to approve; shake to decline) before keyring release",
                         );
                         self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
-                    }
-                }
-            }
-            // Third-party PAD model toggle. settings.conf is root-only, so the
-            // readable proxy for "enabled" is installed weights (disable
-            // deletes them). Enabling runs the CLI's own license/provenance
-            // confirm in the cooked terminal: that friction is the policy,
-            // the TUI hosts it rather than bypassing it.
-            (SC_SETTINGS, KeyCode::Char('m')) => {
-                use irlume_common::thirdparty::{Stage, CATALOG};
-                // Decide from ENABLED state, not installed files: weights can
-                // be orphaned on disk with no settings key (an admitted
-                // partial state of install), and `models disable <name>`
-                // refuses names that are not enabled (#285 review).
-                match crate::models::tui_state() {
-                    crate::models::TuiState::Enabled { entries } if entries.len() == 1 => {
-                        let entry = &entries[0];
-                        self.confirm = Some((
-                            format!(
-                                "Disable third-party {} model '{}'? (its weights are deleted)",
-                                entry.stage.as_str(),
-                                entry.name
-                            ),
-                            "Disable",
-                            ConfirmAct::Sus(Suspend::ModelsDisable(entry.name.to_string())),
-                        ));
-                    }
-                    // Several enabled stages: a single toggle key must not
-                    // guess which authentication policy to remove.
-                    crate::models::TuiState::Enabled { entries } => {
-                        for entry in entries {
-                            self.log(
-                                '·',
-                                format!(
-                                    "enabled: {} ({} stage) — disable with: sudo irlume models disable {}",
-                                    entry.name,
-                                    entry.stage.as_str(),
-                                    entry.name
-                                ),
-                            );
-                        }
-                    }
-                    crate::models::TuiState::UnknownName { name } => {
-                        self.log(
-                            '·',
-                            format!("'{name}' is set in settings.conf but not in the catalog; fix it with `sudo irlume models`"),
-                        );
-                    }
-                    crate::models::TuiState::InstalledUnknown { .. } => {
-                        self.log(
-                            '·',
-                            "weights are installed but the enabled state is root-only; run `sudo irlume models` for the authoritative view",
-                        );
-                    }
-                    crate::models::TuiState::None => {
-                        // Nothing enabled: offer the PAD recommendation, the
-                        // same one doctor makes (the built-in gate does not
-                        // stop a print).
-                        match CATALOG.iter().find(|m| m.stage == Stage::Pad) {
-                            Some(m) => {
-                                self.log('→', format!("sudo irlume models enable {}: the license + provenance confirm runs in the terminal", m.name));
-                                self.suspend = Some(Suspend::ModelsEnable(m.name.to_string()));
-                            }
-                            None => self.log('·', "no third-party models in the catalog"),
-                        }
                     }
                 }
             }
@@ -4887,209 +4750,107 @@ impl App {
                 let mut v = Vec::new();
                 v.extend(self.service_gesture_lines());
                 v.extend(vec![
-                section("Head gesture before keyring release"),
-                {
-                    // Tri-state, not a bool: settings.conf is root-only, so an
-                    // unprivileged TUI genuinely cannot read this. Off is the
-                    // DEFAULT (no nod on a cold login), so it shows neutrally, not
-                    // as a warning; on is the opt-in extra step.
-                    let (icon, icon_style, label) =
-                        match irlume_common::config::credential_release_challenge_visible() {
-                            Some(true) => (
-                                "●",
-                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                "required (opt-in)".to_string(),
-                            ),
-                            Some(false) => (
-                                "○",
-                                Style::new().dim(),
-                                "off (default): the keyring releases with no nod".to_string(),
-                            ),
-                            None => (
-                                "◐",
-                                Style::new().fg(th().warn),
-                                "on/off is root-only; run the TUI with sudo to see it".to_string(),
-                            ),
-                        };
-                    Line::from(vec![
-                        Span::raw("  state  "),
-                        Span::styled(format!("{icon} "), icon_style),
-                        Span::styled(label, Style::new().dim()),
-                    ])
-                },
-                // The gesture proves INTENT, not liveness (it fired on a hand-held
-                // print 2 times in 24 on 2026-07-27), which is why it defaults OFF
-                // for the greeter cold login and logout; the IR gate stops a print.
-                // ONE line: this panel does not scroll and the per-service section
-                // above needs the room. THREAT_MODEL.md carries the numbers.
-                Line::from(Span::styled(
-                    "  Off by default (a cold login releases with no nod). On adds a nod.",
-                    Style::new().dim(),
-                )),
-                Line::from(vec![
-                    Span::styled("  [g]", Style::new().fg(th().accent)),
-                    Span::styled(" turn it on or off (sudo)", Style::new().dim()),
-                ]),
-                Line::raw(""),
-                section("Biopolicy operation-class gate"),
-                {
-                    // The shared tri-state reader, not the raw config read the
-                    // [b] direction uses: settings.conf is 0600 root-only, so
-                    // the raw read showed "off (default)" here while the Done
-                    // dashboard said "◐ root-only" for the same key. Same
-                    // truthy set and env override as the daemon.
-                    let (icon, icon_style, label) =
-                        match irlume_common::config::enforce_biopolicy_visible() {
-                            Some(true) => (
-                                "●",
-                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                "ENFORCING",
-                            ),
-                            Some(false) => ("○", Style::new().dim(), "off (default)"),
-                            None => (
-                                "◐",
-                                Style::new().fg(th().warn),
-                                "on/off is root-only; run the TUI with sudo to see it",
-                            ),
-                        };
-                    Line::from(vec![
-                        Span::raw("  state  "),
-                        Span::styled(format!("{icon} "), icon_style),
-                        Span::styled(label, Style::new().dim()),
-                    ])
-                },
-                Line::from(Span::styled(
-                    "  When on: only Login/Elevation may release the keyring; lock-screen",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  is verify-only; remote/unknown services are denied. Advanced; the",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  password is always available, so this can restrict but never lock out.",
-                    Style::new().dim(),
-                )),
-                Line::from(vec![
-                    Span::styled("  [b]", Style::new().fg(th().accent)),
-                    Span::styled(
-                        match bio {
-                            Some(true) => " turn it off (sudo)",
-                            Some(false) => " turn it on (sudo; asks first)",
-                            None => " on/off is root-only; run the TUI with sudo",
-                        },
-                        Style::new().dim(),
-                    ),
-                ]),
-                Line::raw(""),
-                section("Third-party models"),
-                {
-                    // A ●/○ status row like the sections above, not a text blob.
-                    // The daemon's loaded-cue name is authoritative (it knows
-                    // what it loaded); fall back to the filesystem probe only
-                    // when the daemon can't answer, since settings.conf is
-                    // root-only and a non-root TUI can't read the flag itself.
-                    // Every daemon-reported stage, not just PAD: a loaded
-                    // cue must not hide a loaded recognizer (#285 review).
-                    let loaded: Vec<String> = self
-                        .health
-                        .iter()
-                        .flat_map(|h| {
-                            [
-                                h.third_party_pad
-                                    .as_ref()
-                                    .map(|n| format!("{n} (pad stage, loaded)")),
-                                h.third_party_recognizer
-                                    .as_ref()
-                                    .map(|n| format!("{n} (recognition stage, loaded)")),
-                                h.third_party_detector
-                                    .as_ref()
-                                    .map(|n| format!("{n} (detection stage, loaded)")),
-                            ]
-                        })
-                        .flatten()
-                        .collect();
-                    let (icon, icon_style, label) = if !loaded.is_empty() {
-                        (
-                            "●",
-                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                            format!("enabled: {}", loaded.join(" + ")),
-                        )
-                    } else {
-                        // Nothing daemon-reported: could be a daemon too old
-                        // to report the fields OR genuinely none. We can't
-                        // tell the two apart (both deserialize to None), so
-                        // trust the filesystem probe rather than claim "off":
-                        // an older daemon with flir loaded must not read as
-                        // ○ none.
-                        match &self.heavy.0 {
-                            crate::models::TuiState::Enabled { entries } => (
-                                "●",
-                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                format!(
-                                    "enabled: {}",
-                                    entries
-                                        .iter()
-                                        .map(|e| format!(
-                                            "{} ({} stage · {})",
-                                            e.name,
-                                            e.stage.as_str(),
-                                            match e.weight_state {
-                                                irlume_common::thirdparty::WeightState::ChecksumOk => "checksum ok",
-                                                irlume_common::thirdparty::WeightState::ChecksumMismatch => "CHECKSUM MISMATCH",
-                                                irlume_common::thirdparty::WeightState::Absent => "weights missing",
-                                            }
-                                        ))
-                                        .collect::<Vec<_>>()
-                                        .join(" + ")
+                    section("Head gesture before keyring release"),
+                    {
+                        // Tri-state, not a bool: settings.conf is root-only, so an
+                        // unprivileged TUI genuinely cannot read this. Off is the
+                        // DEFAULT (no nod on a cold login), so it shows neutrally, not
+                        // as a warning; on is the opt-in extra step.
+                        let (icon, icon_style, label) =
+                            match irlume_common::config::credential_release_challenge_visible() {
+                                Some(true) => (
+                                    "●",
+                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                    "required (opt-in)".to_string(),
                                 ),
-                            ),
-                            crate::models::TuiState::UnknownName { name } => (
-                                "◐",
-                                Style::new().fg(th().warn),
-                                format!("'{name}' set in settings.conf but NOT in the catalog (daemon ignores it)"),
-                            ),
-                            crate::models::TuiState::InstalledUnknown { name } => (
-                                "◐",
-                                Style::new().fg(th().warn),
-                                format!("{name} weights installed; on/off is root-only"),
-                            ),
-                            crate::models::TuiState::None => {
-                                ("○", Style::new().dim(), "none (default)".to_string())
-                            }
-                        }
-                    };
-                    Line::from(vec![
-                        Span::raw("  state  "),
-                        Span::styled(format!("{icon} "), icon_style),
-                        Span::styled(label, Style::new().dim()),
-                    ])
-                },
-                Line::from(Span::styled(
-                    "  Opt-in, measured models by pipeline stage: PAD adds a deny-only cue,",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  recognition replaces RGB matching. Licenses + measurements:",
-                    Style::new().dim(),
-                )),
-                Line::from(Span::styled(
-                    "  irlume models list",
-                    Style::new().dim(),
-                )),
-                Line::from(vec![
-                    Span::styled("  [m]", Style::new().fg(th().accent)),
-                    Span::styled(
-                        " enable or disable one (sudo; the license confirm runs in the terminal)",
+                                Some(false) => (
+                                    "○",
+                                    Style::new().dim(),
+                                    "off (default): the keyring releases with no nod".to_string(),
+                                ),
+                                None => (
+                                    "◐",
+                                    Style::new().fg(th().warn),
+                                    "on/off is root-only; run the TUI with sudo to see it"
+                                        .to_string(),
+                                ),
+                            };
+                        Line::from(vec![
+                            Span::raw("  state  "),
+                            Span::styled(format!("{icon} "), icon_style),
+                            Span::styled(label, Style::new().dim()),
+                        ])
+                    },
+                    // The gesture proves INTENT, not liveness (it fired on a hand-held
+                    // print 2 times in 24 on 2026-07-27), which is why it defaults OFF
+                    // for the greeter cold login and logout; the IR gate stops a print.
+                    // ONE line: this panel does not scroll and the per-service section
+                    // above needs the room. THREAT_MODEL.md carries the numbers.
+                    Line::from(Span::styled(
+                        "  Off by default (a cold login releases with no nod). On adds a nod.",
                         Style::new().dim(),
-                    ),
-                ]),
-                Line::raw(""),
-                section("Match thresholds (read-only)"),
-                Line::from(Span::styled(
-                    "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",
-                    Style::new().dim(),
-                )),
+                    )),
+                    Line::from(vec![
+                        Span::styled("  [g]", Style::new().fg(th().accent)),
+                        Span::styled(" turn it on or off (sudo)", Style::new().dim()),
+                    ]),
+                    Line::raw(""),
+                    section("Biopolicy operation-class gate"),
+                    {
+                        // The shared tri-state reader, not the raw config read the
+                        // [b] direction uses: settings.conf is 0600 root-only, so
+                        // the raw read showed "off (default)" here while the Done
+                        // dashboard said "◐ root-only" for the same key. Same
+                        // truthy set and env override as the daemon.
+                        let (icon, icon_style, label) =
+                            match irlume_common::config::enforce_biopolicy_visible() {
+                                Some(true) => (
+                                    "●",
+                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                    "ENFORCING",
+                                ),
+                                Some(false) => ("○", Style::new().dim(), "off (default)"),
+                                None => (
+                                    "◐",
+                                    Style::new().fg(th().warn),
+                                    "on/off is root-only; run the TUI with sudo to see it",
+                                ),
+                            };
+                        Line::from(vec![
+                            Span::raw("  state  "),
+                            Span::styled(format!("{icon} "), icon_style),
+                            Span::styled(label, Style::new().dim()),
+                        ])
+                    },
+                    Line::from(Span::styled(
+                        "  When on: only Login/Elevation may release the keyring; lock-screen",
+                        Style::new().dim(),
+                    )),
+                    Line::from(Span::styled(
+                        "  is verify-only; remote/unknown services are denied. Advanced; the",
+                        Style::new().dim(),
+                    )),
+                    Line::from(Span::styled(
+                        "  password is always available, so this can restrict but never lock out.",
+                        Style::new().dim(),
+                    )),
+                    Line::from(vec![
+                        Span::styled("  [b]", Style::new().fg(th().accent)),
+                        Span::styled(
+                            match bio {
+                                Some(true) => " turn it off (sudo)",
+                                Some(false) => " turn it on (sudo; asks first)",
+                                None => " on/off is root-only; run the TUI with sudo",
+                            },
+                            Style::new().dim(),
+                        ),
+                    ]),
+                    Line::raw(""),
+                    section("Match thresholds (read-only)"),
+                    Line::from(Span::styled(
+                        "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",
+                        Style::new().dim(),
+                    )),
                 ]);
                 v
             })
@@ -6173,7 +5934,7 @@ impl App {
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
         if matches!(
-            self.heavy.1.clone(),
+            self.heavy.clone(),
             Some(crate::bitwarden::TuiState::NeedsSetup)
         ) {
             lines.push(act(
@@ -6194,7 +5955,7 @@ impl App {
         ));
         // Bitwarden status line (not an action): only when installed and the
         // action is present or snapd owns it. Set apart by a blank line.
-        match &self.heavy.1 {
+        match &self.heavy {
             Some(crate::bitwarden::TuiState::Ready) => {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
@@ -6508,7 +6269,6 @@ impl App {
                 ("c", "Toggle Additional Head Gesture…"),
                 ("g", "Wallet Gesture…"),
                 ("b", "Biopolicy…"),
-                ("m", "Third-Party Model…"),
             ],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
@@ -7735,7 +7495,7 @@ mod tests {
             repair_sel: 0,
             cam_sel: 0,
             settings_svc_sel: 0,
-            heavy: (crate::models::tui_state(), crate::bitwarden::tui_state()),
+            heavy: crate::bitwarden::tui_state(),
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
@@ -8418,9 +8178,6 @@ mod tests {
             mesh: true,
             adapter: false,
             version: "test".into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         };
         let caps = App::caps_from_health(&secure);
@@ -8565,9 +8322,6 @@ mod tests {
             mesh: true,
             adapter: false,
             version: "test".into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         });
         let start = std::time::Instant::now();
@@ -10592,9 +10346,6 @@ mod tests {
             mesh: false,
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
         });
         let text = draw_text(&app);
         assert!(text.contains("no camera hardware"), "{text}");
@@ -10676,9 +10427,6 @@ mod tests {
             mesh: false,
             adapter: false,
             version: "1.0".into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         });
         let text = draw_text(&app);
@@ -10692,114 +10440,6 @@ mod tests {
         assert!(text.contains("always fail-safe to the password"));
     }
 
-    #[test]
-    fn settings_row_reports_pad_and_recognizer_together() {
-        // The #285 review's counterexample: with both stages loaded, the
-        // health-driven arm previously showed only the PAD cue — a loaded
-        // deny-only cue hid the replacement RECOGNIZER, the more
-        // consequential of the two.
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        app.daemon_up = true;
-        // Health constructed EXPLICITLY: test_app leaves it None, and an
-        // `if let Some` mutation here would silently opt the test out of the
-        // very state it exists to render.
-        app.health = Some(HealthInfo {
-            tier: "secure".into(),
-            rgb_dev: None,
-            ir_dev: None,
-            mesh: true,
-            adapter: false,
-            version: "test".into(),
-            third_party_pad: Some("flir".into()),
-            third_party_recognizer: Some("buffalo".into()),
-            // A loaded DETECTOR must be visible too: the daemon is the only
-            // authority on it (settings.conf is root-only), and a TUI that
-            // cannot show it cannot verify what is running (#299 review).
-            third_party_detector: Some("fullrange".into()),
-            apparmor: None,
-        });
-        let text = draw_text(&app);
-        assert!(text.contains("flir (pad stage, loaded)"), "{text}");
-        // The detector assertion renders WIDE on purpose: three loaded
-        // entries overflow the 120-column default, and three is synthetic
-        // while the detection stage is closed. The point under test is that
-        // the daemon-reported detector reaches the row at all.
-        let mut wide = Terminal::new(TestBackend::new(220, 40)).unwrap();
-        wide.draw(|f| app.draw(f)).unwrap();
-        let wide_text = rendered(&wide);
-        assert!(
-            wide_text.contains("fullrange (detection stage, loaded)"),
-            "a loaded detector must be reported: {wide_text}"
-        );
-        assert!(
-            text.contains("buffalo (recognition stage, loaded)"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn settings_third_party_row_prefers_the_daemon_loaded_cue() {
-        // The daemon's loaded-cue name is authoritative: a non-root TUI can't
-        // read the root-only settings.conf flag, so a loaded cue must show as
-        // green enabled (not the ◐ "root-only" filesystem guess).
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        app.daemon_up = true;
-        app.health = Some(HealthInfo {
-            tier: "secure".into(),
-            rgb_dev: None,
-            ir_dev: None,
-            mesh: true,
-            adapter: false,
-            version: "test".into(),
-            third_party_pad: Some("flir".into()),
-            third_party_recognizer: None,
-            third_party_detector: None,
-            apparmor: None,
-        });
-        let text = draw_text(&app);
-        assert!(
-            text.contains("● ") && text.contains("enabled: flir"),
-            "a daemon-loaded cue shows green enabled:\n{text}"
-        );
-        // Specifically the THIRD-PARTY row's root-only fallback must be gone (the
-        // keyring-gesture section on the same page has its own root-only label).
-        assert!(
-            !text.contains("weights installed; on/off is root-only"),
-            "the authoritative state replaces the root-only guess"
-        );
-        // No daemon-reported cue: fall back to the filesystem probe (we can't
-        // tell "old daemon didn't report" from "new daemon reports none"). With
-        // no weights on disk (empty state dir) that is a clean ○ none. This also
-        // proves an older daemon with weights present is NOT falsely shown off.
-        let _g = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let empty = std::env::temp_dir().join(format!("irlume-tp-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&empty).unwrap();
-        let old = std::env::var_os("IRLUME_STATE_DIR");
-        std::env::set_var("IRLUME_STATE_DIR", &empty);
-        app.health.as_mut().unwrap().third_party_pad = None;
-        // The draw path reads a cache taken at construction (hashing every
-        // enabled weight file on each frame was costing megabytes of I/O per
-        // keypress). The running TUI re-takes it on its poll; a test that moves
-        // the state dir under it has to do the same.
-        app.refresh_heavy();
-        let text = draw_text(&app);
-        assert!(text.contains("none (default)"), "empty state dir -> ○ none");
-        match old {
-            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
-            None => std::env::remove_var("IRLUME_STATE_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&empty);
-    }
-
-    /// Env restoration for [`with_models_sandbox`] on DROP, so a failed
-    /// assertion inside the body still puts IRLUME_CONFIG_DIR/IRLUME_STATE_DIR
-    /// back (#334 review): restored only on return, a panicking test left the
-    /// process env pointing into its deleted sandbox and later tests failed
-    /// against the wrong configuration, burying the original failure.
     #[test]
     fn done_screen_status_line_matches_setup_state() {
         let mut app = test_app();
@@ -10978,11 +10618,7 @@ mod tests {
             (SC_RECOVERY, "Set Recovery", "Forget"),
             (SC_FINGERPRINT, "Enroll Finger", "Reset"),
             (SC_PAM, "Connect Login", "Disconnect"),
-            (
-                SC_SETTINGS,
-                "Toggle Additional Head Gesture",
-                "Third-Party Model",
-            ),
+            (SC_SETTINGS, "Toggle Additional Head Gesture", "Biopolicy"),
             (SC_DONE, "Connect Login", "Refresh Status"),
         ];
         for (screen, primary, in_overlay) in cases {
@@ -11134,9 +10770,6 @@ mod tests {
             mesh: true,
             adapter: true,
             version: env!("CARGO_PKG_VERSION").into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         });
         app.run_checks();
@@ -11190,9 +10823,6 @@ mod tests {
             mesh: false,
             adapter: false,
             version: "0.0.1-old".into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         });
         app.enroll_error = Some("bad ciphertext".into());

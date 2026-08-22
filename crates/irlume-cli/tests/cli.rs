@@ -585,8 +585,8 @@ fn forget_model_refuses_a_name_that_is_not_a_recognizer() {
     let (code, _, err) = run(&mut sb.cmd(&["profiles", "forget-model", "nonsense"]));
     assert_eq!(code, 2, "an unknown model must be a usage error: {err}");
     assert!(
-        err.contains("unknown model 'nonsense'") && err.contains("shipped"),
-        "the error must list the recognizers: {err}"
+        err.contains("unknown model") && err.contains("nonsense") && err.contains("shipped"),
+        "the error must name the argument and what is accepted: {err}"
     );
     let (code, _, err) = run(&mut sb.cmd(&["profiles", "forget-model", "embed:nothex"]));
     assert_eq!(
@@ -861,15 +861,6 @@ fn doctor_runs_fully_offline_with_a_source_origin() {
     assert!(out.contains("glintr100.onnx"), "{out}");
     assert!(out.contains("face_detection_yunet_2023mar.onnx"), "{out}");
     assert!(out.contains("ORT_DYLIB_PATH: (unset)"), "{out}");
-    assert!(
-        out.contains("third-party PAD model: none"),
-        "empty sandbox config/state must report no third-party model: {out}"
-    );
-    assert!(
-        out.contains("shipped PAD cues are not active") && out.contains("life-size print"),
-        "reporting the cue as absent must also say what its absence costs, or the \
-         line reads as a neutral default: {out}"
-    );
     assert!(out.contains("unknown (daemon not reachable"), "{out}");
 }
 
@@ -977,53 +968,21 @@ fn logs_debug_status_and_root_guards() {
 // ---------------------------------------------------------------------- models
 
 #[test]
-fn models_list_reports_catalog_and_enablement_states() {
+fn models_command_answers_the_removal_notice() {
+    // The third-party/BYOM lane is removed (ADR-0015): every invocation gets
+    // the same clear refusal, never silence and never a stale catalog.
     let sb = Sandbox::new("modelslist");
-    // Default: nothing enabled in the sandbox config.
-    let (code, out, _) = run(&mut sb.cmd(&["models"]));
-    assert_eq!(code, 0);
-    assert!(out.contains("flir"), "catalog entry must be listed: {out}");
-    assert!(out.contains("[disabled]"), "{out}");
-    assert!(out.contains("none enabled"), "{out}");
-
-    // Enabled in settings.conf but weights never fetched.
-    std::fs::write(sb.path("cfg/settings.conf"), "third_party_pad=flir\n").unwrap();
-    let (code, out, _) = run(&mut sb.cmd(&["models", "list"]));
-    assert_eq!(code, 0);
-    assert!(out.contains("ENABLED (weights not fetched)"), "{out}");
-    assert!(out.contains("enabled: flir"), "{out}");
-
-    // Weights present but not matching the pinned checksum.
-    let tp = sb.path("state/models-thirdparty");
-    std::fs::create_dir_all(&tp).unwrap();
-    std::fs::write(tp.join("flir.onnx"), b"not the pinned bytes").unwrap();
-    let (code, out, _) = run(&mut sb.cmd(&["models", "list"]));
-    assert_eq!(code, 0);
-    assert!(out.contains("CHECKSUM MISMATCH"), "{out}");
-}
-
-#[test]
-fn models_usage_and_guards() {
-    let sb = Sandbox::new("modelsguard");
-    let (code, _, err) = run(&mut sb.cmd(&["models", "bogus"]));
-    assert_eq!(code, 2);
-    assert!(err.contains("usage: irlume models"), "{err}");
-
-    let (code, _, _) = run(&mut sb.cmd(&["models", "enable"]));
-    assert_eq!(code, 2, "enable without a name is a usage error");
-
-    let (code, _, err) = run(&mut sb.cmd(&["models", "enable", "nope"]));
-    assert_eq!(code, 1);
-    assert!(err.contains("'nope' is not in the catalog"), "{err}");
-
-    if !is_root() {
-        let (code, _, err) = run(&mut sb.cmd(&["models", "enable", "flir"]));
-        assert_eq!(code, 1);
-        assert!(err.contains("needs root"), "{err}");
-
-        let (code, _, err) = run(&mut sb.cmd(&["models", "disable"]));
-        assert_eq!(code, 1);
-        assert!(err.contains("needs root"), "{err}");
+    for argv in [
+        &["models"][..],
+        &["models", "list"][..],
+        &["models", "enable", "flir"][..],
+    ] {
+        let (code, _, err) = run(&mut sb.cmd(argv));
+        assert_eq!(code, 2, "`{argv:?}` must refuse: {err}");
+        assert!(
+            err.contains("third-party model support was removed"),
+            "{err}"
+        );
     }
 }
 
@@ -1518,9 +1477,6 @@ fn status_takes_the_camera_pair_from_the_daemon_not_a_local_probe() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         },
         _ => Response::Error("unexpected request".into()),
@@ -1907,9 +1863,6 @@ fn setup_walks_every_step_noninteractively() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -1935,15 +1888,14 @@ fn setup_walks_every_step_noninteractively() {
     let (code, out, _) = run_stdin(&mut sb.cmd(&["setup", "--user", "tester"]), "pw\n");
     assert_eq!(code, 0);
     assert!(out.contains("[1/7] Preflight"), "{out}");
-    // The step exists and, on non-TTY stdin, must NOT have fetched anything:
-    // a default-yes question may only apply to someone who was asked (#274).
-    assert!(out.contains("[3/7] Anti-spoof model"), "{out}");
+    // The third-party offer step is REMOVED (ADR-0015: shipped cues are
+    // default-on), so setup must neither fetch external weights nor print the
+    // old offer.
+    assert!(!out.contains("[3/7] Anti-spoof model"), "{out}");
+    assert!(!out.contains("models enable"), "{out}");
     assert!(
-        out.contains("not downloading without an interactive confirmation")
-            || out.contains("needs root to install")
-            || out.contains("already enabled")
-            || out.contains("NO trained print defence"),
-        "non-interactive setup must not fetch third-party weights: {out}"
+        out.contains("[2/7]") && out.contains("[4/7]"),
+        "setup must still walk its steps: {out}"
     );
     assert!(
         out.contains("enrolled 'Face Profile 1' with 6 scans"),

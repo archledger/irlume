@@ -80,7 +80,7 @@ fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
 
 fn read_pinned(path: &str, expected: &str, label: &str) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: read {label}: {e}"));
-    let actual = irlume_common::thirdparty::sha256_hex(&bytes);
+    let actual = irlume_common::sha256_hex(&bytes);
     assert_eq!(actual, expected, "{path}: not the pinned {label}");
     bytes
 }

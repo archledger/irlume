@@ -82,7 +82,7 @@ fn central_span(mut v: Vec<f32>) -> f32 {
 /// measurement doc can record it (#294 review).
 fn require_shipped(path: &str, name: &str) -> String {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read model {path}: {e}"));
-    let actual = irlume_common::thirdparty::sha256_hex(&bytes);
+    let actual = irlume_common::sha256_hex(&bytes);
     let expected = include_str!("../../../models/SHA256SUMS")
         .lines()
         .find_map(|l| {

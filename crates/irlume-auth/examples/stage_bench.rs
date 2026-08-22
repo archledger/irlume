@@ -48,11 +48,6 @@ fn main() {
     let mut vit = PadVit::load_from_file(&p("liveness_vit.onnx")).expect("vit");
     let mut flir = PadIr::load_from_file(&p("flir.onnx")).expect("flir");
 
-    let grey_view = Grey8View {
-        data: &grey,
-        width: w,
-        height: h,
-    };
     let rgb_view = RgbView {
         data: &rgb,
         width: w,

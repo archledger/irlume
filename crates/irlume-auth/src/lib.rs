@@ -428,25 +428,53 @@ pub const CAPTURE_MAX_SILENT_STRETCH_MS: u64 =
 /// The seam term of [`CAPTURE_MAX_SILENT_STRETCH_MS`]; see there.
 const RETRY_SEAM_ALLOWANCE_MS: u64 = 10_000;
 
-/// How far apart the RGB and IR frames of ONE decision may be captured.
+/// How far apart the RGB and IR frames of ONE decision may be captured, under
+/// the CONCURRENT capture schedule.
 ///
 /// The cross-spectrum cues treat the two frames as one scene: the face must sit
 /// in the same place in both, and the RGB head pose is used to judge a decision
 /// made largely on the IR frame. Nothing else bounds the distance between them,
 /// so this does. It is a ceiling on the pathological case, not a tuning knob:
-/// the normal paths sit far below it, since the concurrent captures OVERLAP
-/// (gap zero) and a sequential capture runs the two bursts back to back (the
-/// windows abut, so the gap is again near zero). The distance only grows when
-/// captures stack up: a hard retry of one side, or the dimming self-heal
-/// recapturing RGB after IR finished. Measured worst single capture on the
-/// hardware we have is the NexiGo N930W at ~3.6s for a full sequential pair, so
-/// 3s of GAP between two windows means something went wrong rather than slow.
+/// under the CONCURRENT schedule the captures OVERLAP (gap zero), so the
+/// distance only grows when captures stack up: a hard retry of one side, or
+/// the dimming self-heal recapturing RGB after IR finished. Measured worst
+/// single capture on the hardware we have is the NexiGo N930W at ~3.6s for a
+/// full sequential pair, so 3s of GAP between two concurrent windows means
+/// something went wrong rather than slow.
 ///
 /// Exceeding it is never accepted as a pair: stale RGB evidence is discarded.
 /// A valid IR face may continue through the separately gated IR-only path;
 /// otherwise the capture is [`Verdict::Uncertain`], never Spoof, because stale
 /// frames say nothing about the person in front of the camera.
 const MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The same ceiling under the SEQUENTIAL capture schedule, where a machinery
+/// gap between the two windows is NORMAL, not pathological: the second
+/// stream's one-shot capture pays open/negotiate plus its delivered-rate
+/// evidence (startup flush + a 30-delta window) between the two bursts.
+///
+/// The bound is derived, not chosen: the rate gate guarantees a delivered IR
+/// floor, so the machinery gap is bounded by construction at
+/// ~open(0.3s) + 40 dequeues at the floor. At the measured fleet floors
+/// (14.7-15 fps) that is a ~3.1s gap (ASUS measured 3050ms after the
+/// role-aware flush), and a slower camera that still passes its floor
+/// (e.g. 14.55 fps at the widened IR tolerance) lands at ~3.05s — the flush
+/// and window counts are constants, so the gap cannot exceed ~3.1s while the
+/// gate passes. A single hard retry or self-heal recapture REPLACES one
+/// window and re-pays one open+fill (~3.1s), and both can occur in one
+/// decision, so the pathological stacking case reaches ~6.2s. 8s bounds that
+/// with margin while staying under the login grace window (15s) — a pair
+/// older than the grace window can never use a decision this stale anyway.
+///
+/// Security posture (ADR-0014): the alternative to accepting the pair is not
+/// a stricter check — the IR-only path GRANTS with no RGB evidence at all.
+/// Discarding the pair removes cues (RGB co-location, RGB recognition, the
+/// ViT RGB PAD) from an already-granting decision; accepting it only adds
+/// them, and both paths still hinge on the same independently gated IR
+/// evidence. Stale RGB cannot manufacture a grant; it can only deny (a real
+/// user moving between captures), which is the same false-denial cost the
+/// retry loop already carries.
+const SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Eq, PartialEq)]
 enum EligiblePairEvidence<T> {
@@ -457,10 +485,11 @@ enum EligiblePairEvidence<T> {
 
 fn eligible_pair_evidence<T>(
     skew: std::time::Duration,
+    limit: std::time::Duration,
     rgb_evidence: Option<T>,
     has_ir_face: bool,
 ) -> EligiblePairEvidence<T> {
-    if skew <= MAX_CROSS_SPECTRUM_SKEW {
+    if skew <= limit {
         EligiblePairEvidence::Paired(rgb_evidence)
     } else if has_ir_face {
         EligiblePairEvidence::IrOnly
@@ -3934,7 +3963,20 @@ impl Engine {
         // Move the RGB detection into the eligibility decision. The IR-only
         // variant has no field in which stale RGB evidence could survive, so
         // all later signal and embedding code can consume only eligible data.
-        let eligible_pair = eligible_pair_evidence(skew, rgb_top, ir_top.is_some());
+        // The pairing budget is schedule-aware: concurrent captures overlap,
+        // so 3s of gap still means something went wrong there. The sequential
+        // budget applies whenever the captures ACTUALLY ran as sequential
+        // one-shots — the qualified sequential schedule, or a concurrent
+        // attempt that degraded to the sequential retry (`pair_sequential_retried`),
+        // which re-pays the same one-shot machinery between the bursts. See
+        // [`SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW`] for the derivation and
+        // ADR-0014 for the security posture.
+        let pairing_limit = if sequential || pair_sequential_retried {
+            SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW
+        } else {
+            MAX_CROSS_SPECTRUM_SKEW
+        };
+        let eligible_pair = eligible_pair_evidence(skew, pairing_limit, rgb_top, ir_top.is_some());
         let (rgb_top, stale_pair_reason) = match eligible_pair {
             EligiblePairEvidence::Paired(rgb_top) => (rgb_top, None),
             EligiblePairEvidence::IrOnly => {
@@ -3947,7 +3989,7 @@ impl Engine {
                 let reason = format!(
                     "RGB and IR frames are {}ms apart (limit {}ms); discarded stale RGB and using IR-only authentication",
                     skew.as_millis(),
-                    MAX_CROSS_SPECTRUM_SKEW.as_millis()
+                    pairing_limit.as_millis()
                 );
                 irlume_common::dlog!("assess: {reason}");
                 (None, Some(reason))
@@ -3959,7 +4001,7 @@ impl Engine {
                 let measurements = irlume_common::diagnostics::TraceMeasurement::new(
                     irlume_common::diagnostics::TraceMetric::CaptureSkewMilliseconds,
                     skew.as_secs_f64() * 1_000.0,
-                    Some(MAX_CROSS_SPECTRUM_SKEW.as_secs_f64() * 1_000.0),
+                    Some(pairing_limit.as_secs_f64() * 1_000.0),
                 )
                 .into_iter()
                 .collect();
@@ -3973,7 +4015,7 @@ impl Engine {
                     reason: format!(
                         "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
                         skew.as_millis(),
-                        MAX_CROSS_SPECTRUM_SKEW.as_millis()
+                        pairing_limit.as_millis()
                     ),
                     embedding: None,
                     ir_embedding: None,
@@ -3990,7 +4032,7 @@ impl Engine {
             let measurements = irlume_common::diagnostics::TraceMeasurement::new(
                 irlume_common::diagnostics::TraceMetric::CaptureSkewMilliseconds,
                 skew.as_secs_f64() * 1_000.0,
-                Some(MAX_CROSS_SPECTRUM_SKEW.as_secs_f64() * 1_000.0),
+                Some(pairing_limit.as_secs_f64() * 1_000.0),
             )
             .into_iter()
             .collect();
@@ -5056,9 +5098,17 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> (irlume_common::Result<Outcome>, bool) {
         let mut attempt = 0_u32;
+        // The costliest attempt so far. A retry that cannot FINISH before the
+        // deadline would overrun mid-capture — holding the camera past the
+        // window for a result that can never be used. The costliest (not
+        // latest) attempt is the estimator because a retry can be far slower
+        // than the attempt before it: the held-concurrent pair costs ~1s,
+        // and its sequential fallback re-opens both cameras at ~7s.
+        let mut costliest_attempt = std::time::Duration::ZERO;
         loop {
             attempt += 1;
             let mut held_pair_failed = false;
+            let attempt_started = std::time::Instant::now();
             let attempt_result = Self::run_camera_operation(camera_operation, || {
                 self.authenticate_once(
                     enr,
@@ -5081,7 +5131,22 @@ impl Engine {
                     return (Err(error), held_pair_failed);
                 }
             };
-            if !presence_retryable(&out) || std::time::Instant::now() >= deadline {
+            costliest_attempt = costliest_attempt.max(attempt_started.elapsed());
+            let expired = std::time::Instant::now() >= deadline;
+            let retry_wont_fit = !expired
+                && presence_retryable(&out)
+                && deadline.saturating_duration_since(std::time::Instant::now())
+                    < costliest_attempt;
+            if retry_wont_fit {
+                irlume_common::dlog!(
+                    "grace: retry skipped ({}ms left, costliest attempt {}ms); settling",
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis(),
+                    costliest_attempt.as_millis()
+                );
+            }
+            if !presence_retryable(&out) || expired || retry_wont_fit {
                 if attempt > 1 {
                     irlume_common::dlog!(
                         "grace: settled after {attempt} attempts ({}ms window)",
@@ -7926,6 +7991,7 @@ mod tests {
         assert_eq!(
             eligible_pair_evidence(
                 MAX_CROSS_SPECTRUM_SKEW + std::time::Duration::from_millis(1),
+                MAX_CROSS_SPECTRUM_SKEW,
                 Some(42_u8),
                 true,
             ),
@@ -7936,7 +8002,12 @@ mod tests {
     #[test]
     fn a_pair_at_the_skew_limit_remains_eligible_for_cross_spectrum_authentication() {
         assert_eq!(
-            eligible_pair_evidence(MAX_CROSS_SPECTRUM_SKEW, Some(42_u8), true),
+            eligible_pair_evidence(
+                MAX_CROSS_SPECTRUM_SKEW,
+                MAX_CROSS_SPECTRUM_SKEW,
+                Some(42_u8),
+                true,
+            ),
             EligiblePairEvidence::Paired(Some(42_u8)),
         );
     }
@@ -7946,10 +8017,55 @@ mod tests {
         assert_eq!(
             eligible_pair_evidence(
                 MAX_CROSS_SPECTRUM_SKEW + std::time::Duration::from_millis(1),
+                MAX_CROSS_SPECTRUM_SKEW,
                 Some(42_u8),
                 false,
             ),
             EligiblePairEvidence::Reject,
+        );
+    }
+
+    #[test]
+    fn the_sequential_budget_admits_the_machinery_gap_the_concurrent_budget_rejects() {
+        // The measured post-flush machinery gap is ~3.05s: over the
+        // concurrent ceiling (whose intent — captures that overlap — it does
+        // not describe) and inside the sequential one.
+        let machinery_gap = std::time::Duration::from_millis(3_050);
+        assert_eq!(
+            eligible_pair_evidence(machinery_gap, MAX_CROSS_SPECTRUM_SKEW, Some(42_u8), true),
+            EligiblePairEvidence::IrOnly,
+            "under the concurrent budget the pair is stale"
+        );
+        assert_eq!(
+            eligible_pair_evidence(
+                machinery_gap,
+                SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW,
+                Some(42_u8),
+                true
+            ),
+            EligiblePairEvidence::Paired(Some(42_u8)),
+            "under the sequential budget the machinery gap pairs"
+        );
+        // The sequential ceiling still discards pathological stacking:
+        // measured worst stacking (one retry + one self-heal, ~6.2s) fits;
+        // beyond the constant does not.
+        assert_eq!(
+            eligible_pair_evidence(
+                SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW,
+                SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW,
+                Some(42_u8),
+                true
+            ),
+            EligiblePairEvidence::Paired(Some(42_u8)),
+        );
+        assert_eq!(
+            eligible_pair_evidence(
+                SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW + std::time::Duration::from_millis(1),
+                SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW,
+                Some(42_u8),
+                true
+            ),
+            EligiblePairEvidence::IrOnly,
         );
     }
 

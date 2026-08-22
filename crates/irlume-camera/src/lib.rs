@@ -1528,13 +1528,6 @@ fn rate_evidence_to_common(
 /// 30 deltas, ~2 s at 15 fps); 64 gives >2x headroom for timeouts and corrupt frames.
 const MAX_RATE_FILL_ATTEMPTS: usize = 64;
 
-/// Frames discarded before the rate window is measured. The first window after
-/// STREAMON spans the driver's initial buffer delivery, whose sequence gaps
-/// make a healthy 15 fps stream read ~7 fps (measured: 32 gaps on the ASUS IR).
-/// Flushing one window's worth of frames before resetting and measuring keeps
-/// the gate from rejecting a settled stream for its startup transient.
-const RATE_STARTUP_FLUSH: usize = 30;
-
 struct TrackedStream<S> {
     stream: Option<S>,
     sequence: frame_provenance::SequenceTracker,
@@ -1825,11 +1818,11 @@ impl<S: ValidatedStream> TrackedStream<S> {
         if self.rate_window.ready() {
             return Ok(());
         }
-        // First fill: flush the STREAMON transient before measuring. The first
-        // window spans the driver's initial buffer delivery, whose sequence
-        // gaps would poison a settled stream's measurement. Reset before
-        // measuring so the startup deltas do not count against the floor.
-        for _ in 0..RATE_STARTUP_FLUSH {
+        // First fill: flush the STREAMON transient before measuring. The
+        // flush length is per role and measured per fleet node (see
+        // [`rate_gate::startup_flush`]); it resets before measuring so the
+        // startup deltas do not count against the floor.
+        for _ in 0..rate_gate::startup_flush(self.rate_config.role()) {
             self.next_discarded()?;
         }
         self.rate_window.reset();
@@ -2075,8 +2068,10 @@ fn drain_until_both_ready<S: ValidatedStream>(
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
-    // Flush the STREAMON transient; its sequence gaps would poison the window.
-    for _ in 0..RATE_STARTUP_FLUSH {
+    // Flush the STREAMON transient (per role, measured; see
+    // [`rate_gate::startup_flush`]); its delivery pattern would poison the
+    // window.
+    for _ in 0..rate_gate::startup_flush(stream.rate_config.role()) {
         if cancelled.load(Ordering::Acquire) {
             return Err(paired_rate_cancel_error());
         }
@@ -5611,6 +5606,159 @@ pub mod ir_probe {
             ));
         }
         Ok(out)
+    }
+}
+
+/// Raw per-dequeue startup facts for one device, BEFORE any rate gating.
+///
+/// The production rate gate discards the first window's frames inside
+/// `TrackedStream::fill_rate_evidence` (the per-role startup flush, then a
+/// 30-delta measurement; named in backticks rather than as an intra-doc
+/// link because it is private and public docs may not link to private
+/// items), so its delivered frames say nothing about the
+/// STREAMON transient those constants are sized for. This probe streams
+/// through the same validated dequeue boundary with NO tracked wrapper and
+/// records the transport facts of every attempt, so the flush and window
+/// constants can be re-fitted against measured driver behavior per host
+/// (examples/startup_transient.rs turns a run into the CSV and the
+/// would-flush-K-pass simulation).
+pub mod startup_probe {
+    use super::Spectrum;
+    use super::ValidatedStream as _;
+
+    /// One raw dequeue attempt: `valid` false means the buffer failed
+    /// validation (corrupt); the transport facts are whatever the driver
+    /// reported for that buffer.
+    #[derive(Clone, Copy, Debug)]
+    pub struct StartupDequeue {
+        pub index: usize,
+        pub valid: bool,
+        pub sequence_raw: Option<u32>,
+        pub timestamp_micros: Option<i64>,
+        /// Microseconds from probe start (before the first dequeue; the first
+        /// dequeue is STREAMON) to this dequeue's return.
+        pub dequeue_us: u64,
+    }
+
+    impl StartupDequeue {
+        /// Driver timestamp when the attempt was valid.
+        #[must_use]
+        pub fn ts(&self) -> Option<i64> {
+            if self.valid {
+                self.timestamp_micros
+            } else {
+                None
+            }
+        }
+    }
+
+    fn record(
+        index: usize,
+        dequeued: Result<
+            (&[u8], super::frame_provenance::DequeuedBufferFacts),
+            super::ValidatedDequeueError,
+        >,
+        t0: std::time::Instant,
+    ) -> StartupDequeue {
+        let (valid, facts) = match dequeued {
+            Ok((_, facts)) => (true, Some(facts)),
+            Err(super::ValidatedDequeueError::Corrupt(facts)) => (false, Some(facts)),
+            Err(error) => panic!("stream error during startup probe: {error:?}"),
+        };
+        let facts = facts.map(|f| (f.sequence_raw(), f.timestamp_micros()));
+        StartupDequeue {
+            index,
+            valid,
+            sequence_raw: facts.map(|(s, _)| s),
+            timestamp_micros: facts.map(|(_, t)| t),
+            dequeue_us: t0.elapsed().as_micros() as u64,
+        }
+    }
+
+    /// Raw startup profile of the RGB node. The probe takes the same
+    /// session slot a real session would (in-process double-open guard) but
+    /// writes no camera controls, so nothing about the camera is displaced.
+    ///
+    /// # Errors
+    /// Propagates open/negotiation/dequeue errors verbatim.
+    pub fn rgb(device: &str, frames: usize) -> irlume_common::Result<Vec<StartupDequeue>> {
+        let cam = super::RgbCamera::open(device)?;
+        let _slot = super::SessionSlot::acquire(&cam.session_active, device)?;
+        let mut stream = super::SafeStream::open(
+            super::V4l2CameraState::with_interval(device, cam.lease.clone(), cam.accepted_interval),
+            device,
+            &cam.dev,
+            &cam.negotiated,
+        )?;
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(frames);
+        for index in 0..frames {
+            cam.lease
+                .require_endpoint(device)
+                .map_err(|error| super::Error::Hardware(error.to_string()))?;
+            out.push(record(index, stream.next_validated(), t0));
+        }
+        Ok(out)
+    }
+
+    /// Raw startup profile of the IR node, with the emitter enabled exactly
+    /// as a real session enables it (before the first dequeue, which is
+    /// STREAMON, restored on drop).
+    ///
+    /// # Errors
+    /// Propagates open/privacy/negotiation/emitter/dequeue errors verbatim.
+    pub fn ir(device: &str, frames: usize) -> irlume_common::Result<Vec<StartupDequeue>> {
+        let cam = super::IrCamera::open(device)?;
+        super::require_ir_privacy_released(device, &cam.dev, "before the startup probe")?;
+        let _slot = super::SessionSlot::acquire(&cam.session_active, device)?;
+        // DECLARED before the stream so the restore drops after it.
+        let mode;
+        let mut stream = super::SafeStream::open(
+            super::V4l2CameraState::with_ir_interval(
+                device,
+                cam.lease.clone(),
+                cam.accepted_interval,
+            ),
+            device,
+            &cam.dev,
+            &cam.negotiated,
+        )?;
+        cam.lease
+            .require_endpoint(device)
+            .map_err(|error| super::Error::Hardware(error.to_string()))?;
+        mode = super::enable_ir_emitter_privacy_bounded(
+            device,
+            &cam.dev,
+            &cam.card,
+            cam.lease.clone(),
+            "before Face Authentication D1",
+        )?;
+        // Bound, never read: held for its `Drop`, which restores the control.
+        let _ = &mode;
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::with_capacity(frames);
+        for index in 0..frames {
+            cam.lease
+                .require_endpoint(device)
+                .map_err(|error| super::Error::Hardware(error.to_string()))?;
+            out.push(record(index, stream.next_validated(), t0));
+        }
+        Ok(out)
+    }
+
+    /// Run the probe for either spectrum.
+    ///
+    /// # Errors
+    /// Propagates the per-spectrum probe's errors verbatim.
+    pub fn by_spectrum(
+        spectrum: Spectrum,
+        device: &str,
+        frames: usize,
+    ) -> irlume_common::Result<Vec<StartupDequeue>> {
+        match spectrum {
+            Spectrum::Rgb => rgb(device, frames),
+            Spectrum::Ir => ir(device, frames),
+        }
     }
 }
 

@@ -1368,6 +1368,14 @@ mod onnx {
     fn pad_vit_input(frame: &align::RgbView, bbox: &[f32; 4], size: usize) -> Vec<f32> {
         const MARGIN: f32 = 96.0 / 112.0;
         let (fw, fh) = (frame.width as f32, frame.height as f32);
+        // Degenerate 0-dimension frame (misbehaving V4L2 driver): f32::clamp
+        // asserts min<=max, so 0 would panic BEFORE sample_bilinear's own
+        // degenerate guard runs. Return zeros (an all--1.0 tensor after
+        // normalization is impossible to hit here, but a uniform input is the
+        // fail-safe: the cue reads no signal and denies nothing).
+        if fw <= 0.0 || fh <= 0.0 {
+            return vec![0.0; 3 * size * size];
+        }
         let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
         let x1 = (bbox[0] - bw * MARGIN).max(0.0);
         let y1 = (bbox[1] - bh * MARGIN).max(0.0);

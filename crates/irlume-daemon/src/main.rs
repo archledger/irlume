@@ -693,7 +693,9 @@ fn main() {
                         Some(n) => eprintln!(
                             "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
                         ),
-                        None => eprintln!("irlumed: third-party PAD cue: none (shipped cues below cover it)"),
+                        None => eprintln!(
+                            "irlumed: third-party PAD cue: none (see the shipped PAD cue lines below for actual coverage)"
+                        ),
                     }
                     // Shipped PAD cues (ADR-0013): default-on, kill-switched,
                     // with their measured species coverage named so an

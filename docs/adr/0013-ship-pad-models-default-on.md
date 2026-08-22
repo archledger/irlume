@@ -46,7 +46,12 @@ records why that is sound and what it costs.
 1. **Both models ship in every package** as release assets on `models-v1`,
    installed to `/usr/share/irlume/models/`, pinned in
    `models/SHA256SUMS`, verified at startup, fetched by
-   `scripts/fetch-models.sh` for dev/CI trees.
+   `scripts/fetch-models.sh` for dev/CI trees. Verification follows the
+   shipped-model house policy, not the opt-in lane's: `IRLUME_MODELS_STRICT=1`
+   refuses a present-but-tampered cue; in the default non-strict mode a
+   mismatched file warns and the cue still loads from the path (the same
+   warn-first policy det/mesh/blaze follow — tampering a deny-only cue is
+   capability-equivalent to its kill switch, which root can set anyway).
 
 2. **DENY-ONLY wiring, unchanged from the opt-in lane's contract.** Each cue
    can downgrade a Live verdict to Spoof and NOTHING else. A false fire

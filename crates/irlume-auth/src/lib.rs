@@ -2957,6 +2957,10 @@ impl Engine {
     /// (RGB+IR) when an IR camera is present, else RGB-only (convenience).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn assess(&mut self) -> irlume_common::Result<Assessment> {
+        // One-shot entry: no authenticate_for/capture_scans ran to clear the
+        // ViT vote ring, so repeated assess() calls must not accumulate a
+        // cross-presentation vote (GLM review finding 2).
+        self.vit_scores.clear();
         let endpoints: Vec<&str> = if self.ir_available {
             vec![self.rgb_dev.as_str(), self.ir_dev.as_str()]
         } else {
@@ -5244,7 +5248,6 @@ impl Engine {
                     ));
                 }
             }
-            // Opt-in third-party PAD cue, deny-only (scored in assess_full on
             // Opt-in third-party PAD cue, deny-only (scored in assess_full on
             // the lit IR frame; the dark path re-derives its own gate verdict,
             // so it must consult the cue explicitly too).
@@ -9258,14 +9261,11 @@ mod thirdparty_cue_tests {
         assert!(!vit_vote_denies(&slide));
         slide.push(0.90);
         assert!(!vit_vote_denies(&slide), "window still holds 4 genuine");
+        // After two pushes the window is [0.30,0.30,0.30,0.90,0.90]:
+        // median 0.30, still no denial.
         slide.push(0.90);
-        assert!(
-            !vit_vote_denies(&slide),
-            "median 0.30+genuine tie: 0.30,0.30,0.90,0.90,0.30 median 0.30"
-        );
-        // Recompute: window is [0.30,0.90,0.90,0.90,0.30]? No: slides keep
-        // the LAST five: after two pushes the window is
-        // [0.30,0.30,0.30,0.90,0.90] -> median 0.30. Push more:
+        assert!(!vit_vote_denies(&slide));
+        // Two more: window [0.30,0.90,0.90,0.90,0.90], median 0.90.
         slide.push(0.90);
         slide.push(0.90);
         assert!(vit_vote_denies(&slide), "sustained attack denies");

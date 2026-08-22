@@ -136,7 +136,7 @@ fn enabled_name_for(key: &str) -> Option<String> {
 /// that None as "disabled" told a user whose anti-spoof model IS enabled that
 /// none was, which invites them to re-run enable or to believe the PAD layer is
 /// off. `models list --json` already reports `enabled: {known: false}` here; the
-/// human list has to say the same thing. pub(crate) since #331: the TUI models
+/// human list has to say the same thing. pub(crate) since #331: the TUI Settings
 /// screen renders the same tri-state.
 pub(crate) fn enabled_state_readable() -> bool {
     use irlume_common::config::KvObservation;
@@ -218,7 +218,7 @@ fn file_state(m: &ThirdPartyModel) -> &'static str {
 
 /// The state tag the listing shows for one catalog entry: enabled (with the
 /// weight-file verdict), disabled, or unknown when settings.conf is root-only
-/// and this process cannot read it. Shared with the TUI models screen (#331)
+/// and this process cannot read it. Shared with the TUI Settings section (#331)
 /// so the two surfaces cannot describe the same entry differently.
 pub(crate) fn entry_state_label(m: &ThirdPartyModel) -> String {
     let enabled_here =
@@ -235,7 +235,7 @@ pub(crate) fn entry_state_label(m: &ThirdPartyModel) -> String {
 /// How this entry gets onto the machine, with the exact command: irlume
 /// fetches an entry whose licence permits that; a bring-your-own entry's file
 /// is the user's to obtain (`url: None` is a licence statement, not a gap).
-/// Shared with the TUI models screen (#331): the command spelling has one home.
+/// Shared with the TUI Settings section (#331): the command spelling has one home.
 pub(crate) fn obtain_line(m: &ThirdPartyModel) -> String {
     match m.url {
         Some(_) => format!("irlume fetches it: sudo irlume models enable {}", m.name),
@@ -293,7 +293,7 @@ fn list() -> ExitCode {
 }
 
 /// One line saying what enabling this entry DOES, per stage. Shown in the
-/// listing, in the consent prompts, and on the TUI models screen (#331),
+/// listing, in the consent prompts, and in the TUI Settings section (#331),
 /// because "what happens when I say yes" is the one thing those must not be
 /// vague about.
 pub(crate) fn role_line(m: &ThirdPartyModel) -> String {

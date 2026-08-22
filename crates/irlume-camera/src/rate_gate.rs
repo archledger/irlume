@@ -24,10 +24,23 @@ use crate::frame_interval::FrameInterval;
 /// five/ten-delta enforcement was measured invalid (see the slice-8 design).
 pub(crate) const RATE_WINDOW_CAPACITY: usize = 30;
 
-/// Whole-percent tolerance applied to the floor. 98% is the smallest
-/// whole-percent floor below the measured 14.714 Hz (98.093% of 15 fps) and
-/// rejects 10 Hz.
-pub(crate) const DEFAULT_TOLERANCE_PERCENT: u32 = 98;
+/// Whole-percent tolerance applied to the floor. 97% (IR: 14.55 fps) is
+/// fitted to the fleet's measured steady-state deliveries: the worst real
+/// node is the NexiGo N930W IR at 14.73-14.79 fps across three probe runs
+/// (docs/research/2026-08-22-startup-flush-fleet-measurement.md), 98.2% of
+/// its nominal 15 fps — the previous 98% left 0.2% margin below that node,
+/// i.e. one firmware/thermal drift away from failing every production auth
+/// on a host that passes every other gate. 97% leaves 1.2% margin below the
+/// worst real node while still rejecting every fractional-rate delivery by
+/// a wide margin (10 Hz is 67% of the IR floor).
+///
+/// Loosening this is cheap on purpose: the rate window is TRANSPORT-HEALTH
+/// evidence (a degraded USB link, a starved stream, a demoted schedule),
+/// not the anti-injection control — an injected stream can deliver any rate
+/// it likes, including exactly the floor, which is why camera identity is
+/// pinned by `verify_pinned` instead. A stream that cannot clear 97% of its
+/// role's floor is genuinely unhealthy and still fails closed.
+pub(crate) const DEFAULT_TOLERANCE_PERCENT: u32 = 97;
 
 /// Startup dequeues discarded before the rate window is measured, per stream
 /// role. The flush exists to skip the STREAMON delivery transient, and its
@@ -222,7 +235,7 @@ impl RateWindow {
         (numerator / divisor, denominator / divisor)
     }
 
-    /// Exact 98%-floor comparison using checked `u128` arithmetic only:
+    /// Exact floor comparison using checked `u128` arithmetic only:
     /// `count * 1_000_000 * floor_den * 100 >= span_us * floor_num * tolerance`.
     #[must_use]
     pub(crate) fn meets_floor(
@@ -459,11 +472,13 @@ mod tests {
 
     #[test]
     fn exact_ir_boundary_passes_and_one_microsecond_fails() {
-        // count 30, floor 15/1, tolerance 98: max passing span is
-        // floor(30 * 1_000_000 * 100 / (15 * 98)) = 2_040_816 us.
+        // Max passing span, derived from the constants (count 30, floor
+        // 15/1): floor(30 * 1_000_000 * 100 / (15 * tolerance)).
+        let boundary = RATE_WINDOW_CAPACITY as u64 * 1_000_000 * 100
+            / (u64::from(IR_FLOOR_NUM) * u64::from(DEFAULT_TOLERANCE_PERCENT));
         let mut window = RateWindow::new();
         // Seed + 30 deltas of equal size summing to the boundary span.
-        let delta = 2_040_816 / RATE_WINDOW_CAPACITY as u64;
+        let delta = boundary / RATE_WINDOW_CAPACITY as u64;
         let mut t = 0_i64;
         window.observe_success(t).expect("seed");
         for _ in 0..RATE_WINDOW_CAPACITY {
@@ -477,14 +492,14 @@ mod tests {
         exact.observe_success(t).expect("seed");
         for i in 0..RATE_WINDOW_CAPACITY {
             let step = if i == RATE_WINDOW_CAPACITY - 1 {
-                2_040_816 - (RATE_WINDOW_CAPACITY as u64 - 1) * delta
+                boundary - (RATE_WINDOW_CAPACITY as u64 - 1) * delta
             } else {
                 delta
             };
             t += step as i64;
             exact.observe_success(t).expect("monotonic");
         }
-        assert_eq!(exact.span_us(), 2_040_816);
+        assert_eq!(exact.span_us(), boundary);
         assert!(exact.meets_floor(IR_FLOOR_NUM, IR_FLOOR_DEN, DEFAULT_TOLERANCE_PERCENT));
 
         // +1 us fails.
@@ -493,15 +508,51 @@ mod tests {
         over.observe_success(t).expect("seed");
         for i in 0..RATE_WINDOW_CAPACITY {
             let step = if i == RATE_WINDOW_CAPACITY - 1 {
-                2_040_817 - (RATE_WINDOW_CAPACITY as u64 - 1) * delta
+                boundary + 1 - (RATE_WINDOW_CAPACITY as u64 - 1) * delta
             } else {
                 delta
             };
             t += step as i64;
             over.observe_success(t).expect("monotonic");
         }
-        assert_eq!(over.span_us(), 2_040_817);
+        assert_eq!(over.span_us(), boundary + 1);
         assert!(!over.meets_floor(IR_FLOOR_NUM, IR_FLOOR_DEN, DEFAULT_TOLERANCE_PERCENT));
+    }
+
+    #[test]
+    fn the_widened_tolerance_still_rejects_fractional_rate_delivery() {
+        // The security-relevant property at 97%: every fractional-rate
+        // delivery the gate existed to reject stays rejected, with the
+        // worst real fleet node (14.73 fps) comfortably inside.
+        let fps_to_span = |fps: f64| (RATE_WINDOW_CAPACITY as f64 / fps * 1_000_000.0) as u64;
+        for fps in [10.0, 13.8, 14.0, 14.5] {
+            let mut w = RateWindow::new();
+            let mut t = 0_i64;
+            w.observe_success(t).expect("seed");
+            let step = fps_to_span(fps) / RATE_WINDOW_CAPACITY as u64;
+            for _ in 0..RATE_WINDOW_CAPACITY {
+                t += step as i64;
+                w.observe_success(t).expect("monotonic");
+            }
+            assert!(
+                !w.meets_floor(IR_FLOOR_NUM, IR_FLOOR_DEN, DEFAULT_TOLERANCE_PERCENT),
+                "{fps} fps must fail the IR floor"
+            );
+        }
+        for fps in [14.55, 14.73, 14.79, 15.0] {
+            let mut w = RateWindow::new();
+            let mut t = 0_i64;
+            w.observe_success(t).expect("seed");
+            let step = fps_to_span(fps) / RATE_WINDOW_CAPACITY as u64;
+            for _ in 0..RATE_WINDOW_CAPACITY {
+                t += step as i64;
+                w.observe_success(t).expect("monotonic");
+            }
+            assert!(
+                w.meets_floor(IR_FLOOR_NUM, IR_FLOOR_DEN, DEFAULT_TOLERANCE_PERCENT),
+                "{fps} fps (floor-or-better real delivery) must pass"
+            );
+        }
     }
 
     #[test]

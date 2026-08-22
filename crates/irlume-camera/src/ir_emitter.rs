@@ -1590,6 +1590,97 @@ pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &
         .unwrap_or_else(|_| unreachable!("the unguarded path cannot refuse"))
 }
 
+/// READ-ONLY report of every extension unit a device advertises, plus the
+/// Microsoft camera-control XU's published contract (capabilities, length,
+/// default and current values) for the selectors irlume could ever care
+/// about: exposure (0x02), face authentication (0x06), and IR torch (0x0A).
+///
+/// Performs zero writes — only the query reads (`GET_INFO`, `GET_LEN`,
+/// `GET_DEF`, `GET_CUR`) that the kernel documents for enumeration, which
+/// the camera-control safety dossier
+/// (docs/research/2026-08-22-camera-control-safety-dossier.md) classes as
+/// safe: no documented incident has ever arisen from a control READ, and
+/// nothing is restored because nothing is displaced. Its purpose is to
+/// answer, per fleet camera, whether Microsoft's firmware-per-frame strobe
+/// path (torch ALTERNATING / face-auth modes) is reachable — the Windows
+/// Hello mechanism documented in
+/// docs/research/2026-08-22-windows-hello-camera-control-dossier.md.
+///
+/// # Errors
+/// `Io` when the device cannot be opened or its USB identity cannot be
+/// resolved from sysfs. Individual control queries that the camera refuses
+/// are recorded in the report, not errors: a control that will not answer a
+/// read would certainly not survive a write.
+pub fn microsoft_xu_report(device: &str) -> irlume_common::Result<String> {
+    let dev = v4l::Device::with_path(device).map_err(|e| crate::map_io(device, e))?;
+    let fd = dev.handle().fd();
+    let id = crate::uvc_descriptor::identity_from_fd(fd)
+        .map_err(|e| crate::Error::Hardware(format!("{device}: identity: {e}")))?;
+    let mut out = format!(
+        "{device}: vid {:04x} pid {:04x}, interface {}\n",
+        id.vid, id.pid, id.interface_number
+    );
+    let units = id.extension_units();
+    if units.is_empty() {
+        out.push_str("  no extension units advertised\n");
+        return Ok(out);
+    }
+    for xu in &units {
+        let selectors: Vec<String> = (1..=(usize::from(xu.num_controls.max(1)) * 8))
+            .filter(|&bit| {
+                let byte = (bit - 1) / 8;
+                let mask = 1u8 << ((bit - 1) % 8);
+                xu.bm_controls.get(byte).is_some_and(|b| (b & mask) != 0)
+            })
+            .map(|bit| format!("{bit:02x}"))
+            .collect();
+        out.push_str(&format!(
+            "  XU unit {} {}: {} selector(s): {}\n",
+            xu.unit_id,
+            if xu.is_microsoft_xu() {
+                "MICROSOFT MS_CAMERA_CONTROL_XU"
+            } else {
+                "vendor"
+            },
+            selectors.len(),
+            selectors.join(",")
+        ));
+    }
+    let Some(ms) = id.microsoft_xu() else {
+        out.push_str("  no single Microsoft XU (none, or ambiguous)\n");
+        return Ok(out);
+    };
+    for (name, selector) in [
+        ("exposure", 0x02_u8),
+        ("face-auth", crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION),
+        ("ir-torch", crate::uvc_descriptor::MSXU_IR_TORCH),
+    ] {
+        if !ms.advertises(selector) {
+            out.push_str(&format!("  {name} (sel {selector:02x}): not advertised\n"));
+            continue;
+        }
+        let unit = ms.unit_id;
+        let info = get_info(fd, unit, selector)
+            .map(|b| format!("{b:#04x}"))
+            .unwrap_or_else(|e| format!("refused ({e})"));
+        let len = get_len(fd, unit, selector)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|e| format!("refused ({e})"));
+        let def = get_len(fd, unit, selector)
+            .and_then(|n| get_of(fd, unit, selector, UVC_GET_DEF, n))
+            .map(|v| format!("{v:02x?}"))
+            .unwrap_or_else(|e| format!("refused ({e})"));
+        let cur = get_len(fd, unit, selector)
+            .and_then(|n| get_cur(fd, unit, selector, n))
+            .map(|v| format!("{v:02x?}"))
+            .unwrap_or_else(|e| format!("refused ({e})"));
+        out.push_str(&format!(
+            "  {name} (sel {selector:02x}): info={info} len={len} def={def} cur={cur}\n"
+        ));
+    }
+    Ok(out)
+}
+
 fn enable_guarded(
     handle: std::sync::Arc<v4l::device::Handle>,
     card: &str,

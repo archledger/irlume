@@ -4411,28 +4411,62 @@ impl Engine {
         // entirely. The key is dropped inside load; only the decrypted
         // Enrollment is held, which is already plaintext in memory during
         // each authenticate_once today.
-        let Some(enr) = irlume_core::storage::load(user)? else {
-            return Ok(Outcome::deny(
-                OutcomeKind::OtherDeny,
-                format!("'{user}' is not enrolled"),
-            ));
-        };
-        if let Err(reason) = legacy_eye_policy(&enr) {
-            return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
-        }
-        if enr.profiles.iter().all(|p| p.scans.is_empty()) {
-            return Ok(Outcome::deny(
-                OutcomeKind::OtherDeny,
-                format!("'{user}' has no face scans enrolled"),
-            ));
-        }
-        // Anti-swap: refuse if the live camera no longer matches the one this
-        // user enrolled on (only enforced once an enrollment carries a binding).
-        if let Some(bind) = &enr.camera_binding {
-            if let Some(reason) = self.binding_mismatch(bind) {
-                return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
+        //
+        // It leaves the critical path HERE, for the case that has a critical
+        // path to leave: an ENCRYPTED store, whose unseal costs 2.7s quiet /
+        // 18.97s contended on a discrete TPM. A plaintext store loads with no
+        // TPM at all, so it stays synchronous and keeps the historical
+        // deny-before-camera precedence for every policy check below (tests
+        // and plaintext hosts see identical behavior to before). For an
+        // encrypted store the full load runs on a helper thread CONCURRENTLY
+        // with the camera lease, stream arming, delivered-rate establishment
+        // and the consent watch below (>=5s of camera-bound work in
+        // concurrent mode), joined before the first enrollment-dependent
+        // decision. The one precedence change: on an encrypted store whose
+        // camera path ALSO fails hard, the hardware error now precedes the
+        // empty-scans/binding deny lines — both end at the password, so the
+        // user-visible outcome is unchanged. A panic inside the loader maps
+        // to an error (password fallback), never a daemon crash.
+        let load_started = std::time::Instant::now();
+        let loader = match irlume_core::storage::store_is_encrypted(user) {
+            // No file at all: the instant deny, before anything else wakes.
+            None => {
+                return Ok(Outcome::deny(
+                    OutcomeKind::OtherDeny,
+                    format!("'{user}' is not enrolled"),
+                ));
             }
-        }
+            // Plaintext: cheap JSON load, synchronous, old precedence.
+            Some(false) => None,
+            // Encrypted: the TPM unseal is the expensive part — defer it
+            // into the overlap window.
+            Some(true) => Some({
+                let loader_user = user.to_string();
+                std::thread::Builder::new()
+                    .name("irlume-enrollment-load".into())
+                    .spawn(move || irlume_core::storage::load(&loader_user))
+                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?
+            }),
+        };
+        // The synchronous-path enrollment (plaintext stores). The encrypted
+        // path resolves `enr` at the join below, after camera setup.
+        let loader_was_async = loader.is_some();
+        let sync_enr = if loader.is_none() {
+            match irlume_core::storage::load(user)? {
+                Some(enr) => match self.enrollment_policy_refusal(&enr) {
+                    Some(outcome) => return Ok(outcome),
+                    None => Some(enr),
+                },
+                None => {
+                    return Ok(Outcome::deny(
+                        OutcomeKind::OtherDeny,
+                        format!("'{user}' is not enrolled"),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         if let Some(policy) = blocking_head_consent_policy(purpose, service) {
             return Ok(Outcome::deny(
                 OutcomeKind::OtherDeny,
@@ -4578,6 +4612,60 @@ impl Engine {
                     emit_capture_fallback(RuntimeDegradation::PairArmFailure, diagnostics);
                     demote_after_pair_arm_failure(&mut capture_mode);
                 }
+            }
+        }
+        // Join the enrollment loader. Everything between the spawn and HERE —
+        // camera lease, consent watch, stream arming, delivered-rate
+        // establishment — is the overlap window the TPM unseal ran inside;
+        // on every measured host that window exceeds the unseal (2.7s quiet),
+        // so the load costs the auth path nothing. First enrollment-dependent
+        // decision happens after this join, before any capture is spent.
+        // The Ok(None) arm (file vanished between the check and the read)
+        // keeps the same deny as the pre-check.
+        let enr = match loader {
+            Some(handle) => match handle.join() {
+                Ok(Ok(Some(enr))) => enr,
+                Ok(Ok(None)) => {
+                    return Ok(Outcome::deny(
+                        OutcomeKind::OtherDeny,
+                        format!("'{user}' is not enrolled"),
+                    ));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // The loader panicked: contained by the thread boundary.
+                    // Report failure so PAM cascades to the password rather
+                    // than crashing the daemon over an enrollment read.
+                    return Err(irlume_common::Error::Protocol(
+                        "enrollment loader failed; falling back to password".into(),
+                    ));
+                }
+            },
+            None => match sync_enr {
+                Some(enr) => enr,
+                // Unreachable by construction (the sync path resolves
+                // sync_enr or returns early); a deny rather than a panic so
+                // a future edit cannot crash the daemon here.
+                None => {
+                    return Ok(Outcome::deny(
+                        OutcomeKind::OtherDeny,
+                        format!("'{user}' is not enrolled"),
+                    ));
+                }
+            },
+        };
+        irlume_common::dlog!(
+            "auth: enrollment load took {:?} ({})",
+            load_started.elapsed(),
+            if loader_was_async {
+                "overlapped with camera setup"
+            } else {
+                "plaintext, synchronous"
+            }
+        );
+        if loader_was_async {
+            if let Some(outcome) = self.enrollment_policy_refusal(&enr) {
+                return Ok(outcome);
             }
         }
         if held_rgb.is_none() || held_ir.is_none() {
@@ -5953,6 +6041,31 @@ impl Engine {
     /// If the live cameras no longer match the enrolled binding, return a reason
     /// to refuse (anti-swap). A bound device that now reads differently, or an
     /// enrolled IR camera that's gone, fails; an unbound side is not checked.
+    /// The enrollment-dependent policy refusals that gate an authentication
+    /// before any capture is spent: retired-eye-policy migration, the
+    /// empty-profile refuse, and the anti-swap camera binding. A pure
+    /// decision over the loaded enrollment (plus sysfs identities for the
+    /// binding); runs synchronously for plaintext stores (before the camera)
+    /// and at the loader join for encrypted stores (see
+    /// `authenticate_for_with_diagnostics` for the precedence note).
+    fn enrollment_policy_refusal(&self, enr: &irlume_core::storage::Enrollment) -> Option<Outcome> {
+        if let Err(reason) = legacy_eye_policy(enr) {
+            return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
+        }
+        if enr.profiles.iter().all(|p| p.scans.is_empty()) {
+            return Some(Outcome::deny(
+                OutcomeKind::OtherDeny,
+                format!("'{}' has no face scans enrolled", enr.user),
+            ));
+        }
+        if let Some(bind) = &enr.camera_binding {
+            if let Some(reason) = self.binding_mismatch(bind) {
+                return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
+            }
+        }
+        None
+    }
+
     fn binding_mismatch(&self, bind: &irlume_core::storage::CameraBinding) -> Option<String> {
         if let Some(want) = &bind.rgb {
             if irlume_camera::device_identity(&self.rgb_dev).as_ref() != Some(want) {

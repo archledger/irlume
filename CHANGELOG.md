@@ -5,6 +5,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **SecureDark stage 1 (ADR-0016): the pure-dark (IR-only) path hardens.**
+  The dark path now requires the scene to actually be dark: an RGB frame
+  reading conclusively lit (>= the established 100.0 scene-brightness
+  boundary) refuses IR-only authentication, closing the lit-room routing
+  hole where a presentation crafted to reflect 850nm while absorbing
+  visible light could choose the lowest-evidence path on purpose. The
+  pure-dark match threshold rises 0.55 → 0.60 (CBSR NIR: FAR 1.3e-3 →
+  2.7e-4 for +1.3% FRR), ending the inversion where the dim-light
+  fallback — which verifies an RGB face first — demanded a stricter bar
+  than pure darkness. Per-user IR calibration, FLIR PAD, IR physics, and
+  the per-user center/edge floor are unchanged. Stage 2 (0.635 bar,
+  multi-frame consistency) is gated on the live dark-session measurement
+  protocol in `docs/research/2026-08-22-securedark-v1.md`.
+
 ### Removed
 
 - **Third-party / bring-your-own model support (ADR-0015).** The opt-in model

@@ -64,6 +64,10 @@ contents:
     dst: /usr/share/irlume/models/face_landmarks_detector.tflite
   - src: ../../models/blaze_face_short_range.onnx
     dst: /usr/share/irlume/models/blaze_face_short_range.onnx
+  - src: ../../models/liveness_vit.onnx
+    dst: /usr/share/irlume/models/liveness_vit.onnx
+  - src: ../../models/flir.onnx
+    dst: /usr/share/irlume/models/flir.onnx
   # Bundled onnxruntime (>=1.24) staged by build-deb.sh
   - src: ../../.deb-staging/onnxruntime/lib/
     dst: /opt/irlume/onnxruntime/lib/

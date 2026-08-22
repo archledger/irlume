@@ -42,6 +42,20 @@ Copyright: Google (MediaPipe Face Mesh; the .onnx is a conversion, the
  .tflite is Google's published artifact from face_landmarker.task)
 License: Apache-2.0
 
+Files: models/liveness_vit.onnx
+Copyright: Adedev-W (LivenessModels-ONNX)
+License: MIT
+Comment: ViT RGB liveness classifier, training data undocumented by the
+ publisher (disclosed in ADR-0013); distributed as a release asset from
+ the irlume models-v1 release per the upstream Google Drive artifact
+
+Files: models/flir.onnx
+Copyright: Alibaba DAMO Academy (ModelScope)
+License: MIT
+Comment: IR face liveness classifier, training data undocumented by the
+ publisher (disclosed in ADR-0013); distributed as a release asset from
+ the irlume models-v1 release per the upstream ModelScope artifact
+
 Files: ort-prebuilt/*
 Copyright: Microsoft Corporation
 License: MIT

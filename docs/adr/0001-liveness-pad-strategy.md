@@ -9,6 +9,12 @@
 > head-only and remains separate from passive PAD. See the approved
 > [retirement design](../superpowers/specs/2026-08-19-head-gesture-only-retirement-design.md).
 
+> **Shipped-cue amendment (2026-08-22):** [ADR-0013](0013-ship-pad-models-default-on.md)
+> tiers the shipped-weights bar by blast radius: DENY-ONLY PAD cues may ship
+> default-on with MIT weights and disclosed-undocumented training data; the
+> warrantable-training-data requirement below still governs grant-capable
+> models unchanged.
+
 ## Context
 
 Presentation Attack Detection (PAD) can be approached two ways: single-frame

@@ -863,11 +863,13 @@ pub fn doctor_line() -> String {
     // stop a life-size print: measured 2026-06-30 and again 2026-08-02, an
     // angled vinyl print of the enrolled face reads a centre/edge ratio above
     // the genuine range, so no threshold separates them and the gate accepts
-    // it. This cue denied the same print at p_fake 0.999 and above. A user
-    // reading `doctor` should learn that from the line, not from an issue.
-    "none — RECOMMENDED: `sudo irlume models enable flir`. Without it the \
-     built-in gate is the only anti-spoof layer, and it does not stop a \
-     life-size print of your face (docs/PAD_SELFTEST.md)"
+    // it. The SHIPPED cues (ADR-0013) cover the print species when their
+    // weights are installed — this line is the "weights missing or cues
+    // kill-switched" case, and it says what is actually lost.
+    "none — the shipped PAD cues are not active. Their measured coverage \
+     (print/banner species) is what the built-in gate lacks: it does not stop \
+     a life-size print of your face (docs/PAD_SELFTEST.md). Reinstall the \
+     package or unset pad_vit/pad_ir in settings.conf"
         .into()
 }
 
@@ -1427,7 +1429,8 @@ mod tests {
         let none_line = doctor_line();
         assert!(none_line.starts_with("none"), "got: {none_line}");
         assert!(
-            none_line.contains("models enable flir") && none_line.contains("life-size print"),
+            none_line.contains("shipped PAD cues are not active")
+                && none_line.contains("life-size print"),
             "got: {none_line}"
         );
 

@@ -65,6 +65,7 @@ weights derived from these sets (see `models/README.md` and ADR-0004).
 | `bench_cascade.py` | `results-cascade.json`, `results-cascade.log` | Per-environment detection rate (YuNet vs BlazeFace vs cascade) and the 468-vs-478 mesh eye-NME |
 | `bench_mp_results` (via `bench_cascade.py`/mediapipe harness) | `results-mp_results.json` | Detector eye-NME and standalone 468-vs-478 landmarker NME |
 | `bench_insightface.py` | n/a | Full AuraFace-vs-InsightFace comparison across all sets |
+| FRIR eval (2026-08-21, ad-hoc over these same protocols) | `results-frir.json`, `results-frir.log` | ModelScope `iic/cv_manual_face-recognition_frir` vs AuraFace on CBSR + Tufts under irlume's pipeline; see `docs/research/2026-08-21-frir-ir-recognizer-evaluation.md` |
 | `blaze_parity.py` | n/a | BlazeFace ONNX decode parity vs the official MediaPipe runtime (IoU, keypoint px error) |
 
 ## The headline numbers and where to read them
@@ -75,6 +76,12 @@ weights derived from these sets (see `models/README.md` and ADR-0004).
   InsightFace buffalo scores 99.4% (`results-lfw.json`), higher, but its weights
   are non-commercial, which is why irlume ships AuraFace instead. This is a
   deliberate license-over-peak-accuracy tradeoff, stated plainly.
+- **IR recognizer candidate FRIR: rejected** (`results-frir.json`). ModelScope's
+  IR-native FRIR loses to the shipped AuraFace even on active-NIR CBSR
+  (EER 1.50% vs 0.77%) and collapses on Tufts NIR↔NIR (15.1% vs 1.43%) and
+  RGB↔RGB (15.2% vs 0.40%) under irlume's own detection/alignment. The
+  dedicated-IR-recognizer bar (beat AuraFace-on-IR publicly, then live) stays
+  open with no current candidate.
 - **IR adapter overfit: Tufts NIR→NIR EER 1.43% (raw) vs 1.53% (+v3 adapter)**
   (`results-nir_results.json`, `tufts.nir_nir`). On CBSR, the adapter's own
   training data, it instead improved (0.77% → 0.37%, `cbsr_nir`). Helping the

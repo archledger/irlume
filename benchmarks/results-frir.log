@@ -1,0 +1,13 @@
+[ WARN:0@0.025] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+latency_ms: {'auraface': 37.98, 'frir': 1.93}
+[CBSR det] detect=1.0000 eyes_in_box=1.0000 eye_nme=0.0530 fallbacks=0
+[CBSR] auraface: EER=0.0077 TAR@1e-3=0.9830 rank1=1.0000
+[CBSR] frir: EER=0.0150 TAR@1e-3=0.9740 rank1=0.9979
+[Tufts det] rgb=1.0000 nir=0.9929
+[Tufts nir_nir] auraface: EER=0.0143 TAR@1e-3=0.9363
+[Tufts nir_nir] frir: EER=0.1510 TAR@1e-3=0.3040
+[Tufts rgb_rgb] auraface: EER=0.0040 TAR@1e-3=0.9840
+[Tufts rgb_rgb] frir: EER=0.1520 TAR@1e-3=0.3400
+[Tufts xspec1model] auraface: EER=0.0090 TAR@1e-3=0.9745
+[Tufts xspec1model] frir: EER=0.1025 TAR@1e-3=0.4457
+wrote /tmp/frir-bench/results_frir_bench.json

@@ -1,0 +1,105 @@
+{
+  "ort": "1.27.0",
+  "latency_ms": {
+    "auraface": 37.98,
+    "frir": 1.93
+  },
+  "cbsr_nir": {
+    "detection": {
+      "images": 3940,
+      "detect_rate": 1.0,
+      "gt_eyes_in_box_rate": 1.0,
+      "gt_align_fallbacks": 0,
+      "eye_nme_mean": 0.05295662727480854,
+      "eye_nme_p95": 0.09428756614418426
+    },
+    "auraface": {
+      "verification": {
+        "eer": 0.007666666666666688,
+        "auc": 0.9994966666666667,
+        "tar@far0.01": 0.993,
+        "tar@far0.001": 0.983,
+        "pairs_used": 6000
+      },
+      "rank1_ident": {
+        "acc": 1.0,
+        "probes": 2364,
+        "gallery_ids": 197
+      }
+    },
+    "frir": {
+      "verification": {
+        "eer": 0.015000000000000006,
+        "auc": 0.9963237777777778,
+        "tar@far0.01": 0.9843333333333333,
+        "tar@far0.001": 0.974,
+        "pairs_used": 6000
+      },
+      "rank1_ident": {
+        "acc": 0.9978849407783418,
+        "probes": 2364,
+        "gallery_ids": 197
+      }
+    }
+  },
+  "tufts": {
+    "detection": {
+      "rgb": {
+        "images": 3234,
+        "detected": 3234,
+        "detect_rate": 1.0
+      },
+      "nir": {
+        "images": 3234,
+        "detected": 3211,
+        "detect_rate": 0.9928880643166358
+      }
+    },
+    "nir_nir": {
+      "auraface": {
+        "eer": 0.014333333333333321,
+        "auc": 0.9987338888888889,
+        "tar@far0.01": 0.9833333333333333,
+        "tar@far0.001": 0.9363333333333334,
+        "pairs_used": 6000
+      },
+      "frir": {
+        "eer": 0.15100000000000002,
+        "auc": 0.9202018888888889,
+        "tar@far0.01": 0.541,
+        "tar@far0.001": 0.304,
+        "pairs_used": 6000
+      }
+    },
+    "rgb_rgb": {
+      "auraface": {
+        "eer": 0.004000000000000002,
+        "auc": 0.9998744444444445,
+        "tar@far0.01": 0.9983333333333333,
+        "tar@far0.001": 0.984,
+        "pairs_used": 6000
+      },
+      "frir": {
+        "eer": 0.15200000000000002,
+        "auc": 0.9233193333333334,
+        "tar@far0.01": 0.4856666666666667,
+        "tar@far0.001": 0.34,
+        "pairs_used": 6000
+      }
+    },
+    "cross_spectral_same_model_rgb_enroll_nir_verify": {
+      "auraface": {
+        "eer": 0.009031454375583938,
+        "auc": 0.9996803653278046,
+        "tar@far0.01": 0.9915914045468701,
+        "tar@far0.001": 0.9744627841793834
+      },
+      "frir": {
+        "eer": 0.10246029274369353,
+        "auc": 0.959849545915284,
+        "tar@far0.01": 0.6982248520710059,
+        "tar@far0.001": 0.4456555590158829
+      }
+    }
+  }
+}

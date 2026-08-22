@@ -11,6 +11,7 @@ regenerate scores from your own captures.
 |---|---|---|
 | FLIR (MIT) | `https://modelscope.cn/api/v1/models/damo/cv_manual_face-liveness_flir/repo?FilePath=model.onnx&Revision=master` | `df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72` |
 | anti-spoof-mn3 (Apache-2.0) | `https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/anti-spoof-mn3/anti-spoof-mn3.onnx` | `c4c99af04603b62d7e44f6f4daeb33e0daeccc696008c0b1d62f6f5cebbb3262` |
+| FLXC (MIT) | `https://modelscope.cn/api/v1/models/iic/cv_manual_face-liveness_flxc/repo?FilePath=model.onnx` | `2efcdfeec34a474eaf94b425410635ae9b6b0ba7183dfdcdbd4c573daabbac2e` |
 
 ## Scripts
 
@@ -26,6 +27,12 @@ regenerate scores from your own captures.
 - `live-flir-test.sh <name> [ir-device]`: one-shot live capture + score:
   a 36-frame IR strobe burst via the `landmark_dump` example, each lit frame
   scored immediately. Needs `ORT_DYLIB_PATH` and the shipped YuNet model.
+- `flxc_live_score.py <corpus-root> <out.csv>`: scores the 2026-08-12 flrgb
+  live-session corpora (genuine-desk / genuine-lowlight / attack-print ppm
+  trees) with the FLXC color-flash PAD model in its degenerate single-image
+  mode (4x channel replication, both the shipped landmark-warp and the card's
+  96/112 bbox-pad routes). Verdict and analysis:
+  `docs/research/2026-08-21-flxc-colorflash-pad-evaluation.md` (rejected).
 
 Python deps: `numpy`, `opencv-python` (>= 4.6 for `FaceDetectorYN`),
 `onnxruntime`. Detection uses irlume's shipped YuNet file.

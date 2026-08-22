@@ -89,7 +89,7 @@ fn consume_manifest_entry(manifest: &mut BTreeMap<String, String>, rel: &str, by
     let expected = manifest
         .remove(rel)
         .unwrap_or_else(|| panic!("{rel}: not in the corpus manifest"));
-    let actual = irlume_common::thirdparty::sha256_hex(bytes);
+    let actual = irlume_common::sha256_hex(bytes);
     assert_eq!(actual, expected, "{rel}: content differs from the manifest");
 }
 
@@ -199,7 +199,7 @@ fn parity_skew() -> Option<f32> {
 /// cannot establish anything about the shipped one).
 fn read_pinned(path: &str, expected: &str, label: &str) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{path}: read {label}: {e}"));
-    let actual = irlume_common::thirdparty::sha256_hex(&bytes);
+    let actual = irlume_common::sha256_hex(&bytes);
     assert_eq!(actual, expected, "{path}: not the shipped {label}");
     bytes
 }

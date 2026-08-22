@@ -265,101 +265,6 @@ fn pad_ir_enabled() -> bool {
     )
 }
 
-/// Resolve the opt-in third-party RECOGNIZER selection (#276 stage 4), or EXIT.
-///
-/// The failure policy is the opposite of the PAD cue's fall-back-to-nothing:
-/// an explicit `third_party_recognizer` selection is an authentication-policy
-/// choice, and silently substituting the shipped recognizer would run a
-/// DIFFERENT grant-capable decision system against the templates the operator
-/// kept. Any invalid explicit selection refuses to start; PAM treats an
-/// unavailable daemon as password fallback, so fail-closed means "password",
-/// never lockout. `None` = nothing selected, use the shipped default. The
-/// returned VERIFIED WEIGHTS are what the engine must load: re-reading the path
-/// later (or at a post-panic rebuild) would let a swap pair new weights with
-/// the threshold measured for the old ones. They carry the digest checked here,
-/// so the engine tags the embedding space without hashing them again (#346).
-fn resolve_thirdparty_recognizer() -> Option<(irlume_common::HashedModel, f32, String)> {
-    std::env::var("IRLUME_THIRDPARTY_RECOGNIZER")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            irlume_common::config::read_kv(
-                "settings.conf",
-                irlume_common::thirdparty::RECOGNIZER_SETTINGS_KEY,
-            )
-        })
-        .map(|name| {
-            let name = name.trim().to_string();
-            let entry = irlume_common::thirdparty::recognizer_override(
-                irlume_common::thirdparty::by_name(&name),
-            )
-            .unwrap_or_else(|why| {
-                eprintln!(
-                    "irlumed: third_party_recognizer='{name}' refused ({why:?}); refusing to start so face auth falls back to the password"
-                );
-                std::process::exit(1);
-            });
-            let path = irlume_common::thirdparty::model_path(entry);
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-                eprintln!(
-                    "irlumed: third-party recognizer '{name}' selected but {} unreadable ({e}); refusing to start so face auth falls back to the password",
-                    path.display()
-                );
-                std::process::exit(1);
-            });
-            let weights = irlume_common::HashedModel::new(bytes);
-            if weights.sha256() != entry.sha256 {
-                eprintln!(
-                    "irlumed: third-party recognizer '{name}' checksum mismatch (sha256 {}); refusing to start so face auth falls back to the password",
-                    weights.sha256()
-                );
-                std::process::exit(1);
-            }
-            (weights, entry.threshold, entry.name.to_string())
-        })
-}
-
-/// The explicit third-party DETECTOR selection, same contract and same
-/// fail-closed rule as the recognizer above: an invalid selection refuses to
-/// start (PAM reads an absent daemon as password fallback), a valid one
-/// returns the VERIFIED bytes plus the entry's measured threshold and name.
-/// The wiring target is the RESCUE slot only; YuNet stays primary.
-fn resolve_thirdparty_detector() -> Option<(Vec<u8>, f32, String)> {
-    irlume_common::config::read_kv(
-        "settings.conf",
-        irlume_common::thirdparty::DETECTOR_SETTINGS_KEY,
-    )
-    .filter(|v| !v.trim().is_empty())
-    .map(|name| {
-        let name = name.trim().to_string();
-        let entry = irlume_common::thirdparty::detector_override(
-            irlume_common::thirdparty::by_name(&name),
-        )
-        .unwrap_or_else(|why| {
-            eprintln!(
-                "irlumed: third_party_detector='{name}' refused ({why:?}); refusing to start so face auth falls back to the password"
-            );
-            std::process::exit(1);
-        });
-        let path = irlume_common::thirdparty::model_path(entry);
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-            eprintln!(
-                "irlumed: third-party detector '{name}' selected but {} unreadable ({e}); refusing to start so face auth falls back to the password",
-                path.display()
-            );
-            std::process::exit(1);
-        });
-        let digest = irlume_common::thirdparty::sha256_hex(&bytes);
-        if digest != entry.sha256 {
-            eprintln!(
-                "irlumed: third-party detector '{name}' checksum mismatch (sha256 {digest}); refusing to start so face auth falls back to the password"
-            );
-            std::process::exit(1);
-        }
-        (bytes, entry.threshold, entry.name.to_string())
-    })
-}
-
 fn main() {
     // FIRST, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
@@ -449,7 +354,7 @@ fn main() {
             // The recognizer's verified bytes come back and go straight into the
             // engine below (#346), so the 260MB file is read and hashed once per
             // start rather than once here and once again inside the loader.
-            let mut verified_recognizer = verify_models(
+            let verified_recognizer = verify_models(
                 &models_to_verify([&det, &model, &mesh, &blaze], &adapter, &vit_pad_path, &pad_ir_path),
                 Some(&model),
             );
@@ -493,83 +398,23 @@ fn main() {
                     Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
                 }
             }
-            // Opt-in third-party PAD cue (`irlume models`): enabled via settings.conf,
-            // weights fetched by the CLI to the state dir. Unlike the shipped models'
-            // warn-first verification, a third-party file MUST match its catalog pin:
-            // on any mismatch the cue is skipped (the built-in gate alone is the safe
-            // default), never trusted. Env override for sandboxes.
-            let tp_pad: Option<(String, f32, String)> = std::env::var("IRLUME_THIRDPARTY_PAD")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .or_else(|| {
-                    irlume_common::config::read_kv("settings.conf", irlume_common::thirdparty::SETTINGS_KEY)
-                })
-                .and_then(|name| {
-                    let Some(entry) = irlume_common::thirdparty::by_name(name.trim()) else {
-                        eprintln!("irlumed: WARNING: third_party_pad='{name}' is not in the catalog; ignoring");
-                        return None;
-                    };
-                    // The settings key names a PAD cue; wiring any other stage
-                    // here would run, say, a recognizer as an anti-spoof score.
-                    // The installer refuses closed stages too, but this key is
-                    // root-editable text, so the daemon checks what it loads.
-                    if entry.stage != irlume_common::thirdparty::Stage::Pad {
-                        eprintln!(
-                            "irlumed: WARNING: third_party_pad='{name}' is a {} model, not a PAD cue; ignoring",
-                            entry.stage.as_str()
-                        );
-                        return None;
-                    }
-                    let path = irlume_common::thirdparty::model_path(entry);
-                    let bytes = match std::fs::read(&path) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!(
-                                "irlumed: WARNING: third-party PAD '{name}' enabled but {} unreadable ({e}); cue disabled (run `sudo irlume models enable {name}` to re-fetch)",
-                                path.display()
-                            );
-                            return None;
-                        }
-                    };
-                    let digest = irlume_common::thirdparty::sha256_hex(&bytes);
-                    if digest != entry.sha256 {
-                        eprintln!(
-                            "irlumed: WARNING: third-party PAD '{name}' checksum mismatch (sha256 {digest}); cue DISABLED, refusing to load unpinned weights"
-                        );
-                        return None;
-                    }
-                    Some((
-                        path.to_string_lossy().into_owned(),
-                        entry.threshold,
-                        entry.name.to_string(),
-                    ))
-                });
-            // Opt-in third-party RECOGNIZER (#276 stage 4). Same trust chain
-            // as the PAD cue — catalog entry, stage check, pinned checksum —
-            // but the failure policy is the opposite of the cue's: an explicit
-            // third_party_recognizer selection is an authentication-policy
-            // choice, and silently substituting the shipped recognizer would
-            // run a DIFFERENT grant-capable decision system against the
-            // templates the operator kept. Any invalid selection refuses to
-            // start; PAM treats an unavailable daemon as password fallback, so
-            // fail-closed here means "password", never lockout. Absence of
-            // the setting selects the shipped default as always. The VERIFIED
-            // BYTES are retained and handed to the engine: re-reading the path
-            // at load (or at a post-panic rebuild) would let a swap pair new
-            // weights with the threshold measured for the old ones. The
-            // recognition stage is OPEN (thirdparty::Stage::open, since
-            // 2026-08-05), so an explicit selection naming a Recognition
-            // catalog entry loads; a name absent from the catalog, naming
-            // another stage, or with missing or mismatched weights still
-            // refuses to start.
-            let tp_rec: Option<(irlume_common::HashedModel, f32, String)> =
-                resolve_thirdparty_recognizer();
-            let tp_det: Option<(Vec<u8>, f32, String)> = resolve_thirdparty_detector();
-            // A third-party selection replaces the shipped recognizer outright,
-            // so the shipped bytes are dead weight from here on; free them
-            // before the load instead of carrying 260MB through it.
-            if tp_rec.is_some() {
-                verified_recognizer = None;
+            // Legacy third-party-model keys (BYOM removed, ADR-0015): ignored
+            // with a notice so an operator carrying an old selection learns why
+            // the engine runs the shipped stack (a buffalo enrollment is
+            // quarantined by its embedding-space tag; re-enroll to use face auth).
+            for legacy_key in [
+                "third_party_pad",
+                "third_party_recognizer",
+                "third_party_detector",
+            ] {
+                if let Some(name) = irlume_common::config::read_kv("settings.conf", legacy_key) {
+                    eprintln!(
+                        "irlumed: NOTICE: settings.conf key '{legacy_key}={name}' is ignored: \
+                         third-party model support was removed; the shipped models-v1 \
+                         stack is the only supported set (re-enroll if you enrolled under \
+                         a third-party recognizer)"
+                    );
+                }
             }
             // Engine factory: (re)loads the models and rebinds devices/adapters. Used
             // once at startup and again by the camera worker to rebuild the engine after
@@ -582,19 +427,7 @@ fn main() {
             // the path, which is why the closure takes it as an argument instead
             // of capturing it and holding 260MB for the daemon's life.
             let build_engine = move |recognizer: Option<&irlume_common::HashedModel>| {
-                match &tp_rec {
-                    // The RETAINED verified bytes, not the path: a post-panic
-                    // rebuild must run exactly the artifact the pin check saw.
-                    Some((weights, thr, name)) => {
-                        irlume_auth::Engine::load_with_recognizer_weights(&det, weights).map(|e| {
-                            eprintln!(
-                                "irlumed: third-party recognizer '{name}' loaded (threshold {thr}; IR matching disabled — unmeasured for this model)"
-                            );
-                            e.with_thirdparty_recognizer(*thr, name)
-                        })
-                    }
-                    None => load_shipped_recognizer(&det, &model, recognizer),
-                }
+                load_shipped_recognizer(&det, &model, recognizer)
                     .map(|e| e.with_devices(&rgb_dev, &ir_dev))
                     .and_then(|e| e.with_ir_adapter(&adapter))
                     // A mesh that fails to LOAD degrades, it does not kill the
@@ -629,19 +462,7 @@ fn main() {
                         }
                         Ok(e)
                     })
-                    .and_then(|e| match &tp_det {
-                        Some((bytes, thr, name)) => {
-                            eprintln!(
-                                "irlumed: third-party detector '{name}' loaded into the RESCUE slot (threshold {thr}; YuNet stays primary)"
-                            );
-                            e.with_full_range_rescue(bytes, *thr, name)
-                        }
-                        None => e.with_blaze_rescue(&blaze),
-                    })
-                    .and_then(|e| match &tp_pad {
-                        Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
-                        None => Ok(e),
-                    })
+                    .and_then(|e| e.with_blaze_rescue(&blaze))
                     // Shipped PAD cues (ADR-0013): default-on, kill-switched.
                     // The engine builders no-op on an absent file (degrade to
                     // no cue); the startup lines below name the absence.
@@ -676,27 +497,14 @@ fn main() {
                         "irlumed: FaceMesh (passive liveness) {}",
                         if e.has_mesh() { "loaded" } else { "absent" }
                     );
-                    // Name the occupant: since #295 the rescue slot holds
-                    // either the shipped short-range model or an enabled
-                    // third-party one, and a line that always says
-                    // "BlazeFace" is the stale-claim shape reviewers keep
-                    // finding.
                     eprintln!(
                         "irlumed: rescue detector {}",
-                        match (e.has_blaze_rescue(), e.thirdparty_detector_name()) {
-                            (_, Some(name)) => format!("'{name}' (third-party, full-range)"),
-                            (true, None) => "BlazeFace short-range (shipped)".to_string(),
-                            (false, None) => "absent".to_string(),
+                        if e.has_blaze_rescue() {
+                            "BlazeFace short-range (shipped)"
+                        } else {
+                            "absent"
                         }
                     );
-                    match e.thirdparty_pad_name() {
-                        Some(n) => eprintln!(
-                            "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
-                        ),
-                        None => eprintln!(
-                            "irlumed: third-party PAD cue: none (see the shipped PAD cue lines below for actual coverage)"
-                        ),
-                    }
                     // Shipped PAD cues (ADR-0013): default-on, kill-switched,
                     // with their measured species coverage named so an
                     // operator reading the journal knows what each one does
@@ -2624,9 +2432,6 @@ fn posture(req: &Request) -> RequestPosture<'_> {
 struct EngineBits {
     mesh: bool,
     adapter: bool,
-    third_party_pad: Option<String>,
-    third_party_recognizer: Option<String>,
-    third_party_detector: Option<String>,
     /// The camera facts as the ENGINE observed them when it loaded, so
     /// `Health` can answer from memory. Probing them per request opened
     /// video nodes on a connection thread, outside the camera worker's
@@ -2668,9 +2473,6 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
     publish_engine_bits_raw(EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
-        third_party_pad: engine.thirdparty_pad_name().map(String::from),
-        third_party_recognizer: engine.thirdparty_recognizer_name().map(String::from),
-        third_party_detector: engine.thirdparty_detector_name().map(String::from),
         tier: tier.into(),
         rgb_dev,
         ir_dev,
@@ -2995,11 +2797,6 @@ fn dispatch_status_with_diagnostics(
                 mesh: bits.mesh,
                 adapter: bits.adapter,
                 version: env!("CARGO_PKG_VERSION").into(),
-                // Authoritative loaded-cue name so a non-root TUI can show the
-                // real on/off state (settings.conf is root-only).
-                third_party_pad: bits.third_party_pad.clone(),
-                third_party_recognizer: bits.third_party_recognizer.clone(),
-                third_party_detector: bits.third_party_detector.clone(),
                 apparmor: apparmor_confinement(),
             }
         }
@@ -5208,59 +5005,6 @@ mod tests {
         );
     }
 
-    // An invalid explicit third_party_recognizer selection must REFUSE TO
-    // START, never silently substitute the shipped recognizer: that would run
-    // a different grant-capable decision system than the operator selected
-    // (#279 review). resolve_thirdparty_recognizer exits the process, so
-    // re-exec this test binary as the child that makes the call.
-    #[test]
-    fn recognizer_selection_failures_refuse_to_start() {
-        if std::env::var("IRLUME_TEST_RECOGNIZER_CHILD").is_ok() {
-            // Child: resolution of the env-selected name must exit(1) inside
-            // this call for both an unknown name and a wrong-stage name.
-            let _ = resolve_thirdparty_recognizer();
-            return; // reaching this line means the selection was NOT refused
-        }
-        let exe = std::env::current_exe().unwrap();
-        let run = |selection: &str| {
-            std::process::Command::new(&exe)
-                .args([
-                    "tests::recognizer_selection_failures_refuse_to_start",
-                    "--exact",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env("IRLUME_TEST_RECOGNIZER_CHILD", "1")
-                .env("IRLUME_THIRDPARTY_RECOGNIZER", selection)
-                .output()
-                .unwrap()
-        };
-        // Not in the catalog at all.
-        let out = run("ghost");
-        assert!(!out.status.success(), "an unknown selection must refuse");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            err.contains("refused (NotInCatalog)") && err.contains("falls back to the password"),
-            "stderr was: {err}"
-        );
-        // In the catalog, but a PAD model: naming it as THE recognizer is
-        // nonsense the daemon must refuse, not reinterpret.
-        let out = run("flir");
-        assert!(!out.status.success(), "a wrong-stage selection must refuse");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            err.contains("refused (WrongStage(\"pad\"))"),
-            "stderr was: {err}"
-        );
-        // StageClosed is unreachable until a Recognition entry exists in the
-        // catalog; the decision itself is pinned in irlume-common's tests.
-    }
-
-    // Regression: 834c71e (companion guard). Excluding the optional adapter
-    // must not soften strict mode for the SHIPPED models: under
-    // IRLUME_MODELS_STRICT=1 an unreadable/deleted shipped model still refuses
-    // to start. verify_models exits the process, so re-exec this test binary
-    // as the child that makes the call.
     #[test]
     fn strict_verify_still_refuses_a_missing_shipped_model() {
         if std::env::var("IRLUME_TEST_VERIFY_CHILD").is_ok() {
@@ -7264,9 +7008,6 @@ mod tests {
         publish_engine_bits_raw(EngineBits {
             mesh: true,
             adapter: true,
-            third_party_pad: Some("flir".into()),
-            third_party_recognizer: None,
-            third_party_detector: None,
             tier: "none".into(),
             rgb_dev: None,
             ir_dev: None,
@@ -7278,14 +7019,8 @@ mod tests {
         };
         let resp = dispatch_status(&Request::Health, &peer).expect("status request");
         match resp {
-            Response::Health {
-                mesh,
-                adapter,
-                third_party_pad,
-                ..
-            } => {
+            Response::Health { mesh, adapter, .. } => {
                 assert!(mesh && adapter);
-                assert_eq!(third_party_pad.as_deref(), Some("flir"));
             }
             other => panic!("expected Health, got {other:?}"),
         }
@@ -8387,7 +8122,6 @@ mod tests {
                 mesh,
                 adapter,
                 version,
-                third_party_pad,
                 ..
             } => {
                 // IRLUME_FORCE_NO_IR=1 (set by the shared engine init) forces
@@ -8397,9 +8131,6 @@ mod tests {
                 assert_eq!(ir_dev, None);
                 // The bare shared engine loaded no optional models.
                 assert!(!mesh && !adapter);
-                // No opt-in PAD cue loaded -> Health reports None (the field
-                // the TUI uses for the authoritative on/off state).
-                assert_eq!(third_party_pad, None);
                 assert_eq!(version, env!("CARGO_PKG_VERSION"));
             }
             other => panic!("Health must answer Response::Health, got {other:?}"),

@@ -34,7 +34,6 @@ points at.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the daemon, CLI and PAM module fit together |
 | [INTEGRATION.md](INTEGRATION.md) | Driving irlume from your own software |
 | [MACHINE-API.md](MACHINE-API.md) | The versioned machine API, field by field |
-| [THIRD-PARTY-MODELS.md](THIRD-PARTY-MODELS.md) | Models irlume has measured, and at what threshold |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Dev shell, tests, and the local loop |
 | [CREDITS.md](CREDITS.md) | The projects irlume builds on |
 | [ROADMAP.md](ROADMAP.md) | What is planned |

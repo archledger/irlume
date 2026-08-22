@@ -198,23 +198,18 @@ fn main() -> std::process::ExitCode {
         (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test(&args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
-        // Presence-matched like `profiles list --json`: a contract flag before
-        // the subcommand must not displace it into the human handler.
+        // The machine capability survives the lane's removal (ADR-0015):
+        // contract 1 keeps `models list --json` with every stage closed.
+        // Presence-matched like `profiles list --json`: a contract flag
+        // before the subcommand must not displace it.
         (Some("models"), _)
             if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
         {
             machine::models_list(&args)
         }
-        // Refuse rather than ignore: `models --json` reached the human renderer
-        // and printed prose, so a script that asked for JSON silently got
-        // something it could not parse. The capability is `models list --json`.
-        (Some("models"), _) if args.iter().any(|a| a == "--json") => {
-            eprintln!(
-                "[models] --json is available on `models list`; try: irlume models list --json"
-            );
-            std::process::ExitCode::from(2)
-        }
-        (Some("models"), sub) => models::run(sub, &args),
+        // Removed with the third-party/BYOM lane (ADR-0015): one clear line
+        // for scripts and muscle memory, not silence.
+        (Some("models"), _) => models::removed_notice(),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
         (Some("credential-release-challenge"), sub) => {
             commands::credential_release_challenge(sub, &args)
@@ -2629,7 +2624,7 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
         let file_sha12 = |p: &str| -> serde_json::Value {
             match std::fs::read(p) {
                 Ok(b) => {
-                    let d = irlume_common::thirdparty::sha256_hex(&b);
+                    let d = irlume_common::sha256_hex(&b);
                     d[..12].to_string().into()
                 }
                 Err(_) => serde_json::Value::Null,
@@ -3920,8 +3915,7 @@ fn doctor_run(
     // Each stage's model CANDIDATE from this process's search order. A
     // candidate, not a claim about the daemon: the service unit (or a
     // drop-in) sets the daemon's own environment, which this shell cannot
-    // observe. The PAD stage is the third-party line below; its built-in
-    // gate is code.
+    // observe.
     dout!(
         report,
         "[doctor] pipeline stages (candidate per this shell's search order):"
@@ -3965,32 +3959,6 @@ fn doctor_run(
         dout!(report, "  {}: {line}", s.stage);
         report.check_detail(id, state, line);
     }
-    // Derived from the catalog, never spelled out: this line said "the pad stage
-    // only today" through the release that opened recognition, so doctor denied a
-    // feature the same binary shipped.
-    {
-        let open: Vec<&str> = irlume_common::thirdparty::Stage::ALL
-            .iter()
-            .filter(|st| st.open())
-            .map(|st| st.as_str())
-            .collect();
-        dout!(
-            report,
-            "  (third-party models accepted for: {}; #276. `irlume models` lists them)",
-            if open.is_empty() {
-                "no stage".to_string()
-            } else {
-                open.join(", ")
-            }
-        );
-    }
-    dout!(
-        report,
-        "[doctor] third-party PAD model: {}",
-        models::doctor_line()
-    );
-    report.check_detail("third-party-pad-model", State::Info, models::doctor_line());
-
     // --- companion factors / data-at-rest ----------------------------------
     let fp_names = irlume_fingerprint::device_names();
     let fp = match fp_names.len() {

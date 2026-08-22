@@ -426,48 +426,18 @@ The built-in gate does not stop a life-size print. Measured twice on the same
 hardware, on 2026-06-30 and again on 2026-08-02, an angled vinyl print of the
 enrolled user's face produces the same centre-to-edge infrared falloff a real
 face does, so no threshold separates them and the gate accepts the print. The
-`flir` cue denied the same print at `p_fake` 0.999 and above. It is the only
-defence against this attack that has been measured to work, and it is off until
-you turn it on:
+measured defence is the SHIPPED PAD pair (ADR-0013): the FLIR IR cue denied
+that print at `p_fake` 0.999 and above, and the ViT RGB cue catches the
+print/banner species at login distance. Both ship default-on and verified
+against `models/SHA256SUMS` at daemon startup; kill switches if a cue misfires
+on your hardware: `IRLUME_PAD_IR=0` (service env `pad_ir=0`) and
+`IRLUME_PAD_VIT=0` (`pad_vit=0`), then `sudo systemctl restart irlumed`.
 
-```sh
-sudo irlume models enable flir
-```
-
-The rest of this section is why it is opt-in rather than shipped.
-
-irlume's anti-spoof gate is algorithmic by default. `irlume models` lists
-externally-trained models, and what enabling one does depends on the pipeline
-stage its entry names. A PAD entry is an extra, deny-only liveness cue: it can
-reject a presentation but can never approve one the built-in gate rejected. A
-recognition entry is not deny-only: enabling it replaces the shipped
-recognizer for RGB matching at the threshold irlume measured, and it turns off
-IR matching, fusion, and dark login, which are unmeasured for that model. How
-you obtain the file is also per entry. `flir` is fetched once from the
-publisher by irlume, pinned by checksum, after you confirm the license and
-provenance on screen; `buffalo` you supply yourself with `sudo irlume models
-add buffalo <path>`, because its licence makes obtaining it your decision.
-Either way, these models carry a real license on their weights but fail the
-shipped-stack provenance bar (ADR-0001), so irlume does not ship or mirror
-them, and each catalog entry was measured on real hardware first
-([docs/pad-results/](pad-results/)).
-
-```sh
-irlume models                     # what exists, what it measured, what's enabled
-sudo irlume models enable flir    # fetch + verify + enable (typed confirmation)
-sudo irlume models disable [name] # delete the weights, back to the shipped stack
-```
-
-A bare `models disable` works while one model is enabled; with more than one
-enabled it errors and asks you to name which.
-
-`irlume doctor` names the enabled models. A refusal costs different things per
-stage: a PAD model whose checksum stops matching has its weights refused, and
-the daemon falls back to the built-in gate alone; a selected recognizer that
-is refused (missing file, failed checksum) stops the daemon from starting at
-all, so face auth falls back to the password.
-
----
+Third-party / bring-your-own model support was removed (ADR-0015): irlume
+ships and supports exactly the models-v1 set it was validated with, and there
+is no external recognizer path. The historical measurements behind that
+decision live in [docs/pad-results/](pad-results/) and
+[docs/recognition-results/](recognition-results/).
 
 ## Configuration reference
 

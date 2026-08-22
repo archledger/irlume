@@ -195,7 +195,7 @@ impl TfliteSession {
         expected_sha256: &str,
         threads: i32,
     ) -> irlume_common::Result<Self> {
-        let actual = irlume_common::thirdparty::sha256_hex(bytes);
+        let actual = irlume_common::sha256_hex(bytes);
         if actual != expected_sha256 {
             return Err(err_str(format!(
                 "model sha256 mismatch: expected {expected_sha256}, got {actual}"
@@ -332,7 +332,7 @@ mod tests {
         // The pin IS the flow under test: bytes are verified, then the SAME
         // buffer is loaded.
         assert_eq!(
-            irlume_common::thirdparty::sha256_hex(&bytes),
+            irlume_common::sha256_hex(&bytes),
             FULL_RANGE_SHA256,
             "{model_path}: not the pinned full-range artifact"
         );

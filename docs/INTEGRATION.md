@@ -74,7 +74,7 @@ are the exceptions a consumer should know before invoking them: `auth test
 | `irlume doctor --json` | `doctor-json` | every readiness check as an id and a state |
 | `irlume profiles list --json [--user U]` | `profiles-list-json` | profile and scan display names, per-user liveness flags |
 | `irlume login status --json` | `login-status-json` | which PAM surfaces carry face auth |
-| `irlume models list --json` | `models-list-json` | every pipeline stage's model candidate, and the third-party state of the open stages |
+| `irlume models list --json` | `models-list-json` | every pipeline stage's model candidate (all stages closed to third-party models since ADR-0015) |
 | `irlume auth test --events=jsonl` | `auth-test-events` | does the caller's live face match its own enrolment, as a stream of events; captures from the camera, releases nothing |
 | `irlume login plan --action A --json` | `login-plan-json` | what `login enable` or `disable` would change, without changing anything |
 | `irlume login apply` / `verify` / `rollback` | `login-transactions` | carry out, check, and undo a planned PAM change; `apply` and `rollback --apply` write to the system and need root, `verify` only reads |

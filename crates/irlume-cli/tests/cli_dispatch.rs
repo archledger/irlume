@@ -902,9 +902,6 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -941,9 +938,6 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -982,9 +976,6 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             mesh: true,
             adapter: false,
             version: env!("CARGO_PKG_VERSION").into(),
-            third_party_pad: None,
-            third_party_recognizer: None,
-            third_party_detector: None,
             apparmor: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -1071,16 +1062,13 @@ fn daemon_error_responses_surface_per_command() {
 
 #[test]
 fn forget_model_sends_the_resolved_space_over_the_wire() {
-    // The CLI resolves a catalog name to its embedding-space tag; the daemon
+    // The CLI resolves the model NAME to its embedding-space tag; the daemon
     // only ever sees the tag. The fake daemon asserts the exact request, so a
-    // resolver regression (wrong pin, name passed through raw) fails here and
-    // not on a real enrollment.
+    // resolver regression (name passed through raw, tag mangled) fails here
+    // and not on a real enrollment. With the third-party lane removed
+    // (ADR-0015) the resolvable names are 'shipped' and literal embed spaces.
     let sb = Sandbox::new("forgetwire");
-    let rec = irlume_common::thirdparty::CATALOG
-        .iter()
-        .find(|m| m.stage == irlume_common::thirdparty::Stage::Recognition)
-        .expect("the catalog carries a recognizer");
-    let want = format!("embed:{}", rec.sha256);
+    let want = irlume_core::storage::LEGACY_RECOGNIZER_SPACE.to_string();
     serve(&sb.sock(), move |req| match req {
         Request::ForgetRecognizer { user, space } if user == "tester" && *space == want => {
             Response::Ok(format!("forgot recognizer {space}: 2 scan(s) removed"))
@@ -1088,7 +1076,7 @@ fn forget_model_sends_the_resolved_space_over_the_wire() {
         other => Response::Error(format!("unexpected request {other:?}")),
     });
     let (code, out, err) = run(
-        &mut sb.cmd(&["profiles", "forget-model", rec.name, "--user", "tester"]),
+        &mut sb.cmd(&["profiles", "forget-model", "shipped", "--user", "tester"]),
         "forget-model",
     );
     assert_eq!(code, 0, "{err}");

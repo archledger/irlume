@@ -65,9 +65,10 @@ worst-served group shifts to Middle Eastern under buffalo_l.
 the weights are licensed for non-commercial research only. Bundling it would
 break irlume's clean Bill of Materials and the GPL's promise of downstream
 commercial freedom (see `docs/ARCHITECTURE.md` and the model-licensing
-notes). We accept a fairness/accuracy cost to stay legally clean. Since
-2026-08-05 a user may bring it themselves: the measured `buffalo` catalog
-entry (docs/THIRD-PARTY-MODELS.md) pins the artifact and its threshold, and
+notes). We accept a fairness/accuracy cost to stay legally clean. (A measured
+bring-your-own lane for that model existed from 2026-08-05 until it was
+removed with the rest of the third-party model support, ADR-0015.)
+
 irlume still distributes nothing.
 
 The gap is therefore **partly recognizer quality** (a better-trained model helps)

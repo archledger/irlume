@@ -29,6 +29,38 @@ pub(crate) const RATE_WINDOW_CAPACITY: usize = 30;
 /// rejects 10 Hz.
 pub(crate) const DEFAULT_TOLERANCE_PERCENT: u32 = 98;
 
+/// Startup dequeues discarded before the rate window is measured, per stream
+/// role. The flush exists to skip the STREAMON delivery transient, and its
+/// length is a measured property of the hardware, not a conservative guess:
+///
+/// - Single-stream startup has ZERO sequence gaps on every fleet node
+///   measured (ASUS RGB+IR, NexiGo N930W RGB+IR, Logitech Brio RGB; three
+///   runs each, examples/startup_transient.rs). The 32-gap startup that
+///   motivated the original 30-frame flush was measured under DUAL-load
+///   starvation, a concurrent-mode failure this gate never sees in
+///   sequential capture.
+/// - The transient that IS real is the NexiGo IR's slow first frames: a
+///   window seeded at dequeue 0 measures 14.018 fps (floor 14.7,
+///   fail-closed), at dequeue 3 it is marginal (14.676-14.705 across runs),
+///   and from dequeue 4 it is settled (>=14.734). Ten dequeues cover that
+///   observed 4-frame tail with 2.5x margin.
+/// - No RGB node measured needs any flush: windows seeded at dequeue 0
+///   deliver 14.88-29.64 fps against the 7.5 fps RGB floor, 2x-4x margin.
+///
+/// The cost is per stream session and lands directly on the auth critical
+/// path: the flush was 30 dequeues on BOTH roles (~2 s at 15 fps per stream,
+/// paid serially by each side of a sequential capture). See
+/// docs/research/2026-08-22-startup-flush-fleet-measurement.md for the raw
+/// runs. A future camera whose startup transient exceeds its role's flush
+/// fails CLOSED here (the window misses the floor and the capture errors),
+/// loudly, rather than passing on unaudited evidence.
+pub(crate) const fn startup_flush(role: StreamRole) -> usize {
+    match role {
+        StreamRole::Ir => 10,
+        StreamRole::Rgb => 0,
+    }
+}
+
 /// Exact IR floor: 15 frames per second.
 pub(crate) const IR_FLOOR_NUM: u32 = 15;
 pub(crate) const IR_FLOOR_DEN: u32 = 1;
@@ -527,5 +559,16 @@ mod tests {
         );
         assert_eq!(rgb.policy().floor_num(), RGB_FLOOR_NUM);
         assert_eq!(rgb.policy().floor_den(), RGB_FLOOR_DEN);
+    }
+
+    #[test]
+    fn startup_flush_is_the_fleet_measured_per_role_value() {
+        // IR: the NexiGo N930W's startup transient is settled from dequeue 4
+        // (window seeded earlier measures 14.018-14.705 fps against the 14.7
+        // floor); 10 covers that tail with 2.5x margin.
+        assert_eq!(startup_flush(StreamRole::Ir), 10);
+        // RGB: every measured fleet node needs no flush at all (windows
+        // seeded at dequeue 0 deliver 2x-4x the 7.5 fps floor).
+        assert_eq!(startup_flush(StreamRole::Rgb), 0);
     }
 }

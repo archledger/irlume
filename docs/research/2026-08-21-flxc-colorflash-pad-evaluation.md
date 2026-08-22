@@ -76,12 +76,42 @@ the attack.** At every threshold up to 0.95 the genuine denial rate is greater
 than or equal to the attack denial rate; at 0.99 both collapse. There is no
 operating point, and this is not a tuning problem.
 
-Mechanism, consistent with the vendor's own architecture: with four
-replicated non-flash frames the model has no flash-reflection differences to
-read, and what remains reads ordinary camera imagery as out-of-distribution
-→ spoof. (The demo image passes because it is a genuine flash-session
-capture.) The pad96 route is no better: it merely moves the attack median
-down (0.434) while genuine stays pinned at 0.985 — inverted separation.
+Mechanism, corrected by the at-scale control below: with four replicated
+non-flash frames the model has no flash-reflection differences to read, and
+what remains is domain-sensitive noise, not a usable signal — on this
+camera's imagery it reads the genuine user as spoof at near-saturation
+(overlapping the attack), and on ordinary web photos it smears across the
+entire score range. (The demo image passes because it is a genuine
+flash-session capture.) The pad96 route is no better: it merely moves the
+attack median down (0.434) while genuine stays pinned at 0.985 — inverted
+separation.
+
+## At-scale control: LFW, 13,233 images, 5,749 identities
+
+Same degenerate mode (warp route), every LFW crop scored
+(`flxc_lfw_score.py`, per-frame CSV in
+[`2026-08-21-flxc-lfw-scores.csv`](2026-08-21-flxc-lfw-scores.csv); the mn3
+evaluation used this corpus as its sanity control, so the precedent is
+standing):
+
+| stat | P(fake) |
+|---|---|
+| q25 / median / q75 | 0.087 / 0.329 / 0.637 |
+| q90 / q99 | 0.878 / 0.994 |
+| flagged ≥ 0.5 | **4,591 / 13,233 (34.7%)** |
+| flagged ≥ 0.9 | 1,125 / 13,233 (8.5%) |
+
+LFW is all-genuine (live-person web photos). A usable deny-only cue needs
+the genuine mass near zero; instead it spans the full range with a third of
+ordinary genuine photos above the conventional 0.5 line — no threshold, and
+this cannot be fixed by voting on more of the same frames (voting narrows a
+distribution's extremes, not its 35% mid-band mass). This confirms the
+model card's own 不太鲁棒 ("not robust") warning at 5,749-identity scale,
+and refines the mechanism: the failure is not a uniform OOD→spoof prior
+(LFW mostly does NOT saturate) but instability of the degenerate input —
+camera-dependent, identity-dependent noise. That is strictly worse for a
+security cue: behavior that varies by imaging domain cannot be calibrated
+against a single deployment camera.
 
 ## Why no as-designed (color-flash) live test was attempted
 

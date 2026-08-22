@@ -33,6 +33,15 @@ regenerate scores from your own captures.
   mode (4x channel replication, both the shipped landmark-warp and the card's
   96/112 bbox-pad routes). Verdict and analysis:
   `docs/research/2026-08-21-flxc-colorflash-pad-evaluation.md` (rejected).
+- `flxc_lfw_score.py <lfw-root> <out.csv>`: the FLXC at-scale control — all
+  13,233 LFW crops / 5,749 ids through the degenerate mode; genuine mass
+  smears 0–1 with 35% above 0.5.
+- `flir_public_nir_score.py <cbsr-img-dir> <tufts-nir-dir> <suncal-root> <out.json>`:
+  FLIR revalidation at scale — CBSR 850nm (197 ids), Tufts NIR (110 ids,
+  mismatch arm), and the local NexiGo IR attack bursts through the qualified
+  preprocessing. Result: qualification holds on physics-matched NIR
+  (`docs/research/2026-08-21-flir-public-nir-revalidation.md`); attack bursts
+  show no detectable IR face (non-response).
 
 Python deps: `numpy`, `opencv-python` (>= 4.6 for `FaceDetectorYN`),
 `onnxruntime`. Detection uses irlume's shipped YuNet file.

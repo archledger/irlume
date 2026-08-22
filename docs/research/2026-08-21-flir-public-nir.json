@@ -1,0 +1,112 @@
+{
+ "genuine": {
+  "cbsr_nir": {
+   "n": 3940,
+   "p_fake_min": 0.0,
+   "p_fake_median": 0.0,
+   "p_fake_p90": 0.0001,
+   "p_fake_p99": 0.0085,
+   "p_fake_max": 0.8645,
+   "rejected_at_0.5": 2,
+   "rejected_at_0.9": 0,
+   "no_detect": 0
+  },
+  "tufts_nir": {
+   "n": 3215,
+   "p_fake_min": 0.0,
+   "p_fake_median": 0.3298,
+   "p_fake_p90": 0.9209,
+   "p_fake_p99": 0.9924,
+   "p_fake_max": 0.9994,
+   "rejected_at_0.5": 1279,
+   "rejected_at_0.9": 388,
+   "no_detect": 19
+  }
+ },
+ "attack": {
+  "spoof-01-paper-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 28,
+   "dark_phase": 8
+  },
+  "spoof-02-paper-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 36,
+   "dark_phase": 0
+  },
+  "spoof-03-paper-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 36,
+   "dark_phase": 0
+  },
+  "spoof-04-paper-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 36,
+   "dark_phase": 0
+  },
+  "spoof-05-screen-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 18,
+   "dark_phase": 18
+  },
+  "spoof-06-phone-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 18,
+   "dark_phase": 18
+  },
+  "spoof-07-videoreplay-nexigo-ir": {
+   "n": 0,
+   "p_fake_min": null,
+   "p_fake_median": null,
+   "p_fake_p90": null,
+   "p_fake_p99": null,
+   "p_fake_max": null,
+   "rejected_at_0.5": 0,
+   "rejected_at_0.9": 0,
+   "no_detect": 18,
+   "dark_phase": 18
+  }
+ }
+}

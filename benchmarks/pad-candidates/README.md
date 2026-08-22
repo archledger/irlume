@@ -12,6 +12,7 @@ regenerate scores from your own captures.
 | FLIR (MIT) | `https://modelscope.cn/api/v1/models/damo/cv_manual_face-liveness_flir/repo?FilePath=model.onnx&Revision=master` | `df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72` |
 | anti-spoof-mn3 (Apache-2.0) | `https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/anti-spoof-mn3/anti-spoof-mn3.onnx` | `c4c99af04603b62d7e44f6f4daeb33e0daeccc696008c0b1d62f6f5cebbb3262` |
 | FLXC (MIT) | `https://modelscope.cn/api/v1/models/iic/cv_manual_face-liveness_flxc/repo?FilePath=model.onnx` | `2efcdfeec34a474eaf94b425410635ae9b6b0ba7183dfdcdbd4c573daabbac2e` |
+| ViT liveness (MIT, Adedev-W/LivenessModels-ONNX; Google Drive artifact) | repo `Example/ONNX-python.py` + drive link in README | `c7f8a6f3054b11f9719f5e24d37ec227721608fff8b90373c6c3e7659864161c` |
 
 ## Scripts
 
@@ -42,6 +43,14 @@ regenerate scores from your own captures.
   preprocessing. Result: qualification holds on physics-matched NIR
   (`docs/research/2026-08-21-flir-public-nir-revalidation.md`); attack bursts
   show no detectable IR face (non-response).
+- `vit_liveness_score.py <corpus-root> <out.csv>` / `vit_lfw_score.py <lfw-root> <out.csv>`:
+  the Adedev-W ViT liveness RGB PAD candidate — margin sweep (tight/m25/m96)
+  on the 2026-08-12 live corpus, plus the LFW at-scale control. First RGB
+  candidate with an operating window (m96 @ 0.60, 5-frame voting; window
+  [0.56, 0.604]); NOT wired, live qualification pending — see
+  `docs/research/2026-08-21-vit-liveness-pad-evaluation.md`. The companion
+  `docs/research/2026-08-21-faceid-review.md` records the FaceID repo check
+  (application, nothing adoptable).
 
 Python deps: `numpy`, `opencv-python` (>= 4.6 for `FaceDetectorYN`),
 `onnxruntime`. Detection uses irlume's shipped YuNet file.

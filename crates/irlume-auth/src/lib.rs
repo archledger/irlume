@@ -591,6 +591,67 @@ impl AuthenticationPurpose {
     }
 }
 
+/// The deferred enrollment load's result, as sent by the loader thread in
+/// [`Engine::authenticate_for_with_diagnostics`].
+type EnrollmentLoad = irlume_common::Result<Option<irlume_core::storage::Enrollment>>;
+
+/// Wait out a still-running deferred enrollment load on an early exit, so the
+/// user-state flock and the TPM are free before this request returns. An
+/// immediate retry (decline, then a fallback attempt) would otherwise block
+/// on the orphaned loader's locks — the one way this overlap could make a
+/// retry SLOWER than the serial load it replaced. The exits that can still be
+/// waiting are rare deny/error paths (consent-policy refusal, camera-lease
+/// failure); the post-watch exits arrive seconds after the spawn, by which
+/// time the load has long finished.
+fn finish_loader(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad>>) {
+    if let Some(rx) = loader.take() {
+        // The loader always sends or drops its sender (a panic drops it), so
+        // this returns as soon as the load — not the whole thread — is done.
+        let _ = rx.recv();
+    }
+}
+
+/// How a deferred enrollment load ended when it did not produce an
+/// enrollment the request can use.
+#[derive(Debug)]
+enum LoaderExit {
+    /// The store vanished between the pre-check and the read: the same
+    /// "not enrolled" deny as the pre-check.
+    NotEnrolled,
+    /// The request must fail closed to the password: the load errored, the
+    /// deadline expired before it finished, or the loader panicked.
+    Fallback(irlume_common::Error),
+}
+
+/// Resolve the deferred loader's channel result into the enrollment (or the
+/// request-ending fallback). Pure, so every arm of the fail-closed mapping
+/// is unit-testable without camera hardware; the join in
+/// [`Engine::authenticate_for_with_diagnostics`] is exactly this mapping.
+fn resolve_loader(
+    recv: Result<EnrollmentLoad, std::sync::mpsc::RecvTimeoutError>,
+) -> Result<irlume_core::storage::Enrollment, LoaderExit> {
+    match recv {
+        Ok(Ok(Some(enr))) => Ok(enr),
+        Ok(Ok(None)) => Err(LoaderExit::NotEnrolled),
+        Ok(Err(e)) => Err(LoaderExit::Fallback(e)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(
+                "enrollment load exceeded the authentication deadline; \
+                 falling back to password"
+                    .into(),
+            )))
+        }
+        // The sender is gone without a result: the loader panicked.
+        // Contained by the thread boundary; the request fails closed rather
+        // than crashing the daemon over an enrollment read.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(
+                "enrollment loader failed; falling back to password".into(),
+            )))
+        }
+    }
+}
+
 fn blocking_head_consent_policy(
     purpose: AuthenticationPurpose,
     service: Option<&str>,
@@ -4428,7 +4489,7 @@ impl Engine {
         // user-visible outcome is unchanged. A panic inside the loader maps
         // to an error (password fallback), never a daemon crash.
         let load_started = std::time::Instant::now();
-        let loader = match irlume_core::storage::store_is_encrypted(user) {
+        let mut loader = match irlume_core::storage::store_is_encrypted(user)? {
             // No file at all: the instant deny, before anything else wakes.
             None => {
                 return Ok(Outcome::deny(
@@ -4439,13 +4500,20 @@ impl Engine {
             // Plaintext: cheap JSON load, synchronous, old precedence.
             Some(false) => None,
             // Encrypted: the TPM unseal is the expensive part — defer it
-            // into the overlap window.
+            // into the overlap window. A channel, not a JoinHandle: the
+            // receiver can wait with a timeout at the join (a wedged unseal
+            // must not pin the camera lease past the auth deadline), and a
+            // dropped sender reports a loader panic as a disconnect.
             Some(true) => Some({
                 let loader_user = user.to_string();
+                let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
                 std::thread::Builder::new()
                     .name("irlume-enrollment-load".into())
-                    .spawn(move || irlume_core::storage::load(&loader_user))
-                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?
+                    .spawn(move || {
+                        let _ = tx.send(irlume_core::storage::load(&loader_user));
+                    })
+                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+                rx
             }),
         };
         // The synchronous-path enrollment (plaintext stores). The encrypted
@@ -4453,7 +4521,7 @@ impl Engine {
         let loader_was_async = loader.is_some();
         let sync_enr = if loader.is_none() {
             match irlume_core::storage::load(user)? {
-                Some(enr) => match self.enrollment_policy_refusal(&enr) {
+                Some(enr) => match self.enrollment_policy_refusal(user, &enr) {
                     Some(outcome) => return Ok(outcome),
                     None => Some(enr),
                 },
@@ -4468,6 +4536,7 @@ impl Engine {
             None
         };
         if let Some(policy) = blocking_head_consent_policy(purpose, service) {
+            finish_loader(&mut loader);
             return Ok(Outcome::deny(
                 OutcomeKind::OtherDeny,
                 policy.instruction("approve"),
@@ -4483,12 +4552,17 @@ impl Engine {
         // consent frame through the final grace-window retry.  Keeping this
         // lease across sequential fallbacks is deliberate: otherwise another
         // operation can interleave between consent and matching.
-        let camera_operation = irlume_camera::lease::acquire_camera_operation(
+        let camera_operation = match irlume_camera::lease::acquire_camera_operation(
             &endpoints,
             irlume_camera::lease::CameraOperationKind::Authentication,
             std::time::Duration::from_secs(2),
-        )
-        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        ) {
+            Ok(op) => op,
+            Err(error) => {
+                finish_loader(&mut loader);
+                return Err(irlume_common::Error::Hardware(error.to_string()));
+            }
+        };
 
         // Watch for the consent gesture BEFORE the first capture, so a user who
         // nods when the greeter asks is not ignored for the seconds it takes to
@@ -4496,8 +4570,16 @@ impl Engine {
         // grace window can hold several attempts and none of them should re-ask
         // for a gesture already given.
         if purpose.demands_gesture(service) {
-            self.head_consent_before_match =
-                Self::run_camera_operation(&camera_operation, || self.early_consent_watch())?;
+            let verdict = match Self::run_camera_operation(&camera_operation, || {
+                self.early_consent_watch()
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    finish_loader(&mut loader);
+                    return Err(e);
+                }
+            };
+            self.head_consent_before_match = verdict;
             // A head-shake during the pre-match watch is an explicit decline.
             // Close the request now: do not spend the capture and match only to
             // deny after a second post-match watch, and do not let a later cue
@@ -4506,6 +4588,7 @@ impl Engine {
                 irlume_common::dlog!("consent: head shake before the match cancelled the request");
                 // A pre-match shake never reached matching: no live face, no score.
                 self.head_consent_before_match = HeadConsentVerdict::NoGesture;
+                finish_loader(&mut loader);
                 return Ok(Outcome::gesture_declined(false, 0.0));
             }
         }
@@ -4620,27 +4703,27 @@ impl Engine {
         // on every measured host that window exceeds the unseal (2.7s quiet),
         // so the load costs the auth path nothing. First enrollment-dependent
         // decision happens after this join, before any capture is spent.
-        // The Ok(None) arm (file vanished between the check and the read)
-        // keeps the same deny as the pre-check.
-        let enr = match loader {
-            Some(handle) => match handle.join() {
-                Ok(Ok(Some(enr))) => enr,
-                Ok(Ok(None)) => {
-                    return Ok(Outcome::deny(
-                        OutcomeKind::OtherDeny,
-                        format!("'{user}' is not enrolled"),
-                    ));
+        // The wait is bounded by the authentication deadline: a wedged unseal
+        // (stuck tpmrm, or a user-state flock held by a wedged sibling) must
+        // not pin the camera lease forever — on timeout the auth fails closed
+        // to the password and the detached loader releases its locks whenever
+        // it finishes. A ready result is returned even at zero remaining
+        // time, so a healthy load that already finished is never mistaken
+        // for a timeout. The arms live in [`resolve_loader`].
+        let enr = match loader.take() {
+            Some(rx) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match resolve_loader(rx.recv_timeout(remaining)) {
+                    Ok(enr) => enr,
+                    Err(LoaderExit::NotEnrolled) => {
+                        return Ok(Outcome::deny(
+                            OutcomeKind::OtherDeny,
+                            format!("'{user}' is not enrolled"),
+                        ));
+                    }
+                    Err(LoaderExit::Fallback(e)) => return Err(e),
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    // The loader panicked: contained by the thread boundary.
-                    // Report failure so PAM cascades to the password rather
-                    // than crashing the daemon over an enrollment read.
-                    return Err(irlume_common::Error::Protocol(
-                        "enrollment loader failed; falling back to password".into(),
-                    ));
-                }
-            },
+            }
             None => match sync_enr {
                 Some(enr) => enr,
                 // Unreachable by construction (the sync path resolves
@@ -4664,7 +4747,7 @@ impl Engine {
             }
         );
         if loader_was_async {
-            if let Some(outcome) = self.enrollment_policy_refusal(&enr) {
+            if let Some(outcome) = self.enrollment_policy_refusal(user, &enr) {
                 return Ok(outcome);
             }
         }
@@ -6038,9 +6121,6 @@ impl Engine {
         }
     }
 
-    /// If the live cameras no longer match the enrolled binding, return a reason
-    /// to refuse (anti-swap). A bound device that now reads differently, or an
-    /// enrolled IR camera that's gone, fails; an unbound side is not checked.
     /// The enrollment-dependent policy refusals that gate an authentication
     /// before any capture is spent: retired-eye-policy migration, the
     /// empty-profile refuse, and the anti-swap camera binding. A pure
@@ -6048,14 +6128,18 @@ impl Engine {
     /// binding); runs synchronously for plaintext stores (before the camera)
     /// and at the loader join for encrypted stores (see
     /// `authenticate_for_with_diagnostics` for the precedence note).
-    fn enrollment_policy_refusal(&self, enr: &irlume_core::storage::Enrollment) -> Option<Outcome> {
+    fn enrollment_policy_refusal(
+        &self,
+        user: &str,
+        enr: &irlume_core::storage::Enrollment,
+    ) -> Option<Outcome> {
         if let Err(reason) = legacy_eye_policy(enr) {
             return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
         }
         if enr.profiles.iter().all(|p| p.scans.is_empty()) {
             return Some(Outcome::deny(
                 OutcomeKind::OtherDeny,
-                format!("'{}' has no face scans enrolled", enr.user),
+                format!("'{user}' has no face scans enrolled"),
             ));
         }
         if let Some(bind) = &enr.camera_binding {
@@ -6066,6 +6150,9 @@ impl Engine {
         None
     }
 
+    /// If the live cameras no longer match the enrolled binding, return a reason
+    /// to refuse (anti-swap). A bound device that now reads differently, or an
+    /// enrolled IR camera that's gone, fails; an unbound side is not checked.
     fn binding_mismatch(&self, bind: &irlume_core::storage::CameraBinding) -> Option<String> {
         if let Some(want) = &bind.rgb {
             if irlume_camera::device_identity(&self.rgb_dev).as_ref() != Some(want) {
@@ -10801,5 +10888,60 @@ mod engine_tests {
             })
             .collect();
         assert!(!completed_consent_take_hit(false, true, &poses));
+    }
+
+    #[test]
+    fn deferred_loader_resolution_fails_closed_on_every_arm() {
+        // Every way the deferred enrollment load can end, through a real
+        // channel; the join in authenticate_for_with_diagnostics is exactly
+        // this mapping, so its fail-closed contract is pinned here without
+        // camera hardware.
+        // A finished load passes through, even at zero remaining deadline.
+        let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
+        tx.send(Ok(Some(Enrollment::new("u")))).unwrap();
+        drop(tx);
+        assert!(resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)).is_ok());
+
+        // A store that vanished between the pre-check and the read is the
+        // not-enrolled deny, not an error.
+        let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
+        tx.send(Ok(None)).unwrap();
+        drop(tx);
+        assert!(matches!(
+            resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)),
+            Err(LoaderExit::NotEnrolled)
+        ));
+
+        // A load error is the fallback, propagated verbatim.
+        let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
+        tx.send(Err(irlume_common::Error::Io("unreadable".into())))
+            .unwrap();
+        drop(tx);
+        assert!(matches!(
+            resolve_loader(rx.recv_timeout(std::time::Duration::ZERO)),
+            Err(LoaderExit::Fallback(irlume_common::Error::Io(_)))
+        ));
+
+        // A load that outlives the authentication deadline fails closed.
+        let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
+        let resolved = resolve_loader(rx.recv_timeout(std::time::Duration::from_millis(1)));
+        match resolved {
+            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(msg))) => {
+                assert!(msg.contains("deadline"), "{msg}");
+            }
+            other => panic!("deadline expiry must fail closed to the password: {other:?}"),
+        }
+        drop(tx);
+
+        // A sender dropped without a result (the loader panicked) fails
+        // closed with its own reason, distinct from the deadline.
+        let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
+        drop(tx);
+        match resolve_loader(rx.recv_timeout(std::time::Duration::from_secs(1))) {
+            Err(LoaderExit::Fallback(irlume_common::Error::Protocol(msg))) => {
+                assert!(msg.contains("loader failed"), "{msg}");
+            }
+            other => panic!("a panicked loader must fail closed: {other:?}"),
+        }
     }
 }

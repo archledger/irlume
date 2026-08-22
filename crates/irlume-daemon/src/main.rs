@@ -2942,7 +2942,14 @@ fn dispatch_status_with_diagnostics(
                 // The store's own shape, not the key's presence: those differ
                 // exactly when the key is gone, and that case has to be
                 // reportable rather than collapsed into "plaintext".
-                encrypted: irlume_core::storage::store_is_encrypted(user).unwrap_or(false),
+                // Ok(Some(true)) is the only "encrypted" answer; absent and
+                // unreadable stores both report as not-encrypted here (a
+                // status read, not an auth decision — the auth path
+                // propagates the read error instead).
+                encrypted: matches!(
+                    irlume_core::storage::store_is_encrypted(user),
+                    Ok(Some(true))
+                ),
                 recovery_set: irlume_core::template_key::has_recovery(user),
                 tpm_present: irlume_core::template_key::tpm_available(),
                 key_present: irlume_core::template_key::has_key(user),

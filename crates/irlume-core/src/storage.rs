@@ -641,8 +641,8 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
     deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
 }
 
-/// Whether the on-disk store for `user` is encrypted, or `None` when there is
-/// no store at all.
+/// Whether the on-disk store for `user` is encrypted, `Ok(None)` when there
+/// is no store at all, and `Err` when a store exists but cannot be read.
 ///
 /// Read from the file's own `enc` envelope, NOT from whether a template key
 /// exists. Those two answers disagree in exactly one state, and it is the state
@@ -650,14 +650,25 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
 /// Reporting that as "plaintext at rest" both understates the privacy posture
 /// and hides the data loss, and it points the user at `recovery setup` when the
 /// only remaining move is to re-enroll.
-pub fn store_is_encrypted(user: &str) -> Option<bool> {
+///
+/// An unreadable store is NOT the same as an absent one: collapsing it to
+/// `None` would deny "not enrolled" where the caller's full load reports an
+/// error (and the password fallback). Unparseable bytes read as plaintext so
+/// that full load surfaces the real parse error instead of this probe.
+///
+/// # Errors
+/// `Io` when a store exists but cannot be read.
+pub fn store_is_encrypted(user: &str) -> irlume_common::Result<Option<bool>> {
     let path = profile_path(user);
-    let data = fs::read(&path).ok()?;
-    Some(
-        serde_json::from_slice::<serde_json::Value>(&data)
-            .map(|v| v.get("enc").is_some())
-            .unwrap_or(false),
-    )
+    match fs::read(&path) {
+        Ok(data) => Ok(Some(
+            serde_json::from_slice::<serde_json::Value>(&data)
+                .map(|v| v.get("enc").is_some())
+                .unwrap_or(false),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(irlume_common::Error::Io(e.to_string())),
+    }
 }
 
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -1465,5 +1476,43 @@ mod tests {
             ..ir_scan("rgb-only", None)
         });
         assert_eq!(e.usable_ir_scans("raw"), 0);
+    }
+
+    #[test]
+    fn store_is_encrypted_distinguishes_absent_shape_and_unreadable() {
+        // Held across the whole test: every assertion reads a path derived
+        // from IRLUME_STATE_DIR (same pattern as the retag-marker test).
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-enc-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+
+        // Absent: Ok(None), the "not enrolled" answer.
+        assert_eq!(store_is_encrypted("absent").unwrap(), None);
+
+        // Plaintext JSON: Ok(Some(false)) — the synchronous pre-camera path.
+        fs::write(dir.join("plain.json"), br#"{"user":"plain"}"#).unwrap();
+        assert_eq!(store_is_encrypted("plain").unwrap(), Some(false));
+
+        // Encrypted envelope: Ok(Some(true)) — detection is the `enc` field.
+        fs::write(dir.join("sealed.json"), br#"{"version":3,"enc":"AAAA"}"#).unwrap();
+        assert_eq!(store_is_encrypted("sealed").unwrap(), Some(true));
+
+        // Unparseable bytes read as plaintext so the FULL load reports the
+        // real parse error instead of this probe.
+        fs::write(dir.join("garbage.json"), b"\x00not json").unwrap();
+        assert_eq!(store_is_encrypted("garbage").unwrap(), Some(false));
+
+        // A store that exists but cannot be read is an ERROR, not "absent":
+        // collapsing it to None would deny "not enrolled" where the
+        // caller's load reports an error (and the password fallback).
+        fs::create_dir(dir.join("locked.json")).unwrap();
+        assert!(store_is_encrypted("locked").is_err());
+
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

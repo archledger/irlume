@@ -69,9 +69,15 @@ records why that is sound and what it costs.
    which is the property ADR-0001 was protecting all along.
 
 4. **Operating points are the measured ones, pinned by tests:**
-   - ViT: m96 crop, threshold 0.60, 5-frame-median vote per
-     authentication. The vote is part of the measurement (LFW: 0.29%
-     frame-level tail → 0/531 presentation false-fires under 5-median).
+   - ViT: m96 crop, **0.55** with a 5-frame-median vote per authentication.
+     0.60 was the single-camera (Zenbook) qualification number; fleet
+     validation measured the NexiGo banner at presentation-medians 0.55–0.60,
+     which 0.60 misses entirely. At 0.55: every login-distance banner
+     presentation on both cameras measured 0.594–0.656 (caught), every
+     genuine presentation on both cameras (desk/dim/close/glasses) measured
+     0.27–0.465 (margin 0.085), and 0 of 531 sampled LFW all-genuine
+     presentations fire (0.50 would fire 7.3% — rejected). The vote is part
+     of the measurement (it is what holds the genuine side at zero).
    - FLIR: 0.9 on lit-phase IR frames, the 2026-07-27 re-measured window
      (genuine max 0.702, attack floor 0.941).
 

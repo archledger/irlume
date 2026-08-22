@@ -23,6 +23,24 @@ fn main() {
     let mut engine = irlume_auth::Engine::load(&det, &model)
         .expect("load engine")
         .with_devices(&rgb_dev, &ir_dev);
+    // Attach the shipped PAD cues when their model files exist (ADR-0013),
+    // honouring the same env names the daemon unit sets, so this probe
+    // exercises the exact deny-only wiring a real authentication runs.
+    for (env_key, attach) in [
+        ("IRLUME_VIT_PAD_MODEL", false),
+        ("IRLUME_PAD_IR_MODEL", true),
+    ] {
+        if let Ok(path) = std::env::var(env_key) {
+            if std::path::Path::new(&path).exists() {
+                engine = if attach {
+                    engine.with_pad_ir(&path).expect("load IR PAD")
+                } else {
+                    engine.with_vit_pad(&path).expect("load ViT PAD")
+                };
+                eprintln!("assess_probe: {env_key} cue loaded ({path})");
+            }
+        }
+    }
     println!("assess_probe: rgb={rgb_dev} ir={ir_dev} runs={runs}\nLook at the camera.\n");
 
     let (mut live, mut rgb_face, mut ir_face) = (0, 0, 0);

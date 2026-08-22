@@ -357,18 +357,20 @@ pub struct AddScanOutcome {
 /// share near 1, and the next dark identify was denied every time.
 pub const AMBIENT_LIT_SHARE: f32 = 0.5;
 
-/// Shipped ViT RGB PAD deny threshold (ADR-0013). MEASURED operating point,
-/// not a default: the 2026-08-21/-22 qualification (docs/research/
-/// 2026-08-21-vit-liveness-pad-evaluation.md + 2026-08-22-vit-live-
-/// qualification.md) put genuine (desk/dim/close, incl. glasses) at
-/// 0.34-0.55 and the vinyl banner at 0.594-0.773 across every presentation.
-/// 0.60 sits in the gap: 0/180 genuine frames above it, 100/100 banner
-/// frames above it (5-median voting). The window is NARROW (~0.04 from the
-/// offline corpus's genuine max 0.551 to the attack floor 0.604); a new
-/// camera or instrument landing inside it means false denials — the kill
-/// switch exists for that. Do NOT raise toward 0.65 (drops real banner
-/// detections) or lower toward 0.55 (crosses the genuine max).
-pub const VIT_PAD_THRESHOLD: f32 = 0.60;
+/// Shipped ViT RGB PAD deny threshold (ADR-0013). MEASURED operating point
+/// across the FLEET, not one camera: the 2026-08-22 qualification set 0.60
+/// from the Zenbook window (genuine frames ≤ 0.551, banner floor 0.604), but
+/// fleet validation measured the NexiGo banner at presentation-medians
+/// 0.55–0.60 — 0.60 misses that camera's banner entirely. At 0.55 with
+/// 5-frame-median voting: every login-distance banner presentation on BOTH
+/// cameras measured 0.594–0.656 (caught), every genuine presentation on
+/// both cameras across desk/dim/close/glasses measured 0.27–0.465 (margin
+/// 0.085), and 531 sampled LFW all-genuine presentations: 0 fire (0.50
+/// would fire 7.3% — rejected). Do NOT raise toward 0.60 (drops the NexiGo
+/// banner) or lower toward 0.50 (crosses the LFW tail and halves the
+/// genuine margin). Evidence: docs/research/2026-08-22-vit-live-
+/// qualification.md + the fleet run recorded in PR #516.
+pub const VIT_PAD_THRESHOLD: f32 = 0.55;
 
 /// ViT PAD vote window: the median of the last N scores decides. Voting is
 /// what collapsed the LFW genuine tail (0.29% frame-level ≥ 0.60 → 0/531
@@ -9232,23 +9234,26 @@ mod thirdparty_cue_tests {
     }
 
     /// The ViT PAD vote (ADR-0013): abstains until N scores, median decides,
-    /// the window slides, and the threshold sits in the measured gap between
-    /// the genuine max (0.551, 2026-08-22 live session) and the banner floor
-    /// (0.604 offline / 0.594 live median). These assertions pin BOTH sides:
-    /// a raised threshold drops real detections, a lowered one crosses the
-    /// genuine band.
+    /// the window slides, and the threshold sits in the measured FLEET gap:
+    /// genuine presentation-medians topped at 0.465 (dim-marginal, Zenbook)
+    /// and every login-distance banner presentation on both fleet cameras
+    /// measured 0.594-0.656. These assertions pin BOTH sides: a raised
+    /// threshold drops the NexiGo banner (measured at 0.55-0.60 median), a
+    /// lowered one crosses the LFW presentation tail (1.3% fire at 0.52,
+    /// 7.3% at 0.50).
     #[test]
     fn vit_vote_abstains_until_full_and_the_threshold_pins_the_measured_window() {
-        // Genuine band ceiling measured on live hardware: never a denial.
+        // Worst measured genuine presentation (0.465): never a denial.
         let mut genuine = Vec::new();
         for i in 0..VIT_PAD_VOTE_N {
-            genuine.push(0.551);
+            genuine.push(0.465);
             assert!(!vit_vote_denies(&genuine), "genuine frame {i} denied");
         }
-        // Banner floor measured offline (0.604): every full window denies.
+        // Lowest measured login-distance banner median (0.594): every full
+        // window denies.
         let mut banner = Vec::new();
         for i in 0..VIT_PAD_VOTE_N {
-            banner.push(0.604);
+            banner.push(0.594);
             assert_eq!(
                 vit_vote_denies(&banner),
                 i == VIT_PAD_VOTE_N - 1,
@@ -9280,20 +9285,20 @@ mod thirdparty_cue_tests {
 
     #[test]
     fn vit_threshold_sits_between_the_measured_genuine_max_and_attack_floor() {
-        // Behavioral pin (not a const assert): a window of the measured
-        // genuine max (0.551, 2026-08-22 live session) must never deny, and
-        // a window of the measured attack floor (0.604, offline corpus)
-        // must always deny. Moving VIT_PAD_THRESHOLD across either boundary
-        // fails this.
-        let genuine = vec![0.551; VIT_PAD_VOTE_N];
+        // Behavioral pin (not a const assert): a window of the worst measured
+        // genuine presentation median (0.465, fleet, dim-marginal) must never
+        // deny, and a window of the lowest measured login-distance banner
+        // median (0.594, fleet) must always deny. Moving VIT_PAD_THRESHOLD
+        // across either boundary fails this.
+        let genuine = vec![0.465; VIT_PAD_VOTE_N];
         assert!(
             !vit_vote_denies(&genuine),
-            "threshold crosses the live-session genuine max (0.551): false denials"
+            "threshold crosses the fleet genuine presentation max (0.465): false denials"
         );
-        let banner = vec![0.604; VIT_PAD_VOTE_N];
+        let banner = vec![0.594; VIT_PAD_VOTE_N];
         assert!(
             vit_vote_denies(&banner),
-            "threshold crosses the offline attack floor (0.604): dropped detections"
+            "threshold crosses the fleet banner presentation min (0.594): dropped detections"
         );
         assert_eq!(
             VIT_PAD_VOTE_N, 5,

@@ -11,7 +11,7 @@ All notable changes to irlume are documented here. This project adheres to
   liveness classifier (`liveness_vit.onnx`, MIT) and the DAMO FLIR IR
   liveness classifier (`flir.onnx`, MIT) install with every package, verify
   against `models/SHA256SUMS` at startup, and run DENY-ONLY at their
-  measured operating points: ViT m96 crop, 0.60, 5-frame-median vote per
+  measured operating points: ViT m96 crop, 0.55, 5-frame-median vote per
   authentication (catches the print/banner species at 100% across two
   qualification sessions, 0/180 genuine false-fires; does NOT stop a phone
   at login distance — disclosed in the startup line, IR covers that

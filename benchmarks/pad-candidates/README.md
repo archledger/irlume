@@ -45,12 +45,16 @@ regenerate scores from your own captures.
   show no detectable IR face (non-response).
 - `vit_liveness_score.py <corpus-root> <out.csv>` / `vit_lfw_score.py <lfw-root> <out.csv>`:
   the Adedev-W ViT liveness RGB PAD candidate — margin sweep (tight/m25/m96)
-  on the 2026-08-12 live corpus, plus the LFW at-scale control. First RGB
-  candidate with an operating window (m96 @ 0.60, 5-frame voting; window
-  [0.56, 0.604]); NOT wired, live qualification pending — see
-  `docs/research/2026-08-21-vit-liveness-pad-evaluation.md`. The companion
+  on the 2026-08-12 live corpus, plus the LFW at-scale control. Offline: an
+  operating window existed (m96 @ 0.60, 5-frame voting; window [0.56,
+  0.604]). **Live qualification (2026-08-22) DECLINED it**: phone at login
+  distance scored 0.455 (REAL-side) on the deployment camera — see
+  `docs/research/2026-08-22-vit-live-qualification.md`. The companion
   `docs/research/2026-08-21-faceid-review.md` records the FaceID repo check
   (application, nothing adoptable).
+- `vit_live_session.py` / `vit_live_cap.sh`: the 2026-08-22 live-session
+  capture + scoring harness (m96 crop, 5-frame-median voting, AE-settle
+  drop), reusable as the replay baseline for the next RGB PAD candidate.
 
 Python deps: `numpy`, `opencv-python` (>= 4.6 for `FaceDetectorYN`),
 `onnxruntime`. Detection uses irlume's shipped YuNet file.

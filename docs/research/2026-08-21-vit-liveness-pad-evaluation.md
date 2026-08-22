@@ -1,4 +1,10 @@
-# ViT liveness (Adedev-W/LivenessModels-ONNX) — first RGB PAD candidate with an operating window
+# ViT liveness (Adedev-W/LivenessModels-ONNX) — offline evaluation: operating window found; live qualification DECLINED it
+
+> **Outcome (see [`2026-08-22-vit-live-qualification.md`](2026-08-22-vit-live-qualification.md)):
+> NOT QUALIFIED.** The live session found a scale-dependent phone hole —
+> phone at login distance scores 0.455 (REAL-side) on the deployment
+> camera, inside the genuine range. This offline note is retained as the
+> record of the offline window and its honest constraints.
 
 Date: 2026-08-21 · Agent: opencode · Scoring: archhost (Ryzen 7 5700G, CPU,
 ort-venv); latency probe on minihost (N100) · Corpus: the unchanged

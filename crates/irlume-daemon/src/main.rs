@@ -215,12 +215,54 @@ fn load_shipped_recognizer(
 /// ships since ADR-0004; user supplies their own via IRLUME_IR_ADAPTER), so it
 /// is included only when the file actually exists; otherwise strict mode would
 /// refuse to start on a normal install that never had an adapter.
-fn models_to_verify<'a>(shipped: [&'a str; 4], adapter: &'a str) -> Vec<&'a str> {
+///
+/// The shipped PAD cues (ADR-0013) follow the adapter rule, not the core-four
+/// rule: they are verified when present and simply absent otherwise (the
+/// engine degrades to no cue), because a tree without fetched weights (dev,
+/// partial custom installs) must still run. Kill-switched cues skip
+/// verification entirely: an operator who disabled the cue did not ask to
+/// have its weights checked.
+fn models_to_verify<'a>(
+    shipped: [&'a str; 4],
+    adapter: &'a str,
+    vit_pad: &'a str,
+    pad_ir: &'a str,
+) -> Vec<&'a str> {
     let mut v: Vec<&str> = shipped.to_vec();
     if std::path::Path::new(adapter).exists() {
         v.push(adapter);
     }
+    if vit_pad_enabled() && std::path::Path::new(vit_pad).exists() {
+        v.push(vit_pad);
+    }
+    if pad_ir_enabled() && std::path::Path::new(pad_ir).exists() {
+        v.push(pad_ir);
+    }
     v
+}
+
+/// Shipped ViT RGB PAD cue kill switch (ADR-0013). Off via
+/// `IRLUME_PAD_VIT=0` or `pad_vit=0` in settings.conf; on by default.
+fn vit_pad_enabled() -> bool {
+    !matches!(
+        std::env::var("IRLUME_PAD_VIT").ok().as_deref(),
+        Some(v) if irlume_common::config::falsy(v)
+    ) && !matches!(
+        irlume_common::config::read_kv("settings.conf", "pad_vit").as_deref(),
+        Some(v) if irlume_common::config::falsy(v)
+    )
+}
+
+/// Shipped IR PAD cue kill switch, same shape as [`vit_pad_enabled`]
+/// (`IRLUME_PAD_IR=0` / `pad_ir=0`).
+fn pad_ir_enabled() -> bool {
+    !matches!(
+        std::env::var("IRLUME_PAD_IR").ok().as_deref(),
+        Some(v) if irlume_common::config::falsy(v)
+    ) && !matches!(
+        irlume_common::config::read_kv("settings.conf", "pad_ir").as_deref(),
+        Some(v) if irlume_common::config::falsy(v)
+    )
 }
 
 /// Resolve the opt-in third-party RECOGNIZER selection (#276 stage 4), or EXIT.
@@ -338,6 +380,9 @@ fn main() {
         "IRLUME_BLAZE_MODEL",
         "/etc/irlume/blaze_face_short_range.onnx",
     );
+    // Shipped PAD cues (ADR-0013): default-on, kill-switchable.
+    let vit_pad_path = env_or("IRLUME_VIT_PAD_MODEL", "/etc/irlume/liveness_vit.onnx");
+    let pad_ir_path = env_or("IRLUME_PAD_IR_MODEL", "/etc/irlume/flir.onnx");
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     // PREFER THE SOCKET SYSTEMD ALREADY BOUND, else bind our own.
@@ -404,8 +449,10 @@ fn main() {
             // The recognizer's verified bytes come back and go straight into the
             // engine below (#346), so the 260MB file is read and hashed once per
             // start rather than once here and once again inside the loader.
-            let mut verified_recognizer =
-                verify_models(&models_to_verify([&det, &model, &mesh, &blaze], &adapter), Some(&model));
+            let mut verified_recognizer = verify_models(
+                &models_to_verify([&det, &model, &mesh, &blaze], &adapter, &vit_pad_path, &pad_ir_path),
+                Some(&model),
+            );
             // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
             // discovered Hello camera (built-in or external Brio/NexiGo). No node-number
             // fallback: a camera-less or RGB-only machine has no pair, and the
@@ -595,6 +642,23 @@ fn main() {
                         Some((path, thr, name)) => e.with_thirdparty_pad(path, *thr, name),
                         None => Ok(e),
                     })
+                    // Shipped PAD cues (ADR-0013): default-on, kill-switched.
+                    // The engine builders no-op on an absent file (degrade to
+                    // no cue); the startup lines below name the absence.
+                    .and_then(|e| {
+                        if vit_pad_enabled() {
+                            e.with_vit_pad(&vit_pad_path)
+                        } else {
+                            Ok(e)
+                        }
+                    })
+                    .and_then(|e| {
+                        if pad_ir_enabled() {
+                            e.with_pad_ir(&pad_ir_path)
+                        } else {
+                            Ok(e)
+                        }
+                    })
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
@@ -629,15 +693,22 @@ fn main() {
                         Some(n) => eprintln!(
                             "irlumed: third-party PAD cue '{n}' loaded (deny-only; disable with `sudo irlume models disable`)"
                         ),
-                        // A gap worth naming at every start: the built-in gate accepts
-                        // a life-size print of the enrolled face (docs/PAD_SELFTEST.md),
-                        // and this cue is the only measured defence against one.
-                        None => eprintln!(
-                            "irlumed: third-party PAD cue: none. The built-in gate does NOT stop a \
-                             life-size print of your face; `sudo irlume models enable flir` adds the \
-                             cue that does"
-                        ),
+                        None => eprintln!("irlumed: third-party PAD cue: none (shipped cues below cover it)"),
                     }
+                    // Shipped PAD cues (ADR-0013): default-on, kill-switched,
+                    // with their measured species coverage named so an
+                    // operator reading the journal knows what each one does
+                    // and does not stop.
+                    eprintln!(
+                        "irlumed: RGB PAD cue (ViT) {} — catches print/banner species; \
+                         does NOT stop a phone at login distance; disable: IRLUME_PAD_VIT=0",
+                        if e.has_vit_pad() { "loaded" } else if vit_pad_enabled() { "ABSENT (weights not installed)" } else { "disabled" }
+                    );
+                    eprintln!(
+                        "irlumed: IR PAD cue (flir) {} — screens/phones present no face \
+                         in IR; print species; disable: IRLUME_PAD_IR=0",
+                        if e.has_pad_ir() { "loaded" } else if pad_ir_enabled() { "ABSENT (weights not installed)" } else { "disabled" }
+                    );
                     e
                 }
                 Err(e) => {
@@ -4972,9 +5043,14 @@ mod tests {
             "/etc/irlume/blaze_face_short_range.onnx",
         ];
         assert_eq!(
-            models_to_verify(shipped, "/nonexistent/irlume-test/ir_adapter.onnx"),
+            models_to_verify(
+                shipped,
+                "/nonexistent/irlume-test/ir_adapter.onnx",
+                "/nonexistent/irlume-test/liveness_vit.onnx",
+                "/nonexistent/irlume-test/flir.onnx",
+            ),
             shipped.to_vec(),
-            "a missing optional adapter must not reach verify_models"
+            "a missing optional adapter/PAD cue must not reach verify_models"
         );
         // An adapter that actually exists is still checked.
         let dir =
@@ -4984,9 +5060,66 @@ mod tests {
         let adapter = dir.join("ir_adapter.onnx");
         std::fs::write(&adapter, b"weights").unwrap();
         let ap = adapter.to_string_lossy().into_owned();
-        let v = models_to_verify(shipped, &ap);
+        let v = models_to_verify(
+            shipped,
+            &ap,
+            "/nonexistent/irlume-test/liveness_vit.onnx",
+            "/nonexistent/irlume-test/flir.onnx",
+        );
         assert_eq!(v.len(), 5);
         assert_eq!(v[4], ap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ADR-0013: the shipped PAD cues follow the adapter rule (verified when
+    // present, absent otherwise), and a KILL-SWITCHED cue is not verified at
+    // all — the operator disabled it, not its weights.
+    #[test]
+    fn pad_cue_weights_are_optional_and_kill_switches_skip_verification() {
+        let shipped = [
+            "/etc/irlume/det.onnx",
+            "/etc/irlume/face.onnx",
+            "/etc/irlume/face_landmarks_detector.tflite",
+            "/etc/irlume/blaze_face_short_range.onnx",
+        ];
+        let dir = std::env::temp_dir().join(format!("irlume-daemon-pad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vit = dir.join("liveness_vit.onnx");
+        std::fs::write(&vit, b"vit").unwrap();
+        let flir = dir.join("flir.onnx");
+        std::fs::write(&flir, b"flir").unwrap();
+        let (vp, fp) = (
+            vit.to_string_lossy().into_owned(),
+            flir.to_string_lossy().into_owned(),
+        );
+
+        // Present + enabled: both verified, after the core four.
+        let _g = env_lock();
+        std::env::remove_var("IRLUME_PAD_VIT");
+        std::env::remove_var("IRLUME_PAD_IR");
+        let v = models_to_verify(
+            shipped,
+            "/nonexistent/irlume-test/ir_adapter.onnx",
+            &vp,
+            &fp,
+        );
+        assert_eq!(v.len(), 6, "core four + both PAD cues");
+        assert_eq!(v[4], vp);
+        assert_eq!(v[5], fp);
+
+        // Kill switch removes the cue from verification entirely.
+        std::env::set_var("IRLUME_PAD_VIT", "0");
+        let v = models_to_verify(
+            shipped,
+            "/nonexistent/irlume-test/ir_adapter.onnx",
+            &vp,
+            &fp,
+        );
+        assert_eq!(v.len(), 5, "ViT cue kill-switched out");
+        assert_eq!(v[4], fp);
+        std::env::remove_var("IRLUME_PAD_VIT");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

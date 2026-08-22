@@ -82,6 +82,21 @@ pub struct Engine {
     /// Consulted DENY-ONLY on the lit IR strobe frame; it may downgrade a
     /// Live verdict to Spoof, never the reverse (see `thirdparty_downgrades`).
     tp_pad: Option<(irlume_vision::PadIr, f32, String)>,
+    /// Shipped ViT RGB PAD cue (`liveness_vit.onnx`, ADR-0013, default-on
+    /// with the daemon's kill switch): scores the RGB face chip whenever the
+    /// gate verdicted Live and downgrades to Spoof when the rolling median of
+    /// the last `VIT_VOTE_N` scores clears `VIT_THRESHOLD`. DENY-ONLY.
+    vit_pad: Option<irlume_vision::PadVit>,
+    /// Rolling per-request ViT scores for the 5-frame-median vote. Reset at
+    /// the start of each authentication (`authenticate_for`), because voting
+    /// across requests would mix presentations.
+    vit_scores: Vec<f32>,
+    /// Shipped IR PAD cue (`flir.onnx`, ADR-0013, default-on with the
+    /// daemon's kill switch): the FLIR classifier at its measured 0.9
+    /// threshold, lit-phase IR frames, DENY-ONLY. This is the same weights
+    /// and operating point as the opt-in catalog entry; shipping it removes
+    /// the enablement step the 2026-07-17 qualification asked operators to run.
+    pad_ir: Option<irlume_vision::PadIr>,
     gate: LivenessGate,
     rgb_dev: String,
     ir_dev: String,
@@ -173,6 +188,10 @@ pub struct Assessment {
     /// IR face was present. Deny-only: consulted by both the cross-spectrum
     /// verdict (in `assess_full`) and the dark path.
     pub thirdparty_fake: Option<f32>,
+    /// P(fake) from the SHIPPED IR PAD cue (ADR-0013, `flir.onnx`), when
+    /// loaded and an IR face was present. Deny-only, same consult sites as
+    /// `thirdparty_fake`.
+    pub shipped_ir_fake: Option<f32>,
 }
 
 /// The authentication decision for a user.
@@ -337,6 +356,33 @@ pub struct AddScanOutcome {
 /// the #187 lockout enrolled on an emitterless USB2 Brio under daylight,
 /// share near 1, and the next dark identify was denied every time.
 pub const AMBIENT_LIT_SHARE: f32 = 0.5;
+
+/// Shipped ViT RGB PAD deny threshold (ADR-0013). MEASURED operating point,
+/// not a default: the 2026-08-21/-22 qualification (docs/research/
+/// 2026-08-21-vit-liveness-pad-evaluation.md + 2026-08-22-vit-live-
+/// qualification.md) put genuine (desk/dim/close, incl. glasses) at
+/// 0.34-0.55 and the vinyl banner at 0.594-0.773 across every presentation.
+/// 0.60 sits in the gap: 0/180 genuine frames above it, 100/100 banner
+/// frames above it (5-median voting). The window is NARROW (~0.04 from the
+/// offline corpus's genuine max 0.551 to the attack floor 0.604); a new
+/// camera or instrument landing inside it means false denials — the kill
+/// switch exists for that. Do NOT raise toward 0.65 (drops real banner
+/// detections) or lower toward 0.55 (crosses the genuine max).
+pub const VIT_PAD_THRESHOLD: f32 = 0.60;
+
+/// ViT PAD vote window: the median of the last N scores decides. Voting is
+/// what collapsed the LFW genuine tail (0.29% frame-level ≥ 0.60 → 0/531
+/// 5-frame-median presentations), so single-frame firing would trade that
+/// measured genuine stability away.
+pub const VIT_PAD_VOTE_N: usize = 5;
+
+/// Shipped IR PAD deny threshold (ADR-0013): the FLIR cue's measured
+/// operating point. 2026-07-17 qualification + the 2026-07-27 re-measure:
+/// highest genuine 0.702, banner attack floor 0.941, so 0.9 is inside the
+/// usable window with margin on both sides. Do NOT move without re-running
+/// both legs (see docs/pad-results/2026-07-17-third-party-pad-candidates.md
+/// addendum).
+pub const IR_PAD_THRESHOLD: f32 = 0.9;
 
 /// Presence grace window after the consent gesture, milliseconds, for the
 /// login and lock-screen path. The user pressed Enter (usually already in
@@ -845,6 +891,24 @@ pub fn thirdparty_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f
 pub fn thirdparty_abstains(p_fake: Option<f32>, threshold: f32) -> bool {
     p_fake
         .is_some_and(|p| p >= irlume_common::thirdparty::MEASURED_GENUINE_CEILING && p < threshold)
+}
+
+/// The shipped ViT PAD 5-frame-median vote (ADR-0013). Pure decision core of
+/// [`Engine`]'s `vit_pad_votes_deny`: appends `score` to `scores`, then denies
+/// only when the last [`VIT_PAD_VOTE_N`] scores have a median at or above
+/// [`VIT_PAD_THRESHOLD`]. Fewer than N scores abstain (a presentation denied
+/// in <N frames never had its vote), and the window SLIDES: the 6th score
+/// drops the 1st, so a sustained attack denies on every full window while a
+/// single outlier frame can never carry a denial alone.
+pub fn vit_vote_denies(scores: &[f32]) -> bool {
+    let skip = scores.len().saturating_sub(VIT_PAD_VOTE_N);
+    let window = &scores[skip..];
+    if window.len() < VIT_PAD_VOTE_N {
+        return false;
+    }
+    let mut sorted = window.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[VIT_PAD_VOTE_N / 2] >= VIT_PAD_THRESHOLD
 }
 
 /// IR availability for a caller-selected IR device path.
@@ -2417,6 +2481,9 @@ impl Engine {
             mesh: None,
             blaze: None,
             tp_pad: None,
+            vit_pad: None,
+            vit_scores: Vec::new(),
+            pad_ir: None,
             gate: LivenessGate::new(),
             rgb_dev: irlume_camera::DEFAULT_RGB_DEVICE.into(),
             ir_dev: irlume_camera::DEFAULT_IR_DEVICE.into(),
@@ -2788,6 +2855,51 @@ impl Engine {
         self.tp_pad.as_ref().map(|(_, _, n)| n.as_str())
     }
 
+    /// Load the shipped ViT RGB PAD classifier (`liveness_vit.onnx`,
+    /// ADR-0013). No-op if the file is absent, so a partial install or a
+    /// dev tree without weights degrades to no cue (loud startup line +
+    /// `IRLUME_MODELS_STRICT=1` refusal live in the daemon), never to a
+    /// startup failure here.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_vit_pad(mut self, path: &str) -> irlume_common::Result<Self> {
+        if std::path::Path::new(path).exists() {
+            self.vit_pad = Some(irlume_vision::PadVit::load_from_file(path)?);
+        }
+        Ok(self)
+    }
+
+    pub fn has_vit_pad(&self) -> bool {
+        self.vit_pad.is_some()
+    }
+
+    /// Load the shipped IR PAD classifier (`flir.onnx`, ADR-0013): same
+    /// weights/threshold as the opt-in catalog entry, default-on. Absent
+    /// file degrades the same way as the ViT cue.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_pad_ir(mut self, path: &str) -> irlume_common::Result<Self> {
+        if std::path::Path::new(path).exists() {
+            self.pad_ir = Some(irlume_vision::PadIr::load_from_file(path)?);
+        }
+        Ok(self)
+    }
+
+    pub fn has_pad_ir(&self) -> bool {
+        self.pad_ir.is_some()
+    }
+
+    /// Record one ViT PAD score and answer whether the 5-frame-median vote
+    /// DENIES. Median (not mean) per the qualification protocol: it is the
+    /// statistic that held genuine at 0/531 presentations on LFW. The ring
+    /// keeps the last [`VIT_PAD_VOTE_N`] scores of THIS authentication only
+    /// (`authenticate_for` clears it).
+    fn vit_pad_votes_deny(&mut self, score: f32) -> bool {
+        if !score.is_finite() {
+            return false; // inference garbage abstains, deny-only cannot fire on it
+        }
+        self.vit_scores.push(score);
+        vit_vote_denies(&self.vit_scores)
+    }
+
     /// Detection rescue (cascade stage 2): when YuNet returns no face, try
     /// BlazeFace and refine its coarse box into the 5 alignment landmarks
     /// with FaceMesh (BlazeFace has no mouth corners and its eyes measured
@@ -3150,6 +3262,40 @@ impl Engine {
             signals.rgb_moire_score,
             signals.face_frac
         );
+        // Shipped ViT RGB PAD cue (ADR-0013): on the RGB-ONLY tier this is
+        // the one measured defence against the life-size print (the 2026-06-30
+        // breach species; IR face-presence does not exist here). Same deny-only
+        // 5-median contract as the cross-spectrum path.
+        let vit_score: Option<f32> = match self.vit_pad.as_mut() {
+            Some(pad) if verdict == Verdict::Live => match rgb_top.as_ref() {
+                Some(f) => match pad.p_spoof(&rgb_view, &f.bbox) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        irlume_common::dlog!("pad-vit: inference failed ({e}); cue skipped");
+                        None
+                    }
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        let (verdict, reason) = match vit_score {
+            Some(p) => {
+                irlume_common::dlog!("pad-vit(rgb-only): p_spoof {p:.3}");
+                if self.vit_pad_votes_deny(p) {
+                    irlume_common::dlog!(
+                        "pad-vit: 5-frame median >= {VIT_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
+                    );
+                    (
+                        Verdict::Spoof,
+                        "RGB PAD cue flags a spoof; use your password".into(),
+                    )
+                } else {
+                    (verdict, reason)
+                }
+            }
+            None => (verdict, reason),
+        };
         let embedding = match &rgb_top {
             Some(f) => Some(
                 self.emb
@@ -3168,6 +3314,7 @@ impl Engine {
             ir_brightness: 0.0,
             ir_ambient_share: None, // RGB-only path: no IR burst to measure
             thirdparty_fake: None,
+            shipped_ir_fake: None, // RGB-only path: no IR frame exists
         })
     }
 
@@ -3768,6 +3915,7 @@ impl Engine {
                     ir_brightness: 0.0,
                     ir_ambient_share: None,
                     thirdparty_fake: None,
+                    shipped_ir_fake: None,
                 });
             }
         };
@@ -3916,6 +4064,77 @@ impl Engine {
         } else {
             (verdict, reason)
         };
+        // Shipped IR PAD cue (ADR-0013, default-on): same deny-only contract as
+        // the opt-in cue above on the same lit IR frame. Scored even when the
+        // gate did not say Live so the dark path can reuse it below.
+        let shipped_ir_fake = match (self.pad_ir.as_mut(), ir_top.as_ref()) {
+            (Some(pad), Some(f)) => match pad.p_fake(&ir_view, &f.bbox) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    irlume_common::dlog!("pad-ir: inference failed ({e}); cue skipped");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let (verdict, reason) = if thirdparty_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD)
+        {
+            let pf = shipped_ir_fake.unwrap_or(1.0);
+            irlume_common::dlog!(
+                "pad-ir: p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
+            );
+            (
+                Verdict::Spoof,
+                "IR PAD cue flags a spoof; use your password".into(),
+            )
+        } else {
+            (verdict, reason)
+        };
+        // Shipped ViT RGB PAD cue (ADR-0013, default-on): score the RGB face
+        // only on frames the (already post-IR-PAD) verdict still calls Live —
+        // deny-only cues never need to run on frames that already deny, and
+        // the 268ms N100 inference is not free (the plan: consent-watch-
+        // pipelined, Live frames only).
+        let vit_score: Option<f32> = match self.vit_pad.as_mut() {
+            Some(pad) if verdict == Verdict::Live => match rgb_top.as_ref() {
+                Some(f) => {
+                    // Fresh view against the FINAL RGB frame: the self-heal
+                    // above may have recaptured it after the view built for
+                    // detection.
+                    let view = align::RgbView {
+                        data: &rgb.data,
+                        width: rgb.width,
+                        height: rgb.height,
+                    };
+                    match pad.p_spoof(&view, &f.bbox) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            irlume_common::dlog!("pad-vit: inference failed ({e}); cue skipped");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            _ => None,
+        };
+        let (verdict, reason) = match vit_score {
+            Some(p) => {
+                irlume_common::dlog!("pad-vit: p_spoof {p:.3}");
+                if self.vit_pad_votes_deny(p) {
+                    irlume_common::dlog!(
+                        "pad-vit: 5-frame median >= {VIT_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
+                    );
+                    (
+                        Verdict::Spoof,
+                        "RGB PAD cue flags a spoof; use your password".into(),
+                    )
+                } else {
+                    (verdict, reason)
+                }
+            }
+            None => (verdict, reason),
+        };
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Liveness,
             elapsed_us: u64::try_from(liveness_started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -3968,6 +4187,7 @@ impl Engine {
                 .ambient_observed
                 .then(|| ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0)),
             thirdparty_fake,
+            shipped_ir_fake,
         })
     }
 
@@ -4393,6 +4613,9 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
         self.head_consent_before_match = HeadConsentVerdict::NoGesture;
+        // Fresh ViT PAD vote ring per authentication: votes must not mix
+        // presentations across requests (ADR-0013 protocol).
+        self.vit_scores.clear();
         let window = grace_window_ms(service);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
@@ -5022,6 +5245,7 @@ impl Engine {
                 }
             }
             // Opt-in third-party PAD cue, deny-only (scored in assess_full on
+            // Opt-in third-party PAD cue, deny-only (scored in assess_full on
             // the lit IR frame; the dark path re-derives its own gate verdict,
             // so it must consult the cue explicitly too).
             if let Some((_, thr, name)) = self.tp_pad.as_ref() {
@@ -5037,6 +5261,19 @@ impl Engine {
                         ),
                     ));
                 }
+            }
+            // Shipped IR PAD cue (ADR-0013): the dark path's own consult of
+            // the same lit-frame score computed in assess_full. Same
+            // deny-only contract, same threshold.
+            if thirdparty_downgrades(verdict, a.shipped_ir_fake, IR_PAD_THRESHOLD) {
+                let pf = a.shipped_ir_fake.unwrap_or(1.0);
+                irlume_common::dlog!(
+                    "pad-ir: dark path p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; denying"
+                );
+                return Ok(Outcome::deny(
+                    OutcomeKind::Spoof,
+                    "dark liveness: IR PAD cue flags a spoof; use your password",
+                ));
             }
             let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
@@ -5267,6 +5504,11 @@ impl Engine {
         force_rgb_only: bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
+        // Fresh ViT PAD vote ring per enrollment, mirroring the
+        // per-authentication reset: the 5-median vote must describe ONE
+        // presentation (the enrollment), and a banner presented to enroll is
+        // exactly the sustained presentation the vote exists to deny.
+        self.vit_scores.clear();
         // Hold the cameras open for the whole loop. This is the heaviest repeated
         // capture in the codebase (the budget below is ten assessments per wanted
         // scan), and every one of them otherwise re-opened, re-negotiated,
@@ -8966,6 +9208,7 @@ mod tests {
 #[cfg(test)]
 mod thirdparty_cue_tests {
     use super::{thirdparty_abstains, thirdparty_downgrades};
+    use super::{vit_vote_denies, VIT_PAD_VOTE_N};
     use irlume_common::thirdparty::{Stage, CATALOG, MEASURED_GENUINE_CEILING};
 
     /// The PAD entries only: these invariants are about P(fake) scores, and a
@@ -8983,6 +9226,79 @@ mod thirdparty_cue_tests {
         assert!(thirdparty_downgrades(Verdict::Live, Some(0.5), 0.5)); // at threshold
         assert!(!thirdparty_downgrades(Verdict::Live, Some(0.49), 0.5));
         assert!(!thirdparty_downgrades(Verdict::Live, None, 0.5));
+    }
+
+    /// The ViT PAD vote (ADR-0013): abstains until N scores, median decides,
+    /// the window slides, and the threshold sits in the measured gap between
+    /// the genuine max (0.551, 2026-08-22 live session) and the banner floor
+    /// (0.604 offline / 0.594 live median). These assertions pin BOTH sides:
+    /// a raised threshold drops real detections, a lowered one crosses the
+    /// genuine band.
+    #[test]
+    fn vit_vote_abstains_until_full_and_the_threshold_pins_the_measured_window() {
+        // Genuine band ceiling measured on live hardware: never a denial.
+        let mut genuine = Vec::new();
+        for i in 0..VIT_PAD_VOTE_N {
+            genuine.push(0.551);
+            assert!(!vit_vote_denies(&genuine), "genuine frame {i} denied");
+        }
+        // Banner floor measured offline (0.604): every full window denies.
+        let mut banner = Vec::new();
+        for i in 0..VIT_PAD_VOTE_N {
+            banner.push(0.604);
+            assert_eq!(
+                vit_vote_denies(&banner),
+                i == VIT_PAD_VOTE_N - 1,
+                "vote must abstain until the window fills"
+            );
+        }
+        // Sliding window: a 6th score drops the 1st. Four genuine scores
+        // followed by sustained attacks deny once the window is attack-majority.
+        let mut slide = vec![0.30; VIT_PAD_VOTE_N];
+        assert!(!vit_vote_denies(&slide));
+        slide.push(0.90);
+        assert!(!vit_vote_denies(&slide), "window still holds 4 genuine");
+        slide.push(0.90);
+        assert!(
+            !vit_vote_denies(&slide),
+            "median 0.30+genuine tie: 0.30,0.30,0.90,0.90,0.30 median 0.30"
+        );
+        // Recompute: window is [0.30,0.90,0.90,0.90,0.30]? No: slides keep
+        // the LAST five: after two pushes the window is
+        // [0.30,0.30,0.30,0.90,0.90] -> median 0.30. Push more:
+        slide.push(0.90);
+        slide.push(0.90);
+        assert!(vit_vote_denies(&slide), "sustained attack denies");
+        // A single outlier among genuine never denies (median robustness).
+        let mut outlier = vec![0.40; VIT_PAD_VOTE_N - 1];
+        outlier.push(0.99);
+        assert!(
+            !vit_vote_denies(&outlier),
+            "one spoof outlier among genuine must not deny"
+        );
+    }
+
+    #[test]
+    fn vit_threshold_sits_between_the_measured_genuine_max_and_attack_floor() {
+        // Behavioral pin (not a const assert): a window of the measured
+        // genuine max (0.551, 2026-08-22 live session) must never deny, and
+        // a window of the measured attack floor (0.604, offline corpus)
+        // must always deny. Moving VIT_PAD_THRESHOLD across either boundary
+        // fails this.
+        let genuine = vec![0.551; VIT_PAD_VOTE_N];
+        assert!(
+            !vit_vote_denies(&genuine),
+            "threshold crosses the live-session genuine max (0.551): false denials"
+        );
+        let banner = vec![0.604; VIT_PAD_VOTE_N];
+        assert!(
+            vit_vote_denies(&banner),
+            "threshold crosses the offline attack floor (0.604): dropped detections"
+        );
+        assert_eq!(
+            VIT_PAD_VOTE_N, 5,
+            "the vote protocol is part of the measurement"
+        );
     }
 
     #[test]

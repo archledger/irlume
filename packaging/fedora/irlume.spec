@@ -18,6 +18,8 @@ Source3:        %{url}/releases/download/models-v1/face_detection_yunet_2023mar.
 Source4:        %{url}/releases/download/models-v1/face_landmark.onnx
 Source5:        %{url}/releases/download/models-v1/blaze_face_short_range.onnx
 Source7:        %{url}/releases/download/models-v1/face_landmarks_detector.tflite
+Source8:        %{url}/releases/download/models-v1/liveness_vit.onnx
+Source9:        %{url}/releases/download/models-v1/flir.onnx
 # Bundled onnxruntime runtime (MIT). irlume needs the api-24 ABI (>=1.24);
 # Fedora's own onnxruntime is below that in every release we build for
 # (verified 2026-07-16: f43 1.20.1, f44 1.22.2; rawhide's 1.26 is the first
@@ -99,6 +101,8 @@ echo '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  %{SOURCE
 echo '821683be088447839638f79d64268bd501bdb72e5d9e262ec981c7e252956caf  %{SOURCE4}' | sha256sum -c -
 echo 'c5453678015f6289c1d77bda88a8ba9c87574f01de1a05ba1909b9a7e08b237b  %{SOURCE5}' | sha256sum -c -
 echo 'c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5  %{SOURCE7}' | sha256sum -c -
+echo 'c7f8a6f3054b11f9719f5e24d37ec227721608fff8b90373c6c3e7659864161c  %{SOURCE8}' | sha256sum -c -
+echo 'df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72  %{SOURCE9}' | sha256sum -c -
 
 %build
 cargo build --release --locked
@@ -121,6 +125,8 @@ install -Dm0644 %{SOURCE3} %{buildroot}%{_datadir}/%{name}/models/face_detection
 install -Dm0644 %{SOURCE4} %{buildroot}%{_datadir}/%{name}/models/face_landmark.onnx
 install -Dm0644 %{SOURCE5} %{buildroot}%{_datadir}/%{name}/models/blaze_face_short_range.onnx
 install -Dm0644 %{SOURCE7} %{buildroot}%{_datadir}/%{name}/models/face_landmarks_detector.tflite
+install -Dm0644 %{SOURCE8} %{buildroot}%{_datadir}/%{name}/models/liveness_vit.onnx
+install -Dm0644 %{SOURCE9} %{buildroot}%{_datadir}/%{name}/models/flir.onnx
 install -Dm0644 packaging/systemd/irlumed.service %{buildroot}%{_unitdir}/irlumed.service
 install -Dm0644 packaging/systemd/irlumed.socket %{buildroot}%{_unitdir}/irlumed.socket
 # Self-heal wiring watcher: re-applies irlume's greeter PAM lines if a distro

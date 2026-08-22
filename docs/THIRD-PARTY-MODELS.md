@@ -76,28 +76,30 @@ in issue #235, and again for an enhanced version of the same attack, so a
 trained cue is currently the only thing that refuses it. See
 [the PAD results](pad-results/) for every number behind that.
 
-### `flir`: irlume fetches it
+### `flir`: SHIPPED DEFAULT-ON since ADR-0013 (2026-08-22)
 
 An infrared anti-spoof cue from Alibaba DAMO, published on ModelScope under MIT.
+
+> **This model no longer needs enabling.** It ships in every package and the
+> daemon loads it by default (kill switch: `IRLUME_PAD_IR=0` or `pad_ir=0` in
+> settings.conf). The entry below is retained for the provenance record and
+> for pre-0.11 settings compatibility.
 
 - **Measured:** 122 of 123 attack frames flagged across two cameras
   (2026-07-17); re-measured at the shipped threshold on 2026-07-27, 6 of 6
   presentations flagged at p_fake 0.941 to 1.000; on 2026-08-04 it refused the
   same print enhanced with an infrared-absorbing patch, at 0.998 to 0.999, in
-  the same runs where the built-in gate returned `Live`.
+  the same runs where the built-in gate returned `Live`. Revalidated at 197
+  identities on public NIR corpora 2026-08-21
+  ([record](research/2026-08-21-flir-public-nir-revalidation.md)).
 - **Threshold:** 0.9. Highest genuine score observed 0.702, lowest attack score
   0.941. The publisher's model card states no threshold at all.
 - **Genuine-side failures are mapped, not absent:** dim strobe frames and direct
   sun, and a blown frame drops the score into an abstain band (#237).
 - **Provenance:** the publisher documents neither the training data nor a
-  reproducible pipeline, so it fails ADR-0001 criteria 2 and 3. irlume does not
-  ship or warrant it.
-
-```sh
-sudo irlume models enable flir
-```
-
-`irlume setup` also offers this one, with the licence and provenance on screen.
+  reproducible pipeline. It ships default-on under the ADR-0013 deny-only
+  amendment (worst case is a password fallback), with the gap disclosed here
+  and in the daemon's startup line.
 
 ### Bring-your-own entries
 

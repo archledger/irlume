@@ -866,7 +866,7 @@ fn doctor_runs_fully_offline_with_a_source_origin() {
         "empty sandbox config/state must report no third-party model: {out}"
     );
     assert!(
-        out.contains("models enable flir") && out.contains("life-size print"),
+        out.contains("shipped PAD cues are not active") && out.contains("life-size print"),
         "reporting the cue as absent must also say what its absence costs, or the \
          line reads as a neutral default: {out}"
     );

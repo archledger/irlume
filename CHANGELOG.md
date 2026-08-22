@@ -5,6 +5,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Two PAD models ship default-on (ADR-0013).** The Adedev-W ViT RGB
+  liveness classifier (`liveness_vit.onnx`, MIT) and the DAMO FLIR IR
+  liveness classifier (`flir.onnx`, MIT) install with every package, verify
+  against `models/SHA256SUMS` at startup, and run DENY-ONLY at their
+  measured operating points: ViT m96 crop, 0.60, 5-frame-median vote per
+  authentication (catches the print/banner species at 100% across two
+  qualification sessions, 0/180 genuine false-fires; does NOT stop a phone
+  at login distance — disclosed in the startup line, IR covers that
+  species); FLIR 0.9 on lit IR frames. Kill switches: `IRLUME_PAD_VIT=0` /
+  `pad_vit=0` and `IRLUME_PAD_IR=0` / `pad_ir=0`. The opt-in catalog keeps
+  both provenance records; `flir` selections in existing settings.conf keep
+  working.
+
 ### Changed
 
 - Eye-based user challenges are retired. Gesture-gated requests now use only

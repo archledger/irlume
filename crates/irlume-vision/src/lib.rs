@@ -1313,6 +1313,189 @@ mod onnx {
         }
     }
 
+    /// Shipped ViT RGB PAD classifier (`liveness_vit.onnx`, default-on in the
+    /// daemon; see ADR-0013). Vision-Transformer-base, 224x224x3 RGB input
+    /// normalized `(px/255 - 0.5)/0.5`, two output LOGITS where softmax index
+    /// 1 is P(spoof) per the graph's own `id2label {"0": "real", "1":
+    /// "spoof"}` metadata. Preprocessing is the measured m96 convention from
+    /// the 2026-08-21/-22 qualification: expand the detection bbox by 96/112
+    /// of its width/height per side, CLAMP to the frame (no fill — the margin
+    /// sweep in docs/research/2026-08-21-vit-liveness-pad-evaluation.md showed
+    /// the crop margin is part of the operating point; tight and m25 overlap
+    /// genuine), bilinear-resize to 224.
+    pub struct PadVit {
+        session: Session,
+    }
+
+    impl PadVit {
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            Ok(Self {
+                session: build(model)?,
+            })
+        }
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
+            let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            Self::load_from_memory(&bytes)
+        }
+
+        /// P(spoof) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn p_spoof(
+            &mut self,
+            frame: &align::RgbView,
+            bbox: &[f32; 4],
+        ) -> irlume_common::Result<f32> {
+            let t = pad_vit_input(frame, bbox, 224);
+            let tensor = Tensor::from_array(([1i64, 3, 224, 224], t)).map_err(err)?;
+            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+            if raw.len() < 2 {
+                return Err(err("ViT PAD model: expected 2 output logits"));
+            }
+            // id2label: 0 = real, 1 = spoof.
+            let (a, b) = (raw[0], raw[1]);
+            let m = a.max(b);
+            let (ea, eb) = ((a - m).exp(), (b - m).exp());
+            Ok(eb / (ea + eb))
+        }
+    }
+
+    /// Build the ViT PAD input tensor: m96 bbox expansion (clamped, no fill),
+    /// bilinear resize to `size`, RGB, `(px/255 - 0.5)/0.5`, CHW. Pure and
+    /// separate so the preprocessing arithmetic is testable without weights.
+    fn pad_vit_input(frame: &align::RgbView, bbox: &[f32; 4], size: usize) -> Vec<f32> {
+        const MARGIN: f32 = 96.0 / 112.0;
+        let (fw, fh) = (frame.width as f32, frame.height as f32);
+        let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+        let x1 = (bbox[0] - bw * MARGIN).max(0.0);
+        let y1 = (bbox[1] - bh * MARGIN).max(0.0);
+        let x2 = (bbox[2] + bw * MARGIN).min(fw - 1.0);
+        let y2 = (bbox[3] + bh * MARGIN).min(fh - 1.0);
+        let (cw, ch) = ((x2 - x1).max(1.0), (y2 - y1).max(1.0));
+        let mut t = vec![0.0f32; 3 * size * size];
+        let plane = size * size;
+        for oy in 0..size {
+            for ox in 0..size {
+                // dst center -> source coord (bilinear, cv2 INTER_LINEAR
+                // convention); pixel() clamps sampling at the frame edge.
+                let fx = x1 + (ox as f32 + 0.5) * cw / size as f32 - 0.5;
+                let fy = y1 + (oy as f32 + 0.5) * ch / size as f32 - 0.5;
+                let p = frame.sample_bilinear(fx.clamp(0.0, fw - 1.0), fy.clamp(0.0, fh - 1.0));
+                let o = oy * size + ox;
+                t[o] = (p[0] / 255.0 - 0.5) / 0.5;
+                t[plane + o] = (p[1] / 255.0 - 0.5) / 0.5;
+                t[2 * plane + o] = (p[2] / 255.0 - 0.5) / 0.5;
+            }
+        }
+        t
+    }
+
+    /// Preprocessing arithmetic tests for [`pad_vit_input`]: the m96
+    /// expansion, edge clamping, RGB order, and `(px/255 - 0.5)/0.5`
+    /// normalization. The crop margin IS part of the measured operating
+    /// point (docs/research/2026-08-21-vit-liveness-pad-evaluation.md:
+    /// tight/m25 overlap genuine; m96 separates), so a preprocessing drift
+    /// is a threshold drift and these pin it.
+    #[cfg(test)]
+    mod pad_vit_input_tests {
+        use super::pad_vit_input;
+        use crate::align::RgbView;
+
+        struct Frame {
+            data: Vec<u8>,
+            width: u32,
+            height: u32,
+        }
+
+        impl Frame {
+            fn new(w: u32, h: u32, fill: impl Fn(u32, u32) -> [u8; 3]) -> Self {
+                let mut data = vec![0u8; (w * h * 3) as usize];
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = ((y * w + x) * 3) as usize;
+                        data[i..i + 3].copy_from_slice(&fill(x, y));
+                    }
+                }
+                Self {
+                    data,
+                    width: w,
+                    height: h,
+                }
+            }
+
+            fn view(&self) -> RgbView<'_> {
+                RgbView {
+                    data: &self.data,
+                    width: self.width,
+                    height: self.height,
+                }
+            }
+        }
+
+        const S: usize = 224;
+        const PLANE: usize = S * S;
+
+        #[test]
+        fn uniform_gray_normalizes_to_its_own_value() {
+            // px=128 -> (128/255 - 0.5)/0.5 ≈ +0.004; the m96 crop of a
+            // uniform frame is uniform, so EVERY element sits there.
+            let f = Frame::new(64, 48, |_, _| [128, 128, 128]);
+            let t = pad_vit_input(&f.view(), &[16.0, 8.0, 48.0, 40.0], S);
+            let want = (128.0 / 255.0 - 0.5) / 0.5;
+            assert!(t.iter().all(|&v| (v - want).abs() < 1e-6));
+        }
+
+        #[test]
+        fn channel_order_is_rgb_not_bgr() {
+            // R=255 everywhere: plane 0 ≈ +0.996, planes 1/2 = −1.0. A BGR
+            // swap fails this.
+            let f = Frame::new(16, 16, |_, _| [255, 0, 0]);
+            let t = pad_vit_input(&f.view(), &[2.0, 2.0, 12.0, 12.0], S);
+            let hi = (255.0 / 255.0 - 0.5) / 0.5;
+            let lo = (0.0 / 255.0 - 0.5) / 0.5;
+            assert!(t[..PLANE].iter().all(|&v| (v - hi).abs() < 1e-6));
+            assert!(t[PLANE..2 * PLANE].iter().all(|&v| (v - lo).abs() < 1e-6));
+            assert!(t[2 * PLANE..].iter().all(|&v| (v - lo).abs() < 1e-6));
+        }
+
+        #[test]
+        fn full_frame_bbox_clamps_without_fill() {
+            // A full-frame bbox expands past every edge and must clamp to
+            // the frame: dst (0,0) samples clamped source (0,0), and the
+            // last dst pixel samples source x2*(223.5/224)-0.5 < 31 (not a
+            // fill value). A 127-fill variant (the FLIR convention) would
+            // read ~0.0 there instead of the frame's own pixels.
+            let f = Frame::new(32, 32, |x, y| [(x * 8) as u8, (y * 8) as u8, 0]);
+            let t = pad_vit_input(&f.view(), &[0.0, 0.0, 32.0, 32.0], S);
+            let want00 = (0.0 / 255.0 - 0.5) / 0.5;
+            assert!((t[0] - want00).abs() < 1e-6, "R(0,0)={}", t[0]);
+            // x1 clamps to 0, x2 to 31; the last dst column samples
+            // fx = 223.5*31/224 - 0.5 ≈ 30.43 → R ≈ 8*30.43 = 243.4.
+            let fx = (S as f32 - 0.5) * 31.0 / S as f32 - 0.5;
+            let want_px = (fx * 8.0).min(255.0);
+            let want = (want_px / 255.0 - 0.5) / 0.5;
+            let last = t[PLANE - 1];
+            assert!((last - want).abs() < 0.02, "R(last)={last} want {want}");
+        }
+
+        #[test]
+        fn m96_margin_arithmetic_matches_the_measured_convention() {
+            // bbox x 100..148 (w=48): margin 48*96/112 per side. A horizontal
+            // R=x*4 gradient frame makes dst (0,0) a linear readout of the
+            // sampled fx, pinning the margin arithmetic end to end.
+            let f = Frame::new(256, 64, |x, _| [(x * 4) as u8, 0, 0]);
+            let t = pad_vit_input(&f.view(), &[100.0, 8.0, 148.0, 56.0], S);
+            let x1 = 100.0 - 48.0 * 96.0 / 112.0;
+            let cw = (148.0 + 48.0 * 96.0 / 112.0) - x1;
+            let fx = x1 + 0.5 * cw / S as f32 - 0.5;
+            let want_px = (fx.max(0.0) * 4.0).min(255.0);
+            let want = (want_px / 255.0 - 0.5) / 0.5;
+            assert!((t[0] - want).abs() < 0.02, "t[0]={} want {want}", t[0]);
+        }
+    }
+
     /// Third-party PAD classifier (opt-in; see `irlume_common::thirdparty`).
     /// Built for the DAMO FLIR IR liveness model: 112x112x3, (px-127.5)/128,
     /// NCHW, two output LOGITS where softmax index 0 is P(fake). Preprocessing
@@ -1666,8 +1849,8 @@ mod onnx {
 pub use onnx::{
     blaze_anchors, blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output,
     mesh_box_valid, mesh_output_plausible, runtime_resolution, selftest_alignment_identity,
-    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD,
-    MESH_INPUT, MESH_N, MESH_N_IRIS,
+    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, PadVit, BLAZE_INPUT,
+    BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
 };
 
 /// Pure decode tests for the short-range head: the reject half (floor, NaN)
@@ -1875,6 +2058,44 @@ mod model_tests {
         })
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Shipped ViT PAD session (models/liveness_vit.onnx via fetch-models.sh).
+    fn pad_vit() -> MutexGuard<'static, PadVit> {
+        static S: OnceLock<Mutex<PadVit>> = OnceLock::new();
+        S.get_or_init(|| {
+            ort_init();
+            Mutex::new(PadVit::load_from_file(&model_path("liveness_vit.onnx")).expect("vit pad"))
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The 2026-08-21 measured operating point (docs/research/
+    /// 2026-08-21-vit-liveness-pad-evaluation.md + the live session): the
+    /// deterministic synthetic chip must score the same value twice (pipeline
+    /// determinism, the property 5-frame median voting relies on) and a
+    /// uniform frame must land in the genuine band observed across 180 live
+    /// genuine frames (max 0.551 live, offline corpus). A uniform frame is
+    /// not a face; the assertion is only that the preprocessing produces a
+    /// stable, low-spoof input, not that it mimics a face.
+    #[test]
+    fn pad_vit_deterministic_and_uniform_frame_is_low_spoof() {
+        let mut pad = pad_vit();
+        let data = vec![140u8; 160 * 120 * 3];
+        let view = align::RgbView {
+            data: &data,
+            width: 160,
+            height: 120,
+        };
+        let bbox = [40.0, 30.0, 120.0, 90.0];
+        let a = pad.p_spoof(&view, &bbox).expect("score");
+        let b = pad.p_spoof(&view, &bbox).expect("score");
+        assert!((a - b).abs() < 1e-6, "nondeterministic: {a} vs {b}");
+        assert!(
+            a < 0.7,
+            "uniform frame scored {a}; the measured genuine band tops at 0.551"
+        );
     }
 
     /// Deterministic pseudo-textured 112x112 chip (the embedder's input shape).

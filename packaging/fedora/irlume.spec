@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.10.0
+Version:        0.11.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -255,6 +255,15 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sun Aug 23 2026 archledger <archledger236@gmail.com> - 0.11.0-1
+- SecureDark: scene gate + 0.635 dark threshold (ADR-0016)
+- Capture-path: role-aware flush (-3.3s/auth), schedule-aware pairing (ADR-0014)
+- IR emitter lock: clean installs keep IR auth under confinement
+- AppArmor: template-key locks + media-controller reads
+- TUI: Diagnostics fixes issues in-app; visible support report; exit chip
+- install.sh: verified channel fallbacks for Copr/PPA outages
+- uninstall: socket, units, AppArmor profile, user XDG state swept
+
 * Wed Aug 12 2026 archledger <archledger236@gmail.com> - 0.10.0-1
 - Per-service consent gestures with a head-shake decline; elevation and polkit prompts require a nod by default
 - The keyring-release gesture default changed from ON to OFF; opt back in with irlume credential-release-challenge credential_release on

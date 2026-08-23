@@ -5,6 +5,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+- Nothing yet.
+
+## [0.11.0] - 2026-08-23
+
 ### Security
 
 - **SecureDark stage 1 (ADR-0016): the pure-dark (IR-only) path hardens.**
@@ -63,6 +67,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- **Diagnostics finds AND fixes.** Rows can open the exact fixing flow
+  in-TUI (`Fix::Goto`): no-face-enrolled and template-key-missing start
+  enrollment, a missing recovery passphrase opens its prompt, a new
+  keyring-not-armed check opens the arm flow, and the daemon-down row
+  runs the sudo fix it used to merely describe. Diagnosis rows are
+  click-to-select then click-to-fix; the IR-test and Support lines and
+  every footer chip are click targets; the diagnosis box breathes with
+  proper spacing.
 - Eye-based user challenges are retired. Gesture-gated requests now use only
   repeated head nodding to approve and a head shake to decline. Existing
   per-service defaults are unchanged; passive PAD remains mandatory.
@@ -117,6 +129,50 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **Clean installs keep IR face authentication (P0).** The packaged daemon
+  creates the emitter lock root-owned, then the #487 access-mirror rework
+  hard-failed the group correction under the unit's deliberately
+  CAP_CHOWN-less bounding set — IR auth was dead on every clean install
+  (existing hosts only worked via leftover dev-run locks, which /run
+  clears at reboot). A lock owned by the process with no world bits is
+  strictly tighter than the mirror target and now proceeds; a
+  world-accessible uncorrectable lock still refuses.
+- **AppArmor profile gaps (enforce-mode installs):** the deferred
+  template-key loader's flocks and camera classification's media-graph
+  reads were both denied under enforcement — the first broke every
+  enrollment read, the second silently regressed the no-open
+  classification to the privacy-LED open probe. Both rules added; a
+  complain-mode audit across the full exercise battery confirmed no
+  other denial class remains.
+- **TUI could not be exited discoverably:** `q` was documented only in the
+  `?` overlay and bare `Esc` exited the whole app without confirmation.
+  Every screen's header now carries a clickable `✕ Exit (q)` chip; Esc
+  returns to Overview instead of quitting (it remains the escape hatch
+  during a stalled camera probe); the Cameras sudo action confirms
+  before running.
+- **`[s] Create Support Report` appeared broken:** the report ran silently
+  during the terminal suspend, showing a blank screen. The outcome now
+  prints with the absolute path on the suspended terminal (failure
+  included), and the file lands findably in the TUI's working directory.
+- **`sudo irlume` no longer writes user state into the invoking user's
+  HOME** (a root-owned `~/.local/share/irlume/<user>.json` survived
+  until now); privileged processes resolve to the system state dir
+  whenever $HOME is foreign.
+- **Uninstall leaves nothing behind:** the stale `/run/irlume.sock`, the
+  kernel-loaded AppArmor profile, `systemctl enable`'s unit copies in
+  `/etc/systemd/system/` (with a still-enabled timer), and per-user
+  `~/.local/share/irlume` state are all swept.
+- **install.sh:** verified channel fallbacks (Copr/PPA outage →
+  checksum+signature-verified release packages, upgrade-only: no
+  downgrades or lane flip-flop; `IRLUME_UPDATE=1` updates an installed
+  system from the release lane when the distro lane is down;
+  `IRLUME_RELEASE_PKG=1` opts Arch into the release package), plus
+  audit fixes: the PPA purge no longer defeats the no-downgrade guard,
+  asset matching is anchored with exactly-one-match, and the RPM path
+  uses `dnf install` (upgrade cannot fresh-install). Tampered sums,
+  stripped signatures, and reruns are container-verified fail-closed.
+- **The universal .deb container build** installs `libudev-dev` and
+  accepts docker as a podman fallback.
 - **`irlume diag` reports the keyring and face-template seals separately.** A
   healthy keyring credential envelope can no longer hide a missing, unreadable,
   or PCR-drifted template-key envelope behind one generic seal status; each row
@@ -2785,7 +2841,8 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/archledger/irlume/compare/v0.10.0...v0.11.0
 [0.9.0]: https://github.com/archledger/irlume/releases/tag/v0.9.0
 [0.8.1]: https://github.com/archledger/irlume/releases/tag/v0.8.1
 [0.8.0]: https://github.com/archledger/irlume/releases/tag/v0.8.0

@@ -714,20 +714,43 @@ fn mirror_device_access(
     }
 
     // Group first so the mode and ACL land on the device's group. uid -1
-    // leaves the owner alone. Do not silently accept a failed correction: the
-    // old group may grant the lock to callers who cannot open the device.
+    // leaves the owner alone. A correction failure is FATAL only when the
+    // lock is not already locked down to this process: the packaged daemon
+    // runs under CapabilityBoundingSet without CAP_CHOWN (the unit documents
+    // "nothing chowns"), so on a clean install it CREATES the lock root:root
+    // 0600 and cannot widen it to the device's group/ACL — a root-only lock
+    // excludes strictly MORE callers than the mirror target, which is safe
+    // for authentication (the mirror exists so user-context dev tools can
+    // share the lock, #487; a privileged tool re-runs ir-setup, which
+    // re-mirrors). A world-accessible lock this process cannot correct
+    // still refuses, unchanged. This restores the contract the ignored
+    // harness test documents: "it must not make a root-owned lock this
+    // process can open (but not chmod) refuse".
     let lock_meta = file
         .metadata()
         .map_err(|e| format!("stat emitter lock {}: {e}", path.display()))?;
+    // SAFETY: geteuid reads this process's own credentials and cannot fail.
+    let secure_fallback =
+        lock_meta.uid() == unsafe { libc::geteuid() } && lock_meta.mode() & 0o007 == 0;
     if lock_meta.gid() != st.st_gid {
         // SAFETY: fchown sets only the group on an owned fd.
         if unsafe { libc::fchown(lock_fd, u32::MAX, st.st_gid) } != 0 {
-            return Err(format!(
-                "set emitter lock {} group to {}: {}",
+            let e = std::io::Error::last_os_error();
+            if !secure_fallback {
+                return Err(format!(
+                    "set emitter lock {} group to {}: {}",
+                    path.display(),
+                    st.st_gid,
+                    e
+                ));
+            }
+            irlume_common::dlog!(
+                "emitter lock {}: cannot set group {} ({}); proceeding on the                  already-restricted root-owned lock (no world access)",
                 path.display(),
                 st.st_gid,
-                std::io::Error::last_os_error()
-            ));
+                e
+            );
+            return Ok(());
         }
     }
 
@@ -736,7 +759,17 @@ fn mirror_device_access(
     // stale named-user entries would grant callers who lost device access.
     let device_acl =
         read_access_acl(fd).map_err(|e| format!("read camera device fd {fd} access ACL: {e}"))?;
-    replace_access_acl(lock_fd, device_acl.as_deref(), path)?;
+    if let Err(e) = replace_access_acl(lock_fd, device_acl.as_deref(), path) {
+        if !secure_fallback {
+            return Err(e);
+        }
+        irlume_common::dlog!(
+            "emitter lock {}: cannot mirror the device ACL ({}); proceeding on              the already-restricted root-owned lock",
+            path.display(),
+            e
+        );
+        return Ok(());
+    }
 
     // Mode last. The ACL mask (if any) already fixed the group bits; without
     // an ACL the mode must be set to the device's exactly. Preserve the

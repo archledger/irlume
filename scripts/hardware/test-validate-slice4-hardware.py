@@ -119,6 +119,23 @@ class ValidatorTests(unittest.TestCase):
         result = self.run_validator(record)
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
+    def test_discarded_below_the_role_aware_minimum_is_rejected(self):
+        # The deterministic minimum mirrors rate_gate::startup_flush (RGB 0,
+        # IR 10): warm-up + two fill establishments of flush+31 each. One
+        # below the RGB floor (14 + 2*31 = 76) must reject; the floor itself
+        # is accepted by the untouched fixture above (136 > 76).
+        def one_below_rgb_floor(record):
+            stream = record["streams"][0]
+            stream["discarded_observations"] = 75
+            stream["observations"] = stream["frames"] + 75
+            stream["sequence_span_sum"] = (
+                stream["observations"]
+                - stream["epoch_count"]
+                + stream["cumulative_drops"]
+            )
+
+        self.assert_rejected(one_below_rgb_floor)
+
     def test_ambiguous_or_nonstandard_json_is_rejected(self):
         encoded = json.dumps(valid_record())
         duplicate_host = encoded.replace(

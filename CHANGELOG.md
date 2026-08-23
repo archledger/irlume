@@ -55,6 +55,25 @@ All notable changes to irlume are documented here. This project adheres to
 - Eye-based user challenges are retired. Gesture-gated requests now use only
   repeated head nodding to approve and a head shake to decline. Existing
   per-service defaults are unchanged; passive PAD remains mandatory.
+- **Capture-path latency and pairing (ADR-0014, PR #518).** The rate-gate
+  startup flush is role-aware (IR 10 dequeues, RGB 0; was 30/30) from fleet
+  measurement — lit authentication on sequential-schedule dual hosts drops
+  from ~10.4 s to ~7.0 s. The cross-spectrum pairing budget is
+  schedule-aware: concurrent captures keep the 3 s ceiling, sequential
+  one-shot captures (and concurrent attempts that degraded to their
+  sequential retry) pair within 8 s, ending the structural discard of paired
+  RGB at the ~3.05 s machinery gap (this also un-breaks `irlume identify`
+  and makes the ViT RGB PAD reachable on those hosts). Pairs admitted only
+  under the sequential budget defer the lit path's RGB-primary and fusion
+  grants to the IR-identity arms (IR fallback / calibrated centroid, which
+  carry identity thresholds): the machinery gap is a physical swap window
+  and the IR-side gates prove liveness, not identity. The delivered-rate
+  tolerance widens 98%→97% (1.2% margin below
+  the worst fleet IR node; fractional-rate deliveries still fail closed),
+  grace-window retries and the sequential fallback are bounded by
+  remaining-time vs costliest-attempt, and a read-only MSXU probe
+  (`irlume-camera` examples) reports Microsoft face-auth XU capabilities
+  without writing camera controls.
 - Legacy `consent_gesture=closure` and `require_eyes_open=true` fail closed with
   migration instructions for one release. Contract-1 eye fields remain present
   and frozen at `false`.

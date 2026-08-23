@@ -198,17 +198,18 @@ def main(argv):
             stream.get("recovery_duration_seconds"), f"{role}: recovery duration"
         )
         # The delivered-rate fill discards a bounded number of frames per
-        # stream on top of the warm-up discards: flush RATE_STARTUP_FLUSH (30)
-        # + fill (1 seed + RATE_WINDOW_CAPACITY deltas = 31) per establishment,
-        # run twice (initial + post-recovery). The faster stream keeps
-        # discarding until its slower twin is ready, so the total is rate-ratio
-        # dependent; assert only the deterministic minimum, and let the
+        # stream on top of the warm-up discards: flush (role-aware,
+        # rate_gate::startup_flush: RGB 0, IR 10) + fill (1 seed +
+        # RATE_WINDOW_CAPACITY deltas = 31) per establishment, run twice
+        # (initial + post-recovery). The faster stream keeps discarding until
+        # its slower twin is ready, so the total is rate-ratio dependent;
+        # assert only the deterministic minimum, and let the
         # delivered/discarded accounting check above catch inconsistency.
         minimum_discarded = {
             # warm-up (14 = 7 initial + 7 recovered; 1 = the IR session warm-up)
-            # + two fill establishments (2 * 61).
-            "rgb": 14 + 2 * 61,
-            "ir": 1 + 2 * 61,
+            # + two fill establishments (2 * (flush + 31)).
+            "rgb": 14 + 2 * (0 + 31),
+            "ir": 1 + 2 * (10 + 31),
         }[role]
         if discarded_observations < minimum_discarded:
             fail(

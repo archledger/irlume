@@ -506,9 +506,43 @@ fn state_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/irlume");
+        // A `sudo irlume ...` run keeps HOME at the invoking user's home on
+        // default sudoers (env_keep). Writing user state from the ROOT uid
+        // leaves root-owned files in $HOME that later user-mode runs cannot
+        // touch (found on the 2026-08-23 fleet audit: a root-owned
+        // ~/.local/share/irlume/<user>.json from July). The dev fallback is
+        // for the HUMAN running as themselves; privilege-mismatched HOME is
+        // never a dev sandbox, so it resolves to the system state dir instead.
+        if !sudo_writing_into_user_home(&home) {
+            return PathBuf::from(home).join(".local/share/irlume");
+        }
+        return PathBuf::from(irlume_common::STATE_DIR);
     }
     PathBuf::from(irlume_common::STATE_DIR)
+}
+
+/// True when this process is privileged but $HOME belongs to a non-root user
+/// (the `sudo irlume` shape). libc-free: /proc/self/status is Linux-standard.
+fn privileged_with_foreign_home(euid: u32, home: &str) -> bool {
+    if euid == 0 {
+        // Root's own $HOME (/root) is fine; any other HOME means env_keep
+        // carried the invoking user's home into the privileged process.
+        return home != "/root";
+    }
+    false
+}
+
+fn sudo_writing_into_user_home(home: &str) -> bool {
+    let euid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines().find(|l| l.starts_with("Uid:")).and_then(|l| {
+                l.split_whitespace()
+                    .nth(2)
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
+        });
+    euid.is_some_and(|euid| privileged_with_foreign_home(euid, home))
 }
 
 pub fn profile_path(user: &str) -> PathBuf {
@@ -1522,5 +1556,22 @@ mod tests {
 
         std::env::remove_var("IRLUME_STATE_DIR");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(test)]
+    mod sudo_state_dir_tests {
+        use super::*;
+
+        #[test]
+        fn sudo_with_env_keep_home_resolves_to_the_system_state_dir() {
+            // The pure decision: root euid + the invoking user's HOME is the
+            // `sudo irlume` env_keep shape and must NOT use $HOME.
+            assert!(privileged_with_foreign_home(0, "/home/wisbfime"));
+            // Root's own home is legitimate.
+            assert!(!privileged_with_foreign_home(0, "/root"));
+            // Unprivileged processes (the dev fallback's actual audience) are
+            // never the sudo shape, whatever HOME is.
+            assert!(!privileged_with_foreign_home(1000, "/home/wisbfime"));
+        }
     }
 }

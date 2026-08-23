@@ -160,6 +160,13 @@ pub struct Assessment {
     /// loaded and an IR face was present. Deny-only: consulted by both the
     /// cross-spectrum verdict (in `assess_full`) and the dark path.
     pub shipped_ir_fake: Option<f32>,
+    /// True when the RGB/IR pair this assessment rests on was admitted only
+    /// under the sequential pairing budget (`SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW`,
+    /// ADR-0014): the frames were captured as two temporally separated one-shot
+    /// bursts, not concurrently. The lit path then defers its RGB-primary grant
+    /// to the IR-identity-verified arms (fusion / IR fallback / centroid); see
+    /// `rgb_primary_grant_admissible` and ADR-0014.
+    pub sequential_pair: bool,
 }
 
 /// The authentication decision for a user.
@@ -464,6 +471,20 @@ fn eligible_pair_evidence<T>(
     } else {
         EligiblePairEvidence::Reject
     }
+}
+
+/// ADR-0014 security posture: on a pair captured under the sequential
+/// schedule the RGB and IR bursts are separated by the capture machinery gap
+/// (~3.05 s measured), which is a physical swap window. The lit path's
+/// IR-side gates (cross-spectrum co-location, FLIR IR PAD, the per-user IR
+/// center/edge floor) pass for ANY live face — they prove presence and
+/// liveness, not identity — so an RGB recognition hit must not carry the
+/// grant alone across that gap. Such pairs grant only through arms that also
+/// require an IR identity match (fusion, IR fallback, calibrated centroid).
+/// Concurrent pairs (skew <= `MAX_CROSS_SPECTRUM_SKEW`) interleave the two
+/// spectra and keep the RGB-primary arm.
+fn rgb_primary_grant_admissible(score: f32, threshold: f32, sequential_pair: bool) -> bool {
+    score >= threshold && !sequential_pair
 }
 
 /// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
@@ -3264,6 +3285,7 @@ impl Engine {
             ir_brightness: 0.0,
             ir_ambient_share: None, // RGB-only path: no IR burst to measure
             shipped_ir_fake: None,  // RGB-only path: no IR frame exists
+            sequential_pair: false, // RGB-only path: no pair exists
         })
     }
 
@@ -3877,6 +3899,7 @@ impl Engine {
                     ir_brightness: 0.0,
                     ir_ambient_share: None,
                             shipped_ir_fake: None,
+                            sequential_pair: false, // rejected pair: no pair survives
                 });
             }
         };
@@ -4109,6 +4132,10 @@ impl Engine {
                 .ambient_observed
                 .then(|| ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0)),
             shipped_ir_fake,
+            // Paired under the schedule-aware budget AND beyond the concurrent
+            // ceiling: the bursts ran as separated one-shots (ADR-0014). Such
+            // pairs defer the RGB-primary grant (rgb_primary_grant_admissible).
+            sequential_pair: rgb_top.is_some() && skew > MAX_CROSS_SPECTRUM_SKEW,
         })
     }
 
@@ -4840,6 +4867,7 @@ impl Engine {
             drop(held_cams);
             let mut no_rgb = None;
             let mut no_ir = None;
+            let mut costliest_attempt = std::time::Duration::ZERO;
             return self
                 .authentication_attempt_loop(
                     &enr,
@@ -4852,9 +4880,11 @@ impl Engine {
                     &capture_mode,
                     &camera_operation,
                     diagnostics,
+                    &mut costliest_attempt,
                 )
                 .0;
         }
+        let mut costliest_attempt = std::time::Duration::ZERO;
         let (first_result, held_pair_failed) = self.authentication_attempt_loop(
             &enr,
             purpose,
@@ -4866,11 +4896,27 @@ impl Engine {
             &capture_mode,
             &camera_operation,
             diagnostics,
+            &mut costliest_attempt,
         );
         if !held_pair_failed {
             return first_result;
         }
         let error = first_result.expect_err("held-pair failure must return an error");
+        // The sequential fallback re-opens both cameras (~7 s for the pair).
+        // Bound its FIRST attempt the same way the loop bounds retries: when
+        // the costliest observed attempt cannot finish before the deadline,
+        // do not start it — the camera is released and the password fallback
+        // answers inside the window instead of the lease overrunning
+        // mid-capture (ADR-0014).
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining < costliest_attempt {
+            irlume_common::dlog!(
+                "grace: sequential fallback skipped ({}ms left, costliest attempt {}ms); settling",
+                remaining.as_millis(),
+                costliest_attempt.as_millis()
+            );
+            return Err(error);
+        }
         drop(held_rgb);
         drop(held_ir);
         drop(held_cams);
@@ -4880,6 +4926,8 @@ impl Engine {
         );
         let mut no_rgb = None;
         let mut no_ir = None;
+        // Seed with the first loop's costliest attempt so the fallback's own
+        // retry decisions account for what this deadline has already spent.
         self.authentication_attempt_loop(
             &enr,
             purpose,
@@ -4891,6 +4939,7 @@ impl Engine {
             &capture_mode,
             &camera_operation,
             diagnostics,
+            &mut costliest_attempt,
         )
         .0
     }
@@ -4908,15 +4957,17 @@ impl Engine {
         capture_mode: &CaptureModeSelection,
         camera_operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        costliest_attempt: &mut std::time::Duration,
     ) -> (irlume_common::Result<Outcome>, bool) {
         let mut attempt = 0_u32;
-        // The costliest attempt so far. A retry that cannot FINISH before the
-        // deadline would overrun mid-capture — holding the camera past the
-        // window for a result that can never be used. The costliest (not
-        // latest) attempt is the estimator because a retry can be far slower
-        // than the attempt before it: the held-concurrent pair costs ~1s,
-        // and its sequential fallback re-opens both cameras at ~7s.
-        let mut costliest_attempt = std::time::Duration::ZERO;
+        // The costliest attempt so far (caller-seeded: the sequential fallback
+        // starts with the concurrent loop's observed worst). A retry that
+        // cannot FINISH before the deadline would overrun mid-capture —
+        // holding the camera past the window for a result that can never be
+        // used. The costliest (not latest) attempt is the estimator because a
+        // retry can be far slower than the attempt before it: the
+        // held-concurrent pair costs ~1s, and its sequential fallback re-opens
+        // both cameras at ~7s.
         loop {
             attempt += 1;
             let mut held_pair_failed = false;
@@ -4943,12 +4994,12 @@ impl Engine {
                     return (Err(error), held_pair_failed);
                 }
             };
-            costliest_attempt = costliest_attempt.max(attempt_started.elapsed());
+            *costliest_attempt = (*costliest_attempt).max(attempt_started.elapsed());
             let expired = std::time::Instant::now() >= deadline;
             let retry_wont_fit = !expired
                 && presence_retryable(&out)
                 && deadline.saturating_duration_since(std::time::Instant::now())
-                    < costliest_attempt;
+                    < *costliest_attempt;
             if retry_wont_fit {
                 irlume_common::dlog!(
                     "grace: retry skipped ({}ms left, costliest attempt {}ms); settling",
@@ -5103,12 +5154,18 @@ impl Engine {
                 thr,
                 score >= thr,
             );
-            if score >= thr {
+            if rgb_primary_grant_admissible(score, thr, a.sequential_pair) {
                 release_held(held_rgb, held_ir);
                 return self.challenge_if_required(
                     purpose,
                     service,
                     Outcome::grant(score, format!("match: {who} (rgb)")),
+                );
+            }
+            if a.sequential_pair && score >= thr {
+                irlume_common::dlog!(
+                    "match(rgb): {score:.3} >= thr {thr:.3} DEFERRED (sequential-schedule pair; \
+                     IR-identity arms only, ADR-0014)"
                 );
             }
             // Stage-2 lighting-adaptive fusion: RGB recognition missed (poor ambient
@@ -5210,7 +5267,14 @@ impl Engine {
             return Ok(Outcome::deny_live(
                 OutcomeKind::BelowThreshold,
                 score,
-                format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)"),
+                if a.sequential_pair && score >= thr {
+                    format!(
+                        "rgb {score:.2} matched but the sequentially captured pair \
+                         requires an IR-verified match; fusion+ir missed"
+                    )
+                } else {
+                    format!("below threshold (rgb {score:.2}, fusion+ir-fallback miss)")
+                },
             ));
         }
 
@@ -7851,6 +7915,26 @@ mod tests {
             ),
             EligiblePairEvidence::IrOnly,
         );
+    }
+
+    #[test]
+    fn sequential_schedule_pairs_do_not_grant_on_rgb_alone() {
+        // ADR-0014 security posture: the machinery gap between the RGB and IR
+        // bursts of a sequential-schedule pair is a physical swap window, and
+        // the IR-side gates pass for any live face (presence/liveness, not
+        // identity), so a passing RGB score must defer to the IR-identity
+        // arms instead of granting alone.
+        assert!(
+            !rgb_primary_grant_admissible(0.90, 0.60, true),
+            "a sequential-schedule pair must not take the RGB-primary grant"
+        );
+        // Concurrent pairs interleave the two spectra; the arm stands.
+        assert!(
+            rgb_primary_grant_admissible(0.90, 0.60, false),
+            "a concurrent pair keeps the RGB-primary arm"
+        );
+        // A miss is a miss on either schedule.
+        assert!(!rgb_primary_grant_admissible(0.59, 0.60, false));
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn main() {
         Spectrum::Ir => (15, 1),
         Spectrum::Rgb => (15, 2),
     };
-    println!("# flush attempts -> window span_us delivered fps meets_floor(98%)");
+    println!("# flush attempts -> window span_us delivered fps meets_floor(97%)");
     for flush in 0..=30_usize {
         let mut deltas: Vec<i64> = Vec::with_capacity(30);
         let mut seed: Option<i64> = None;
@@ -125,9 +125,10 @@ fn main() {
         let span: i64 = deltas.iter().sum();
         let fps = 30.0 * 1_000_000.0 / span.max(1) as f64;
         // Exact integer floor check mirroring RateWindow::meets_floor:
-        // count * 1e6 * floor_den * 100 >= span * floor_num * 98.
+        // count * 1e6 * floor_den * 100 >= span * floor_num * tolerance.
+        // Tolerance must track rate_gate::DEFAULT_TOLERANCE_PERCENT (97).
         let lhs = 30_u128 * 1_000_000 * u128::from(floor_den) * 100;
-        let rhs = span as u128 * u128::from(floor_num) * 98;
+        let rhs = span as u128 * u128::from(floor_num) * 97;
         println!("{flush} -> {span} {fps:.3} {}", lhs >= rhs);
     }
 }

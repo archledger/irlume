@@ -32,7 +32,7 @@ pub(crate) const RATE_WINDOW_CAPACITY: usize = 30;
 /// i.e. one firmware/thermal drift away from failing every production auth
 /// on a host that passes every other gate. 97% leaves 1.2% margin below the
 /// worst real node while still rejecting every fractional-rate delivery by
-/// a wide margin (10 Hz is 67% of the IR floor).
+/// a wide margin (10 Hz clears only ~69% of the 14.55 fps IR floor).
 ///
 /// Loosening this is cheap on purpose: the rate window is TRANSPORT-HEALTH
 /// evidence (a degraded USB link, a starved stream, a demoted schedule),

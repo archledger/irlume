@@ -5659,20 +5659,27 @@ pub mod startup_probe {
             super::ValidatedDequeueError,
         >,
         t0: std::time::Instant,
-    ) -> StartupDequeue {
+    ) -> irlume_common::Result<StartupDequeue> {
         let (valid, facts) = match dequeued {
             Ok((_, facts)) => (true, Some(facts)),
             Err(super::ValidatedDequeueError::Corrupt(facts)) => (false, Some(facts)),
-            Err(error) => panic!("stream error during startup probe: {error:?}"),
+            Err(error) => {
+                // A stream error ends the probe as an error, not a panic: the
+                // caller may hold the emitter guard and a session slot, and a
+                // panicking pub probe in this crate would escape both.
+                return Err(super::Error::Hardware(format!(
+                    "stream error during startup probe: {error:?}"
+                )));
+            }
         };
         let facts = facts.map(|f| (f.sequence_raw(), f.timestamp_micros()));
-        StartupDequeue {
+        Ok(StartupDequeue {
             index,
             valid,
             sequence_raw: facts.map(|(s, _)| s),
             timestamp_micros: facts.map(|(_, t)| t),
             dequeue_us: t0.elapsed().as_micros() as u64,
-        }
+        })
     }
 
     /// Raw startup profile of the RGB node. The probe takes the same
@@ -5696,7 +5703,7 @@ pub mod startup_probe {
             cam.lease
                 .require_endpoint(device)
                 .map_err(|error| super::Error::Hardware(error.to_string()))?;
-            out.push(record(index, stream.next_validated(), t0));
+            out.push(record(index, stream.next_validated(), t0)?);
         }
         Ok(out)
     }
@@ -5741,7 +5748,7 @@ pub mod startup_probe {
             cam.lease
                 .require_endpoint(device)
                 .map_err(|error| super::Error::Hardware(error.to_string()))?;
-            out.push(record(index, stream.next_validated(), t0));
+            out.push(record(index, stream.next_validated(), t0)?);
         }
         Ok(out)
     }

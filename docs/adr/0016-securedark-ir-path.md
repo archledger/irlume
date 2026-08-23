@@ -55,8 +55,8 @@ calibrated-centroid arms. Stage 1 shipped 0.60 (FAR 2.7e-4 / FRR 3.0%
 pairwise); stage 2's pre-written rule — raise to 0.635 only if the live
 genuine 1st-percentile clears the effective bar by >= 0.02 — was executed
 against the 2026-08-23 live dark session (minihost NexiGo, 30 auths, true
-dark: genuine min 0.884 vs 0.685 effective, margin 0.199, 10x the rule)
-plus the deployment-shaped CBSR OR-arm (0.635 -> FAR 1.24e-4 / FRR 0.69%)
+dark: genuine min 0.884 vs 0.685 effective (10 enrolled scans), margin 0.199, 10x the rule)
+plus the deployment-shaped CBSR OR-arm (0.635 -> FAR 1.24e-4 / FRR 0.68%)
 and the Tufts calibrated arm (~4.9e-5). The stage-1 inversion fix stands:
 the dim-light fallback (RGB-verified, more evidence) keeps its
 0.60-effective bar while the pure-dark bar sits above it, so the arm with
@@ -134,7 +134,7 @@ lit-room IR-only attacks; the species defenses are the PAD stack.
 ## Consequences
 
 - A pure-dark grant is defensible as Secure-tier evidence at the 0.635 bar
-  with the scene gate closing the lit-room routing hole; the "convenience
+  with the scene gate closing presentation-based lit-room routing (the measured occlusion residual is disclosed above); the "convenience
   grade" caveat in the threshold documentation is retired for the dark path.
 - Lit rooms where RGB genuinely cannot find a face (harsh backlight) lose
   IR-only fallback: retry, then password. Disclosed trade.

@@ -63,7 +63,7 @@ same split, `--cache` npz):
 
 - **OR operating point (the number that matters)**: base 0.60 -> single
   frame **FAR 4.03e-4 / FRR 0.56%**; 0.615 -> 2.62e-4 / 0.64%; 0.625 ->
-  1.90e-4 / 0.67%; 0.635 -> 1.24e-4 / 0.69%; 0.65 -> 7.2e-5 / 0.89%.
+  1.90e-4 / 0.67%; 0.635 -> 1.24e-4 / 0.68%; 0.65 -> 7.2e-5 / 0.89%.
   The OR costs ~2.9x the best-of-N arm's FAR at 0.60 — the centroid arm
   is the contributor (its own FAR 4.0e-4 at 0.60 flat).
 - **AND-of-2 consecutive frames** (correlated, same burst — the honest
@@ -160,7 +160,7 @@ user, branch binary with both PAD cues attached:
   dark. Center/edge ratio 1.45-2.00; ambient 0 (emitter-dominated).
 - **Stage-2 decision rule ("0.635 only if live genuine p1 clears it by
   >= 0.02"): PASSED with 10x margin** — genuine MINIMUM 0.884 vs the
-  0.635-scaled bar 0.685 (margin 0.199). IR_DARK_MATCH_THRESHOLD raised
+  0.635-scaled bar 0.685 (10 enrolled scans: 0.635 + 0.015*log2(10); margin 0.199). IR_DARK_MATCH_THRESHOLD raised
   to 0.635 (stage 2) on this session + the CBSR OR-arm (1.24e-4 FAR) +
   Tufts calibrated arm.
 

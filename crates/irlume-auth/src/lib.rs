@@ -9632,11 +9632,14 @@ mod pad_cue_tests {
         // 0.702 on 2026-07-27 (the reading that denied a real user when the
         // threshold was 0.5), and the vinyl-print attack at 0.998-1.0000
         // medians with a measured floor of 0.941 (2026-07-27, 6/6 flagged at
-        // 0.941-1.000). The operating window is 0.702-0.941; the threshold
-        // must stay inside it. Raising it "to be safer" crosses the attack
-        // floor and drops detections; lowering it crosses the genuine
-        // excursion and denies real faces.
-        const MEASURED_GENUINE_EXCURSION: f32 = 0.702;
+        // 0.941-1.000). The 2026-08-23 SecureDark lit-room control (RGB lens
+        // occluded, room lit, genuine face via IR) measured 0.799 — the
+        // worst genuine excursion on record, an out-of-domain regime (FLIR
+        // trained on emitter-dark NIR), disclosed in ADR-0016. The operating
+        // window is 0.799-0.941; the threshold must stay inside it. Raising
+        // it "to be safer" crosses the attack floor and drops detections;
+        // lowering it crosses the genuine excursion and denies real faces.
+        const MEASURED_GENUINE_EXCURSION: f32 = 0.799;
         const MEASURED_ATTACK_FLOOR: f32 = 0.941;
         const { assert!(IR_PAD_THRESHOLD > MEASURED_GENUINE_EXCURSION) };
         const { assert!(IR_PAD_THRESHOLD < MEASURED_ATTACK_FLOOR) };

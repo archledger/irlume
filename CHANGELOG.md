@@ -21,7 +21,7 @@ All notable changes to irlume are documented here. This project adheres to
   the live dark session ran (30 true-dark auths, minihost NexiGo; genuine
   best-cosine min 0.884, FLIR p_fake <= 0.005) and the pre-written decision
   rule passed with 10x margin, so `IR_DARK_MATCH_THRESHOLD` rises
-  0.60 → 0.635 (CBSR deployment-shaped OR-arm FAR 1.24e-4 / FRR 0.69%;
+  0.60 → 0.635 (CBSR deployment-shaped OR-arm FAR 1.24e-4 / FRR 0.68%;
   Tufts calibrated ~4.9e-5). The session also MEASURED the disclosed
   residuals: the ASUS Shinetech module's firmware auto-engages its privacy
   shutter while streaming in darkness (dark auth is firmware-impossible on

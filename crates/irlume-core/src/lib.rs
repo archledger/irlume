@@ -112,7 +112,7 @@ pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 /// 0.635 only if the live genuine 1st-percentile clears the effective bar by
 /// >= 0.02 — satisfied with 10x margin):
 /// - CBSR deployment-shaped OR-arm (best-of-N OR centroid, 197 ids / 347,508
-///   impostor pairs): 0.635 -> FAR 1.24e-4 / FRR 0.69% (0.60 -> 4.03e-4).
+///   impostor pairs): 0.635 -> FAR 1.24e-4 / FRR 0.68% (0.60 -> 4.03e-4).
 /// - Tufts cross-spectral calibrated arm: 0.635-class FAR ~4.9e-5.
 /// - LIVE dark session (2026-08-23, minihost NexiGo, true dark, 30 auths,
 ///   `docs/research/2026-08-22-securedark-v1.md`): genuine best-cosine min

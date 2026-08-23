@@ -80,6 +80,14 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # engine mis-tiers (found enforcing on Arch, 2026-08-05; issues #281/#283).
   /dev/ r,
   /dev/video[0-9]* rw,
+  # Media-controller nodes: camera classification's no-open path (#428) reads
+  # the media graph to decide a video node's role WITHOUT opening it (a video
+  # open powers the camera up pre-6.16 = privacy-LED blink per scan, and the
+  # udev lifecycle thread re-reads the graph on every hot-plug event). Under
+  # enforce without this rule the read fails and classification silently
+  # falls back to the legacy open probe — found by the 0.11.0rc3 complain-mode
+  # audit: the ONLY denial class across a full exercise battery.
+  /dev/media[0-9]* r,
   /sys/class/video4linux/ r,
   /sys/class/video4linux/** r,
   /sys/devices/** r,

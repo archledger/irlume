@@ -72,7 +72,7 @@ podman run --rm \
     apt-get install -y -qq --no-install-recommends \
       ca-certificates curl rsync git xz-utils \
       build-essential dpkg-dev debhelper devscripts fakeroot linux-libc-dev \
-      cargo rustc pkg-config clang libclang-dev libtss2-dev libpam0g-dev >/dev/null
+      cargo rustc pkg-config clang libclang-dev libtss2-dev libpam0g-dev libudev-dev >/dev/null
     cd /work
     export BUILDROOT=/work/ppa-build
     bash scripts/build-ppa-source.sh

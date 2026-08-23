@@ -39,6 +39,7 @@ LAMBDAS = [None, 0.1, 0.5, 1.0]   # None = no calibration (control); 0.5 shipped
 KS = [3, 5]            # calibration fit-pair counts (MIN_FIT_PAIRS=3 shipped)
 THRESHOLDS = [0.55, 0.60, 0.635]
 TEMPLATE_SCALE = 0.015  # irlume-core scaled_threshold step per log2(N)
+THRESHOLDS_V2 = [0.55, 0.575, 0.60, 0.615, 0.625, 0.635, 0.65]  # dark-path grid
 
 
 def scaled_threshold(base, n):
@@ -106,7 +107,14 @@ def embed_dir(det, emb, paths):
     return out, misses
 
 
-def cbsr_arm(det, emb, cbsr_dir):
+def cbsr_embeddings(det, emb, cbsr_dir, cache=None):
+    """Embed the CBSR corpus once; optionally cache to a .npz so sweep
+    iterations do not re-pay ~4k inference passes. Returns {sid: (n,d)
+    L2-normalized matrix} for ids with more than N_ENROLL+3 usable frames."""
+    cache_file = Path(cache) if cache else None
+    if cache_file and cache_file.exists():
+        z = np.load(cache_file, allow_pickle=True)
+        return {s: z[s] for s in z.files}
     ids = {}
     for p in sorted(Path(cbsr_dir).glob("*.bmp")):
         ids.setdefault(p.name.split("-")[0], []).append(p)
@@ -116,7 +124,14 @@ def cbsr_arm(det, emb, cbsr_dir):
         miss += m
         if len(e) > N_ENROLL + 3:
             embs[sid] = normalize_rows(np.array(e))
-    result = {"ids_used": len(embs), "detect_misses": miss,
+    if cache_file:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache_file, **embs)
+    return embs
+
+
+def cbsr_arm(embs):
+    result = {"ids_used": len(embs), "detect_misses": None,
               "n_enroll": N_ENROLL}
     enroll = {s: E[:N_ENROLL] for s, E in embs.items()}
     probes = {s: E[N_ENROLL:] for s, E in embs.items()}
@@ -139,6 +154,111 @@ def cbsr_arm(det, emb, cbsr_dir):
                 for t in THRESHOLDS],
         }
     return result
+
+
+def cbsr_v2_arm(embs):
+    """Deployment-shape operating point + multi-frame design inputs (ADR-0016
+    open measurement, offline arm 2).
+
+    Production's dark path grants on best-of-N at scaled_threshold(t,
+    n_scans) OR the calibrated centroid at scaled_threshold(t, n_profiles).
+    A CBSR id models ONE profile with N_ENROLL scans, so per base t:
+    thr_b = t + 0.015*log2(11) ~ t+0.052, thr_c = t exactly. The separate
+    per-arm sweeps above bound the OR from below only; this measures the OR.
+
+    AND-of-2: a presentation is two CONSECUTIVE same-session probe frames
+    (correlated, like a burst); it grants only if BOTH frames clear. CBSR
+    cannot measure cross-session or cross-condition correlation — the live
+    dark session still decides; this is the correlated-frame upper bound.
+
+    Frame-pair cosines feed the multi-frame agreement constant design: the
+    same-person-across-frames distribution that must not be guessed.
+    """
+    enroll = {s: E[:N_ENROLL] for s, E in embs.items()}
+    probes = {s: E[N_ENROLL:] for s, E in embs.items()}
+    cents = {s: normalize_vec(T.mean(0)) for s, T in enroll.items()}
+    sids = sorted(embs)
+    # Flat probe matrix with per-row owner, for vectorized per-victim scoring.
+    rows, owner = [], []
+    for sid in sids:
+        for v in probes[sid]:
+            rows.append(v)
+            owner.append(sid)
+    P = np.array(rows)
+    owner = np.array(owner)
+    # Per-victim arm scores for every probe frame.
+    B = np.zeros((len(sids), len(rows)))
+    C = np.zeros((len(sids), len(rows)))
+    for vi, v in enumerate(sids):
+        B[vi] = (P @ enroll[v].T).max(1)
+        C[vi] = P @ cents[v]
+    gen_mask = owner[None, :] == np.array(sids)[:, None]
+
+    def frame_pass(t):
+        thr_b = scaled_threshold(t, N_ENROLL)
+        return (B >= thr_b) | (C >= t)          # OR arm, per frame
+
+    def best_only_pass(t):
+        return B >= scaled_threshold(t, N_ENROLL)
+
+    def pres_rates(pass_mat):
+        """AND-of-2 over consecutive same-owner frames. A presentation is an
+        ATTACKER sid's consecutive probe pair scored against victim v; the
+        pair grants only if BOTH frames pass v's condition."""
+        idx_by_sid = {s: np.where(owner == s)[0] for s in sids}
+        gen_pres = imp_pres = gen_pass = imp_pass = 0
+        for vi, v in enumerate(sids):
+            for s in sids:
+                idx = idx_by_sid[s]
+                for a, b in zip(idx[0::2], idx[1::2]):
+                    both = bool(pass_mat[vi, a]) and bool(pass_mat[vi, b])
+                    if s == v:
+                        gen_pres += 1
+                        gen_pass += both
+                    else:
+                        imp_pres += 1
+                        imp_pass += both
+        return {"far": imp_pass / imp_pres if imp_pres else None,
+                "frr": 1 - gen_pass / gen_pres if gen_pres else None,
+                "n_gen_pres": gen_pres, "n_imp_pres": imp_pres}
+
+    # Single-frame OR rates per threshold (vectorized over the mask).
+    rows_out = []
+    for t in THRESHOLDS_V2:
+        pf = frame_pass(t)
+        rows_out.append({
+            "thr": round(t, 4),
+            "far": float(pf[~gen_mask].mean()),
+            "frr": float((~pf)[gen_mask].mean()),
+            "n_gen": int(gen_mask.sum()),
+            "n_imp": int((~gen_mask).sum()),
+        })
+    or_arm = {
+        "note": "grant = best_of_N >= t+0.015*log2(11) OR centroid >= t "
+                "(1 profile); thresholds are the BASE t",
+        "single_frame": rows_out,
+        "and2": [dict(thr=round(t, 4), **pres_rates(frame_pass(t)))
+                 for t in THRESHOLDS_V2],
+        "and2_best_of_n_only": [
+            dict(thr=round(t, 4), **pres_rates(best_only_pass(t)))
+            for t in THRESHOLDS_V2],
+    }
+
+    # Frame-pair cosines: adjacent same-id frames (the same-person-across-
+    # frames distribution) and a cross-id first-probe control.
+    gen_pairs = []
+    for s in sids:
+        E = embs[s]
+        gen_pairs += list(np.sum(E[:-1] * E[1:], 1))
+    firsts = np.array([embs[s][N_ENROLL] for s in sids])
+    imp_pairs = (firsts @ firsts.T)[np.triu_indices(len(sids), 1)]
+    return {
+        "or_arm": or_arm,
+        "frame_pair_cosines": {
+            "genuine_adjacent_frames": percentile_table(gen_pairs),
+            "impostor_first_probes": percentile_table(imp_pairs),
+        },
+    }
 
 
 def tufts_arm(det, emb, rgb_root, nir_root):
@@ -220,6 +340,8 @@ def main():
     ap.add_argument("--tufts-nir", required=True)
     ap.add_argument("--models-dir", required=True)
     ap.add_argument("--out", default="securedark_sweep.json")
+    ap.add_argument("--cache", default=None,
+                    help="npz path to cache/load CBSR embeddings")
     a = ap.parse_args()
 
     det = Detector(str(Path(a.models_dir) / "face_detection_yunet_2023mar.onnx"))
@@ -228,7 +350,9 @@ def main():
     emb = Embedder(str(Path(a.models_dir) / "glintr100.onnx"), 128.0,
                    ["CPUExecutionProvider"])
 
-    out = {"cbsr_raw": cbsr_arm(det, emb, a.cbsr),
+    embs = cbsr_embeddings(det, emb, a.cbsr, a.cache)
+    out = {"cbsr_raw": cbsr_arm(embs),
+           "cbsr_v2": cbsr_v2_arm(embs),
            "tufts_calibrated": tufts_arm(det, emb, a.tufts_rgb, a.tufts_nir)}
     Path(a.out).write_text(json.dumps(out, indent=1))
     print("wrote", a.out)
@@ -239,6 +363,9 @@ def main():
               f"imp max={c[mode]['impostor'].get('max'):.3f}")
         for row in c[mode]["sweep"]:
             print("   ", row["flat"])
+    v2 = out["cbsr_v2"]["or_arm"]
+    print("  OR single-frame @0.60:", v2["single_frame"][2])
+    print("  OR and2 @0.60:", v2["and2"][2])
 
 
 if __name__ == "__main__":

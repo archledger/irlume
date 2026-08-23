@@ -41,6 +41,23 @@ fn main() {
     let mut engine = irlume_auth::Engine::load(&det, &model)
         .expect("load engine")
         .with_devices(&rgb, &ir);
+    // Attach the shipped PAD cues when their model files exist (ADR-0013),
+    // honouring the same env names the daemon unit sets — the dark-session
+    // protocol records FLIR p_fake per auth, so the probe must exercise the
+    // exact deny-only wiring a real authentication runs (assess_probe
+    // pattern).
+    for (env_key, attach) in [("IRLUME_VIT_PAD_MODEL", false), ("IRLUME_PAD_IR_MODEL", true)] {
+        if let Ok(path) = std::env::var(env_key) {
+            if std::path::Path::new(&path).exists() {
+                engine = if attach {
+                    engine.with_pad_ir(&path).expect("load IR PAD")
+                } else {
+                    engine.with_vit_pad(&path).expect("load ViT PAD")
+                };
+                eprintln!("auth_timing: {env_key} cue loaded ({path})");
+            }
+        }
+    }
     let sink = StageSink::default();
     let t0 = std::time::Instant::now();
     let outcome = engine

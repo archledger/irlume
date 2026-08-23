@@ -55,6 +55,64 @@ Net: the shipped 0.60 + scaling is STRONGER than the ADR's flat-number
 claim; no constant changes tonight. The 0.635 rung now has deployment-
 shaped support on both corpora (5.2e-5 / 4.9e-5 FAR) and stays live-gated.
 
+## Offline sweep v2 (2026-08-23, OR-arm + multi-frame design numbers)
+
+The committed sweep measured each grant arm separately; production's dark
+path grants on best-of-N OR calibrated-centroid. cbsr_v2 (same corpus,
+same split, `--cache` npz):
+
+- **OR operating point (the number that matters)**: base 0.60 -> single
+  frame **FAR 4.03e-4 / FRR 0.56%**; 0.615 -> 2.62e-4 / 0.64%; 0.625 ->
+  1.90e-4 / 0.67%; 0.635 -> 1.24e-4 / 0.69%; 0.65 -> 7.2e-5 / 0.89%.
+  The OR costs ~2.9x the best-of-N arm's FAR at 0.60 — the centroid arm
+  is the contributor (its own FAR 4.0e-4 at 0.60 flat).
+- **AND-of-2 consecutive frames** (correlated, same burst — the honest
+  upper bound for same-burst multi-frame): 0.60 -> FAR 2.65e-4 / FRR
+  0.76%; only a 1.5x FAR improvement over single-frame. Confirms the
+  design note: correlated frames are hardening, NOT a squared FAR; a
+  meaningful multi-frame win needs the temporal constant or cross-burst
+  frames, not a second frame from the same burst.
+- **Frame-pair cosines (the temporal-constant input, CBSR arm)**:
+  genuine adjacent same-id frames p1 = 0.520, p5 = 0.666, p50 = 0.944,
+  mean 0.894, min 0.334; impostor first-probe pairs p50 = 0.255. The
+  same-person-across-frames distribution is wide — a temporal agreement
+  constant near ~0.52 would carry ~1% intra-person rejection; near 0.67
+  ~5%. Any multi-frame agreement gate must be designed against the LIVE
+  in-burst distribution (which will be tighter than CBSR stills), with
+  these numbers as the loose-bound anchor.
+
+## ASUS (Shinetech module) auto-shutter finding — live session blocked
+
+The 2026-08-23 live dark session on the ASUS could not complete; the
+camera module's own firmware defeats it. All observations controlled,
+sampled at 2 Hz via the read-only `privacy` UVC control:
+
+- Idle in complete darkness: privacy stays 0 (135/135 samples over 70 s).
+- Actively streaming in complete darkness: privacy engages =1 on BOTH
+  nodes mid-capture within seconds (caught live, 20:57).
+- Streaming in a lit room: never engages (all historical sessions).
+- Release: within seconds of the stream stopping or light returning.
+- **Decisive control: RGB lens taped + fully lit room -> still engages**
+  during streaming. The firmware judges darkness from its own RGB
+  stream's content, not the room's actual illumination.
+- Consequence: sustained dark-room streaming on this host is firmware-
+  impossible; the band between "RGB still finds a face" (mean ~50) and
+  the engage threshold (~40s, one good grant at mean 41 exists) has
+  hysteresis and flaps mid-capture (~50 loop failures observed, all
+  failing CLOSED: irlume refuses capture and any emitter write when
+  privacy reads 1 — correct behavior, no unsafe fallback taken).
+- The module's HID descriptor exposes a Windows `Sensors.
+  BiometricHumanPresence` sensor stack (Shinetech 3277:0059): the
+  presence/darkness policy is firmware-owned and not configurable from
+  Linux (the ASUS Windows "Camera Extension" installer is a Realtek
+  package for a different module; irrelevant here).
+- No ambient-light sensor exists on this laptop (IIO exposes two `prox`
+  presence sensors only, no `in_illuminance*`), so the engage threshold
+  cannot be cross-read from lux.
+- The live >=30-auth dark session moves to minihost (NexiGo N930W, no
+  such firmware behavior). ASUS dark-room support = fail-closed denial
+  + password fallback, recorded as a host quirk.
+
 ## The open measurement (user-present session; blocks stages 2-4)
 
 **Live dark-session genuine distribution** — needed before any bar above

@@ -538,6 +538,29 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
             let _ = std::fs::remove_file(sock);
         }
     }
+    // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
+    // systemd does this for units with [Install] aliases) — files pacman/apt
+    // do not own, so package removal leaves them behind as the second
+    // RC2 audit finding (4 files + a still-enabled timer). Remove exactly the
+    // irlume-named units from /etc; package-owned /usr/lib copies are the
+    // package manager's business.
+    for unit in [
+        "irlume-runner-prune.timer",
+        "irlume-runner-prune.service",
+        "irlume-reconcile.path",
+        "irlume-reconcile.timer",
+        "irlume-reconcile.service",
+        "irlumed.socket",
+        "irlumed.service",
+    ] {
+        let _ = systemctl(&["reset-failed", unit]);
+        let p = std::path::Path::new("/etc/systemd/system").join(unit);
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    // Reload so a later `systemctl list-unit-files` reflects the removal.
+    let _ = systemctl(&["daemon-reload"]);
     // AppArmor: removing the package deletes /etc/apparmor.d/usr.bin.irlumed
     // but does NOT unload the profile from the kernel — the daemon binary is
     // gone, so the residual profile can only cause confusion (and would

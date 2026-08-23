@@ -5490,7 +5490,7 @@ impl App {
         } else if self.enrolled_known() == Some(true) {
             (
                 "Face unlock is ready",
-                "Keep nodding to approve; shake your head to decline.",
+                "Face confirmed with your keyboard at the prompt.",
                 th().ok,
             )
         } else {
@@ -11214,8 +11214,9 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("Face unlock is ready"));
         assert!(
-            text.contains("Keep nodding to approve; shake your head to decline."),
-            "the ready state must explain head approval and decline: {text}"
+            !text.contains("Keep nodding to approve"),
+            "Overview must not carry the head-gesture line (default-off, \
+             configured in Settings): {text}"
         );
 
         // Keyring: keyring_armed is already tri-state.

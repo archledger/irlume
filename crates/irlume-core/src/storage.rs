@@ -30,7 +30,15 @@ pub const MAX_PROFILES: usize = 3;
 /// [`crate::scaled_threshold`] (+0.074 at 30, under the +0.10 cap).
 pub const MAX_SCANS_PER_PROFILE: usize = 30;
 /// Scans captured by a fresh enrollment to bootstrap solid recognition and a
-/// usable first calibration fit.
+/// usable first calibration fit. 10 is the measured knee, not a round number:
+/// the 2026-07-15 calibrated cross-condition sweep improves FRR steeply from
+/// 5 scans (25%) through ~10 and plateaus by 15 (17%); the 2026-08-23 CBSR
+/// deployment-shaped OR-arm N-sweep (dark-path bars, within-session split)
+/// is N-insensitive from 5-13 (FAR 3.5-4.0e-4, FRR 0.5-0.7% — noise), so the
+/// binding constraint is CROSS-CONDITION coverage + the per-user calibration
+/// fit (k=5 fit pairs beat k=3, ADR-0004 Tufts arm), which need headroom
+/// above the MIN_FIT_PAIRS floor. Lowering to 5 buys ~15s of enrollment time
+/// and costs ~7-8pp of hard-condition FRR; do not.
 pub const DEFAULT_ENROLL_SCANS: usize = 10;
 /// Scans added per improve-recognition round.
 pub const IMPROVE_SCANS: usize = 5;

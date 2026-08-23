@@ -46,7 +46,10 @@ fn main() {
     // protocol records FLIR p_fake per auth, so the probe must exercise the
     // exact deny-only wiring a real authentication runs (assess_probe
     // pattern).
-    for (env_key, attach) in [("IRLUME_VIT_PAD_MODEL", false), ("IRLUME_PAD_IR_MODEL", true)] {
+    for (env_key, attach) in [
+        ("IRLUME_VIT_PAD_MODEL", false),
+        ("IRLUME_PAD_IR_MODEL", true),
+    ] {
         if let Ok(path) = std::env::var(env_key) {
             if std::path::Path::new(&path).exists() {
                 engine = if attach {

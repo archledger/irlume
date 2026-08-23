@@ -347,6 +347,23 @@ enum Fix {
     Manual(String),
     /// Needs root: suspend the TUI and run via sudo (`apply_fix` → Suspend).
     Root(RootFix),
+    /// Fixable in the TUI itself: navigate to the screen that owns the flow
+    /// and open it (`apply_fix` routes through the same key handlers the
+    /// screen's own button uses, so every gate still applies).
+    Goto(GotoFix),
+}
+
+/// In-TUI fix destinations. Each pairs a screen with the key that opens the
+/// fixing flow there, so a Diagnostics row can hand the user to the exact
+/// prompt instead of describing it in prose.
+#[derive(Clone, Copy)]
+enum GotoFix {
+    /// Faces screen, \[e]: start enrollment.
+    Enroll,
+    /// Recovery screen, \[s]: set the recovery passphrase.
+    RecoveryPass,
+    /// Password Wallet screen, \[a\]: (re-)arm the keyring seal.
+    KeyringArm,
 }
 
 /// The root-op fixes `apply_fix` knows how to run. A dedicated enum (not a
@@ -1602,7 +1619,10 @@ impl App {
                     "cannot check the cameras while the daemon is down (start it with: \
                      sudo systemctl start irlumed)"
                         .to_string(),
-                    Fix::Manual("sudo systemctl start irlumed".into()),
+                    // The RestartDaemon fix is exactly this command via sudo;
+                    // a Manual string made the row describe a fix the TUI
+                    // already knew how to run.
+                    Fix::Root(RootFix::RestartDaemon),
                 )
             } else if !rgb && !ir {
                 (
@@ -1709,7 +1729,7 @@ impl App {
                 if enrolled {
                     Fix::None
                 } else {
-                    Fix::Manual("Faces → [e] enroll".into())
+                    Fix::Goto(GotoFix::Enroll)
                 },
             ));
         }
@@ -2009,13 +2029,24 @@ impl App {
         // exactly the state it exists to explain. With the daemon down,
         // `health` is None, `loaded` is false, and the row is emitted.
 
+        // Keyring seal: the wallet-unlock feature is core, and "not armed" was
+        // only visible on the Password Wallet screen — Diagnostics is where a
+        // user goes to find out what is missing. Fixable in-TUI (arm flow).
+        if self.daemon_up && self.keyring_armed == Some(false) {
+            v.push(mk(
+                "Keyring seal",
+                Sev::Warn,
+                "face login will not unlock your password wallet (not armed)".into(),
+                Fix::Goto(GotoFix::KeyringArm),
+            ));
+        }
         if let Some(r) = self.recovery {
             if r.encrypted && !r.recovery_set {
                 v.push(mk(
                     "Recovery backstop",
                     Sev::Warn,
                     "templates encrypted but no recovery passphrase".into(),
-                    Fix::Manual("Recovery → [s] set a recovery passphrase".into()),
+                    Fix::Goto(GotoFix::RecoveryPass),
                 ));
             } else if r.encrypted && !r.key_present {
                 // Encrypted with the key gone: no passphrase and no reseal opens
@@ -2028,7 +2059,7 @@ impl App {
                     "templates encrypted but the template key is MISSING: nothing can \
                      open them"
                         .into(),
-                    Fix::Manual("re-enroll: Faces → [e]".into()),
+                    Fix::Goto(GotoFix::Enroll),
                 ));
             } else {
                 v.push(mk(
@@ -2091,6 +2122,23 @@ impl App {
         match fix {
             Fix::None => self.log('·', "nothing to fix on this row"),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
+            // Navigate-and-open: the destination screen's own key handler runs
+            // (with all of its gating), so the fix is the same flow the user
+            // would have driven by hand — one key earlier.
+            Fix::Goto(g) => {
+                let (screen, key, what) = match g {
+                    GotoFix::Enroll => (SC_PROFILES, KeyCode::Char('e'), "enroll a face"),
+                    GotoFix::RecoveryPass => (
+                        SC_RECOVERY,
+                        KeyCode::Char('s'),
+                        "set the recovery passphrase",
+                    ),
+                    GotoFix::KeyringArm => (SC_KEYRING, KeyCode::Char('a'), "arm the keyring seal"),
+                };
+                self.log('→', format!("opening {what}…"));
+                self.enter_screen(screen);
+                self.on_key(key);
+            }
             // Emitter setup writes the persisted UVC control, a root op now.
             Fix::Root(RootFix::RestartDaemon) => {
                 self.log(
@@ -2843,14 +2891,27 @@ impl App {
                 let _ = crate::doctor(&["--user".to_string(), self.user.clone()]);
             }
             Suspend::SupportReport => match crate::support_report::create_read_only_default() {
-                Ok(path) => self.log(
-                    '✓',
-                    format!(
-                        "Support report created: {} — inspect before sharing",
-                        path.display()
-                    ),
-                ),
-                Err(error) => self.set_error(format!("support report: {error}")),
+                Ok(path) => {
+                    // Print on the SUSPENDED terminal too: the report lands in
+                    // the TUI's working directory, and a success line buried in
+                    // the Activity log read as "nothing happened" (user report
+                    // 2026-08-23: "[s] seems to not work"). Absolute path so
+                    // the file is findable from wherever the TUI was launched.
+                    let shown = std::fs::canonicalize(&path).unwrap_or(path.clone());
+                    println!("Support report created: {}", shown.display());
+                    println!("Inspect it before sharing (no camera data was captured).");
+                    self.log(
+                        '✓',
+                        format!(
+                            "Support report created: {} — inspect before sharing",
+                            path.display()
+                        ),
+                    );
+                }
+                Err(error) => {
+                    println!("Support report FAILED: {error}");
+                    self.set_error(format!("support report: {error}"));
+                }
             },
             Suspend::PcrlockMakePolicy => self.sudo_step(
                 "refresh the pcrlock policy (re-predict the boot measurements)",
@@ -4296,8 +4357,22 @@ impl App {
                     }
                 }
                 Click::Select(i) => match self.screen {
-                    SC_REPAIR if i < self.repair.len() => self.repair_sel = i,
-                    SC_CAMERAS if i < self.pairs.len() => self.cam_sel = i,
+                    // Click a Diagnostics row once to select it, again to run
+                    // its fix ([f]): mouse users never need the keyboard.
+                    SC_REPAIR if i < self.repair.len() => {
+                        if self.repair_sel == i {
+                            self.on_key(KeyCode::Enter);
+                        } else {
+                            self.repair_sel = i;
+                        }
+                    }
+                    SC_CAMERAS if i < self.pairs.len() => {
+                        if self.cam_sel == i {
+                            self.on_key(KeyCode::Enter);
+                        } else {
+                            self.cam_sel = i;
+                        }
+                    }
                     SC_PROFILES if i < self.rows().len() => self.sel = i,
                     SC_SETTINGS if i < SETTINGS_GESTURE_SERVICES.len() => {
                         self.settings_svc_sel = i;
@@ -4361,9 +4436,31 @@ impl App {
         } else {
             format!("{} ", self.user)
         };
-        let right = Line::from(Span::styled(account, Style::new().dim())).right_aligned();
+        // Visible, clickable exit: 'q' quits but a key nobody mentions is not
+        // discoverability (user report 2026-08-23: "how would I exit?"). The
+        // chip both teaches the key and is a click target for it.
+        let exit_span = Span::styled(
+            " ✕ Exit (q) ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(th().warn)
+                .add_modifier(Modifier::BOLD),
+        );
+        let exit_width = exit_span.content.len() as u16;
+        let right =
+            Line::from(vec![Span::styled(account, Style::new().dim()), exit_span]).right_aligned();
         f.render_widget(Paragraph::new(Line::from(left)), area);
-        f.render_widget(Paragraph::new(right), area);
+        f.render_widget(Paragraph::new(right.clone()), area);
+        // The chip sits at the line's right edge; register its exact rect.
+        self.click_targets.borrow_mut().push((
+            Rect::new(
+                area.right().saturating_sub(exit_width),
+                area.y,
+                exit_width,
+                1,
+            ),
+            Click::Key(KeyCode::Char('q')),
+        ));
     }
 
     /// A single plain-language line under the header: what THIS tab is for and
@@ -5599,7 +5696,7 @@ impl App {
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
         let [list_area, info_area] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(10)]).areas(area);
+            Layout::vertical([Constraint::Min(4), Constraint::Length(12)]).areas(area);
 
         // ---- checklist --------------------------------------------------
         let ok = self.repair.iter().filter(|c| c.sev == Sev::Ok).count();
@@ -5618,6 +5715,7 @@ impl App {
                     Fix::None => "",
                     Fix::Manual(_) => " · manual",
                     Fix::Root(_) => " · [f] fix (sudo)",
+                    Fix::Goto(_) => " · [f] fix",
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -5673,6 +5771,8 @@ impl App {
             ("f", "fix selected"),
             ("r", "re-check"),
             ("l", "IR self-test"),
+            ("s", "support report"),
+            ("d", "doctor"),
             ("g", "logs"),
         ]));
         lines.push(Line::raw(""));
@@ -5686,12 +5786,16 @@ impl App {
                 Fix::None => "no action needed".to_string(),
                 Fix::Manual(cmd) => format!("manual: {cmd}"),
                 Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
+                Fix::Goto(_) => "press [f]: opens the fixing flow here in the TUI".to_string(),
             };
             lines.push(Line::from(vec![
                 Span::styled("  → ", Style::new().fg(th().accent)),
                 Span::styled(hint, Style::new()),
             ]));
         }
+        // Breathing room between the selected-row hint block and the platform
+        // facts (readability pass: the box read as one clumped paragraph).
+        lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("  platform  ", Style::new().dim()),
             Span::styled(
@@ -5731,14 +5835,40 @@ impl App {
                 Style::new().dim(),
             ),
         ]));
+        lines.push(Line::raw(""));
+        // The two action lines are click targets, not just text: register the
+        // rows they will occupy so a click fires the same key the hint names.
+        // Row math: each Line is one row, start at info_area.y + 1 (border).
+        let ir_line_row = info_area.y + 1 + (lines.len() as u16);
         lines.push(Line::from(Span::styled(
             "  IR test    press [l] to run the IR PAD self-test (sudo; look at the camera)",
             Style::new().dim(),
         )));
+        let support_line_row = info_area.y + 1 + (lines.len() as u16);
         lines.push(Line::from(Span::styled(
             "  Support    [s] Create Support Report (read-only; captures no camera data)",
             Style::new().dim(),
         )));
+        let mut reg = self.click_targets.borrow_mut();
+        reg.push((
+            Rect::new(
+                info_area.x + 1,
+                ir_line_row,
+                info_area.width.saturating_sub(2),
+                1,
+            ),
+            Click::Key(KeyCode::Char('l')),
+        ));
+        reg.push((
+            Rect::new(
+                info_area.x + 1,
+                support_line_row,
+                info_area.width.saturating_sub(2),
+                1,
+            ),
+            Click::Key(KeyCode::Char('s')),
+        ));
+        drop(reg);
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim())
@@ -9158,6 +9288,44 @@ mod tests {
         app.on_key(KeyCode::Char('l'));
         assert!(matches!(app.suspend, Some(Suspend::SelfTestLiveness)));
         assert!(app.op.is_none() && app.error.is_none());
+    }
+
+    #[test]
+    fn goto_fixes_navigate_and_open_the_flow() {
+        let mut app = test_app();
+        app.repair = vec![Check {
+            label: "Recovery backstop".into(),
+            sev: Sev::Warn,
+            detail: "templates encrypted but no recovery passphrase".into(),
+            fix: Fix::Goto(GotoFix::RecoveryPass),
+        }];
+        app.screen = SC_REPAIR;
+        app.apply_fix(0);
+        assert_eq!(
+            app.screen, SC_RECOVERY,
+            "the fix must land on the flow's screen"
+        );
+        assert!(
+            app.input.is_some() || app.enroll.is_some() || !app.activity.is_empty(),
+            "the flow's key must actually fire, not just navigate"
+        );
+    }
+
+    #[test]
+    fn header_exit_chip_is_a_click_target() {
+        let app = test_app();
+        let text = draw_text(&app);
+        assert!(
+            text.contains("Exit (q)"),
+            "the exit chip must render: {text}"
+        );
+        assert!(
+            app.click_targets
+                .borrow()
+                .iter()
+                .any(|(_, c)| matches!(c, Click::Key(KeyCode::Char('q')))),
+            "the exit chip must be registered as a clickable quit"
+        );
     }
 
     #[test]

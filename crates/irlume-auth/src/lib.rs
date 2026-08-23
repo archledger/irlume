@@ -5213,13 +5213,15 @@ impl Engine {
             diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
                 verdict, &a.signals,
             ));
-            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0}",
+            irlume_common::dlog!("liveness(ir-only/dark): {verdict:?} ({reason}); ir_bright={:.0} ir_center_edge_ratio={:.2} glint={} ambient={:.0} ir_pad_p_fake={:?} rgb_frame_mean={:.0}",
                 a.signals.ir_face_brightness, a.signals.ir_center_edge_ratio,
                 a.signals
                     .ir_eye_glint
                     .map(|g| format!("{g:.2}"))
                     .unwrap_or_else(|| "n/a".into()),
-                a.signals.ir_ambient);
+                a.signals.ir_ambient,
+                a.shipped_ir_fake,
+                a.rgb_frame_mean);
             if verdict != Verdict::Live {
                 // Dark-path kinds: Uncertain retries under grace, any Spoof
                 // does not (the retryable RGB-yes/IR-no transient cannot occur

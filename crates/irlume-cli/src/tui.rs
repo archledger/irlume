@@ -2944,6 +2944,15 @@ impl App {
         let _ = std::io::stdin().read_line(&mut line);
     }
 
+    /// Jump to the Welcome/Overview hub. Shared by 'h' and by Esc-with-
+    /// nothing-to-close, so the reflexive "back out" key lands somewhere
+    /// predictable instead of exiting the app.
+    fn go_home(&mut self) {
+        if self.visible.contains(&SC_WELCOME) {
+            self.screen = SC_WELCOME;
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode) {
         // A raised error banner says "press any key to dismiss", so it takes the
         // next key BEFORE anything else (including the activity scroll below).
@@ -3073,14 +3082,17 @@ impl App {
             return;
         }
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // 'q' is the ONLY global quit. Esc deliberately does not quit:
+            // users press it reflexively to "back out", and at 0.11.0rc1 it
+            // silently exited the whole TUI (verified on two hosts). Esc with
+            // nothing to close lands on Overview instead — a harmless "back".
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => self.go_home(),
             KeyCode::Char('?') => self.show_help = true,
             // Home: jump back to the Welcome hub from any tab, so the "at a
             // glance" summary is one key away instead of a Tab walk. (Home the
             // KEY is taken by activity scroll; 'h' for home is unused globally.)
-            KeyCode::Char('h') if self.visible.contains(&SC_WELCOME) => {
-                self.screen = SC_WELCOME;
-            }
+            KeyCode::Char('h') if self.visible.contains(&SC_WELCOME) => self.go_home(),
             // Release/recapture the mouse: captured, the wheel scrolls the TUI
             // but the terminal cannot select text; released, highlight-to-copy
             // works. A toggle because both are legitimate wants.
@@ -3229,20 +3241,25 @@ impl App {
                 self.log('·', "no camera on this device: face enrollment/identify unavailable (see Fingerprint/Settings)");
             }
             // Cameras: switch the active pair; persists to /etc, so it's a root
-            // op that suspends to `sudo irlume set-cameras`.
+            // op that suspends to `sudo irlume set-cameras`. Confirmed first:
+            // an Enter on the row is easy to hit by accident (found during the
+            // 0.11.0rc1 walkthrough: a mis-focused Enter ran it blind) and it
+            // changes the persisted camera pin.
             (SC_CAMERAS, KeyCode::Enter) => {
                 // Use the cached pairs (clone the selected one so self stays
                 // free for the log/suspend below).
                 match self.pairs.get(self.cam_sel).cloned() {
                     Some(p) => {
-                        self.log(
-                            '→',
+                        self.confirm = Some((
                             format!(
-                                "sudo irlume set-cameras {} {} (you'll be asked for your password)",
+                                "Switch the active camera pair to {} + {}? This \
+                                 writes /etc/irlume/cameras.conf and asks for your \
+                                 password.",
                                 p.rgb, p.ir
                             ),
-                        );
-                        self.suspend = Some(Suspend::SetCameras(p.rgb.clone(), p.ir.clone()));
+                            "Switch",
+                            ConfirmAct::Sus(Suspend::SetCameras(p.rgb.clone(), p.ir.clone())),
+                        ));
                     }
                     None => self.log(
                         '·',
@@ -8740,9 +8757,13 @@ mod tests {
         let mut app = test_app();
         app.on_key(KeyCode::Char('q'));
         assert!(app.quit);
+        // Esc does NOT quit (0.11.0rc1 finding: users press it reflexively to
+        // back out and lost the whole TUI). It lands on Overview instead.
         let mut app = test_app();
+        app.screen = SC_KEYRING;
         app.on_key(KeyCode::Esc);
-        assert!(app.quit);
+        assert!(!app.quit, "Esc must never exit the TUI");
+        assert_eq!(app.screen, SC_WELCOME, "Esc goes home when nothing is open");
         // During a running op only q/Esc get through; the rest are swallowed.
         let mut app = test_app();
         let (_tx, op) = fake_op();
@@ -8753,6 +8774,13 @@ mod tests {
         assert!(!app.quit);
         app.on_key(KeyCode::Char('q'));
         assert!(app.quit, "q must stay a live escape hatch during an op");
+        // A stalled op keeps the Esc exit: it is the only way out of a hung
+        // camera probe, so the op-running branch keeps Esc-quit (not home).
+        let mut app = test_app();
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        app.on_key(KeyCode::Esc);
+        assert!(app.quit, "Esc still exits during a stalled op");
     }
 
     #[test]
@@ -9047,6 +9075,7 @@ mod tests {
         app.screen = SC_CAMERAS;
         app.on_key(KeyCode::Enter);
         assert!(app.suspend.is_none());
+        assert!(app.confirm.is_none(), "no pair -> no confirm either");
         let (_, msg) = app.activity.last().expect("the no-pair case is explained");
         assert!(msg.contains("no paired Hello camera"), "got: {msg}");
         app.pairs = vec![irlume_common::CameraPairInfo {
@@ -9058,10 +9087,19 @@ mod tests {
         }];
         app.cam_sel = 0;
         app.on_key(KeyCode::Enter);
-        assert!(matches!(
-            app.suspend,
-            Some(Suspend::SetCameras(ref r, ref i)) if r == "/dev/video0" && i == "/dev/video2"
-        ));
+        // Enter ARMS the confirm dialog (0.11.0rc1 finding: a mis-focused
+        // Enter ran the sudo op blind); only the dialog's y/Esc fires it.
+        assert!(
+            app.suspend.is_none(),
+            "Enter must not suspend straight into sudo set-cameras"
+        );
+        let (_, _verb, act) = app.confirm.take().expect("confirm dialog armed");
+        match act {
+            ConfirmAct::Sus(Suspend::SetCameras(ref r, ref i)) => {
+                assert_eq!((r.as_str(), i.as_str()), ("/dev/video0", "/dev/video2"));
+            }
+            _ => panic!("confirm action must be SetCameras"),
+        }
     }
 
     #[test]

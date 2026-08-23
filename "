@@ -1,0 +1,12 @@
+crates/irlume-cli/src/tui.rs:1894:        for foreign in ["howdy", "linhello"] {
+crates/irlume-cli/src/tui.rs:2434:                        let e = e.strip_prefix("hardware: ").unwrap_or(&e);
+crates/irlume-cli/src/tui.rs:7048:        let app = app_with_user("handed-in");
+crates/irlume-cli/src/tui.rs:7049:        assert_eq!(app.user, "handed-in");
+crates/irlume-cli/src/tui.rs:7876:        assert!(rows.len() >= 6, "hub rows: {rows:?}");
+crates/irlume-cli/src/tui.rs:9712:        tx.send(WMsg::Err("hardware: camera busy".into())).unwrap();
+crates/irlume-cli/src/tui.rs:9783:            Ok(Response::Position(good_report("hold still"))),
+crates/irlume-cli/src/tui.rs:9784:            Ok(Response::Position(good_report("hold still"))),
+crates/irlume-cli/src/tui.rs:9785:            Ok(Response::Position(good_report("hold still"))),
+crates/irlume-cli/src/tui.rs:10562:            "hunter2".into(),
+crates/irlume-cli/src/tui.rs:10571:            !text.contains("hunter2"),
+crates/irlume-cli/src/tui.rs:10679:        assert!(text.contains("history (25 up"));

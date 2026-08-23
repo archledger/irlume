@@ -522,8 +522,36 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         "irlume-reconcile.path",
         "irlume-reconcile.timer",
         "irlume-reconcile.service",
+        // The login-runner prune unit ships enabled-by-default in some lanes;
+        // an uninstall must not leave a dead unit armed (#335 class).
+        "irlume-runner-prune.service",
     ] {
         let _ = systemctl(&["disable", "--now", unit]);
+    }
+    // The socket unit does not unlink its socket file on stop, and a stopped
+    // daemon leaves /run/irlume.sock behind as a stale node (found by the
+    // 0.11.0rc1 uninstall-cleanliness audit). Remove it when the service is
+    // down; a live daemon would only recreate it, so only try after a stop.
+    if stop {
+        let sock = std::path::Path::new("/run/irlume.sock");
+        if sock.exists() {
+            let _ = std::fs::remove_file(sock);
+        }
+    }
+    // AppArmor: removing the package deletes /etc/apparmor.d/usr.bin.irlumed
+    // but does NOT unload the profile from the kernel — the daemon binary is
+    // gone, so the residual profile can only cause confusion (and would
+    // silently re-confine a later non-irlume binary at the same path). Unload
+    // it explicitly; absence of apparmor_parser is not an error (non-AA boxes).
+    if std::path::Path::new("/etc/apparmor.d/usr.bin.irlumed").exists()
+        || Command::new("apparmor_status")
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("irlumed"))
+            .unwrap_or(false)
+    {
+        let _ = Command::new("apparmor_parser")
+            .args(["-R", "/etc/apparmor.d/usr.bin.irlumed"])
+            .status();
     }
     // systemd keeps a monotonic stamp per timer under /var/lib/systemd/timers
     // and deletes it neither on disable nor on package remove: the #335 audit
@@ -569,6 +597,18 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         ]) {
             data_left.push(dir.display().to_string());
         }
+        // Per-user XDG state (~/.local/share/irlume): login-runner records and
+        // similar. Root cannot know every human's $HOME, so sweep the HOMEs of
+        // human accounts (uid >= 1000). Files owned by root inside a user HOME
+        // (written by a past `sudo irlume` run) still remove fine here because
+        // teardown itself runs as root; the residue the 0.11.0rc1 audit found
+        // was exactly such a root-owned file a non-root sweep would miss.
+        for home in human_homes() {
+            let p = home.join(".local/share/irlume");
+            for dir in wipe_data_trees(&[p]) {
+                data_left.push(format!("{} (user state)", dir.display()));
+            }
+        }
     }
 
     let data_wipe_requested = !keep_data;
@@ -580,6 +620,28 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         data_wiped: data_wipe_requested && data_left.is_empty(),
         data_left,
     }
+}
+
+/// HOME directories of human accounts (uid >= 1000, below the nobody range),
+/// via /etc/passwd. Used only to sweep per-user XDG state at uninstall; an
+/// unreadable passwd entry is skipped, not fatal.
+fn human_homes() -> Vec<std::path::PathBuf> {
+    let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
+        return Vec::new();
+    };
+    passwd
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            match (f.first(), f.get(2), f.get(5)) {
+                (Some(_), Some(uid), Some(home)) => {
+                    let uid: u32 = uid.parse().ok()?;
+                    (1000..=60000).contains(&uid).then(|| (*home).into())
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Delete the given data trees and return the ones that still exist afterwards.
@@ -881,6 +943,21 @@ mod tests {
     // could not remove must come back to the caller, not vanish into stderr.
     // remove_dir_all on a regular FILE fails on any filesystem, root or not, so
     // the failure fixture is deterministic.
+    #[test]
+    fn human_homes_skips_system_accounts_and_malformed_lines() {
+        // Invariant test (no /etc/passwd fixture): every returned home is an
+        // absolute path belonging to a human account; a machine with no human
+        // users legitimately returns an empty vec. System accounts (root,
+        // nobody, daemons) never appear because of the uid >= 1000 filter.
+        for h in human_homes() {
+            assert!(
+                h.is_absolute(),
+                "a passwd HOME must be absolute: {}",
+                h.display()
+            );
+        }
+    }
+
     #[test]
     fn wipe_data_trees_returns_the_trees_it_could_not_remove() {
         let root = std::env::temp_dir().join(format!("irlume-wipe-trees-{}", std::process::id()));

@@ -451,6 +451,13 @@ const MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_s
 /// retry loop already carries.
 const SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Cost of ONE sequential two-stream attempt: open + negotiate + flush +
+/// rate window per stream (~3.1 s each, ADR-0014's derivation), paid serially
+/// ≈ 7 s with recovery headroom. Used only to decide whether a sequential
+/// fallback can still finish inside the remaining window before it starts
+/// re-opening cameras.
+const SEQUENTIAL_PAIR_ATTEMPT_COST: std::time::Duration = std::time::Duration::from_secs(7);
+
 #[derive(Debug, Eq, PartialEq)]
 enum EligiblePairEvidence<T> {
     Paired(Option<T>),
@@ -479,12 +486,22 @@ fn eligible_pair_evidence<T>(
 /// IR-side gates (cross-spectrum co-location, FLIR IR PAD, the per-user IR
 /// center/edge floor) pass for ANY live face — they prove presence and
 /// liveness, not identity — so an RGB recognition hit must not carry the
-/// grant alone across that gap. Such pairs grant only through arms that also
-/// require an IR identity match (fusion, IR fallback, calibrated centroid).
+/// grant alone across that gap. Such pairs grant only through arms that
+/// carry IR identity thresholds (IR fallback, calibrated centroid).
 /// Concurrent pairs (skew <= `MAX_CROSS_SPECTRUM_SKEW`) interleave the two
 /// spectra and keep the RGB-primary arm.
 fn rgb_primary_grant_admissible(score: f32, threshold: f32, sequential_pair: bool) -> bool {
     score >= threshold && !sequential_pair
+}
+
+/// Whether a PAIRED assessment's frames were admitted only under the
+/// sequential budget: a pair exists AND the frames sit beyond the concurrent
+/// ceiling, i.e. they were captured as separated one-shot bursts (ADR-0014).
+/// The budget that admitted the pair (`pairing_limit`) is schedule-aware, so
+/// a concurrent capture can never pair beyond `MAX_CROSS_SPECTRUM_SKEW`
+/// (`eligible_pair_evidence` demotes it to IrOnly first).
+fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
+    paired && skew > MAX_CROSS_SPECTRUM_SKEW
 }
 
 /// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
@@ -4135,7 +4152,7 @@ impl Engine {
             // Paired under the schedule-aware budget AND beyond the concurrent
             // ceiling: the bursts ran as separated one-shots (ADR-0014). Such
             // pairs defer the RGB-primary grant (rgb_primary_grant_admissible).
-            sequential_pair: rgb_top.is_some() && skew > MAX_CROSS_SPECTRUM_SKEW,
+            sequential_pair: pair_admitted_sequentially(skew, rgb_top.is_some()),
         })
     }
 
@@ -4902,18 +4919,22 @@ impl Engine {
             return first_result;
         }
         let error = first_result.expect_err("held-pair failure must return an error");
-        // The sequential fallback re-opens both cameras (~7 s for the pair).
+        // The sequential fallback re-opens both cameras: ~3.1 s of machinery
+        // per stream, ~7 s for the pair (the loop comment below derives it).
         // Bound its FIRST attempt the same way the loop bounds retries: when
-        // the costliest observed attempt cannot finish before the deadline,
-        // do not start it — the camera is released and the password fallback
-        // answers inside the window instead of the lease overrunning
-        // mid-capture (ADR-0014).
+        // the cost of that attempt cannot finish before the deadline, do not
+        // start it — the camera is released and the password fallback answers
+        // inside the window instead of the lease overrunning mid-capture
+        // (ADR-0014). The estimator is the observed costliest attempt raised
+        // to that floor: the concurrent loop's own attempts (~1 s) would
+        // never bound a ~7 s sequential reopen.
+        let fallback_cost = costliest_attempt.max(SEQUENTIAL_PAIR_ATTEMPT_COST);
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining < costliest_attempt {
+        if remaining < fallback_cost {
             irlume_common::dlog!(
-                "grace: sequential fallback skipped ({}ms left, costliest attempt {}ms); settling",
+                "grace: sequential fallback skipped ({}ms left, fallback cost {}ms); settling",
                 remaining.as_millis(),
-                costliest_attempt.as_millis()
+                fallback_cost.as_millis()
             );
             return Err(error);
         }
@@ -5175,6 +5196,13 @@ impl Engine {
             // grant while FMR stays bounded (an impostor must fool BOTH at once). The
             // cross-spectrum liveness gate + per-user IR floor already passed above.
             // This is the bright→RGB / dark→IR / dim→FUSE story.
+            // SEQUENTIAL-SCHEDULE PAIRS DO NOT FUSE (ADR-0014): the fusion
+            // floor only requires IR to clear FUSION_MIN_PER_MODALITY_PROB
+            // (~0.35 Platt-equivalent cosine) — a presence bar, not an
+            // identity bar — and a strong RGB score alone can carry the
+            // fused grant. On a temporally split capture that reopens the
+            // swap window; such pairs grant only through the IR-fallback and
+            // centroid arms below, which carry identity thresholds.
             // With a third-party recognizer the whole IR side is unmeasured
             // (thresholds AND the fusion Platt calibration are shipped-model
             // measurements), so a marginal RGB miss ends here: password.
@@ -5198,7 +5226,7 @@ impl Engine {
                         irlume_core::fusion::FUSION_PROB_THRESHOLD,
                         f.grant,
                     );
-                    if f.grant {
+                    if f.grant && !a.sequential_pair {
                         let who = if ir_score >= score { ir_who } else { who };
                         release_held(held_rgb, held_ir);
                         return self.challenge_if_required(
@@ -5206,6 +5234,13 @@ impl Engine {
                     service,
                     Outcome::grant(f.prob,
                             format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
+                    }
+                    if f.grant && a.sequential_pair {
+                        irlume_common::dlog!(
+                            "fusion p={:.3} DEFERRED (sequential-schedule pair: the fusion \
+                             IR floor is a presence bar, not an identity bar; ADR-0014)",
+                            f.prob
+                        );
                     }
                     // (b) pure IR fallback: still valid when IR alone is clearly strong
                     // (e.g. IR-only enrollment, or RGB template absent). Stricter than the
@@ -7935,6 +7970,26 @@ mod tests {
         );
         // A miss is a miss on either schedule.
         assert!(!rgb_primary_grant_admissible(0.59, 0.60, false));
+    }
+
+    #[test]
+    fn sequential_pair_stamp_matches_the_schedule_that_admitted_the_pair() {
+        // The stamp couples to the pairing budget: the measured machinery gap
+        // (3.05 s) pairs only under the sequential budget and stamps; under
+        // the concurrent budget the same gap demotes to IrOnly (no pair), so
+        // the stamp cannot fire. A held-sequential sub-3s pair
+        // (concurrent-equivalent) does not stamp either.
+        let machinery_gap = std::time::Duration::from_millis(3_050);
+        assert!(pair_admitted_sequentially(machinery_gap, true));
+        assert!(!pair_admitted_sequentially(MAX_CROSS_SPECTRUM_SKEW, true));
+        assert!(!pair_admitted_sequentially(machinery_gap, false));
+        // The pairing side of the coupling: the concurrent budget demotes the
+        // same gap to IrOnly, so `paired` can only be true there for
+        // sub-ceiling skews.
+        assert_eq!(
+            eligible_pair_evidence(machinery_gap, MAX_CROSS_SPECTRUM_SKEW, Some(42_u8), true),
+            EligiblePairEvidence::IrOnly
+        );
     }
 
     #[test]

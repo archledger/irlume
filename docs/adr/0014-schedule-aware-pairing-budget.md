@@ -92,18 +92,26 @@ the hosts that carry dual cameras.
 Pairs admitted only under the sequential budget (skew above
 `MAX_CROSS_SPECTRUM_SKEW`, i.e. captured as separated one-shot bursts)
 carry that fact on the `Assessment` (`sequential_pair`). The lit path then
-DEFERS its RGB-primary grant: such pairs authenticate only through the arms
-that also require an IR identity match — quality-weighted fusion, the IR
-fallback (+`IR_FALLBACK_MARGIN`), or the calibrated centroid (ADR-0004).
-Concurrent pairs (skew ≤ 3 s) interleave the two spectra and keep the
-RGB-primary arm unchanged.
+DEFERS both fused grant arms for such pairs: the RGB-primary grant (RGB
+recognition + liveness alone) and the fusion grant, whose per-modality IR
+floor (`FUSION_MIN_PER_MODALITY_PROB`, ~0.35 Platt-equivalent cosine) is a
+presence bar, not an identity bar — a strong RGB score alone can carry the
+fused grant. Sequential-schedule pairs authenticate only through the arms
+that carry IR identity thresholds: the IR fallback
+(+`IR_FALLBACK_MARGIN`) and the calibrated centroid (ADR-0004). Concurrent
+pairs (skew ≤ 3 s) interleave the two spectra and keep the RGB-primary and
+fusion arms unchanged.
 
 This preserves the pre-ADR-0014 posture on sequential-schedule hosts (the
 stale discard forced the IR-only path, which requires IR identity) while
 restoring paired evidence, the ViT print-species PAD, and identify on that
 hardware. Genuine users keep the latency win: a genuine face passes
-fusion/IR-fallback with its usual margin (live IR scores 0.78-0.82
-fleet-measured against a ~0.63 fallback bar).
+IR-fallback with its usual margin (live IR scores 0.78-0.82
+fleet-measured against a ~0.63 fallback bar). One honest FRR edge: an
+enrollment with RGB templates but no IR templates on a sequential-schedule
+dual host now denies every lit capture (password fallback, re-enroll with
+IR restores) — previously the same capture fell to the dark IR-only path
+and denied identically for lack of IR templates.
 
 ## What this does NOT change
 

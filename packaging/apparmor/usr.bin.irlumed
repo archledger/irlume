@@ -104,6 +104,14 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # same machine, one restart later: locks need naming wherever they live.
   /var/lib/irlume/ir-emitter-stream/*.lock rwk,
 
+  # The deferred template-key loader's per-user flock (same lesson as the
+  # emitter rule above: the state tree's ** rule grants rw without the
+  # flock 'k' permission). Found when the 0.11.0rc1 Arch install loaded this
+  # profile into enforce mode and every enrollment read failed with
+  # "lock state transaction ... Permission denied" — fail-closed, but wrong.
+  /var/lib/irlume/template-keys/.locks/*.lock rwk,
+  /var/lib/irlume/template-keys/.locks/ rw,
+
   # TPM (template-key sealing, keyring unlock).
   /dev/tpmrm[0-9] rw,
   /dev/tpm[0-9] rw,

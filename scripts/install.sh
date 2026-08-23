@@ -5,11 +5,23 @@
 #
 # What it does, by distro:
 #   Fedora / RHEL family : enable the signed Copr repo, then dnf install irlume.
+#                           If the Copr lane is unreachable (outage), falls back
+#                           to the checksum+signature-verified release RPM.
 #   Ubuntu (current LTS)  : add the signed PPA, then apt install irlume.
+#                           PPA unavailable -> verified universal .deb.
 #   Debian / Ubuntu deriv : download the universal .deb from the latest GitHub
 #                           release, verify it, then install.
 #   Arch                  : install from the AUR (yay/paru when present;
 #                           otherwise prints the makepkg steps and stops).
+#                           IRLUME_RELEASE_PKG=1 opts into the verified release
+#                           .pkg.tar.zst instead (pacman -U, no-downgrade).
+#
+# Channel fallbacks never DOWNGRADE: a release package is installed only when
+# it is strictly newer than what is installed (dnf upgrade / apt / vercmp
+# semantics), so a distro lane coming back online never flip-flops with the
+# release lane. Already installed and the lane is down for a security update?
+#   IRLUME_UPDATE=1 sh scripts/install.sh   (below) pulls the newest verified
+#   release package for your distro, or reports "already current".
 #
 # Integrity:
 #   - The repo paths (Fedora Copr, Ubuntu PPA) are cryptographically verified by
@@ -116,8 +128,20 @@ fetch_verified() {
   # caller removes the parent dir after installing.
   tmp="$(mktemp -d)"
   fetch_sums "$tmp"
-  line="$(grep -F -- "$match" "${tmp}/SHA256SUMS" | head -n1)" || true
-  [ -n "$line" ] || die "no release asset matching '$match' in SHA256SUMS."
+  # Anchored patterns: a future .sig/.sha256 sibling must never be selected
+  # as "the package", and multiple matches are an error, not first-wins.
+  # Anchored, asset-name-accurate patterns (must match the actual lane names:
+  # irlume_0.10.0_amd64.deb, irlume-0.10.0-1.fc44.x86_64.rpm,
+  # irlume-0.10.0-1-x86_64.pkg.tar.zst). The selinux noarch RPM must NOT match.
+  case "$match" in
+    '_amd64.deb')          re='^[0-9a-f]{64}[[:space:]]+irlume_[^/]*_amd64\.deb$' ;;
+    *'.x86_64.rpm')        re='^[0-9a-f]{64}[[:space:]]+irlume-[0-9][^/]*'"$(printf '%s' "$match" | sed 's/[.[\*^$]/\\&/g')"'$' ;;
+    '_x86_64.pkg.tar.zst') re='^[0-9a-f]{64}[[:space:]]+irlume-[0-9][^/]*-x86_64\.pkg\.tar\.zst$' ;;
+    *) re='^[0-9a-f]{64}[[:space:]]+[^/]*'"$(printf '%s' "$match" | sed 's/[.[\*^$]/\\&/g')"'$' ;;
+  esac
+  n_matches="$(grep -Ec -- "$re" "${tmp}/SHA256SUMS" || true)"
+  [ "$n_matches" -eq 1 ] || die "expected exactly one release asset matching '$match' in SHA256SUMS, found ${n_matches}."
+  line="$(grep -E -- "$re" "${tmp}/SHA256SUMS")"
   name="$(printf '%s' "$line" | awk '{print $NF}')"
   say "downloading ${name} ..."
   curl -fSL --progress-bar "${RELEASE_BASE}/${name}" -o "${tmp}/${name}" \
@@ -126,6 +150,84 @@ fetch_verified() {
   ( cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null 2>&1 ) \
     || die "CHECKSUM MISMATCH on ${name}; refusing to install."
   printf '%s/%s\n' "$tmp" "$name"
+}
+
+# --- Channel-resilience helpers ---------------------------------------------
+# The release lane is the fallback for every distro lane. Guards make the
+# fallback upgrade-only: no downgrade, no flip-flop when a lane recovers.
+
+deb_version_installed() { dpkg-query -W -f '${Version}' irlume 2>/dev/null || true; }
+
+# $1 = candidate version, $2 = installed version ("" = fresh install).
+# Exits 0 (install) when candidate is strictly newer or nothing is installed.
+should_install_deb() {
+  cand="$1"; have="$2"
+  [ -z "$have" ] && return 0
+  dpkg --compare-versions "$cand" le "$have" && return 1
+  return 0
+}
+
+install_deb_release() {
+  deb="$(fetch_verified '_amd64.deb')"
+  cand="$(basename "$deb" | sed -n 's/^irlume_\(.*\)_amd64.deb$/\1/p')"
+  [ -n "$cand" ] || die "could not parse the release .deb filename: $(basename "$deb")"
+  have="$(deb_version_installed)"
+  if ! should_install_deb "$cand" "$have"; then
+    say "release .deb ${cand} is not newer than the installed ${have}; already current."
+    rm -rf "$(dirname "$deb")"
+    return 0
+  fi
+  $SUDO apt-get install -y "$deb"
+  rm -rf "$(dirname "$deb")"
+}
+
+install_rpm_release() {
+  # Match the release RPM built for this Fedora release (fc43/fc44 assets).
+  ver="${VERSION_ID:-}"
+  [ -n "$ver" ] || die "Fedora family without VERSION_ID; cannot pick a release RPM. Install from Copr when it is back."
+  rpm_path="$(fetch_verified ".fc${ver}.x86_64.rpm")" || \
+    die "no release RPM for fc${ver} in the latest release. Install from Copr when it is back."
+  # `dnf install <local.rpm>` handles both fresh install and upgrade, and is
+  # a no-op ("Nothing to do") when the installed version is not older: exactly
+  # the upgrade-only semantics the fallback needs (`dnf upgrade` alone cannot
+  # fresh-install).
+  $SUDO dnf -y install "${rpm_path}"
+  rm -rf "$(dirname "${rpm_path}")"
+}
+
+install_pkg_release() {
+  need vercmp
+  pkg="$(fetch_verified '_x86_64.pkg.tar.zst')"
+  cand="$(basename "$pkg" | sed -n 's/^irlume-\(.*\)-x86_64.pkg.tar.zst$/\1/p')"
+  [ -n "$cand" ] || die "could not parse the release package filename: $(basename "$pkg")"
+  have="$(pacman -Qi irlume 2>/dev/null | awk '/^Version/ {print $3}')"
+  if [ -n "$have" ] && [ "$(vercmp "$cand" "$have")" -ne 1 ]; then
+    say "release package ${cand} is not newer than the installed ${have}; already current."
+    rm -rf "$(dirname "$pkg")"
+    return 0
+  fi
+  $SUDO pacman -U --noconfirm "$pkg"
+  rm -rf "$(dirname "$pkg")"
+}
+
+# Newest verified release package for THIS distro, upgrade-only. Used by
+# IRLUME_UPDATE=1 when the primary lane is unavailable (outage) and a newer
+# release (e.g. a security fix) already exists on GitHub.
+update_from_release() {
+  [ -r /etc/os-release ] || die "cannot read /etc/os-release; unsupported system."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  family=" ${ID:-} ${ID_LIKE:-} "
+  need curl
+  need sha256sum
+  case "$family" in
+    *" debian "*|*" ubuntu "*) install_deb_release ;;
+    *" fedora "*|*" rhel "*|*" centos "*) install_rpm_release ;;
+    *" arch "*|*" archlinux "*) install_pkg_release ;;
+    *) die "unrecognised distro (ID=${ID:-?}); no release-lane update available." ;;
+  esac
+  say "release-lane update complete."
+  exit 0
 }
 
 main() {
@@ -144,8 +246,14 @@ main() {
     say "Not installing. To update an existing install, run:  irlume update"
     if [ "${IRLUME_FORCE:-}" = "1" ]; then
       say "IRLUME_FORCE=1 set; reinstalling anyway."
+    elif [ "${IRLUME_UPDATE:-}" = "1" ]; then
+      # Security-update escape hatch: the distro lane may be down; pull the
+      # newest verified release package instead (upgrade-only, see below).
+      say "IRLUME_UPDATE=1 set; updating from the verified GitHub release lane."
+      update_from_release
     else
-      say "Nothing was changed. Set IRLUME_FORCE=1 to reinstall regardless."
+      say "Nothing was changed. Set IRLUME_FORCE=1 to reinstall regardless, or"
+      say "IRLUME_UPDATE=1 to update from the release lane if the distro channel is down."
       exit 0
     fi
   fi
@@ -171,33 +279,44 @@ main() {
        && $SUDO apt-get install -y irlume; then
       say "installed from the signed PPA."
     else
-      warn "PPA path unavailable for this release; using the checksum-verified .deb."
-      # Clear any half-configured PPA package first: it would otherwise block the
-      # .deb as a downgrade and leave apt wedged.
-      $SUDO apt-get purge -y irlume >/dev/null 2>&1 || true
-      deb="$(fetch_verified '_amd64.deb')"
-      $SUDO apt-get install -y "$deb"
-      rm -rf "$(dirname "$deb")"
+      warn "PPA path unavailable (outage or no add-apt-repository); using the checksum-verified .deb."
+      # Only a HALF-CONFIGURED package can block the .deb; a working install
+      # must never be purged (the guard below needs its version, and purging a
+      # PAM-facing package on a network blip is exactly the churn the
+      # upgrade-only promise exists to prevent).
+      status="$(dpkg-query -W -f '${Status}' irlume 2>/dev/null || true)"
+      case "$status" in
+        "install ok installed") : ;;  # healthy: leave it; guard compares versions
+        *) $SUDO apt-get purge -y irlume >/dev/null 2>&1 || true ;;
+      esac
+      install_deb_release
     fi
   else
     case "$family" in
       *" fedora "*|*" rhel "*|*" centos "*)
         say "Fedora family: installing from the signed Copr repo."
-        $SUDO dnf -y copr enable "${REPO}"
-        $SUDO dnf -y install irlume
+        if $SUDO dnf -y copr enable "${REPO}" && $SUDO dnf -y install irlume; then
+          say "installed from the signed Copr repo."
+        else
+          warn "Copr lane unavailable (outage?); falling back to the checksum+signature-verified release RPM."
+          install_rpm_release
+        fi
         ;;
       *" arch "*|*" archlinux "*)
         say "Arch: irlume ships via the AUR (it builds the signed release tag)."
-        if [ "$(id -u)" -eq 0 ]; then
+        if [ "${IRLUME_RELEASE_PKG:-}" = "1" ]; then
+          # pacman -U is root-safe (only makepkg/AUR helpers refuse root).
+          say "IRLUME_RELEASE_PKG=1 set; installing the verified release .pkg.tar.zst (pacman -U)."
+          install_pkg_release
+        elif [ "$(id -u)" -eq 0 ]; then
           # AUR helpers and makepkg refuse to run as root by design.
           say "AUR builds cannot run as root. As your normal user, run:"
           say "  yay -S irlume    (or: paru -S irlume)"
           say "  or, without a helper:"
           say "  git clone https://aur.archlinux.org/irlume.git && cd irlume && makepkg -si"
-          say "Nothing was changed."
+          say "Nothing was changed. (Set IRLUME_RELEASE_PKG=1 for the verified release package instead.)"
           exit 0
-        fi
-        if command -v yay >/dev/null 2>&1; then
+        elif command -v yay >/dev/null 2>&1; then
           yay -S --noconfirm irlume
         elif command -v paru >/dev/null 2>&1; then
           paru -S --noconfirm irlume
@@ -210,9 +329,7 @@ main() {
         ;;
       *" debian "*|*" ubuntu "*)
         say "Debian/Ubuntu-derivative: installing the checksum-verified universal .deb."
-        deb="$(fetch_verified '_amd64.deb')"
-        $SUDO apt-get install -y "$deb"
-        rm -rf "$(dirname "$deb")"
+        install_deb_release
         ;;
       *)
         die "unrecognised distro (ID=${ID:-?}). See the manual instructions at https://github.com/${REPO}#install"

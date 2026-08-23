@@ -142,5 +142,50 @@ sampled at 2 Hz via the read-only `privacy` UVC control:
 - The banner species (0.650) clears any plausible threshold; FLIR is the
   defense; its kill switch (`IRLUME_PAD_IR=0`) disables it knowingly.
 - Dim rooms (mean < 100) with genuinely undetectable RGB faces still take
-  the dark path at 0.60 — the gate is deliberately "conclusively lit", not
-  "any light", so it never false-refuses a legitimate dark user.
+  the dark path at the dark bar — the gate is deliberately "conclusively
+  lit", not "any light", so it never false-refuses a legitimate dark user.
+
+## Live dark session (2026-08-23, minihost NexiGo N930W — stage 2 gate)
+
+30 dark-path auths, true dark (rgb_frame_mean = 0 on every run), enrolled
+user, branch binary with both PAD cues attached:
+
+- **23/30 granted**; all 7 denials were the pre-#518 one-shot skew discard
+  (~5.9s gap vs the then-3s limit on `assess()`), NOT dark-path quality —
+  #518's sequential budget (merged to main after this branch) admits that
+  gap; no denial touched scores, liveness, or PAD.
+- **Genuine best-cosine: min 0.884, p10 0.891, p50 0.954, mean 0.941,
+  max 0.977** (n=23). Calibrated centroid: min 0.881, p50 0.953.
+- FLIR p_fake: 6e-5 .. 4.9e-3 (threshold 0.9) — zero interference in true
+  dark. Center/edge ratio 1.45-2.00; ambient 0 (emitter-dominated).
+- **Stage-2 decision rule ("0.635 only if live genuine p1 clears it by
+  >= 0.02"): PASSED with 10x margin** — genuine MINIMUM 0.884 vs the
+  0.635-scaled bar 0.685 (margin 0.199). IR_DARK_MATCH_THRESHOLD raised
+  to 0.635 (stage 2) on this session + the CBSR OR-arm (1.24e-4 FAR) +
+  Tufts calibrated arm.
+
+### Lit-room control FAILED in the instructive way (measured residual)
+
+Protocol item 4 (lit room, RGB lens occluded by a finger, face in IR):
+the scene gate did NOT refuse. rgb_frame_mean read 18 (finger-
+translucency glow) < 100 -> gate saw "dark" -> IR-only path granted.
+Second run identical (mean 18, granted). Findings, now measured rather
+than theoretical (the independent review had flagged this as an
+undisclosed residual):
+
+- **The scene gate reads brightness through the same lens an attacker can
+  occlude.** A true-dark room (0-17 measured: ASUS 17, minihost 0) is
+  indistinguishable from a covered lens (~18). The gate closes
+  PRESENTATION-based lit-room IR routing (dark-looking media in a lit
+  room); it cannot close PHYSICAL occlusion of the RGB lens. The
+  occlusion attacker still faces the full IR stack (identity at 0.635
+  effective ~0.68+, FLIR, per-user floor) — but with no RGB-side cues.
+- **FLIR's lit-room-via-IR regime is out of domain**: genuine-face p_fake
+  0.799 in the occluded-lit control (vs <= 0.005 true dark) — consistent
+  with the Tufts NIR domain bound already recorded. Under the 0.9 bar,
+  but the margin is thin in exactly the regime the occlusion residual
+  routes to.
+- Both facts are disclosed in ADR-0016's threat model; no code change
+  (no reliable lens-occlusion discriminator exists in the RGB stream
+  itself; a true fix needs an independent sensor or the Windows-Hello
+  per-frame illumination metadata trust chain).

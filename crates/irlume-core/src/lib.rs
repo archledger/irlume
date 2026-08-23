@@ -103,28 +103,34 @@ pub const RGB_MATCH_THRESHOLD: f32 = 0.55;
 /// measurement.
 pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 
-/// The PURE-DARK (IR-only) authentication threshold, SecureDark v1
+/// The PURE-DARK (IR-only) authentication threshold, SecureDark stage 2
 /// (ADR-0016). Higher than [`IR_MATCH_THRESHOLD`] because a pure-dark grant
 /// carries NO RGB evidence at all — no co-location, no RGB recognition, no
 /// RGB PAD — so the IR cosine alone must clear a stricter statistical bar.
 ///
-/// Evidence (same CBSR NIR benchmark as above): 0.55 → FAR 1.3e-3 / FRR
-/// 1.7%; **0.60 → FAR 2.7e-4 / FRR 3.0%** — a ~5x impostor-bar tightening
-/// for +1.3% false rejects. The old pure-dark bar was a consistency
-/// inversion: the DIM-LIGHT fallback (which at least SAW an RGB face) demanded
-/// base+0.60 while pure dark (strictly less evidence) granted at 0.55; this
-/// constant aligns the two at the stricter end.
+/// Evidence stack for 0.635 (stage 2's pre-written decision rule: raise to
+/// 0.635 only if the live genuine 1st-percentile clears the effective bar by
+/// >= 0.02 — satisfied with 10x margin):
+/// - CBSR deployment-shaped OR-arm (best-of-N OR centroid, 197 ids / 347,508
+///   impostor pairs): 0.635 -> FAR 1.24e-4 / FRR 0.69% (0.60 -> 4.03e-4).
+/// - Tufts cross-spectral calibrated arm: 0.635-class FAR ~4.9e-5.
+/// - LIVE dark session (2026-08-23, minihost NexiGo, true dark, 30 auths,
+///   `docs/research/2026-08-22-securedark-v1.md`): genuine best-cosine min
+///   0.884 (n=23 grants) vs the 0.635-scaled bar 0.685 — margin 0.199.
+///   FLIR p_fake <= 0.005 throughout; rgb_frame_mean = 0 (true dark).
 ///
 /// What this threshold does NOT do: stop the life-size print species. ADR-0002
 /// measured the vinyl banner of the enrolled user at IR cosine 0.650 — above
-/// 0.60 and above even the 0.635 FAR≤1e-4 point — so prints are FLIR PAD +
-/// IR physics + per-user center/edge floor's job, never the threshold's.
+/// 0.635 — so prints are FLIR PAD + IR physics + per-user center/edge floor's
+/// job, never the threshold's. (0.650 also brackets the practical ceiling:
+/// the next rung would start denying the measured print while buying little.)
 ///
-/// 0.635 (FAR ≤1e-4, FRR 4.6% on CBSR) is the measured next rung, NOT
-/// shipped: the threshold doc's live observation ("genuine IR in the overlap
-/// zone") means the live dark-session genuine distribution must be measured
-/// on the fleet before the bar goes there (ADR-0016's open measurement).
-pub const IR_DARK_MATCH_THRESHOLD: f32 = 0.60;
+/// History: the old pure-dark bar was a consistency inversion — the DIM-LIGHT
+/// fallback (which at least SAW an RGB face) demanded base+0.05=0.60 while
+/// pure dark granted at 0.55. Stage 1 aligned both at 0.60; stage 2 raises
+/// the pure-dark bar to the live-measured 0.635 while the dim-light fallback
+/// (RGB-verified, more evidence) stays at its 0.60-effective bar.
+pub const IR_DARK_MATCH_THRESHOLD: f32 = 0.635;
 
 /// Match threshold for ADAPTED IR embeddings (when an IR adapter is loaded).
 /// No adapter ships by default (retired 2026-07-15, ADR-0004: its training data

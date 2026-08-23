@@ -5450,10 +5450,11 @@ impl Engine {
             let ir_base = if self.ir_adapter.is_some() {
                 irlume_core::IR_ADAPTED_MATCH_THRESHOLD
             } else {
-                // SecureDark v1 (ADR-0016): the pure-dark grant carries no
-                // RGB evidence at all, so its bar is the STRICTER dark
-                // constant (0.60: FAR 2.7e-4 on CBSR), not the convenience
-                // base — and no longer looser than the dim-light fallback
+                // SecureDark stage 2 (ADR-0016): the pure-dark grant carries
+                // no RGB evidence at all, so its bar is the STRICTER dark
+                // constant (0.635: deployment-shaped OR-arm FAR 1.24e-4 on
+                // CBSR; live dark-session genuine min 0.884 vs the 0.685
+                // effective bar), never looser than the dim-light fallback
                 // that at least saw an RGB face.
                 irlume_core::IR_DARK_MATCH_THRESHOLD
             };
@@ -9017,12 +9018,13 @@ mod tests {
         // Constant relations the decision paths assume; checked at compile time.
         const { assert!(IR_ADAPTED_MATCH_THRESHOLD < IR_MATCH_THRESHOLD) };
         const { assert!(IR_FALLBACK_MARGIN > 0.0) };
-        // SecureDark v1 (ADR-0016): the pure-dark bar matches the dim-light
-        // fallback's effective bar exactly — the old inversion (less
-        // evidence, looser threshold) is pinned dead. The dark bar must
-        // stay strictly above the convenience base.
+        // SecureDark (ADR-0016): stage 1 ended the old inversion (less
+        // evidence, looser threshold) by aligning the pure-dark bar with the
+        // dim-light fallback's effective bar; stage 2's live-measured bar
+        // (0.635) must stay AT OR ABOVE that fallback bar — the dark path
+        // carries strictly less evidence and can never be the looser arm.
         const {
-            assert!(IR_DARK_MATCH_THRESHOLD == IR_MATCH_THRESHOLD + IR_FALLBACK_MARGIN);
+            assert!(IR_DARK_MATCH_THRESHOLD >= IR_MATCH_THRESHOLD + IR_FALLBACK_MARGIN);
             assert!(IR_DARK_MATCH_THRESHOLD > IR_MATCH_THRESHOLD);
         }
         for n in [1usize, 5, 30, 90] {

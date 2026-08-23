@@ -17,9 +17,20 @@ All notable changes to irlume are documented here. This project adheres to
   2.7e-4 for +1.3% FRR), ending the inversion where the dim-light
   fallback — which verifies an RGB face first — demanded a stricter bar
   than pure darkness. Per-user IR calibration, FLIR PAD, IR physics, and
-  the per-user center/edge floor are unchanged. Stage 2 (0.635 bar,
-  multi-frame consistency) is gated on the live dark-session measurement
-  protocol in `docs/research/2026-08-22-securedark-v1.md`.
+  the per-user center/edge floor are unchanged. **Stage 2 (2026-08-23):**
+  the live dark session ran (30 true-dark auths, minihost NexiGo; genuine
+  best-cosine min 0.884, FLIR p_fake <= 0.005) and the pre-written decision
+  rule passed with 10x margin, so `IR_DARK_MATCH_THRESHOLD` rises
+  0.60 → 0.635 (CBSR deployment-shaped OR-arm FAR 1.24e-4 / FRR 0.69%;
+  Tufts calibrated ~4.9e-5). The session also MEASURED the disclosed
+  residuals: the ASUS Shinetech module's firmware auto-engages its privacy
+  shutter while streaming in darkness (dark auth is firmware-impossible on
+  that host, failing closed), and an occluded RGB lens in a lit room reads
+  ~18 and routes to the dark path (no in-stream discriminator exists; the
+  occlusion attacker still faces the 0.635-effective IR identity bar, FLIR
+  — whose lit-room-via-IR margin thins to p_fake 0.80 — and the per-user
+  floor). Multi-frame consistency stays gated on the next session's
+  in-burst pair-cosine measurement.
 
 ### Removed
 

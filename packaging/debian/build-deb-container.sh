@@ -16,7 +16,7 @@
 # 2.27 / GLIBCXX 3.4.22, so it never binds first. If BASE ever moves, update
 # the libc6 floor in nfpm.yaml; build-deb.sh asserts the two stay in sync.
 #
-# Requires: podman (rootless is fine) and real LFS model weights in models/.
+# Requires: podman (or docker; rootless is fine) and real LFS model weights in models/.
 #   bash packaging/debian/build-deb-container.sh
 # Output: ./irlume_<version>_amd64.deb (copied out of the container).
 set -euo pipefail
@@ -32,13 +32,16 @@ NFPM_VER="${NFPM_VER:-2.47.0}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${OUT:-$REPO}"
 
-command -v podman >/dev/null || { echo "need podman"; exit 1; }
+CONTAINER_RUN="$(command -v podman || command -v docker)" || {
+    echo "need podman (or docker)"
+    exit 1
+}
 # Models are hosted as release assets (not Git LFS); fetch + verify them so a
 # fresh checkout (CI, a clean clone) has real weights to bundle into the .deb.
 bash "$REPO/scripts/fetch-models.sh"
 
 echo "==> building universal .deb in $BASE (rustup $RUST_VER)"
-podman run --rm \
+"$CONTAINER_RUN" run --rm \
   -v "$REPO:/src:ro,z" \
   -v "$OUT:/out:z" \
   "docker.io/library/$BASE" bash -euc '
@@ -47,7 +50,7 @@ podman run --rm \
     apt-get update -qq
     # clang/libclang-dev: bindgen (v4l2-sys-mit) needs libclang at build time.
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
-        libtss2-dev libpam0g-dev clang libclang-dev git xz-utils >/dev/null
+        libtss2-dev libpam0g-dev libudev-dev clang libclang-dev git xz-utils >/dev/null
     curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain '"$RUST_VER"' --profile minimal >/dev/null
     . "$HOME/.cargo/env"
     # Pinned nfpm, verified against its published (goreleaser-signed) checksums.

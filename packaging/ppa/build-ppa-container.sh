@@ -63,7 +63,7 @@ cp "$REPO"/models/*.onnx "$WORK/models/"
 echo "==> building PPA source in $BASE (SERIES=$SERIES, SOURCE_DATE_EPOCH=$SDE)"
 podman run --rm \
   -v "$WORK:/work:z" \
-  -e "SOURCE_DATE_EPOCH=$SDE" -e "SERIES=$SERIES" \
+  -e "SOURCE_DATE_EPOCH=$SDE" -e "SERIES=$SERIES" -e "PPAREV=${PPAREV:-0ppa1}" \
   "$BASE" bash -euc '
     export DEBIAN_FRONTEND=noninteractive HOME=/work CARGO_HOME=/work/.cargo-home
     apt-get update -qq >/dev/null

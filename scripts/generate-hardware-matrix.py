@@ -10,10 +10,10 @@ pages rotted within months because they were maintained by hand. This
 generator is the countermeasure: the matrix is RENDERED from two inputs
 that already have review pressure on them:
 
-1. docs/hardware/fleet-evidence.json — one record per validated host,
+1. docs/hardware/fleet-evidence.json: one record per validated host,
    each row citing the irlume version and the measurement that produced
    it. A camera without evidence does not get a row.
-2. crates/irlume-camera/src/ir_emitter.rs — the `known_control` match
+2. crates/irlume-camera/src/ir_emitter.rs: the `known_control` match
    arms, read straight from source so the emitter-control table in the
    docs can never drift from the code that applies it.
 
@@ -49,7 +49,7 @@ HEADER = """\
 
 Howdy-class install pain (54% of its open issues) does not exist here:
 no interpreter, no pip, no dlib. If your camera is not listed, irlume
-still runs — the RGB path needs any UVC camera, and unknown IR emitters
+still runs: the RGB path needs any UVC camera, and unknown IR emitters
 take `sudo irlume ir-setup` (it measures, warns, and undoes; it never
 blind-writes). Hardware reports are the most useful contribution:
 open an issue with `irlume status`, `sudo irlume doctor --probe`, and
@@ -128,18 +128,18 @@ def render_host(h: dict) -> list[str]:
     rgb = h.get("rgb")
     if rgb:
         lines.append(
-            f"- **RGB:** `/dev/{rgb['node']}` — {rgb['format']} ({rgb['role']})"
+            f"- **RGB:** `/dev/{rgb['node']}`: {rgb['format']} ({rgb['role']})"
         )
     ir = h.get("ir")
     if ir:
-        lines.append(f"- **IR:** `/dev/{ir['node']}` — {ir['format']}")
+        lines.append(f"- **IR:** `/dev/{ir['node']}`: {ir['format']}")
     else:
         lines.append("- **IR:** none (RGB-only host; convenience tier only)")
-    lines.append(f"- **Capture mode:** {h['capture_mode']} — {h['capture_mode_source']}")
+    lines.append(f"- **Capture mode:** {h['capture_mode']}: {h['capture_mode_source']}")
     em = h.get("emitter")
     if em:
         lines.append(
-            f"- **IR emitter:** {em['control']} — {em['status']}"
+            f"- **IR emitter:** {em['control']}: {em['status']}"
             + (f". {em['notes']}" if em.get("notes") else "")
         )
     if h.get("pad"):
@@ -170,7 +170,7 @@ def main() -> int:
         " output, restoration). Everything else uses `irlume ir-setup`.\n"
     )
     for e in known_control_entries():
-        note = f" — {e['comment']}" if e["comment"] else ""
+        note = f" ({e['comment']})" if e["comment"] else ""
         out.append(
             f"- `{e['vid']}:{e['pid']}` MS-XU unit {e['unit']}, selector 0x06"
             f" (face authentication){note}"

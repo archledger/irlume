@@ -18,27 +18,27 @@ panic/watchdog) across each resume boundary.
 | Host | Irlume | Suspend type | Cycles | Daemon | Post-resume auth |
 |---|---|---|---|---|---|
 | archhost (Brio dual) | 0.11.1-1 | S3 deep (mem) | 3 | `active` throughout, zero restarts, zero journal anomalies | **Granted at t+4 s after resume cycle 3** (`archledger 0.674 ✅`); other probes honest environmental denials (no face / yaw-pitch while user was angled away) |
-| minihost (NexiGo dual) | 0.11.1-1 | S3 deep (mem) | 3 | `active` throughout, zero restarts, zero journal anomalies | Unattended headless camera: honest denials only (no face in RGB / Spoof: no face in IR — nobody present). Camera paths reopened cleanly after every cycle |
+| minihost (NexiGo dual) | 0.11.1-1 | S3 deep (mem) | 3 | `active` throughout, zero restarts, zero journal anomalies | Unattended headless camera: honest denials only (no face in RGB / Spoof: no face in IR; nobody present). Camera paths reopened cleanly after every cycle |
 | thinkpad (RGB-only) | 0.11.0-0ppa1 (PPA index lag at test time; same daemon lineage) | s2idle | 3 | `active` throughout, zero anomalies | Unattended: honest "no face" denials; camera reopened every cycle |
-| ASUS dev box | 0.11.1-1.fc44 | — | — | — | **Skipped by owner instruction** (daily driver in active use); the same daemon build is validated on the other three hosts |
+| ASUS dev box | 0.11.1-1.fc44 | none | none | none | **Skipped by owner instruction** (daily driver in active use); the same daemon build is validated on the other three hosts |
 
 Kernel evidence for every cycle: `PM: suspend entry (deep)` /
 `suspend exit` (and s2idle equivalents on thinkpad) in the system
 journal, plus resume-delta timestamps on the probe log (22-34 s gaps).
 rtcwake ran as root; the first pass silently failed unprivileged
 (`rtcwake: /dev/rtc0: Permission denied`, 0 real cycles) and was
-discarded — recorded below as a test-harness lesson.
+discarded, recorded below as a test-harness lesson.
 
 ## Why the wall-clock failure mode cannot occur here
 
 Static sweep (this session): every timeout, deadline, rate window,
 timestamp-continuity and skew measurement in irlume-camera and
 irlume-auth uses `std::time::Instant` (CLOCK_MONOTONIC, suspend-
-excluding) — the slice-4 evidence schema literally records
+excluding); the slice-4 evidence schema literally records
 `clock: "monotonic"`. The only `SystemTime` (wall-clock) uses in the
 crates are: the capture-qualification record's persisted
 `measured_at_unix` metadata (camera/lib.rs:6713), diagnostic epoch
-stamps, and CLI support-report headers — none feed any auth decision,
+stamps, and CLI support-report headers. None feed any auth decision,
 timeout, or rate computation. Howdy's #1131 class (a wall-clock jump
 across suspend inflating a timeout) has no code path to live in.
 
@@ -48,7 +48,7 @@ visage #26's shape is a daemon holding a camera fd across hibernate
 that wedges on resume. irlume's daemon opens and drops the camera per
 request under the lease supervisor; no capture spans the suspend. The
 3x3 real cycles above show zero `camera busy`, zero EBUSY, zero
-watchdog, and a full grant at t+4 s after one resume — the camera
+watchdog, and a full grant at t+4 s after one resume, so the camera
 subsystem re-acquires cleanly.
 
 ## Residuals
@@ -60,7 +60,7 @@ subsystem re-acquires cleanly.
 - ASUS was not cycled (owner instruction). If a user report ever
   implicates suspend on the Shinetech module, the follow-up is a cycle
   on this class of hardware with a user present.
-- `mem` (S3) and `s2idle` covered; `disk` (hibernate) was not tested —
+- `mem` (S3) and `s2idle` covered; `disk` (hibernate) was not tested:
   no fleet host hibernates in normal use. Hibernate's extra variable is
   the restore path, not the clock; the wall-clock immunity argument
   covers it, but a real hibernate cycle remains untested.
@@ -75,7 +75,7 @@ post-resume grant within 4 s. No code change needed.
 ## Harness lessons (recorded)
 
 1. Unprivileged `rtcwake` fails with "unable to find device: Permission
-   denied" and returns 0 while suspending NOTHING — a run whose log
+   denied" and returns 0 while suspending NOTHING; a run whose log
    lacks `PM: suspend entry` did not test suspend. Root rtcwake or it
    did not happen; verify against the kernel journal, never the script's
    own resume line.

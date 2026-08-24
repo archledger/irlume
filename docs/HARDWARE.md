@@ -8,7 +8,7 @@
 
 Howdy-class install pain (54% of its open issues) does not exist here:
 no interpreter, no pip, no dlib. If your camera is not listed, irlume
-still runs — the RGB path needs any UVC camera, and unknown IR emitters
+still runs: the RGB path needs any UVC camera, and unknown IR emitters
 take `sudo irlume ir-setup` (it measures, warns, and undoes; it never
 blind-writes). Hardware reports are the most useful contribution:
 open an issue with `irlume status`, `sudo irlume doctor --probe`, and
@@ -20,10 +20,10 @@ open an issue with `irlume status`, `sudo irlume doctor --probe`, and
 ### ASUS Zenbook S 14 (UX5406S)
 
 - **Module:** Shinetech ASUS FHD webcam + IR (`3277:0059`)
-- **RGB:** `/dev/video0` — MJPG 1280x720@30 (also YUYV) (RGB primary)
-- **IR:** `/dev/video2` — GREY 640x400@15
-- **Capture mode:** sequential — measured (camera-tune qualification); concurrent dims both sensors
-- **IR emitter:** MS-XU unit 14 selector 0x06 (face authentication), D1 alternative-frame illumination — validated (write, read-back, optical output, restoration). firmware privacy shutter auto-engages in darkness (reads its own RGB); fail-closed refusal, disclosed in ADR-0016; no ALS on the host
+- **RGB:** `/dev/video0`: MJPG 1280x720@30 (also YUYV) (RGB primary)
+- **IR:** `/dev/video2`: GREY 640x400@15
+- **Capture mode:** sequential: measured (camera-tune qualification); concurrent dims both sensors
+- **IR emitter:** MS-XU unit 14 selector 0x06 (face authentication), D1 alternative-frame illumination: validated (write, read-back, optical output, restoration). firmware privacy shutter auto-engages in darkness (reads its own RGB); fail-closed refusal, disclosed in ADR-0016; no ALS on the host
 - **Anti-spoofing:** ViT RGB + FLIR IR qualified
 - **Evidence (irlume 0.11.1-1.fc44):**
   - slice4: sequential PASS (2026-08-24, sha a9c410e0: 0 drops both streams, recovery 2.1-2.9s)
@@ -33,10 +33,10 @@ open an issue with `irlume status`, `sudo irlume doctor --probe`, and
 ### HP Arch Linux gaming desktop + Logitech Brio 4K
 
 - **Module:** Logitech BRIO 4K (`046d:085e`)
-- **RGB:** `/dev/video0` — YUYV 640x480@30 (RGB primary)
-- **IR:** `/dev/video2` — GREY 340x340 (metadata node video1)
-- **Capture mode:** sequential — measured; RGB+IR concurrent fails QBUF EINVAL (dual-stream incapable); IR emitter strobes on USB3 only
-- **IR emitter:** MS-XU unit 12 selector 0x06 present — qualified through camera-tune; strobe alternates frames on USB3 link. MSXU probe finding recorded 2026-08-22 (Brio is a third dual-capable host, not RGB-only)
+- **RGB:** `/dev/video0`: YUYV 640x480@30 (RGB primary)
+- **IR:** `/dev/video2`: GREY 340x340 (metadata node video1)
+- **Capture mode:** sequential: measured; RGB+IR concurrent fails QBUF EINVAL (dual-stream incapable); IR emitter strobes on USB3 only
+- **IR emitter:** MS-XU unit 12 selector 0x06 present: qualified through camera-tune; strobe alternates frames on USB3 link. MSXU probe finding recorded 2026-08-22 (Brio is a third dual-capable host, not RGB-only)
 - **Anti-spoofing:** FLIR IR qualified; ViT weights not installed on this host's package (open package follow-up)
 - **Evidence (irlume 0.11.1-1 (Arch)):**
   - suspend: 3x S3 cycles, daemon active zero-anomaly, GRANTED t+4s post-resume (2026-08-24)
@@ -45,10 +45,10 @@ open an issue with `irlume status`, `sudo irlume doctor --probe`, and
 ### minihost (headless N100)
 
 - **Module:** NexiGo HelloCam N930W (`3443:c803`)
-- **RGB:** `/dev/video0` — MJPG 1280x720@30 (RGB primary)
-- **IR:** `/dev/video2` — GREY 640x360, strobe ~2.4fps burst / ~15fps delivered lit frames
-- **Capture mode:** sequential — measured (capture_mode.3443:c803+3443:c803=sequential persisted)
-- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination — validated (write, read-back, optical output via burst_dump PGM evidence, restoration); 3443:930d deliberately NOT in the table (identity ambiguous, see ir_emitter.rs). steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)
+- **RGB:** `/dev/video0`: MJPG 1280x720@30 (RGB primary)
+- **IR:** `/dev/video2`: GREY 640x360, strobe ~2.4fps burst / ~15fps delivered lit frames
+- **Capture mode:** sequential: measured (capture_mode.3443:c803+3443:c803=sequential persisted)
+- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination: validated (write, read-back, optical output via burst_dump PGM evidence, restoration); 3443:930d deliberately NOT in the table (identity ambiguous, see ir_emitter.rs). steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)
 - **Anti-spoofing:** ViT RGB + FLIR IR qualified; SecureDark stage 2+3 measured on this host
 - **Evidence (irlume 0.11.1-1 (Arch)):**
   - slice4: sequential PASS as unprivileged runner (2026-08-24, sha a9c410e0: 0 drops)
@@ -58,9 +58,9 @@ open an issue with `irlume status`, `sudo irlume doctor --probe`, and
 ### ThinkPad X13 Yoga Gen 4
 
 - **Module:** Chicony Integrated Camera (`04f2:b7bf`)
-- **RGB:** `/dev/video0` — MJPG 1080p/720p@30 (RGB-only host)
+- **RGB:** `/dev/video0`: MJPG 1080p/720p@30 (RGB-only host)
 - **IR:** none (RGB-only host; convenience tier only)
-- **Capture mode:** rgb-only — single camera; policy denies face for privileged surfaces on RGB-only hosts (convenience tier only)
+- **Capture mode:** rgb-only: single camera; policy denies face for privileged surfaces on RGB-only hosts (convenience tier only)
 - **Anti-spoofing:** ViT RGB (print species) on the RGB-only tier
 - **Evidence (irlume 0.11.0-0ppa1 (suspend-tested build; 0.11.1 PPA publication pending index at test time)):**
   - slice4: thinkpad-validated release lane (rc4 == final content)
@@ -70,7 +70,7 @@ open an issue with `irlume status`, `sudo irlume doctor --probe`, and
 
 Read from source at generation time. These are the modules whose emitter payload was validated end to end (write, read-back, optical output, restoration). Everything else uses `irlume ir-setup`.
 
-- `3277:0059` MS-XU unit 14, selector 0x06 (face authentication) — Shinetech "ASUS FHD webcam" in the Zenbook S 14; MS-XU is unit 14.
-- `3443:c803` MS-XU unit 4, selector 0x06 (face authentication) — NexiGo HelloCam N930W; MS-XU is unit 4.
+- `3277:0059` MS-XU unit 14, selector 0x06 (face authentication) (Shinetech "ASUS FHD webcam" in the Zenbook S 14; MS-XU is unit 14.)
+- `3443:c803` MS-XU unit 4, selector 0x06 (face authentication) (NexiGo HelloCam N930W; MS-XU is unit 4.)
 
 <!-- generated: schema 1; inputs: docs/hardware/fleet-evidence.json + ir_emitter.rs known_control; regenerate with scripts/generate-hardware-matrix.py -->

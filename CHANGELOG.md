@@ -15,14 +15,14 @@ All notable changes to irlume are documented here. This project adheres to
   daemon's systemd unit deliberately excludes `CAP_CHOWN`, so the lock it
   creates on a clean boot could not be re-grouped to the camera's group;
   the #534 tolerance then returned early, skipping the ACL copy and mode
-  set as well, leaving the lock `root:root 0600` with no ACL — unopenable
+  set as well, leaving the lock `root:root 0600` with no ACL, unopenable
   by `camera-tune`, user-context `ir-setup`, and the hardware stress
   runner on every host. Two halves fix it: the tolerated mirror failure
   now continues to the ACL and mode steps (which work under the daemon's
   bounding set), and the lock moves to a dedicated setgid
   `/run/lock/irlume` directory (tmpfiles.d, `root:video` 2751) so
-  daemon-created locks inherit the camera group at creation — the only
-  capability-free fix for hosts whose cameras carry no per-user ACL. When
+  daemon-created locks inherit the camera group at creation. That is the
+  only capability-free fix for hosts whose cameras carry no per-user ACL. When
   the group still cannot be corrected (a camera group no tmpfiles override
   covers), the mirror now strips every group-class grant from the lock
   instead of granting the wrong group, so the lock never opens to callers
@@ -34,7 +34,7 @@ All notable changes to irlume are documented here. This project adheres to
   change.** With non-root tools reaching the journal read for the first
   time (they used to stop at the lock), a permission failure reading the
   root-owned store was reported as "an emitter control ... was left
-  changed ... and has not been put back" — asserting a record that was
+  changed ... and has not been put back", asserting a record that was
   never observed. The store-read failure now reports "could not check"
   (same fail-closed refusal, honest wording), matching the lock-side
   #210 contract.
@@ -51,7 +51,7 @@ All notable changes to irlume are documented here. This project adheres to
   visible light could choose the lowest-evidence path on purpose. The
   pure-dark match threshold rises 0.55 → 0.60 (CBSR NIR: FAR 1.3e-3 →
   2.7e-4 for +1.3% FRR), ending the inversion where the dim-light
-  fallback — which verifies an RGB face first — demanded a stricter bar
+  fallback (which verifies an RGB face first) demanded a stricter bar
   than pure darkness. Per-user IR calibration, FLIR PAD, IR physics, and
   the per-user center/edge floor are unchanged. **Stage 2 (2026-08-23):**
   the live dark session ran (30 true-dark auths, minihost NexiGo; genuine
@@ -64,7 +64,7 @@ All notable changes to irlume are documented here. This project adheres to
   that host, failing closed), and an occluded RGB lens in a lit room reads
   ~18 and routes to the dark path (no in-stream discriminator exists; the
   occlusion attacker still faces the 0.635-effective IR identity bar, FLIR
-  — whose lit-room-via-IR margin thins to p_fake 0.80 — and the per-user
+  (whose lit-room-via-IR margin thins to p_fake 0.80), and the per-user
   floor). Multi-frame consistency stays gated on the next session's
   in-burst pair-cosine measurement.
 
@@ -91,7 +91,7 @@ All notable changes to irlume are documented here. This project adheres to
   measured operating points: ViT m96 crop, 0.55, 5-frame-median vote per
   authentication (catches the print/banner species at 100% across two
   qualification sessions, 0/180 genuine false-fires; does NOT stop a phone
-  at login distance — disclosed in the startup line, IR covers that
+  at login distance (disclosed in the startup line; IR covers that
   species); FLIR 0.9 on lit IR frames. Kill switches: `IRLUME_PAD_VIT=0` /
   `pad_vit=0` and `IRLUME_PAD_IR=0` / `pad_ir=0`. The opt-in catalog keeps
   both provenance records; `flir` selections in existing settings.conf keep
@@ -112,7 +112,7 @@ All notable changes to irlume are documented here. This project adheres to
   per-service defaults are unchanged; passive PAD remains mandatory.
 - **Capture-path latency and pairing (ADR-0014, PR #518).** The rate-gate
   startup flush is role-aware (IR 10 dequeues, RGB 0; was 30/30) from fleet
-  measurement — lit authentication on sequential-schedule dual hosts drops
+  measurement: lit authentication on sequential-schedule dual hosts drops
   from ~10.4 s to ~7.0 s. The cross-spectrum pairing budget is
   schedule-aware: concurrent captures keep the 3 s ceiling, sequential
   one-shot captures (and concurrent attempts that degraded to their
@@ -164,14 +164,14 @@ All notable changes to irlume are documented here. This project adheres to
 - **Clean installs keep IR face authentication (P0).** The packaged daemon
   creates the emitter lock root-owned, then the #487 access-mirror rework
   hard-failed the group correction under the unit's deliberately
-  CAP_CHOWN-less bounding set — IR auth was dead on every clean install
+  CAP_CHOWN-less bounding set, so IR auth was dead on every clean install
   (existing hosts only worked via leftover dev-run locks, which /run
   clears at reboot). A lock owned by the process with no world bits is
   strictly tighter than the mirror target and now proceeds; a
   world-accessible uncorrectable lock still refuses.
 - **AppArmor profile gaps (enforce-mode installs):** the deferred
   template-key loader's flocks and camera classification's media-graph
-  reads were both denied under enforcement — the first broke every
+  reads were both denied under enforcement. The first broke every
   enrollment read, the second silently regressed the no-open
   classification to the privacy-LED open probe. Both rules added; a
   complain-mode audit across the full exercise battery confirmed no

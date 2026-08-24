@@ -44,10 +44,10 @@ IR camera. Stored as an embedding, never an image. Password always works.
 | 🔓 **Unlocks everything** | Login, lock screen, `sudo`, polkit prompts |
 | 🗝️ **Opens your wallet** | A face match TPM-unseals your keyring secret |
 | 🧬 **No face images** | 512-D embeddings, AES-256-GCM under a TPM-sealed key |
-| 🙋 **Consent before camera** | `yes` for a face attempt; typing your password never starts a scan, and both work in the same prompt — no waiting for one to time out (the field accepts either) |
+| 🙋 **Consent before camera** | `yes` for a face attempt; typing your password never starts a scan, and both work in the same prompt (the field accepts either, so you never wait for one path to time out) |
 | 🛡️ **Refuses photos and screens** | Two anti-spoofing models run by default: print attacks on RGB, screens/phones on IR (Howdy's own README warns a printed photo can defeat it) |
 | 🔁 **Survives real life** | Suspend/resume verified on hardware; a failed scan or a crashed component falls back to your password, never a lockout |
-| 📦 **Installs boring** | One Rust binary per package, no Python, no dlib, no pip — the class of install breakage that dominates other face-unlock trackers does not exist here |
+| 📦 **Installs boring** | One Rust binary per package, no Python, no dlib, no pip. The class of install breakage that dominates other face-unlock trackers does not exist here |
 | 🩺 **Repairs itself** | A live TUI fixes faults; PAM wiring survives updates |
 
 </div>

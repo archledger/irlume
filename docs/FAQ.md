@@ -29,6 +29,21 @@ treating it as a security boundary.
 </details>
 
 <details>
+<summary><b>Does it learn my face over time?</b></summary>
+
+No, and that is deliberate
+([ADR-0017](adr/0017-no-adaptive-enrollment.md)). Templates change only
+when you run an enrollment: explicit, consented, quality-gated, under a
+minute, and additive (new scans join the old ones; nothing is lost). A
+recognizer that silently updates itself from accepted frames also
+updates itself from whatever *almost* got in, so a run of near-miss
+impostor probes could drag your template toward the attacker, and every
+measured threshold would silently stop meaning what it said. If your
+appearance changed enough to stop matching, re-enroll; the TUI's
+"not recognizing you" diagnosis points you there.
+</details>
+
+<details>
 <summary><b>Do I need an IR camera?</b></summary>
 
 No. An IR (Windows Hello) camera gets the full **Secure** tier: greeter
@@ -125,8 +140,8 @@ IR captures run in parallel, which cuts the capture stage by about a third;
 [docs/DEBUGGING.md](DEBUGGING.md) shows how to time every stage on your
 own hardware.
 
-Privileged services—polkit and terminal elevation such as sudo, su, and
-doas—first ask for hidden literal `yes`. Enter or any other response chooses
+Privileged services (polkit and terminal elevation such as sudo, su, and
+doas) first ask for hidden literal `yes`. Enter or any other response chooses
 password/fingerprint without opening the camera; `yes` authorizes one face
 attempt. Login, logout, lock-screen, and credential-release flows do not gain
 this extra irlume prompt.

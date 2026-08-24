@@ -3,7 +3,7 @@
 - [Privilege separation](#privilege-separation): who is trusted, and the one
   socket everything crosses
 - [Authentication flow](#authentication-flow): what happens on a login attempt
-- [Model stack](#model-stack): the five bundled models, and what is
+- [Model stack](#model-stack): the seven bundled models, and what is
   deliberately not a model
 - [IR capture: strobe and ambient subtraction](#ir-capture-strobe-and-ambient-subtraction)
 - [Face login → keyring unlock](#face-login--keyring-unlock): the
@@ -81,7 +81,8 @@ flowchart LR
 
 ## Model stack
 
-Five model files ship with every package, loaded once by `irlumed` at startup
+Seven model files ship with every package (five recognizers/landmarkers plus
+the two PAD models below), loaded once by `irlumed` at startup
 and checksum-verified against a built-in manifest (a mismatch warns;
 `IRLUME_MODELS_STRICT=1` refuses to start instead). Four are ONNX; the
 landmark mesh is Google's published `.tflite`, run on the TFLite C runtime the
@@ -133,8 +134,10 @@ physics (cross-spectrum co-location, center/edge brightness falloff, corneal gli
 and the matcher is a fixed cosine threshold; both are plain, auditable
 algorithms. Per-user IR calibration is fitted on-device from the user's own
 enrollment scans ([ADR-0004](adr/0004-per-enrollment-ir-adapter.md); it
-replaced a retired, dataset-trained IR adapter). No learned anti-spoof model
-ships; the acceptance bar one would have to clear is in
+replaced a retired, dataset-trained IR adapter). Two learned anti-spoof
+models ship default-on as deny-only cues
+([ADR-0013](adr/0013-ship-pad-models-default-on.md)); the acceptance bar a
+grant-capable model would have to clear is in
 [ADR-0001](adr/0001-liveness-pad-strategy.md).
 
 Per-model provenance, license verification notes, and the models this project

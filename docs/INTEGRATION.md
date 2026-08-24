@@ -30,7 +30,7 @@ irlume status --json --contract 1
 Call `irlume version --json` once at startup:
 
 ```json
-{ "contract_version": 1, "engine_version": "0.8.1", "command": "version", "ok": true,
+{ "contract_version": 1, "engine_version": "0.11.0", "command": "version", "ok": true,
   "data": { "capabilities": ["version-json", "profiles-list-json", "status-json",
                              "doctor-json", "login-status-json", "auth-test-events",
                              "login-plan-json", "login-transactions", "models-list-json"],

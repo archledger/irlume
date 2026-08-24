@@ -17,7 +17,7 @@ not on this page.
 
 | Standard / bar | What it covers | irlume today |
 |---|---|---|
-| [ISO/IEC 30107-3](#isoiec-30107-3-presentation-attack-detection) | spoof testing and reporting | methodology adopted, self-tested; one attack class published as unsolved |
+| [ISO/IEC 30107-3](#isoiec-30107-3-presentation-attack-detection) | spoof testing and reporting | methodology adopted, self-tested; the vinyl-print class is denied by the shipped PAD pair |
 | [ISO/IEC 19795-1](#isoiec-19795-1-measuring-and-reporting-accuracy) | accuracy measurement and reporting | benchmark protocols with committed raw results |
 | [ISO/IEC 24745](#isoiec-24745-template-protection) | biometric template protection | encryption and TPM key custody, live-audited |
 | [Windows Hello requirements](#the-windows-hello-bar) | consumer face-login bar (FAR, TAR) | not demonstrated at the required confidence; measured points published |
@@ -60,12 +60,13 @@ irlume adopted the methodology rather than the certificate:
   shake decline remain experimental and separate from passive PAD
   ([ADR-0010](adr/0010-conventional-face-intent-confirmation.md)).
 
-What that adds up to, stated plainly: in the default configuration the
-credential-releasing gate is single-frame IR physics. It stopped every emissive
+What that adds up to, stated plainly: the algorithmic credential-releasing
+gate is single-frame IR physics. It stopped every emissive
 screen and matte print tested; a large IR-reflective flat print of the enrolled
-user defeats it, and that is an accepted, documented residual risk
-([ADR-0001](adr/0001-liveness-pad-strategy.md), and the README's honest
-limitations). Level 2 instruments (3D masks) have never been tested and no
+user defeats the algorithmic layer alone, and the default-on shipped PAD pair
+denies it (ADR-0013), leaving the print breach open only in kill-switch
+configurations ([ADR-0001](adr/0001-liveness-pad-strategy.md), and the
+README's honest limitations). Level 2 instruments (3D masks) have never been tested and no
 resistance is claimed. Scene-level IR flooding (open sky, sun) fails closed with
 an explanatory message rather than degrading the cues silently
 (`IR_AMBIENT_FLOOD` in `crates/irlume-liveness/src/lib.rs`).
@@ -177,7 +178,8 @@ shape as per-species APCER, and irlume's spoof results read directly in those
 terms. From the published self-tests under the default configuration: SAR 0%
 (n=20 each, CI upper bound 16.8%) for phone-screen, laptop-screen, and
 matte-print instruments; SAR 98.6% for the life-size vinyl-print instrument
-that remains the documented open breach.
+against the algorithmic layer alone (the shipped PAD pair denies it; see
+[ADR-0013](adr/0013-ship-pad-models-default-on.md)).
 
 ## Standards that do not apply to irlume
 

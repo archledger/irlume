@@ -27,9 +27,11 @@ IR camera. Stored as an embedding, never an image. Password always works.
 ---
 
 > [!IMPORTANT]
-> **A printed photograph of an enrolled face passes the built-in liveness gate**
-> (accepted in 69 of 70 measured presentations). `irlume setup` offers a trained
-> cue that refuses it. Read **[Limits](docs/LIMITATIONS.md)** before wiring this
+> **A printed photograph of an enrolled face passes the algorithmic IR gate
+> alone** (accepted in 69 of 70 measured presentations). The shipped PAD pair
+> (ViT RGB + FLIR IR) refuses it, runs default-on, and verifies against signed
+> checksums at startup; kill switches: `IRLUME_PAD_VIT=0`, `IRLUME_PAD_IR=0`.
+> Read **[Limits](docs/LIMITATIONS.md)** before wiring this
 > into anything that matters.
 
 <br>

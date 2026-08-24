@@ -146,7 +146,8 @@ headless SPICE host.
 
 ## Model weights and building from a remote flake
 
-The four ONNX model files are fetched by the flake from the `models-v1` GitHub
+The six ONNX model files plus the TFLite mesh are
+fetched by the flake from the `models-v1` GitHub
 release as hash-pinned `fetchurl` inputs, and the package installs them into
 `$out/share/irlume/models/`. Because they are fixed-output fetches keyed by
 sha256 (not Git LFS), `nix build github:archledger/irlume` gets the real weights

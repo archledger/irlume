@@ -1,6 +1,6 @@
 # ADR-0006: Which pipeline stages accept third-party models, and on what evidence
 
-**Status:** Accepted
+**Status:** Accepted; the lane this governs was removed by [ADR-0015](0015-remove-thirdparty-model-lane.md)
 **Date:** 2026-08-12
 
 ## Context

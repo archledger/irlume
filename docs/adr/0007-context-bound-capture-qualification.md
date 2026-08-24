@@ -2,7 +2,7 @@
 
 Date: 2026-08-17
 
-Status: Proposed
+Status: Accepted; implemented (context-bound qualification-v2 and runtime degradation shipped)
 
 ## Context
 

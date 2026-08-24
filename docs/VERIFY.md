@@ -77,7 +77,7 @@ cd irlume && bash scripts/fetch-models.sh
 cargo test --workspace
 ```
 
-Around 150 tests pass; the fifteen or so that need camera or TPM hardware are
+Around 1,700 tests pass; the ones that need camera or TPM hardware are
 marked `ignored`.
 
 ## 4. The liveness gate is self-tested against ISO/IEC 30107-3 · deeper (needs your own spoofs)

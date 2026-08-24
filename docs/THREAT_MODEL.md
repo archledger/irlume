@@ -160,9 +160,11 @@ here is a claim about those.
 [ms-ess]: https://learn.microsoft.com/windows-hardware/design/device-experiences/windows-hello-enhanced-sign-in-security
 [ms-xu]: https://learn.microsoft.com/windows-hardware/drivers/stream/device-requirements-for-usb-video-class-extension-units
 
-## Liveness: algorithmic single-frame gate (no trained weights)
+## Liveness: algorithmic gate plus shipped deny-only PAD models
 
-The default PAD gate uses no trained weights. MediaPipe FaceMesh remains a
+The algorithmic gate uses no trained weights; the default configuration's PAD
+stack additionally runs two shipped deny-only models (ViT RGB + FLIR IR,
+ADR-0013). MediaPipe FaceMesh remains a
 dense landmarker for BlazeFace rescue alignment, not a spoof classifier or a
 consent detector; it is Apache-2.0, so the clean-BOM claim holds.
 
@@ -200,21 +202,18 @@ brightness-ratio cue (banner center/edge 1.02–1.58 *overlaps and exceeds* genu
 were still fully rejected. This is a demonstrated instance of the accepted
 IR-approximating-spoof residual risk.
 
-One mitigation exists and it is not automatic. The **trained `flir` cue** has
+The mitigation is automatic. The **shipped FLIR PAD cue** (default-on since
+ADR-0013, verified against `models/SHA256SUMS` at daemon startup) has
 refused this print in every measured session, including one enhanced with an
 infrared-absorbing patch that carries the centre/edge ratio into the genuine
-range while the built-in gate still returns `Live`; since 2026-08-04
-`irlume setup` offers it as a recommended step with the license and provenance
-on screen ([ADR-0001](adr/0001-liveness-pad-strategy.md)), though the weights
-are neither shipped nor fetched without consent. The passive-blink gate that
+range while the built-in gate still returns `Live`. The passive-blink gate that
 once closed this breach in validation was retired for field non-response
 ([ADR-0002](adr/0002-challenge-response-liveness.md), superseded); the nod and
 head-shake gestures that replaced it prove intent, not liveness, and do not
 stand between a print and a grant. Measurements:
 [docs/pad-results/](pad-results/).
 
-A user who declines both, or who never runs setup, still carries this gap in
-full.
+A user who sets the kill switch (`IRLUME_PAD_IR=0`) carries this gap in full.
 Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/2026-06-30-ir-liveness-selftest.md).
 
 ## Storage
@@ -326,7 +325,7 @@ with a fabricated print.
   of a live person and must not be read as an anti-spoofing figure.
 
   No printed attempt was ever granted. Every one was refused by cross-spectrum
-  liveness and the third-party PAD cue, at `p_fake` 0.996-1.000; the gesture was
+  liveness and the FLIR PAD cue (shipped since ADR-0013), at `p_fake` 0.996-1.000; the gesture was
   never the layer standing between the print and a credential.
 
   The gate's own separation was then measured directly, with the daemon

@@ -49,8 +49,9 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
   release manifest (`models/SHA256SUMS`, embedded at build time) and logs a
   loud warning on any mismatch; `IRLUME_MODELS_STRICT=1` turns both a
   mismatch and an unreadable/deleted model into a startup refusal. Warn-first
-  is the default so operators can run self-trained weights without being
-  locked out.
+  is the default so a recoverable mis-packaging (or a deliberately overridden
+  model path via the unit's `IRLUME_*_MODEL` variables) degrades to a loud
+  warning instead of bricking face login; strict is the hardened choice.
 
 ## Reporting a vulnerability
 

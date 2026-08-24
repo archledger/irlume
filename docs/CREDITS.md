@@ -8,6 +8,8 @@ The bundled models:
 - **[YuNet](https://github.com/opencv/opencv_zoo)** (OpenCV Zoo, MIT) detects faces in both streams.
 - **[AuraFace](https://huggingface.co/fal/AuraFace-v1)** by fal (Apache-2.0) is the 512-D ArcFace recognizer; irlume ships only its `glintr100.onnx`.
 - **[MediaPipe FaceLandmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker)** and **[BlazeFace short-range](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector)** (Google, Apache-2.0) supply dense landmarks and the detection-rescue stage for saturated frames; FaceLandmarker refines BlazeFace rescue boxes for alignment.
+- **[ViT liveness](https://github.com/Adedev-W/LivenessModels-ONNX)** (Adedev-W, MIT) is the shipped RGB PAD cue (`liveness_vit.onnx`), default-on per ADR-0013.
+- **[FLIR liveness](https://modelscope.cn/models/iic/cv_manual_face-liveness_flir)** (Alibaba DAMO Academy on ModelScope, MIT) is the shipped IR PAD cue (`flir.onnx`), default-on per ADR-0013.
 
 The TPM and camera code builds on:
 

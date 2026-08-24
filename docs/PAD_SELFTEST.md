@@ -1,7 +1,9 @@
 # IR liveness PAD self-test (ISO/IEC 30107-3)
 
-**Status:** V1.0 methodology · **Applies to:** the credential-releasing IR liveness
-gate (`irlume_liveness::LivenessGate`)
+**Status:** V1.0 methodology · **Applies to:** the algorithmic credential-releasing
+IR liveness gate (`irlume_liveness::LivenessGate`). The shipped deny-only PAD
+models (ViT RGB + FLIR IR, ADR-0013) run alongside this gate on the credential
+path and are out of scope here; see `docs/pad-results/`.
 
 This document defines how irlume's presentation-attack-detection (PAD) gate is
 self-tested against the methodology of **ISO/IEC 30107-3** (*Biometric presentation
@@ -36,7 +38,8 @@ overstate what it is trusted to do, so it is excluded from the PAD claim. Its
 screen/glare/moiré cues are documented in the source, not certified here.
 
 The gate is a **hard AND of physically-grounded cues** (any single failure
-rejects); there is no learned model and no score fusion in the liveness decision.
+rejects); there is no learned model and no score fusion in this gate's decision
+(the shipped PAD cues are separate, deny-only stages).
 See [`adr/0001-liveness-pad-strategy.md`](adr/0001-liveness-pad-strategy.md) for why
 (clean-BOM constraint + the rPPG latency paradox).
 

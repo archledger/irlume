@@ -419,10 +419,10 @@ with none of these checks ([#179]).
 [#159]: https://github.com/archledger/irlume/issues/159
 [#179]: https://github.com/archledger/irlume/issues/179
 
-## Third-party models: optional, and recommended
+## Anti-spoofing (PAD) models: shipped default-on
 
-**Enable one if a printed photograph of you should not unlock your machine.**
-The built-in gate does not stop a life-size print. Measured twice on the same
+The shipped PAD pair refuses a life-size print.
+The algorithmic gate alone does not stop one. Measured twice on the same
 hardware, on 2026-06-30 and again on 2026-08-02, an angled vinyl print of the
 enrolled user's face produces the same centre-to-edge infrared falloff a real
 face does, so no threshold separates them and the gate accepts the print. The
@@ -453,7 +453,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before the login-keyring credential is released (default off); every `service_gesture.<service>` also defaults off, with `=1` adding an experimental gesture after mandatory privileged keyboard confirmation; the legacy `polkit_gesture=1` switch remains an explicit polkit opt-in. `enforce_biopolicy=1` opts into operation-class gating; `third_party_pad=<name>` and `third_party_recognizer=<name>` select enabled third-party models. During the migration window, `consent_gesture=closure` or malformed values block only a gesture-gated request until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off`; `sudo irlume models enable/add/disable` |
+| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before the login-keyring credential is released (default off); every `service_gesture.<service>` also defaults off, with `=1` adding an experimental gesture after mandatory privileged keyboard confirmation; the legacy `polkit_gesture=1` switch remains an explicit polkit opt-in. `enforce_biopolicy=1` opts into operation-class gating; the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). During the migration window, `consent_gesture=closure` or malformed values block only a gesture-gated request until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off` |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |

@@ -8,11 +8,13 @@ summary lives on the [README](../README.md); this is the detail.
   accepted a life-size vinyl print in 69 of 70 presentations. The cue is a
   brightness ratio on a 2D infrared sensor, and a print held at an angle produces
   the same falloff a face does, so no threshold accepts the user and rejects the
-  print. `irlume setup` offers a trained deny-only cue (`flir`) that refused the
+  print. The shipped default-on PAD pair (ADR-0013) refused the
   same print at p_fake 0.941 to 1.000, including when it was enhanced with an
-  infrared-absorbing patch. irlume does not ship or warrant those weights,
-  because their publisher documents neither the training data nor a way to
-  reproduce the model ([ADR-0001](adr/0001-liveness-pad-strategy.md)).
+  infrared-absorbing patch. The weights are bundled, checksummed, and verified
+  at daemon startup; their publishers document neither the training data nor a
+  way to reproduce the models, which is disclosed at startup and in
+  [models/README.md](../models/README.md) ([ADR-0001](adr/0001-liveness-pad-strategy.md),
+  amended by ADR-0013).
   Every miss falls safely to the password.
 - **Bright infrared behind you rejects a genuine face.** The gate infers shape
   from how the emitter's light falls, and open sky or a hot lamp floods it. In a

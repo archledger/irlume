@@ -6,31 +6,19 @@ not promises, and the order can change when hardware reports or security
 findings say it should. Dated snapshots of what shipped live in
 [CHANGELOG.md](../CHANGELOG.md).
 
-## Next: a security-focused 0.3.x
+## Done from the original audit backlog
 
-The audit backlog, in rough order:
+Shipped since this list was written: the consecutive-failure throttle (0.4.0;
+the NIST SP 800-63B-4 3.2.3 hard requirement), panic containment at the PAM
+entry points, the hardening passes (constant-time checks, zeroization), the
+sandboxed systemd unit (validated on real logins), and the anti-spoof
+decision: both PAD models ship default-on and bundled, verified at startup
+([ADR-0013](adr/0013-ship-pad-models-default-on.md)); the third-party model
+lane was later removed outright
+([ADR-0015](adr/0015-remove-thirdparty-model-lane.md)).
 
-- Consecutive-failure lockout in the daemon: disable face auth for a user
-  after repeated failed verifications and fall back to password. This is the
-  one hard requirement from NIST SP 800-63B-4 section 3.2.3 that irlume
-  lacks, and it bounds spoof-retry attacks.
-- `catch_unwind` at the PAM entry points plus `forbid(unsafe_code)` and
-  panic-lint denies on the crates that already have no unsafe, so a panic
-  can never take down the host greeter.
-- Constant-time comparison (`subtle`) for the sealed-password check, a
-  manual `Clone` for `SecretBytes` that keeps the mlock guarantee, and
-  zeroization of the remaining error-path copies.
-- systemd unit sandboxing (NoNewPrivileges, ProtectSystem, SystemCallFilter,
-  device allow-listing) layered under the existing SELinux/AppArmor
-  policies, validated on real logins before shipping.
-- `PR_SET_DUMPABLE` and core-dump limits for the daemon.
+## Still open: footprint
 
-## Then: anti-spoof and footprint (0.4 direction)
-
-- Decide whether the qualified third-party IR PAD model becomes a default
-  deny-only cue instead of an opt-in. It closes the one demonstrated
-  presentation-attack breach (life-size glossy print); the open question is
-  UX for offline installs, since the model is fetched, not bundled.
 - Convert the recognizer model to external-data ONNX so onnxruntime maps it
   from disk instead of copying it; the daemon currently holds about 617 MB
   resident for 260 MB of weights.

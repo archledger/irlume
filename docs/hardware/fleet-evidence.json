@@ -1,0 +1,85 @@
+{
+  "generator": "scripts/generate-hardware-matrix.py",
+  "schema": 1,
+  "policy": "Every row must cite measured evidence captured with the named irlume version on the named hardware. A camera without evidence on this file's terms does not get a row. Community reports extend this file by PR with their own evidence attached; the generator merges nothing from thin air.",
+  "hosts": [
+    {
+      "host_label": "ASUS Zenbook S 14 (UX5406S)",
+      "module": "Shinetech ASUS FHD webcam + IR",
+      "usb": { "vid": "3277", "pid": "0059", "serial_note": "reports batch serial 200901010001, repeated across units" },
+      "rgb": { "node": "video0", "format": "MJPG 1280x720@30 (also YUYV)", "role": "RGB primary" },
+      "ir": { "node": "video2", "format": "GREY 640x400@15" },
+      "capture_mode": "sequential",
+      "capture_mode_source": "measured (camera-tune qualification); concurrent dims both sensors",
+      "emitter": {
+        "control": "MS-XU unit 14 selector 0x06 (face authentication), D1 alternative-frame illumination",
+        "status": "validated (write, read-back, optical output, restoration)",
+        "notes": "firmware privacy shutter auto-engages in darkness (reads its own RGB); fail-closed refusal, disclosed in ADR-0016; no ALS on the host"
+      },
+      "pad": "ViT RGB + FLIR IR qualified",
+      "evidence": {
+        "irlume": "0.11.1-1.fc44",
+        "slice4": "sequential PASS (2026-08-24, sha a9c410e0: 0 drops both streams, recovery 2.1-2.9s)",
+        "auth": "granted 7.60s e2e content-verdict (2026-08-24); dark-path grants 0.944/0.954 vs 0.685 scaled bar",
+        "suspend": "not cycled (dev host); same daemon build suspend-validated on 3 other hosts"
+      }
+    },
+    {
+      "host_label": "HP Arch Linux gaming desktop + Logitech Brio 4K",
+      "module": "Logitech BRIO 4K",
+      "usb": { "vid": "046d", "pid": "085e", "serial_note": "per-unit serial present (e179cb54 on the fleet unit)" },
+      "rgb": { "node": "video0", "format": "YUYV 640x480@30", "role": "RGB primary" },
+      "ir": { "node": "video2", "format": "GREY 340x340 (metadata node video1)", "role": "IR (Windows Hello minimum compliant)" },
+      "capture_mode": "sequential",
+      "capture_mode_source": "measured; RGB+IR concurrent fails QBUF EINVAL (dual-stream incapable); IR emitter strobes on USB3 only",
+      "emitter": {
+        "control": "MS-XU unit 12 selector 0x06 present",
+        "status": "qualified through camera-tune; strobe alternates frames on USB3 link",
+        "notes": "MSXU probe finding recorded 2026-08-22 (Brio is a third dual-capable host, not RGB-only)"
+      },
+      "pad": "FLIR IR qualified; ViT weights not installed on this host's package (open package follow-up)",
+      "evidence": {
+        "irlume": "0.11.1-1 (Arch)",
+        "suspend": "3x S3 cycles, daemon active zero-anomaly, GRANTED t+4s post-resume (2026-08-24)",
+        "auth": "identify grants live (0.674 post-resume, 2026-08-24)"
+      }
+    },
+    {
+      "host_label": "minihost (headless N100)",
+      "module": "NexiGo HelloCam N930W",
+      "usb": { "vid": "3443", "pid": "c803", "serial_note": "no distinguishing serial; keyed on vid:pid only" },
+      "rgb": { "node": "video0", "format": "MJPG 1280x720@30", "role": "RGB primary" },
+      "ir": { "node": "video2", "format": "GREY 640x360, strobe ~2.4fps burst / ~15fps delivered lit frames", "role": "IR" },
+      "capture_mode": "sequential",
+      "capture_mode_source": "measured (capture_mode.3443:c803+3443:c803=sequential persisted)",
+      "emitter": {
+        "control": "MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination",
+        "status": "validated (write, read-back, optical output via burst_dump PGM evidence, restoration); 3443:930d deliberately NOT in the table (identity ambiguous, see ir_emitter.rs)",
+        "notes": "steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)"
+      },
+      "pad": "ViT RGB + FLIR IR qualified; SecureDark stage 2+3 measured on this host",
+      "evidence": {
+        "irlume": "0.11.1-1 (Arch)",
+        "slice4": "sequential PASS as unprivileged runner (2026-08-24, sha a9c410e0: 0 drops)",
+        "auth": "true-dark grants via ir/dark path (0.944/0.954, FLIR p_fake <= 0.001, 2026-08-24)",
+        "suspend": "3x S3 cycles, daemon active zero-anomaly (2026-08-24)"
+      }
+    },
+    {
+      "host_label": "ThinkPad X13 Yoga Gen 4",
+      "module": "Chicony Integrated Camera",
+      "usb": { "vid": "04f2", "pid": "b7bf", "serial_note": "-" },
+      "rgb": { "node": "video0", "format": "MJPG 1080p/720p@30", "role": "RGB-only host" },
+      "ir": null,
+      "capture_mode": "rgb-only",
+      "capture_mode_source": "single camera; policy denies face for privileged surfaces on RGB-only hosts (convenience tier only)",
+      "emitter": null,
+      "pad": "ViT RGB (print species) on the RGB-only tier",
+      "evidence": {
+        "irlume": "0.11.0-0ppa1 (suspend-tested build; 0.11.1 PPA publication pending index at test time)",
+        "slice4": "thinkpad-validated release lane (rc4 == final content)",
+        "suspend": "3x s2idle cycles, daemon active zero-anomaly (2026-08-24)"
+      }
+    }
+  ]
+}

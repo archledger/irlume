@@ -410,4 +410,21 @@ if [ "$fail" -ne 0 ]; then
   echo "packaging parity: FAILED"
   exit 1
 fi
+
+# The hardware matrix is GENERATED (survey action item: Howdy's and visage's
+# hand-maintained compat pages both rotted). The committed HARDWARE.md must
+# match what its evidence inputs would render, the same contract as
+# cargo fmt --check.
+echo
+echo "== hardware matrix regenerated (docs/HARDWARE.md) =="
+if python3 scripts/generate-hardware-matrix.py --check; then
+  :
+else
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "packaging parity: FAILED"
+  exit 1
+fi
 echo "packaging parity: OK"

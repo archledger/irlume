@@ -106,6 +106,8 @@ unlock · **fingerprint** → companion factor.
 
 **v0.11.1**, working on real hardware across Fedora, Ubuntu and Arch. Self-tested
 against ISO/IEC 30107-3, not lab-certified. Interfaces may shift before 1.0.
+Validated cameras are listed in [Hardware compatibility](docs/HARDWARE.md)
+(generated from measured evidence, never hand-edited).
 
 Hardware reports from laptops with IR cameras, working or not, are the most
 useful contribution right now:

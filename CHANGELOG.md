@@ -22,6 +22,14 @@ All notable changes to irlume are documented here. This project adheres to
   Authentication was never affected (fail-closed direction); upgrading
   from an older version and back again during one boot mixes lock paths
   for the transition window, disclosed here.
+- **An unexaminable emitter journal no longer reports a phantom pending
+  change.** With non-root tools reaching the journal read for the first
+  time (they used to stop at the lock), a permission failure reading the
+  root-owned store was reported as "an emitter control ... was left
+  changed ... and has not been put back" — asserting a record that was
+  never observed. The store-read failure now reports "could not check"
+  (same fail-closed refusal, honest wording), matching the lock-side
+  #210 contract.
 
 ## [0.11.0] - 2026-08-23
 

@@ -985,6 +985,16 @@ pub(crate) enum Situation {
     SameModelElsewhere(Box<PendingWrite>),
 }
 
+/// Prefix `load` puts on errors that mean "the store could not be examined"
+/// (an unreadable directory or record), as opposed to a record that exists
+/// and is damaged. The recovery path maps these to `Unchecked` ("could not
+/// check whether a change is pending") rather than `Unresolved` ("a change
+/// is recorded"): an unreadable store must refuse writes without claiming a
+/// pending change that may not exist. Same contract as the lock-side
+/// #210 fix; the read side resurfaced once #542 let unprivileged tools get
+/// past the lock to the store at all (#542 fleet validation, minihost).
+pub(crate) const STORE_UNEXAMINABLE: &str = "cannot examine the store: ";
+
 /// Classify the store against this camera.
 ///
 /// The exact record is tried first, by name, so the ordinary case costs one
@@ -1040,7 +1050,7 @@ pub(crate) fn load(id: &CameraIdentity) -> Result<Situation, String> {
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+        Err(e) => return Err(format!("{STORE_UNEXAMINABLE}read {}: {e}", path.display())),
     }
 
     // EVERY same-model record is examined, not the first one `read_dir` happens
@@ -1081,18 +1091,18 @@ fn all_records() -> Result<Vec<(PathBuf, PendingWrite)>, String> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("list {}: {e}", dir.display())),
+        Err(e) => return Err(format!("{STORE_UNEXAMINABLE}list {}: {e}", dir.display())),
     };
     let mut records = Vec::new();
     for entry in entries {
         let path = entry
-            .map_err(|e| format!("list {}: {e}", dir.display()))?
+            .map_err(|e| format!("{STORE_UNEXAMINABLE}list {}: {e}", dir.display()))?
             .path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let body =
-            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{STORE_UNEXAMINABLE}read {}: {e}", path.display()))?;
         let record =
             serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
         records.push((path, record));

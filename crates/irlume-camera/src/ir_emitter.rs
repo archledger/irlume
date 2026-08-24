@@ -3662,8 +3662,19 @@ fn recover_pending_write_locked(
             }
         }
         // A store that cannot be read may be hiding a change to THIS camera, so
-        // it is unresolved rather than "nothing pending".
-        Err(why) => return RecoveryOutcome::Unresolved(why),
+        // it is unresolved rather than "nothing pending" — UNLESS the store
+        // simply could not be examined (permission, IO), which must refuse
+        // with the honest "could not check" wording instead of asserting a
+        // recorded change that may not exist. Same refusal either way
+        // (#210 contract; the unprivileged read side of it surfaced during
+        // the #542 fleet validation).
+        Err(why) => {
+            return if why.starts_with(journal::STORE_UNEXAMINABLE) {
+                RecoveryOutcome::Unchecked(why)
+            } else {
+                RecoveryOutcome::Unresolved(why)
+            }
+        }
     };
     if let Err(mismatch) = journal::record_applies(&record, id) {
         use journal::Mismatch;
@@ -6117,9 +6128,9 @@ mod tests {
             !msg.contains("recorded original"),
             "the message must not claim a record exists: {msg}"
         );
-        // And no unsupported assurance in the other direction: nothing here
-        // knows whether any other process checked or recovered anything, and
-        // the daemon itself can land here (EROFS, ENOSPC, a bad lock path).
+        // The daemon knows nothing was checked, so it must not claim the
+        // process itself will sort it out; that wording predates the shared
+        // lock and reads as "ignore this" today.
         assert!(!msg.contains("checks and recovers on its own"), "{msg}");
         assert!(!msg.contains("expected and harmless"), "{msg}");
         assert!(
@@ -6128,6 +6139,64 @@ mod tests {
         );
         assert!(outcome.blocks_discovery());
         std::fs::remove_file(&dir).expect("remove blocking file");
+    }
+
+    /// The read-side twin of the test above: a store that cannot be examined
+    /// (an unprivileged tool hitting the 0700 root journal directory, made
+    /// reachable once #542 let such tools past the lock) must report
+    /// "could not check", never fabricate a recorded change. The blocking
+    /// fixture is a regular FILE where the journal directory belongs: ENOTDIR
+    /// stops root and CAP_DAC_OVERRIDE exactly like an unprivileged uid, so
+    /// this test has no privileged skip arm.
+    #[test]
+    fn an_unexaminable_store_reports_unchecked_never_a_phantom_record() {
+        let _lock = crate::testenv::env_lock();
+        let state =
+            std::env::temp_dir().join(format!("irlume-unreadable-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).expect("scratch state dir");
+        std::fs::write(state.join("ir-emitter-journal"), b"not a directory")
+            .expect("blocking file where the journal dir belongs");
+        let _statedir = EnvGuard::set("IRLUME_STATE_DIR", &state);
+        let lockdir = std::env::temp_dir().join(format!(
+            "irlume-unreadable-store-locks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&lockdir);
+        std::fs::create_dir_all(&lockdir).expect("scratch lock dir");
+        let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &lockdir);
+        let id = identity(0x3277, 0x0059);
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::io::AsRawFd as _;
+        let device = std::env::temp_dir().join(format!(
+            "irlume-unreadable-store-device-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&device);
+        let device_file = std::fs::File::create(&device).expect("device stand-in");
+        device_file
+            .set_permissions(std::fs::Permissions::from_mode(0o660))
+            .expect("device mode");
+        let fd = device_file.as_raw_fd();
+        let outcome = recover_pending_write(fd, &id);
+        assert!(
+            matches!(outcome, RecoveryOutcome::Unchecked(_)),
+            "an unreadable store is a failure to OBSERVE, got {outcome:?}"
+        );
+        let msg = outcome.message().expect("unchecked is loud");
+        assert!(msg.contains("could not check"), "{msg}");
+        assert!(msg.contains("cannot examine the store"), "{msg}");
+        assert!(
+            !msg.contains("was left changed"),
+            "the message must not claim a record was observed: {msg}"
+        );
+        assert!(
+            !outcome.permits_capture_write(),
+            "refusing is the safe half"
+        );
+        assert!(outcome.blocks_discovery());
+        let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(&lockdir);
     }
 
     /// A camera that says "yes" to the final write but holds something else

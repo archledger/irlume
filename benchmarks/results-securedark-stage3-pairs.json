@@ -1,0 +1,54 @@
+{
+  "session": "securedark-stage3",
+  "date": "2026-08-24",
+  "host": "minihost",
+  "camera": "NexiGo HelloCam N930W",
+  "irlume": "0.11.0-1",
+  "source_commit": "7eb8667bf5681b23565ffd94729fb72022fde3c2",
+  "conditions": "true dark (rgb_frame_mean 18-19), enrolled user main (10 scans)",
+  "bursts": {
+    "count": 30,
+    "frames_per_burst": 12,
+    "lit_frames_per_burst": 6,
+    "full_frame_mean_range": [18.7, 26.8]
+  },
+  "offline_detection": {
+    "tool": "detect_bench",
+    "lit_frames_detected": "180/180",
+    "yunet_score_min": 0.923,
+    "yunet_score_p50": 0.934,
+    "yunet_score_max": 0.940,
+    "black_frames_detected": "0/180"
+  },
+  "frame_pair_cosines": {
+    "tool": "norm_ab_bench",
+    "within_burst": {
+      "pairs": 450,
+      "mean": 0.9716,
+      "sd": 0.0177,
+      "median": 0.9769
+    },
+    "cross_scene": {
+      "pairs": 10875,
+      "mean": 0.9090,
+      "sd": 0.0582
+    },
+    "divisor_ab_delta_mean": 0.00002
+  },
+  "production_dark_auth": {
+    "tool": "auth_timing",
+    "cues": ["flir.onnx", "liveness_vit.onnx"],
+    "close_range": {
+      "granted": 2,
+      "denied": 1,
+      "deny_reason": "below threshold (ir) — bad-pose capture, best 0.512",
+      "granted_best_cosines": [0.944, 0.954],
+      "scaled_bar_10_scans": 0.685,
+      "flir_p_fake": [0.0006099139, 0.0009672163],
+      "center_edge_ratio": [1.97, 1.99],
+      "per_user_center_edge_floor": 1.06,
+      "ambient": 0
+    },
+    "far_range_open_observation": "auth-path IR faces=0 at the far pose range (n=1 auth + unattended identifies) while offline detection on the same-night frames is 100% across 30-70cm; needs a controlled distance sweep"
+  }
+}

@@ -189,3 +189,50 @@ undisclosed residual):
   (no reliable lens-occlusion discriminator exists in the RGB stream
   itself; a true fix needs an independent sensor or the Windows-Hello
   per-frame illumination metadata trust chain).
+
+## Live dark session (2026-08-24, minihost NexiGo N930W — stage 3: the temporal constant)
+
+Released 0.11.0-1 packages, staged detached worktree at 7eb8667b, true dark
+(rgb_frame_mean 18-19), enrolled user `main` (10 scans), all instruments the
+shipped examples (`burst_dump`, `detect_bench`, `norm_ab_bench`,
+`auth_timing` with both PAD cues attached).
+
+- **Emitter question closed.** The 01:38 "marked illumination on, image
+  stayed dark (mean 7)" startup readings were no-reflective-target in an
+  unattended dark room, not emitter failure: with a face present the strobe
+  alternates lit (~40 local face-region, ~20-25 full-frame) / black (0)
+  frames and the lit frames carry a detector-grade face. The NexiGo
+  emitter works in true dark on 0.11.0.
+- **30 bursts × 12 frames** (user varying distance 30-70 cm, glasses
+  on/off, angle): every burst delivered exactly 6 lit frames (strobe
+  alternation), full-frame means 18.7-26.8.
+- **Offline detection on all 360 frames** (`detect_bench`, shipped YuNet):
+  180/180 lit frames detected (score min 0.923, p50 0.934, max 0.940);
+  0/180 black frames (expected — no content).
+- **Stage-3 deliverable — same-burst frame-pair cosines** (`norm_ab_bench`,
+  production /128.0 normalizer, n = 450 within-burst pairs):
+  **mean 0.9716, sd 0.0177, median 0.9769**. Cross-scene same-person pairs
+  (n = 10,875): mean 0.9090, sd 0.0582. Divisor A/B delta +0.00002
+  (consistent with the #510 record). Conclusion for the temporal-constant
+  design: same-burst frames are highly correlated (0.97), so the stage-1
+  decision rule's reading holds — a multi-frame AND is hardening, not an
+  independence win; the CBSR loose bound stands; no code change from this
+  session.
+- **Production-path dark auth on released 0.11.0** (`auth_timing`, both
+  cues): 2/3 granted at close range — `match: main (ir/dark)`, best cosine
+  0.944 / 0.954 vs the 10-scan scaled bar 0.685, FLIR p_fake 0.0006-0.0009,
+  center/edge 1.97-1.99 vs per-user floor 1.06, ambient 0. The one deny was
+  an honest `below threshold (ir)` on a bad-pose capture (best 0.512,
+  centroid 0.512) — fail-closed, no false grant.
+- **Open observation (recorded, not concluded).** At the far end of the
+  pose range (n = 1 auth + 10 unattended `irlume identify` runs) the auth
+  path's IR phase reported `faces=0`, while offline detection on the
+  same-night burst frames captured across the full 30-70 cm range is
+  100%. Single-sample distance dependence in the auth-path frame
+  selection; needs a controlled distance sweep before any code
+  conclusion. Not reproducible against `identify` (RGB-primary by design,
+  it never reaches the dark arm).
+- **Tooling note.** Non-root camera tools cannot drive the emitter on any
+  host where the daemon created the emitter lock first (#542,
+  CAP_CHOWN-excluded sandbox); the session ran captures as root to route
+  around it. Fix decision pending in the issue.

@@ -122,7 +122,12 @@ SystemCallArchitectures=native
 # chowns. The old comment here claimed the daemon "chowns enrolled files to the
 # target user", which was never implemented; enrollment files are created by the
 # root daemon and left root-owned at mode 0600. The capability's one real user
-# was the socket's `root:irlume` chown, and that is gone.
+# was the socket's `root:irlume` chown, and that is gone. The emitter lock's
+# group mirror DOES attempt an fchown and deliberately tolerates its EPERM
+# here (#542): the lock directory created by the irlume tmpfiles.d rule
+# (setgid root:video /run/lock/irlume) gives locks the camera group at
+# creation, so no chown capability is needed. Do not "fix" the tolerated
+# fchown failure by adding CAP_CHOWN or removing the fchown call.
 #
 # Do not delete this directive to "simplify" it. For a uid-0 service systemd
 # clears everything not listed before exec, and the root exec rule then makes

@@ -166,7 +166,7 @@ install -Dm0644 schemas/machine-api-v1.schema.json %{buildroot}%{_datadir}/%{nam
 # Create the setgid lock directory (#542) BEFORE the daemon starts below: on
 # a fresh install there has been no boot to apply the tmpfiles.d rule yet,
 # and the first lock the daemon creates sets the group it will keep.
-systemd-tmpfiles --create irlume.conf &>/dev/null || :
+systemd-tmpfiles --create irlume.conf || :
 # %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
 # self-heal path unit on first install.
 %systemd_post irlumed.socket irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service

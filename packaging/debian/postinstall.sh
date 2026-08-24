@@ -20,7 +20,7 @@ systemctl daemon-reload 2>/dev/null || true
 # Create the setgid lock directory (#542) BEFORE any daemon start below: the
 # first lock the daemon creates sets the group it will keep, and a fresh
 # install has had no boot to apply the tmpfiles.d rule yet.
-systemd-tmpfiles --create irlume.conf 2>/dev/null || true
+systemd-tmpfiles --create irlume.conf || true
 # Enable + start ONLY on first install ($2 empty). On an upgrade, re-enabling
 # would override a unit the user deliberately disabled; try-restart below picks
 # up the new binary/unit for a running daemon and is a no-op for a stopped one.

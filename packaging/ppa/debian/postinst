@@ -7,7 +7,7 @@ case "$1" in
         # restarts the unit below: the first lock the daemon creates sets the
         # group it will keep, and a fresh install has had no boot to apply the
         # tmpfiles.d rule yet.
-        systemd-tmpfiles --create irlume.conf 2>/dev/null || true
+        systemd-tmpfiles --create irlume.conf || true
         # Load the AppArmor profile (enforces, soak-validated - see the profile
         # header). Runs before the debhelper-inserted section starts or restarts
         # the unit, so the daemon is confined at exec time on both fresh install

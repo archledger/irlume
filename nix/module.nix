@@ -204,7 +204,10 @@ in
     # Setgid root:video directory for the IR-emitter exclusion locks (#542).
     # The service below mirrors the packaged unit's bounding set (no
     # CAP_CHOWN), so a lock the daemon creates cannot be re-grouped
-    # in-process; the group must be inherited at creation.
+    # in-process; the group must be inherited at creation. Keep this rule in
+    # step with packaging/tmpfiles.d/irlume.conf — the conf shipped inside
+    # the package is documentation here; THIS line is the operative one on
+    # NixOS (nothing scans $out/lib/tmpfiles.d).
     systemd.tmpfiles.rules = [
       "d /run/lock/irlume 2751 root video -"
     ];

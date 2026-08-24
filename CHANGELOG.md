@@ -18,10 +18,14 @@ All notable changes to irlume are documented here. This project adheres to
   bounding set), and the lock moves to a dedicated setgid
   `/run/lock/irlume` directory (tmpfiles.d, `root:video` 2751) so
   daemon-created locks inherit the camera group at creation — the only
-  capability-free fix for hosts whose cameras carry no per-user ACL.
-  Authentication was never affected (fail-closed direction); upgrading
-  from an older version and back again during one boot mixes lock paths
-  for the transition window, disclosed here.
+  capability-free fix for hosts whose cameras carry no per-user ACL. When
+  the group still cannot be corrected (a camera group no tmpfiles override
+  covers), the mirror now strips every group-class grant from the lock
+  instead of granting the wrong group, so the lock never opens to callers
+  the camera itself would refuse. Authentication was never affected
+  (fail-closed direction); upgrading from an older version and back again
+  during one boot mixes lock paths for the transition window, disclosed
+  here.
 - **An unexaminable emitter journal no longer reports a phantom pending
   change.** With non-root tools reaching the journal read for the first
   time (they used to stop at the lock), a permission failure reading the

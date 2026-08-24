@@ -98,6 +98,11 @@ contents:
     dst: /usr/lib/systemd/system/irlume-reconcile.service
   - src: ../systemd/irlume-reconcile.timer
     dst: /usr/lib/systemd/system/irlume-reconcile.timer
+  # tmpfiles.d: setgid root:video lock directory for the IR-emitter exclusion
+  # locks (#542); the daemon's bounding set has no CAP_CHOWN, so the group
+  # must be inherited at creation.
+  - src: ../tmpfiles.d/irlume.conf
+    dst: /usr/lib/tmpfiles.d/irlume.conf
   # AppArmor profile (enforces by default; see the profile header)
   - src: ../apparmor/usr.bin.irlumed
     dst: /etc/apparmor.d/usr.bin.irlumed

@@ -86,9 +86,11 @@ profile irlumed /usr/local/bin/irlumed {
   /run/irlume.sock rw,
 
   # TPM (template-key sealing, keyring unlock).
-  # Emitter locks: the undo-journal per-camera flock under /run/lock, and
-  # the per-stream bookkeeping flock, whose 'k' the state-dir ** rule does
-  # not grant (#283).
+  # Emitter locks: the undo-journal per-camera flock under the setgid
+  # /run/lock/irlume directory (#542), and the per-stream bookkeeping flock,
+  # whose 'k' the state-dir ** rule does not grant (#283). The flat-path rule
+  # is kept one release for a still-running old binary at upgrade time.
+  /run/lock/irlume/irlume-emitter-*.lock rwk,
   /run/lock/irlume-emitter-*.lock rwk,
   /var/lib/irlume/ir-emitter-stream/*.lock rwk,
 

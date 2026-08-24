@@ -169,6 +169,11 @@ rustPlatform.buildRustPackage {
     # speaks.
     install -Dm0644 schemas/machine-api-v1.schema.json \
       "$out/share/irlume/schemas/machine-api-v1.schema.json"
+
+    # tmpfiles.d rule for the setgid root:video emitter-lock directory (#542);
+    # the NixOS module applies it via systemd.tmpfiles.rules.
+    install -Dm0644 packaging/tmpfiles.d/irlume.conf \
+      "$out/lib/tmpfiles.d/irlume.conf"
   '';
 
   meta = {

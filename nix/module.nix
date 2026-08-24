@@ -201,6 +201,14 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
+    # Setgid root:video directory for the IR-emitter exclusion locks (#542).
+    # The service below mirrors the packaged unit's bounding set (no
+    # CAP_CHOWN), so a lock the daemon creates cannot be re-grouped
+    # in-process; the group must be inherited at creation.
+    systemd.tmpfiles.rules = [
+      "d /run/lock/irlume 2751 root video -"
+    ];
+
     # systemd owns the socket, so it exists from sockets.target onward rather
     # than only once irlumed has finished loading models. Greeters authenticate
     # well before that, and a PAM client with nothing to connect to loses the

@@ -149,6 +149,10 @@ install -m0644 libtensorflowlite_c-%{tflite_ver}-linux-x64/PROVENANCE %{buildroo
 # (MPL-2.0), XNNPACK, ruy and others. Name them beside the library.
 install -m0644 packaging/licenses/THIRD-PARTY-NOTICES.tflite %{buildroot}%{_datadir}/%{name}/tflite/THIRD-PARTY-NOTICES
 install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.service.d/10-ort.conf
+# tmpfiles.d: the setgid root:video lock directory for the IR-emitter
+# exclusion locks (#542). The daemon's bounding set has no CAP_CHOWN, so the
+# group must be inherited at creation, not corrected in-process.
+install -Dm0644 packaging/tmpfiles.d/irlume.conf %{buildroot}%{_tmpfilesdir}/irlume.conf
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
 # Preset: the daemon is enabled on install (see %%post); it only serves a local
 # socket and auth stays opt-in, so "installed" should mean "works".
@@ -159,6 +163,10 @@ install -Dm0644 packaging/fedora/90-irlume.preset %{buildroot}%{_presetdir}/90-i
 install -Dm0644 schemas/machine-api-v1.schema.json %{buildroot}%{_datadir}/%{name}/schemas/machine-api-v1.schema.json
 
 %post
+# Create the setgid lock directory (#542) BEFORE the daemon starts below: on
+# a fresh install there has been no boot to apply the tmpfiles.d rule yet,
+# and the first lock the daemon creates sets the group it will keep.
+systemd-tmpfiles --create irlume.conf &>/dev/null || :
 # %%systemd_post honours our shipped preset → enables irlumed + the PAM-wiring
 # self-heal path unit on first install.
 %systemd_post irlumed.socket irlumed.service irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
@@ -250,6 +258,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_unitdir}/irlume-reconcile.service
 %{_unitdir}/irlume-reconcile.timer
 %{_presetdir}/90-irlume.preset
+%{_tmpfilesdir}/irlume.conf
 
 %files selinux
 %{_datadir}/selinux/packages/irlume.pp

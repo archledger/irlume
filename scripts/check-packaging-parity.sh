@@ -350,6 +350,7 @@ APPARMOR_RUNTIME_RULES=(
   "/var/lib/systemd/pcrlock.json r,"
   "deny capability sys_ptrace,"
   "/dev/ r,"
+  "/run/lock/irlume/irlume-emitter-*.lock rwk,"
   "/run/lock/irlume-emitter-*.lock rwk,"
   "/var/lib/irlume/ir-emitter-stream/*.lock rwk,"
 )
@@ -362,6 +363,47 @@ for profile in "${APPARMOR_PROFILES[@]}"; do
       fail=1
     fi
   done
+done
+
+echo
+echo "== tmpfiles.d setgid lock dir shipped and applied in every lane (#542) =="
+# The setgid lock directory must exist BEFORE the daemon creates its first
+# lock. Every lane needs BOTH halves: the file shipped to
+# /usr/lib/tmpfiles.d, and a scriptlet that applies it ahead of any daemon
+# start (a fresh install has had no boot to apply it). The NixOS module has
+# no package scriptlets; its equivalent is the tmpfiles rule inline.
+TMPFILES_SHIP_MARKERS=(
+  "packaging/fedora/irlume.spec|%{_tmpfilesdir}/irlume.conf"
+  "packaging/arch/PKGBUILD|usr/lib/tmpfiles.d/irlume.conf"
+  "packaging/debian/nfpm.yaml|/usr/lib/tmpfiles.d/irlume.conf"
+  "packaging/ppa/debian/rules|usr/lib/tmpfiles.d/irlume.conf"
+)
+for marker in "${TMPFILES_SHIP_MARKERS[@]}"; do
+  lane="${marker%%|*}"
+  needle="${marker#*|}"
+  if uncommented "$lane" | grep -F -- "$needle" >/dev/null; then
+    printf '  ok    %-34s %s\n' "tmpfiles.d/irlume.conf" "$lane"
+  else
+    printf '  MISS  %-34s %s\n' "tmpfiles.d/irlume.conf" "$lane"
+    fail=1
+  fi
+done
+TMPFILES_APPLY_MARKERS=(
+  "packaging/fedora/irlume.spec|systemd-tmpfiles --create irlume.conf"
+  "packaging/arch/irlume.install|systemd-tmpfiles --create irlume.conf"
+  "packaging/debian/postinstall.sh|systemd-tmpfiles --create irlume.conf"
+  "packaging/ppa/debian/postinst|systemd-tmpfiles --create irlume.conf"
+  "nix/module.nix|d /run/lock/irlume 2751 root video -"
+)
+for marker in "${TMPFILES_APPLY_MARKERS[@]}"; do
+  lane="${marker%%|*}"
+  needle="${marker#*|}"
+  if uncommented "$lane" | grep -F -- "$needle" >/dev/null; then
+    printf '  ok    %-34s %s\n' "apply before daemon start" "$lane"
+  else
+    printf '  MISS  %-34s %s\n' "apply before daemon start" "$lane"
+    fail=1
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then

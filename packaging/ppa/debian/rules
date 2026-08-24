@@ -90,6 +90,11 @@ override_dh_auto_install:
 # failure it was built for.
 	install -D -m0644 packaging/systemd/irlume-reconcile.timer \
 		debian/irlume/usr/lib/systemd/system/irlume-reconcile.timer
+# tmpfiles.d: the setgid root:video lock directory for the IR-emitter
+# exclusion locks (#542). The daemon's bounding set has no CAP_CHOWN, so the
+# group must be inherited at creation; postinst creates it before any start.
+	install -D -m0644 packaging/tmpfiles.d/irlume.conf \
+		debian/irlume/usr/lib/tmpfiles.d/irlume.conf
 	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
 		debian/irlume/etc/apparmor.d/usr.bin.irlumed
 

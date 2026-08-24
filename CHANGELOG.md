@@ -5,6 +5,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+- Nothing yet.
+
+## [0.11.1] - 2026-08-24
+
 ### Fixed
 
 - **Non-root camera tools can open the IR-emitter lock again (#542).** The
@@ -2869,7 +2873,8 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/archledger/irlume/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/archledger/irlume/compare/v0.10.0...v0.11.0
 [0.9.0]: https://github.com/archledger/irlume/releases/tag/v0.9.0
 [0.8.1]: https://github.com/archledger/irlume/releases/tag/v0.8.1

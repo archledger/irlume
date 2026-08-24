@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.11.0
+Version:        0.11.1
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -264,6 +264,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Mon Aug 24 2026 archledger <archledger236@gmail.com> - 0.11.1-1
+- IR emitter lock: shared with non-root camera tools under the sandboxed daemon (#542)
+- IR emitter lock: setgid /run/lock/irlume via tmpfiles.d, group-strip hardening
+- Emitter journal: an unexaminable store reports "could not check", not a phantom record
+
 * Sun Aug 23 2026 archledger <archledger236@gmail.com> - 0.11.0-1
 - SecureDark: scene gate + 0.635 dark threshold (ADR-0016)
 - Capture-path: role-aware flush (-3.3s/auth), schedule-aware pairing (ADR-0014)

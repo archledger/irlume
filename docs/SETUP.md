@@ -532,4 +532,6 @@ sudo irlume login disable --apply
 
 Removes every PAM change (greeter, lock, and `sudo`) and restores the originals.
 Your password login is never touched. To remove just face-`sudo` while keeping
-the greeter, re-run `login enable --apply` *without* `--with-sudo`.
+the greeter, re-run `login enable --apply` *without* `--with-sudo`. For every
+off-switch in one place (per-surface tiers, standing face down without touching
+PAM, canceling a running scan, full uninstall), read [DISABLE.md](DISABLE.md).

@@ -5,6 +5,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **One page for turning irlume off (`docs/DISABLE.md`).** The disable
+  tiers all existed but lived in different heads: `login status` and dry
+  runs, full `login disable --apply` (which also removes the SELinux
+  module and clears the self-heal marker), scoped re-enables with
+  `--with-sudo` / `--with-polkit`, standing face down without touching
+  PAM via `fingerprint enable --fingerprint-only`, the bounded scan
+  windows and cancel paths per surface, rate-limit cooldowns, and the
+  uninstall teardown order. Linked from the README docs table and the
+  SETUP undo section.
+
 ### Fixed
 
 - **irlume can now be installed on rpm-ostree systems.** The Fedora

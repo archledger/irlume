@@ -95,6 +95,7 @@ unlock · **fingerprint** → companion factor.
 | | |
 |:--|:--|
 | [**Setup**](docs/SETUP.md) | Install and configure, guided or by hand |
+| [**Turning it off**](docs/DISABLE.md) | Per-surface disable, canceling a scan, uninstall |
 | [**Commands**](docs/COMMANDS.md) | Every command and flag |
 | [**Limits**](docs/LIMITATIONS.md) | What irlume does not do, and the measurements |
 | [**FAQ**](docs/FAQ.md) | Common questions |

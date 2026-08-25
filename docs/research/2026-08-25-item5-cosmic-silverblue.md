@@ -61,8 +61,9 @@ sandbox `/var`, so they keep working; not changed.
 - Layered install of irlume + irlume-selinux survives reboot into the new
   deployment; SELinux module loads (Enforcing).
 - All units active (`irlumed.service/socket`, `irlume-reconcile.timer/path`);
-  `/var/lib/irlume` and the setgid `/run/lock/irlume` are created at boot by
-  tmpfiles.d exactly as on mutable Fedora.
+  `/var/lib/irlume` is created on demand by the daemon and the reconcile
+  service (not by tmpfiles.d, which only owns the setgid `/run/lock/irlume`),
+  and that lock directory appeared at boot exactly as on mutable Fedora.
 - "IR emitter ready" in the daemon log: the #542 emitter path works on a
   USB3 virt redirect under ostree.
 - `irlume login enable --apply` self-gates on "no camera" until

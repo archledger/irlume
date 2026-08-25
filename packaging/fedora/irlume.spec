@@ -190,8 +190,10 @@ systemctl start irlume-reconcile.timer &>/dev/null || :
 # touch below must stay `touch`: the old `: > marker` is a redirection on
 # the POSIX special builtin `:`, and a redirection failure there aborts
 # the entire /bin/sh scriptlet, which `|| :` cannot catch.
-# The marker simply stays unwritten on ostree; the timer-arming repeats on
-# the next mutable-side upgrade, and tmpfiles.d creates /var/lib/irlume at boot.
+# The marker simply stays unwritten on ostree, so this block re-runs on
+# every upgrade (the sandboxed `systemctl enable` is inert there);
+# /var/lib/irlume itself is created on demand by the daemon and the
+# reconcile service, so nothing needs it from this scriptlet.
 if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
     systemctl enable --now irlume-reconcile.timer &>/dev/null || :
     mkdir -p /var/lib/irlume 2>/dev/null || :

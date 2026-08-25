@@ -7,14 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
-- **irlume can now be installed on rpm-ostree systems (Silverblue,
-  Kinoite, Bazzite).** The Fedora `%post` scriptlet wrote the
-  reconcile-timer marker with `: > /var/lib/irlume/.reconcile-timer-armed`;
-  rpm-ostree runs scriptlets in a sandbox with `/var` read-only, and a
-  redirection failure on the POSIX special builtin `:` aborts the whole
-  scriptlet, aborting the entire `rpm-ostree install` transaction. The
-  marker is now written with `touch` (a failure `|| :` can actually
-  catch) and the `mkdir` is guarded. Verified by layering 0.11.1 on a
+- **irlume can now be installed on rpm-ostree systems.** The Fedora
+  `%post` scriptlet wrote the reconcile-timer marker with `: >
+  /var/lib/irlume/.reconcile-timer-armed`; rpm-ostree runs scriptlets in
+  a sandbox with `/var` read-only, and a redirection failure on the
+  POSIX special builtin `:` aborts the whole scriptlet, aborting the
+  entire `rpm-ostree install` transaction. The marker is now written
+  with `touch` (a failure `|| :` can actually catch) and the `mkdir` is
+  guarded. Verified by layering a rebuilt 0.11.1 carrying this fix on a
   Fedora Silverblue 44 VM: install, boot, daemon, emitter, PAM wiring,
   `login disable`, and `rpm-ostree uninstall` all pass; see
   `docs/research/2026-08-25-item5-cosmic-silverblue.md`. The same

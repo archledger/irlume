@@ -108,7 +108,7 @@ unlock · **fingerprint** → companion factor.
 
 ## Status
 
-**v0.11.1**, working on real hardware across Fedora, Ubuntu and Arch. Self-tested
+**v0.11.2**, working on real hardware across Fedora, Ubuntu and Arch. Self-tested
 against ISO/IEC 30107-3, not lab-certified. Interfaces may shift before 1.0.
 Validated cameras are listed in [Hardware compatibility](docs/HARDWARE.md)
 (generated from measured evidence, never hand-edited).

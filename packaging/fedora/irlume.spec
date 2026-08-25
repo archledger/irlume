@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.11.1
+Version:        0.11.2
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -274,6 +274,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Tue Aug 25 2026 archledger <archledger236@gmail.com> - 0.11.2-1
+- rpm-ostree: %post survives the scriptlet sandbox (touch instead of `: >`,
+  guarded mkdir); layering was impossible on Silverblue/Kinoite before this
+- docs: one page for turning irlume off (docs/DISABLE.md)
+
 * Mon Aug 24 2026 archledger <archledger236@gmail.com> - 0.11.1-1
 - IR emitter lock: shared with non-root camera tools under the sandboxed daemon (#542)
 - IR emitter lock: setgid /run/lock/irlume via tmpfiles.d, group-strip hardening

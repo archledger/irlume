@@ -61,7 +61,9 @@ requires cryptographic camera attestation, which is **out of scope for V1.0**.
 **Implemented:** `irlume-camera::verify_pinned`, called at the head of every
 `capture_rgb`/`capture_ir`. The physical-bus check is always on (no config);
 `IRLUME_CAMERA_PIN="vid:pid"` and `IRLUME_CAMERA_REQUIRE_FIXED=1` add descriptor
-and removability pinning per host. One deliberate exception exists for the CI
+and removability pinning per host; the settings key `forbid_external_cameras=1`
+(env `IRLUME_FORBID_EXTERNAL_CAMERAS`) drives the same fixed-camera requirement
+from settings.conf, live-read per request. One deliberate exception exists for the CI
 test harness: `IRLUME_TEST_ALLOW_VIRTUAL_CAMERA` names exact device paths
 (v4l2loopback nodes) that may skip the physical-bus check, and every use is
 logged. It weakens nothing in production: the daemon's environment comes from

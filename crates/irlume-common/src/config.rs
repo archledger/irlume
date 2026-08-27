@@ -934,10 +934,57 @@ pub fn enforce_biopolicy_visible() -> Option<bool> {
     }
 }
 
+/// Whether the external-camera prohibition (`forbid_external_cameras`) is on,
+/// or `None` when settings.conf exists and this process may not read it.
+///
+/// The policy twin of Windows' `ShouldForbidExternalCameras` (hardened after
+/// CVE-2021-34466): with the key set, only cameras the kernel reports as
+/// `removable: fixed` may authenticate. Mirrors [`enforce_biopolicy_visible`]:
+/// same truthy set, same env override shape, Absent means the default (off,
+/// external Hello cameras work).
+pub fn forbid_external_cameras_visible() -> Option<bool> {
+    if let Ok(v) = std::env::var("IRLUME_FORBID_EXTERNAL_CAMERAS") {
+        return Some(truthy(&v));
+    }
+    match observe_kv("settings.conf", "forbid_external_cameras") {
+        KvObservation::Value(v) => Some(truthy(&v)),
+        KvObservation::Absent => Some(false),
+        KvObservation::Unknown(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testenv;
+
+    /// The external-camera prohibition reads env-over-settings with Absent
+    /// meaning off, exactly like the biopolicy gate it mirrors.
+    #[test]
+    fn forbid_external_cameras_env_wins_then_settings_then_default_off() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-extcam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+
+        // Absent key: off, and unambiguously so.
+        assert_eq!(forbid_external_cameras_visible(), Some(false));
+
+        // Settings file turns it on.
+        write_kv("settings.conf", "forbid_external_cameras", "1").unwrap();
+        assert_eq!(forbid_external_cameras_visible(), Some(true));
+
+        // The env override wins over the file, in both directions.
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "0");
+        assert_eq!(forbid_external_cameras_visible(), Some(false));
+        std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "yes");
+        assert_eq!(forbid_external_cameras_visible(), Some(true));
+
+        std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn read_write_round_trip_preserves_comments() {

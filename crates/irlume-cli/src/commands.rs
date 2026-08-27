@@ -839,6 +839,16 @@ pub fn status(args: &[String]) -> ExitCode {
             None => "unknown: root-only setting, re-run with sudo".into(),
         }
     );
+    // External-camera prohibition (opt-in): only `removable: fixed` cameras
+    // may authenticate when on.
+    println!(
+        "  external cams : {}",
+        match irlume_common::config::forbid_external_cameras_visible() {
+            Some(true) => format!("FORBIDDEN {OK} (internal cameras only)"),
+            Some(false) => "allowed (default)".to_string(),
+            None => "unknown: root-only setting, re-run with sudo".to_string(),
+        }
+    );
 
     // The credential-release gesture gate (DEFAULT OFF). Print it always: an
     // opt-in step the user may want to know is available shows where they look

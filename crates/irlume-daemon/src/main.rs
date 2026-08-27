@@ -1103,6 +1103,22 @@ fn biopolicy_enforced() -> bool {
         .unwrap_or(false)
 }
 
+/// `forbid_external_cameras` (env `IRLUME_FORBID_EXTERNAL_CAMERAS` wins, same
+/// shape as biopolicy): only `removable: fixed` cameras may authenticate.
+/// Pushed into irlume-camera before capture; refresh sites mirror biopolicy's.
+fn forbid_external_cameras() -> bool {
+    use irlume_common::config::truthy;
+    let on = if let Ok(v) = std::env::var("IRLUME_FORBID_EXTERNAL_CAMERAS") {
+        truthy(&v)
+    } else {
+        irlume_common::config::read_kv("settings.conf", "forbid_external_cameras")
+            .map(|v| truthy(&v))
+            .unwrap_or(false)
+    };
+    irlume_auth::set_forbid_external_cameras(on);
+    on
+}
+
 /// Peer identity from SO_PEERCRED.
 #[derive(Clone)]
 struct Peer {
@@ -3387,6 +3403,10 @@ fn dispatch_scoped(
                     };
                 }
             }
+            // Refresh the external-camera prohibition before any capture: the
+            // settings key is live-read, so a config change applies to the next
+            // request without a daemon restart.
+            forbid_external_cameras();
             // Opt-in biopolicy also gates identity VERIFICATION on IR/Secure
             // hardware (mirrors the credential-release gate); else a face grant
             // for a Remote/Unknown service would bypass the "face never satisfies
@@ -3832,6 +3852,9 @@ fn dispatch_scoped(
                     "RGB-only convenience: face cannot release the login credential".into(),
                 );
             }
+            // Refresh the external-camera prohibition on the credential-release
+            // path too: live-read, applies to the next request.
+            forbid_external_cameras();
             // Opt-in biopolicy: when enforcement is enabled, gate credential
             // release by the PAM service's operation class (e.g. refuse a remote
             // / unknown service). Default off → unchanged behaviour.

@@ -3721,6 +3721,14 @@ fn doctor_run(
         } else {
             ""
         };
+        // Internal versus external, keyed on the kernel's `removable`
+        // attribute: the fact the forbid-external-cameras policy acts on,
+        // printed so the classification is verifiable at a glance.
+        let attachment = match irlume_camera::node_removable_class(path) {
+            "fixed" => " (internal)",
+            "removable" => " (external)",
+            _ => " (removable unknown)",
+        };
         // Name the backend on every node: uvcvideo-on-USB is the case irlume
         // is built and tested for, and anything else is the first fact a bug
         // report needs (an IPU/MIPI node classifies by format just as well and
@@ -3736,7 +3744,7 @@ fn doctor_run(
             // one surface whose whole job is telling (#195 review).
             Err(e) => format!(" (backend unknown: {e})  ⚠ could not identify camera backend"),
         };
-        dout!(report, "  {path}: {role:?}{backend}{priv_on}");
+        dout!(report, "  {path}: {role:?}{backend}{attachment}{priv_on}");
         // An RGB node the capture path can't decode (MJPEG-only) classifies as
         // usable but would fail at capture; warn here instead.
         if *role == irlume_camera::Role::Rgb {

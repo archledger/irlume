@@ -30,7 +30,9 @@ pub use irlume_camera::{
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
 /// (#187), so this is the only path to a listing.
-pub use irlume_camera::{camera_rate_diagnostics, list_pairs, privacy_engaged, CameraPair};
+pub use irlume_camera::{
+    camera_rate_diagnostics, list_pairs, privacy_engaged, set_forbid_external_cameras, CameraPair,
+};
 /// Auto-select the RGB+IR camera pair (built-in or external Hello webcam), plus
 /// the stable per-device identity the daemon records alongside a persisted pair
 /// so select_pair can survive a udev renumber. Re-exported so the daemon can pick

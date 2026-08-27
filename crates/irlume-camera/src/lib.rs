@@ -3059,6 +3059,56 @@ pub(crate) fn virtual_camera_allowed(device: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The daemon-set policy twin of `IRLUME_CAMERA_REQUIRE_FIXED`: the daemon
+/// reads `forbid_external_cameras` from settings.conf live (env override
+/// `IRLUME_FORBID_EXTERNAL_CAMERAS` wins, same shape as biopolicy) and pushes
+/// it here before capture. Either signal turns the fixed-camera requirement
+/// on; the env var keeps its existing standalone meaning for custom units.
+static FORBID_EXTERNAL_CAMERAS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set the settings-driven half of the external-camera prohibition. Idempotent;
+/// the daemon refreshes it whenever it consults the config for a request.
+pub fn set_forbid_external_cameras(on: bool) {
+    FORBID_EXTERNAL_CAMERAS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `verify_pinned` must insist on `removable: fixed`. Env OR policy
+/// switch: one enables a lab machine, the other follows settings.conf live.
+fn require_fixed_camera() -> bool {
+    std::env::var("IRLUME_CAMERA_REQUIRE_FIXED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        || FORBID_EXTERNAL_CAMERAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `removable` sysfs attribute's meaning for the external-camera policy,
+/// as a pure mapping so the classification is testable: `fixed` is internal,
+/// `removable` is hot-pluggable, anything else (including the attribute being
+/// absent or `unknown`, which the kernel prints for many legitimate internal
+/// devices) is honestly reported as unknown rather than guessed.
+fn removable_class(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some("fixed") => "fixed",
+        Some("removable") => "removable",
+        _ => "unknown",
+    }
+}
+
+/// The `removable` classification of a camera node for `doctor`'s per-node
+/// line: `fixed` (internal), `removable` (external), or `unknown` (the kernel
+/// prints `unknown` for many legitimate internal devices; honesty over guess).
+pub fn node_removable_class(device: &str) -> &'static str {
+    let node = device.strip_prefix("/dev/").unwrap_or(device);
+    let link = format!("/sys/class/video4linux/{node}/device");
+    let Ok(real) = std::fs::canonicalize(&link) else {
+        return "unknown";
+    };
+    let raw = find_attr_dir(&real, "removable")
+        .and_then(|d| std::fs::read_to_string(d.join("removable")).ok());
+    removable_class(raw.as_deref())
+}
+
 /// Camera device-pinning: verify `/dev/videoN` is a real, physically-attached
 /// camera before any frame is read, defeating unprivileged software frame
 /// injection (v4l2loopback / OBS virtual camera). See docs/THREAT_MODEL.md.
@@ -3121,10 +3171,7 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
             }
         }
     }
-    if std::env::var("IRLUME_CAMERA_REQUIRE_FIXED")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-    {
+    if require_fixed_camera() {
         let removable = dev_dir
             .as_ref()
             .and_then(|d| std::fs::read_to_string(d.join("removable")).ok())
@@ -8444,6 +8491,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The external-camera policy classification is a pure mapping and the
+    /// kernel's `unknown` (printed for many legitimate internal devices) is
+    /// reported as unknown, never guessed into either side.
+    #[test]
+    fn removable_class_maps_fixed_removable_and_reports_unknown() {
+        assert_eq!(removable_class(Some("fixed\n")), "fixed");
+        assert_eq!(removable_class(Some("removable\n")), "removable");
+        assert_eq!(removable_class(Some("unknown\n")), "unknown");
+        assert_eq!(removable_class(None), "unknown");
+        assert_eq!(removable_class(Some("")), "unknown");
+    }
+
+    /// The settings-driven switch turns the fixed-camera requirement on by
+    /// itself, and clearing it leaves the env var in sole control.
+    #[test]
+    fn forbid_external_cameras_switch_drives_require_fixed() {
+        set_forbid_external_cameras(true);
+        assert!(require_fixed_camera());
+        set_forbid_external_cameras(false);
+        // Without the env var set for this test process, off is the default.
+        assert!(!require_fixed_camera());
+    }
 
     #[test]
     fn a_device_default_d1_message_reports_evidence_and_absence_of_writes() {

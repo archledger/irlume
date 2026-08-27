@@ -4158,6 +4158,11 @@ pub fn intel_ipu_present() -> Option<&'static str> {
             "/sys/bus/pci/drivers/intel-ipu6",
             "/sys/module/intel_ipu6",
         ),
+        (
+            "IPU3",
+            "/sys/bus/pci/drivers/ipu3-cio2",
+            "/sys/module/ipu3_cio2",
+        ),
     ] {
         if driver_has_bound_device(drv) || std::path::Path::new(module).exists() {
             return Some(gen);
@@ -4199,15 +4204,126 @@ fn ipu_pci_generation() -> Option<&'static str> {
 /// Map an Intel PCI device ID (as sysfs prints it, e.g. `0x7d19`) to the IPU
 /// generation, or None. IDs from the mainline ipu6/ipu7 drivers.
 fn ipu_generation_for_id(device_id: &str) -> Option<&'static str> {
+    // IPU3 is the single-ID CIO2 (8086:9d32, mainline ipu3-cio2.c's
+    // CIO2_PCI_ID); the camera-facing generations before the ipu6 naming.
+    const IPU3: &[&str] = &["0x9d32"];
     const IPU6: &[&str] = &["0x9a19", "0x4e19", "0x465d", "0x462e", "0xa75d", "0x7d19"];
     const IPU7: &[&str] = &["0x645d", "0xb05d"];
     if IPU7.contains(&device_id) {
         Some("IPU7")
     } else if IPU6.contains(&device_id) {
         Some("IPU6")
+    } else if IPU3.contains(&device_id) {
+        Some("IPU3")
     } else {
         None
     }
+}
+
+/// USB vendor:product pairs of VERIFIED MIPI camera bridges: modules whose
+/// sensor reaches the host over MIPI CSI-2 and whose only USB presence is a
+/// vendor-specific interface carrying an I2C tunnel, so uvcvideo binds
+/// nothing and every UVC-based tool reports "no camera".
+///
+/// Keyed on the exact pair, never the vendor alone. 06cb is Synaptics and also
+/// covers their fingerprint readers (06cb:00f9 ships on fleet thinkpads) with
+/// the same vendor-class, uvc-less shape; a vendor-only rule would call a
+/// fingerprint reader a camera bridge.
+///
+/// Entries need on-device evidence: the SVP7500 "CVS" bridge 06cb:0701 is
+/// author-verified on a Dell XPS 16 (jibsta210/svp7500-camera-fix-pack), with
+/// third-party reports on Dell Pro 14 machines naming a second bridge whose
+/// USB identity is not public yet; it joins this table when someone prints it.
+const MIPI_BRIDGE_IDS: &[(&str, &str)] = &[("06cb", "0701")];
+
+/// Whether `(id_vendor, id_product, interfaces)` is one of the verified MIPI
+/// camera bridges. `interfaces` is `(bInterfaceClass, bound driver name)` per
+/// USB interface of the device.
+///
+/// A uvcvideo-bound interface disqualifies the device however else it matches:
+/// the shape this detects is precisely "no UVC anywhere".
+fn is_vendor_mipi_bridge(
+    id_vendor: &str,
+    id_product: &str,
+    interfaces: &[(u8, Option<&str>)],
+) -> bool {
+    if !MIPI_BRIDGE_IDS
+        .iter()
+        .any(|(vid, pid)| *vid == id_vendor && *pid == id_product)
+    {
+        return false;
+    }
+    interfaces.iter().any(|(class, _)| *class == 0xff)
+        && interfaces
+            .iter()
+            .all(|(_, driver)| driver != &Some("uvcvideo"))
+}
+
+/// The verified MIPI camera bridge on this machine, if one is attached, with
+/// its USB identity for the report. Read from /sys, root-free.
+///
+/// `doctor` uses this to explain a cameraless machine whose camera is really
+/// a MIPI sensor behind an ISP: the bridge is the one USB-visible fact.
+pub fn vendor_mipi_bridge_present() -> Option<String> {
+    bridge_in(std::path::Path::new("/sys/bus/usb/devices"))
+}
+
+/// [`vendor_mipi_bridge_present`] with the sysfs devices root passed in, so a
+/// fixture tree can exercise the whole walk.
+fn bridge_in(devices_root: &std::path::Path) -> Option<String> {
+    let devices = std::fs::read_dir(devices_root).ok()?;
+    // In sysfs, interface entries are SIBLINGS of their device entry in
+    // /sys/bus/usb/devices, named `{device}:{config}.{iface}` (device 5-1.1,
+    // interface 5-1.1:1.0). Collect the whole listing once so each device can
+    // find its own interfaces by prefix.
+    let names: Vec<String> = devices
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    for name in &names {
+        // Devices are `bus-port` / `bus-port.port` (root hubs are `usbN` and
+        // never match a bridge pair anyway); interfaces carry the ':' and are
+        // handled per-device below.
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == '.')
+        {
+            continue;
+        }
+        let dir = devices_root.join(name);
+        let read = |file: &str| {
+            std::fs::read_to_string(dir.join(file))
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        };
+        let (vendor, product) = (read("idVendor"), read("idProduct"));
+        let prefix = format!("{name}:");
+        let mut interfaces: Vec<(u8, Option<String>)> = Vec::new();
+        for iname in names.iter().filter(|n| n.starts_with(&prefix)) {
+            let iface = devices_root.join(iname);
+            let class = u8::from_str_radix(
+                std::fs::read_to_string(iface.join("bInterfaceClass"))
+                    .unwrap_or_default()
+                    .trim(),
+                16,
+            )
+            .unwrap_or(0);
+            // The bound driver is the symlink target's final component.
+            let driver = std::fs::read_link(iface.join("driver"))
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+            interfaces.push((class, driver));
+        }
+        let borrowed: Vec<(u8, Option<&str>)> = interfaces
+            .iter()
+            .map(|(class, driver)| (*class, driver.as_deref()))
+            .collect();
+        if is_vendor_mipi_bridge(&vendor, &product, &borrowed) {
+            return Some(format!("{vendor}:{product}"));
+        }
+    }
+    None
 }
 
 /// A node's advertised pixel formats (fourcc), for negotiation and `doctor`.
@@ -12116,6 +12232,114 @@ mod tests {
         assert_eq!(ipu_generation_for_id("0xb05d"), Some("IPU7")); // Panther Lake
         assert_eq!(ipu_generation_for_id("0x1234"), None);
         assert_eq!(ipu_generation_for_id(""), None);
+    }
+
+    /// IPU3's CIO2 has exactly one PCI ID in the mainline table (8086:9d32,
+    /// ipu3-cio2.c's CIO2_PCI_ID), and the machines that carry it are the ones
+    /// whose cameras libcamera owns.
+    #[test]
+    fn ipu3_cio2_pci_id_maps_to_ipu3() {
+        assert_eq!(ipu_generation_for_id("0x9d32"), Some("IPU3"));
+    }
+
+    /// The sysfs walk itself, over a fixture tree with the three devices that
+    /// matter side by side: the verified SVP7500 bridge, a Synaptics
+    /// fingerprint reader with the same vendor and interface shape, and a
+    /// plain UVC camera with uvcvideo bound. Only the bridge may match.
+    #[test]
+    fn bridge_walk_matches_only_the_verified_device_in_sysfs_shape() {
+        let root = std::env::temp_dir().join(format!("irlume-bridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        fn device(root: &std::path::Path, name: &str, vendor: &str, product: &str) {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("idVendor"), vendor).unwrap();
+            std::fs::write(dir.join("idProduct"), product).unwrap();
+        }
+        fn iface(root: &std::path::Path, name: &str, class: &str, driver: Option<&str>) {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("bInterfaceClass"), class).unwrap();
+            if let Some(d) = driver {
+                let target = root.join("drivers").join(d);
+                std::fs::create_dir_all(&target).unwrap();
+                std::os::unix::fs::symlink(&target, dir.join("driver")).unwrap();
+            }
+        }
+
+        // The verified SVP7500: vendor-class tunnel interface, nothing bound.
+        device(&root, "5-1.1", "06cb", "0701");
+        iface(&root, "5-1.1:1.0", "ff", None);
+        // A Synaptics fingerprint reader: same vendor, same shape, wrong
+        // product. This one is on real fleet hardware.
+        device(&root, "3-2", "06cb", "00f9");
+        iface(&root, "3-2:1.0", "ff", None);
+        // A plain UVC camera with uvcvideo bound.
+        device(&root, "1-4", "046d", "085e");
+        iface(&root, "1-4:1.0", "0e", Some("uvcvideo"));
+
+        assert_eq!(
+            bridge_in(&root).as_deref(),
+            Some("06cb:0701"),
+            "only the verified bridge matches"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn bridge_walk_reports_none_when_no_verified_bridge_is_attached() {
+        let root = std::env::temp_dir().join(format!("irlume-bridge-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Only the fingerprint reader: same vendor, wrong product. Interface
+        // entries are siblings of the device entry, as in real sysfs.
+        let dev = root.join("3-2");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("idVendor"), "06cb").unwrap();
+        std::fs::write(dev.join("idProduct"), "00f9").unwrap();
+        let iface = root.join("3-2:1.0");
+        std::fs::create_dir_all(&iface).unwrap();
+        std::fs::write(iface.join("bInterfaceClass"), "ff").unwrap();
+
+        assert_eq!(bridge_in(&root), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The vendor-bridge decision. Keyed on the exact USB vendor:product pair,
+    /// never the vendor alone: 06cb is also Synaptics FINGERPRINT readers
+    /// (06cb:00f9 ships on a fleet thinkpad) with the same vendor-class,
+    /// uvc-less interface shape. The only verified camera bridge is the SVP7500
+    /// "CVS" bridge 06cb:0701 (fix-pack author-verified on a Dell XPS 16;
+    /// third-party reports on Dell Pro 14 machines name a different bridge
+    /// whose USB identity is not yet public, so it is deliberately absent).
+    #[test]
+    fn vendor_mipi_bridge_decision() {
+        // The SVP7500 shape: vendor-class interface, nothing bound.
+        assert!(is_vendor_mipi_bridge("06cb", "0701", &[(0xff, None)]));
+        // Same bridge with a second vendor-class interface some other driver
+        // claimed: still no UVC anywhere, still the tunnel shape.
+        assert!(is_vendor_mipi_bridge(
+            "06cb",
+            "0701",
+            &[(0xff, None), (0xff, Some("i2c-tunnel-hid"))]
+        ));
+        // A Synaptics fingerprint reader: same vendor, same shape, WRONG
+        // product. This is the false positive the vendor-only rule would ship.
+        assert!(!is_vendor_mipi_bridge("06cb", "00f9", &[(0xff, None)]));
+        // The bridge pair but a uvcvideo-bound interface: not the tunnel
+        // shape, however it got here.
+        assert!(!is_vendor_mipi_bridge(
+            "06cb",
+            "0701",
+            &[(0x0e, Some("uvcvideo")), (0xff, None)]
+        ));
+        // An ordinary external UVC webcam vendor: never a bridge.
+        assert!(!is_vendor_mipi_bridge("046d", "085e", &[(0xff, None)]));
+        // The bridge pair but no vendor-class interface at all: the shape is
+        // the evidence, the pair alone is not.
+        assert!(!is_vendor_mipi_bridge("06cb", "0701", &[(0x0e, None)]));
     }
 
     #[test]

@@ -3702,9 +3702,16 @@ fn doctor_run(
                  - its capture nodes emit raw Bayer, not a directly-openable YUYV/GREY stream;\n     \
                  - the IR (Windows Hello) sensor is not exposed on Linux at all, so IR face\n       \
                  auth and IR liveness are unavailable on this hardware.\n     \
-                 RGB-only webcam use is possible via a libcamera software-ISP + v4l2loopback\n     \
-                 bridge, but irlume needs the IR sensor; an external USB IR camera is the\n     \
+                 RGB-only webcam use is possible via a libcamera software-ISP + v4l2loopback\n       \
+                 bridge, but irlume needs the IR sensor; an external USB IR camera is the\n       \
                  supported path on {gen} machines."
+            );
+        } else if let Some(bridge) = irlume_camera::vendor_mipi_bridge_present() {
+            dout!(report,
+                "  ⚠ this machine has a verified MIPI camera bridge (USB {bridge}) and no UVC\n     \
+                 camera: the sensor is a MIPI module behind an ISP that Linux drives through\n     \
+                 libcamera, so uvcvideo binds nothing and irlume cannot use it. An external\n     \
+                 USB IR camera is the supported path on this machine."
             );
         }
     }

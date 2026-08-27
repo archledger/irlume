@@ -5,6 +5,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`doctor` recognizes the IPU3 generation and the verified MIPI camera
+  bridge class.** A cameraless machine now gets an honest explanation for
+  two more classes instead of a bare "no camera": IPU3 CIO2 systems (the
+  single mainline PCI ID 8086:9d32, driver `ipu3-cio2`), and laptops whose
+  camera is a MIPI sensor behind a Synaptics SVP7500 "CVS" bridge (USB
+  06cb:0701, vendor-class I2C tunnel, uvcvideo binds nothing). The bridge
+  table is keyed on the exact vendor:product pair, never the vendor alone:
+  06cb also covers Synaptics fingerprint readers with the same interface
+  shape, and a vendor-only rule would have called the fleet thinkpad's
+  fingerprint reader a camera. Entries carry their evidence (the fix-pack's
+  author-verified machine); a second Dell Pro 14 bridge joins the table
+  when its USB identity is published. The decision function, the PCI ID
+  map, and the sysfs walk are all unit-tested, the walk against fixture
+  trees replicating real sysfs layout (sibling interface entries) including
+  the fingerprint-reader counter-case.
+
 ### Fixed
 
 - **AppArmor: `ir-setup` refused to write the emitter journal on enforcing

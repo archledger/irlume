@@ -33,6 +33,11 @@ body:
     id: logs
     attributes:
       label: Relevant log lines
+      description: >
+        Easiest: run `irlume support-report --since 10m` and attach the file
+        it writes; it is sanitized and safe to share. Otherwise paste
+        `journalctl -u irlumed` excerpts. Never attach raw captures,
+        embeddings, or template files.
       description: "`irlume logs --since \"10 min ago\"` around the failure; doctor output helps too"
       render: text
     validations:

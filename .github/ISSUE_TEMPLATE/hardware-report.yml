@@ -7,7 +7,8 @@ body:
     attributes:
       value: |
         Most hardware fixes start from the same three command outputs. Filling them in
-        up front usually saves a full round-trip.
+        up front usually saves a full round-trip. If you can, also attach the
+        output of `irlume support-report` (sanitized and safe to share).
   - type: input
     id: machine
     attributes:

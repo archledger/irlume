@@ -79,6 +79,14 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # from inside the daemon while sysfs-based selection still works, and the
   # engine mis-tiers (found enforcing on Arch, 2026-08-05; issues #281/#283).
   /dev/ r,
+  # The emitter journal's durability walk opens and fsyncs every ancestor of
+  # the record it is about to write, / included, so a crash mid-setup can
+  # never lose the undo record. Directory read is all that ask needs (found
+  # enforcing on Arch, 2026-08-27: ir-setup refused to send anything with
+  # "fsync /: Permission denied").
+  / r,
+  /var/ r,
+  /var/lib/ r,
   /dev/video[0-9]* rw,
   # Media-controller nodes: camera classification's no-open path (#428) reads
   # the media graph to decide a video node's role WITHOUT opening it (a video

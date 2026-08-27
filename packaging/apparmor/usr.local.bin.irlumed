@@ -74,9 +74,14 @@ profile irlumed /usr/local/bin/irlumed {
 
   # Cameras: capture nodes + the sysfs identity walk of the anti-injection
   # camera pinning (canonicalized device path, USB ids, privacy switch).
-  # /dev/ readdir is the discovery walk; without it capabilities() sees no
+  # /dev/ readdir is the discovery walk; without it, capabilities() sees no
   # cameras inside the daemon while sysfs selection works (#281/#283).
   /dev/ r,
+  # Ancestor opens for the emitter journal's fsync chain; see the same rule's
+  # comment in usr.bin.irlumed (found enforcing on Arch, 2026-08-27).
+  / r,
+  /var/ r,
+  /var/lib/ r,
   /dev/video[0-9]* rw,
   /sys/class/video4linux/ r,
   /sys/class/video4linux/** r,

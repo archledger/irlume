@@ -3,6 +3,21 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **AppArmor: `ir-setup` refused to write the emitter journal on enforcing
+  hosts.** The durability walk opens and fsyncs every ancestor of the undo
+  record, `/` included, and the shipped `irlumed` profiles granted directory
+  read on `/dev`, `/sys/class`, and the state store but not on `/`, `/var`,
+  or `/var/lib`, so the journal could not be made durable and discovery
+  correctly refused to send anything to the camera (`fsync /: Permission
+  denied`). Found enforcing on Arch (archhost fleet machine, 2026-08-27);
+  SELinux and non-enforcing hosts were unaffected. Both executable-path
+  profile variants now carry the three ancestor rules, and the packaging
+  parity ratchet asserts them so the gap cannot re-ship.
+
 ## [0.11.2] - 2026-08-25
 
 ### Added

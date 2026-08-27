@@ -4853,6 +4853,55 @@ pub(crate) fn face_auth_payload(def: &[u8], max: &[u8]) -> std::result::Result<V
     Ok(out)
 }
 
+/// Read a Face Authentication `SET_CUR` payload back as promotion evidence.
+///
+/// The `ir-setup` transcript is the evidence chain for adding a USB ID to the
+/// built-in table: descriptor, on-device write, read-back, optical output,
+/// restoration. The raw bytes leave the reader to decode the accepted mode by
+/// hand; this names each streaming interface and the mode it was set to, in the
+/// specification's own vocabulary, so a transcript can be filed as-is.
+///
+/// It interprets, never guesses. Every shape rule the builder enforces is a
+/// `None` here rather than a best effort, because evidence that might be wrong
+/// is worse than evidence that admits it read nothing.
+pub(crate) fn face_auth_mode_evidence(payload: &[u8]) -> Option<String> {
+    const D0_GENERAL: u8 = 1 << 0;
+    const D1_ALTERNATIVE_ILLUMINATION: u8 = 1 << 1;
+    const D2_BACKGROUND_SUBTRACTION: u8 = 1 << 2;
+    const DEFINED: u8 = D0_GENERAL | D1_ALTERNATIVE_ILLUMINATION | D2_BACKGROUND_SUBTRACTION;
+
+    let len = payload.len();
+    if len < 3 || !(len - 1).is_multiple_of(2) {
+        return None;
+    }
+    let entries = usize::from(payload[0]);
+    let capacity = (len - 1) / 2;
+    if entries == 0 || entries > capacity {
+        return None;
+    }
+    let tail = 1 + entries * 2;
+    if payload[tail..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(entries);
+    for i in 0..entries {
+        let at = 1 + i * 2;
+        let interface = payload[at];
+        let flags = payload[at + 1];
+        if flags & !DEFINED != 0 || flags.count_ones() != 1 {
+            return None;
+        }
+        let mode = match flags {
+            D0_GENERAL => "D0 (general purpose)",
+            D1_ALTERNATIVE_ILLUMINATION => "D1 (alternative illumination)",
+            D2_BACKGROUND_SUBTRACTION => "D2 (background subtraction)",
+            _ => return None,
+        };
+        parts.push(format!("interface 0x{interface:02x} set to {mode}"));
+    }
+    Some(parts.join(", "))
+}
+
 /// Whether an IR Torch `GET_DEF` value is one the specification says may be
 /// written back.
 ///
@@ -10271,6 +10320,51 @@ mod tests {
         assert!(face_auth_payload(&[1, 3, 1], &[1, 3, 3, 0]).is_err());
         // A length that cannot hold whole entries.
         assert!(face_auth_payload(&[1, 3], &[1, 3]).is_err());
+    }
+
+    /// The payload validated on both built-in cameras reads back as the
+    /// mode and interface the USB-ID promotion evidence chain needs.
+    #[test]
+    fn evidence_names_the_mode_the_camera_accepted() {
+        let evidence = face_auth_mode_evidence(&[1, 3, 2, 0, 0, 0, 0, 0, 0])
+            .expect("the validated payload is well-formed");
+        assert!(evidence.contains("0x03"), "names the interface: {evidence}");
+        assert!(evidence.contains("D1"), "names the mode: {evidence}");
+        assert!(
+            evidence.contains("alternative illumination"),
+            "spells the mode out: {evidence}"
+        );
+    }
+
+    /// A multi-interface payload names each interface and its own mode.
+    #[test]
+    fn evidence_names_each_interface_and_mode() {
+        let evidence = face_auth_mode_evidence(&[2, 3, 2, 5, 4, 0, 0, 0, 0])
+            .expect("two whole entries, zero tail");
+        assert!(
+            evidence.contains("0x03") && evidence.contains("0x05"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("D1") && evidence.contains("D2"),
+            "{evidence}"
+        );
+        assert!(evidence.contains("background subtraction"), "{evidence}");
+    }
+
+    /// The reader interprets, it never guesses: anything that is not the
+    /// layout the builder produces yields no evidence at all.
+    #[test]
+    fn malformed_payloads_yield_no_evidence() {
+        assert!(face_auth_mode_evidence(&[]).is_none());
+        assert!(face_auth_mode_evidence(&[1, 3]).is_none());
+        assert!(face_auth_mode_evidence(&[2, 3, 2, 5]).is_none());
+        assert!(face_auth_mode_evidence(&[1, 3, 2, 9]).is_none());
+        assert!(face_auth_mode_evidence(&[0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        // Undefined flag bits are not a mode.
+        assert!(face_auth_mode_evidence(&[1, 3, 0b1000, 0, 0, 0, 0, 0, 0]).is_none());
+        // More than one mode bit set is not a mode.
+        assert!(face_auth_mode_evidence(&[1, 3, 0b011, 0, 0, 0, 0, 0, 0]).is_none());
     }
 
     /// Nothing is invented: the output names only interfaces the camera listed,

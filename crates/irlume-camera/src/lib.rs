@@ -7927,16 +7927,23 @@ pub fn store_sequential_if_still_concurrent(
 /// anything changed can be undone.
 fn active_by_device_default_message(control: &ir_emitter::EmitterControl) -> String {
     let encoded = control.encode();
-    let mode = if control.selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION {
-        "Face Authentication D1"
-    } else {
-        "IR Torch active mode"
-    };
-    format!(
-        "IR emitter mode active by device default: {encoded} on the camera's Microsoft \
-         camera-control unit; GET_CUR and GET_DEF both report the validated {mode} value \
-         (no camera write or saved config was needed)"
-    )
+    if control.selector == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION {
+        // The accepted mode is read out of the payload rather than assumed, so
+        // the transcript states what THIS camera reported (#565). A default
+        // that does not parse still works; it just cannot be described beyond
+        // its control name.
+        let evidence = ir_emitter::face_auth_mode_evidence(&control.payload)
+            .unwrap_or_else(|| "an uninterpretable face-authentication value".to_string());
+        return format!(
+            "IR emitter mode active by device default: {encoded} on the camera's Microsoft \
+             camera-control unit; GET_CUR and GET_DEF both report the validated Face \
+             Authentication value, {evidence} (no camera write or saved config was needed)"
+        );
+    }
+    "IR emitter mode active by device default: {encoded} on the camera's Microsoft \
+     camera-control unit; GET_CUR and GET_DEF both report the validated IR Torch active \
+     mode value (no camera write or saved config was needed)"
+        .replace("{encoded}", &encoded)
 }
 
 fn setup_measurement_from_burst(
@@ -8118,13 +8125,26 @@ pub fn setup_ir_emitter(device: &str) -> irlume_common::Result<String> {
         ) {
             Ok(ir_emitter::DiscoveryOutcome::Applied(found)) => {
                 let encoded = found.control().encode();
+                // The accepted mode rides along for the USB-ID promotion
+                // evidence chain (#565): descriptor, write, read-back, optical
+                // output, restoration, and now WHICH face-authentication mode
+                // the camera took. IR Torch has no per-interface modes to name.
+                let accepted = if found.control().selector
+                    == crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
+                {
+                    ir_emitter::face_auth_mode_evidence(&found.control().payload)
+                        .map(|evidence| format!("; accepted: {evidence}"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 // Confirm, publish, release, in that order. The sequence lives in
                 // `finish` rather than here so it is reachable by a test.
                 found.finish(&id).map_err(Error::Hardware)?;
                 Ok(format!(
                     "IR emitter enabled: {encoded} on the camera's Microsoft camera-control unit, \
                  using a value built from what the camera reports about that control \
-                    (saved; future captures rebuild it the same way)"
+                     (saved; future captures rebuild it the same way){accepted}"
                 ))
             }
             Ok(ir_emitter::DiscoveryOutcome::ActiveByDeviceDefault(control)) => {
@@ -8318,7 +8338,12 @@ mod tests {
         });
 
         assert!(message.contains("active by device default"), "{message}");
-        assert!(message.contains("Face Authentication D1"), "{message}");
+        assert!(message.contains("Face Authentication"), "{message}");
+        assert!(
+            message.contains("D1 (alternative illumination)"),
+            "the accepted mode is read from the payload: {message}"
+        );
+        assert!(message.contains("interface 0x02"), "{message}");
         assert!(message.contains("GET_CUR and GET_DEF"), "{message}");
         assert!(
             message.contains("no camera write or saved config was needed"),

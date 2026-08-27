@@ -62,6 +62,7 @@ pub const SERVICES: &[(&str, ServiceKind)] = &[
     ("swaylock", ServiceKind::ScreenUnlock),
     ("i3lock", ServiceKind::ScreenUnlock),
     ("hyprlock", ServiceKind::ScreenUnlock),
+    ("omarchy-lock-face", ServiceKind::ScreenUnlock),
     // Display-manager greeters (cold login), including GDM's separate
     // fingerprint login service, same login class.
     ("sddm", ServiceKind::Greeter),
@@ -164,6 +165,16 @@ mod tests {
         for probe in ["SUDO", " sudo ", "Sudo"] {
             assert_eq!(classify(probe), Some(ServiceKind::Elevation), "{probe}");
         }
+    }
+
+    /// Omarchy's lock shell drives face auth through a dedicated PAM service.
+    /// It is a live-session screen unlock, not a cold-login greeter.
+    #[test]
+    fn omarchy_face_lock_is_screen_unlock() {
+        assert_eq!(
+            classify("omarchy-lock-face"),
+            Some(ServiceKind::ScreenUnlock)
+        );
     }
 
     /// The divergence that prompted this: doas was Elevation for the policy and

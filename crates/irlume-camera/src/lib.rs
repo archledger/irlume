@@ -32,6 +32,7 @@
 
 mod backend;
 pub mod capture_qualification;
+pub mod census;
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;
@@ -2813,6 +2814,10 @@ pub(crate) fn video_node_paths() -> NodeListing {
 pub struct NodeScan {
     /// Nodes that answered, excluding `Role::Other`.
     pub classified: Vec<(String, Role)>,
+    /// Nodes that answered and advertised no capture format: the metadata
+    /// interface of a streaming node (#575). Informational; no camera-picking
+    /// caller consumes this bucket.
+    pub other: Vec<String>,
     pub unreadable: Vec<Unreadable>,
     /// Nodes refused before format enumeration because their format list is
     /// not camera evidence (#425). Working hardware, deliberately unused;
@@ -2831,7 +2836,11 @@ pub struct NodeScan {
 /// the outcome, so the bucketing is testable without a device per arm.
 fn file_node(scan: &mut NodeScan, path: String, outcome: Result<NodeKind, Unreadable>) {
     match outcome {
-        Ok(NodeKind::Camera(Role::Other)) => {}
+        // Kept for the census (#575): a node that answered with no capture
+        // format is the metadata interface of a streaming node, which the
+        // census reports as informational. Camera-picking callers still see
+        // nothing here, exactly as before.
+        Ok(NodeKind::Camera(Role::Other)) => scan.other.push(path),
         Ok(NodeKind::Camera(role)) => scan.classified.push((path, role)),
         Ok(NodeKind::McCentric(mc)) => scan.mc_centric.push((path, mc)),
         Err(u) => scan.unreadable.push(u),
@@ -3563,15 +3572,21 @@ pub fn camera_rate_diagnostics(
     })
 }
 
-fn uvc_list_pairs() -> Vec<CameraPair> {
+pub(crate) fn uvc_list_pairs() -> Vec<CameraPair> {
+    pairs_from(&uvc_discover_nodes())
+}
+
+/// The pair list over classified nodes the caller already holds, so the
+/// census (#575) pairs from one scan instead of re-classifying the machine.
+fn pairs_from(nodes: &[(String, Role)]) -> Vec<CameraPair> {
     let mut groups: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, Vec<String>)> =
         Default::default();
-    for (path, role) in uvc_discover_nodes() {
-        if let Some(id) = physical_device_id(&path) {
+    for (path, role) in nodes {
+        if let Some(id) = physical_device_id(path) {
             let e = groups.entry(id).or_default();
             match role {
-                Role::Rgb => e.0.push(path),
-                Role::Ir => e.1.push(path),
+                Role::Rgb => e.0.push(path.clone()),
+                Role::Ir => e.1.push(path.clone()),
                 _ => {}
             }
         }

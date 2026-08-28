@@ -395,6 +395,46 @@ closed stage never carries a `third_party` object.
 The command needs no daemon, so it still answers when the daemon will not
 start.
 
+### `irlume camera census --json`
+
+Capability: `camera-census`.
+
+Every video-adjacent device on the machine, classified once, each row
+carrying the evidence its classification keyed on (#575). The command runs
+CLI-side like `doctor --json` (read-only `/dev/video*` opens and sysfs
+walks; no daemon), so unreadable nodes are their own class with the errno as
+evidence rather than a failure.
+
+```json
+{
+  "listing_error": null,
+  "entries": [
+    {
+      "node": "/dev/video0",
+      "class": "uvc_rgb",
+      "paired": true,
+      "verdict": "supported",
+      "note": null,
+      "privacy_engaged": false,
+      "evidence": ["driver uvcvideo on USB", "USB 046d:085e", "internal", "formats MJPG/YUYV"]
+    }
+  ]
+}
+```
+
+Row fields:
+
+| Field | Meaning |
+| --- | --- |
+| `node` | The `/dev/videoN` row, or `null` for machine-level rows (MIPI pipelines, unbound USB devices) |
+| `class` | One of `uvc_rgb`, `uvc_ir`, `y8_ir`, `metadata_only`, `dummy_node`, `unreadable_node`, `mc_centric`, `mipi_ipu`, `mipi_vendor_bridge`, `usb_camera_without_driver`. Class-specific side fields (`paired`, `generation`, `usb_id`) sit beside it |
+| `verdict` | `supported` (with a tier `note`), `supported_with_limits`, `informational`, `not_hardware`, `unsupported`, or `broken`. Every `note` names the supported path or the next step |
+| `privacy_engaged` | The hardware privacy shutter is engaged on that node: nothing is wrong, the shutter needs opening |
+| `evidence` | The facts the classification keyed on (driver, USB identity, format fourccs, internal/external, cause). Never empty |
+
+`listing_error` is non-null when `/dev` could not be listed: the census may
+be incomplete, which is not the same as empty.
+
 ### Error codes
 
 | Code | Meaning | `retryable` |

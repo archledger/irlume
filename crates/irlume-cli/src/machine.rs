@@ -38,6 +38,7 @@ const CAPABILITIES: &[&str] = &[
     "login-transactions",
     "models-list-json",
     "camera-diagnostics",
+    "camera-census",
     "support-report-json",
 ];
 
@@ -527,6 +528,51 @@ pub fn doctor(args: &[String]) -> ExitCode {
     let checks = report.into_checks();
     emit(
         &success(COMMAND, json!({ "checks": checks }), contract),
+        ExitCode::SUCCESS,
+    )
+}
+
+/// `irlume camera census --json` (#575): machine-readable census of every
+/// video-adjacent device on the machine, each row carrying the class, the
+/// verdict, and the evidence the classification keyed on. Runs CLI-side like
+/// `doctor --json` (it opens `/dev/video*` read-only and walks sysfs; no
+/// daemon involved), so the privilege story is doctor's: run with the
+/// machine's usual access and unreadable nodes report as their own class
+/// with the errno as evidence.
+pub fn camera_census(args: &[String]) -> ExitCode {
+    const COMMAND: &str = "camera.census";
+    let contract = match negotiate(args) {
+        Contract::Agreed(v) => v,
+        Contract::Malformed => {
+            return emit(
+                &failure(COMMAND, "usage-error", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+        Contract::Unsupported => {
+            return emit(
+                &failure(COMMAND, "unsupported-contract", false, CONTRACT_DEFAULT),
+                ExitCode::from(2),
+            )
+        }
+    };
+    if without_contract(args) != ["camera", "census", "--json"] {
+        return emit(
+            &failure(COMMAND, "usage-error", false, contract),
+            ExitCode::from(2),
+        );
+    }
+    let scan = irlume_camera::scan_nodes();
+    let entries = irlume_camera::census::census_from(&scan);
+    emit(
+        &success(
+            COMMAND,
+            json!({
+                "listing_error": scan.listing_error,
+                "entries": entries,
+            }),
+            contract,
+        ),
         ExitCode::SUCCESS,
     )
 }
@@ -2402,6 +2448,7 @@ mod tests {
                 "login-transactions",
                 "models-list-json",
                 "camera-diagnostics",
+                "camera-census",
                 "support-report-json"
             ])
         );

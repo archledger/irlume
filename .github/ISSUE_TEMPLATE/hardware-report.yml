@@ -8,7 +8,10 @@ body:
       value: |
         Most hardware fixes start from the same three command outputs. Filling them in
         up front usually saves a full round-trip. If you can, also attach the
-        output of `irlume support-report` (sanitized and safe to share).
+        output of `irlume support-report` (sanitized and safe to share), and
+        `irlume camera census --json` (it classifies every camera-like device
+        with the evidence each row keyed on, so "broken, unsupported class, or
+        configuration" is answered before the first reply).
   - type: input
     id: machine
     attributes:
@@ -38,6 +41,14 @@ body:
       render: text
     validations:
       required: true
+  - type: textarea
+    id: census
+    attributes:
+      label: Output of `irlume camera census --json`
+      description: Classifies every camera-like device on the machine; optional but it usually replaces the first diagnostic round-trip
+      render: text
+    validations:
+      required: false
   - type: textarea
     id: problem
     attributes:

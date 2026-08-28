@@ -394,6 +394,7 @@ mod tests {
 
     fn fixture_scan_nodes() -> NodeScan {
         NodeScan {
+            other: Vec::new(),
             classified: vec![
                 ("/dev/fixture-rgb".into(), Role::Rgb),
                 ("/dev/fixture-ir".into(), Role::Ir),

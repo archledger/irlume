@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **The camera census: every camera-like device on the machine, classified
+  once, each row printing the evidence it keyed on.** New
+  `irlume camera census [--json]` (#575) and a doctor camera section rebuilt
+  on the same rows. The census covers UVC RGB and IR sensors (with pairing
+  and tier), unbranded Y8-only IR shapes, metadata-only nodes (informational,
+  not cameras), v4l2loopback/vivid dummies (not hardware), Intel
+  IPU3/IPU6/IPU7 and verified vendor MIPI bridges (unsupported class, named
+  supported path), unreadable nodes (errno and holder as evidence), and a
+  new walk listing USB camera-class devices with NO driver bound (a
+  kernel/firmware problem, said so instead of reading as absent hardware).
+  `--json` is a contract-1 machine document (`camera-census` capability,
+  schema in MACHINE-API.md); doctor classifies each node exactly once and
+  shares the scan with its capability check. Diagnostics only: no capture
+  behavior changed. Fixture-tree tests cover the walks; the per-class
+  hardware evidence rides in the PR.
 - **MS-XU illumination metadata is a recorded, reportable, fuzzed pipeline
   capability.** Camera qualification measurements now record whether the IR
   node's Microsoft-metadata sibling was discoverable (a `TRY_FMT` probe;

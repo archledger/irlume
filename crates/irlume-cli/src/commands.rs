@@ -2132,6 +2132,9 @@ SYSTEM INTEGRATION
                         IR at once without dimming, and store the answer (sudo)
   camera-mode                     report the capture mode in force for the
                         auto-selected pair, and where that verdict came from
+  camera census [--json]          classify every camera-like device on the
+                        machine, printing the evidence each classification
+                        keyed on (#575; the hardware-report attachment)
   models [list|add|enable|disable [name]]   opt-in third-party models, measured
                         and checksum-pinned. A PAD entry is a deny-only liveness
                         cue; a recognition entry REPLACES the RGB matcher at its

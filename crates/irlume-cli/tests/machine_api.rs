@@ -34,9 +34,51 @@ fn version_json_is_one_machine_document() {
             "login-transactions",
             "models-list-json",
             "camera-diagnostics",
+            "camera-census",
             "support-report-json"
         ])
     );
+}
+
+/// `irlume camera census --json` (#575): one machine document whose data is
+/// the full census, every row carrying class, verdict, and the evidence it
+/// keyed on. Runs CLI-side like doctor, so no daemon is needed and the test
+/// needs no camera: an empty census on a cameraless CI runner is a valid
+/// one.
+#[test]
+fn camera_census_json_is_one_document_with_evidence_rows() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["camera", "census", "--json"])
+        .output()
+        .expect("run irlume");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+        1
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(document["contract_version"], 1);
+    assert_eq!(document["command"], "camera.census");
+    assert_eq!(document["ok"], true);
+    let entries = document["data"]["entries"]
+        .as_array()
+        .expect("entries is an array");
+    for entry in entries {
+        assert!(
+            entry["class"].is_string(),
+            "every row carries its class: {entry}"
+        );
+        assert!(
+            entry["verdict"].is_string(),
+            "every row carries its verdict: {entry}"
+        );
+        assert!(
+            entry["evidence"].as_array().is_some_and(|e| !e.is_empty()),
+            "a bare verdict is what the census exists to replace: {entry}"
+        );
+    }
 }
 
 #[test]

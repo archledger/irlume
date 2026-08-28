@@ -227,6 +227,10 @@ fn main() -> std::process::ExitCode {
         (Some("camera"), Some("diagnostics")) if args.iter().any(|arg| arg == "--json") => {
             machine::camera_diagnostics(&args)
         }
+        (Some("camera"), Some("census")) if args.iter().any(|arg| arg == "--json") => {
+            machine::camera_census(&args)
+        }
+        (Some("camera"), Some("census")) => camera_census(&args),
         (Some("status"), _) if args.iter().any(|arg| arg == "--json") => machine::status(&args),
         (Some("version"), _) if args.iter().any(|arg| arg == "--json") => machine::version(&args),
         (Some("version"), _) | (Some("--version"), _) | (Some("-V"), _) => {
@@ -686,6 +690,21 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
         "camera-tune",
         daemon_request(&Request::TuneCaptureMode { rounds }),
     )
+}
+
+/// `irlume camera census`: every video-adjacent device on the machine,
+/// classified once, each line printing the evidence its classification
+/// keyed on (#575). The one-shot answer to "broken, an unusable class, or
+/// configuration"; `--json` is the machine-readable twin.
+fn camera_census(_args: &[String]) -> std::process::ExitCode {
+    let scan = irlume_camera::scan_nodes();
+    if let Some(why) = &scan.listing_error {
+        eprintln!("[camera-census] ⚠ {why}; whether this machine has camera nodes is unknown");
+    }
+    for entry in irlume_camera::census::census_from(&scan) {
+        println!("{}", irlume_camera::census::render_line(&entry));
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// `irlume camera-mode`: report which capture strategy the pair irlume would
@@ -3692,109 +3711,23 @@ fn doctor_run(
             report,
             "  ⚠ {why}; whether this machine has camera nodes is unknown"
         );
-    } else if nodes.is_empty() && scan.unreadable.is_empty() && scan.mc_centric.is_empty() {
+    } else if nodes.is_empty()
+        && scan.unreadable.is_empty()
+        && scan.mc_centric.is_empty()
+        && scan.other.is_empty()
+    {
         dout!(report, "  (no /dev/video* nodes on this machine)");
     }
-    if nodes.is_empty() {
-        if let Some(gen) = irlume_camera::intel_ipu_present() {
-            dout!(report,
-                "  ⚠ this laptop has an Intel {gen} MIPI camera, which irlume cannot use:\n     \
-                 - its capture nodes emit raw Bayer, not a directly-openable YUYV/GREY stream;\n     \
-                 - the IR (Windows Hello) sensor is not exposed on Linux at all, so IR face\n       \
-                 auth and IR liveness are unavailable on this hardware.\n     \
-                 RGB-only webcam use is possible via a libcamera software-ISP + v4l2loopback\n       \
-                 bridge, but irlume needs the IR sensor; an external USB IR camera is the\n       \
-                 supported path on {gen} machines."
-            );
-        } else if let Some(bridge) = irlume_camera::vendor_mipi_bridge_present() {
-            dout!(report,
-                "  ⚠ this machine has a verified MIPI camera bridge (USB {bridge}) and no UVC\n     \
-                 camera: the sensor is a MIPI module behind an ISP that Linux drives through\n     \
-                 libcamera, so uvcvideo binds nothing and irlume cannot use it. An external\n     \
-                 USB IR camera is the supported path on this machine."
-            );
-        }
-    }
-    for (path, role) in &nodes {
-        let priv_on = if irlume_camera::privacy_engaged(path) {
-            "  ⚠ PRIVACY SWITCH ON"
-        } else {
-            ""
-        };
-        // Internal versus external, keyed on the kernel's `removable`
-        // attribute: the fact the forbid-external-cameras policy acts on,
-        // printed so the classification is verifiable at a glance.
-        let attachment = match irlume_camera::node_removable_class(path) {
-            "fixed" => " (internal)",
-            "removable" => " (external)",
-            _ => " (removable unknown)",
-        };
-        // Name the backend on every node: uvcvideo-on-USB is the case irlume
-        // is built and tested for, and anything else is the first fact a bug
-        // report needs (an IPU/MIPI node classifies by format just as well and
-        // then behaves nothing alike; #187 had to establish this by hand).
-        let backend = match irlume_camera::node_backend(path) {
-            Ok((drv, true)) if drv == "uvcvideo" => format!(" ({drv}, USB)"),
-            Ok((drv, on_usb)) => {
-                let bus = if on_usb { "USB" } else { "not USB" };
-                format!(" ({drv}, {bus})  ⚠ not the uvcvideo-on-USB case irlume is built for")
-            }
-            // A failed observation says so; rendering it as the old bare line
-            // would make "could not tell" look like "nothing to tell" on the
-            // one surface whose whole job is telling (#195 review).
-            Err(e) => format!(" (backend unknown: {e})  ⚠ could not identify camera backend"),
-        };
-        dout!(report, "  {path}: {role:?}{backend}{attachment}{priv_on}");
-        // An RGB node the capture path can't decode (MJPEG-only) classifies as
-        // usable but would fail at capture; warn here instead.
-        if *role == irlume_camera::Role::Rgb {
-            // Must match the capture path's DECODABLE_RGB (YUYV, NV12); listing
-            // RGB3/BGR3 here would pass doctor then fail at capture.
-            let fmts = irlume_camera::rgb_node_formats(path);
-            let decodable = fmts.iter().any(|f| f == b"YUYV" || f == b"NV12");
-            if !fmts.is_empty() && !decodable {
-                let list: Vec<String> = fmts
-                    .iter()
-                    .map(|f| {
-                        std::str::from_utf8(f)
-                            .unwrap_or("????")
-                            .trim_end()
-                            .to_string()
-                    })
-                    .collect();
-                dout!(
-                    report,
-                    "     ⚠ offers only [{}]; irlume needs an uncompressed format\n       \
-                     (YUYV or NV12). This camera will detect but fail at capture.",
-                    list.join(", ")
-                );
-            }
-        }
-    }
-    // MC-centric nodes are working hardware irlume refuses to classify by
-    // format (#425): an Intel IPU6 laptop puts up to eight capture nodes per
-    // CSI-2 port that all enumerate YUYV from a static table, so before this
-    // gate they listed here as a fleet of RGB cameras that fail at capture.
-    // Grouped by cause like the unreadable nodes below: one IPU6 is one fact,
-    // not thirty-two.
-    let mut mc_by_cause: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
-    for (path, mc) in &scan.mc_centric {
-        mc_by_cause.entry(mc.cause()).or_default().push(path);
-    }
-    for (cause, paths) in &mc_by_cause {
-        dout!(report, "  ⚠ {}: {cause}", paths.join(", "));
-    }
-    // A node irlume could not read is named with its errno, never omitted.
-    // Dropping these is what let a permission problem read as absent hardware
-    // and sent the reader after a driver bug they did not have (#227).
-    // Nodes are grouped by cause: one missing 'video' group membership denies
-    // every node on the machine, and that is one fact, not eleven.
-    let mut by_cause: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
-    for u in &scan.unreadable {
-        by_cause.entry(u.cause()).or_default().push(&u.path);
-    }
-    for (cause, paths) in &by_cause {
-        dout!(report, "  ⚠ {}: {cause}", paths.join(", "));
+    // #575: the census renders every video-adjacent node and every
+    // machine-level camera fact, each line carrying the evidence its
+    // classification keyed on. The pieces this replaces (the per-node loop,
+    // the IPU/bridge fallbacks, the grouped unreadable and MC-centric
+    // lines) each told one part of the story; the census is the whole
+    // answer to "broken, unusable class, or configuration", and it comes
+    // from the same single scan the capability check above read, so doctor
+    // classifies each node exactly once.
+    for entry in irlume_camera::census::census_from(&scan) {
+        dout!(report, "  {}", irlume_camera::census::render_line(&entry));
     }
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------

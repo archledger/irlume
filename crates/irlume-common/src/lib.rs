@@ -1094,6 +1094,39 @@ pub struct CameraRoleDiagnostic {
     pub evidence: Option<CameraStreamRateEvidence>,
 }
 
+/// Whether the IR image node's MS-XU metadata sibling was discoverable during
+/// a diagnostics run (#568).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraIlluminationNode {
+    /// A same-interface sibling above the IR node accepted the UVCM probe.
+    Present,
+    /// No metadata sibling exists, or none accepted the format.
+    Absent,
+}
+
+/// MS-XU illumination metadata stream state for one diagnostics run (#568).
+///
+/// The per-frame counts come from the same bounded gated capture that
+/// produced the delivered-rate evidence. `None` means the capture could not
+/// run, not that the camera reported nothing: a present node with zero
+/// classified frames is the honest "the camera did not say" reading, exactly
+/// as the illumination fallback treats a missing per-frame record.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraIlluminationState {
+    /// Metadata node presence for the IR image node, by UVCM probe.
+    pub node: CameraIlluminationNode,
+    /// Burst frames the camera's illumination metadata classified (lit or
+    /// dark).
+    pub frames_classified: Option<usize>,
+    /// The subset the camera flagged lit (the illuminator fired).
+    pub frames_lit: Option<usize>,
+    /// True only when the camera flagged both a lit and a dark frame, so
+    /// `frames_lit < frames_classified` is a real emitter-off observation
+    /// rather than absent records.
+    pub ambient_observed: Option<bool>,
+}
+
 /// Complete machine diagnostic report for [`Response::CameraDiagnostics`].
 ///
 /// Deliberately free of device paths, account identity, and template data.
@@ -1106,6 +1139,11 @@ pub struct CameraDiagnosticsReport {
     pub skew_us: Option<i64>,
     /// Capture strategy used by the diagnostic (`"burst"`, `"streaming"`, …).
     pub capture_strategy: String,
+    /// MS-XU illumination metadata stream state for the IR node. `None` on an
+    /// RGB-only pair (there is no IR node to probe). Reports written before
+    /// #568 deserialize this as `None`.
+    #[serde(default)]
+    pub illumination: Option<CameraIlluminationState>,
 }
 
 /// Crate-wide error type.
@@ -1221,6 +1259,50 @@ mod tests {
             Error::DeliveredRate(inner) => assert_eq!(*inner, evidence),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// The illumination section added by #568 must serialize under its
+    /// documented snake_case names, and a report written before #568 must
+    /// keep parsing with the section reading as absent rather than failing.
+    #[test]
+    fn camera_diagnostics_report_carries_and_survives_without_the_illumination_section() {
+        use super::{
+            CameraDiagnosticsReport, CameraIlluminationNode, CameraIlluminationState,
+            CameraRoleDiagnostic,
+        };
+
+        let role = CameraRoleDiagnostic {
+            known: true,
+            state: "measured".to_string(),
+            evidence: None,
+        };
+        let report = CameraDiagnosticsReport {
+            rgb: role.clone(),
+            ir: role,
+            skew_us: None,
+            capture_strategy: "burst".to_string(),
+            illumination: Some(CameraIlluminationState {
+                node: CameraIlluminationNode::Present,
+                frames_classified: Some(12),
+                frames_lit: Some(5),
+                ambient_observed: Some(true),
+            }),
+        };
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["illumination"]["node"], "present");
+        assert_eq!(json["illumination"]["frames_classified"], 12);
+        assert_eq!(json["illumination"]["frames_lit"], 5);
+        assert_eq!(json["illumination"]["ambient_observed"], true);
+
+        let legacy = serde_json::json!({
+            "rgb": {"known": true, "state": "measured"},
+            "ir": {"known": false, "state": "missing"},
+            "skew_us": null,
+            "capture_strategy": "burst",
+        });
+        let decoded: CameraDiagnosticsReport =
+            serde_json::from_value(legacy).expect("a pre-#568 report keeps parsing");
+        assert_eq!(decoded.illumination, None);
     }
 
     /// The digest a `HashedModel` reports must be the digest of the bytes it

@@ -660,10 +660,10 @@ jobs:
       # committed), then fuzz for a bounded time. Replaying the seeds is a
       # regression gate: an input that once crashed a parser fails CI forever.
       # A crash exits non-zero and fails the job; the input is uploaded below.
-      - name: Fuzz the IPC, envelope, and PCR-signature parsers
+      - name: Fuzz the IPC, envelope, PCR-signature, and UVC-illumination parsers
         working-directory: fuzz
         run: |
-          for t in ipc_request pcr_signature sealed_envelope; do
+          for t in ipc_request pcr_signature sealed_envelope uvc_illumination; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true

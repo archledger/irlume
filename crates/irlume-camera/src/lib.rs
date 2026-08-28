@@ -40,7 +40,11 @@ pub mod frame_provenance;
 mod inventory;
 pub mod ir_dark;
 pub mod ir_emitter;
-mod ir_metadata;
+/// Public because its pure parsing half is attacker-reachable input to a
+/// root daemon and lives in the fuzz workspace
+/// (`fuzz/fuzz_targets/uvc_illumination.rs`, #568); the ioctls and the
+/// stream below it stay crate-internal.
+pub mod ir_metadata;
 pub mod lease;
 mod lifecycle;
 mod media_graph;
@@ -326,6 +330,11 @@ pub struct IrCaptureStats {
     /// always were. Recorded so "the metadata path ran" is something callers
     /// can check rather than assume.
     pub camera_classified_frames: usize,
+    /// The subset of `camera_classified_frames` the camera flagged LIT (#568).
+    /// The difference between the two is the burst's metadata-flagged ambient
+    /// (emitter-off) frames, meaningful only when
+    /// `ambient_observed` is true.
+    pub camera_lit_frames: usize,
     /// The decoded value that means "this pixel was at or above the sensor's
     /// ceiling", or `None` when the negotiated format cannot support that
     /// claim. A caller measuring clipping (#221) must treat `None` as NOT
@@ -3446,12 +3455,12 @@ fn diagnose_rgb_rate(
 /// One bounded, gated diagnostic capture on an IR node.
 fn diagnose_ir_rate(
     device: &str,
-) -> irlume_common::Result<irlume_common::CameraStreamRateEvidence> {
+) -> irlume_common::Result<(irlume_common::CameraStreamRateEvidence, IrCaptureStats)> {
     let camera = IrCamera::open(device)?;
     let mut session = camera.session()?;
-    let (frame, _stats) = session.capture_with_stats()?;
+    let (frame, stats) = session.capture_with_stats()?;
     let evidence = frame.provenance().rate_evidence();
-    Ok(rate_evidence_to_common(&evidence))
+    Ok((rate_evidence_to_common(&evidence), stats))
 }
 
 fn role_diagnostic(
@@ -3477,12 +3486,37 @@ fn role_diagnostic(
     }
 }
 
-/// Machine-readable delivered-rate diagnostics for a camera pair (issue #462).
+/// Assemble the #568 illumination section of a diagnostics report: metadata
+/// node presence from the UVCM probe, per-frame classification from the same
+/// bounded capture that produced the delivered-rate evidence. `None` stats
+/// mean the capture could not run, and read as not-measured, never as zero.
+fn illumination_state(
+    presence: capture_qualification::IlluminationMetadataPresence,
+    stats: Option<&IrCaptureStats>,
+) -> irlume_common::CameraIlluminationState {
+    irlume_common::CameraIlluminationState {
+        node: match presence {
+            capture_qualification::IlluminationMetadataPresence::Present => {
+                irlume_common::CameraIlluminationNode::Present
+            }
+            capture_qualification::IlluminationMetadataPresence::Absent => {
+                irlume_common::CameraIlluminationNode::Absent
+            }
+        },
+        frames_classified: stats.map(|stats| stats.camera_classified_frames),
+        frames_lit: stats.map(|stats| stats.camera_lit_frames),
+        ambient_observed: stats.map(|stats| stats.ambient_observed),
+    }
+}
+
+/// Machine-readable delivered-rate diagnostics for a camera pair (issue #462),
+/// plus the MS-XU illumination metadata stream state of the IR node (#568).
 ///
 /// Runs the ordinary gated capture session per present role and reports the
 /// measured evidence: an under-rate stream is a measured `fail`, never
-/// degraded to prose. `ir` is `None` on an RGB-only device. No device path,
-/// account identity, or template data is exposed.
+/// degraded to prose. `ir` is `None` on an RGB-only device, in which case the
+/// illumination section is absent too. No device path, account identity, or
+/// template data is exposed.
 ///
 /// # Errors
 ///
@@ -3494,13 +3528,25 @@ pub fn camera_rate_diagnostics(
     ir: Option<&str>,
 ) -> irlume_common::Result<irlume_common::CameraDiagnosticsReport> {
     let rgb_diag = role_diagnostic(true, diagnose_rgb_rate(rgb));
-    let ir_diag = match ir {
-        Some(node) => role_diagnostic(true, diagnose_ir_rate(node)),
-        None => irlume_common::CameraRoleDiagnostic {
-            known: false,
-            state: "missing".into(),
-            evidence: None,
-        },
+    let (ir_diag, illumination) = match ir {
+        Some(node) => {
+            let presence =
+                ir_metadata::presence_from_discovered(ir_metadata::metadata_node_for(node));
+            let result = diagnose_ir_rate(node);
+            let stats = result.as_ref().ok().map(|(_, stats)| stats.clone());
+            (
+                role_diagnostic(true, result.map(|(evidence, _)| evidence)),
+                Some(illumination_state(presence, stats.as_ref())),
+            )
+        }
+        None => (
+            irlume_common::CameraRoleDiagnostic {
+                known: false,
+                state: "missing".into(),
+                evidence: None,
+            },
+            None,
+        ),
     };
     let skew_us = match (&rgb_diag.evidence, &ir_diag.evidence) {
         (Some(r), Some(i)) if r.clock == i.clock && r.source == i.source => {
@@ -3513,6 +3559,7 @@ pub fn camera_rate_diagnostics(
         ir: ir_diag,
         skew_us,
         capture_strategy: "burst".into(),
+        illumination,
     })
 }
 
@@ -5444,6 +5491,7 @@ impl IrSession<'_> {
                         .any(|f| matches!(f, Some(ir_metadata::Illumination::Dark))),
                 burst_frames: IR_BURST,
                 camera_classified_frames: from_camera,
+                camera_lit_frames: ir_metadata::count_lit(&flags),
                 white_level,
             },
         ))
@@ -6883,6 +6931,9 @@ pub fn measure_capture_qualification_with_progress(
         qualification_arm(&report.concurrent, requested_rounds)?,
         report.trailing_sequential_control,
         outcome,
+        Some(ir_metadata::presence_from_discovered(
+            ir_metadata::metadata_node_for(ir_dev),
+        )),
     )
     .map_err(|error| Error::Hardware(format!("capture qualification evidence: {error}")))?;
     Ok(CaptureQualificationMeasurement {
@@ -8560,6 +8611,36 @@ mod tests {
         assert_eq!(illumination_provenance(Some(Lit)), ActiveIr);
         assert_eq!(illumination_provenance(Some(Dark)), Ambient);
         assert_eq!(illumination_provenance(None), Unknown);
+    }
+
+    /// #568: the diagnostics section must carry what the probe and the burst
+    /// actually observed, and must distinguish "capture could not run" (None
+    /// counts) from "camera classified nothing" (Some(0)).
+    #[test]
+    fn illumination_state_maps_presence_and_burst_stats_faithfully() {
+        use capture_qualification::IlluminationMetadataPresence::{Absent, Present};
+
+        let stats = IrCaptureStats {
+            lit_mean: 90.0,
+            ambient_mean: 12.0,
+            ambient_observed: true,
+            burst_frames: 8,
+            camera_classified_frames: 12,
+            camera_lit_frames: 5,
+            white_level: None,
+            saturation_frame: None,
+        };
+        let state = illumination_state(Present, Some(&stats));
+        assert_eq!(state.node, irlume_common::CameraIlluminationNode::Present);
+        assert_eq!(state.frames_classified, Some(12));
+        assert_eq!(state.frames_lit, Some(5));
+        assert_eq!(state.ambient_observed, Some(true));
+
+        let bare = illumination_state(Absent, None);
+        assert_eq!(bare.node, irlume_common::CameraIlluminationNode::Absent);
+        assert_eq!(bare.frames_classified, None);
+        assert_eq!(bare.frames_lit, None);
+        assert_eq!(bare.ambient_observed, None);
     }
 
     #[test]
@@ -11636,6 +11717,7 @@ mod tests {
             ambient_observed: false,
             burst_frames: 8,
             camera_classified_frames: 0,
+            camera_lit_frames: 0,
             white_level: None,
             saturation_frame: None,
         }

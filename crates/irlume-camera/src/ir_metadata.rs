@@ -206,8 +206,11 @@ fn vidioc_streamoff() -> libc::c_ulong {
 // ---------------------------------------------------------------------------
 
 /// One frame's worth of illumination, as the camera reported it.
+///
+/// Public for the fuzz harness only (#568); production consumers go through
+/// the capture path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Illumination {
+pub enum Illumination {
     /// The illuminator fired for this frame.
     Lit,
     /// The illuminator did not fire; this frame is the ambient exposure.
@@ -235,7 +238,12 @@ pub(crate) enum Illumination {
 ///
 /// Returns `None` when the buffer carries no illumination record, which is
 /// normal for the first frame after `STREAMON` and must not be read as "dark".
-pub(crate) fn parse_illumination(buf: &[u8]) -> Option<Illumination> {
+///
+/// Public for the fuzz harness only (#568): uvcvideo permits partial first
+/// metadata buffers (fixed only in the 6.12.97-era "Avoid partial metadata
+/// buffers" series), and a camera is external hardware, so this parses
+/// attacker-reachable bytes for a root daemon and must never panic.
+pub fn parse_illumination(buf: &[u8]) -> Option<Illumination> {
     let mut at = 0usize;
     while at + UVC_META_BUF_HEADER <= buf.len() {
         let length = usize::from(buf[at + 10]);
@@ -306,7 +314,9 @@ fn illumination_in_header(body: &[u8], flags: u8) -> Option<Illumination> {
 ///
 /// Falls back to the brightest frame overall when no frame was flagged lit,
 /// which covers a camera that reports no illumination records at all.
-pub(crate) fn brightest_lit(means: &[f64], flags: &[Option<Illumination>]) -> Option<usize> {
+///
+/// Public for the fuzz harness only (#568).
+pub fn brightest_lit(means: &[f64], flags: &[Option<Illumination>]) -> Option<usize> {
     let eligible = |i: usize| matches!(flags.get(i), Some(Some(Illumination::Lit)));
     let any_lit = (0..means.len()).any(eligible);
     // Strictly-greater keeps the FIRST frame holding the maximum, matching the
@@ -811,7 +821,7 @@ fn zeroed_buffer(index: u32) -> V4l2Buffer {
 /// stream the kernel registers the metadata node immediately AFTER its image
 /// node (measured on the Brio's media topology: entity pairs 1/4 and 7/10),
 /// so the right sibling is the lowest-numbered one ABOVE the image node.
-fn metadata_node_for(ir_device: &str) -> Option<String> {
+pub(crate) fn metadata_node_for(ir_device: &str) -> Option<String> {
     // Diagnostic kill switch, added while working #187's hardware session.
     // Absence of the variable changes nothing.
     if std::env::var_os("IRLUME_NO_ILLUM_META").is_some_and(|v| v == "1") {
@@ -830,6 +840,31 @@ fn metadata_node_for(ir_device: &str) -> Option<String> {
         );
     }
     found
+}
+
+/// How many burst frames the camera itself flagged lit (#568 diagnostics).
+pub(crate) fn count_lit(flags: &[Option<Illumination>]) -> usize {
+    flags
+        .iter()
+        .filter(|flag| matches!(flag, Some(Illumination::Lit)))
+        .count()
+}
+
+/// Map a discovered metadata node onto qualification-record evidence (#568).
+///
+/// `Some(node)` from [`metadata_node_for`] means a same-interface sibling
+/// above the image node accepted the UVCM probe; `None` covers every other
+/// outcome (no node, format refused, kill switch). Presence, not the node
+/// path: `/dev/videoN` numbering is not stable across reboots and a reshuffle
+/// must never look like a hardware change.
+pub(crate) fn presence_from_discovered(
+    found: Option<String>,
+) -> crate::capture_qualification::IlluminationMetadataPresence {
+    if found.is_some() {
+        crate::capture_qualification::IlluminationMetadataPresence::Present
+    } else {
+        crate::capture_qualification::IlluminationMetadataPresence::Absent
+    }
 }
 
 /// The sibling that is this image node's OWN metadata node: the FIRST
@@ -950,6 +985,30 @@ fn offers_uvcm(node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture_qualification::IlluminationMetadataPresence;
+
+    #[test]
+    fn a_discovered_node_maps_to_present_and_no_node_to_absent() {
+        assert_eq!(
+            presence_from_discovered(Some("/dev/video3".into())),
+            IlluminationMetadataPresence::Present
+        );
+        assert_eq!(
+            presence_from_discovered(None),
+            IlluminationMetadataPresence::Absent
+        );
+    }
+
+    #[test]
+    fn counting_lit_flags_counts_only_the_frames_the_camera_called_lit() {
+        use Illumination::{Dark, Lit};
+        assert_eq!(
+            count_lit(&[Some(Lit), None, Some(Dark), Some(Lit), None]),
+            2
+        );
+        assert_eq!(count_lit(&[None, None]), 0);
+        assert_eq!(count_lit(&[]), 0);
+    }
 
     /// #310, the Brio layout: four nodes on ONE interface, so the IR node's
     /// same-interface candidates include the RGB stream's metadata queue at a

@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **MS-XU illumination metadata is a recorded, reportable, fuzzed pipeline
+  capability.** Camera qualification measurements now record whether the IR
+  node's Microsoft-metadata sibling was discoverable (a `TRY_FMT` probe;
+  presence only, never the unstable `/dev/videoN` path). The fact lives as
+  evidence on the qualification attempt, where it cannot invalidate stored
+  authority: records written before this change keep authorizing the pairs
+  they always did, and cameras without metadata nodes are unaffected.
+  `irlume camera diagnostics --json` gains an `illumination` section (node
+  present or absent, frames the camera classified, the subset it flagged
+  lit, whether a real emitter-off frame was observed), harvested from the
+  same bounded capture that measures delivered rate. The parser for those
+  camera-supplied bytes is now a fuzz target (`uvc_illumination`): uvcvideo
+  permitted partial first metadata buffers until the 6.12.97-era "Avoid
+  partial metadata buffers" fix, so the records are untrusted input to a
+  root daemon, replayed from checked-in seeds on every CI run.
 - **`doctor` recognizes the IPU3 generation and the verified MIPI camera
   bridge class.** A cameraless machine now gets an honest explanation for
   two more classes instead of a bare "no camera": IPU3 CIO2 systems (the

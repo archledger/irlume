@@ -970,6 +970,24 @@ pub enum AttemptOutcome {
     Inconclusive(InconclusiveReason),
 }
 
+/// Whether the IR image node's MS-XU metadata sibling was discoverable when
+/// a measurement ran (#568).
+///
+/// Evidence, never authorization: this is recorded on the attempt so a
+/// support reader can tell a metadata-capable pair from a metadata-less one,
+/// and deliberately NOT on [`QualificationContext`], whose equality and
+/// runtime key gate stored authority. A camera gaining or losing its
+/// metadata node cannot invalidate a stored qualification, because
+/// illumination ingestion is opportunistic by design.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IlluminationMetadataPresence {
+    /// A same-interface sibling above the IR node offered the UVCM format.
+    Present,
+    /// No sibling offered it, or the diagnostic kill switch was set.
+    Absent,
+}
+
 /// One measurement and all evidence needed to interpret it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QualificationAttempt {
@@ -980,6 +998,9 @@ pub struct QualificationAttempt {
     concurrent: ArmEvidence,
     trailing_sequential_control: bool,
     outcome: AttemptOutcome,
+    /// MS-XU illumination metadata node presence for the IR endpoint.
+    /// `None` means "not recorded" (every record written before #568).
+    ir_illumination_metadata: Option<IlluminationMetadataPresence>,
 }
 
 impl QualificationAttempt {
@@ -995,6 +1016,7 @@ impl QualificationAttempt {
         concurrent: ArmEvidence,
         trailing_sequential_control: bool,
         outcome: AttemptOutcome,
+        ir_illumination_metadata: Option<IlluminationMetadataPresence>,
     ) -> Result<Self, QualificationError> {
         let value = Self {
             producer_engine_version: PRODUCER_ENGINE_VERSION,
@@ -1004,9 +1026,17 @@ impl QualificationAttempt {
             concurrent,
             trailing_sequential_control,
             outcome,
+            ir_illumination_metadata,
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// MS-XU illumination metadata node presence observed for the IR endpoint,
+    /// or `None` when the attempt predates #568.
+    #[must_use]
+    pub const fn ir_illumination_metadata(&self) -> Option<IlluminationMetadataPresence> {
+        self.ir_illumination_metadata
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
@@ -1610,6 +1640,13 @@ mod tests {
     }
 
     fn concurrent_attempt(port: &str) -> QualificationAttempt {
+        concurrent_attempt_with_presence(port, None)
+    }
+
+    fn concurrent_attempt_with_presence(
+        port: &str,
+        ir_illumination_metadata: Option<IlluminationMetadataPresence>,
+    ) -> QualificationAttempt {
         QualificationAttempt::new(
             1_786_944_000,
             context(port),
@@ -1617,6 +1654,7 @@ mod tests {
             arm(6),
             false,
             AttemptOutcome::ConcurrentQualified,
+            ir_illumination_metadata,
         )
         .unwrap()
     }
@@ -1640,6 +1678,68 @@ mod tests {
             decoded.resolve(&moved),
             QualificationResolution::Unqualified(QualificationMismatch::ContextChanged)
         ));
+    }
+
+    #[test]
+    fn illumination_metadata_presence_round_trips_and_names_the_wire_field() {
+        let attempt = concurrent_attempt_with_presence(
+            "/devices/pci0000:00/usb3/3-2",
+            Some(IlluminationMetadataPresence::Present),
+        );
+        assert_eq!(
+            attempt.ir_illumination_metadata(),
+            Some(IlluminationMetadataPresence::Present)
+        );
+        let record = CaptureQualificationRecord::new(7, attempt.clone(), Some(attempt)).unwrap();
+        let body = record.to_json().unwrap();
+        assert!(
+            body.contains("\"ir_illumination_metadata\": \"present\""),
+            "the wire field must keep its documented name: {body}"
+        );
+        let decoded = CaptureQualificationRecord::from_json(body.as_bytes()).unwrap();
+        assert_eq!(
+            decoded.authoritative().unwrap().ir_illumination_metadata(),
+            Some(IlluminationMetadataPresence::Present)
+        );
+    }
+
+    /// Records written before #568 carry no illumination-metadata field at
+    /// all. They must keep parsing, keep their authority, and simply read as
+    /// "not recorded": the presence is evidence on the attempt, never part of
+    /// the context equality that gates authorization.
+    #[test]
+    fn legacy_records_without_illumination_metadata_still_authorize() {
+        let port = "/devices/pci0000:00/usb3/3-2";
+        let recorded =
+            concurrent_attempt_with_presence(port, Some(IlluminationMetadataPresence::Present));
+        let record =
+            CaptureQualificationRecord::new(7, recorded.clone(), Some(recorded.clone())).unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&record.to_json().unwrap()).unwrap();
+        for attempt in ["last_attempt", "authoritative"] {
+            legacy[attempt]
+                .as_object_mut()
+                .unwrap()
+                .remove("ir_illumination_metadata");
+        }
+        let legacy = serde_json::to_vec(&legacy).unwrap();
+
+        let decoded = CaptureQualificationRecord::from_json(&legacy)
+            .expect("a pre-#568 record must keep parsing");
+        assert_eq!(
+            decoded.authoritative().unwrap().ir_illumination_metadata(),
+            None,
+            "a stripped record reads as not-recorded, never as absent hardware"
+        );
+        assert_eq!(
+            decoded.resolve(recorded.context()),
+            QualificationResolution::ConcurrentQualified,
+            "metadata presence must not gate stored authority"
+        );
+        let without_field = concurrent_attempt_with_presence(port, None);
+        let expected =
+            CaptureQualificationRecord::new(7, without_field.clone(), Some(without_field)).unwrap();
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -1674,6 +1774,7 @@ mod tests {
             .unwrap(),
             false,
             AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds),
+            None,
         )
         .unwrap();
 
@@ -1723,6 +1824,7 @@ mod tests {
                 partial_rate_failure,
                 false,
                 AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+                None,
             )
             .is_err(),
             "one rate-failed frame cannot authorize a six-round sequential verdict"
@@ -1737,6 +1839,7 @@ mod tests {
                 typed_rate_shortfall,
                 true,
                 AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+                None,
             )
             .is_ok(),
             "six typed concurrent rate failures plus a healthy trailing control are authority"
@@ -1912,6 +2015,7 @@ mod tests {
             .unwrap(),
             false,
             AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds),
+            None,
         )
         .unwrap();
 

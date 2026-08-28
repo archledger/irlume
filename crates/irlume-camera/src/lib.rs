@@ -7715,8 +7715,18 @@ impl ContinuityCursor {
 /// one fired. The string is the journal/verdict vocabulary; stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContinuityFact {
-    RgbWithinRound,
-    IrWithinRound,
+    RgbTimestampClock,
+    RgbTimestampDiscontinuity,
+    RgbSequenceDiscontinuity,
+    RgbSequenceGap,
+    RgbRateGap,
+    RgbAggregateDrops,
+    IrTimestampClock,
+    IrTimestampDiscontinuity,
+    IrSequenceDiscontinuity,
+    IrSequenceGap,
+    IrRateGap,
+    IrAggregateDrops,
     RgbStreamEpochChanged,
     RgbDropsAdvanced,
     RgbTimestampStalled,
@@ -7728,8 +7738,18 @@ enum ContinuityFact {
 impl ContinuityFact {
     fn as_str(self) -> &'static str {
         match self {
-            Self::RgbWithinRound => "rgb stream discontinuous within the round",
-            Self::IrWithinRound => "ir stream discontinuous within the round",
+            Self::RgbTimestampClock => "rgb timestamp clock was not monotonic within the round",
+            Self::RgbTimestampDiscontinuity => "rgb timestamp discontinuity within the round",
+            Self::RgbSequenceDiscontinuity => "rgb sequence discontinuity within the round",
+            Self::RgbSequenceGap => "rgb sequence gap within the round",
+            Self::RgbRateGap => "rgb rate-window sequence gap within the round",
+            Self::RgbAggregateDrops => "rgb aggregate dropped a contributor within the round",
+            Self::IrTimestampClock => "ir timestamp clock was not monotonic within the round",
+            Self::IrTimestampDiscontinuity => "ir timestamp discontinuity within the round",
+            Self::IrSequenceDiscontinuity => "ir sequence discontinuity within the round",
+            Self::IrSequenceGap => "ir sequence gap within the round",
+            Self::IrRateGap => "ir rate-window sequence gap within the round",
+            Self::IrAggregateDrops => "ir aggregate dropped a contributor within the round",
             Self::RgbStreamEpochChanged => {
                 "rgb stream_epoch changed (stream recreated between rounds)"
             }
@@ -7753,9 +7773,11 @@ impl PairContinuityState {
     ) -> Option<ContinuityFact> {
         let rgb_current = ContinuityCursor::from_provenance(rgb);
         let ir_current = ContinuityCursor::from_provenance(ir);
+        let rgb_within = WithinRound::from_provenance(rgb);
+        let ir_within = WithinRound::from_provenance(ir);
         let fact = continuity_fact(
-            rgb.is_continuous(),
-            ir.is_continuous(),
+            &rgb_within,
+            &ir_within,
             self.rgb,
             rgb_current,
             self.ir,
@@ -7771,20 +7793,18 @@ impl PairContinuityState {
 /// conditions failed, in check order (within-round first, then the
 /// cross-round cursors, RGB before IR). Testable without provenance mocks.
 fn continuity_fact(
-    rgb_continuous: bool,
-    ir_continuous: bool,
+    rgb_within: &WithinRound,
+    ir_within: &WithinRound,
     rgb_previous: Option<ContinuityCursor>,
     rgb_current: ContinuityCursor,
     ir_previous: Option<ContinuityCursor>,
     ir_current: ContinuityCursor,
 ) -> Option<ContinuityFact> {
-    if !rgb_continuous {
-        return Some(ContinuityFact::RgbWithinRound);
-    }
-    if !ir_continuous {
-        return Some(ContinuityFact::IrWithinRound);
-    }
-    cursor_fact(rgb_previous, rgb_current, Stream::Rgb)
+    // Within-round sub-conditions first (matching is_continuous's gate
+    // order), then the cross-round cursor facts, RGB before IR.
+    within_round_fact(Stream::Rgb, rgb_within)
+        .or_else(|| within_round_fact(Stream::Ir, ir_within))
+        .or_else(|| cursor_fact(rgb_previous, rgb_current, Stream::Rgb))
         .or_else(|| cursor_fact(ir_previous, ir_current, Stream::Ir))
 }
 
@@ -7792,6 +7812,126 @@ fn continuity_fact(
 enum Stream {
     Rgb,
     Ir,
+}
+
+/// The within-round sub-conditions of [`frame_provenance::RuntimeFrameProvenance::is_continuous`],
+/// as one flat summary either stream's provenance can produce. Pure core
+/// below; the extraction from Single/Aggregate lives in
+/// [`Self::from_provenance`].
+#[derive(Clone, Copy, Debug)]
+struct WithinRound {
+    clock_monotonic: bool,
+    timestamp_discontinuity: bool,
+    sequence_discontinuity: bool,
+    sequence_gap: u64,
+    rate_gap: u64,
+    aggregate_drops: u64,
+}
+
+impl WithinRound {
+    const CLEAN: Self = Self {
+        clock_monotonic: true,
+        timestamp_discontinuity: false,
+        sequence_discontinuity: false,
+        sequence_gap: 0,
+        rate_gap: 0,
+        aggregate_drops: 0,
+    };
+}
+
+impl Default for WithinRound {
+    fn default() -> Self {
+        Self::CLEAN
+    }
+}
+
+impl WithinRound {
+    fn from_single(single: &frame_provenance::SingleFrameProvenance) -> Self {
+        Self {
+            clock_monotonic: single.timestamp().clock()
+                == frame_provenance::TimestampClock::Monotonic,
+            timestamp_discontinuity: single.timestamp().discontinuity(),
+            sequence_discontinuity: single.sequence().discontinuity(),
+            sequence_gap: u64::from(single.sequence().gap()),
+            rate_gap: u64::from(single.rate_evidence().sequence_gap()),
+            aggregate_drops: 0,
+        }
+    }
+
+    fn from_provenance(provenance: &frame_provenance::RuntimeFrameProvenance) -> Self {
+        use frame_provenance::RuntimeFrameProvenance;
+        match provenance {
+            RuntimeFrameProvenance::Single(single) => Self::from_single(single),
+            RuntimeFrameProvenance::Aggregate(aggregate) => {
+                // For the aggregate, the worst contributor plus the
+                // aggregate-level facts is the honest summary: whichever
+                // condition fired is what the summary must name.
+                let mut worst = contributors_worst(aggregate);
+                worst.aggregate_drops = aggregate.drops_within();
+                worst.sequence_gap = worst.sequence_gap.max(u64::from(aggregate.worst_gap()));
+                worst
+            }
+        }
+    }
+}
+
+fn contributors_worst(aggregate: &frame_provenance::AggregateFrameProvenance) -> WithinRound {
+    let mut worst = WithinRound {
+        clock_monotonic: true,
+        ..WithinRound::default()
+    };
+    for contributor in aggregate.contributors() {
+        let summary = WithinRound::from_single(contributor);
+        worst.clock_monotonic &= summary.clock_monotonic;
+        worst.timestamp_discontinuity |= summary.timestamp_discontinuity;
+        worst.sequence_discontinuity |= summary.sequence_discontinuity;
+        worst.sequence_gap = worst.sequence_gap.max(summary.sequence_gap);
+        worst.rate_gap = worst.rate_gap.max(summary.rate_gap);
+    }
+    worst
+}
+
+/// Which within-round sub-condition broke continuity, in `is_continuous`
+/// order. Pure over the summary.
+fn within_round_fact(stream: Stream, summary: &WithinRound) -> Option<ContinuityFact> {
+    let pick = |rgb: ContinuityFact, ir: ContinuityFact| match stream {
+        Stream::Rgb => rgb,
+        Stream::Ir => ir,
+    };
+    if !summary.clock_monotonic {
+        return Some(pick(
+            ContinuityFact::RgbTimestampClock,
+            ContinuityFact::IrTimestampClock,
+        ));
+    }
+    if summary.timestamp_discontinuity {
+        return Some(pick(
+            ContinuityFact::RgbTimestampDiscontinuity,
+            ContinuityFact::IrTimestampDiscontinuity,
+        ));
+    }
+    if summary.sequence_discontinuity {
+        return Some(pick(
+            ContinuityFact::RgbSequenceDiscontinuity,
+            ContinuityFact::IrSequenceDiscontinuity,
+        ));
+    }
+    if summary.sequence_gap > 0 {
+        return Some(pick(
+            ContinuityFact::RgbSequenceGap,
+            ContinuityFact::IrSequenceGap,
+        ));
+    }
+    if summary.rate_gap > 0 {
+        return Some(pick(ContinuityFact::RgbRateGap, ContinuityFact::IrRateGap));
+    }
+    if summary.aggregate_drops > 0 {
+        return Some(pick(
+            ContinuityFact::RgbAggregateDrops,
+            ContinuityFact::IrAggregateDrops,
+        ));
+    }
+    None
 }
 
 fn cursor_fact(
@@ -8680,7 +8820,8 @@ mod tests {
     /// classifier must pick the right one, in check order, for every shape.
     #[test]
     fn continuity_fact_names_every_failure_shape() {
-        use super::{continuity_fact, ContinuityCursor, ContinuityFact};
+        use super::{continuity_fact, ContinuityCursor, ContinuityFact, WithinRound};
+        let clean = WithinRound::default();
         let cursor = |epoch, drops, ts| ContinuityCursor {
             stream_epoch: epoch,
             cumulative_drops: drops,
@@ -8689,8 +8830,8 @@ mod tests {
         // Clean round: nothing to report.
         assert_eq!(
             continuity_fact(
-                true,
-                true,
+                &clean,
+                &clean,
                 Some(cursor(0, 0, 100)),
                 cursor(0, 0, 200),
                 Some(cursor(0, 0, 100)),
@@ -8698,20 +8839,69 @@ mod tests {
             ),
             None
         );
-        // Within-round stream break beats everything else, RGB first.
+        // Within-round stream breaks beat cross-round facts, RGB first, and
+        // the SUB-condition is named: each of the five, in gate order.
         assert_eq!(
-            continuity_fact(false, true, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
-            Some(ContinuityFact::RgbWithinRound)
+            continuity_fact(
+                &clean,
+                &clean,
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200),
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200)
+            ),
+            None,
+            "clean summaries report nothing even though clock_monotonic defaults false"
+        );
+        let clock = super::WithinRound {
+            clock_monotonic: false,
+            ..clean
+        };
+        assert_eq!(
+            continuity_fact(&clock, &clean, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::RgbTimestampClock)
         );
         assert_eq!(
-            continuity_fact(true, false, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
-            Some(ContinuityFact::IrWithinRound)
+            continuity_fact(&clean, &clock, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::IrTimestampClock)
+        );
+        let ts = super::WithinRound {
+            timestamp_discontinuity: true,
+            ..clean
+        };
+        assert_eq!(
+            continuity_fact(&ts, &clean, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::RgbTimestampDiscontinuity)
+        );
+        let seq = super::WithinRound {
+            sequence_discontinuity: true,
+            ..clean
+        };
+        assert_eq!(
+            continuity_fact(&seq, &clean, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::RgbSequenceDiscontinuity)
+        );
+        let gap = super::WithinRound {
+            sequence_gap: 2,
+            ..clean
+        };
+        assert_eq!(
+            continuity_fact(&gap, &clean, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::RgbSequenceGap)
+        );
+        let rate = super::WithinRound {
+            rate_gap: 1,
+            ..clean
+        };
+        assert_eq!(
+            continuity_fact(&rate, &clean, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::RgbRateGap)
         );
         // Cross-round cursor facts, RGB before IR at equal severity.
         assert_eq!(
             continuity_fact(
-                true,
-                true,
+                &clean,
+                &clean,
                 Some(cursor(1, 0, 100)),
                 cursor(2, 0, 200),
                 Some(cursor(0, 0, 100)),
@@ -8721,8 +8911,8 @@ mod tests {
         );
         assert_eq!(
             continuity_fact(
-                true,
-                true,
+                &clean,
+                &clean,
                 Some(cursor(0, 0, 100)),
                 cursor(0, 3, 200),
                 Some(cursor(0, 0, 100)),
@@ -8732,8 +8922,8 @@ mod tests {
         );
         assert_eq!(
             continuity_fact(
-                true,
-                true,
+                &clean,
+                &clean,
                 Some(cursor(0, 0, 200)),
                 cursor(0, 0, 200),
                 Some(cursor(0, 0, 100)),
@@ -8743,8 +8933,8 @@ mod tests {
         );
         assert_eq!(
             continuity_fact(
-                true,
-                true,
+                &clean,
+                &clean,
                 Some(cursor(0, 0, 100)),
                 cursor(0, 0, 200),
                 Some(cursor(0, 0, 100)),
@@ -8754,8 +8944,8 @@ mod tests {
         );
         assert_eq!(
             continuity_fact(
-                true,
-                true,
+                &clean,
+                &clean,
                 Some(cursor(0, 0, 100)),
                 cursor(0, 0, 200),
                 Some(cursor(0, 0, 300)),
@@ -8765,7 +8955,7 @@ mod tests {
         );
         // First round (no previous cursor) is continuous by definition.
         assert_eq!(
-            continuity_fact(true, true, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            continuity_fact(&clean, &clean, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
             None
         );
     }

@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Docs: the XFCE lock screen is recorded as unsupported for face unlock,
+  with the measured reason.** xfce4-screensaver pre-starts its PAM
+  conversation at lock-open and auto-answers module prompts, so a
+  consent-gated module fires the camera with zero user action (any typed
+  submit included, correct password among them), never displays prompt
+  text, and refuses empty-field submits; the privacy rule cannot hold
+  there, so no recipe ships for it. Every other XFCE surface works
+  (LightDM greeter, sudo, polkit). Reported upstream; any prompt-based
+  PAM module misfires the same way on this dialog.
+
 - **Per-round continuity facts: a failing concurrent qualification now says
   WHICH condition fired (#586).** The round-continuity verdict is four
   nameable conditions (a within-round stream break on either sensor, and

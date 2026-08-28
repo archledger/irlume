@@ -3,6 +3,21 @@
 What irlume does not do, and the measurements behind each statement. The
 summary lives on the [README](../README.md); this is the detail.
 
+- **Face unlock does not work on the XFCE lock screen (xfce4-screensaver),
+  by design.** The screensaver pre-starts its PAM conversation the moment
+  the lock engages and auto-answers module prompts without user action, so
+  a consent-gated module like pam_irlume fires the camera the instant the
+  lock opens, with no keystroke and with any typed input, correct password
+  included; the dialog also never displays the module's prompt text, and it
+  refuses to submit an empty field, which rules out the on-demand
+  empty-Enter gesture too. Measured on Manjaro XFCE with instrumented
+  runs: the face attempt starts at lock-open, denies cleanly when the
+  camera is covered (the password then unlocks), and the privacy rule
+  "typing your password never triggers a camera" cannot be upheld on this
+  dialog. Every other surface on XFCE works (LightDM greeter on-demand,
+  `sudo`, polkit). The screensaver inherits its conversation style from
+  GNOME-screensaver; any prompt-based PAM module (challenge-response, one
+  time codes) misfires the same way there, which is reported upstream.
 - **A glossy printed photo defeats the built-in gate.** The
   [2026-06-30 self-test](pad-results/2026-06-30-ir-liveness-selftest.md)
   accepted a life-size vinyl print in 69 of 70 presentations. The cue is a

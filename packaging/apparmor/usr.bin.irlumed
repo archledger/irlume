@@ -152,6 +152,13 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # Config + state: enrollments (per-user), template keys, recovery blobs.
   /etc/irlume/ r,
   /etc/irlume/** rw,
+  # Config writes serialize on a lock file beside the config (config.rs
+  # lock_exclusive). The broad rw rule above grants the lock file's create
+  # and write; flock additionally needs `k`, without which set-cameras
+  # switched the running daemon live but silently failed to persist the pair,
+  # and the next restart reverted it (found enforcing on Arch, 2026-08-28;
+  # issue #580).
+  /etc/irlume/*.lock rwk,
   /home/*/.local/share/irlume/ rw,
   /home/*/.local/share/irlume/** rw,
   /var/lib/irlume/ rw,

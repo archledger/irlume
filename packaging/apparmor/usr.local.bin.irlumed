@@ -117,6 +117,10 @@ profile irlumed /usr/local/bin/irlumed {
   # Config + state: enrollments (per-user), template keys, recovery blobs.
   /etc/irlume/ r,
   /etc/irlume/** rw,
+  # Config writes serialize on a lock file beside the config (config.rs
+  # lock_exclusive); flock needs `k` on top of the broad rw rule above, or
+  # set-cameras switches live but never persists (issue #580).
+  /etc/irlume/*.lock rwk,
   /home/*/.local/share/irlume/ rw,
   /home/*/.local/share/irlume/** rw,
   /var/lib/irlume/ rw,

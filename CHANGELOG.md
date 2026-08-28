@@ -5,6 +5,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **AppArmor: `set-cameras` could not persist the camera pair.** Config
+  writes serialize on a lock file beside the config (`cameras.conf.lock`),
+  and the shipped `irlumed` profiles granted the lock file's create and
+  write but not `flock`'s `k`, so on an enforcing host `set-cameras`
+  switched the running daemon live, reported success with a persist
+  warning, and the next daemon restart silently reverted the pair. Both
+  profile variants now carry `rwk` on `/etc/irlume/*.lock`, the packaging
+  parity ratchet asserts the rule so the gap cannot re-ship, and the fix is
+  hardware-validated (live patch on the enforcing Arch host completed a
+  persisting `set-cameras` immediately after; issue #580).
+
 ### Added
 
 - **Camera triage docs: the kernel quirk table, first.** DEBUGGING.md gains

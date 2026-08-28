@@ -6420,7 +6420,7 @@ impl CaptureMode {
 }
 
 /// One arm of the contention probe: what a capture produced, averaged.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PairSample {
     pub rgb_mean: f32,
     pub ir_mean: f32,
@@ -6457,6 +6457,11 @@ pub struct PairSample {
     pub capture_failures: usize,
     /// Failed rounds carrying typed delivered-rate-below-floor evidence.
     pub rate_shortfall_failures: usize,
+    /// Per-fact counts of the cross-round continuity failures (#586): which
+    /// of the four nameable conditions fired, and how often. Arm-local
+    /// diagnostic detail; deliberately NOT carried into the persisted
+    /// ArmEvidence, whose schema stays untouched.
+    pub continuity_facts: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl PairSample {
@@ -6491,7 +6496,7 @@ impl PairSample {
 }
 
 /// What the probe measured about capturing both sensors at once.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ContentionReport {
     pub sequential: PairSample,
     pub concurrent: PairSample,
@@ -7705,37 +7710,124 @@ impl ContinuityCursor {
     }
 }
 
+/// Which fact failed a round's cross-round continuity check (#586): the
+/// check is four nameable conditions, and an aggregate counter hides which
+/// one fired. The string is the journal/verdict vocabulary; stable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuityFact {
+    RgbWithinRound,
+    IrWithinRound,
+    RgbStreamEpochChanged,
+    RgbDropsAdvanced,
+    RgbTimestampStalled,
+    IrStreamEpochChanged,
+    IrDropsAdvanced,
+    IrTimestampStalled,
+}
+
+impl ContinuityFact {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RgbWithinRound => "rgb stream discontinuous within the round",
+            Self::IrWithinRound => "ir stream discontinuous within the round",
+            Self::RgbStreamEpochChanged => {
+                "rgb stream_epoch changed (stream recreated between rounds)"
+            }
+            Self::RgbDropsAdvanced => "rgb cumulative_drops advanced between rounds",
+            Self::RgbTimestampStalled => "rgb timestamp did not advance between rounds",
+            Self::IrStreamEpochChanged => {
+                "ir stream_epoch changed (stream recreated between rounds)"
+            }
+            Self::IrDropsAdvanced => "ir cumulative_drops advanced between rounds",
+            Self::IrTimestampStalled => "ir timestamp did not advance between rounds",
+        }
+    }
+}
+
+impl PairContinuityState {
+    /// Like [`Self::observe`], naming WHICH fact failed (`None` = continuous).
+    fn observe_fact(
+        &mut self,
+        rgb: &frame_provenance::RuntimeFrameProvenance,
+        ir: &frame_provenance::RuntimeFrameProvenance,
+    ) -> Option<ContinuityFact> {
+        let rgb_current = ContinuityCursor::from_provenance(rgb);
+        let ir_current = ContinuityCursor::from_provenance(ir);
+        let fact = continuity_fact(
+            rgb.is_continuous(),
+            ir.is_continuous(),
+            self.rgb,
+            rgb_current,
+            self.ir,
+            ir_current,
+        );
+        self.rgb = Some(rgb_current);
+        self.ir = Some(ir_current);
+        fact
+    }
+}
+
+/// The pure core of the round-continuity verdict: which of the four nameable
+/// conditions failed, in check order (within-round first, then the
+/// cross-round cursors, RGB before IR). Testable without provenance mocks.
+fn continuity_fact(
+    rgb_continuous: bool,
+    ir_continuous: bool,
+    rgb_previous: Option<ContinuityCursor>,
+    rgb_current: ContinuityCursor,
+    ir_previous: Option<ContinuityCursor>,
+    ir_current: ContinuityCursor,
+) -> Option<ContinuityFact> {
+    if !rgb_continuous {
+        return Some(ContinuityFact::RgbWithinRound);
+    }
+    if !ir_continuous {
+        return Some(ContinuityFact::IrWithinRound);
+    }
+    cursor_fact(rgb_previous, rgb_current, Stream::Rgb)
+        .or_else(|| cursor_fact(ir_previous, ir_current, Stream::Ir))
+}
+
+#[derive(Clone, Copy)]
+enum Stream {
+    Rgb,
+    Ir,
+}
+
+fn cursor_fact(
+    previous: Option<ContinuityCursor>,
+    current: ContinuityCursor,
+    stream: Stream,
+) -> Option<ContinuityFact> {
+    let previous = previous?;
+    if current.stream_epoch != previous.stream_epoch {
+        return Some(match stream {
+            Stream::Rgb => ContinuityFact::RgbStreamEpochChanged,
+            Stream::Ir => ContinuityFact::IrStreamEpochChanged,
+        });
+    }
+    if current.cumulative_drops != previous.cumulative_drops {
+        return Some(match stream {
+            Stream::Rgb => ContinuityFact::RgbDropsAdvanced,
+            Stream::Ir => ContinuityFact::IrDropsAdvanced,
+        });
+    }
+    if current.latest_timestamp_us <= previous.latest_timestamp_us {
+        return Some(match stream {
+            Stream::Rgb => ContinuityFact::RgbTimestampStalled,
+            Stream::Ir => ContinuityFact::IrTimestampStalled,
+        });
+    }
+    None
+}
+
 #[derive(Debug, Default)]
 struct PairContinuityState {
     rgb: Option<ContinuityCursor>,
     ir: Option<ContinuityCursor>,
 }
 
-impl PairContinuityState {
-    fn observe(
-        &mut self,
-        rgb: &frame_provenance::RuntimeFrameProvenance,
-        ir: &frame_provenance::RuntimeFrameProvenance,
-    ) -> bool {
-        let rgb_current = ContinuityCursor::from_provenance(rgb);
-        let ir_current = ContinuityCursor::from_provenance(ir);
-        let continuous = rgb.is_continuous()
-            && ir.is_continuous()
-            && continuity_advances(self.rgb, rgb_current)
-            && continuity_advances(self.ir, ir_current);
-        self.rgb = Some(rgb_current);
-        self.ir = Some(ir_current);
-        continuous
-    }
-}
-
-fn continuity_advances(previous: Option<ContinuityCursor>, current: ContinuityCursor) -> bool {
-    previous.is_none_or(|previous| {
-        current.stream_epoch == previous.stream_epoch
-            && current.cumulative_drops == previous.cumulative_drops
-            && current.latest_timestamp_us > previous.latest_timestamp_us
-    })
-}
+impl PairContinuityState {}
 
 /// Fold one probe round into a running mean.
 ///
@@ -7793,10 +7885,20 @@ fn accumulate(
     } else {
         into.rate_failures += 1;
     }
-    if continuity.observe(rgb_provenance, ir_provenance) {
-        into.continuous_rounds += 1;
-    } else {
+    if let Some(fact) = continuity.observe_fact(rgb_provenance, ir_provenance) {
         into.continuity_failures += 1;
+        // #586: an aggregate counter cannot say WHICH of the four nameable
+        // conditions fired, and neither could any diagnostic surface. Name it
+        // per round in the journal (visible under `irlume logs debug on`)
+        // and count it for the verdict message.
+        *into.continuity_facts.entry(fact.as_str()).or_insert(0) += 1;
+        irlume_common::dlog!(
+            "qualification round: continuity failed: {} (arm round {})",
+            fact.as_str(),
+            into.rounds + 1
+        );
+    } else {
+        into.continuous_rounds += 1;
     }
     if ir_provenance.illumination() == contracts::IlluminationProvenance::ActiveIr {
         into.active_ir_rounds += 1;
@@ -8574,6 +8676,100 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// #586: the round-continuity verdict is four nameable conditions; the
+    /// classifier must pick the right one, in check order, for every shape.
+    #[test]
+    fn continuity_fact_names_every_failure_shape() {
+        use super::{continuity_fact, ContinuityCursor, ContinuityFact};
+        let cursor = |epoch, drops, ts| ContinuityCursor {
+            stream_epoch: epoch,
+            cumulative_drops: drops,
+            latest_timestamp_us: ts,
+        };
+        // Clean round: nothing to report.
+        assert_eq!(
+            continuity_fact(
+                true,
+                true,
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200),
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200)
+            ),
+            None
+        );
+        // Within-round stream break beats everything else, RGB first.
+        assert_eq!(
+            continuity_fact(false, true, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::RgbWithinRound)
+        );
+        assert_eq!(
+            continuity_fact(true, false, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            Some(ContinuityFact::IrWithinRound)
+        );
+        // Cross-round cursor facts, RGB before IR at equal severity.
+        assert_eq!(
+            continuity_fact(
+                true,
+                true,
+                Some(cursor(1, 0, 100)),
+                cursor(2, 0, 200),
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200)
+            ),
+            Some(ContinuityFact::RgbStreamEpochChanged)
+        );
+        assert_eq!(
+            continuity_fact(
+                true,
+                true,
+                Some(cursor(0, 0, 100)),
+                cursor(0, 3, 200),
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200)
+            ),
+            Some(ContinuityFact::RgbDropsAdvanced)
+        );
+        assert_eq!(
+            continuity_fact(
+                true,
+                true,
+                Some(cursor(0, 0, 200)),
+                cursor(0, 0, 200),
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 300)
+            ),
+            Some(ContinuityFact::RgbTimestampStalled)
+        );
+        assert_eq!(
+            continuity_fact(
+                true,
+                true,
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200),
+                Some(cursor(0, 0, 100)),
+                cursor(0, 2, 200)
+            ),
+            Some(ContinuityFact::IrDropsAdvanced)
+        );
+        assert_eq!(
+            continuity_fact(
+                true,
+                true,
+                Some(cursor(0, 0, 100)),
+                cursor(0, 0, 200),
+                Some(cursor(0, 0, 300)),
+                cursor(0, 0, 250)
+            ),
+            Some(ContinuityFact::IrTimestampStalled)
+        );
+        // First round (no previous cursor) is continuous by definition.
+        assert_eq!(
+            continuity_fact(true, true, None, cursor(0, 0, 1), None, cursor(0, 0, 1)),
+            None
+        );
+    }
+
     use super::*;
 
     /// The external-camera policy classification is a pure mapping and the
@@ -11369,38 +11565,52 @@ mod tests {
         ));
     }
 
+    /// The pre-#586 boolean shape, re-expressed in the named-fact
+    /// vocabulary: every condition the old `continuity_advances` rejected
+    /// now carries its own name.
     #[test]
     fn qualification_continuity_detects_between_round_drops_and_recovery() {
+        use super::{cursor_fact, ContinuityFact, Stream};
         let baseline = ContinuityCursor {
             stream_epoch: 7,
             cumulative_drops: 11,
             latest_timestamp_us: 1_000,
         };
-        assert!(continuity_advances(None, baseline));
-        assert!(continuity_advances(
-            Some(baseline),
-            ContinuityCursor {
-                latest_timestamp_us: 2_000,
-                ..baseline
-            }
-        ));
-        assert!(!continuity_advances(
-            Some(baseline),
-            ContinuityCursor {
-                cumulative_drops: 12,
-                latest_timestamp_us: 2_000,
-                ..baseline
-            }
-        ));
-        assert!(!continuity_advances(
-            Some(baseline),
-            ContinuityCursor {
-                stream_epoch: 8,
-                latest_timestamp_us: 2_000,
-                ..baseline
-            }
-        ));
-        assert!(!continuity_advances(Some(baseline), baseline));
+        let advanced = ContinuityCursor {
+            latest_timestamp_us: 2_000,
+            ..baseline
+        };
+        // First round and a clean advance: no fact.
+        assert_eq!(cursor_fact(None, baseline, Stream::Rgb), None);
+        assert_eq!(cursor_fact(Some(baseline), advanced, Stream::Rgb), None);
+        // Drops advanced, epoch changed, and a stalled timestamp each carry
+        // their own name.
+        assert_eq!(
+            cursor_fact(
+                Some(baseline),
+                ContinuityCursor {
+                    cumulative_drops: 12,
+                    ..advanced
+                },
+                Stream::Rgb
+            ),
+            Some(ContinuityFact::RgbDropsAdvanced)
+        );
+        assert_eq!(
+            cursor_fact(
+                Some(baseline),
+                ContinuityCursor {
+                    stream_epoch: 8,
+                    ..advanced
+                },
+                Stream::Ir
+            ),
+            Some(ContinuityFact::IrStreamEpochChanged)
+        );
+        assert_eq!(
+            cursor_fact(Some(baseline), baseline, Stream::Rgb),
+            Some(ContinuityFact::RgbTimestampStalled)
+        );
     }
 
     // The decision the probe exists to make, checked against the two modules we
@@ -11501,6 +11711,7 @@ mod tests {
                 arm_failures: 0,
                 capture_failures: failed,
                 rate_shortfall_failures: 0,
+                continuity_facts: Default::default(),
             };
             ContentionReport {
                 sequential: sample(seq),
@@ -11537,9 +11748,9 @@ mod tests {
             concurrent: PairSample {
                 capture_failures: 0,
                 rate_shortfall_failures: 6,
-                ..unavailable.concurrent
+                ..unavailable.concurrent.clone()
             },
-            ..unavailable
+            ..unavailable.clone()
         };
         assert_eq!(
             qualification_outcome(&rate_shortfall, 6, true),
@@ -11547,7 +11758,7 @@ mod tests {
         );
         let no_control = ContentionReport {
             trailing_sequential_control: false,
-            ..unavailable
+            ..unavailable.clone()
         };
         assert_eq!(
             qualification_outcome(&no_control, 6, true),
@@ -11557,23 +11768,23 @@ mod tests {
         for missing in [
             PairSample {
                 contract_rounds: 5,
-                ..healthy.concurrent
+                ..healthy.concurrent.clone()
             },
             PairSample {
                 rate_floor_rounds: 5,
-                ..healthy.concurrent
+                ..healthy.concurrent.clone()
             },
             PairSample {
                 continuous_rounds: 5,
-                ..healthy.concurrent
+                ..healthy.concurrent.clone()
             },
             PairSample {
                 active_ir_rounds: 5,
-                ..healthy.concurrent
+                ..healthy.concurrent.clone()
             },
         ] {
             let report = ContentionReport {
-                sequential: healthy.sequential,
+                sequential: healthy.sequential.clone(),
                 concurrent: missing,
                 trailing_sequential_control: false,
             };

@@ -1533,6 +1533,7 @@ mod worker_engine {
                     arm_failures: 0,
                     capture_failures: 0,
                     rate_shortfall_failures: 0,
+                    continuity_facts: Default::default(),
                 },
                 concurrent: PairSample {
                     rgb_mean: 140.0,
@@ -1552,6 +1553,7 @@ mod worker_engine {
                     arm_failures: 0,
                     capture_failures: 0,
                     rate_shortfall_failures: 0,
+                    continuity_facts: Default::default(),
                 },
                 trailing_sequential_control: true,
             }
@@ -1561,9 +1563,19 @@ mod worker_engine {
         /// 4 of 6 concurrent rounds failing continuity. The store holds
         /// sequential_required/invalid_provenance; the message must say
         /// SEQUENTIAL and name the provenance bar, never "concurrent".
+        /// With per-fact counts recorded (#586 diagnostics), the specific
+        /// fact leads the detail, most frequent first.
         #[test]
         fn provenance_failure_beats_retention_in_the_verdict_message() {
-            let report = healthy_concurrent(6, 2);
+            let mut report = healthy_concurrent(6, 2);
+            report
+                .concurrent
+                .continuity_facts
+                .insert("ir cumulative_drops advanced between rounds", 3);
+            report
+                .concurrent
+                .continuity_facts
+                .insert("rgb timestamp did not advance between rounds", 1);
             let msg = camera_tune_verdict_message(
                 &report,
                 AttemptOutcome::SequentialRequired(SequentialReason::InvalidProvenance),
@@ -1574,8 +1586,16 @@ mod worker_engine {
                 "the persisted verdict leads: {msg}"
             );
             assert!(
-                msg.contains("frame-provenance") && msg.contains("continuity"),
+                msg.contains("frame-provenance"),
                 "the reason is named: {msg}"
+            );
+            assert!(
+                msg.contains("4 of 6 concurrent rounds"),
+                "the count is concrete: {msg}"
+            );
+            assert!(
+                msg.contains("3x ir cumulative_drops advanced between rounds"),
+                "the most frequent fact is named with its count, sorted first: {msg}"
             );
             assert!(
                 !msg.contains("saves"),
@@ -3167,14 +3187,32 @@ fn camera_tune_verdict_message(
         // message must say what was persisted and why (#586).
         AttemptOutcome::SequentialRequired(reason) => {
             let why = match reason {
-                irlume_auth::SequentialReason::InvalidProvenance => format!(
-                    "{} of {rounds} concurrent rounds failed the frame-provenance bar \
-                     ({} continuity, {} contract mismatch(es)), so the safe \
-                     one-at-a-time mode is what was measured and persisted",
-                    rounds - report.concurrent.continuous_rounds.min(rounds),
-                    report.concurrent.continuity_failures,
-                    report.concurrent.contract_failures,
-                ),
+                irlume_auth::SequentialReason::InvalidProvenance => {
+                    // Name WHICH continuity fact fired (#586), most frequent
+                    // first, when the arm recorded per-fact counts.
+                    let mut facts: Vec<(&&str, &usize)> =
+                        report.concurrent.continuity_facts.iter().collect();
+                    facts.sort_by(|a, b| b.1.cmp(a.1));
+                    let detail = if facts.is_empty() {
+                        format!(
+                            "{} continuity, {} contract mismatch(es)",
+                            report.concurrent.continuity_failures,
+                            report.concurrent.contract_failures,
+                        )
+                    } else {
+                        let named: Vec<String> = facts
+                            .iter()
+                            .map(|(fact, count)| format!("{count}x {fact}"))
+                            .collect();
+                        named.join("; ")
+                    };
+                    format!(
+                        "{} of {rounds} concurrent rounds failed the frame-provenance bar \
+                         ({detail}), so the safe one-at-a-time mode is what was \
+                         measured and persisted",
+                        rounds - report.concurrent.continuous_rounds.min(rounds),
+                    )
+                }
                 irlume_auth::SequentialReason::DeliveredRateShortfall => format!(
                     "concurrent rounds failed their delivered-rate floors ({} below floor), \
                      so the safe one-at-a-time mode is what was measured and persisted",

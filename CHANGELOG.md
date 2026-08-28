@@ -5,6 +5,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Per-round continuity facts: a failing concurrent qualification now says
+  WHICH condition fired (#586).** The round-continuity verdict is four
+  nameable conditions (a within-round stream break on either sensor, and
+  per-sensor cross-round cursor drift: stream epoch change, cumulative
+  drops advancing, or the timestamp stalling), and until now all four
+  collapsed into one aggregate counter that no diagnostic surface could
+  split. Each failed round now names its fact in the journal (under
+  `irlume logs debug on`), the arm counts per fact, and the camera-tune
+  verdict lists them most-frequent-first ("4 of 6 concurrent rounds failed
+  the frame-provenance bar (3x ir cumulative_drops advanced between
+  rounds; 1x ...)"). Diagnostics only; the persisted qualification schema
+  is untouched.
+
 ### Fixed
 
 - **`camera-tune` now reports the verdict it persisted, not the one the

@@ -5,6 +5,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **AppArmor: `camera-tune` could not persist any qualification on
+  enforcing hosts.** The capture-qualification store serializes every
+  save behind a lock file of its own, and the shipped `irlumed` profiles
+  granted `rw` on it but not `flock`'s `k` (camera-tune runs its probe
+  through the daemon), so every `sudo irlume camera-tune` ended in
+  "lock ...: Permission denied" and the pair stayed unmeasured. Found by
+  a 10-iteration tune stress run on the enforcing host; the emitter-stream
+  locks had carried `rwk` all along while this lock, one directory deeper,
+  never did. Both profile variants now carry it, the parity ratchet asserts
+  it, and the fix is hardware-validated by re-running the full stress loop.
+
 ### Added
 
 - **`irlume login status` now lists the lock screen** (and gets its mode

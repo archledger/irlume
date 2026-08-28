@@ -98,6 +98,12 @@ profile irlumed /usr/local/bin/irlumed {
   /run/lock/irlume/irlume-emitter-*.lock rwk,
   /run/lock/irlume-emitter-*.lock rwk,
   /var/lib/irlume/ir-emitter-stream/*.lock rwk,
+  # The capture-qualification store serializes every save behind a lock file
+  # of its own; flock needs `k` on top of rw, or camera-tune (which runs the
+  # probe through the daemon) cannot persist any qualification on an
+  # enforcing host (found by a 10-iteration tune stress run; issue #589,
+  # the #580 shape one directory deeper).
+  /var/lib/irlume/capture-qualifications/*.lock rwk,
 
   /dev/tpmrm[0-9] rw,
   /dev/tpm[0-9] rw,

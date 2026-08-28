@@ -357,6 +357,7 @@ APPARMOR_RUNTIME_RULES=(
   "/run/lock/irlume-emitter-*.lock rwk,"
   "/var/lib/irlume/ir-emitter-stream/*.lock rwk,"
   "/etc/irlume/*.lock rwk,"
+  "/var/lib/irlume/capture-qualifications/*.lock rwk,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

@@ -124,6 +124,12 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # permission. Fixing the /run/lock rule above unmasked this one on the
   # same machine, one restart later: locks need naming wherever they live.
   /var/lib/irlume/ir-emitter-stream/*.lock rwk,
+  # The capture-qualification store serializes every save behind a lock file
+  # of its own; flock needs `k` on top of rw, or camera-tune (which runs the
+  # probe through the daemon) cannot persist any qualification on an
+  # enforcing host (found by a 10-iteration tune stress run; issue #589,
+  # the #580 shape one directory deeper).
+  /var/lib/irlume/capture-qualifications/*.lock rwk,
 
   # The deferred template-key loader's per-user flock (same lesson as the
   # emitter rule above: the state tree's ** rule grants rw without the

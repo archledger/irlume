@@ -1509,6 +1509,109 @@ mod worker_engine {
     }
 
     #[cfg(test)]
+    mod tune_message_tests {
+        use super::super::camera_tune_verdict_message;
+        use irlume_auth::{AttemptOutcome, ContentionReport, PairSample, SequentialReason};
+
+        fn healthy_concurrent(rounds: usize, continuous: usize) -> ContentionReport {
+            ContentionReport {
+                sequential: PairSample {
+                    rgb_mean: 140.0,
+                    ir_mean: 120.0,
+                    total_ms: 8500.0,
+                    rounds,
+                    failed: 0,
+                    contract_rounds: rounds,
+                    rate_floor_rounds: rounds,
+                    continuous_rounds: rounds,
+                    active_ir_rounds: rounds,
+                    contract_failures: 0,
+                    rate_failures: 0,
+                    continuity_failures: 0,
+                    illumination_failures: 0,
+                    open_failures: 0,
+                    arm_failures: 0,
+                    capture_failures: 0,
+                    rate_shortfall_failures: 0,
+                },
+                concurrent: PairSample {
+                    rgb_mean: 140.0,
+                    ir_mean: 122.0,
+                    total_ms: 3000.0,
+                    rounds,
+                    failed: 0,
+                    contract_rounds: rounds,
+                    rate_floor_rounds: rounds,
+                    continuous_rounds: continuous,
+                    active_ir_rounds: rounds,
+                    contract_failures: 0,
+                    rate_failures: 0,
+                    continuity_failures: rounds - continuous,
+                    illumination_failures: 0,
+                    open_failures: 0,
+                    arm_failures: 0,
+                    capture_failures: 0,
+                    rate_shortfall_failures: 0,
+                },
+                trailing_sequential_control: true,
+            }
+        }
+
+        /// #586 exactly: full brightness retention (100% RGB, 102% IR) with
+        /// 4 of 6 concurrent rounds failing continuity. The store holds
+        /// sequential_required/invalid_provenance; the message must say
+        /// SEQUENTIAL and name the provenance bar, never "concurrent".
+        #[test]
+        fn provenance_failure_beats_retention_in_the_verdict_message() {
+            let report = healthy_concurrent(6, 2);
+            let msg = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::InvalidProvenance),
+                6,
+            );
+            assert!(
+                msg.starts_with("capture mode sequential for this camera"),
+                "the persisted verdict leads: {msg}"
+            );
+            assert!(
+                msg.contains("frame-provenance") && msg.contains("continuity"),
+                "the reason is named: {msg}"
+            );
+            assert!(
+                !msg.contains("saves"),
+                "a concurrent saving is not advertised for a sequential verdict: {msg}"
+            );
+        }
+
+        /// Control: a qualified concurrent verdict keeps the historical
+        /// message, including the time saving.
+        #[test]
+        fn qualified_concurrent_message_is_unchanged() {
+            let report = healthy_concurrent(6, 6);
+            let msg = camera_tune_verdict_message(&report, AttemptOutcome::ConcurrentQualified, 6);
+            assert!(msg.starts_with("capture mode concurrent for this camera"));
+            assert!(msg.contains("saves"));
+            assert!(msg.contains("100% of RGB"));
+        }
+
+        /// Rate-shortfall diverges the same way retention-blind: full
+        /// brightness, floors missed, sequential persisted.
+        #[test]
+        fn rate_shortfall_divergence_is_phrrased_from_the_verdict() {
+            let mut report = healthy_concurrent(6, 6);
+            report.concurrent.rate_floor_rounds = 3;
+            report.concurrent.rate_shortfall_failures = 3;
+            let msg = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+                6,
+            );
+            assert!(msg.starts_with("capture mode sequential for this camera"));
+            assert!(msg.contains("delivered-rate"), "{msg}");
+        }
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::{StopSignalSink, WorkerEngine};
 
@@ -2947,8 +3050,10 @@ fn run_capture_mode_probe(
     )
     .map_err(|e| e.to_string())?;
     let report = measurement.report();
-    let mode = report.recommended_mode();
     let attempt = measurement.attempt().clone();
+    // The AUTHORITATIVE verdict: what the store will hold. The message is
+    // phrased from this, not from the retention-only recommendation (#586).
+    let persisted_outcome = attempt.outcome().clone();
     let measured_runtime_key = measurement.runtime_key().to_owned();
     let conclusive = !matches!(
         attempt.outcome(),
@@ -3010,43 +3115,85 @@ fn run_capture_mode_probe(
     if policy == ProbeStore::ExplicitReplace {
         irlume_auth::reset_runtime_capture_health(&measured_runtime_key);
     }
+    Ok(camera_tune_verdict_message(
+        report,
+        persisted_outcome,
+        rounds,
+    ))
+}
+
+/// The camera-tune summary, phrased from the AUTHORITATIVE persisted verdict
+/// rather than the retention-only recommendation (#586): a concurrent arm can
+/// keep full brightness and still fail the provenance bar, and the message
+/// used to say "capture mode concurrent" while the store held
+/// sequential_required/invalid_provenance. Pure over the evidence, so the
+/// wording is testable without hardware.
+fn camera_tune_verdict_message(
+    report: &irlume_auth::ContentionReport,
+    outcome: irlume_auth::AttemptOutcome,
+    rounds: usize,
+) -> String {
+    use irlume_auth::AttemptOutcome;
     // An arm that never streamed has no retention to report; percentages
     // from its empty samples would read as dimming when the finding is
     // "cannot run at all" (#192, the BRIO's EINVAL on concurrent RGB open).
-    let mut msg = if report.concurrent_impossible() {
+    if report.concurrent_impossible() {
         // Observed counts, not the requested round count: a sequential arm
         // can complete fewer rounds than were asked for, and "measured fine"
         // must not overstate its evidence.
-        format!(
-            "capture mode {} for this camera: it cannot stream RGB and IR \
+        return format!(
+            "capture mode sequential for this camera: it cannot stream RGB and IR \
              at once (all {} concurrent attempts errored; {} sequential \
              round(s) completed, {} errored; a trailing one-at-a-time \
              control confirmed the camera still answers)",
-            mode.as_str(),
-            report.concurrent.failed,
-            report.sequential.rounds,
-            report.sequential.failed,
-        )
-    } else {
-        format!(
-            "capture mode {} for this camera: concurrent capture keeps {:.0}% of RGB \
-             and {:.0}% of IR brightness and saves {:.0}ms ({rounds} rounds)",
-            mode.as_str(),
-            report.retained_rgb() * 100.0,
-            report.retained_ir() * 100.0,
-            report.saved_ms(),
-        )
-    };
-    // Say so rather than letting a dark room read as a clean bill of health.
-    if !report.conclusive() {
-        msg.push_str(&format!(
-            "\n     measured in a dim scene (RGB mean {:.0}); this loss only \
-             shows in normal light, so re-run camera-tune with the room lit \
-             to confirm",
-            report.sequential.rgb_mean
-        ));
+            report.concurrent.failed, report.sequential.rounds, report.sequential.failed,
+        );
     }
-    Ok(msg)
+    let retention = format!(
+        "concurrent capture keeps {:.0}% of RGB and {:.0}% of IR brightness",
+        report.retained_rgb() * 100.0,
+        report.retained_ir() * 100.0,
+    );
+    match outcome {
+        AttemptOutcome::ConcurrentQualified => format!(
+            "capture mode concurrent for this camera: {retention} and saves {:.0}ms \
+             ({rounds} rounds)",
+            report.saved_ms(),
+        ),
+        // Brightness survived but the frames did not pass the bar concurrent
+        // REQUIRES (per-round provenance: contract match, delivered rate,
+        // sequence/timestamp continuity). The recommendation arithmetic
+        // would say concurrent here; the store said sequential, and the
+        // message must say what was persisted and why (#586).
+        AttemptOutcome::SequentialRequired(reason) => {
+            let why = match reason {
+                irlume_auth::SequentialReason::InvalidProvenance => format!(
+                    "{} of {rounds} concurrent rounds failed the frame-provenance bar \
+                     ({} continuity, {} contract mismatch(es)), so the safe \
+                     one-at-a-time mode is what was measured and persisted",
+                    rounds - report.concurrent.continuous_rounds.min(rounds),
+                    report.concurrent.continuity_failures,
+                    report.concurrent.contract_failures,
+                ),
+                irlume_auth::SequentialReason::DeliveredRateShortfall => format!(
+                    "concurrent rounds failed their delivered-rate floors ({} below floor), \
+                     so the safe one-at-a-time mode is what was measured and persisted",
+                    rounds - report.concurrent.rate_floor_rounds.min(rounds),
+                ),
+                _ => format!(
+                    "{retention}, but the safe one-at-a-time mode is what was \
+                     measured and persisted"
+                ),
+            };
+            format!("capture mode sequential for this camera: {retention}, but {why}")
+        }
+        // Inconclusive outcomes never reach the message (the caller returns
+        // the left-unmeasured wording first); render defensively anyway.
+        AttemptOutcome::Inconclusive(_) => format!(
+            "capture mode left unmeasured for this camera ({retention} measured; \
+             the evidence did not qualify either mode)"
+        ),
+    }
 }
 
 /// Whether enrollment must measure the capture mode first: exactly when the

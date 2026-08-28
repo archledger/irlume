@@ -4452,6 +4452,24 @@ pub fn rgb_node_formats(device: &str) -> Vec<[u8; 4]> {
         .unwrap_or_default()
 }
 
+/// [`rgb_node_formats`] distinguishing a probe that ran from one that could
+/// not (#575 census evidence): `None` means the node was not probed (lease
+/// refused or open failed), `Some(list)` means it answered, and an EMPTY list
+/// is a real answer (a metadata node advertises no capture format). Callers
+/// that only need best-effort formats keep [`rgb_node_formats`].
+pub(crate) fn node_capture_formats_probed(device: &str) -> Option<Vec<[u8; 4]>> {
+    let _permit = lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .ok()?;
+    let dev = Device::with_path(device).ok()?;
+    Capture::enum_formats(&dev)
+        .ok()
+        .map(|v| v.into_iter().map(|d| d.fourcc.repr).collect())
+}
+
 /// Choose the format to capture in: the first `DECODABLE_RGB` entry the camera
 /// advertises. If it advertises none we can decode (e.g. MJPEG-only), fail with
 /// a message that names what it offers rather than a bare "expected YUYV".

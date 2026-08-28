@@ -939,7 +939,7 @@ fn siblings_on_same_interface(video_device: &str, sysfs: &std::path::Path) -> Ve
 /// The trailing integer of a `/dev/videoN` path, for ordering. A path with no
 /// trailing digits sorts last and then by name, so an unexpected shape is
 /// merely deprioritised rather than treated as node zero.
-fn node_number(node: &str) -> u32 {
+pub(crate) fn node_number(node: &str) -> u32 {
     let digits: String = node
         .chars()
         .rev()

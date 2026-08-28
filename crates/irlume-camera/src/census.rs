@@ -13,10 +13,13 @@
 use crate::Role;
 use std::path::Path;
 
-/// Drivers that manufacture video nodes without manufacturing cameras. A
-/// node backed by one of these is working software pretending to be
-/// hardware, and must never read as a broken camera.
-const DUMMY_DRIVERS: [&str; 2] = ["v4l2loopback", "vivid"];
+/// Drivers and classes that manufacture video nodes without manufacturing
+/// cameras. A node backed by one of these is working software pretending to
+/// be hardware, and must never read as a broken camera. `virtual-device` is
+/// the census's name for a node with no hardware bus at all (its sysfs
+/// device path resolves under `/sys/devices/virtual/`, which is how
+/// v4l2loopback registers).
+const DUMMY_DRIVERS: [&str; 3] = ["v4l2loopback", "vivid", "virtual-device"];
 
 /// One census row: one video-adjacent node, or one machine-level fact (a
 /// MIPI pipeline, an unbound USB camera). The class and verdict flatten
@@ -98,7 +101,10 @@ pub enum CensusVerdict {
 pub(crate) struct NodeFacts {
     pub node: String,
     pub role: crate::Role,
-    pub fourccs: Vec<[u8; 4]>,
+    /// The node's advertised capture formats. `None` means the formats were
+    /// NOT probed (open or lease refused), which is a different statement
+    /// from an empty advertisement and must never print as one.
+    pub fourccs: Option<Vec<[u8; 4]>>,
     pub driver: String,
     pub on_usb: bool,
     /// `vid:pid` when the node sits on USB and the identity was readable.
@@ -115,16 +121,18 @@ pub(crate) struct NodeFacts {
 /// Classify one answering node from gathered facts. Pure, and the part worth
 /// testing: the table's every row is a rule here.
 pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
-    let fourcc_list = || {
-        let names: Vec<String> = facts
-            .fourccs
-            .iter()
-            .map(|f| String::from_utf8_lossy(f).trim_end().to_string())
-            .collect();
-        if names.is_empty() {
-            "no capture format advertised".to_string()
-        } else {
-            names.join("/")
+    let fourcc_list = || match &facts.fourccs {
+        None => "not probed (the node could not be opened to list its formats)".to_string(),
+        Some(list) => {
+            let names: Vec<String> = list
+                .iter()
+                .map(|f| String::from_utf8_lossy(f).trim_end().to_string())
+                .collect();
+            if names.is_empty() {
+                "no capture format advertised".to_string()
+            } else {
+                names.join("/")
+            }
         }
     };
     let mut evidence = vec![
@@ -148,10 +156,13 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
         evidence.insert(1, format!("USB {id}"));
     }
 
-    let y8_only = |fourccs: &[[u8; 4]]| {
-        let grey = fourccs.iter().any(|f| f == b"GREY");
-        let y8 = fourccs.iter().any(|f| f == b"Y8  " || f == b"Y800");
-        y8 && !grey
+    let y8_only = |fourccs: &Option<Vec<[u8; 4]>>| match fourccs {
+        None => false,
+        Some(list) => {
+            let grey = list.iter().any(|f| f == b"GREY");
+            let y8 = list.iter().any(|f| f == b"Y8  " || f == b"Y800");
+            y8 && !grey
+        }
     };
 
     // doctor's tested-path honesty, carried as evidence: anything but
@@ -165,9 +176,12 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
     // as the verdict. Must match the capture path's DECODABLE_RGB (YUYV,
     // NV12): listing RGB3/BGR3 here would pass the census then fail at
     // capture, the exact bug that warning existed to prevent.
-    let undecodable_rgb = facts.role == Role::Rgb
-        && !facts.fourccs.is_empty()
-        && !facts.fourccs.iter().any(|f| f == b"YUYV" || f == b"NV12");
+    // Judging decodability needs formats that were actually probed: an
+    // unprobed list neither clears nor convicts.
+    let undecodable_rgb = matches!(&facts.fourccs, Some(list)
+        if facts.role == Role::Rgb
+            && !list.is_empty()
+            && !list.iter().any(|f| f == b"YUYV" || f == b"NV12"));
 
     let (class, verdict) = if DUMMY_DRIVERS.contains(&facts.driver.as_str()) {
         (
@@ -246,6 +260,16 @@ pub fn census() -> Vec<CensusEntry> {
 pub fn census_from(scan: &crate::NodeScan) -> Vec<CensusEntry> {
     let pairs = crate::pairs_from(&scan.classified);
     let mut entries = node_entries(scan, &pairs);
+    // Numeric node order across every bucket, double digits included: the
+    // scan's buckets (classified, other, mc_centric, unreadable) are book
+    // structure, not an order a person reading a census wants.
+    entries.sort_by_key(|entry| {
+        entry
+            .node
+            .as_deref()
+            .map(crate::ir_metadata::node_number)
+            .unwrap_or(u32::MAX)
+    });
     entries.extend(machine_entries());
     entries
 }
@@ -284,13 +308,46 @@ fn facts_for(
     role: crate::Role,
     paired: &std::collections::HashSet<String>,
 ) -> NodeFacts {
-    let (driver, on_usb) = crate::node_backend(path)
-        .unwrap_or_else(|error| (format!("unknown driver ({error})"), false));
+    let (driver, on_usb) = crate::node_backend(path).unwrap_or_else(|error| {
+        // node_backend resolves the PHYSICAL device, which virtual nodes
+        // (v4l2loopback, vivid) do not have; their driver name still exists
+        // as the /sys/class/video4linux/<node>/driver symlink, and it is the
+        // one fact the dummy classification keys on.
+        let node_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| std::path::Path::new("/sys/class/video4linux").join(n));
+        // A driver symlink on the class entry names the driver directly.
+        let driver_link = node_name
+            .as_deref()
+            .map(|dir| std::fs::read_link(dir.join("driver")))
+            .and_then(|link| link.ok())
+            .and_then(|link| {
+                link.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            });
+        if let Some(driver) = driver_link {
+            return (driver, false);
+        }
+        // No driver link: a device with no hardware bus at all is virtual by
+        // structure (v4l2loopback registers under /sys/devices/virtual/),
+        // which is the dummy classification's evidence, not an error.
+        let virtual_by_path = node_name
+            .as_deref()
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .is_some_and(|resolved| resolved.starts_with("/sys/devices/virtual/"));
+        if virtual_by_path {
+            return ("virtual-device".into(), false);
+        }
+        (format!("unknown driver ({error})"), false)
+    });
     let usb_id = crate::physical_device_id(path).and_then(|dir| crate::read_vidpid(&dir));
+    let fourccs = crate::node_capture_formats_probed(path);
     NodeFacts {
         node: path.to_string(),
         role,
-        fourccs: crate::rgb_node_formats(path),
+        fourccs,
         driver,
         on_usb,
         usb_id,
@@ -539,7 +596,7 @@ mod tests {
         NodeFacts {
             node: node.into(),
             role,
-            fourccs: fourccs.iter().map(|f| **f).collect(),
+            fourccs: Some(fourccs.iter().map(|f| **f).collect()),
             driver: "uvcvideo".into(),
             on_usb: true,
             usb_id: Some("046d:085e".into()),
@@ -619,24 +676,26 @@ mod tests {
 
     #[test]
     fn a_dummy_driver_node_is_not_hardware_and_says_so() {
-        let mut f = facts("/dev/video9", Role::Rgb, &[b"YUYV"]);
-        f.driver = "v4l2loopback".into();
-        f.on_usb = false;
-        f.usb_id = None;
-        f.paired = false;
-        let entry = node_entry_from_facts(&f);
-        assert_eq!(entry.class, CensusClass::DummyNode);
-        assert!(matches!(entry.verdict, CensusVerdict::NotHardware(_)));
-        let evidence = entry.evidence.join(" | ");
-        assert!(
-            evidence.contains("v4l2loopback"),
-            "the driver name is the whole evidence for this class: {evidence}"
-        );
+        for driver in ["v4l2loopback", "vivid", "virtual-device"] {
+            let mut f = facts("/dev/video9", Role::Rgb, &[b"YUYV"]);
+            f.driver = driver.into();
+            f.on_usb = false;
+            f.usb_id = None;
+            f.paired = false;
+            let entry = node_entry_from_facts(&f);
+            assert_eq!(entry.class, CensusClass::DummyNode, "driver {driver}");
+            assert!(matches!(entry.verdict, CensusVerdict::NotHardware(_)));
+            assert!(
+                entry.evidence.join(" | ").contains(driver),
+                "the driver/class name is the whole evidence for this class"
+            );
+        }
     }
 
     #[test]
     fn a_node_with_no_capture_formats_is_informational_metadata_not_a_camera() {
         let mut f = facts("/dev/video1", Role::Other, &[]);
+        f.fourccs = Some(Vec::new());
         f.paired = false;
         let entry = node_entry_from_facts(&f);
         assert_eq!(entry.class, CensusClass::MetadataOnly);
@@ -838,6 +897,51 @@ mod tests {
         assert!(
             entry.evidence.join(" | ").contains("MJPG"),
             "the offered formats are the evidence"
+        );
+    }
+
+    #[test]
+    fn an_unprobed_formats_list_never_prints_as_an_empty_advertisement() {
+        let mut f = facts("/dev/video8", Role::Rgb, &[b"YUYV"]);
+        f.fourccs = None;
+        f.paired = false;
+        let entry = node_entry_from_facts(&f);
+        let evidence = entry.evidence.join(" | ");
+        assert!(
+            evidence.contains("not probed"),
+            "a refused probe is a different statement from an empty advertisement: {evidence}"
+        );
+        assert!(
+            !evidence.contains("no capture format advertised"),
+            "the unprobed case must not borrow the empty-advertisement wording: {evidence}"
+        );
+        assert_eq!(
+            entry.verdict,
+            CensusVerdict::Supported(Some("RGB-only convenience tier")),
+            "an unprobed list neither clears nor convicts decodability"
+        );
+    }
+
+    #[test]
+    fn node_rows_render_in_numeric_order_across_buckets() {
+        let scan = crate::NodeScan {
+            other: vec!["/dev/video1".into()],
+            classified: vec![
+                ("/dev/video10".into(), Role::Rgb),
+                ("/dev/video2".into(), Role::Ir),
+            ],
+            unreadable: Vec::new(),
+            mc_centric: Vec::new(),
+            listing_error: None,
+        };
+        let nodes: Vec<String> = census_from(&scan)
+            .into_iter()
+            .filter_map(|entry| entry.node)
+            .collect();
+        assert_eq!(
+            nodes,
+            vec!["/dev/video1", "/dev/video2", "/dev/video10"],
+            "numeric order, double digits after single, buckets interleaved"
         );
     }
 

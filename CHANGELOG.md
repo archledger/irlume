@@ -7,6 +7,36 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Camera triage docs: the kernel quirk table, first.** DEBUGGING.md gains
+  a "Cameras: check the kernel first" section: the two-minute lookup of your
+  USB ID in uvcvideo's per-device quirk table, a userspace-appearance table
+  for the common quirks (PROBE_MINMAX through MJPEG_NO_EOF), and the
+  after-a-kernel-upgrade requalification note (re-run camera-tune and one
+  qualification, watch skew) reflecting upstream uvcvideo's active
+  timestamping and metadata changes. The hardware-report template's intro
+  points reporters at the check. (#569)
+- **FAIRNESS.md and FAQ grounded in their primary sources.** A new "Against
+  the Windows Hello bars" subsection states Microsoft's certified facial
+  bars (FAR below 0.001 percent, TAR above 95 percent) and irlume's measured
+  counterparts in identical terms, including the honest "No" on the FAR bar,
+  plus the multi-user statement: irlume verifies one claimed identity per
+  authentication so other enrollments never move a user's threshold, where
+  Hello raises its threshold with multiple enrolled users. The FAQ's Howdy
+  entry now cites the documented incident (howdy #822, a phone photo
+  unlocking an Ubuntu 22.04 machine) and what irlume does differently, with
+  the published ISO/IEC 30107-3 self-test linked. (#570)
+- **TPM tiers mapped to the Windows ESS/SDEV vocabulary.**
+  SECURITY_AT_REST.md gains a short comparison note: what corresponds
+  (TPM-sealed secrets, measured-boot PCR policies versus SDEV-style firmware
+  attestation of the sensor chain), what does not (no VBS-equivalent
+  isolation on Linux; fail-closed design and TPM gating compensate), and
+  the deliberate difference (the user-controlled recovery passphrase).
+  Explicitly a vocabulary mapping, not an equivalence claim. (#571)
+- **The camera-landscape research is in the repo.** The 2026-08-27 survey
+  (Windows Hello deep dive, MS-XU protocol, ESS/SDEV, OEM camera taxonomy,
+  ecosystem issue mining) is committed as
+  docs/research/2026-08-27-camera-landscape-research.md; #570 and #571 cite
+  its preserved copies of Microsoft pages that have since been retired.
 - **The camera census: every camera-like device on the machine, classified
   once, each row printing the evidence it keyed on.** New
   `irlume camera census [--json]` (#575) and a doctor camera section rebuilt

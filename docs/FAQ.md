@@ -19,8 +19,18 @@ TPM-sealed templates, and a fully open stack.
 
 [Howdy](https://github.com/boltgolt/howdy) is the best-known face unlock for
 Linux, and it's honest about being a *convenience*: its README says a
-well-printed photo of you could be enough to fool it. irlume is built as an
-*authenticator*: an IR liveness gate (self-tested against ISO/IEC 30107-3),
+well-printed photo of you could be enough to fool it. That is not
+hypothetical: [howdy issue #822](https://github.com/boltgolt/howdy/issues/822)
+documents a reporter's machine (Ubuntu 22.04) unlocking to a photo of their
+face taken on a phone, with no presentation-attack detection in the path.
+The maintainer's reply there notes a proper IR camera makes phone-screen
+attacks much harder, which is the honest framing: the incident is the
+documented cost of shipping face unlock as a convenience with no PAD.
+irlume is built as an *authenticator* and takes the opposite default: two
+presentation-attack-detection models (RGB and IR cues) run on every capture
+and refuse print, phone, and screen species by default, with the
+[ISO/IEC 30107-3 self-test published](PAD_SELFTEST.md) so the claim is
+reproducible, not adjectival. Beyond that: an IR liveness gate,
 AES-256-GCM-encrypted templates under a TPM-sealed key, camera pinning, and
 TPM keyring unlock at login, with tiers, so RGB-only face match is
 deliberately limited to screen unlock. That gate has a documented hole of its

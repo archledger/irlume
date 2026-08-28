@@ -170,6 +170,45 @@ Expected on-demand matrix (all live-validated):
   /org/freedesktop/secrets/collection/kdewallet org.freedesktop.Secret.Collection Locked`
   (`b false` = unlocked).
 
+## Cameras: check the kernel first
+
+Most "my camera misbehaves" reports have a kernel-level explanation visible
+in uvcvideo's per-USB-ID quirk table, in
+[`drivers/media/usb/uvc/uvc_driver.c`](https://elixir.bootlin.com/linux/latest/source/drivers/media/usb/uvc/uvc_driver.c)
+in the kernel source. Checking it is a two-minute step and belongs before
+any capture-code debugging:
+
+1. Get your camera's USB identity: `irlume camera census` prints it on every
+   node row (`USB 046d:085e` in the evidence), or `lsusb | grep -i cam`.
+2. Search that `vid:pid` in the quirk table link above.
+3. If your ID is there, the quirk name tells you what the kernel already
+   knows. The common ones, as they look from userspace:
+
+| Quirk | What you see |
+|---|---|
+| `PROBE_MINMAX` | probe/commit answers lie about limits: format or rate negotiation errors that make no sense against the advertised formats |
+| `FIX_BANDWIDTH` | bandwidth miscounting on dual-camera hosts: the second stream fails to start while the first works |
+| `FORCE_Y8` | the unbranded-IR path: the driver advertises Y8 to a module that only half supports it (`irlume camera census` classifies the node as an unbranded Y8 IR sensor) |
+| `NO_RESET_RESUME` | suspend or reset, pick one: the camera is dead after resume until replugged |
+| `RESTRICT_FRAME_RATE` | advertised frame rates are not all real: delivered-rate floors fail or qualification measures less than the menu promised |
+| `RESTORE_CTRLS_ON_INIT` | controls are reset on every open: IR emitter state surprises across processes |
+| `INVALID_DEVICE_SOF` | bogus USB start-of-frame numbers: timestamp and pairing-skew anomalies, exactly what capture qualification keys on |
+| `MJPEG_NO_EOF` | missing MJPEG end-of-frame markers: capture errors on MJPG streams only |
+
+A quirk hit means the behavior is the kernel's documented accommodation for
+your exact hardware, not an irlume bug; link the table entry in any report
+about it.
+
+**After a kernel upgrade, re-qualify.** Upstream uvcvideo is actively
+changing hardware timestamping and metadata delivery (clock-interpolation
+relaxation, SOF filtering fixes, and the partial-metadata-buffer fix that
+reached stable in the 6.12.97 era). irlume's pairing-skew measurement and
+capture qualification depend on frame timing, so after a major kernel
+upgrade run `sudo irlume camera-tune` and one capture qualification, and
+watch the skew in `irlume camera diagnostics --json` for drift. This has
+been fleet practice since the capture-path program landed, for exactly that
+reason.
+
 ## Fingerprint reader stopped responding
 
 The most common cause is a stale fprintd device claim, and the most common

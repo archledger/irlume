@@ -38,6 +38,40 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    move it; Tiers 1 and 2 are the ones that bind boot-component measurements.
    The plaintext key exists only transiently in the daemon's memory (zeroized
    on drop).
+
+### Compared with Windows Enhanced Sign-in Security
+
+Windows describes its Enhanced Sign-in Security (ESS) trust architecture with
+vocabulary that maps onto what irlume already does, and vocabulary that does
+not. ESS isolates the biometric path using Virtualization Based Security
+(VBS) and TPM 2.0
+([Microsoft's ESS overview](https://support.microsoft.com/en-us/windows/security/identity-signin/enhanced-sign-in-security-in-windows)),
+plus an OEM-configured SDEV ACPI table describing the biometric hardware
+chain and, for fingerprint sensors, Microsoft-issued factory certificates
+(preserved in
+[the camera-landscape research](research/2026-08-27-camera-landscape-research.md)
+after Microsoft retired the hardware page that documented them).
+
+What corresponds: both seal biometric-derived secrets to a TPM 2.0, and both
+gate their release on firmware-measured state. irlume's signed PCR-11 policy
+(Tier 1) and pcrlock policy (Tier 2) are the closest analog to SDEV-style
+firmware attestation of the sensor chain: a signed statement, checked before
+the credential moves, that the machine below the credential is the one that
+was measured. The literal PCR-7 policy (Tier 3) is the deliberately weaker
+corner: boot-chain *state*, not component measurements.
+
+What does not correspond, stated plainly: ESS isolates the matching engine
+in a hypervisor; Linux has no equivalent here, and irlume runs in the normal
+kernel/user boundary, compensating with fail-closed design (capture errors
+and PAD misses deny to password, never grant), TPM gating of credential
+release, and camera pinning. And where ESS is an OEM firmware program,
+irlume consumes the camera through the ordinary kernel driver and records
+what that hardware says (the census, the illumination metadata) rather than
+attesting it. One deliberate difference: irlume's recovery passphrase is a
+user-controlled escape hatch that can re-arm a lost seal, which a
+pure-attestation model would not offer. This is a mapping of vocabulary, not
+a claim of equivalence.
+
 4. **IPC: SO_PEERCRED.** The daemon releases profile data only to the target
    user or root; the sealed *login password* (keyring) only to a root peer.
    *Tested:* a CLI peer asking for another user's profiles → **"not

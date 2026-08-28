@@ -11,7 +11,10 @@ body:
         output of `irlume support-report` (sanitized and safe to share), and
         `irlume camera census --json` (it classifies every camera-like device
         with the evidence each row keyed on, so "broken, unsupported class, or
-        configuration" is answered before the first reply).
+        configuration" is answered before the first reply). Before filing, also
+        try the two-minute kernel check in
+        docs/DEBUGGING.md ("Cameras: check the kernel first"): most camera
+        misbehavior has a uvcvideo quirk-table entry for your exact USB ID.
   - type: input
     id: machine
     attributes:

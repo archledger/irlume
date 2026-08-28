@@ -46,6 +46,38 @@ to +0.10; the IR path uses 0.55 native / 0.40 adapted, and calibrated RGB+IR
 fusion grants at probability ≥ 0.50), and the mandatory password fallback
 bounds the residual either way.
 
+## Against the Windows Hello bars
+
+Microsoft certifies Windows Hello face hardware against fixed bars
+([Windows Hello biometric requirements](https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/windows-hello-biometric-requirements)):
+facial false acceptance **below 0.001 percent (1 in 100,000)** and true
+acceptance **above 95 percent** (equivalently, false rejection below 5
+percent). Stated in exactly those terms, irlume's own measurements above:
+
+| Hello's bar | irlume measured | Meets the bar? |
+|---|---|---|
+| FAR < 0.001% (1×10⁻⁵) | worst-group FAR 1.04×10⁻³ at the 0.50 measurement point (best group 1.05×10⁻⁴) | **No.** Only the best-served group approaches it; irlume does not claim Hello's FAR bar |
+| TAR > 95% (FRR < 5%) | FRR 4.65% at the matched-FAR (1×10⁻³) operating point (AuraFace) | Yes, at that operating point |
+
+The comparison is deliberately like-for-like and deliberately not a
+marketing table: irlume publishes its per-group variance (above) where a
+single certified bar cannot, and bounds the residual differently, with two
+presentation-attack-detection models on every capture and a mandatory
+password fallback rather than a certified-hardware program.
+
+**Multiple enrolled users.** Hello raises its match threshold automatically
+when several users are enrolled on one machine (Microsoft's Windows Hello
+hardware documentation; the page carrying that statement has since been
+retired, and the finding is preserved in
+[the camera-landscape research](research/2026-08-27-camera-landscape-research.md)).
+irlume does not need that compensation because it does not do open-set
+matching at login: every authentication verifies **one claimed identity**
+(the PAM stack names the user, and the match runs 1:1 against that user's
+templates), so enrolling additional users never moves another user's
+threshold. The threshold that does scale is per-user template count
+(`+0.10` at the maximum). Open-set 1:N "who is this" exists only as the
+separate, root-scoped `irlume identify` diagnostic.
+
 ## Recognizer trade-off: AuraFace vs buffalo_l
 
 A stronger recognizer narrows the gap. **buffalo_l** (InsightFace; its

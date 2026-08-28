@@ -11,6 +11,8 @@
 # every node line, turning
 #
 #     /dev/video2: Ir
+#     /dev/video2: Ir (uvcvideo, USB)
+#     /dev/video2: UVC IR sensor (paired), supported (secure IR tier); ...   (#575 census)
 # into
 #     /dev/video2: Ir (uvcvideo, USB)
 #
@@ -75,7 +77,7 @@ readonly ABSENCE_MARKER='(no /dev/video* nodes on this machine)'
 # (a UVC metadata node), so it counts as a listed node but never as IR. A
 # role token outside this set means the enum grew and this script has not
 # been taught about it, which is exit 12 and not a silent miss.
-readonly KNOWN_ROLES='Rgb|Ir|Other'
+readonly KNOWN_ROLES='Rgb|Ir|Other|Unreadable'
 
 parse() {
   local doc="$1"
@@ -86,7 +88,10 @@ parse() {
     !/^[[:space:]]/ { in_section = 0; next }
     # doctor saying, positively, that this machine has no camera nodes.
     index($0, absent) { absence_stated = 1; next }
-    # A node line, whatever doctor appends after the role.
+    # A node line, in either shape doctor has printed:
+    #   pre-#575:  the Role word first ("/dev/video2: Ir (uvcvideo, USB)")
+    #   #575 census: the class phrase up to the first comma
+    #              ("/dev/video2: UVC IR sensor (paired), supported ...")
     /^[[:space:]]+\/dev\/[^:]+:[[:space:]]/ {
       nodes++
       path = $0
@@ -95,24 +100,39 @@ parse() {
       role = $0
       sub(/^[[:space:]]+\/dev\/[^:]+:[[:space:]]+/, "", role)
       sub(/[[:space:]].*$/, "", role)
-      if (role !~ ("^(" roles ")$")) { unknown_role = role; next }
+      if (role !~ ("^(" roles ")$")) {
+        # Not a bare role word: try the census class phrase, mapped back to
+        # the same role vocabulary. An unknown phrase is still exit 12.
+        phrase = $0
+        sub(/^[[:space:]]+\/dev\/[^:]+:[[:space:]]+/, "", phrase)
+        sub(/,.*$/, "", phrase)
+        if (phrase ~ /^UVC RGB camera/) role = "Rgb"
+        else if (phrase ~ /^UVC IR sensor/) role = "Ir"
+        else if (phrase ~ /^unbranded Y8 IR sensor/) role = "Ir"
+        else if (phrase ~ /^metadata-only node/) role = "Other"
+        else if (phrase ~ /^dummy node/) role = "Other"
+        else if (phrase ~ /^media-controller node/) role = "Other"
+        else if (phrase ~ /^unreadable node/) role = "Unreadable"
+        else { unknown_role = phrase; next }
+      }
       parsed++
+      if (role == "Unreadable") unreadable++
       if (role == "Ir" && ir == "") ir = path
     }
     END {
-      printf "%s|%d|%d|%s|%d|%d\n", ir, nodes + 0, parsed + 0, unknown_role, \
-        seen_section + 0, absence_stated + 0
+      printf "%s|%d|%d|%s|%d|%d|%d\n", ir, nodes + 0, parsed + 0, unknown_role, \
+        seen_section + 0, absence_stated + 0, unreadable + 0
     }
   ' "$doc"
 }
 
 resolve() {
-  local doc="$1" ir nodes parsed unknown seen absent
+  local doc="$1" ir nodes parsed unknown seen absent unreadable
   # `|`, not a tab: tab is an IFS whitespace character, so `read` would strip
   # the leading empty field and shift every value one position left whenever
   # no IR node was found. That silently turned "no IR node" into "the IR node
   # is 2", which is the same class of defect this whole script exists for.
-  IFS='|' read -r ir nodes parsed unknown seen absent < <(parse "$doc")
+  IFS='|' read -r ir nodes parsed unknown seen absent unreadable < <(parse "$doc")
 
   # The section header itself is a format claim. Losing it means the parse
   # never even started, so nothing below it can be trusted.
@@ -147,6 +167,13 @@ could not be walked. This is NOT an absent camera" >&2
     return "$EXIT_CAMERA_UNKNOWN"
   fi
   if [ -z "$ir" ]; then
+    # A census row that says the node itself could not be read means the IR
+    # camera might BE that node: unknown, never "no IR" (#227 one layer up).
+    if [ "${unreadable:-0}" -gt 0 ]; then
+      echo "doctor listed ${unreadable} unreadable node(s) and no readable Ir: \
+whether this machine has an IR camera is unknown" >&2
+      return "$EXIT_CAMERA_UNKNOWN"
+    fi
     echo "doctor classified ${nodes} camera node(s), none of them Ir" >&2
     return "$EXIT_NO_IR"
   fi
@@ -190,6 +217,29 @@ self_test() {
   /dev/video2: Ir (uvcvideo, USB)
   /dev/video8: Rgb (v4l2 loopback, not USB)  ⚠ not the uvcvideo-on-USB case irlume is built for
 [doctor] IR stream: 340x340@30.00fps GREY ✓
+'
+  # The #575 census format: class phrase, verdict, evidence after the
+  # semicolon; metadata-only and dummy rows are nodes that are never IR.
+  check "census format, IR present" 0 "/dev/video2" \
+'[doctor] camera nodes (classified by pixel format):
+  /dev/video0: UVC RGB camera (paired), supported; driver uvcvideo on USB | USB 046d:085e | internal | formats MJPG/YUYV
+  /dev/video1: metadata-only node (not a camera), nothing to fix; this row exists so a metadata interface never reads as a missing or broken camera
+  /dev/video2: UVC IR sensor (paired), supported (secure IR tier); driver uvcvideo on USB | USB 046d:085e | internal | formats GREY
+  /dev/video8: dummy node (not hardware), created by software; it can never be the machine'"'"'s face camera; driver virtual-device, not USB
+[doctor] IR stream: 340x340@30.00fps GREY ✓
+'
+  # The #227 rule, census shape: an unreadable node row is a camera whose
+  # state is unknown, and must never license the "no IR" skip.
+  check "census unreadable row is camera-unknown" "$EXIT_CAMERA_UNKNOWN" "" \
+'[doctor] camera nodes (classified by pixel format):
+  /dev/video0: UVC RGB camera (paired), supported; driver uvcvideo on USB | USB 046d:085e | internal | formats MJPG/YUYV
+  /dev/video4: unreadable node, the node exists but could not be read; could not be opened: permission denied
+[doctor] TPM 2.0: /dev/tpmrm0 ✓
+'
+  check "census format, no IR among readable nodes" "$EXIT_NO_IR" "" \
+'[doctor] camera nodes (classified by pixel format):
+  /dev/video0: UVC RGB camera (unpaired), supported (RGB-only convenience tier); driver uvcvideo on USB | formats MJPG/YUYV
+  /dev/video1: metadata-only node (not a camera), nothing to fix
 '
   # The pre-#195 bare line. Kept so the parse stays a superset rather than
   # trading one exact format for another.

@@ -52,8 +52,11 @@ no interpreter, no pip, no dlib. If your camera is not listed, irlume
 still runs: the RGB path needs any UVC camera, and unknown IR emitters
 take `sudo irlume ir-setup` (it measures, warns, and undoes; it never
 blind-writes). Hardware reports are the most useful contribution:
-open an issue with `irlume status`, `sudo irlume doctor --probe`, and
-`irlume camera diagnostics --json` output attached.
+open an issue with `irlume status`, `sudo irlume doctor --probe`,
+`irlume camera census --json`, and `irlume camera diagnostics --json`
+output attached. The census classifies every camera-like device on the
+machine and prints the evidence each classification keyed on, so a report
+answers "broken, an unusable class, or configuration" in one round trip.
 
 ## Validated hosts
 

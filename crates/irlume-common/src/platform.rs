@@ -35,6 +35,25 @@ pub fn distro_family() -> DistroFamily {
     distro_family_from(&os)
 }
 
+/// Whether this machine runs Omarchy (the Arch-based distro from the omarchy
+/// package). Omarchy is `DistroFamily::Arch` for every general purpose, but
+/// it owns opinionated PAM layouts of its own (a fingerprint lock lane,
+/// clamshell-gated pam_fprintd in sudo and polkit), so features that touch
+/// PAM branch on this probe rather than on the family. Keyed on
+/// `/usr/share/omarchy`, which the omarchy package always installs and
+/// nothing else does; a directory probe, not a database read, so it works
+/// in fixture trees and chroots alike.
+#[must_use]
+pub fn omarchy_present() -> bool {
+    omarchy_present_in(std::path::Path::new("/"))
+}
+
+/// [`omarchy_present`] against a root, so a fixture tree can decide it.
+#[must_use]
+pub fn omarchy_present_in(root: &std::path::Path) -> bool {
+    root.join("usr/share/omarchy").is_dir()
+}
+
 /// Classify raw `os-release` contents. Split out of [`distro_family`] verbatim
 /// (test seam: the parse is exercised against fixture strings without touching
 /// the host's `/etc/os-release`); behavior unchanged.
@@ -175,6 +194,21 @@ fn uid_for_name(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omarchy_detection_keys_on_the_share_directory() {
+        let root = std::env::temp_dir().join(format!("irlume-omarchy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // No omarchy tree: plain Arch must NOT match.
+        std::fs::create_dir_all(root.join("usr/share")).unwrap();
+        assert!(!omarchy_present_in(&root));
+        // The omarchy package installs /usr/share/omarchy; that directory is
+        // the stable signal (present on every omarchy install, absent
+        // elsewhere, no reading of pacman databases).
+        std::fs::create_dir_all(root.join("usr/share/omarchy")).unwrap();
+        assert!(omarchy_present_in(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn distro_family_classifies_real_os_release_shapes() {

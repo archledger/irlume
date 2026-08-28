@@ -322,6 +322,102 @@ fn effective_uid() -> u32 {
         .unwrap_or(1000)
 }
 
+/// Wire omarchy's fingerprint layout on this machine: the gate+fprintd pair
+/// into sudo and polkit-1 (backup-once, idempotent) and the lock lane when
+/// the user has fingers enrolled. Mirrors omarchy's own scripts exactly, so
+/// `omarchy-apply-lock` and this agree on every line.
+fn wire_omarchy(user: &str) -> bool {
+    let mut ok = true;
+    for name in ["sudo", "polkit-1"] {
+        let path = format!("{PAM_DIR}/{name}");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match omarchy_wire_stack(&content) {
+                Some(next) => {
+                    if write_pam_edit(&path, &next) {
+                        println!("[fingerprint] omarchy: wired fingerprint into {name} (backup: {name}.pre-irlume)");
+                    } else {
+                        eprintln!("[fingerprint] omarchy: could not write {path}");
+                        ok = false;
+                    }
+                }
+                None => {
+                    println!("[fingerprint] omarchy: {name} already carries the fingerprint lines")
+                }
+            },
+            Err(_) if name == "polkit-1" => {
+                // omarchy's script creates a minimal polkit-1 in this case;
+                // same bytes here, so the stacks converge either way.
+                if write_pam_edit(&path, OMARCHY_MINIMAL_POLKIT) {
+                    println!("[fingerprint] omarchy: created {path} with the fingerprint stack");
+                } else {
+                    eprintln!("[fingerprint] omarchy: could not create {path}");
+                    ok = false;
+                }
+            }
+            Err(_) => println!("[fingerprint] omarchy: no {name} stack on this machine; skipped"),
+        }
+    }
+    // The lock lane: upstream creates it exactly when fingers are enrolled
+    // and REMOVES it otherwise, so the lock plugin can key on its existence.
+    let lane = format!("{PAM_DIR}/omarchy-lock-fingerprint");
+    if fp::has_enrollment(user) {
+        match std::fs::write(&lane, OMARCHY_LOCK_LANE) {
+            Ok(()) => println!(
+                "[fingerprint] omarchy: lock lane {lane} written (the omarchy lock picks it up)"
+            ),
+            Err(e) => {
+                eprintln!("[fingerprint] omarchy: could not write the lock lane: {e}");
+                ok = false;
+            }
+        }
+    } else {
+        println!(
+            "[fingerprint] omarchy: no enrolled fingers, lock lane left absent (upstream behavior)"
+        );
+    }
+    ok
+}
+
+/// Reverse [`wire_omarchy`]: strip the pair from both stacks and remove the
+/// lock lane. Idempotent against files omarchy's own tools shaped.
+fn unwire_omarchy() -> bool {
+    let mut ok = true;
+    for name in ["sudo", "polkit-1"] {
+        let path = format!("{PAM_DIR}/{name}");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let next = omarchy_unwire_stack(&content);
+            if next != content && !write_pam_edit(&path, &next) {
+                eprintln!("[fingerprint] omarchy: could not unwire {path}");
+                ok = false;
+            }
+        }
+    }
+    let lane = format!("{PAM_DIR}/omarchy-lock-fingerprint");
+    match std::fs::remove_file(&lane) {
+        Ok(()) => println!("[fingerprint] omarchy: lock lane removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("[fingerprint] omarchy: could not remove the lock lane: {e}");
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// One PAM edit with the same discipline pamwire uses: back the original up
+/// once beside the file, write the new content, keep mode 0644.
+fn write_pam_edit(path: &str, next: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let backup = format!("{path}.pre-irlume");
+    if !std::path::Path::new(&backup).exists() {
+        if let Ok(current) = std::fs::read_to_string(path) {
+            let _ = std::fs::write(&backup, current);
+        }
+    }
+    std::fs::write(path, next).is_ok()
+        && std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).is_ok()
+}
+
 fn enable(user: &str, args: &[String]) -> ExitCode {
     if !fp::available() {
         eprintln!("[fingerprint] no usable reader (need fprintd + a fingerprint reader)");
@@ -349,6 +445,11 @@ fn enable(user: &str, args: &[String]) -> ExitCode {
                 && run_cmd("authselect", &["apply-changes"])
         }
         DistroFamily::Debian => run_cmd("pam-auth-update", &["--enable", "fprintd"]),
+        // Omarchy owns a fingerprint layout its lock and scripts depend on;
+        // wire exactly that instead of punting like plain Arch (#584).
+        DistroFamily::Arch | DistroFamily::Other if irlume_common::platform::omarchy_present() => {
+            wire_omarchy(user)
+        }
         // No supported wiring tool here. Proceed only when the admin has already
         // added the stanza: recording method=fingerprint with nothing wired
         // disables face while no biometric drives the prompt, silently leaving
@@ -440,6 +541,9 @@ fn disable() -> ExitCode {
                 && run_cmd("authselect", &["apply-changes"])
         }
         DistroFamily::Debian => run_cmd("pam-auth-update", &["--disable", "fprintd"]),
+        DistroFamily::Arch | DistroFamily::Other if irlume_common::platform::omarchy_present() => {
+            unwire_omarchy()
+        }
         DistroFamily::Arch | DistroFamily::Other => {
             println!("[fingerprint] Remove the 'auth sufficient pam_fprintd.so' line you added.");
             true
@@ -460,6 +564,83 @@ fn disable() -> ExitCode {
 /// Where PAM service files live; a const so tests can exercise the scan on a
 /// directory they control.
 const PAM_DIR: &str = "/etc/pam.d";
+
+// --- Omarchy fingerprint wiring (#582-era research, upstream contract) -----
+//
+// Omarchy is Arch underneath but owns an opinionated fingerprint layout its
+// lock and scripts depend on (bin/omarchy-setup-security-fingerprint and
+// bin/omarchy-apply-lock in basecamp/omarchy). irlume wires EXACTLY that
+// layout, byte for byte, so omarchy's own idempotent tools and irlume's
+// agree instead of fighting:
+//
+// - sudo and polkit-1: a clamshell gate (when the lid is shut the reader is
+//   unreachable, so `success=1` skips pam_fprintd and PAM falls straight to
+//   the password) immediately followed by `sufficient pam_fprintd.so`;
+// - the lock screen does NOT take pam_fprintd inline: the omarchy lock
+//   calls a dedicated `omarchy-lock-fingerprint` lane that exists exactly
+//   when the user has fingers enrolled (apply-lock creates/removes it).
+//
+// Without this arm, a fresh Omarchy install has pam_fprintd wired NOWHERE
+// (Arch ships no fingerprint PAM by default and irlume's Arch arm punts),
+// which is exactly "fingerprint dead at pkexec, lock screen, and greeter".
+
+/// The clamshell gate line, byte-identical to omarchy's script.
+const OMARCHY_GATE: &str =
+    "auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed";
+/// The pam_fprintd line, byte-identical to omarchy's script.
+const OMARCHY_FPRINTD: &str = "auth      sufficient pam_fprintd.so";
+/// The lock lane file, byte-identical to omarchy's `omarchy-apply-lock`.
+const OMARCHY_LOCK_LANE: &str = "#%PAM-1.0\nauth       required                    pam_fprintd.so\naccount    include                     system-local-login\n";
+/// omarchy's own minimal polkit-1 for the file-does-not-exist case.
+const OMARCHY_MINIMAL_POLKIT: &str = "#%PAM-1.0\nauth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed\nauth      sufficient pam_fprintd.so\nauth      required pam_unix.so\n\naccount   required pam_unix.so\npassword  required pam_unix.so\nsession   required pam_unix.so\n";
+
+/// Wire one Omarchy auth stack (sudo or polkit-1 content). `None` means
+/// nothing to do. Insert semantics match omarchy's script exactly: no
+/// pam_fprintd yet, both lines go to the very top; pam_fprintd present
+/// without the gate, the gate goes immediately above it.
+fn omarchy_wire_stack(content: &str) -> Option<String> {
+    let has_fprintd = content.lines().any(|l| l.contains("pam_fprintd.so"));
+    let has_gate = content
+        .lines()
+        .any(|l| l.contains("omarchy-hw-laptop-closed"));
+    if has_fprintd && has_gate {
+        return None;
+    }
+    if !has_fprintd {
+        // omarchy's script inserts both at line 1 (`sed 1i`); mirrored.
+        return Some(format!("{OMARCHY_GATE}\n{OMARCHY_FPRINTD}\n{content}"));
+    }
+    // pam_fprintd present, gate missing: the gate goes immediately above
+    // the fprintd line so its `success=1` skips exactly it.
+    let mut out = String::with_capacity(content.len() + OMARCHY_GATE.len() + 1);
+    let mut inserted = false;
+    for line in content.lines() {
+        if !inserted && line.contains("pam_fprintd.so") {
+            out.push_str(OMARCHY_GATE);
+            out.push('\n');
+            inserted = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // A trailing newline was appended per line; the content came with its
+    // own shape, so preserve it by not adding another.
+    Some(out)
+}
+
+/// Remove irlume/omarchy's fingerprint pair from one stack, wherever the
+/// lines sit. Idempotent; returns the content to write (possibly unchanged).
+fn omarchy_unwire_stack(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        if line.contains("pam_fprintd.so") || line.contains("omarchy-hw-laptop-closed") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
 
 /// The vendor service directory libpam falls back to when the machine
 /// directory has no file for a service.
@@ -960,6 +1141,74 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omarchy_wire_inserts_the_pair_at_the_top_of_a_bare_stack() {
+        // Real /etc/pam.d/sudo from a fresh Omarchy install.
+        let stock_sudo = "#%PAM-1.0
+auth     include  system-auth
+account  include  system-auth
+";
+        let wired = omarchy_wire_stack(stock_sudo).expect("bare stack needs the pair");
+        assert!(
+            wired.starts_with(OMARCHY_GATE),
+            "the gate leads the file, matching omarchy's `sed 1i`: {wired}"
+        );
+        let second = wired.lines().nth(1).expect("gate then fprintd");
+        assert_eq!(second, OMARCHY_FPRINTD);
+        // Idempotent: the second run has nothing to do.
+        assert_eq!(omarchy_wire_stack(&wired), None);
+        // And unwiring restores the original bytes.
+        assert_eq!(omarchy_unwire_stack(&wired), stock_sudo);
+    }
+
+    #[test]
+    fn omarchy_wire_adds_only_the_gate_before_an_existing_bare_fprintd_line() {
+        // omarchy's own script may have added pam_fprintd without the gate
+        // (older script revision); the gate slots directly above it.
+        let bare = "#%PAM-1.0
+auth      sufficient pam_fprintd.so
+auth     include  system-auth
+";
+        let wired = omarchy_wire_stack(bare).expect("gate still missing");
+        let lines: Vec<&str> = wired.lines().collect();
+        let gate_at = lines
+            .iter()
+            .position(|l| *l == OMARCHY_GATE)
+            .expect("gate present");
+        assert_eq!(lines[gate_at + 1], OMARCHY_FPRINTD, "gate hugs fprintd");
+        assert_eq!(omarchy_wire_stack(&wired), None);
+    }
+
+    #[test]
+    fn omarchy_unwire_removes_both_lines_wherever_they_sit() {
+        let upstream_shaped = format!(
+            "{}\n{}\n#%PAM-1.0\nauth     include  system-auth\n",
+            OMARCHY_GATE, OMARCHY_FPRINTD
+        );
+        let bare = omarchy_unwire_stack(&upstream_shaped);
+        assert_eq!(bare, "#%PAM-1.0\nauth     include  system-auth\n");
+        // Already bare stays byte-identical.
+        let clean = "#%PAM-1.0\nauth     include  system-auth\n";
+        assert_eq!(omarchy_unwire_stack(clean), clean);
+    }
+
+    #[test]
+    fn omarchy_lane_constants_are_byte_identical_to_upstream() {
+        // Pinned against basecamp/omarchy bin/omarchy-apply-lock and
+        // bin/omarchy-setup-security-fingerprint. If upstream ever changes
+        // these, this test failing IS the signal to re-sync the layout.
+        assert_eq!(
+            OMARCHY_LOCK_LANE,
+            "#%PAM-1.0\nauth       required                    pam_fprintd.so\naccount    include                     system-local-login\n"
+        );
+        assert_eq!(
+            OMARCHY_GATE,
+            "auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed"
+        );
+        assert!(OMARCHY_MINIMAL_POLKIT.contains(OMARCHY_GATE));
+        assert!(OMARCHY_MINIMAL_POLKIT.contains(OMARCHY_FPRINTD));
+    }
 
     #[test]
     fn effective_uid_matches_the_real_euid() {

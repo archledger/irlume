@@ -5,6 +5,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Omarchy: `irlume fingerprint enable` now wires the distro's own
+  fingerprint layout.** Omarchy (Arch underneath) owns an opinionated
+  fingerprint contract its lock and scripts depend on: a clamshell gate
+  (skip the reader when the lid is shut) plus `sufficient pam_fprintd.so`
+  in sudo and polkit-1, and a dedicated `omarchy-lock-fingerprint` PAM
+  lane that exists exactly when fingers are enrolled. irlume's Arch arm
+  previously punted ("no wiring tool on this distro"), so on a fresh
+  Omarchy install pam_fprintd was wired nowhere and fingerprint was dead
+  at pkexec, the lock screen, and the greeter. The new arm, active only
+  when the omarchy package is detected (`/usr/share/omarchy`), wires
+  byte-identical lines so `omarchy-apply-lock` and irlume converge instead
+  of fighting; `disable` reverses all three idempotently. Stock Arch,
+  Fedora, and Debian paths are untouched.
+
 ### Fixed
 
 - **AppArmor: `set-cameras` could not persist the camera pair.** Config

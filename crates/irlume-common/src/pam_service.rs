@@ -67,6 +67,11 @@ pub const SERVICES: &[(&str, ServiceKind)] = &[
     // default, this is where a cold boot actually prompts, and pam_irlume
     // wires into it with the polkit-style consent line.
     ("omarchy-lock-password", ServiceKind::ScreenUnlock),
+    // Cinnamon's screensaver (Linux Mint and friends): a live-session screen
+    // unlock. Live-validated on Mint 22.3: the dialog submits empty fields,
+    // so the on-demand empty-Enter camera arm works there, the best lock UX
+    // irlume has.
+    ("cinnamon-screensaver", ServiceKind::ScreenUnlock),
     // Display-manager greeters (cold login), including GDM's separate
     // fingerprint login service, same login class.
     ("sddm", ServiceKind::Greeter),
@@ -189,6 +194,16 @@ mod tests {
     fn omarchy_stock_lock_password_lane_is_screen_unlock() {
         assert_eq!(
             classify("omarchy-lock-password"),
+            Some(ServiceKind::ScreenUnlock)
+        );
+    }
+
+    /// Cinnamon's screensaver service (Mint): a live-session unlock, wired
+    /// with the on-demand empty-Enter face arm.
+    #[test]
+    fn cinnamon_screensaver_is_screen_unlock() {
+        assert_eq!(
+            classify("cinnamon-screensaver"),
             Some(ServiceKind::ScreenUnlock)
         );
     }

@@ -123,13 +123,29 @@ const OMARCHY_LOCKSCREEN: Svc = Svc {
 type LockSurface = (&'static Svc, fn(&str) -> (String, bool));
 
 fn lock_surface() -> LockSurface {
-    lock_surface_for(irlume_common::platform::omarchy_present())
+    lock_surface_for(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new(CINNAMON_LOCKSCREEN.etc).exists(),
+    )
 }
 
 /// Testable core of [`lock_surface`].
-fn lock_surface_for(omarchy: bool) -> LockSurface {
+/// The stock Cinnamon screensaver's service (Linux Mint, and any Cinnamon
+/// desktop): Debian include-layout, so the KDE on-demand recipe applies, and
+/// live-validated on Mint 22.3 the dialog DOES submit empty fields, which is
+/// what the on-demand empty-Enter camera arm needs. Typed input never reaches
+/// the camera here (by design); it goes to whatever the includes carry, which
+/// on Mint is pam_fprintd then the password.
+const CINNAMON_LOCKSCREEN: Svc = Svc {
+    etc: "/etc/pam.d/cinnamon-screensaver",
+    vendor: None,
+};
+
+fn lock_surface_for(omarchy: bool, cinnamon: bool) -> LockSurface {
     if omarchy {
         (&OMARCHY_LOCKSCREEN, wire_polkit_service)
+    } else if cinnamon {
+        (&CINNAMON_LOCKSCREEN, wire_lock)
     } else {
         (&LOCKSCREEN, wire_lock)
     }
@@ -2533,7 +2549,7 @@ mod tests {
     /// stack because the first auth directive is the faillock preauth.
     #[test]
     fn omarchy_lock_surface_uses_the_stock_lane_with_the_polkit_recipe() {
-        let (svc, wire) = lock_surface_for(true);
+        let (svc, wire) = lock_surface_for(true, false);
         assert_eq!(svc.etc, "/etc/pam.d/omarchy-lock-password");
         assert!(svc.vendor.is_none(), "omarchy ships a real /etc file");
 
@@ -2556,12 +2572,41 @@ mod tests {
         assert!(!again);
 
         // Non-omarchy keeps the KDE lane and its own recipe, untouched.
-        let (kde_svc, kde_wire) = lock_surface_for(false);
+        let (kde_svc, kde_wire) = lock_surface_for(false, false);
         assert_eq!(kde_svc.etc, "/etc/pam.d/kde");
         let kde_stock = "#%PAM-1.0\nauth       include     system-local-login\naccount    include     system-local-login\n";
         let (w, changed) = kde_wire(kde_stock);
         assert!(changed);
         assert!(w.contains("ondemand"), "KDE keeps the on-demand shape");
+    }
+
+    /// Live-validated on Mint 22.3 (#585-era): the Cinnamon screensaver's
+    /// Debian include-layout takes the SAME on-demand recipe as KDE, and its
+    /// dialog submits empty fields, so empty-Enter arms the camera there.
+    /// Omarchy, when present, still wins the lock.
+    #[test]
+    fn cinnamon_lock_surface_takes_the_kde_recipe_when_present() {
+        let (svc, wire) = lock_surface_for(false, true);
+        assert_eq!(svc.etc, "/etc/pam.d/cinnamon-screensaver");
+
+        // Byte-for-byte the stock file from a Mint 22.3 install.
+        let stock = "@include common-auth\nauth optional pam_gnome_keyring.so\n";
+        let (wired, changed) = wire(stock);
+        assert!(changed);
+        assert!(
+            wired.contains("sufficient   pam_irlume.so unseal ondemand"),
+            "the on-demand line the live experiment validated: {wired}"
+        );
+        let face_at = wired.find("pam_irlume.so").expect("face line");
+        let inc_at = wired.find("@include common-auth").expect("the include");
+        assert!(face_at < inc_at, "face line leads the include");
+        // Idempotent.
+        let (_, again) = wire(&wired);
+        assert!(!again);
+
+        // Omarchy outranks Cinnamon when both signals somehow exist.
+        let (omarchy_svc, _) = lock_surface_for(true, true);
+        assert_eq!(omarchy_svc.etc, "/etc/pam.d/omarchy-lock-password");
     }
 
     #[test]

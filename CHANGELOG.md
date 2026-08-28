@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Cinnamon lock screen support (Linux Mint and friends).** The Cinnamon
+  screensaver's `cinnamon-screensaver` PAM service is now classified as a
+  screen unlock and wired with the on-demand recipe: empty-field Enter arms
+  the camera, exactly like KDE's lock, because live validation on Mint 22.3
+  showed the Cinnamon dialog submits empty fields (the best lock UX irlume
+  ships; no `yes` keyword needed). Typed input still never triggers the
+  camera on any lock: on Mint it flows to the stock pam_fprintd-then-
+  password order in common-auth. Surfaces on a fresh Mint install now cover
+  greeter face (lightdm on-demand), lock face, lock fingerprint, polkit
+  face, and sudo.
+
+
 - **Omarchy: face authentication on the stock lock screen.** Omarchy boots
   with autologin by default, so the lock screen, not the greeter, is where
   a cold boot actually asks for credentials, and the stock lock's

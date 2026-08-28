@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/inst
 
 ```sh
 sudo dnf copr enable archledger/irlume && sudo dnf install irlume   # Fedora
-sudo add-apt-repository ppa:archledger/irlume && sudo apt install irlume   # Ubuntu
+sudo add-apt-repository ppa:archledger/irlume && sudo apt install irlume   # Ubuntu 26.04; on 22.04/24.04 and derivatives (Mint, Pop!_OS, Zorin, elementary) the PPA serves no build: use the universal .deb from the latest release
 yay -S irlume                                                       # Arch
 sudo apt install ./irlume_*.deb                                     # Debian 12+, from Releases
 ```

@@ -77,6 +77,19 @@ are all in the repo, reproducible regardless of what tools wrote them.
 </details>
 
 <details>
+<summary><b>On Linux Mint/Cinnamon, why does typing at the lock screen ask for my fingerprint first?</b></summary>
+
+That is the stock Debian-lane ordering, not irlume: enabling fingerprint
+places `pam_fprintd` before the password in `common-auth`, and Cinnamon's
+lock uses one PAM conversation for every factor, so ANY submitted text
+reaches the fingerprint prompt first. Your password is held and honored
+the moment the reader gives up (about ten seconds); touching the reader
+unlocks instantly. Face on the Cinnamon lock stays on the empty-field
+Enter gesture (press Enter on the empty password field), and typed input
+never triggers the camera on any lock.
+</details>
+
+<details>
 <summary><b>Can I verify these claims myself?</b></summary>
 
 That's the point of [`docs/VERIFY.md`](VERIFY.md). Each claim maps to a

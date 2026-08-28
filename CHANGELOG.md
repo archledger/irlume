@@ -7,6 +7,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **`irlume login status` now lists the lock screen** (and gets its mode
+  right): the report had kept the static KDE row after the lock surface
+  became environment-aware, so no desktop ever saw its lock listed, and
+  the Omarchy lock's consent line reported as a keyring line. The lock
+  row now follows the exact surface `login enable` wires, and the mode
+  naming (verify / on-demand / keyring / face-first) is one pure, tested
+  decision shared by the human report, `login status --json`, and the TUI.
+- **Docs: the Mint/Cinnamon fingerprint detour and the PPA's release
+  coverage.** The FAQ explains why typing anything at a Cinnamon lock
+  reaches the fingerprint prompt first (stock Debian-lane ordering; the
+  password is honored after the reader timeout) and that face there stays
+  on the empty-field Enter. The README's PPA line now says which Ubuntu
+  releases the PPA builds for and routes 22.04/24.04 derivatives (Mint,
+  Pop!_OS, Zorin, elementary) to the universal .deb, instead of leaving
+  them at "Unable to locate package".
+
+
 - **Cinnamon lock screen support (Linux Mint and friends).** The Cinnamon
   screensaver's `cinnamon-screensaver` PAM service is now classified as a
   screen unlock and wired with the on-demand recipe: empty-field Enter arms

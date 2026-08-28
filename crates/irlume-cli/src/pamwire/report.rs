@@ -48,20 +48,7 @@ pub(super) fn surface_fact(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
     let wired = content_has_module(&content);
-    // Name HOW face fires on this service: on-demand (the consent model) is
-    // invisible in the PAM file to a reader, and a keyring-only line is the
-    // fingerprint unlock rather than face at all.
-    let mode = if !wired {
-        None
-    } else if role == ROLE_SUDO || role == ROLE_POLKIT {
-        Some("verify")
-    } else if !content.contains("unseal") {
-        Some("keyring")
-    } else if content.contains("ondemand") {
-        Some("on-demand")
-    } else {
-        Some("face-first")
-    };
+    let mode = wiring_mode(role, &content);
     SurfaceFact {
         id: service_name(etc),
         role,
@@ -72,11 +59,47 @@ pub(super) fn surface_fact(
     }
 }
 
+/// Name HOW face fires on a wired service, from its content. Pure: the same
+/// decision feeds the human report, `login status --json`, and the TUI.
+/// `verify` is the plain consent line (sudo, polkit, and the Omarchy lock,
+/// whose polkit-recipe line carries no `unseal`); a keyring-only line is the
+/// fingerprint unlock rather than face at all, and locks never carry one.
+fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
+    if !content_has_module(content) {
+        return None;
+    }
+    if role == ROLE_SUDO
+        || role == ROLE_POLKIT
+        || (role == ROLE_LOCK && !content.contains("unseal"))
+    {
+        return Some("verify");
+    }
+    if !content.contains("unseal") {
+        return Some("keyring");
+    }
+    if content.contains("ondemand") {
+        return Some("on-demand");
+    }
+    Some("face-first")
+}
+
 /// Every surface irlume can wire, present or not, in the order the human report
 /// prints them. Absent services are kept in the list with `present: false`: a
 /// consumer must be able to read an id it knows and cannot find as "this engine
 /// does not wire that service" rather than as "not wired here".
 pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
+    surface_facts_with(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new("/etc/pam.d/cinnamon-screensaver").exists(),
+    )
+}
+
+/// Testable core of [`surface_facts`]: the lock row follows the SAME dynamic
+/// lock surface the wiring uses, so what `login status` reports can never
+/// drift from what `login enable` wires (#584/#585 made the lock surface
+/// environment-aware; the report had kept the static KDE row, which is why
+/// no desktop ever saw its lock listed).
+fn surface_facts_with(omarchy: bool, cinnamon: bool) -> Vec<SurfaceFact> {
     let mut out: Vec<SurfaceFact> = GREETERS
         .iter()
         .map(|s| surface_fact(s.etc, s.vendor, ROLE_LOGIN))
@@ -86,7 +109,8 @@ pub(crate) fn surface_facts() -> Vec<SurfaceFact> {
                 .map(|s| surface_fact(s.etc, s.vendor, ROLE_LOGIN_FP)),
         )
         .collect();
-    out.push(surface_fact(LOCKSCREEN.etc, LOCKSCREEN.vendor, ROLE_LOCK));
+    let (lock_svc, _) = lock_surface_for(omarchy, cinnamon);
+    out.push(surface_fact(lock_svc.etc, lock_svc.vendor, ROLE_LOCK));
     out.push(surface_fact(SUDO, None, ROLE_SUDO));
     out.push(surface_fact(POLKIT.etc, POLKIT.vendor, ROLE_POLKIT));
     out
@@ -279,4 +303,57 @@ pub(super) fn status() -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #584/#585 made the lock surface environment-aware; the status report
+    /// must follow the SAME surface the wiring writes, or `login status`
+    /// silently omits a wired lock (which is exactly what shipped: no desktop
+    /// ever saw a lock row). The lock row's path tracks the chosen surface,
+    /// including the Omarchy-beats-Cinnamon precedence.
+    #[test]
+    fn wiring_mode_names_each_shape_correctly() {
+        // The Omarchy lock's polkit-recipe line: a consent keyword, not
+        // keyring, not on-demand.
+        let omarchy_lock = "auth       [success=done new_authtok_reqd=done abort=die default=ignore]   pam_irlume.so\n@include common-auth\n";
+        assert_eq!(wiring_mode(ROLE_LOCK, omarchy_lock), Some("verify"));
+        // The KDE/Cinnamon on-demand line.
+        let ondemand =
+            "auth       sufficient   pam_irlume.so unseal ondemand\n@include common-auth\n";
+        assert_eq!(wiring_mode(ROLE_LOCK, ondemand), Some("on-demand"));
+        // A keyring-only line on a greeter is the fingerprint unlock
+        // (stanzas.rs KEYRING_UNSEAL's exact shape, no `unseal` token).
+        let keyring = "auth       optional                     pam_irlume.so keyring\n";
+        assert_eq!(wiring_mode(ROLE_LOGIN_FP, keyring), Some("keyring"));
+        // Nothing wired says nothing.
+        assert_eq!(wiring_mode(ROLE_LOCK, "#%PAM-1.0\n"), None);
+    }
+
+    #[test]
+    fn surface_facts_lock_row_follows_the_dynamic_lock_surface() {
+        let lock_row = |omarchy: bool, cinnamon: bool| {
+            surface_facts_with(omarchy, cinnamon)
+                .into_iter()
+                .find(|f| f.role == ROLE_LOCK)
+                .expect("exactly one lock row")
+        };
+        assert_eq!(
+            lock_row(true, true).id,
+            "omarchy-lock-password",
+            "omarchy wins when both signals exist"
+        );
+        assert_eq!(
+            lock_row(false, true).id,
+            "cinnamon-screensaver",
+            "Cinnamon's lock is reported when its service file exists"
+        );
+        assert_eq!(
+            lock_row(false, false).id,
+            "kde",
+            "KDE remains the default lock row"
+        );
+    }
 }

@@ -5,6 +5,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **`camera-tune` now reports the verdict it persisted, not the one the
+  brightness arithmetic alone would pick (#586).** A concurrent arm can
+  keep 100% of RGB and 102% of IR brightness and still fail the
+  frame-provenance bar, and the summary used to say "capture mode
+  concurrent" while the authoritative qualification on disk held
+  sequential_required/invalid_provenance. The message is now phrased
+  from the persisted outcome: sequential leads when sequential was
+  stored, the reason is named (provenance continuity/contract counts,
+  or delivered-rate floors), and a concurrent time saving is never
+  advertised for a sequential verdict.
+
 ### Added
 
 - **`irlume login status` now lists the lock screen** (and gets its mode

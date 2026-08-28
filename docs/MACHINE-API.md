@@ -429,11 +429,45 @@ Row fields:
 | `node` | The `/dev/videoN` row, or `null` for machine-level rows (MIPI pipelines, unbound USB devices) |
 | `class` | One of `uvc_rgb`, `uvc_ir`, `y8_ir`, `metadata_only`, `dummy_node`, `unreadable_node`, `mc_centric`, `mipi_ipu`, `mipi_vendor_bridge`, `usb_camera_without_driver`. Class-specific side fields (`paired`, `generation`, `usb_id`) sit beside it |
 | `verdict` | `supported` (with a tier `note`), `supported_with_limits`, `informational`, `not_hardware`, `unsupported`, or `broken`. Every `note` names the supported path or the next step |
-| `privacy_engaged` | The hardware privacy shutter is engaged on that node: nothing is wrong, the shutter needs opening |
+| `privacy_engaged` | The hardware privacy shutter is engaged on that node: nothing is wrong, the shutter needs opening. `null` on machine-level rows (no node to probe) or when the control could not be read |
 | `evidence` | The facts the classification keyed on (driver, USB identity, format fourccs, internal/external, cause). Never empty |
 
 `listing_error` is non-null when `/dev` could not be listed: the census may
 be incomplete, which is not the same as empty.
+
+### `irlume camera diagnostics --json`
+
+Capability: `camera-diagnostics`.
+
+Machine-readable delivered-rate evidence for the configured pair (#462), plus
+the MS-XU illumination stream state (#568). Runs through the daemon: one
+bounded, gated capture per present role. No device path, account identity, or
+template data is exposed.
+
+```json
+{
+  "rgb": { "known": true, "state": "measured", "evidence": { ... } },
+  "ir": { "known": true, "state": "measured", "evidence": { ... } },
+  "skew_us": 3612533,
+  "capture_strategy": "burst",
+  "illumination": { "node": "present", "frames_classified": 10, "frames_lit": 5, "ambient_observed": true }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `rgb`, `ir` | Per-role diagnostic: `"measured"` (floor cleared), `"fail"` (under-rate), `"missing"` (no node), or `"unknown"` (open/transport failure) |
+| `rgb.evidence` / `ir.evidence` | Exact requested/accepted/delivered rationals, floor, tolerance, window count/span, sequence gap, cumulative drops, timestamp clock and source, latest timestamp |
+| `skew_us` | Same-domain RGB/IR skew in microseconds. `null` means unknown (the two latest timestamps do not share clock and source, or a role is missing) |
+| `capture_strategy` | The strategy the diagnostic used (`"burst"`, `"streaming"`) |
+| `illumination` | The MS-XU illumination metadata stream state (#568): `node` (`"present"`/`"absent"`), `frames_classified`, `frames_lit`, `ambient_observed`. `null` on an RGB-only pair (no IR node to probe). Reports written before #568 deserialize this as `null` |
+
+The `illumination` section: `node` is whether the IR node's metadata sibling
+accepted the UVCM probe; `frames_classified` is how many burst frames the
+camera's own illumination metadata classified; `frames_lit` the subset it
+flagged lit; `ambient_observed` is true only when the camera flagged both a
+lit and a dark frame, meaning the counts reflect a real emitter-off
+observation rather than absent records.
 
 ### Error codes
 

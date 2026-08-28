@@ -1243,11 +1243,29 @@ impl App {
         if let Ok(Response::CaptureModeStatus {
             mode,
             source,
+            qualification_state,
+            qualification_reason,
             runtime_degradation,
             ..
         }) = crate::daemon_poll(&Request::CaptureModeStatus)
         {
+            // The qualification state tells the user WHY their camera is in
+            // this mode: "measured_sequential" (the camera cannot sustain
+            // concurrent) reads very differently from
+            // "unqualified_context_changed" (kernel or USB changed; re-tune).
+            // Both are actionable facts the bare mode string hides (#586
+            // audit: a user who never runs camera-mode or doctor has no way
+            // to learn their qualification is stale).
             let mut text = format!("{mode} (source: {source})");
+            if !qualification_state.is_empty() {
+                text.push_str("; qualification: ");
+                text.push_str(&qualification_state);
+                if let Some(reason) = &qualification_reason {
+                    text.push_str(" (");
+                    text.push_str(reason);
+                    text.push(')');
+                }
+            }
             if let Some(why) = runtime_degradation {
                 text.push_str("; degraded: ");
                 text.push_str(&why);
@@ -1796,16 +1814,12 @@ impl App {
                         .unwrap_or(false)
                 })
         };
-        let fprintd_wired = ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
-            .iter()
-            .any(|p| {
-                std::fs::read_to_string(p)
-                    .map(|s| {
-                        s.lines()
-                            .any(|l| crate::pamwire::directive_has_auth_module(l, "pam_fprintd.so"))
-                    })
-                    .unwrap_or(false)
-            });
+        // The CLI's own gate, not a copy (#583 audit): Omarchy wires
+        // pam_fprintd into sudo/polkit-1 and the lock lane, never into
+        // common-auth/system-auth, so the old two-file probe read a
+        // healthy Omarchy box as unwired.
+        let fprintd_wired =
+            crate::fingerprint::pam_fprintd_wired_pub(&crate::fingerprint::PamSearchPath::live());
         match self.fp.method.as_str() {
             "fingerprint" => {
                 if !fprintd_wired {
@@ -5028,7 +5042,9 @@ impl App {
                 // pair shown right below (#187).
                 v.push(ListItem::new(Span::styled(
                     if self.pairs_known {
-                        "no camera found: face auth unavailable on this device"
+                        "no paired RGB+IR camera found: an RGB webcam alone gives the \
+                         Convenience tier (lock-screen face only); run `irlume camera census` \
+                         or `sudo irlume doctor --probe` to see every camera-like device"
                     } else if self.daemon_up {
                         "asking irlumed for the camera list (it answers once the camera is free)"
                     } else {
@@ -10559,7 +10575,7 @@ mod tests {
         // The daemon ANSWERED with an empty list: now "none" is a fact.
         app.pairs_known = true;
         let text = draw_text(&app);
-        assert!(text.contains("no camera found"), "{text}");
+        assert!(text.contains("no paired RGB+IR camera found"), "{text}");
         // RGB node only: convenience tier, and why Secure needs IR.
         app.nodes = vec![("/dev/video9".into(), irlume_camera::Role::Rgb)];
         let text = draw_text(&app);

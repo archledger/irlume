@@ -13,8 +13,8 @@ use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
 
 pub use irlume_camera::capture_qualification::{
-    AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationResolution,
-    QualificationStore, QualificationStoreError, SequentialReason,
+    AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationMismatch,
+    QualificationResolution, QualificationStore, QualificationStoreError, SequentialReason,
 };
 pub use irlume_camera::lease;
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
@@ -1542,6 +1542,25 @@ pub fn reset_runtime_capture_health(context_key: &str) {
     health.reset(context_key);
 }
 
+/// Whether a SUCCESSFUL concurrent capture's provenance evidence carries
+/// early warning signs that the next one will fail (#586 proactive
+/// degradation). Pure over the three observable warning facts, so the
+/// decision is testable without a camera.
+///
+/// The threshold is deliberately any-single-sign: the #586 testbed showed
+/// that once sequence gaps start under concurrent USB isochronous load,
+/// they compound (rounds 1-3 clean, then every round fails). Waiting for
+/// two or three warning captures means the user eats a failure that could
+/// have been avoided. The CURRENT auth completes normally (the frame was
+/// usable); the NEXT one goes sequential.
+fn successful_capture_shows_degradation_signs(
+    rgb_sequence_gap: bool,
+    ir_sequence_gap: bool,
+    timestamp_discontinuity: bool,
+) -> bool {
+    rgb_sequence_gap || ir_sequence_gap || timestamp_discontinuity
+}
+
 fn concurrent_pair_requires_fallback(
     sequential: bool,
     rgb_failed: bool,
@@ -2339,6 +2358,30 @@ mod capture_mode_switch_tests {
         assert!(!concurrent_pair_requires_fallback(
             false, false, false, false, false
         ));
+    }
+
+    /// #586 proactive degradation: a concurrent capture that SUCCEEDED but
+    /// carried provenance warning signs should trip runtime degradation so
+    /// the NEXT capture goes sequential, not wait for a hard failure.
+    #[test]
+    fn successful_capture_degradation_signs() {
+        use super::successful_capture_shows_degradation_signs;
+        // Clean capture: no signs, no proactive degradation.
+        assert!(!successful_capture_shows_degradation_signs(
+            false, false, false
+        ));
+        // Any single sign is enough (the #586 evidence: gaps compound).
+        assert!(successful_capture_shows_degradation_signs(
+            true, false, false
+        ));
+        assert!(successful_capture_shows_degradation_signs(
+            false, true, false
+        ));
+        assert!(successful_capture_shows_degradation_signs(
+            false, false, true
+        ));
+        // Multiple signs: still just true.
+        assert!(successful_capture_shows_degradation_signs(true, true, true));
     }
 
     #[test]
@@ -3709,6 +3752,34 @@ impl Engine {
                 irlume_common::diagnostics::TraceStage::IrCapture,
                 ir_ms,
             );
+        }
+        // Proactive degradation (#586): a concurrent capture that SUCCEEDED
+        // but carried provenance warning signs (sequence gaps, timestamp
+        // discontinuity) is the leading indicator the next one will fail
+        // outright. The #586 testbed showed gaps compound under USB
+        // isochronous load (rounds 1-3 clean, then every round fails). The
+        // current auth completes normally (the frame was usable); the NEXT
+        // one goes sequential via runtime degradation. Post-capture check,
+        // zero streaming overhead.
+        if !sequential && !pair_sequential_retried {
+            if let (Ok(rgb), Ok(Some((ir, _)))) = (&rgb_res, &ir_res) {
+                let rgb_gap = rgb.provenance().rate_evidence().sequence_gap() > 0;
+                let ir_gap = ir.provenance().rate_evidence().sequence_gap() > 0;
+                let ts_disc = !rgb.provenance().is_continuous() || !ir.provenance().is_continuous();
+                if successful_capture_shows_degradation_signs(rgb_gap, ir_gap, ts_disc) {
+                    if let Some(context_key) = capture_mode.runtime_key.as_deref() {
+                        trip_runtime_capture_health(
+                            context_key,
+                            RuntimeDegradation::ContinuityLoss,
+                        );
+                    }
+                    irlume_common::dlog!(
+                        "assess: proactive degradation: concurrent capture succeeded \\
+                         but showed warning signs (rgb_gap={rgb_gap}, ir_gap={ir_gap}, \\
+                         ts_discontinuity={ts_disc}); subsequent captures go sequential"
+                    );
+                }
+            }
         }
         // Retry a hard-failed side alone: with the other stream stopped, a
         // bandwidth-starved capture succeeds; a genuine fault (privacy

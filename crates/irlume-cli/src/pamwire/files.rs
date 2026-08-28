@@ -12,7 +12,7 @@
 
 use super::grammar::*;
 use super::stanzas::*;
-use super::{Svc, FP_GREETERS, GREETERS, LOCKSCREEN, POLKIT, SUDO};
+use super::{lock_surface, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
 use std::path::{Path, PathBuf};
 
 pub(super) fn read(p: &str) -> Result<String, String> {
@@ -69,12 +69,18 @@ pub(crate) fn surface_digest(path: &Path) -> String {
 pub(crate) fn is_managed_path(path: &str) -> bool {
     let bare = path.strip_suffix(BACKUP).unwrap_or(path);
     // Built from the same lists the wiring uses, so a surface added there is
-    // restorable without anyone remembering to update a second list.
+    // restorable without anyone remembering to update a second list. The
+    // lock surface goes through the same dynamic chooser the wiring walks
+    // (#584/#585 audit round 2: the static KDE const here made `login
+    // rollback` refuse with `unmanaged-path` on Omarchy and Cinnamon after
+    // a clean enable, exactly the consumer-drift class #587 fixed for the
+    // status report).
+    let (lock_svc, _) = lock_surface();
     GREETERS
         .iter()
         .chain(FP_GREETERS.iter())
         .map(|s| s.etc)
-        .chain([LOCKSCREEN.etc, POLKIT.etc, SUDO])
+        .chain([lock_svc.etc, POLKIT.etc, SUDO])
         .any(|managed| managed == bare)
 }
 

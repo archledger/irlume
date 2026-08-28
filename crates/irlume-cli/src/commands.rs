@@ -2135,10 +2135,8 @@ SYSTEM INTEGRATION
   camera census [--json]          classify every camera-like device on the
                         machine, printing the evidence each classification
                         keyed on (#575; the hardware-report attachment)
-  models [list|add|enable|disable [name]]   opt-in third-party models, measured
-                        and checksum-pinned. A PAD entry is a deny-only liveness
-                        cue; a recognition entry REPLACES the RGB matcher at its
-                        measured threshold. Fetched or user-supplied, never shipped
+  models list --json           machine model listing; all other models
+                        subcommands are removed (ADR-0015) and answer with a notice
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   credential-release-challenge [<service>] <on|off|status>
@@ -2157,7 +2155,8 @@ SYSTEM INTEGRATION
 
 MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
   --json                on version, status, doctor, support-report, profiles list, models list,
-                        login status, login plan/verify, auth test --events=jsonl:
+                        camera census, camera diagnostics, login status, login plan/apply/
+                        verify/rollback, auth test --events=jsonl:
                         one line of JSON on stdout, stable check ids and error
                         codes, nothing else printed
   --contract N          declare the contract version you implement; omitted

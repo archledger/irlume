@@ -846,6 +846,13 @@ fn pam_fprintd_wired(path: &PamSearchPath) -> bool {
         .any(|s| !crate::pamwire::has_line_continuation(s) && has_auth_module(s, "pam_fprintd.so"))
 }
 
+/// Pub wrapper for the TUI's Repair probe (#583 audit): the TUI previously
+/// read two fixed files and went blind on the Omarchy lane, where pam_fprintd
+/// lands in sudo/polkit-1 and the lock lane, never in common-auth.
+pub(crate) fn pam_fprintd_wired_pub(path: &PamSearchPath) -> bool {
+    pam_fprintd_wired(path)
+}
+
 /// True when one PAM service file stacks BOTH pam_faillock and pam_fprintd.
 /// That combination locks accounts in the field: a touch sensor misread burns
 /// all fingerprint retries in under two seconds, each one counting as a
@@ -915,6 +922,16 @@ const FP_SURFACES: &[(&str, &str)] = &[
     ("ly", "login screen (ly)"),
     ("kde", "lock screen (KDE)"),
     ("kde-fingerprint", "lock screen (KDE, fingerprint slot)"),
+    (
+        "omarchy-lock-password",
+        "lock screen (Omarchy, password service)",
+    ),
+    (
+        "omarchy-lock-fingerprint",
+        "lock screen (Omarchy, fingerprint lane)",
+    ),
+    ("cinnamon-screensaver", "lock screen (Cinnamon)"),
+    ("polkit-1", "app prompts (polkit)"),
     ("login", "console login"),
     ("sudo", "sudo"),
 ];

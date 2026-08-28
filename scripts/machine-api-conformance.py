@@ -41,6 +41,7 @@ CAPABILITY_COMMANDS = {
     "login-status-json": ["login", "status", "--json"],
     "login-plan-json": ["login", "plan", "--action", "enable", "--json"],
     "models-list-json": ["models", "list", "--json"],
+    "camera-census": ["camera", "census", "--json", "--contract", "1"],
 }
 
 # Streaming capabilities operate the camera, so invoking them here would need

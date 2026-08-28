@@ -398,6 +398,57 @@ fn main() {
                     Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
                 }
             }
+            // Background auto-requalification (#586 gap): when the stored
+            // qualification's context no longer matches the live cameras
+            // (kernel upgrade, USB replug, driver update), the daemon
+            // silently falls to sequential-by-default. Detect the mismatch
+            // here, where both cameras and the store are reachable, and
+            // schedule a one-shot probe after a 60s settle. The probe is
+            // the same measurement camera-tune runs, stored atomically,
+            // and yields to any auth request via the camera lease. Cloned
+            // because `build_engine` below moves the originals.
+            if !ir_dev.is_empty() {
+                let rgb_for_requalify = rgb_dev.clone();
+                let ir_for_requalify = ir_dev.clone();
+                std::thread::Builder::new()
+                    .name("irlume-requalify".into())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        match irlume_auth::stored_capture_qualification(
+                            &rgb_for_requalify,
+                            &ir_for_requalify,
+                        ) {
+                            Ok(irlume_auth::QualificationResolution::Unqualified(
+                                irlume_auth::QualificationMismatch::ContextChanged,
+                            )) => {
+                                eprintln!(
+                                    "irlumed: camera context changed since the last \\
+                                     qualification; running a background requalification \\
+                                     (the IR emitter fires for up to a minute)"
+                                );
+                                match run_capture_mode_probe(
+                                    &rgb_for_requalify,
+                                    &ir_for_requalify,
+                                    TUNE_DEFAULT_ROUNDS,
+                                    ProbeStore::AutomaticIfAbsent,
+                                ) {
+                                    Ok(note) => eprintln!(
+                                        "irlumed: background requalification complete: {note}"
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "irlumed: background requalification failed ({e}); \\
+                                         run `sudo irlume camera-tune` to requalify manually"
+                                    ),
+                                }
+                            }
+                            _ => {
+                                // Valid qualification or fresh install; the
+                                // enrollment probe (#340) covers the latter.
+                            }
+                        }
+                    })
+                    .ok();
+            }
             // Legacy third-party-model keys (BYOM removed, ADR-0015): ignored
             // with a notice so an operator carrying an old selection learns why
             // the engine runs the shipped stack (a buffalo enrollment is

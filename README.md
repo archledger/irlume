@@ -41,7 +41,7 @@ IR camera. Stored as an embedding, never an image. Password always works.
 |  |  |
 |:--|:--|
 | 🌑 **Works in the dark** | Infrared recognition, no ambient light needed |
-| 🔓 **Unlocks everything** | Login, lock screen, `sudo`, polkit prompts |
+| 🔓 **Unlocks everything** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/LIMITATIONS.md)), `sudo`, polkit prompts |
 | 🗝️ **Opens your wallet** | A face match TPM-unseals your keyring secret |
 | 🧬 **No face images** | 512-D embeddings, AES-256-GCM under a TPM-sealed key |
 | 🙋 **Consent before camera** | `yes` for a face attempt; typing your password never starts a scan, and both work in the same prompt (the field accepts either, so you never wait for one path to time out) |

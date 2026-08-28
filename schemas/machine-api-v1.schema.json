@@ -205,6 +205,22 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "const": "camera.census"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/cameraCensusData"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -301,6 +317,7 @@
           "description": "Whether the daemon answered. An unreachable daemon is a reported value, not an error, because the facts that do not need it are still worth having.",
           "enum": [
             "running",
+            "starting",
             "access-denied",
             "unreachable"
           ]
@@ -1059,6 +1076,103 @@
               }
             }
           }
+        }
+      }
+    },
+    "cameraCensusData": {
+      "type": "object",
+      "required": [
+        "listing_error",
+        "entries"
+      ],
+      "properties": {
+        "listing_error": {
+          "description": "Non-null when /dev could not be listed: the census may be incomplete, which is not the same as empty.",
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/censusEntry"
+          }
+        }
+      }
+    },
+    "censusEntry": {
+      "type": "object",
+      "required": [
+        "node",
+        "class",
+        "verdict",
+        "privacy_engaged",
+        "evidence"
+      ],
+      "properties": {
+        "node": {
+          "description": "The /dev/videoN node, or null on machine-level rows.",
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "class": {
+          "description": "The census class: one of uvc_rgb, uvc_ir, y8_ir, metadata_only, dummy_node, unreadable_node, mc_centric, mipi_ipu, mipi_vendor_bridge, usb_camera_without_driver.",
+          "type": "string",
+          "enum": [
+            "uvc_rgb",
+            "uvc_ir",
+            "y8_ir",
+            "metadata_only",
+            "dummy_node",
+            "unreadable_node",
+            "mc_centric",
+            "mipi_ipu",
+            "mipi_vendor_bridge",
+            "usb_camera_without_driver"
+          ]
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "supported",
+            "supported_with_limits",
+            "informational",
+            "not_hardware",
+            "unsupported",
+            "broken"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paired": {
+          "type": "boolean"
+        },
+        "generation": {
+          "type": "string"
+        },
+        "usb_id": {
+          "type": "string"
+        },
+        "privacy_engaged": {
+          "description": "True when the privacy shutter is engaged. Null when the control could not be read or on machine-level rows.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
         }
       }
     }

@@ -220,13 +220,15 @@ pub(crate) fn login_manager_fact() -> LoginManagerFact {
 }
 
 /// Structured wiring status for the TUI: `(label, present, wired)` per service
-/// plus a trailing SELinux row. Mirrors what `status()` prints.
+/// plus a trailing SELinux row. Mirrors what `status()` prints, lock surface
+/// included: the same dynamic chooser the wiring uses (#587's lesson).
 pub(crate) fn status_report() -> Vec<(String, bool, bool)> {
+    let (lock_svc, _) = lock_surface();
     let mut out = Vec::new();
     for s in GREETERS
         .iter()
         .chain(FP_GREETERS.iter())
-        .chain(std::iter::once(&LOCKSCREEN))
+        .chain(std::iter::once(lock_svc))
     {
         match service_present(s) {
             Some(p) => out.push((label_of(s.etc), true, file_has_module(&p))),

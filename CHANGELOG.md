@@ -7,6 +7,33 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Capture mode in the TUI now shows the qualification state and reason.**
+  The Cameras screen's capture row previously said just `sequential
+  (source: default)`; it now carries the full picture including
+  qualification state, reason, and degradation. A user whose qualification
+  went stale after a kernel upgrade can see that from the TUI without
+  running `camera-mode` or `doctor`.
+- **Proactive concurrent degradation (#586 lesson).** A concurrent capture
+  that succeeds but shows provenance warning signs (sequence gaps,
+  timestamp discontinuity) trips runtime degradation immediately, so the
+  next capture goes sequential instead of waiting for the hard failure
+  the signs are building toward. The current auth completes normally.
+- **Background auto-requalification after camera-context change.** When
+  the daemon detects at startup that the stored qualification's context
+  no longer matches (kernel upgrade, USB replug), it schedules a
+  background requalification probe after a 60s settle: the same
+  measurement camera-tune runs, stored atomically. No more silently
+  falling to sequential-by-default after a kernel update.
+
+- **`forbid_external_cameras`: refuse face authentication on removable
+  cameras (#576).** A settings key (or `IRLUME_FORBID_EXTERNAL_CAMERAS=1`)
+  mirroring Microsoft's post-CVE-2021-34466 ShouldForbidExternalCameras
+  posture for policy-sensitive deployments. The daemon re-reads the switch
+  before every capture, so a mid-session settings change takes effect on
+  the next attempt. Unknown (unreadable `removable` attribute) fails closed
+  to password. Off by default. Doctor and `login status --json` surface the
+  state; SETUP.md and THREAT_MODEL.md document the policy.
+
 - **Docs: the XFCE lock screen is recorded as unsupported for face unlock,
   with the measured reason.** xfce4-screensaver pre-starts its PAM
   conversation at lock-open and auto-answers module prompts, so a
@@ -30,31 +57,6 @@ All notable changes to irlume are documented here. This project adheres to
   rounds; 1x ...)"). Diagnostics only; the persisted qualification schema
   is untouched.
 
-### Fixed
-
-- **`camera-tune` now reports the verdict it persisted, not the one the
-  brightness arithmetic alone would pick (#586).** A concurrent arm can
-  keep 100% of RGB and 102% of IR brightness and still fail the
-  frame-provenance bar, and the summary used to say "capture mode
-  concurrent" while the authoritative qualification on disk held
-  sequential_required/invalid_provenance. The message is now phrased
-  from the persisted outcome: sequential leads when sequential was
-  stored, the reason is named (provenance continuity/contract counts,
-  or delivered-rate floors), and a concurrent time saving is never
-  advertised for a sequential verdict.
-- **AppArmor: `camera-tune` could not persist any qualification on
-  enforcing hosts.** The capture-qualification store serializes every
-  save behind a lock file of its own, and the shipped `irlumed` profiles
-  granted `rw` on it but not `flock`'s `k` (camera-tune runs its probe
-  through the daemon), so every `sudo irlume camera-tune` ended in
-  "lock ...: Permission denied" and the pair stayed unmeasured. Found by
-  a 10-iteration tune stress run on the enforcing host; the emitter-stream
-  locks had carried `rwk` all along while this lock, one directory deeper,
-  never did. Both profile variants now carry it, the parity ratchet asserts
-  it, and the fix is hardware-validated by re-running the full stress loop.
-
-### Added
-
 - **`irlume login status` now lists the lock screen** (and gets its mode
   right): the report had kept the static KDE row after the lock surface
   became environment-aware, so no desktop ever saw its lock listed, and
@@ -71,7 +73,6 @@ All notable changes to irlume are documented here. This project adheres to
   Pop!_OS, Zorin, elementary) to the universal .deb, instead of leaving
   them at "Unable to locate package".
 
-
 - **Cinnamon lock screen support (Linux Mint and friends).** The Cinnamon
   screensaver's `cinnamon-screensaver` PAM service is now classified as a
   screen unlock and wired with the on-demand recipe: empty-field Enter arms
@@ -82,7 +83,6 @@ All notable changes to irlume are documented here. This project adheres to
   password order in common-auth. Surfaces on a fresh Mint install now cover
   greeter face (lightdm on-demand), lock face, lock fingerprint, polkit
   face, and sudo.
-
 
 - **Omarchy: face authentication on the stock lock screen.** Omarchy boots
   with autologin by default, so the lock screen, not the greeter, is where
@@ -110,21 +110,6 @@ All notable changes to irlume are documented here. This project adheres to
   byte-identical lines so `omarchy-apply-lock` and irlume converge instead
   of fighting; `disable` reverses all three idempotently. Stock Arch,
   Fedora, and Debian paths are untouched.
-
-### Fixed
-
-- **AppArmor: `set-cameras` could not persist the camera pair.** Config
-  writes serialize on a lock file beside the config (`cameras.conf.lock`),
-  and the shipped `irlumed` profiles granted the lock file's create and
-  write but not `flock`'s `k`, so on an enforcing host `set-cameras`
-  switched the running daemon live, reported success with a persist
-  warning, and the next daemon restart silently reverted the pair. Both
-  profile variants now carry `rwk` on `/etc/irlume/*.lock`, the packaging
-  parity ratchet asserts the rule so the gap cannot re-ship, and the fix is
-  hardware-validated (live patch on the enforcing Arch host completed a
-  persisting `set-cameras` immediately after; issue #580).
-
-### Added
 
 - **Camera triage docs: the kernel quirk table, first.** DEBUGGING.md gains
   a "Cameras: check the kernel first" section: the two-minute lookup of your
@@ -203,6 +188,44 @@ All notable changes to irlume are documented here. This project adheres to
   the fingerprint-reader counter-case.
 
 ### Fixed
+
+- **`ir-setup` evidence names the accepted face-authentication mode (#572).**
+  The undo record's evidence now states which D1/D2 mode the camera actually
+  accepted (for example "D1 (alternative illumination)"), not just that a
+  write happened, so a future restore and any support reader know exactly
+  what the camera was set to.
+
+- **`camera-tune` now reports the verdict it persisted, not the one the
+  brightness arithmetic alone would pick (#586).** A concurrent arm can
+  keep 100% of RGB and 102% of IR brightness and still fail the
+  frame-provenance bar, and the summary used to say "capture mode
+  concurrent" while the authoritative qualification on disk held
+  sequential_required/invalid_provenance. The message is now phrased
+  from the persisted outcome: sequential leads when sequential was
+  stored, the reason is named (provenance continuity/contract counts,
+  or delivered-rate floors), and a concurrent time saving is never
+  advertised for a sequential verdict.
+- **AppArmor: `camera-tune` could not persist any qualification on
+  enforcing hosts.** The capture-qualification store serializes every
+  save behind a lock file of its own, and the shipped `irlumed` profiles
+  granted `rw` on it but not `flock`'s `k` (camera-tune runs its probe
+  through the daemon), so every `sudo irlume camera-tune` ended in
+  "lock ...: Permission denied" and the pair stayed unmeasured. Found by
+  a 10-iteration tune stress run on the enforcing host; the emitter-stream
+  locks had carried `rwk` all along while this lock, one directory deeper,
+  never did. Both profile variants now carry it, the parity ratchet asserts
+  it, and the fix is hardware-validated by re-running the full stress loop.
+
+- **AppArmor: `set-cameras` could not persist the camera pair.** Config
+  writes serialize on a lock file beside the config (`cameras.conf.lock`),
+  and the shipped `irlumed` profiles granted the lock file's create and
+  write but not `flock`'s `k`, so on an enforcing host `set-cameras`
+  switched the running daemon live, reported success with a persist
+  warning, and the next daemon restart silently reverted the pair. Both
+  profile variants now carry `rwk` on `/etc/irlume/*.lock`, the packaging
+  parity ratchet asserts the rule so the gap cannot re-ship, and the fix is
+  hardware-validated (live patch on the enforcing Arch host completed a
+  persisting `set-cameras` immediately after; issue #580).
 
 - **AppArmor: `ir-setup` refused to write the emitter journal on enforcing
   hosts.** The durability walk opens and fsyncs every ancestor of the undo
@@ -3112,7 +3135,8 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/archledger/irlume/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/archledger/irlume/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/archledger/irlume/compare/v0.10.0...v0.11.0
 [0.9.0]: https://github.com/archledger/irlume/releases/tag/v0.9.0

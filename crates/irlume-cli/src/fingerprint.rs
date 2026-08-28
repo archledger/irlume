@@ -1183,8 +1183,7 @@ auth     include  system-auth
     #[test]
     fn omarchy_unwire_removes_both_lines_wherever_they_sit() {
         let upstream_shaped = format!(
-            "{}\n{}\n#%PAM-1.0\nauth     include  system-auth\n",
-            OMARCHY_GATE, OMARCHY_FPRINTD
+            "{OMARCHY_GATE}\n{OMARCHY_FPRINTD}\n#%PAM-1.0\nauth     include  system-auth\n"
         );
         let bare = omarchy_unwire_stack(&upstream_shaped);
         assert_eq!(bare, "#%PAM-1.0\nauth     include  system-auth\n");

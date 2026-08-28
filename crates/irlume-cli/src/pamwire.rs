@@ -105,6 +105,35 @@ const LOCKSCREEN: Svc = Svc {
     // screen because /etc/pam.d/kde doesn't exist yet.
     vendor: Some("/usr/lib/pam.d/kde"),
 };
+
+/// The stock Omarchy lock's password lane. Face rides the polkit-style
+/// verify line, NOT the KDE on-demand block: the Omarchy lock dialog submits
+/// a typed value (the same type-`yes` consent its polkit agent already
+/// carries), and that exact line was live-validated on Omarchy 4.0.1. Its
+/// fingerprint sibling lane (`omarchy-lock-fingerprint`) belongs to
+/// `irlume fingerprint`, never to this wiring.
+const OMARCHY_LOCKSCREEN: Svc = Svc {
+    etc: "/etc/pam.d/omarchy-lock-password",
+    vendor: None,
+};
+
+/// The lock surface for THIS machine. Omarchy's stock lock replaces KDE's:
+/// with the distro's autologin default, the lock is where a cold boot
+/// actually prompts, so wiring it is not optional there.
+type LockSurface = (&'static Svc, fn(&str) -> (String, bool));
+
+fn lock_surface() -> LockSurface {
+    lock_surface_for(irlume_common::platform::omarchy_present())
+}
+
+/// Testable core of [`lock_surface`].
+fn lock_surface_for(omarchy: bool) -> LockSurface {
+    if omarchy {
+        (&OMARCHY_LOCKSCREEN, wire_polkit_service)
+    } else {
+        (&LOCKSCREEN, wire_lock)
+    }
+}
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
 /// distinct from `gdm-password` (password/face). It runs pam_fprintd then
 /// pam_gnome_keyring, which finds no password and leaves the wallet locked. We
@@ -265,8 +294,9 @@ fn reconcile() -> ExitCode {
         // Record the lock screen as ours only if the /etc override actually
         // carries the module now (it was wired), not merely because the vendor
         // file exists.
+        let (lock_svc, _) = lock_surface();
         let with_lock =
-            Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc));
+            Path::new(lock_svc.etc).exists() && file_has_module(Path::new(lock_svc.etc));
         write_wired_marker(true, with_sudo, with_polkit, with_lock);
         eprintln!(
             "[login] adopted the existing face-login wiring into the self-heal marker \
@@ -328,7 +358,8 @@ fn reconcile() -> ExitCode {
 /// WIRED rather than what was asked for: writing `with_lock=true` on a host that
 /// wires no lock screen makes reconcile chase a surface that was never there.
 pub(crate) fn lock_wired() -> bool {
-    Path::new(LOCKSCREEN.etc).exists() && file_has_module(Path::new(LOCKSCREEN.etc))
+    let (svc, _) = lock_surface();
+    Path::new(svc.etc).exists() && file_has_module(Path::new(svc.etc))
 }
 
 pub(crate) fn active_login_wired() -> bool {
@@ -358,7 +389,8 @@ fn lockscreen_regressed(with_lock: bool) -> bool {
     if !with_lock {
         return false;
     }
-    lock_regressed(Path::new(LOCKSCREEN.etc), LOCKSCREEN.vendor.map(Path::new))
+    let (svc, _) = lock_surface();
+    lock_regressed(Path::new(svc.etc), svc.vendor.map(Path::new))
 }
 
 /// Testable core of [`lockscreen_regressed`]: the /etc override was stripped in
@@ -460,10 +492,11 @@ pub(crate) fn reconcile_needed() -> bool {
 }
 
 pub(crate) fn login_wired() -> bool {
+    let (lock_svc, _) = lock_surface();
     for s in GREETERS
         .iter()
         .chain(FP_GREETERS.iter())
-        .chain(std::iter::once(&LOCKSCREEN))
+        .chain(std::iter::once(lock_svc))
     {
         if let Some(p) = service_present(s) {
             if file_has_module(&p) {
@@ -859,7 +892,8 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         let fp_wire = |c: &str| wire_fp_keyring(c, service_name(s.etc));
         visit(s, ROLE_LOGIN_FP, &fp_wire, fp_keyring);
     }
-    visit(&LOCKSCREEN, ROLE_LOCK, &wire_lock, face_lock);
+    let (lock_svc, lock_wire) = lock_surface();
+    visit(lock_svc, ROLE_LOCK, &lock_wire, face_lock);
     if sudo_in_scope(enable, with_sudo) {
         visit(
             &Svc {
@@ -1372,7 +1406,8 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
     }
     // A separate lock service (KDE `kde`) is a WARM screen unlock: the module
     // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
-    do_svc(&LOCKSCREEN, &wire_lock, want_face_lock);
+    let (lock_svc, lock_wire) = lock_surface();
+    do_svc(lock_svc, &lock_wire, want_face_lock);
     if sudo_in_scope(enable, with_sudo) {
         match wire_service(
             &Svc {
@@ -2486,9 +2521,47 @@ mod tests {
     fn fedora_substack_still_uses_the_jump_form() {
         // Regression guard: a Fedora `substack` is atomic for jump counting, so
         // it must keep the [success=1] jump, not switch to sufficient.
-        let fedora = "#%PAM-1.0\nauth       substack     password-auth\nauth       optional     pam_permit.so\n";
+        let fedora = "#%PAM-1.0\nauth       substack     password-auth\nauth        optional     pam_permit.so\n";
         let (l, _) = wire_lock(fedora);
         assert!(l.contains("[success=1 default=ignore]   pam_irlume.so unseal ondemand"));
+    }
+
+    /// #583-era research, live-validated on a fresh Omarchy thinkpad: the
+    /// stock lock's password lane carries the polkit-style consent line
+    /// (type `yes` in the lock's field fires the camera), the KDE on-demand
+    /// shape does not apply there, and the line lands ABOVE the whole auth
+    /// stack because the first auth directive is the faillock preauth.
+    #[test]
+    fn omarchy_lock_surface_uses_the_stock_lane_with_the_polkit_recipe() {
+        let (svc, wire) = lock_surface_for(true);
+        assert_eq!(svc.etc, "/etc/pam.d/omarchy-lock-password");
+        assert!(svc.vendor.is_none(), "omarchy ships a real /etc file");
+
+        // Byte-for-byte the stock file from a fresh Omarchy 4.0.1 install.
+        let stock = "#%PAM-1.0\nauth       required                    pam_faillock.so preauth silent deny=10 unlock_time=120\n-auth      [success=2 default=ignore]  pam_systemd_home.so\nauth       [success=1 default=bad]     pam_unix.so try_first_pass nullok\nauth       [default=die]               pam_faillock.so authfail deny=10 unlock_time=120\nauth       optional                    pam_permit.so\nauth       required                    pam_env.so\nauth       required                    pam_faillock.so authsucc\naccount    include                     system-local-login\n";
+        let (wired, changed) = wire(stock);
+        assert!(changed);
+        let face_at = wired
+            .find("auth       [success=done new_authtok_reqd=done abort=die default=ignore]   pam_irlume.so")
+            .expect("the exact line the live experiment validated");
+        let first_auth = wired
+            .find("pam_faillock.so")
+            .expect("the stack's first auth line");
+        assert!(
+            face_at < first_auth,
+            "the face line must precede the whole auth stack: {wired}"
+        );
+        // Idempotent: the module present means a second pass changes nothing.
+        let (_, again) = wire(&wired);
+        assert!(!again);
+
+        // Non-omarchy keeps the KDE lane and its own recipe, untouched.
+        let (kde_svc, kde_wire) = lock_surface_for(false);
+        assert_eq!(kde_svc.etc, "/etc/pam.d/kde");
+        let kde_stock = "#%PAM-1.0\nauth       include     system-local-login\naccount    include     system-local-login\n";
+        let (w, changed) = kde_wire(kde_stock);
+        assert!(changed);
+        assert!(w.contains("ondemand"), "KDE keeps the on-demand shape");
     }
 
     #[test]

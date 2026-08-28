@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- **Omarchy: face authentication on the stock lock screen.** Omarchy boots
+  with autologin by default, so the lock screen, not the greeter, is where
+  a cold boot actually asks for credentials, and the stock lock's
+  `omarchy-lock-password` PAM lane carried no pam_irlume (only the sddm,
+  sudo, and polkit-1 lanes were wired): face worked at pkexec and the
+  logout greeter but never at the lock. The lock surface is now
+  environment-aware: on Omarchy, `irlume login enable` wires the stock lock
+  lane with the same polkit-style consent line the polkit agent already
+  carries (type `yes` in the lock's field to fire the camera; validated
+  live on Omarchy 4.0.1), self-heal reconcile watches that file, and the
+  service classifies as ScreenUnlock so biopolicy treats it as an unlock
+  surface. Non-Omarchy machines keep the KDE lock lane and its on-demand
+  shape byte-for-byte.
 - **Omarchy: `irlume fingerprint enable` now wires the distro's own
   fingerprint layout.** Omarchy (Arch underneath) owns an opinionated
   fingerprint contract its lock and scripts depend on: a clamshell gate

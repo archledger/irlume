@@ -63,6 +63,10 @@ pub const SERVICES: &[(&str, ServiceKind)] = &[
     ("i3lock", ServiceKind::ScreenUnlock),
     ("hyprlock", ServiceKind::ScreenUnlock),
     ("omarchy-lock-face", ServiceKind::ScreenUnlock),
+    // The stock Omarchy lock's password lane: with the distro's autologin
+    // default, this is where a cold boot actually prompts, and pam_irlume
+    // wires into it with the polkit-style consent line.
+    ("omarchy-lock-password", ServiceKind::ScreenUnlock),
     // Display-manager greeters (cold login), including GDM's separate
     // fingerprint login service, same login class.
     ("sddm", ServiceKind::Greeter),
@@ -173,6 +177,18 @@ mod tests {
     fn omarchy_face_lock_is_screen_unlock() {
         assert_eq!(
             classify("omarchy-lock-face"),
+            Some(ServiceKind::ScreenUnlock)
+        );
+    }
+
+    /// The stock Omarchy lock's PASSWORD lane: with autologin as the distro
+    /// default, this lane (not the greeter) is where a cold boot actually
+    /// asks for credentials, so it classifies as ScreenUnlock exactly like
+    /// the dedicated face service.
+    #[test]
+    fn omarchy_stock_lock_password_lane_is_screen_unlock() {
+        assert_eq!(
+            classify("omarchy-lock-password"),
             Some(ServiceKind::ScreenUnlock)
         );
     }

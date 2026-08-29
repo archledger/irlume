@@ -18,6 +18,13 @@ calibrations:
     Pair_list_F.txt / Pair_list_P.txt. Wild (unaligned) images scored
     with the same detect + warp path as LFW; the ff vs fp rows quantify
     the pose gap.
+  - NIR (Task 5): CBSR (OTCBVS 07) verification on the shipped
+    gallery/probe ground truth with the bench_nir_ext.py preprocessing
+    (YuNet 5-point warp, ground-truth two-eye fallback), and a seeded
+    10,000-pair Oulu-CASIA NIR protocol over subject-disjoint fold
+    halves. Pools both sets into a NIR grant-threshold calibration whose
+    candidate sweep spans 0.2-0.6, covering both the band NIR evidence
+    operates in and its impostor tail.
 
 The embedding path reuses bench_faceid.py exactly (YuNet detect + 5-point
 similarity warp to 112x112 for unaligned sets; (x - 127.5) / 128
@@ -26,19 +33,20 @@ the numbers stay comparable with the committed results. Metrics come from
 verification_metrics (eer, far_threshold_table, fold_accuracy, ten_fold).
 
 The aligned-set protocols ship no folds, so those sets report fold_accuracy
-at the fixed 0.45 line (key acc_at_045) plus eer and tar_table; LFW and
-CFPW report acc10fold over their shipped folds.
+at the fixed 0.45 line (key acc_at_045) plus eer and tar_table; LFW, CFPW
+and Oulu report acc10fold over their folds.
 
 Usage:
   python3 bench_recog_suite.py --models-dir ~/irlume-bench/models \
       --lfw ~/datasets/lfw --bundle ~/datasets/aligned_fr_bundle \
-      --cfp ~/datasets/cfpw --out results-recognition.json
+      --cfp ~/datasets/cfpw --cbsr ~/datasets/cbsr_nir \
+      --oulu ~/datasets/oulu_casia_nir --out results-recognition.json
 
 The out file is merged, not replaced: lanes not run in this invocation
 keep their existing rows, and threshold_calibration.rgb stays frozen to
 the task 3 pool (lfw, agedb30, calfw, cplfw) it was derived from.
 """
-import argparse, hashlib, json, sys, time
+import argparse, hashlib, json, random, sys, time
 from pathlib import Path
 
 import cv2
@@ -47,11 +55,18 @@ import onnxruntime as ort
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import verification_metrics as vm
-from bench_faceid import Detector, Embedder, align_or_center, lfw_tenfold_accuracy
+from bench_faceid import (Embedder, align_or_center, estimate_norm,
+                          lfw_tenfold_accuracy)
+from bench_nir_ext import DetectorFull, load_cbsr_gt, two_point_norm
 
 FARS = [0.1, 0.03, 0.01, 0.003, 0.001]
 GRANT_THRESHOLDS = [0.3, 0.35, 0.4, 0.45, 0.5]
 GRANT_FAR_CAP = 1e-3
+NIR_SEED = 42
+NIR_CBSR_PAIRS = 3000
+OULU_PER_FOLD = 2500
+NIR_GRANT_THRESHOLDS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
+NIR_OPERATING_BAND = (0.2, 0.4)
 ALIGNED_SETS = {
     "agedb30": "agedb_30_ann.txt",
     "calfw": "calfw_ann.txt",
@@ -346,9 +361,161 @@ def run_cfp(cfp_dir, det, emb):
     return {"ff": rows["ff"], "fp": rows["fp"]}, skipped
 
 
-def grant_calibration(pooled_gen, pooled_imp):
+def run_cbsr(cbsr_dir, det, emb, n_pairs=NIR_CBSR_PAIRS, seed=NIR_SEED):
+    """Score CBSR NIR verification on the shipped gallery/probe split.
+
+    Preprocessing is the bench_nir_ext.py NIR path: YuNet largest-face
+    5-point warp, falling back to the ground-truth two-eye similarity
+    warp so coverage stays at 100%. Genuine pairs are seeded same-subject
+    (gallery, probe) combinations; impostor pairs are seeded
+    different-subject (gallery, probe) pairs over the same subjects.
+    """
+    gt = load_cbsr_gt(cbsr_dir)
+    img_dir = cbsr_dir / "NIR_face_dataset" / "NIR_face_dataset"
+    chips, fallbacks, missing = {}, 0, 0
+    t0 = time.perf_counter()
+    for i, n in enumerate(sorted(gt), 1):
+        img = cv2.imread(str(img_dir / n), cv2.IMREAD_COLOR)
+        if img is None:
+            missing += 1
+            continue
+        f = det.largest_face(img)
+        if f is not None:
+            m = estimate_norm(f[4:14].reshape(5, 2))
+        else:
+            fallbacks += 1
+            m = two_point_norm(gt[n]["le"], gt[n]["re"])
+        chips[n] = cv2.warpAffine(img, m, (112, 112), flags=cv2.INTER_LINEAR)
+        if i % 500 == 0:
+            print(f"[cbsr] {i}/{len(gt)} chips "
+                  f"({time.perf_counter() - t0:.0f}s)", flush=True)
+
+    gal, probe = {}, {}
+    for n in sorted(chips):
+        by = n.split("-")[0]
+        (gal if gt[n]["split"] == "gallery" else probe).setdefault(
+            by, []).append(n)
+    elig = sorted(set(gal) & set(probe))
+    rng = random.Random(seed)
+    pairs = []
+    while len(pairs) < n_pairs:
+        i = rng.choice(elig)
+        pairs.append((rng.choice(gal[i]), rng.choice(probe[i]), 1))
+    while len(pairs) < 2 * n_pairs:
+        i, j = rng.sample(elig, 2)
+        pairs.append((rng.choice(gal[i]), rng.choice(probe[j]), 0))
+
+    embs = {}
+    for i, (n, c) in enumerate(chips.items(), 1):
+        embs[n] = emb.embed(c, flip_tta=True)
+        if i % 500 == 0:
+            print(f"[cbsr] {i}/{len(chips)} embedded "
+                  f"({time.perf_counter() - t0:.0f}s)", flush=True)
+    scores = [float(embs[a] @ embs[b]) for a, b, _ in pairs]
+    labels = [l for _, _, l in pairs]
+    genuine = [s for s, l in zip(scores, labels) if l == 1]
+    impostor = [s for s, l in zip(scores, labels) if l == 0]
+    r = {
+        "eer": vm.eer(genuine, impostor),
+        "tar_table": vm.far_threshold_table(genuine, impostor, FARS),
+        "acc_at_045": vm.fold_accuracy(list(zip(scores, labels)), 0.45),
+        "pairs": len(scores),
+        "images": len(chips),
+        "gt_align_fallbacks": fallbacks,
+        "missing_images": missing,
+        "seed": seed,
+    }
+    print(f"[cbsr] eer={r['eer']:.4f} acc@0.45={r['acc_at_045']:.4f} "
+          f"images={len(chips)} fallbacks={fallbacks} missing={missing}",
+          flush=True)
+    return r, genuine, impostor
+
+
+def run_oulu(oulu_dir, det, emb, per_fold=OULU_PER_FOLD, seed=NIR_SEED):
+    """Score the seeded Oulu-CASIA NIR verification protocol.
+
+    Identity is the P### subject across the Dark/Strong/Weak lighting
+    trees. The sorted usable subject list is split into two disjoint
+    halves; each half contributes per_fold genuine (same subject,
+    different image) and per_fold impostor (different subjects) pairs,
+    so the two fold halves are subject-disjoint. Deterministic under
+    random.Random(seed); pairs with no detected face are skipped and
+    counted.
+    """
+    by_id = {}
+    for lighting in sorted(p for p in (oulu_dir / "NI").iterdir()
+                           if p.is_dir()):
+        for subj in sorted(p for p in lighting.iterdir() if p.is_dir()):
+            for emo in sorted(p for p in subj.iterdir() if p.is_dir()):
+                for p in sorted(emo.iterdir()):
+                    if p.suffix.lower() in (".jpg", ".jpeg"):
+                        by_id.setdefault(subj.name, []).append(p)
+    usable = sorted(i for i in by_id if len(by_id[i]) >= 2)
+    if len(usable) < 4 or len(usable) % 2:
+        raise ValueError(
+            f"oulu: cannot split {len(usable)} subjects into halves")
+    halves = (usable[:len(usable) // 2], usable[len(usable) // 2:])
+    rng = random.Random(seed)
+    pairs = []
+    for fold, half in enumerate(halves):
+        n = 0
+        while n < per_fold:
+            i = rng.choice(half)
+            a, b = rng.sample(by_id[i], 2)
+            pairs.append((a, b, 1, fold))
+            n += 1
+        n = 0
+        while n < per_fold:
+            i, j = rng.sample(half, 2)
+            pairs.append((rng.choice(by_id[i]), rng.choice(by_id[j]), 0, fold))
+            n += 1
+
+    cache = embed_images([p for pr in pairs for p in pr[:2]],
+                         det, emb, "oulu", detect=True)
+    scores, labels, folds, skipped = [], [], [], 0
+    for p1, p2, label, fold in pairs:
+        a, b = cache.get(p1), cache.get(p2)
+        if a is None or b is None:
+            skipped += 1
+            continue
+        scores.append(float(a @ b))
+        labels.append(label)
+        folds.append(fold)
+    genuine = [s for s, l in zip(scores, labels) if l == 1]
+    impostor = [s for s, l in zip(scores, labels) if l == 0]
+    tf = vm.ten_fold(scores, labels, folds)
+    r = {
+        "acc10fold": tf["acc10fold"],
+        "acc_sd": tf["sd"],
+        "eer": vm.eer(genuine, impostor),
+        "tar_table": vm.far_threshold_table(genuine, impostor, FARS),
+        "acc_at_045": vm.fold_accuracy(list(zip(scores, labels)), 0.45),
+        "pairs": len(scores),
+        "subjects": len(usable),
+        "seed": seed,
+        "skipped": skipped,
+    }
+    print(f"[oulu] acc10fold={tf['acc10fold']:.4f}±{tf['sd']:.4f} "
+          f"eer={r['eer']:.4f} acc@0.45={r['acc_at_045']:.4f} "
+          f"skip={skipped}", flush=True)
+    return r, genuine, impostor
+
+
+def nir_operating_band(pooled_gen, pooled_imp):
+    """FAR/TAR rows across the NIR operating band of the grant paths."""
+    rows = []
+    for t in NIR_GRANT_THRESHOLDS:
+        if not (NIR_OPERATING_BAND[0] <= t <= NIR_OPERATING_BAND[1]):
+            continue
+        far = sum(1 for s in pooled_imp if s > t) / len(pooled_imp)
+        tar = sum(1 for s in pooled_gen if s > t) / len(pooled_gen)
+        rows.append({"threshold": t, "far": far, "tar": tar})
+    return rows
+
+
+def grant_calibration(pooled_gen, pooled_imp, thresholds=GRANT_THRESHOLDS):
     table = []
-    for t in GRANT_THRESHOLDS:
+    for t in thresholds:
         far = sum(1 for s in pooled_imp if s > t) / len(pooled_imp)
         tar = sum(1 for s in pooled_gen if s > t) / len(pooled_gen)
         table.append({"threshold": t, "far": far, "tar": tar})
@@ -368,6 +535,8 @@ def main():
     ap.add_argument("--lfw", type=Path)
     ap.add_argument("--bundle", type=Path)
     ap.add_argument("--cfp", type=Path)
+    ap.add_argument("--cbsr", type=Path)
+    ap.add_argument("--oulu", type=Path)
     ap.add_argument("--out", type=Path, default=Path("results-recognition.json"))
     a = ap.parse_args()
 
@@ -378,8 +547,8 @@ def main():
     print(f"onnxruntime {ort.__version__} cuda={have_cuda}", flush=True)
 
     model_path = a.models_dir / "glintr100.onnx"
-    need_detect = bool(a.lfw or a.cfp)
-    det = (Detector(a.models_dir / "face_detection_yunet_2023mar.onnx")
+    need_detect = bool(a.lfw or a.cfp or a.cbsr or a.oulu)
+    det = (DetectorFull(a.models_dir / "face_detection_yunet_2023mar.onnx")
            if need_detect else None)
     emb = Embedder(model_path, 128.0, prov)
 
@@ -471,7 +640,64 @@ def main():
             "table stays frozen to its task 3 pool (lfw, agedb30, calfw, "
             "cplfw) and cfpw is reported alongside as the pose-gap evidence.")
 
+    nir = dict(results.get("nir", {}))
+    nir_gen, nir_imp = [], []
     calibration = dict(results.get("threshold_calibration", {}))
+    if a.cbsr:
+        t0 = time.perf_counter()
+        r, gen, imp = run_cbsr(a.cbsr, det, emb)
+        per_set_seconds["cbsr_nir"] = round(time.perf_counter() - t0, 1)
+        nir["cbsr"] = r
+        nir_gen += gen
+        nir_imp += imp
+        add_note(
+            "cbsr protocol consumed: gallery-groundtruth.txt (1,576 lines) "
+            "and probe-groundtruth.txt (2,364 lines), 'name,lx,ly,rx,ry' per "
+            "image; the split field of each ground-truth entry defines the "
+            "gallery/probe membership and the name prefix before '-' the "
+            "subject; verification pairs are seeded (seed 42): 3,000 genuine "
+            "same-subject (gallery, probe) pairs and 3,000 impostor "
+            "different-subject (gallery, probe) pairs over subjects present "
+            "in both splits; preprocessing is the bench_nir_ext.py NIR path "
+            "(YuNet largest-face 5-point warp, ground-truth two-eye "
+            "similarity warp fallback keeps coverage at 100%); embeddings "
+            "use the suite flip-TTA path, while the committed bench_nir_ext "
+            "numbers used no TTA, so eers are not directly comparable.")
+    if a.oulu:
+        t0 = time.perf_counter()
+        r, gen, imp = run_oulu(a.oulu, det, emb)
+        per_set_seconds["oulu_nir"] = round(time.perf_counter() - t0, 1)
+        nir["oulu"] = r
+        nir_gen += gen
+        nir_imp += imp
+        add_note(
+            "oulu protocol is constructed, not canonical (no shipped pair "
+            "list): identity is the P### subject across the Dark/Strong/Weak "
+            "lighting trees; the sorted usable subject list splits into two "
+            "disjoint halves, each contributing 2,500 genuine (same subject, "
+            "different image, any lighting and emotion) and 2,500 impostor "
+            "pairs under random.Random(seed 42), so acc10fold averages the "
+            "two subject-disjoint fold halves; pairs with no detected face "
+            "are skipped and counted.")
+    if nir_gen and a.cbsr and a.oulu:
+        calibration["nir"] = grant_calibration(
+            nir_gen, nir_imp, NIR_GRANT_THRESHOLDS)
+        calibration["nir"]["operating_band"] = nir_operating_band(
+            nir_gen, nir_imp)
+        t50 = next(r for r in calibration["nir"]["table"]
+                   if r["threshold"] == 0.5)
+        add_note(
+            "nir grant calibration pools the impostor and genuine cosine "
+            "scores of the cbsr and oulu pairs of this run; derivation "
+            "matches rgb (smallest candidate threshold with realized FAR <= "
+            "1e-3, best TAR, lowest threshold on ties, strict inequality); "
+            "the candidate sweep spans 0.2-0.6 because same-modality NIR "
+            "evidence concentrates lower than RGB while the pooled impostor "
+            f"tail reaches past 0.5 (FAR {t50['far']:.2e} at 0.5 on this "
+            "run); operating_band lists FAR/TAR at 0.2-0.4, the realistic "
+            "operating band of the recognition grant paths on NIR evidence; "
+            "calibration-only evidence, no runtime change.")
+
     if pool_gen:
         calibration["rgb"] = grant_calibration(pool_gen, pool_imp)
         add_note(
@@ -494,9 +720,11 @@ def main():
             "per_set_seconds": per_set_seconds,
         },
         "rgb": rgb,
-        "threshold_calibration": calibration,
-        "notes": notes,
     }
+    if nir:
+        out["nir"] = nir
+    out["threshold_calibration"] = calibration
+    out["notes"] = notes
     a.out.write_text(json.dumps(out, indent=2))
     print(f"wrote {a.out}", flush=True)
 

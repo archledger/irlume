@@ -5,15 +5,17 @@
     "ort": "1.27.0",
     "cuda": true,
     "flip_tta": true,
-    "started_utc": "2026-08-29T14:26:15Z",
-    "wall_seconds": 132.9,
+    "started_utc": "2026-08-29T14:55:02Z",
+    "wall_seconds": 377.6,
     "per_set_seconds": {
       "lfw": 142.5,
       "bundle_lfw_crosscheck": 194.4,
       "agedb30": 194.0,
       "calfw": 194.0,
       "cplfw": 194.0,
-      "cfpw": 132.4
+      "cfpw": 132.4,
+      "cbsr_nir": 93.2,
+      "oulu_nir": 283.8
     }
   },
   "rgb": {
@@ -216,6 +218,81 @@
       }
     }
   },
+  "nir": {
+    "cbsr": {
+      "eer": 0.008333333333333333,
+      "tar_table": [
+        {
+          "far": 0.1,
+          "threshold": 0.38981467485427856,
+          "tar": 0.999
+        },
+        {
+          "far": 0.03,
+          "threshold": 0.4545297622680664,
+          "tar": 0.9956666666666667
+        },
+        {
+          "far": 0.01,
+          "threshold": 0.5074434280395508,
+          "tar": 0.992
+        },
+        {
+          "far": 0.003,
+          "threshold": 0.534734845161438,
+          "tar": 0.9903333333333333
+        },
+        {
+          "far": 0.001,
+          "threshold": 0.5735234022140503,
+          "tar": 0.982
+        }
+      ],
+      "acc_at_045": 0.9818333333333333,
+      "pairs": 6000,
+      "images": 3940,
+      "gt_align_fallbacks": 0,
+      "missing_images": 0,
+      "seed": 42
+    },
+    "oulu": {
+      "acc10fold": 0.9883,
+      "acc_sd": 0.005300000000000027,
+      "eer": 0.0122,
+      "tar_table": [
+        {
+          "far": 0.1,
+          "threshold": 0.3000190258026123,
+          "tar": 0.9994
+        },
+        {
+          "far": 0.03,
+          "threshold": 0.3757762312889099,
+          "tar": 0.995
+        },
+        {
+          "far": 0.01,
+          "threshold": 0.4334918260574341,
+          "tar": 0.9854
+        },
+        {
+          "far": 0.003,
+          "threshold": 0.4800117313861847,
+          "tar": 0.9696
+        },
+        {
+          "far": 0.001,
+          "threshold": 0.5080506801605225,
+          "tar": 0.9522
+        }
+      ],
+      "acc_at_045": 0.9862,
+      "pairs": 10000,
+      "subjects": 80,
+      "seed": 42,
+      "skipped": 0
+    }
+  },
   "threshold_calibration": {
     "rgb": {
       "grant_recommendation": 0.35,
@@ -247,6 +324,84 @@
           "tar": 0.4685
         }
       ]
+    },
+    "nir": {
+      "grant_recommendation": 0.6,
+      "far_at_grant": 0.0,
+      "table": [
+        {
+          "threshold": 0.2,
+          "far": 0.4955,
+          "tar": 1.0
+        },
+        {
+          "threshold": 0.25,
+          "far": 0.32725,
+          "tar": 0.99975
+        },
+        {
+          "threshold": 0.3,
+          "far": 0.196625,
+          "tar": 0.999625
+        },
+        {
+          "threshold": 0.35,
+          "far": 0.099125,
+          "tar": 0.9985
+        },
+        {
+          "threshold": 0.4,
+          "far": 0.041625,
+          "tar": 0.99425
+        },
+        {
+          "threshold": 0.45,
+          "far": 0.017,
+          "tar": 0.986125
+        },
+        {
+          "threshold": 0.5,
+          "far": 0.005625,
+          "tar": 0.971125
+        },
+        {
+          "threshold": 0.55,
+          "far": 0.001125,
+          "tar": 0.945125
+        },
+        {
+          "threshold": 0.6,
+          "far": 0.0,
+          "tar": 0.9045
+        }
+      ],
+      "operating_band": [
+        {
+          "threshold": 0.2,
+          "far": 0.4955,
+          "tar": 1.0
+        },
+        {
+          "threshold": 0.25,
+          "far": 0.32725,
+          "tar": 0.99975
+        },
+        {
+          "threshold": 0.3,
+          "far": 0.196625,
+          "tar": 0.999625
+        },
+        {
+          "threshold": 0.35,
+          "far": 0.099125,
+          "tar": 0.9985
+        },
+        {
+          "threshold": 0.4,
+          "far": 0.041625,
+          "tar": 0.99425
+        }
+      ]
     }
   },
   "notes": [
@@ -257,6 +412,9 @@
     "rgb grant calibration pools the impostor and genuine cosine scores of all scored pairs across the four sets above; grant rule is score > threshold; far/tar fractions use strict inequality; grant_recommendation is the candidate threshold with realized FAR <= 1e-3 and the best TAR (lowest threshold on ties).",
     "cfpw protocol consumed: Protocol/Split/{FF,FP}/{01..10}/{same,diff}.txt with 350 same + 350 diff rows per fold per protocol; 'a,b' lines are 1-based image indices resolved through Pair_list_F.txt (5,000 frontal) and Pair_list_P.txt (2,000 profile); FF lines index the frontal list twice, FP lines are (frontal, profile); 500 identities asserted across both lists; folds are identity-separable per the shipped Readme, so acc10fold uses verification_metrics.ten_fold (per-fold optimal threshold on the fold itself, ties to lowest) and acc_sd is the population sd across the 10 folds.",
     "cfpw pose gap: compare rgb.cfpw.ff (frontal-frontal) with rgb.cfpw.fp (frontal-profile) accuracy and eer; images are wild (unaligned) photos embedded with the same detect + warp path as lfw; pairs with no detected face are skipped and counted (ff skipped=10, fp skipped=101).",
-    "cfpw scores are not pooled into threshold_calibration.rgb; that table stays frozen to its task 3 pool (lfw, agedb30, calfw, cplfw) and cfpw is reported alongside as the pose-gap evidence."
+    "cfpw scores are not pooled into threshold_calibration.rgb; that table stays frozen to its task 3 pool (lfw, agedb30, calfw, cplfw) and cfpw is reported alongside as the pose-gap evidence.",
+    "cbsr protocol consumed: gallery-groundtruth.txt (1,576 lines) and probe-groundtruth.txt (2,364 lines), 'name,lx,ly,rx,ry' per image; the split field of each ground-truth entry defines the gallery/probe membership and the name prefix before '-' the subject; verification pairs are seeded (seed 42): 3,000 genuine same-subject (gallery, probe) pairs and 3,000 impostor different-subject (gallery, probe) pairs over subjects present in both splits; preprocessing is the bench_nir_ext.py NIR path (YuNet largest-face 5-point warp, ground-truth two-eye similarity warp fallback keeps coverage at 100%); embeddings use the suite flip-TTA path, while the committed bench_nir_ext numbers used no TTA, so eers are not directly comparable.",
+    "oulu protocol is constructed, not canonical (no shipped pair list): identity is the P### subject across the Dark/Strong/Weak lighting trees; the sorted usable subject list splits into two disjoint halves, each contributing 2,500 genuine (same subject, different image, any lighting and emotion) and 2,500 impostor pairs under random.Random(seed 42), so acc10fold averages the two subject-disjoint fold halves; pairs with no detected face are skipped and counted.",
+    "nir grant calibration pools the impostor and genuine cosine scores of the cbsr and oulu pairs of this run; derivation matches rgb (smallest candidate threshold with realized FAR <= 1e-3, best TAR, lowest threshold on ties, strict inequality); the candidate sweep spans 0.2-0.6 because same-modality NIR evidence concentrates lower than RGB while the pooled impostor tail reaches past 0.5 (FAR 5.62e-03 at 0.5 on this run); operating_band lists FAR/TAR at 0.2-0.4, the realistic operating band of the recognition grant paths on NIR evidence; calibration-only evidence, no runtime change."
   ]
 }

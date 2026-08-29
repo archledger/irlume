@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
-"""RGB recognition lane for calibration phase 2 (Task 3).
+"""Recognition suite for calibration phase 2 (Tasks 3-5).
 
-Scores AuraFace glintr100 (the recognizer irlume ships) over four standard
-RGB verification protocols and derives the RGB grant-threshold calibration:
+Scores AuraFace glintr100 (the recognizer irlume ships) over standard
+verification protocols and derives per-modality grant-threshold
+calibrations:
 
-  - LFW deepfunneled, shipped pairs.csv 10-fold protocol (6,000 pairs,
-    10 folds x [300 match + 300 mismatch] in canonical row order).
-    Continuity cross-check against the committed results-lfw.json
+  - LFW deepfunneled (Task 3), shipped pairs.csv 10-fold protocol
+    (6,000 pairs, 10 folds x [300 match + 300 mismatch] in canonical row
+    order). Continuity cross-check against the committed results-lfw.json
     auraface flip-TTA number (acc10fold 0.9903).
-  - AgeDB-30 / CALFW / CPLFW from the aligned_fr_bundle mirror:
+  - AgeDB-30 / CALFW / CPLFW (Task 3) from the aligned_fr_bundle mirror:
     pre-aligned 112x112 crops scored over each set's shipped 6,000-pair
     annotation file.
+  - CFPW (Task 4): official 10-fold frontal-frontal (FF) and
+    frontal-profile (FP) verification, 350 same + 350 diff pairs per
+    fold per protocol (7,000 pairs each), resolved through
+    Pair_list_F.txt / Pair_list_P.txt. Wild (unaligned) images scored
+    with the same detect + warp path as LFW; the ff vs fp rows quantify
+    the pose gap.
 
 The embedding path reuses bench_faceid.py exactly (YuNet detect + 5-point
-similarity warp to 112x112 for LFW; (x - 127.5) / 128 normalization, flip
-TTA, 512-D L2-normalized embedding, cosine scoring) so the numbers stay
-comparable with the committed results. Metrics come from
+similarity warp to 112x112 for unaligned sets; (x - 127.5) / 128
+normalization, flip TTA, 512-D L2-normalized embedding, cosine scoring) so
+the numbers stay comparable with the committed results. Metrics come from
 verification_metrics (eer, far_threshold_table, fold_accuracy, ten_fold).
 
 The aligned-set protocols ship no folds, so those sets report fold_accuracy
-at the fixed 0.45 line (key acc_at_045) plus eer and tar_table; only LFW
-reports acc10fold.
+at the fixed 0.45 line (key acc_at_045) plus eer and tar_table; LFW and
+CFPW report acc10fold over their shipped folds.
 
 Usage:
   python3 bench_recog_suite.py --models-dir ~/irlume-bench/models \
       --lfw ~/datasets/lfw --bundle ~/datasets/aligned_fr_bundle \
-      --out results-recognition.json
+      --cfp ~/datasets/cfpw --out results-recognition.json
+
+The out file is merged, not replaced: lanes not run in this invocation
+keep their existing rows, and threshold_calibration.rgb stays frozen to
+the task 3 pool (lfw, agedb30, calfw, cplfw) it was derived from.
 """
 import argparse, hashlib, json, sys, time
 from pathlib import Path
@@ -234,6 +245,107 @@ def bundle_lfw_crosscheck(bundle_root, emb):
     return eer, float(accs[best_i])
 
 
+def load_cfp_pairs(cfp_dir):
+    """Resolve the CFPW 10-fold FF/FP pair files to image paths.
+
+    Protocol/Split/{FF,FP}/{01..10}/{same,diff}.txt hold 'a,b' 1-based
+    image indices per fold (350 same + 350 diff rows each). Indices point
+    into Protocol/Pair_list_F.txt (5,000 frontal images) and
+    Protocol/Pair_list_P.txt (2,000 profile images); FF lines index the
+    frontal list twice, FP lines are (frontal, profile). Fold directories
+    are identity-separable per the shipped Readme.
+    """
+    def read_index(path):
+        out = {}
+        for ln in path.read_text().splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            idx, rel = ln.split(None, 1)
+            out[int(idx)] = (path.parent / rel.strip()).resolve()
+        return out
+
+    proto_dir = cfp_dir / "Protocol"
+    flist = read_index(proto_dir / "Pair_list_F.txt")
+    plist = read_index(proto_dir / "Pair_list_P.txt")
+    subjects = ({p.parent.parent.name for p in flist.values()}
+                | {p.parent.parent.name for p in plist.values()})
+    if len(subjects) != 500:
+        raise ValueError(
+            f"cfpw: expected 500 identities, got {len(subjects)}")
+    protos = {}
+    for proto in ("ff", "fp"):
+        pairs = []
+        split_dir = proto_dir / "Split" / proto.upper()
+        fold_dirs = sorted(d for d in split_dir.iterdir() if d.is_dir())
+        if len(fold_dirs) != 10:
+            raise ValueError(
+                f"cfpw {proto}: expected 10 fold dirs, got {len(fold_dirs)}")
+        for fold, d in enumerate(fold_dirs):
+            for label, name in ((1, "same.txt"), (0, "diff.txt")):
+                rows = [ln.strip() for ln
+                        in (d / name).read_text().splitlines() if ln.strip()]
+                if len(rows) != 350:
+                    raise ValueError(
+                        f"{d / name}: expected 350 rows, got {len(rows)}")
+                for ln in rows:
+                    ia, ib = (int(x) for x in ln.split(","))
+                    if proto == "ff":
+                        p1, p2 = flist[ia], flist[ib]
+                        ok = (p1.parent.name == "frontal"
+                              and p2.parent.name == "frontal")
+                    else:
+                        p1, p2 = flist[ia], plist[ib]
+                        ok = (p1.parent.name == "frontal"
+                              and p2.parent.name == "profile")
+                    if not ok:
+                        raise ValueError(
+                            f"cfpw {proto}: pose mismatch at "
+                            f"{d.name}/{name}: {ln}")
+                    pairs.append((p1, p2, label, fold))
+        protos[proto] = pairs
+    return protos
+
+
+def run_cfp(cfp_dir, det, emb):
+    """Score the CFPW FF and FP protocols; returns rows + skipped counts.
+
+    The pose gap is the ff row vs the fp row: frontal-frontal accuracy
+    against frontal-profile accuracy under the identical embedding path.
+    """
+    protos = load_cfp_pairs(cfp_dir)
+    cache = embed_images(
+        [p for pr in (protos["ff"] + protos["fp"]) for p in pr[:2]],
+        det, emb, "cfpw", detect=True)
+    rows, skipped = {}, {}
+    for proto in ("ff", "fp"):
+        scores, labels, folds, skip = [], [], [], 0
+        for p1, p2, label, fold in protos[proto]:
+            a, b = cache.get(p1), cache.get(p2)
+            if a is None or b is None:
+                skip += 1
+                continue
+            scores.append(float(a @ b))
+            labels.append(label)
+            folds.append(fold)
+        genuine = [s for s, l in zip(scores, labels) if l == 1]
+        impostor = [s for s, l in zip(scores, labels) if l == 0]
+        tf = vm.ten_fold(scores, labels, folds)
+        rows[proto] = {
+            "acc10fold": tf["acc10fold"],
+            "acc_sd": tf["sd"],
+            "eer": vm.eer(genuine, impostor),
+            "tar_table": vm.far_threshold_table(genuine, impostor, FARS),
+            "acc_at_045": vm.fold_accuracy(list(zip(scores, labels)), 0.45),
+            "pairs": len(scores),
+        }
+        skipped[proto] = skip
+        print(f"[cfp_{proto}] acc10fold={tf['acc10fold']:.4f}±{tf['sd']:.4f} "
+              f"eer={rows[proto]['eer']:.4f} acc@0.45="
+              f"{rows[proto]['acc_at_045']:.4f} skip={skip}", flush=True)
+    return {"ff": rows["ff"], "fp": rows["fp"]}, skipped
+
+
 def grant_calibration(pooled_gen, pooled_imp):
     table = []
     for t in GRANT_THRESHOLDS:
@@ -255,6 +367,7 @@ def main():
     ap.add_argument("--models-dir", type=Path, required=True)
     ap.add_argument("--lfw", type=Path)
     ap.add_argument("--bundle", type=Path)
+    ap.add_argument("--cfp", type=Path)
     ap.add_argument("--out", type=Path, default=Path("results-recognition.json"))
     a = ap.parse_args()
 
@@ -265,12 +378,23 @@ def main():
     print(f"onnxruntime {ort.__version__} cuda={have_cuda}", flush=True)
 
     model_path = a.models_dir / "glintr100.onnx"
-    det = Detector(a.models_dir / "face_detection_yunet_2023mar.onnx") if a.lfw else None
+    need_detect = bool(a.lfw or a.cfp)
+    det = (Detector(a.models_dir / "face_detection_yunet_2023mar.onnx")
+           if need_detect else None)
     emb = Embedder(model_path, 128.0, prov)
 
-    notes = []
-    rgb, pool_gen, pool_imp = {}, [], []
-    per_set_seconds = {}
+    results = {}
+    if a.out.exists():
+        results = json.loads(a.out.read_text())
+    notes = list(results.get("notes", []))
+    per_set_seconds = dict(
+        results.get("runtime", {}).get("per_set_seconds", {}))
+
+    def add_note(text):
+        if text not in notes:
+            notes.append(text)
+
+    rgb, pool_gen, pool_imp = dict(results.get("rgb", {})), [], []
     if a.lfw:
         t0 = time.perf_counter()
         lfw_r, lfw_extra = run_lfw(a.lfw, det, emb)
@@ -278,7 +402,7 @@ def main():
         rgb["lfw"] = lfw_r
         pool_gen += lfw_extra["gen"]
         pool_imp += lfw_extra["imp"]
-        notes.append(
+        add_note(
             "lfw acc10fold uses verification_metrics.ten_fold (per-fold optimal "
             f"threshold on the fold itself, ties to lowest threshold). The "
             f"bench_faceid.py held-out-train-fold-threshold protocol gives "
@@ -286,18 +410,19 @@ def main():
             "run; the committed results-lfw.json continuity number 0.9903 used "
             "that protocol with the same auraface flip-TTA embedding path.")
         if lfw_extra["skipped"]:
-            notes.append(f"lfw: {lfw_extra['skipped']} pairs skipped (no face "
-                         "detected in at least one image).")
+            add_note(f"lfw: {lfw_extra['skipped']} pairs skipped (no face "
+                     "detected in at least one image).")
     if a.bundle:
         t0 = time.perf_counter()
         x_eer, x_acc = bundle_lfw_crosscheck(a.bundle, emb)
         per_set_seconds["bundle_lfw_crosscheck"] = round(
             time.perf_counter() - t0, 1)
         if a.lfw:
-            notes.append(
-                f"bundle coherence cross-check: the bundle's own aligned-LFW "
-                f"annotation (lfw_ann.txt, 6,000 pairs) through the identical "
-                f"embedding path gives eer={x_eer:.4f} and best-threshold "
+            add_note(
+                "bundle coherence cross-check: the bundle's own aligned-LFW "
+                "annotation (lfw_ann.txt, 6,000 pairs) through the identical "
+                "embedding path gives eer="
+                f"{x_eer:.4f} and best-threshold "
                 f"accuracy {x_acc:.4f} on its 112x112 crops, vs eer="
                 f"{rgb['lfw']['eer']:.4f} for the deepfunneled detect+warp lane; "
                 "the bundle data and the pipeline are consistent.")
@@ -308,28 +433,56 @@ def main():
             rgb[key] = r
             pool_gen += extra["gen"]
             pool_imp += extra["imp"]
-        notes.append(
+        add_note(
             "aligned sets (agedb30, calfw, cplfw): pre-aligned 112x112 crops "
             "embedded directly without detection; the shipped protocols define "
             "no folds, so each set reports acc_at_045 = "
             "verification_metrics.fold_accuracy at the fixed 0.45 line plus "
             "eer and tar_table; acc10fold is reported for lfw only.")
-        notes.append(
+        add_note(
             "aligned bundle annotations consumed: agedb_30_ann.txt, "
             "calfw_ann.txt, cplfw_ann.txt at the bundle root, label-first "
             "'<1|0> <img1> <img2>' format, 6,000 pairs (3,000 genuine / 3,000 "
             "impostor) per set, paths relative to the bundle root.")
+    if a.cfp:
+        t0 = time.perf_counter()
+        cfp_r, cfp_skip = run_cfp(a.cfp, det, emb)
+        per_set_seconds["cfpw"] = round(time.perf_counter() - t0, 1)
+        rgb["cfpw"] = cfp_r
+        add_note(
+            "cfpw protocol consumed: Protocol/Split/{FF,FP}/{01..10}/"
+            "{same,diff}.txt with 350 same + 350 diff rows per fold per "
+            "protocol; 'a,b' lines are 1-based image indices resolved through "
+            "Pair_list_F.txt (5,000 frontal) and Pair_list_P.txt (2,000 "
+            "profile); FF lines index the frontal list twice, FP lines are "
+            "(frontal, profile); 500 identities asserted across both lists; "
+            "folds are identity-separable per the shipped Readme, so "
+            "acc10fold uses verification_metrics.ten_fold (per-fold optimal "
+            "threshold on the fold itself, ties to lowest) and acc_sd is the "
+            "population sd across the 10 folds.")
+        add_note(
+            "cfpw pose gap: compare rgb.cfpw.ff (frontal-frontal) with "
+            "rgb.cfpw.fp (frontal-profile) accuracy and eer; images are wild "
+            "(unaligned) photos embedded with the same detect + warp path as "
+            "lfw; pairs with no detected face are skipped and counted "
+            f"(ff skipped={cfp_skip['ff']}, fp skipped={cfp_skip['fp']}).")
+        add_note(
+            "cfpw scores are not pooled into threshold_calibration.rgb; that "
+            "table stays frozen to its task 3 pool (lfw, agedb30, calfw, "
+            "cplfw) and cfpw is reported alongside as the pose-gap evidence.")
 
-    calibration = {"rgb": grant_calibration(pool_gen, pool_imp)}
-    notes.append(
-        "rgb grant calibration pools the impostor and genuine cosine scores of "
-        "all scored pairs across the four sets above; grant rule is score > "
-        "threshold; far/tar fractions use strict inequality; "
-        "grant_recommendation is the candidate threshold with realized FAR <= "
-        "1e-3 and the best TAR (lowest threshold on ties).")
+    calibration = dict(results.get("threshold_calibration", {}))
+    if pool_gen:
+        calibration["rgb"] = grant_calibration(pool_gen, pool_imp)
+        add_note(
+            "rgb grant calibration pools the impostor and genuine cosine scores of "
+            "all scored pairs across the four sets above; grant rule is score > "
+            "threshold; far/tar fractions use strict inequality; "
+            "grant_recommendation is the candidate threshold with realized FAR <= "
+            "1e-3 and the best TAR (lowest threshold on ties).")
 
     wall = time.perf_counter() - t_start
-    results = {
+    out = {
         "runtime": {
             "host_model": str(model_path),
             "model_sha256": sha256_file(model_path),
@@ -344,7 +497,7 @@ def main():
         "threshold_calibration": calibration,
         "notes": notes,
     }
-    a.out.write_text(json.dumps(results, indent=2))
+    a.out.write_text(json.dumps(out, indent=2))
     print(f"wrote {a.out}", flush=True)
 
 

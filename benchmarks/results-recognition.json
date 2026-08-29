@@ -5,14 +5,15 @@
     "ort": "1.27.0",
     "cuda": true,
     "flip_tta": true,
-    "started_utc": "2026-08-29T13:57:23Z",
-    "wall_seconds": 919.4,
+    "started_utc": "2026-08-29T14:26:15Z",
+    "wall_seconds": 132.9,
     "per_set_seconds": {
       "lfw": 142.5,
       "bundle_lfw_crosscheck": 194.4,
       "agedb30": 194.0,
       "calfw": 194.0,
-      "cplfw": 194.0
+      "cplfw": 194.0,
+      "cfpw": 132.4
     }
   },
   "rgb": {
@@ -143,6 +144,76 @@
       ],
       "acc_at_045": 0.7053333333333334,
       "pairs": 6000
+    },
+    "cfpw": {
+      "ff": {
+        "acc10fold": 0.9954240475345072,
+        "acc_sd": 0.003427871269124747,
+        "eer": 0.007153078164990466,
+        "tar_table": [
+          {
+            "far": 0.1,
+            "threshold": 0.14836134016513824,
+            "tar": 0.9974234182651016
+          },
+          {
+            "far": 0.03,
+            "threshold": 0.19883783161640167,
+            "tar": 0.9965645576868022
+          },
+          {
+            "far": 0.01,
+            "threshold": 0.23265235126018524,
+            "tar": 0.9945605496707701
+          },
+          {
+            "far": 0.003,
+            "threshold": 0.28206557035446167,
+            "tar": 0.988834812482107
+          },
+          {
+            "far": 0.001,
+            "threshold": 0.29740291833877563,
+            "tar": 0.9862582307472088
+          }
+        ],
+        "acc_at_045": 0.957653791130186,
+        "pairs": 6990
+      },
+      "fp": {
+        "acc10fold": 0.9601043907608677,
+        "acc_sd": 0.01068565456609313,
+        "eer": 0.04667343191263168,
+        "tar_table": [
+          {
+            "far": 0.1,
+            "threshold": 0.15008127689361572,
+            "tar": 0.9692664540446506
+          },
+          {
+            "far": 0.03,
+            "threshold": 0.1935785710811615,
+            "tar": 0.9394027254276602
+          },
+          {
+            "far": 0.01,
+            "threshold": 0.23861075937747955,
+            "tar": 0.895042041171354
+          },
+          {
+            "far": 0.003,
+            "threshold": 0.27218765020370483,
+            "tar": 0.8498115395766889
+          },
+          {
+            "far": 0.001,
+            "threshold": 0.3119370937347412,
+            "tar": 0.7755871267033922
+          }
+        ],
+        "acc_at_045": 0.6890853746919844,
+        "pairs": 6899
+      }
     }
   },
   "threshold_calibration": {
@@ -183,6 +254,9 @@
     "bundle coherence cross-check: the bundle's own aligned-LFW annotation (lfw_ann.txt, 6,000 pairs) through the identical embedding path gives eer=0.0067 and best-threshold accuracy 0.9948 on its 112x112 crops, vs eer=0.0127 for the deepfunneled detect+warp lane; the bundle data and the pipeline are consistent.",
     "aligned sets (agedb30, calfw, cplfw): pre-aligned 112x112 crops embedded directly without detection; the shipped protocols define no folds, so each set reports acc_at_045 = verification_metrics.fold_accuracy at the fixed 0.45 line plus eer and tar_table; acc10fold is reported for lfw only.",
     "aligned bundle annotations consumed: agedb_30_ann.txt, calfw_ann.txt, cplfw_ann.txt at the bundle root, label-first '<1|0> <img1> <img2>' format, 6,000 pairs (3,000 genuine / 3,000 impostor) per set, paths relative to the bundle root.",
-    "rgb grant calibration pools the impostor and genuine cosine scores of all scored pairs across the four sets above; grant rule is score > threshold; far/tar fractions use strict inequality; grant_recommendation is the candidate threshold with realized FAR <= 1e-3 and the best TAR (lowest threshold on ties)."
+    "rgb grant calibration pools the impostor and genuine cosine scores of all scored pairs across the four sets above; grant rule is score > threshold; far/tar fractions use strict inequality; grant_recommendation is the candidate threshold with realized FAR <= 1e-3 and the best TAR (lowest threshold on ties).",
+    "cfpw protocol consumed: Protocol/Split/{FF,FP}/{01..10}/{same,diff}.txt with 350 same + 350 diff rows per fold per protocol; 'a,b' lines are 1-based image indices resolved through Pair_list_F.txt (5,000 frontal) and Pair_list_P.txt (2,000 profile); FF lines index the frontal list twice, FP lines are (frontal, profile); 500 identities asserted across both lists; folds are identity-separable per the shipped Readme, so acc10fold uses verification_metrics.ten_fold (per-fold optimal threshold on the fold itself, ties to lowest) and acc_sd is the population sd across the 10 folds.",
+    "cfpw pose gap: compare rgb.cfpw.ff (frontal-frontal) with rgb.cfpw.fp (frontal-profile) accuracy and eer; images are wild (unaligned) photos embedded with the same detect + warp path as lfw; pairs with no detected face are skipped and counted (ff skipped=10, fp skipped=101).",
+    "cfpw scores are not pooled into threshold_calibration.rgb; that table stays frozen to its task 3 pool (lfw, agedb30, calfw, cplfw) and cfpw is reported alongside as the pose-gap evidence."
   ]
 }

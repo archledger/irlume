@@ -7639,6 +7639,17 @@ fn held_concurrent_arm<'d>(
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             accumulate(into, &mut continuity, &rgb, &ir, t0.elapsed(), context);
         }
+        // #606: the verdict names these facts only when the whole probe is
+        // conclusive, so a dark-scene inconclusive run used to leave the
+        // concurrent arm's failure mode unreadable. Say them when they
+        // happened, whatever the scene.
+        if !into.continuity_facts.is_empty() || !into.capture_failure_facts.is_empty() {
+            irlume_common::dlog!(
+                "[capture-stage] concurrent-arm facts: continuity={:?} capture={:?}",
+                into.continuity_facts,
+                into.capture_failure_facts
+            );
+        }
         Ok(())
     }
 }

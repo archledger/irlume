@@ -31,7 +31,8 @@ use std::str::FromStr;
 use zeroize::Zeroizing;
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
-use tss_esapi::constants::SessionType;
+use tss_esapi::constants::tss::{TPM2_HT_NV_INDEX, TPM2_HT_PERSISTENT};
+use tss_esapi::constants::{CapabilityType, SessionType};
 use tss_esapi::handles::{
     KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle, SessionHandle,
     TpmHandle,
@@ -44,10 +45,10 @@ use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::resource_handles::{Hierarchy, NvAuth, Provision};
 use tss_esapi::interface_types::session_handles::{AuthSession, PolicySession};
 use tss_esapi::structures::{
-    Auth, Digest, DigestList, KeyedHashScheme, Nonce, PcrSelectionList, PcrSelectionListBuilder,
-    PcrSlot, Private, Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters,
-    PublicRsaParameters, RsaExponent, RsaScheme, RsaSignature, SensitiveData, Signature,
-    SymmetricDefinition, SymmetricDefinitionObject,
+    Auth, CapabilityData, Digest, DigestList, HandleList, KeyedHashScheme, Nonce, PcrSelectionList,
+    PcrSelectionListBuilder, PcrSlot, Private, Public, PublicBuilder, PublicKeyRsa,
+    PublicKeyedHashParameters, PublicRsaParameters, RsaExponent, RsaScheme, RsaSignature,
+    SensitiveData, Signature, SymmetricDefinition, SymmetricDefinitionObject,
 };
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::ESYS_TR;
@@ -320,27 +321,41 @@ fn is_irlume_srk(public: &Public) -> Result<bool> {
 /// be flushed by the caller).
 fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
     let persistent = persistent_srk_handle()?;
+    let wanted = TpmHandle::Persistent(persistent);
 
-    if let Ok(object) = ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)) {
-        let key_handle = KeyHandle::from(ESYS_TR::from(object));
-        let is_ours = match ctx.read_public(key_handle) {
-            Ok((public, _, _)) => is_irlume_srk(&public)?,
-            Err(_) => false,
-        };
-        if is_ours {
-            // A handle obtained via tr_from_tpm_public starts with no tracked
-            // auth; our SRK was created with an empty authValue, so tell ESYS so
-            // loading a child under it doesn't fail with TPM_RC_AUTH_UNAVAILABLE.
-            ctx.tr_set_auth(object, Auth::default()).map_err(tpm_err)?;
-            return Ok((key_handle, true));
+    // Quiet first-use probe (#601): tr_from_tpm_public answers a handle that
+    // does not exist yet with three esys ERROR lines in the journal, and the
+    // missing handle is the EXPECTED state on a fresh install's first enroll.
+    // Ask GetCapability first, so the expected miss never prints as an error;
+    // the probe below then only runs against a handle that is really there.
+    if tpm_handle_exists(ctx, u32::from(TPM2_HT_PERSISTENT), wanted)? {
+        if let Ok(object) = ctx.tr_from_tpm_public(wanted) {
+            let key_handle = KeyHandle::from(ESYS_TR::from(object));
+            let is_ours = match ctx.read_public(key_handle) {
+                Ok((public, _, _)) => is_irlume_srk(&public)?,
+                Err(_) => false,
+            };
+            if is_ours {
+                // A handle obtained via tr_from_tpm_public starts with no tracked
+                // auth; our SRK was created with an empty authValue, so tell ESYS so
+                // loading a child under it doesn't fail with TPM_RC_AUTH_UNAVAILABLE.
+                ctx.tr_set_auth(object, Auth::default()).map_err(tpm_err)?;
+                return Ok((key_handle, true));
+            }
+            // Persistent handle occupied by a foreign key: leave it untouched and
+            // use a transient SRK this run (correct, just slower).
+            let transient = create_srk(ctx)?;
+            return Ok((transient, false));
         }
-        // Persistent handle occupied by a foreign key: leave it untouched and
-        // use a transient SRK this run (correct, just slower).
-        let transient = create_srk(ctx)?;
-        return Ok((transient, false));
     }
 
     // First run: derive the primary (one-time slow step) and persist it.
+    // Said in our words, because the library's logging for the expected
+    // handle miss this path replaces is three ERROR lines (#601).
+    irlume_common::dlog!(
+        "irlume: first TPM use on this machine: deriving and persisting the \
+         storage root key (a few seconds on slow TPMs)"
+    );
     let transient = create_srk(ctx)?;
     let persisted = ctx
         .execute_with_nullauth_session(|ctx| {
@@ -1008,10 +1023,36 @@ fn pcr_composite_digest(values: &[[u8; 32]]) -> Result<Digest> {
 
 fn nv_index_handle(ctx: &mut Context, nv_index: u32) -> Result<NvIndexHandle> {
     let tpm_handle = NvIndexTpmHandle::new(nv_index).map_err(tpm_err)?;
-    let obj: ObjectHandle = ctx
-        .tr_from_tpm_public(TpmHandle::NvIndex(tpm_handle))
-        .map_err(tpm_err)?;
+    let wanted = TpmHandle::NvIndex(tpm_handle);
+    // Same quiet-probe rationale as the SRK (#601): an undefined NV index is
+    // the pcrlock-not-provisioned state, not an error worth three esys lines.
+    if !tpm_handle_exists(ctx, u32::from(TPM2_HT_NV_INDEX), wanted)? {
+        return Err(Error::Tpm(format!(
+            "NV index {nv_index:#x} is not defined on this TPM (pcrlock not provisioned)"
+        )));
+    }
+    let obj: ObjectHandle = ctx.tr_from_tpm_public(wanted).map_err(tpm_err)?;
     Ok(NvIndexHandle::from(obj))
+}
+
+/// Whether a handle of `handle_type` (a TPM2_HT_* constant) exists, from one
+/// GetCapability call. Exists so the expected-miss paths never reach
+/// `tr_from_tpm_public`, whose library logging prints the miss as ERROR (#601).
+fn tpm_handle_exists(ctx: &mut Context, handle_type: u32, wanted: TpmHandle) -> Result<bool> {
+    let (data, _more) = ctx
+        .get_capability(CapabilityType::Handles, handle_type, 0xff)
+        .map_err(tpm_err)?;
+    let CapabilityData::Handles(list) = data else {
+        return Err(Error::Tpm(
+            "TPM returned a non-handle capability for a handle query".into(),
+        ));
+    };
+    Ok(capability_list_has(list, wanted))
+}
+
+/// Pure matching core of [`tpm_handle_exists`], testable without a TPM.
+fn capability_list_has(list: HandleList, wanted: TpmHandle) -> bool {
+    list.into_inner().contains(&wanted)
 }
 
 /// One step of a systemd super-PCR policy, replayable in a trial session to
@@ -1403,6 +1444,34 @@ pub(crate) mod tests {
         assert!(is_irlume_srk(&srk_template().unwrap()).unwrap());
         let sealed = sealed_template(Digest::default()).unwrap();
         assert!(!is_irlume_srk(&sealed).unwrap());
+    }
+
+    /// #601: the quiet-existence probe's matching core must find the exact
+    /// persistent or NV handle in a capability list and miss everything else,
+    /// because the probe decides whether the expected-miss path runs at all.
+    #[test]
+    fn capability_list_has_matches_exact_persistent_and_nv_handles() {
+        let srk = TpmHandle::Persistent(PersistentTpmHandle::new(0x8101_0002).unwrap());
+        let nv = TpmHandle::NvIndex(NvIndexTpmHandle::new(0x0140_0001).unwrap());
+        let list = HandleList::try_from(vec![
+            TpmHandle::Persistent(PersistentTpmHandle::new(0x8100_0001).unwrap()),
+            srk,
+        ])
+        .unwrap();
+        assert!(capability_list_has(list, srk));
+        let empty = HandleList::try_from(Vec::new()).unwrap();
+        assert!(
+            !capability_list_has(empty, srk),
+            "an empty TPM has no SRK: this is the first-use state"
+        );
+        let persistent_only = HandleList::try_from(vec![TpmHandle::Persistent(
+            PersistentTpmHandle::new(0x8100_0001).unwrap(),
+        )])
+        .unwrap();
+        assert!(
+            !capability_list_has(persistent_only, nv),
+            "an NV handle never matches a persistent-handle list"
+        );
     }
 
     #[test]

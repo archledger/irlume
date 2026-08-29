@@ -1,0 +1,183 @@
+{
+  "runtime": {
+    "ort_version": "1.27.0",
+    "providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "cv2_version": "5.0.0"
+  },
+  "protocol": {
+    "smoke": true,
+    "n": 32,
+    "source": "wider_face val, first N images of the sorted bbox ground truth"
+  },
+  "per_image": [
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_465.jpg",
+      "n_faces": 4,
+      "max_score": 0.7421
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_628.jpg",
+      "n_faces": 11,
+      "max_score": 0.9151
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_765.jpg",
+      "n_faces": 140,
+      "max_score": 0.906
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_194.jpg",
+      "n_faces": 5,
+      "max_score": 0.9256
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_379.jpg",
+      "n_faces": 15,
+      "max_score": 0.8356
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_814.jpg",
+      "n_faces": 19,
+      "max_score": 0.837
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_470.jpg",
+      "n_faces": 23,
+      "max_score": 0.945
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_1045.jpg",
+      "n_faces": 20,
+      "max_score": 0.9159
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_556.jpg",
+      "n_faces": 12,
+      "max_score": 0.9224
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_829.jpg",
+      "n_faces": 1,
+      "max_score": 0.9244
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_593.jpg",
+      "n_faces": 63,
+      "max_score": 0.8445
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_29.jpg",
+      "n_faces": 20,
+      "max_score": 0.9228
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_72.jpg",
+      "n_faces": 14,
+      "max_score": 0.8733
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_205.jpg",
+      "n_faces": 4,
+      "max_score": 0.8741
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_881.jpg",
+      "n_faces": 10,
+      "max_score": 0.8223
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_490.jpg",
+      "n_faces": 235,
+      "max_score": 0.9033
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_125.jpg",
+      "n_faces": 5,
+      "max_score": 0.8761
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_120.jpg",
+      "n_faces": 17,
+      "max_score": 0.9127
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_476.jpg",
+      "n_faces": 40,
+      "max_score": 0.9272
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_620.jpg",
+      "n_faces": 21,
+      "max_score": 0.9083
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_960.jpg",
+      "n_faces": 4,
+      "max_score": 0.9291
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_488.jpg",
+      "n_faces": 6,
+      "max_score": 0.8901
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_901.jpg",
+      "n_faces": 3,
+      "max_score": 0.9293
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_822.jpg",
+      "n_faces": 5,
+      "max_score": 0.9285
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_353.jpg",
+      "n_faces": 2,
+      "max_score": 0.9495
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_74.jpg",
+      "n_faces": 119,
+      "max_score": 0.9186
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_234.jpg",
+      "n_faces": 55,
+      "max_score": 0.8996
+    },
+    {
+      "file": "0--Parade/0_Parade_marchingband_1_359.jpg",
+      "n_faces": 14,
+      "max_score": 0.9389
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_266.jpg",
+      "n_faces": 4,
+      "max_score": 0.9035
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_275.jpg",
+      "n_faces": 2,
+      "max_score": 0.6726
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_478.jpg",
+      "n_faces": 3,
+      "max_score": 0.8196
+    },
+    {
+      "file": "0--Parade/0_Parade_Parade_0_913.jpg",
+      "n_faces": 6,
+      "max_score": 0.9103
+    }
+  ],
+  "summary": {
+    "images": 32,
+    "total_faces": 902,
+    "images_with_zero_faces": 0
+  }
+}

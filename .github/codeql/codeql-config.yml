@@ -1,0 +1,39 @@
+# CodeQL configuration: the default suite, minus the two Rust queries that
+# cannot see inline `#[cfg(test)] mod tests` blocks.
+#
+# CodeQL's Rust extractor does not evaluate `cfg` attributes, so unit-test
+# code that compiles only under `cfg(test)` is analyzed as production code.
+# These two queries then fire on test fixtures and on every `panic!` or
+# `assert!` message that interpolates one:
+#
+# - `rust/cleartext-logging`: 119 of 119 alerts were false positives.
+#   116 were `panic!`/`assert!` messages inside `mod tests` printing enum
+#   Debug output or a numeric uid; 3 were production lines logging a
+#   refused caller's uid, which is public account metadata logged
+#   deliberately for field diagnostics (the unseal-refusal journal line
+#   exists because a silent refusal once cost hours of investigation).
+# - `rust/hard-coded-cryptographic-value`: 20 of 20 alerts were false
+#   positives: test fixtures (`b"correct horse battery staple"`,
+#   `vec![0x5a; SALT_LEN]`), key-length-rejection asserts over zero-filled
+#   arrays, and a public NIST CAVP known-answer vector.
+#
+# The same classes were manually dismissed on 2026-07-05, 2026-08-03, and
+# 2026-08-04, and they regenerate with new alert numbers whenever test lines
+# drift, which buries real findings under noise. Excluding the queries is
+# surgical: every other query in the default code-scanning suite still runs
+# for all three languages, and the `id` filters are no-ops for the actions
+# and python matrix legs.
+#
+# Trade-off, accepted with eyes open: a future REAL regression of these two
+# classes in production code would not be caught by CodeQL. Re-include a
+# query by deleting its filter when CodeQL gains `cfg(test)` modeling for
+# Rust (the queries live in the `codeql/rust-queries` pack:
+# CWE-312/CleartextLogging.ql and CWE-798/HardcodedCryptographicValue.ql).
+
+name: "irlume CodeQL configuration"
+
+query-filters:
+  - exclude:
+      id: rust/cleartext-logging
+  - exclude:
+      id: rust/hard-coded-cryptographic-value

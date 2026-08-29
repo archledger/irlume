@@ -189,6 +189,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **Code scanning no longer buries real alerts under test-fixture noise.**
+  CodeQL's Rust extractor does not evaluate `cfg` attributes, so its two
+  fixture-sensitive queries (`rust/cleartext-logging`,
+  `rust/hard-coded-cryptographic-value`) fired on inline
+  `#[cfg(test)] mod tests` code: 139 false-positive alerts in one run
+  (test passwords like `b"correct horse battery staple"`, salt and
+  key-length fixtures, a public NIST vector, and `panic!` messages
+  printing enum Debug output), regenerating with new alert numbers every
+  time test lines drift. The checked-in CodeQL workflow now applies two
+  `query-filters` that exclude exactly those two queries while every
+  other default-suite query keeps running for all three languages, and
+  the 139 standing alerts were dismissed with per-alert reasoning. The
+  rationale and the re-enable condition live in
+  `.github/codeql/codeql-config.yml`.
+
 - **`ir-setup` evidence names the accepted face-authentication mode (#572).**
   The undo record's evidence now states which D1/D2 mode the camera actually
   accepted (for example "D1 (alternative illumination)"), not just that a

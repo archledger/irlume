@@ -73,6 +73,13 @@ jobs:
           # same suite the default setup used. `queries: default` is not a
           # suite name; it fatal-errors with "Query pack default cannot be
           # found".
+          #
+          # The config file keeps that default suite and only applies two
+          # `query-filters` excluding the Rust queries that cannot see inline
+          # `#[cfg(test)] mod tests` code (139/139 false-positive alerts,
+          # regenerating on every test-line drift; rationale in the config
+          # file). The filters are no-ops for the actions and python legs.
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7

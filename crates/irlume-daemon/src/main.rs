@@ -8153,7 +8153,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("irlume.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        set_mode(path.to_str().unwrap(), DAEMON_SOCKET_MODE);
+        set_mode(path.to_str().unwrap(), DAEMON_SOCKET_MODE).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o666, "every local uid must be able to connect");

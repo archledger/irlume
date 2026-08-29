@@ -76,18 +76,19 @@ directly.
 
 | protocol | pairs | acc10fold | sd | eer | acc@0.45 | TAR@1e-1 | TAR@1e-2 | TAR@1e-3 |
 |---|---|---|---|---|---|---|---|---|
-| ff (frontal-frontal) | 6,990 | 0.9954 | 0.0034 | 0.0072 | 0.9577 | 0.9974 | 0.9946 | 0.9883 |
+| ff (frontal-frontal) | 6,990 | 0.9954 | 0.0034 | 0.0072 | 0.9577 | 0.9974 | 0.9946 | 0.9863 |
 | fp (frontal-profile) | 6,899 | 0.9601 | 0.0107 | 0.0467 | 0.6891 | 0.9693 | 0.8950 | 0.7756 |
 
 Pose gap, stated plainly: profile costs ~3.5pt of acc10fold (0.9601 vs
-0.9954), raises EER from 0.72% to 4.67%, and drops TAR@1e-3 from 0.9883 to
+0.9954), raises EER from 0.72% to 4.67%, and drops TAR@1e-3 from 0.9863 to
 0.7756 under the identical embedding path. FP is the weakest RGB condition
 measured in this campaign, consistent with an RGB grant line tuned on
 cooperative frontal evidence.
 
 Detection-skip accounting: pairs with no detected face are skipped and
-counted, never silently dropped: 10 FF pairs and 101 FP pairs skipped (34
-wild images without a detectable face).
+counted, never silently dropped: 10 FF pairs and 101 FP pairs skipped (the
+verification run counted 34 undetected wild images; task-4 verification
+count, not a committed JSON field).
 
 ## 3. NIR track
 
@@ -191,9 +192,10 @@ synthesis question.
 - The CBSR protocol is likewise seeded (gallery/probe over the shipped GT)
   and differs from the committed `bench_nir_ext.py` construction (see the
   comparability caveat in section 3).
-- CFPW detection skips: 34 wild images had no detectable face (10 FF + 101 FP
-  pairs skipped, counted); the reported CFPW figures condition on detected
-  faces.
+- CFPW detection skips: the verification run counted 34 undetected wild
+  images (task-4 verification count, not a committed JSON field); 10 FF +
+  101 FP pairs skipped, counted. The reported CFPW figures condition on
+  detected faces.
 - Tufts is absent (request-form acquisition; user decision pending). Tufts was
   the clean unseen-faces NIR control in prior benches; this phase has no such
   control, and CBSR/Oulu are also the sets the removed IR adapter trained on,

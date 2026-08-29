@@ -31,7 +31,7 @@ use std::str::FromStr;
 use zeroize::Zeroizing;
 
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
-use tss_esapi::constants::tss::{TPM2_HT_NV_INDEX, TPM2_HT_PERSISTENT};
+use tss_esapi::constants::tss::{TPM2_HR_NV_INDEX, TPM2_HR_PERSISTENT};
 use tss_esapi::constants::{CapabilityType, SessionType};
 use tss_esapi::handles::{
     KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle, SessionHandle,
@@ -328,7 +328,7 @@ fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
     // missing handle is the EXPECTED state on a fresh install's first enroll.
     // Ask GetCapability first, so the expected miss never prints as an error;
     // the probe below then only runs against a handle that is really there.
-    if tpm_handle_exists(ctx, u32::from(TPM2_HT_PERSISTENT), wanted)? {
+    if tpm_handle_exists(ctx, TPM2_HR_PERSISTENT, wanted)? {
         if let Ok(object) = ctx.tr_from_tpm_public(wanted) {
             let key_handle = KeyHandle::from(ESYS_TR::from(object));
             let is_ours = match ctx.read_public(key_handle) {
@@ -1026,7 +1026,7 @@ fn nv_index_handle(ctx: &mut Context, nv_index: u32) -> Result<NvIndexHandle> {
     let wanted = TpmHandle::NvIndex(tpm_handle);
     // Same quiet-probe rationale as the SRK (#601): an undefined NV index is
     // the pcrlock-not-provisioned state, not an error worth three esys lines.
-    if !tpm_handle_exists(ctx, u32::from(TPM2_HT_NV_INDEX), wanted)? {
+    if !tpm_handle_exists(ctx, TPM2_HR_NV_INDEX, wanted)? {
         return Err(Error::Tpm(format!(
             "NV index {nv_index:#x} is not defined on this TPM (pcrlock not provisioned)"
         )));

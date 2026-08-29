@@ -85,11 +85,11 @@ def safe_extract_zip(
 
 
 def render_provenance(
-    spec,
-    hashes,
-    terms_quoted,
-    now=None,
-):
+    spec: DatasetSpec,
+    hashes: dict[str, str],
+    terms_quoted: str,
+    now: datetime.datetime | None = None,
+) -> str:
     stamp = now or datetime.datetime.now(datetime.UTC)
     stamp = stamp.replace(microsecond=0)
     lines = [

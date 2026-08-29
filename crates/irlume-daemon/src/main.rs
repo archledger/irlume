@@ -382,10 +382,14 @@ fn main() {
                     "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
                 );
             }
-            // Re-apply the KNOWN emitter control at startup. The emitter is camera
-            // hardware state that resets on a USB/power cycle or a daemon restart, so
-            // without this the first auth after a restart gets a dark IR frame (the
-            // "worked at enroll, failed at the lock screen" case).
+            // The emitter verification is deliberately NOT run at startup
+            // (#603). Applying the KNOWN control is part of every capture's
+            // open path (see `capture_ir`), so the first authentication
+            // re-applies and verifies it there; running it at daemon start
+            // meant opening the IR camera, lighting the emitter, and grabbing
+            // a frame on every boot with no user action anywhere, which the
+            // consent wording never declared. The first auth is the declared
+            // moment.
             //
             // This used to fall through to a blind search when IR came back dark, which
             // is what destroyed a reporter's camera in #159. A daemon start is not
@@ -393,15 +397,11 @@ fn main() {
             // even imply the emitter is the problem: an unlit room or an empty chair
             // produces exactly the same measurement. Discovery now happens only when
             // someone runs `irlume ir-setup` and accepts the warning.
-            if std::path::Path::new(&ir_dev).exists() {
-                match irlume_auth::apply_known_ir_emitter(&ir_dev) {
-                    Ok(true) => eprintln!("irlumed: IR emitter ready"),
-                    Ok(false) => eprintln!(
-                        "irlumed: IR is dark (dark-mode unlock may be unavailable). If this camera needs an \
-                         emitter control irlume does not know, run `sudo irlume ir-setup`."
-                    ),
-                    Err(e) => eprintln!("irlumed: IR emitter check skipped: {e}"),
-                }
+            if !ir_dev.is_empty() {
+                eprintln!(
+                    "irlumed: IR emitter verification deferred to the first authentication \
+                     (no camera opens at boot; every capture re-applies the known control)"
+                );
             }
             // Background auto-requalification (#586 gap): when the stored
             // qualification's context no longer matches the live cameras
@@ -1620,6 +1620,31 @@ mod worker_engine {
         /// #606: the cannot-stream branch names the per-round failure facts
         /// with counts, so the verdict says how the arm died, not just that
         /// it did.
+        /// #603: the daemon must not open any camera at startup. The emitter
+        /// verification is deferred to the first authentication, which
+        /// re-applies the known control as part of every capture's open path;
+        /// running it at boot lit the IR emitter on every start with no user
+        /// action. Source-scanned like the auth crate's probe tripwire,
+        /// because the invariant lives in startup glue.
+        #[test]
+        fn the_daemon_does_not_open_the_camera_at_startup() {
+            let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+            let text = std::fs::read_to_string(&src).expect("read the daemon source");
+            assert!(
+                text.contains("deferred to the first authentication"),
+                "the startup deferral notice must stay: journal readers and this \
+                 test both pin the behavior by it"
+            );
+            // Assembled from pieces so this test's own source cannot satisfy
+            // the needle it searches for.
+            let startup_call = ["match irlume_auth::apply_known_ir_", "emitter(&ir_dev)"].concat();
+            assert!(
+                !text.contains(&startup_call),
+                "the startup path must not apply the emitter control (#603); the \
+                 legitimate callers are the enrollment preflight and diagnostics"
+            );
+        }
+
         #[test]
         fn cannot_stream_verdict_names_capture_failure_facts() {
             let mut report = healthy_concurrent(6, 6);

@@ -3,6 +3,21 @@
 What irlume does not do, and the measurements behind each statement. The
 summary lives on the [README](../README.md); this is the detail.
 
+- **The daemon does not open any camera at startup.** The startup
+  IR-emitter verification used to open the IR camera, light the emitter,
+  and grab one frame on every daemon start, with no user action anywhere;
+  since #603 it is deferred to the first authentication, which re-applies
+  the known emitter control as part of every capture's open path and
+  surfaces a dark emitter through the auth-path diagnostics. One capture
+  without a user action remains, and it is conditional: when the stored
+  capture qualification no longer matches the live cameras (a kernel
+  upgrade, USB replug, or driver update), a background requalification
+  probe re-measures the pair for up to a minute, IR emitter firing,
+  starting 60 seconds after the daemon does; it yields to any
+  authentication via the camera lease and the same measurement is
+  available on demand with `irlume camera-tune`. Camera discovery and
+  classification are query-only: no streaming, no frames, no emitter
+  writes.
 - **Face unlock does not work on the XFCE lock screen (xfce4-screensaver),
   by design.** The screensaver pre-starts its PAM conversation the moment
   the lock engages and auto-answers module prompts without user action, so

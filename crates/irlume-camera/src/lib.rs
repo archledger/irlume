@@ -4114,6 +4114,7 @@ impl<'a> RgbSession<'a> {
         }
         let device = self.cam.device.clone();
         let progress = self.progress.clone();
+        let warmup_started = std::time::Instant::now();
         warm_up_stream(&device, &mut self.stream, &progress)?;
         for _ in 0..AE_WARMUP {
             self.cam
@@ -4125,6 +4126,11 @@ impl<'a> RgbSession<'a> {
                 .map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
         self.warmed = true;
+        irlume_common::dlog!(
+            "[capture-stage] warmup {device}: {}ms (stream recovery discards plus \
+             AE settle; the delivered-rate window fills during these)",
+            warmup_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -4147,6 +4153,7 @@ impl<'a> RgbSession<'a> {
         let format =
             frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         let mut frames = Vec::with_capacity(n.max(1));
+        let burst_started = std::time::Instant::now();
         for _ in 0..n.max(1) {
             self.cam
                 .lease
@@ -4156,6 +4163,13 @@ impl<'a> RgbSession<'a> {
                 .stream
                 .next()
                 .map_err(|error| map_delivery(&device, error))?;
+            if frames.is_empty() {
+                irlume_common::dlog!(
+                    "[capture-stage] first-frame {device}: {}ms after warmup \
+                     (the gated delivery window fills here)",
+                    burst_started.elapsed().as_millis()
+                );
+            }
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
@@ -4221,12 +4235,41 @@ pub fn capture_rgb_burst_with_progress(
     n: usize,
     progress: &Progress,
 ) -> irlume_common::Result<Vec<Frame>> {
+    let opened = std::time::Instant::now();
     let cam = RgbCamera::open(device)?;
+    let open_ms = opened.elapsed().as_millis();
+    let armed = std::time::Instant::now();
     let mut session = cam.session_with_progress(progress)?;
+    let arm_ms = armed.elapsed().as_millis();
+    let captured = std::time::Instant::now();
     let frames = session.burst(n);
+    let capture_ms = captured.elapsed().as_millis();
     // Drop the stream before `cam`: the session borrows the device.
     drop(session);
+    irlume_common::dlog!(
+        "{}",
+        capture_stage_summary("rgb", device, open_ms, arm_ms, capture_ms)
+    );
     frames
+}
+
+/// One debug-trace line naming where a one-shot capture's wall time went.
+/// The sequential path measured ~89% ramp on some hosts (#606 follow-up), and
+/// the next tuning decision needs that ramp attributed: device open and
+/// negotiation, session arm (buffer claim plus stream start), and the capture
+/// itself (warmup discards, rate-window fill, burst). Numbers only, per the
+/// diagnostic-trace policy: never frames, embeddings, or identities.
+fn capture_stage_summary(
+    role: &str,
+    device: &str,
+    open_ms: u128,
+    arm_ms: u128,
+    capture_ms: u128,
+) -> String {
+    format!(
+        "[capture-stage] {role} {device}: open={open_ms}ms arm={arm_ms}ms \
+         capture(warmup+fill+burst)={capture_ms}ms"
+    )
 }
 
 /// The uncompressed RGB fourccs the capture path can decode, best first.
@@ -4839,11 +4882,21 @@ pub fn capture_ir_with_stats_and_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    let opened = std::time::Instant::now();
     let cam = IrCamera::open(device)?;
+    let open_ms = opened.elapsed().as_millis();
+    let armed = std::time::Instant::now();
     let mut session = cam.session_with_progress(progress)?;
+    let arm_ms = armed.elapsed().as_millis();
+    let captured = std::time::Instant::now();
     let shot = session.capture_with_stats();
+    let capture_ms = captured.elapsed().as_millis();
     // Drop the stream before `cam`: the session borrows the device.
     drop(session);
+    irlume_common::dlog!(
+        "{}",
+        capture_stage_summary("ir", device, open_ms, arm_ms, capture_ms)
+    );
     shot
 }
 
@@ -12363,6 +12416,22 @@ mod tests {
         );
         let parsed: capture_qualification::ArmEvidence = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, arm);
+    }
+
+    /// The capture-stage trace line names every span with numbers only, so
+    /// the diagnostic-trace policy (never frames or embeddings) holds and the
+    /// format stays stable for journal tooling.
+    #[test]
+    fn capture_stage_summary_names_every_span_with_numbers_only() {
+        let line = capture_stage_summary("ir", "/dev/video6", 12, 34, 5678);
+        assert_eq!(
+            line,
+            "[capture-stage] ir /dev/video6: open=12ms arm=34ms capture(warmup+fill+burst)=5678ms"
+        );
+        assert!(
+            !line.contains('\u{2014}'),
+            "no em dashes in trace vocabulary"
+        );
     }
 
     #[test]

@@ -1,0 +1,79 @@
+[ WARN:0@0.044] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+[cbsr] 500/3940 frames
+[cbsr] 1000/3940 frames
+[cbsr] 1500/3940 frames
+[cbsr] 2000/3940 frames
+[cbsr] 2500/3940 frames
+[cbsr] 3000/3940 frames
+[cbsr] 3500/3940 frames
+[cbsr] 3940 scored in 46.2s
+{"frames": 3940, "scored": 3940, "flagged_rate_at_wired": 0.0002538071065989848, "score_p50": 2.2464078028860968e-06, "score_p10": 5.950176458213719e-08, "threshold_sweep": [{"threshold": 0.5, "flagged_rate": 0.0005076142131979696}, {"threshold": 0.6, "flagged_rate": 0.0005076142131979696}, {"threshold": 0.7, "flagged_rate": 0.0005076142131979696}, {"threshold": 0.8, "flagged_rate": 0.0005076142131979696}, {"threshold": 0.9, "flagged_rate": 0.0002538071065989848}, {"threshold": 0.95, "flagged_rate": 0.0002538071065989848}, {"threshold": 0.99, "flagged_rate": 0.0}], "wall_s": 46.2}
+merged cbsr into results-pad-ir.json
+[ WARN:0@0.043] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+[oulu-Dark] 500/10782 frames
+[oulu-Dark] 1000/10782 frames
+[oulu-Dark] 1500/10782 frames
+[oulu-Dark] 2000/10782 frames
+[oulu-Dark] 2500/10782 frames
+[oulu-Dark] 3000/10782 frames
+[oulu-Dark] 3500/10782 frames
+[oulu-Dark] 4000/10782 frames
+[oulu-Dark] 4500/10782 frames
+[oulu-Dark] 5000/10782 frames
+[oulu-Dark] 5500/10782 frames
+[oulu-Dark] 6000/10782 frames
+[oulu-Dark] 6500/10782 frames
+[oulu-Dark] 7000/10782 frames
+[oulu-Dark] 7500/10782 frames
+[oulu-Dark] 8000/10782 frames
+[oulu-Dark] 8500/10782 frames
+[oulu-Dark] 9000/10782 frames
+[oulu-Dark] 9500/10782 frames
+[oulu-Dark] 10000/10782 frames
+[oulu-Dark] 10500/10782 frames
+[oulu-Dark] 10782 scored in 128.3s
+[oulu-Strong] 500/10379 frames
+[oulu-Strong] 1000/10379 frames
+[oulu-Strong] 1500/10379 frames
+[oulu-Strong] 2000/10379 frames
+[oulu-Strong] 2500/10379 frames
+[oulu-Strong] 3000/10379 frames
+[oulu-Strong] 3500/10379 frames
+[oulu-Strong] 4000/10379 frames
+[oulu-Strong] 4500/10379 frames
+[oulu-Strong] 5000/10379 frames
+[oulu-Strong] 5500/10379 frames
+[oulu-Strong] 6000/10379 frames
+[oulu-Strong] 6500/10379 frames
+[oulu-Strong] 7000/10379 frames
+[oulu-Strong] 7500/10379 frames
+[oulu-Strong] 8000/10379 frames
+[oulu-Strong] 8500/10379 frames
+[oulu-Strong] 9000/10379 frames
+[oulu-Strong] 9500/10379 frames
+[oulu-Strong] 10000/10379 frames
+[oulu-Strong] 10379 scored in 117.3s
+[oulu-Weak] 500/10834 frames
+[oulu-Weak] 1000/10834 frames
+[oulu-Weak] 1500/10834 frames
+[oulu-Weak] 2000/10834 frames
+[oulu-Weak] 2500/10834 frames
+[oulu-Weak] 3000/10834 frames
+[oulu-Weak] 3500/10834 frames
+[oulu-Weak] 4000/10834 frames
+[oulu-Weak] 4500/10834 frames
+[oulu-Weak] 5000/10834 frames
+[oulu-Weak] 5500/10834 frames
+[oulu-Weak] 6000/10834 frames
+[oulu-Weak] 6500/10834 frames
+[oulu-Weak] 7000/10834 frames
+[oulu-Weak] 7500/10834 frames
+[oulu-Weak] 8000/10834 frames
+[oulu-Weak] 8500/10834 frames
+[oulu-Weak] 9000/10834 frames
+[oulu-Weak] 9500/10834 frames
+[oulu-Weak] 10000/10834 frames
+[oulu-Weak] 10500/10834 frames
+[oulu-Weak] 10834 scored in 121.7s
+{"overall": {"frames": 31995, "scored": 31995, "flagged_rate_at_wired": 0.00012501953430223473, "score_p50": 4.4191097003931645e-06, "score_p10": 3.9056352818533924e-08, "threshold_sweep": [{"threshold": 0.5, "flagged_rate": 0.0005313330207844975}, {"threshold": 0.6, "flagged_rate": 0.00046882325363338024}, {"threshold": 0.7, "flagged_rate": 0.00037505860290670416}, {"threshold": 0.8, "flagged_rate": 0.00025003906860446946}, {"threshold": 0.9, "flagged_rate": 0.00012501953430223473}, {"threshold": 0.95, "flagged_rate": 3.125488357555868e-05}, {"threshold": 0.99, "flagged_rate": 0.0}]}, "wall_s": 368.5}
+merged oulu into results-pad-ir.json

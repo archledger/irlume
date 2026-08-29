@@ -1,0 +1,126 @@
+{
+  "runtime": {
+    "ort_version": "1.27.0",
+    "providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "cv2_version": "5.0.0"
+  },
+  "wired": {
+    "flir_threshold": 0.9,
+    "rationale": "irlume-auth/src/lib.rs:358-364: IR_PAD_THRESHOLD 0.9 is the measured deny-only operating point (highest genuine 0.702, banner attack floor 0.941); models/README.md flir row: deny-only at 0.9, revalidated 0/3,940 above the line on CBSR 850nm at 197 identities"
+  },
+  "cbsr": {
+    "frames": 3940,
+    "scored": 3940,
+    "flagged_rate_at_wired": 0.0002538071065989848,
+    "score_p50": 2.2464078028860968e-06,
+    "score_p10": 5.950176458213719e-08,
+    "threshold_sweep": [
+      {
+        "threshold": 0.5,
+        "flagged_rate": 0.0005076142131979696
+      },
+      {
+        "threshold": 0.6,
+        "flagged_rate": 0.0005076142131979696
+      },
+      {
+        "threshold": 0.7,
+        "flagged_rate": 0.0005076142131979696
+      },
+      {
+        "threshold": 0.8,
+        "flagged_rate": 0.0005076142131979696
+      },
+      {
+        "threshold": 0.9,
+        "flagged_rate": 0.0002538071065989848
+      },
+      {
+        "threshold": 0.95,
+        "flagged_rate": 0.0002538071065989848
+      },
+      {
+        "threshold": 0.99,
+        "flagged_rate": 0.0
+      }
+    ],
+    "wall_s": 46.2
+  },
+  "notes": [
+    "CONTROLLER SCOPE RULING: no IR attack data exists on disk, so this lane measures the GENUINE-side flag rate at the wired flir deny line: flagged_rate_at_wired = fraction of scored genuine frames with P(fake) >= 0.9 (the BPCER side of the deny line), NOT attack TPR; the brief's tpr_at_wired schema key is replaced accordingly. Attack-side IR evidence remains the fleet/banner measurements (models/README.md flir row: 122/123 banner frames flagged; docs/pad-results/2026-07-17-third-party-pad-candidates.md), a spec-honest limitation of this lane.",
+    "cbsr: flat sorted walk of ALL .bmp frames under the root (the mirror nests the frames one level under NIR_face_dataset); subjects are encoded in the filename prefix and ALL subjects are included (supersedes the 197-identity revalidation sample in models/README.md); the gallery groundtruth file is not consulted; flagged_rate_at_wired denominators are scored frames (YuNet detection at the operating point required).",
+    "cbsr finding: 1/3,940 scored frames flagged at the wired 0.9 line (sweep 2/3,940 at 0.5, 0 at 0.99; score_p50 2.2e-06), consistent with the committed 197-identity revalidation (models/README.md: 0/3,940 above the line at lit frames).",
+    "oulu: sorted recursive walk of ALL .jpeg frames under NI only (70 Thumbs.db files excluded), grouped by the lighting directory name (Dark/Strong/Weak); the VL/ RGB counterpart is not walked; flagged_rate_at_wired denominators are scored frames (YuNet detection at the operating point required).",
+    "oulu finding: the dim-lighting hypothesis is NOT confirmed at the wired line. Dark never crosses 0.9 (0/10,782; widest sub-threshold tail of the three lightings: 59 frames >= 0.1, max 0.8204); the only wired-line flags are 4/10,379 Strong frames concentrated in two subjects (P049 Disgust 010-012, P012 Happiness 017; max 0.9606); Weak 0/10,834. The fleet dim-strobe genuine failure regime (models/README.md) does not reproduce at frame level on this mirror through this chain and remains fleet-measurement evidence."
+  ],
+  "oulu": {
+    "per_lighting": [
+      {
+        "lighting": "Dark",
+        "frames": 10782,
+        "scored": 10782,
+        "flagged_rate_at_wired": 0.0,
+        "score_p50": 3.385749323570053e-06,
+        "score_p10": 3.3710983160517595e-08
+      },
+      {
+        "lighting": "Strong",
+        "frames": 10379,
+        "scored": 10379,
+        "flagged_rate_at_wired": 0.00038539358319683977,
+        "score_p50": 5.922064246988157e-06,
+        "score_p10": 4.871862131494708e-08
+      },
+      {
+        "lighting": "Weak",
+        "frames": 10834,
+        "scored": 10834,
+        "flagged_rate_at_wired": 0.0,
+        "score_p50": 4.184301133136614e-06,
+        "score_p10": 3.68059023259093e-08
+      }
+    ],
+    "overall": {
+      "frames": 31995,
+      "scored": 31995,
+      "flagged_rate_at_wired": 0.00012501953430223473,
+      "score_p50": 4.4191097003931645e-06,
+      "score_p10": 3.9056352818533924e-08,
+      "threshold_sweep": [
+        {
+          "threshold": 0.5,
+          "flagged_rate": 0.0005313330207844975
+        },
+        {
+          "threshold": 0.6,
+          "flagged_rate": 0.00046882325363338024
+        },
+        {
+          "threshold": 0.7,
+          "flagged_rate": 0.00037505860290670416
+        },
+        {
+          "threshold": 0.8,
+          "flagged_rate": 0.00025003906860446946
+        },
+        {
+          "threshold": 0.9,
+          "flagged_rate": 0.00012501953430223473
+        },
+        {
+          "threshold": 0.95,
+          "flagged_rate": 3.125488357555868e-05
+        },
+        {
+          "threshold": 0.99,
+          "flagged_rate": 0.0
+        }
+      ]
+    },
+    "wall_s": 368.5
+  }
+}

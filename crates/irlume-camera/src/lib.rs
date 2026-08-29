@@ -6462,6 +6462,12 @@ pub struct PairSample {
     /// diagnostic detail; deliberately NOT carried into the persisted
     /// ArmEvidence, whose schema stays untouched.
     pub continuity_facts: std::collections::BTreeMap<&'static str, usize>,
+    /// Per-fact counts of capture-level round failures (#606): an aggregate
+    /// count cannot say HOW a concurrent arm refused to stream. Rounds whose
+    /// leg errored at delivery are named here, and the map is mirrored into
+    /// the persisted ArmEvidence (additive, serde-defaulted) so a stored
+    /// verdict names its facts months later.
+    pub capture_failure_facts: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl PairSample {
@@ -7435,6 +7441,15 @@ fn qualification_arm(
     let requested_rounds = count(requested_rounds, "round")?;
     let completed_rounds = count(sample.rounds, "completed")?;
     let failed_rounds = count(sample.failed, "failure")?;
+    let capture_failure_facts = sample
+        .capture_failure_facts
+        .iter()
+        .map(|(fact, value)| {
+            u32::try_from(*value)
+                .map(|value| ((*fact).to_string(), value))
+                .map_err(|_| Error::Hardware("capture qualification fact count overflow".into()))
+        })
+        .collect::<std::result::Result<std::collections::BTreeMap<String, u32>, _>>()?;
     if !sample.total_ms.is_finite() || sample.total_ms < 0.0 || sample.total_ms > u64::MAX as f32 {
         return Err(Error::Hardware(
             "capture qualification elapsed time is invalid".into(),
@@ -7456,6 +7471,7 @@ fn qualification_arm(
         count(sample.arm_failures, "arm-failure")?,
         count(sample.capture_failures, "capture-failure")?,
         count(sample.rate_shortfall_failures, "rate-shortfall-failure")?,
+        capture_failure_facts,
         sample.rgb_mean,
         sample.ir_mean,
         sample.total_ms.round() as u64,
@@ -7578,6 +7594,10 @@ fn record_concurrent_establishment_failure(
     );
     into.failed += rounds;
     into.capture_failures += rounds;
+    *into
+        .capture_failure_facts
+        .entry("rate-window-establishment")
+        .or_insert(0) += rounds;
 }
 
 /// [`measure_contention_with_progress`] over injected captures and an
@@ -7998,6 +8018,15 @@ fn accumulate(
             into.rate_shortfall_failures += 1;
         } else {
             into.capture_failures += 1;
+            // #606: open and arm failures are counted separately above, so a
+            // leg erroring here failed at delivery by construction. Name it:
+            // the count alone cannot distinguish this camera from one whose
+            // rounds die mid-stream for other reasons, and the stored verdict
+            // is all a future support reader has.
+            *into
+                .capture_failure_facts
+                .entry("stream-delivery-failure")
+                .or_insert(0) += 1;
         }
         return;
     };
@@ -11902,6 +11931,7 @@ mod tests {
                 capture_failures: failed,
                 rate_shortfall_failures: 0,
                 continuity_facts: Default::default(),
+                capture_failure_facts: Default::default(),
             };
             ContentionReport {
                 sequential: sample(seq),
@@ -12248,6 +12278,91 @@ mod tests {
                 capture_qualification::SequentialReason::DeliveredRateShortfall
             )
         );
+    }
+
+    /// #606: an errored round names its failure fact. The typed rate bucket
+    /// stays separate, so the map's total always equals capture_failures.
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn capture_failure_facts_name_errored_rounds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rgb_calls = AtomicUsize::new(0);
+        let rgb = || {
+            let call = rgb_calls.fetch_add(1, Ordering::SeqCst);
+            if (2..4).contains(&call) {
+                Err(Error::Hardware(
+                    "/dev/video4: the camera never delivered".into(),
+                ))
+            } else {
+                Ok(frame(&[120; 4]))
+            }
+        };
+        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let report =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("errored concurrent rounds are a measurement, not a probe abort");
+        assert_eq!(report.concurrent.failed, 2);
+        assert_eq!(report.concurrent.capture_failures, 2);
+        assert_eq!(
+            report
+                .concurrent
+                .capture_failure_facts
+                .get("stream-delivery-failure"),
+            Some(&2),
+            "each errored round records the nameable delivery fact"
+        );
+        assert_eq!(
+            report
+                .concurrent
+                .capture_failure_facts
+                .values()
+                .sum::<usize>(),
+            report.concurrent.capture_failures,
+            "the facts account for every capture failure, nothing else"
+        );
+        assert_eq!(report.concurrent.rate_shortfall_failures, 0);
+    }
+
+    /// #606: a pair that cannot even establish its rate windows names that
+    /// fact, distinct from a round that died mid-arm.
+    #[test]
+    fn establishment_failure_names_its_fact() {
+        let mut sample = PairSample::default();
+        record_concurrent_establishment_failure(&mut sample, 6, &"synthetic refusal");
+        assert_eq!(sample.failed, 6);
+        assert_eq!(sample.capture_failures, 6);
+        assert_eq!(
+            sample
+                .capture_failure_facts
+                .get("rate-window-establishment"),
+            Some(&6)
+        );
+    }
+
+    /// #606: the fact map survives the conversion into the persisted
+    /// ArmEvidence and round-trips, so a stored verdict names its facts.
+    #[test]
+    fn qualification_arm_carries_capture_failure_facts() {
+        let mut sample = PairSample {
+            rounds: 6,
+            contract_rounds: 6,
+            rate_floor_rounds: 6,
+            continuous_rounds: 6,
+            active_ir_rounds: 6,
+            total_ms: 1_000.0,
+            ..Default::default()
+        };
+        sample
+            .capture_failure_facts
+            .insert("stream-delivery-failure", 6);
+        let arm = qualification_arm(&sample, 6).expect("valid arm");
+        let json = serde_json::to_string(&arm).unwrap();
+        assert!(
+            json.contains("\"stream-delivery-failure\":6"),
+            "the persisted form carries the fact: {json}"
+        );
+        let parsed: capture_qualification::ArmEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, arm);
     }
 
     #[test]

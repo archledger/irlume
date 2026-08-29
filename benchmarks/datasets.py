@@ -262,6 +262,76 @@ _ALIGNED_FR_BUNDLE = DatasetSpec(
     ),
 )
 
+_CASIA_FASD = DatasetSpec(
+    name="casia_fasd",
+    source="kaggle",
+    repo="immada/casia-fasd",
+    files=(
+        DatasetFile(
+            path="kaggle-archive.zip",
+            extract=True,
+            size_hint_bytes=2_200_000_000,
+        ),
+    ),
+    license_note=(
+        "CASIA-FASD is provided for non-commercial research use per its "
+        "source page; the exact terms stated there are quoted verbatim into "
+        "PROVENANCE.md at download time."
+    ),
+    provenance_url="https://www.kaggle.com/datasets/immada/casia-fasd",
+    notes=(
+        "Single kaggle archive (~2.2 GB). Mirror identity matters (see "
+        "benchmarks/README.md): numbers are valid only for this mirror."
+    ),
+)
+
+_OULU_NPU = DatasetSpec(
+    name="oulu_npu",
+    source="kaggle",
+    repo="mizaku/oulu-npu-test",
+    files=(
+        DatasetFile(
+            path="kaggle-archive.zip",
+            extract=True,
+            size_hint_bytes=500_000_000,
+        ),
+    ),
+    license_note=(
+        "Oulu-NPU is provided for non-commercial research use per its source "
+        "page; the exact terms stated there are quoted verbatim into "
+        "PROVENANCE.md at download time."
+    ),
+    provenance_url="https://www.kaggle.com/datasets/mizaku/oulu-npu-test",
+    notes=(
+        "Start with mizaku/oulu-npu-test (~500 MB). Decision rule: if "
+        "extraction shows test-split-only content and the bench needs "
+        "sessions breadth, fetch minhtranv/oulu-npu-w-depth "
+        "(2_760_000_000 bytes hint) as the fallback instead and record in "
+        "the result JSON which mirror was used. Mirror identity matters "
+        "(see benchmarks/README.md): numbers are valid only for this mirror."
+    ),
+)
+
+_CELEBA_SPOOF_HF = DatasetSpec(
+    name="celeba_spoof_hf",
+    source="hf",
+    repo="Ar4ikov/celebA_spoof",
+    files=(),
+    license_note=(
+        "CelebA-Spoof is provided for non-commercial research use per its "
+        "source page; the exact terms stated there are quoted verbatim into "
+        "PROVENANCE.md at download time."
+    ),
+    provenance_url="https://huggingface.co/datasets/Ar4ikov/celebA_spoof",
+    notes=(
+        "Parquet shard snapshot lane: fetch with fetch_data.py --snapshot, "
+        "which runs huggingface_hub snapshot_download with allow_patterns "
+        "data/* into the dataset dir; no per-file resolve entries. Mirror "
+        "identity matters (see benchmarks/README.md): numbers are valid "
+        "only for this mirror."
+    ),
+)
+
 _DATASETS: dict[str, DatasetSpec] = {
     _WIDER.name: _WIDER,
     _THREE00W.name: _THREE00W,
@@ -272,6 +342,9 @@ _DATASETS: dict[str, DatasetSpec] = {
     _LFW.name: _LFW,
     _CFPW.name: _CFPW,
     _ALIGNED_FR_BUNDLE.name: _ALIGNED_FR_BUNDLE,
+    _CASIA_FASD.name: _CASIA_FASD,
+    _OULU_NPU.name: _OULU_NPU,
+    _CELEBA_SPOOF_HF.name: _CELEBA_SPOOF_HF,
 }
 
 

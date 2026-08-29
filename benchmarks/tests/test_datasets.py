@@ -23,7 +23,10 @@ def test_every_entry_has_required_fields():
         assert spec.name == name
         assert spec.source in ("hf", "kaggle")
         assert spec.repo
-        assert spec.files
+        if not spec.files:
+            assert spec.source == "hf", (
+                f"{name}: only hf specs may use the empty-files snapshot lane"
+            )
         assert spec.license_note
         assert spec.provenance_url
         assert spec.notes
@@ -116,3 +119,43 @@ def test_new_recognition_entries():
     assert "112" in bundle.notes
     assert "pair" in bundle.notes.lower()
     assert "published-comparable" in bundle.notes
+
+
+def test_pad_entries_pinned_mirrors():
+    casia = get_dataset("casia_fasd")
+    assert casia.source == "kaggle"
+    assert casia.repo == "immada/casia-fasd"
+    assert casia.files[0].path == "kaggle-archive.zip"
+    assert casia.files[0].extract
+    assert casia.files[0].size_hint_bytes == 2_200_000_000
+    npu = get_dataset("oulu_npu")
+    assert npu.source == "kaggle"
+    assert npu.repo == "mizaku/oulu-npu-test"
+    assert npu.files[0].path == "kaggle-archive.zip"
+    assert npu.files[0].extract
+    assert npu.files[0].size_hint_bytes == 500_000_000
+    assert "minhtranv/oulu-npu-w-depth" in npu.notes
+    assert "2_760_000_000" in npu.notes
+    assert "record" in npu.notes.lower()
+    celeba = get_dataset("celeba_spoof_hf")
+    assert celeba.source == "hf"
+    assert celeba.repo == "Ar4ikov/celebA_spoof"
+    assert celeba.files == ()
+    assert "snapshot_download" in celeba.notes
+    assert "data/*" in celeba.notes
+    for spec in (casia, npu, celeba):
+        assert spec.provenance_url
+        assert spec.license_note
+        assert spec.notes
+
+
+def test_snapshot_guard_signature():
+    from fetch_data import validate_snapshot
+
+    validate_snapshot(get_dataset("celeba_spoof_hf"))
+    with pytest.raises(SystemExit):
+        validate_snapshot(get_dataset("casia_fasd"))
+    with pytest.raises(SystemExit):
+        validate_snapshot(get_dataset("oulu_npu"))
+    with pytest.raises(SystemExit):
+        validate_snapshot(get_dataset("wider_face"))

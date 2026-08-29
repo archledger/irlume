@@ -49,6 +49,18 @@ def validate_spec(spec: DatasetSpec) -> None:
         )
 
 
+def validate_snapshot(spec: DatasetSpec) -> None:
+    if spec.source != "hf":
+        raise SystemExit(
+            f"{spec.name}: --snapshot requires source hf, got {spec.source}"
+        )
+    if spec.files:
+        raise SystemExit(
+            f"{spec.name}: --snapshot requires an empty files tuple, got "
+            f"{len(spec.files)} files"
+        )
+
+
 def load_token(env_var: str, file_path: Path) -> str | None:
     tok = os.environ.get(env_var, "").strip()
     if tok:
@@ -114,6 +126,8 @@ def download_dataset(
 ) -> dict:
     spec = get_dataset(spec_name)
     validate_spec(spec)
+    if not spec.files:
+        raise SystemExit(f"{spec.name}: spec declares no files; use --snapshot")
     session = session or requests.Session()
     if spec.source == "hf":
         tok = load_token("HF_TOKEN", Path.home() / ".cache/huggingface/token")
@@ -178,6 +192,36 @@ def download_dataset(
     return {"dataset": spec.name, "files": sorted(hashes), "extracted": extracted}
 
 
+def download_dataset_snapshot(spec_name: str, root: Path) -> dict:
+    spec = get_dataset(spec_name)
+    validate_snapshot(spec)
+    from huggingface_hub import snapshot_download
+
+    tok = load_token("HF_TOKEN", Path.home() / ".cache/huggingface/token")
+    ddir = root / spec.name
+    ddir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=spec.repo,
+        repo_type="dataset",
+        local_dir=ddir,
+        allow_patterns=["data/*"],
+        token=tok,
+    )
+
+    data_dir = ddir / "data"
+    shard_files = sorted(p for p in data_dir.rglob("*") if p.is_file())
+    hashes = {p.relative_to(ddir).as_posix(): sha256_file(p) for p in shard_files}
+
+    manifest_path = ddir / "MANIFEST.sha256"
+    prior = parse_manifest(manifest_path.read_text()) if manifest_path.is_file() else {}
+    prior.update(hashes)
+    manifest_path.write_text(manifest_lines(prior))
+
+    terms = _terms_from_readme(spec, requests.Session())
+    (ddir / "PROVENANCE.md").write_text(render_provenance(spec, prior, terms))
+    return {"dataset": spec.name, "files": sorted(hashes), "extracted": {}}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -186,6 +230,14 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--root", type=Path, required=True, help="datasets root, e.g. ~/datasets")
     d.add_argument("--only", action="append", default=[], help="substring filter on file paths")
     d.add_argument("--keep-archives", action="store_true")
+    d.add_argument(
+        "--snapshot",
+        action="store_true",
+        help=(
+            "hf snapshot lane: snapshot_download with allow_patterns "
+            "data/*; requires an empty-files hf spec"
+        ),
+    )
     d.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
     sub.add_parser("list")
     args = ap.parse_args(argv)
@@ -198,10 +250,19 @@ def main(argv: list[str] | None = None) -> int:
 
     spec = get_dataset(args.name)
     if args.dry_run:
+        if not spec.files:
+            print(
+                f"would snapshot-download {spec.repo} (allow_patterns "
+                f"data/*) into {args.root / spec.name}"
+            )
+            return 0
         for f in spec.files:
             print(f"would fetch {f.path} (~{f.size_hint_bytes} bytes)")
         return 0
-    summary = download_dataset(args.name, args.root, args.only or None, args.keep_archives)
+    if args.snapshot:
+        summary = download_dataset_snapshot(args.name, args.root)
+    else:
+        summary = download_dataset(args.name, args.root, args.only or None, args.keep_archives)
     print(json.dumps(summary, indent=2))
     return 0
 

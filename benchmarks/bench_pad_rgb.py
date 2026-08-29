@@ -2,7 +2,8 @@
 """RGB PAD lane for the calibration campaign: CASIA-FASD, OULU-NPU,
 CelebA-Spoof through the shipped ViT chain.
 
-Chain mirrors the shipped Rust path exactly (irlume-vision/src/lib.rs
+Chain mirrors the shipped chain's preprocessing conventions
+(irlume-vision/src/lib.rs
 1316-1401 PadVit / pad_vit_input; crates/irlume-auth/src/lib.rs:350
 VIT_PAD_THRESHOLD = 0.55, :356 VIT_PAD_VOTE_N = 5): face box -> expand by
 96/112 of w/h per side CLAMPED to the frame (no fill) -> bilinear resize
@@ -29,7 +30,7 @@ Dataset label pins (verified 2026-08-29 on archhost):
   No split column: the split comes from the shard FILENAME prefix
   (train-* / valid-* / test-*). Headline metrics use the test shards.
   CASIA-FASD: frame-extracted mirror, 123,533 frames under train/test x
-  live/spooof directories; label from the directory. Frame-level scoring
+  live/spoof directories; label from the directory. Frame-level scoring
   only (the video structure is not in the mirror, so no voting is
   possible). Headline metrics use the test split.
   OULU-NPU: mirror-limited test subset, 1,701 flat frames under true/

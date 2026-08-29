@@ -185,6 +185,83 @@ _OULU_CASIA_NIR = DatasetSpec(
     ),
 )
 
+_LFW = DatasetSpec(
+    name="lfw",
+    source="kaggle",
+    repo="jessicali9530/lfw-dataset",
+    files=(
+        DatasetFile(
+            path="kaggle-archive.zip",
+            extract=True,
+            size_hint_bytes=112_000_000,
+        ),
+    ),
+    license_note=(
+        "LFW is provided for non-commercial research use per its source "
+        "page; the exact terms stated there are quoted verbatim into "
+        "PROVENANCE.md at download time."
+    ),
+    provenance_url="https://www.kaggle.com/datasets/jessicali9530/lfw-dataset",
+    notes=(
+        "Must contain the lfw-deepfunneled images; verify at download before "
+        "benchmarking. The committed 99.03 percent accuracy is on "
+        "deepfunneled. Mirror identity matters (see benchmarks/README.md): "
+        "numbers are valid only for this mirror."
+    ),
+)
+
+_CFPW = DatasetSpec(
+    name="cfpw",
+    source="kaggle",
+    repo="chinafax/cfpw-dataset",
+    files=(
+        DatasetFile(
+            path="kaggle-archive.zip",
+            extract=True,
+            size_hint_bytes=86_000_000,
+        ),
+    ),
+    license_note=(
+        "CFPW is provided for non-commercial research use per its source "
+        "page; the exact terms stated there are quoted verbatim into "
+        "PROVENANCE.md at download time."
+    ),
+    provenance_url="https://www.kaggle.com/datasets/chinafax/cfpw-dataset",
+    notes=(
+        "Official protocol: 500 identities, 10 folds, 7000 pairs; verify at "
+        "download. If the mirror is short, score what exists and label it "
+        "honestly. Mirror identity matters (see benchmarks/README.md): "
+        "numbers are valid only for this mirror."
+    ),
+)
+
+_ALIGNED_FR_BUNDLE = DatasetSpec(
+    name="aligned_fr_bundle",
+    source="kaggle",
+    repo="yakhyokhuja/agedb-30-calfw-cplfw-lfw-aligned-112x112",
+    files=(
+        DatasetFile(
+            path="kaggle-archive.zip",
+            extract=True,
+            size_hint_bytes=1_400_000_000,
+        ),
+    ),
+    license_note=(
+        "AgeDB-30, CALFW, CPLFW and LFW are each provided for non-commercial "
+        "research use per their source pages; the exact terms stated there "
+        "are quoted verbatim into PROVENANCE.md at download time."
+    ),
+    provenance_url=(
+        "https://www.kaggle.com/datasets/"
+        "yakhyokhuja/agedb-30-calfw-cplfw-lfw-aligned-112x112"
+    ),
+    notes=(
+        "AgeDB-30, CALFW, CPLFW and LFW aligned at 112x112 with shipped pair "
+        "lists; the published-comparable lane. Mirror identity matters (see "
+        "benchmarks/README.md): numbers are valid only for this mirror."
+    ),
+)
+
 _DATASETS: dict[str, DatasetSpec] = {
     _WIDER.name: _WIDER,
     _THREE00W.name: _THREE00W,
@@ -192,6 +269,9 @@ _DATASETS: dict[str, DatasetSpec] = {
     _AFLW2000.name: _AFLW2000,
     _CBSR_NIR.name: _CBSR_NIR,
     _OULU_CASIA_NIR.name: _OULU_CASIA_NIR,
+    _LFW.name: _LFW,
+    _CFPW.name: _CFPW,
+    _ALIGNED_FR_BUNDLE.name: _ALIGNED_FR_BUNDLE,
 }
 
 

@@ -78,3 +78,41 @@ def test_new_landmark_and_ir_entries():
         assert spec.provenance_url
         assert spec.license_note
         assert spec.notes
+
+
+def test_new_recognition_entries():
+    lfw = get_dataset("lfw")
+    assert lfw.source == "kaggle"
+    assert lfw.repo == "jessicali9530/lfw-dataset"
+    assert lfw.files[0].path == "kaggle-archive.zip"
+    assert lfw.files[0].extract
+    assert lfw.files[0].size_hint_bytes == 112_000_000
+    cfpw = get_dataset("cfpw")
+    assert cfpw.source == "kaggle"
+    assert cfpw.repo == "chinafax/cfpw-dataset"
+    assert cfpw.files[0].path == "kaggle-archive.zip"
+    assert cfpw.files[0].extract
+    assert cfpw.files[0].size_hint_bytes == 86_000_000
+    bundle = get_dataset("aligned_fr_bundle")
+    assert bundle.source == "kaggle"
+    assert bundle.repo == (
+        "yakhyokhuja/agedb-30-calfw-cplfw-lfw-aligned-112x112"
+    )
+    assert bundle.files[0].path == "kaggle-archive.zip"
+    assert bundle.files[0].extract
+    assert bundle.files[0].size_hint_bytes == 1_400_000_000
+    for spec in (lfw, cfpw, bundle):
+        assert spec.provenance_url == (
+            "https://www.kaggle.com/datasets/" + spec.repo
+        )
+        assert "research" in spec.license_note.lower()
+        assert spec.notes
+    assert "deepfunneled" in lfw.notes
+    assert "verify" in lfw.notes.lower()
+    assert "verify" in cfpw.notes.lower()
+    assert "500" in cfpw.notes
+    assert "7000" in cfpw.notes
+    assert "honestly" in cfpw.notes.lower()
+    assert "112" in bundle.notes
+    assert "pair" in bundle.notes.lower()
+    assert "published-comparable" in bundle.notes

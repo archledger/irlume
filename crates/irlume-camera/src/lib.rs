@@ -5057,6 +5057,7 @@ impl IrCamera {
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
+        let arm_alloc_started = std::time::Instant::now();
         let mut stream = TrackedStream::new(
             SafeStream::open(
                 V4l2CameraState::with_ir_interval(
@@ -5074,12 +5075,15 @@ impl IrCamera {
                 self.accepted_interval,
             ),
         );
+        let alloc_ms = arm_alloc_started.elapsed().as_millis();
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
         // buffers; STREAMON happens on the first dequeue, which is inside
         // `warm_up_stream` below. This is the window, and it is the only one.
+        let meta_started = std::time::Instant::now();
         let mut meta = ir_metadata::IlluminationLog::open(&self.device);
+        let metadata_ms = meta_started.elapsed().as_millis();
         // BEFORE the warm-up, because the warm-up's first dequeue is STREAMON.
         // Microsoft's sequence sets the property and THEN starts streaming, and
         // this ran the other way round: every authentication set the mode under
@@ -5104,6 +5108,7 @@ impl IrCamera {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        let emitter_started = std::time::Instant::now();
         mode = enable_ir_emitter_privacy_bounded(
             &self.device,
             &self.dev,
@@ -5111,21 +5116,31 @@ impl IrCamera {
             self.lease.clone(),
             "before Face Authentication D1",
         )?;
+        let emitter_ms = emitter_started.elapsed().as_millis();
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
+        let warmup_started = std::time::Instant::now();
         warm_up_stream(&self.device, &mut stream, progress)?;
+        let warmup_ms = warmup_started.elapsed().as_millis();
         // Rate establishment internally discards more frames than the metadata
         // ring can hold. Drain those records now, after the fill, so buffers are
         // requeued before the first frame a caller can observe.
-        fill_rate_then_drain_metadata(
+        let fill_started = std::time::Instant::now();
+        let fill_result = fill_rate_then_drain_metadata(
             || stream.fill_rate_evidence(),
             || {
                 if let Some(log) = meta.as_mut() {
                     log.drain();
                 }
             },
-        )
-        .map_err(|error| map_io(&self.device, error))?;
+        );
+        let fill_ms = fill_started.elapsed().as_millis();
+        irlume_common::dlog!(
+            "[capture-stage] ir-arm {}: alloc={alloc_ms}ms metadata={metadata_ms}ms \
+             emitter={emitter_ms}ms warmup(streamon+flush)={warmup_ms}ms rate-fill={fill_ms}ms",
+            self.device
+        );
+        fill_result.map_err(|error| map_io(&self.device, error))?;
         Ok(IrSession {
             cam: self,
             stream,

@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.11.2
+Version:        0.11.3
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -274,6 +274,23 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Sat Aug 29 2026 archledger <archledger236@gmail.com> - 0.11.3-1
+- AppArmor: emitter-journal ancestor-fsync reads and the qualification-store
+  file lock are granted in both profiles (set-cameras persist, camera-tune and
+  ir-setup work on enforcing hosts) (#573/#582/#590)
+- Omarchy: fingerprint wiring honors upstream's contract; face unlock on the
+  stock lock screen (#583/#584); Cinnamon lock screen face (#585)
+- camera-tune reports the persisted verdict and names the continuity fact that
+  failed (#588/#591/#592); TUI shows capture qualification state
+- proactive concurrent degradation and background auto-requalification after a
+  camera-context change (#594)
+- security audit batch: atomic mode-preserving PAM edits, atomic method-file
+  writes, sanitized journal service strings (#597); CodeQL noise fix (#595)
+- forbid_external_cameras policy for high-security deployments (#577-era)
+- docs: census/machine diagnostics grounding, far-range dark-path sweep,
+  XFCE-lock unsupported note, calibration campaign foundations (#578/#579/#581/
+  #593/#596)
+
 * Tue Aug 25 2026 archledger <archledger236@gmail.com> - 0.11.2-1
 - rpm-ostree: %post survives the scriptlet sandbox (touch instead of `: >`,
   guarded mkdir); layering was impossible on Silverblue/Kinoite before this

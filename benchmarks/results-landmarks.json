@@ -1,0 +1,60 @@
+{
+  "runtime": {
+    "ort_version": "1.27.0",
+    "providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "cv2_version": "5.0.0",
+    "yunet_model": "face_detection_yunet_2023mar.onnx",
+    "mesh_model": "face_landmark.onnx",
+    "input": 640,
+    "score_threshold": 0.6,
+    "crop_scale": 1.25,
+    "match_iou": 0.3
+  },
+  "per_dataset": {
+    "wflw_test": {
+      "images": 2500,
+      "mesh_ok": 2441,
+      "eye_nme_mean": 0.09499063033298641,
+      "eye_nme_p90": 0.170142303990803,
+      "eye_nme_standalone_mean": 0.12324530316516216,
+      "anchor_nme_mean": 0.11480280901387324,
+      "align_iou_gain_mean": 0.08674666391245962,
+      "n_fail_yunet": 59,
+      "n_fail_mesh": 0
+    },
+    "300w_test": {
+      "images": 600,
+      "mesh_ok": 595,
+      "eye_nme_mean": 0.0813231819785711,
+      "eye_nme_p90": 0.12082165358095844,
+      "eye_nme_standalone_mean": 0.08411110436093504,
+      "anchor_nme_mean": 0.08571396667999348,
+      "align_iou_gain_mean": 0.10019160213714208,
+      "n_fail_yunet": 5,
+      "n_fail_mesh": 0
+    },
+    "aflw2000": {
+      "images": 2000,
+      "mesh_ok": 1974,
+      "eye_nme_mean": 0.19896590445745124,
+      "eye_nme_p90": 0.437031216528208,
+      "eye_nme_standalone_mean": 0.27949611693397297,
+      "anchor_nme_mean": 0.21120826789504607,
+      "align_iou_gain_mean": 0.10073690034410658,
+      "n_fail_yunet": 26,
+      "n_fail_mesh": 0
+    }
+  },
+  "notes": [
+    "pipeline: YuNet at the operating point (640 square letterbox, score 0.6); best detection matched to the GT face box at IoU >= 0.3; matched and standalone paths crop a 1.25x-side square centered on the box, edge-replicated at the frame border, resized to 256; mesh output gated by the runtime plausibility rule before scoring.",
+    "gt face box = tight bounds of the GT landmarks: WFLW's shipped rect is a loose region (2.1-5.4x the landmark extent wide on the first test rows), unusable for IoU-0.3 matching or face-scale crops; 300W ships no box. Eye indices pinned by geometry over the first 20 annotations per dataset (evidence in the task report): wflw98 left 60-67/right 68-75 with corners 60/64/68/72, mouth 76/82, nose tip 57, chin 16; pts68 left 36-41/right 42-47 with corners 36/39/42/45, mouth 48/54, nose tip 30, chin 8; eye centers are corner means; the 68-pt scheme scores 6 anchors (its topology has no separate inner-corner points for mesh 133/362), wflw98 scores 8.",
+    "wflw_test audit: {\"elapsed_s\": 63.6, \"eye_nme_n\": 2441, \"n_standalone_mesh_fail\": 0, \"n_unreadable\": 0, \"n_zero_iod\": 0, \"rows\": 2500, \"standalone_n\": 2500, \"unique_images\": 2118}",
+    "300w_test audit: {\"elapsed_s\": 49.9, \"eye_nme_n\": 595, \"n_standalone_mesh_fail\": 0, \"n_unreadable\": 0, \"n_zero_iod\": 0, \"rows\": 600, \"standalone_n\": 600, \"unique_images\": 600}",
+    "aflw2000 gt: 68-pt from mat pt3d_68 x/y in image pixel space (flat glob of 2,000 mats; the mirror's Code/ tree holds unrelated mats, excluded); roi ignored as a loose detection region, tight landmark bounds per the shared convention; parsed with scipy 1.18.1; pts68 eye/anchor constants reused, geometry re-verified over the first 20 mats (two tight clusters above the mouth).",
+    "aflw2000 audit: {\"elapsed_s\": 51.7, \"eye_nme_n\": 1974, \"n_standalone_mesh_fail\": 0, \"n_unreadable\": 0, \"n_zero_iod\": 0, \"rows\": 2000, \"standalone_n\": 2000, \"unique_images\": 2000}"
+  ]
+}

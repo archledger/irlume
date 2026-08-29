@@ -17,7 +17,7 @@ from pathlib import Path
 
 import requests
 
-from datasets import get_dataset, list_datasets
+from datasets import DatasetSpec, get_dataset, list_datasets
 from fetchlib import (
     manifest_lines,
     parse_manifest,
@@ -39,6 +39,14 @@ def kaggle_url(repo: str) -> str:
     # Kaggle v1 REST downloads the WHOLE dataset archive per call, so a
     # kaggle-sourced DatasetSpec must define exactly one archive file.
     return f"{KAGGLE_HOST}/api/v1/datasets/download/{repo}"
+
+
+def validate_spec(spec: DatasetSpec) -> None:
+    if spec.source == "kaggle" and len(spec.files) != 1:
+        raise SystemExit(
+            f"{spec.name}: kaggle specs must define exactly one archive "
+            f"file, got {len(spec.files)}"
+        )
 
 
 def load_token(env_var: str, file_path: Path) -> str | None:
@@ -105,6 +113,7 @@ def download_dataset(
     session: requests.Session | None = None,
 ) -> dict:
     spec = get_dataset(spec_name)
+    validate_spec(spec)
     session = session or requests.Session()
     if spec.source == "hf":
         tok = load_token("HF_TOKEN", Path.home() / ".cache/huggingface/token")

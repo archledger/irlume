@@ -1,0 +1,131 @@
+{
+  "runtime": {
+    "ort_version": "1.27.0",
+    "providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "cv2_version": "5.0.0"
+  },
+  "operating_point": {
+    "input": 640,
+    "score_threshold": 0.6
+  },
+  "ap": {
+    "easy": 0.85737325681448,
+    "medium": 0.7931565495545686,
+    "hard": 0.47331454598277894,
+    "tp": 15825,
+    "fp": 2345,
+    "n_gt": 32764,
+    "images": 3226
+  },
+  "notes": [
+    "ap run: 3226 val images in 42.0s at the operating point (letterbox 640, score 0.6); easy/medium/hard use GT height bands >= 50 / >= 20 / all with predictions unchanged; tp/fp/n_gt are the hard-band totals.",
+    "ap run: 3226 val images in 41.1s at the operating point (letterbox 640, score 0.6); easy/medium/hard use GT height bands >= 50 / >= 20 / all with predictions unchanged; tp/fp/n_gt are the hard-band totals.",
+    "sweep run: 1613 of 3226 val images (stride 2, nearest stride-integer approximation of the 2000-image target) in 34.5s; decoders run at the lowest sweep threshold 0.3 and rows post-filter scores; recall_at_op_fppi uses this sample's operating-point FPPI 0.7564 (640/0.6 row); ap_hard and recall use all valid val GT faces (hard band).",
+    "cascade run: YuNet at the operating point, BlazeFace short-range rescue only on YuNet-empty images (rescue score 0.5, shipped anchor decode); recall is valid-GT faces matched at IoU 0.5; train sample is 3220 of 12880 train images at stride 4.",
+    "ap run: 3226 val images in 43.5s at the operating point (letterbox 640, score 0.6); official-approximation tier cuts (h>50/h>30/h>=10), off-tier predictions discarded (best-overlap valid GT outside the tier drops the prediction; zero-overlap predictions stay fp candidates); invalid-flag GT boxes excluded everywhere; tp/fp/n_gt are the hard-tier totals.",
+    "height-band approximation run superseded by tier semantics: the earlier h>=50/h>=20/all-valid bands scored easy 0.6859 / medium 0.6866 / hard 0.3964 (tp 15826, fp 2366, n_gt 39123)."
+  ],
+  "sweep": [
+    {
+      "input": 320,
+      "score_threshold": 0.3,
+      "ap_hard": 0.24381529631492171,
+      "recall_at_op_fppi": 0.22755369303300158
+    },
+    {
+      "input": 320,
+      "score_threshold": 0.45,
+      "ap_hard": 0.22826061503427242,
+      "recall_at_op_fppi": 0.22755369303300158
+    },
+    {
+      "input": 320,
+      "score_threshold": 0.6,
+      "ap_hard": 0.20491703959318375,
+      "recall_at_op_fppi": 0.2101100052383447
+    },
+    {
+      "input": 320,
+      "score_threshold": 0.7,
+      "ap_hard": 0.17792717428536076,
+      "recall_at_op_fppi": 0.18019905709795705
+    },
+    {
+      "input": 448,
+      "score_threshold": 0.3,
+      "ap_hard": 0.35205073565751405,
+      "recall_at_op_fppi": 0.3187008905185961
+    },
+    {
+      "input": 448,
+      "score_threshold": 0.45,
+      "ap_hard": 0.33245090116226134,
+      "recall_at_op_fppi": 0.3187008905185961
+    },
+    {
+      "input": 448,
+      "score_threshold": 0.6,
+      "ap_hard": 0.2991855198181052,
+      "recall_at_op_fppi": 0.30607647983237296
+    },
+    {
+      "input": 448,
+      "score_threshold": 0.7,
+      "ap_hard": 0.2620410076475537,
+      "recall_at_op_fppi": 0.2648507071765322
+    },
+    {
+      "input": 640,
+      "score_threshold": 0.3,
+      "ap_hard": 0.4729180720954009,
+      "recall_at_op_fppi": 0.4214248297537978
+    },
+    {
+      "input": 640,
+      "score_threshold": 0.45,
+      "ap_hard": 0.45041893620870965,
+      "recall_at_op_fppi": 0.4214248297537978
+    },
+    {
+      "input": 640,
+      "score_threshold": 0.6,
+      "ap_hard": 0.412442232944838,
+      "recall_at_op_fppi": 0.4212676794133054
+    },
+    {
+      "input": 640,
+      "score_threshold": 0.7,
+      "ap_hard": 0.3668725725643984,
+      "recall_at_op_fppi": 0.3708224201152436
+    }
+  ],
+  "cascade": {
+    "val": {
+      "yunet_recall": 0.40451908084758326,
+      "cascade_recall": 0.4047746849679217,
+      "rescues": 10,
+      "n_gt": 39123,
+      "images": 3226,
+      "yunet_empty_images": 182,
+      "rescue_fired": 182,
+      "rescue_boxes": 27,
+      "elapsed_s": 41.7
+    },
+    "train_sample": {
+      "yunet_recall": 0.40928301511535403,
+      "cascade_recall": 0.4094073190135243,
+      "rescues": 5,
+      "n_gt": 40224,
+      "images": 3220,
+      "yunet_empty_images": 182,
+      "rescue_fired": 182,
+      "rescue_boxes": 22,
+      "elapsed_s": 41.8,
+      "stride": 4
+    }
+  }
+}

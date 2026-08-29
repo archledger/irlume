@@ -49,3 +49,32 @@ def test_no_em_dashes_anywhere():
     import inspect
     src = inspect.getsource(m)
     assert "\u2014" not in src
+
+
+def test_kaggle_specs_are_single_archive():
+    for name in list_datasets():
+        spec = get_dataset(name)
+        if spec.source == "kaggle":
+            assert len(spec.files) == 1, f"{name} must be a single kaggle archive"
+            assert spec.files[0].path == "kaggle-archive.zip"
+            assert spec.files[0].extract
+
+
+def test_new_landmark_and_ir_entries():
+    wflw = get_dataset("wflw")
+    assert wflw.source == "kaggle"
+    assert wflw.repo == "mrriandmstique/wflw-wider-facial-landmarks-in-the-wild"
+    three = get_dataset("300w")
+    assert three.source == "hf"
+    assert three.repo == "quoctai219/300W"
+    assert three.files[0].path == "300w_dataset.zip"
+    aflw = get_dataset("aflw2000")
+    assert aflw.repo == "mohamedadlyi/aflw2000-3d"
+    cbsr = get_dataset("cbsr_nir")
+    assert cbsr.repo == "gpreda/cbsr-nir-face-dataset"
+    oulu = get_dataset("oulu_casia_nir")
+    assert oulu.repo == "aryanbaibaswata/oulu-casia"
+    for spec in (wflw, three, aflw, cbsr, oulu):
+        assert spec.provenance_url
+        assert spec.license_note
+        assert spec.notes

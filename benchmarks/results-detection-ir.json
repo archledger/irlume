@@ -1,0 +1,45 @@
+{
+  "runtime": {
+    "cv2_version": "5.0.0",
+    "yunet": "face_detection_yunet_2023mar.onnx",
+    "input": 640,
+    "score_threshold": 0.6
+  },
+  "cbsr": {
+    "frames": 3940,
+    "detected": 3940,
+    "rate": 1.0,
+    "score_p50": 0.9320595562458038,
+    "score_p10": 0.9213406860828399
+  },
+  "oulu": {
+    "per_lighting": [
+      {
+        "lighting": "Dark",
+        "frames": 1348,
+        "rate": 1.0
+      },
+      {
+        "lighting": "Strong",
+        "frames": 1298,
+        "rate": 1.0
+      },
+      {
+        "lighting": "Weak",
+        "frames": 1354,
+        "rate": 1.0
+      }
+    ],
+    "overall": {
+      "frames": 4000,
+      "detected": 4000,
+      "rate": 1.0,
+      "score_p50": 0.9333271086215973,
+      "score_p10": 0.9249388337135315
+    }
+  },
+  "notes": [
+    "cbsr run: 3940 of 3940 bmp frames (stride 1, nearest stride-integer approximation of the 4000-frame cap) in one flat sorted walk; the gallery groundtruth file is not consulted.",
+    "oulu run: 4000 of 31995 jpg frames under NI (stride 8, nearest stride-integer approximation of the 4000-frame cap) in one sorted recursive walk, grouped by lighting directory name; the VL/ RGB counterpart is not walked."
+  ]
+}

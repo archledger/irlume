@@ -8,3 +8,4 @@ opencv-python-headless==5.0.0.93
 numpy>=2.0,<3
 requests>=2.32,<3
 pytest>=8
+scipy>=1.11

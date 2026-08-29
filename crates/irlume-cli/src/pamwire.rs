@@ -4373,9 +4373,11 @@ auth required pam_fprintd.so\n\
     #[test]
     fn status_report_labels_and_login_wired_agree() {
         // The report's rows are the greeters, the fingerprint service, the lock
-        // screen, then sudo and polkit, in that order; labels come from the
-        // constant paths.
-        let rows = status_report();
+        // screen, then sudo and polkit, in that order. Pinned through the
+        // testable seam (KDE fallback): the live status_report() reads the
+        // host filesystem and would pick a different lock surface on
+        // Omarchy or Cinnamon, breaking the exact-label assertion.
+        let rows = report::status_report_for(false, false);
         let labels: Vec<&str> = rows.iter().map(|(l, _, _)| l.as_str()).collect();
         assert_eq!(
             labels,
@@ -4496,7 +4498,10 @@ auth required pam_fprintd.so\n\
             // A sidecar is restorable because its surface is.
             "/etc/pam.d/sudo.pre-irlume",
         ] {
-            assert!(is_managed_path(managed), "{managed} must be restorable");
+            assert!(
+                files::is_managed_path_for(false, false, managed),
+                "{managed} must be restorable"
+            );
         }
         for stray in [
             "/etc/shadow",
@@ -4508,7 +4513,10 @@ auth required pam_fprintd.so\n\
             "/etc/pam.d/system-auth",
             "",
         ] {
-            assert!(!is_managed_path(stray), "{stray} must NOT be restorable");
+            assert!(
+                !files::is_managed_path_for(false, false, stray),
+                "{stray} must NOT be restorable"
+            );
         }
     }
 

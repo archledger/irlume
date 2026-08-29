@@ -12,7 +12,7 @@
 
 use super::grammar::*;
 use super::stanzas::*;
-use super::{lock_surface, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
+use super::{lock_surface_for, Svc, FP_GREETERS, GREETERS, POLKIT, SUDO};
 use std::path::{Path, PathBuf};
 
 pub(super) fn read(p: &str) -> Result<String, String> {
@@ -67,15 +67,23 @@ pub(crate) fn surface_digest(path: &Path) -> String {
 /// So the paths are checked against the surfaces irlume wires, plus their
 /// `.pre-irlume` sidecars, and nothing else is restorable.
 pub(crate) fn is_managed_path(path: &str) -> bool {
+    is_managed_path_for(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new("/etc/pam.d/cinnamon-screensaver").exists(),
+        path,
+    )
+}
+
+/// Testable core of [`is_managed_path`], so the rollback test can pin the
+/// KDE fallback without reading the host filesystem (the live call would
+/// reject `/etc/pam.d/kde` on an Omarchy or Cinnamon box where the
+/// dynamic chooser picks a different lock surface).
+pub(crate) fn is_managed_path_for(omarchy: bool, cinnamon: bool, path: &str) -> bool {
     let bare = path.strip_suffix(BACKUP).unwrap_or(path);
     // Built from the same lists the wiring uses, so a surface added there is
     // restorable without anyone remembering to update a second list. The
-    // lock surface goes through the same dynamic chooser the wiring walks
-    // (#584/#585 audit round 2: the static KDE const here made `login
-    // rollback` refuse with `unmanaged-path` on Omarchy and Cinnamon after
-    // a clean enable, exactly the consumer-drift class #587 fixed for the
-    // status report).
-    let (lock_svc, _) = lock_surface();
+    // lock surface goes through the same dynamic chooser the wiring walks.
+    let (lock_svc, _) = lock_surface_for(omarchy, cinnamon);
     GREETERS
         .iter()
         .chain(FP_GREETERS.iter())

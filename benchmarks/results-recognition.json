@@ -1,0 +1,188 @@
+{
+  "runtime": {
+    "host_model": "/home/archledger/irlume-bench/models/glintr100.onnx",
+    "model_sha256": "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60",
+    "ort": "1.27.0",
+    "cuda": true,
+    "flip_tta": true,
+    "started_utc": "2026-08-29T13:57:23Z",
+    "wall_seconds": 919.4,
+    "per_set_seconds": {
+      "lfw": 142.5,
+      "bundle_lfw_crosscheck": 194.4,
+      "agedb30": 194.0,
+      "calfw": 194.0,
+      "cplfw": 194.0
+    }
+  },
+  "rgb": {
+    "lfw": {
+      "acc10fold": 0.9918333333333333,
+      "eer": 0.012666666666666666,
+      "tar_table": [
+        {
+          "far": 0.1,
+          "threshold": 0.13998645544052124,
+          "tar": 0.9933333333333333
+        },
+        {
+          "far": 0.03,
+          "threshold": 0.18320134282112122,
+          "tar": 0.9896666666666667
+        },
+        {
+          "far": 0.01,
+          "threshold": 0.2266618311405182,
+          "tar": 0.987
+        },
+        {
+          "far": 0.003,
+          "threshold": 0.25557735562324524,
+          "tar": 0.9846666666666667
+        },
+        {
+          "far": 0.001,
+          "threshold": 0.30397218465805054,
+          "tar": 0.976
+        }
+      ],
+      "pairs": 6000
+    },
+    "agedb30": {
+      "eer": 0.044,
+      "tar_table": [
+        {
+          "far": 0.1,
+          "threshold": 0.16937951743602753,
+          "tar": 0.9726666666666667
+        },
+        {
+          "far": 0.03,
+          "threshold": 0.21740920841693878,
+          "tar": 0.946
+        },
+        {
+          "far": 0.01,
+          "threshold": 0.2646714746952057,
+          "tar": 0.8916666666666667
+        },
+        {
+          "far": 0.003,
+          "threshold": 0.2996916174888611,
+          "tar": 0.8386666666666667
+        },
+        {
+          "far": 0.001,
+          "threshold": 0.3358559012413025,
+          "tar": 0.7546666666666667
+        }
+      ],
+      "acc_at_045": 0.6995,
+      "pairs": 6000
+    },
+    "calfw": {
+      "eer": 0.06633333333333333,
+      "tar_table": [
+        {
+          "far": 0.1,
+          "threshold": 0.17696551978588104,
+          "tar": 0.9426666666666667
+        },
+        {
+          "far": 0.03,
+          "threshold": 0.2342020869255066,
+          "tar": 0.9133333333333333
+        },
+        {
+          "far": 0.01,
+          "threshold": 0.2844330966472626,
+          "tar": 0.8773333333333333
+        },
+        {
+          "far": 0.003,
+          "threshold": 0.32392334938049316,
+          "tar": 0.8456666666666667
+        },
+        {
+          "far": 0.001,
+          "threshold": 0.343755304813385,
+          "tar": 0.8246666666666667
+        }
+      ],
+      "acc_at_045": 0.815,
+      "pairs": 6000
+    },
+    "cplfw": {
+      "eer": 0.11966666666666667,
+      "tar_table": [
+        {
+          "far": 0.1,
+          "threshold": 0.18139153718948364,
+          "tar": 0.8743333333333333
+        },
+        {
+          "far": 0.03,
+          "threshold": 0.23878023028373718,
+          "tar": 0.8166666666666667
+        },
+        {
+          "far": 0.01,
+          "threshold": 0.27155399322509766,
+          "tar": 0.7763333333333333
+        },
+        {
+          "far": 0.003,
+          "threshold": 0.3168729245662689,
+          "tar": 0.6956666666666667
+        },
+        {
+          "far": 0.001,
+          "threshold": 0.35672250390052795,
+          "tar": 0.6246666666666667
+        }
+      ],
+      "acc_at_045": 0.7053333333333334,
+      "pairs": 6000
+    }
+  },
+  "threshold_calibration": {
+    "rgb": {
+      "grant_recommendation": 0.35,
+      "far_at_grant": 0.0006666666666666666,
+      "table": [
+        {
+          "threshold": 0.3,
+          "far": 0.003833333333333333,
+          "tar": 0.8525833333333334
+        },
+        {
+          "threshold": 0.35,
+          "far": 0.0006666666666666666,
+          "tar": 0.7825
+        },
+        {
+          "threshold": 0.4,
+          "far": 8.333333333333333e-05,
+          "tar": 0.6929166666666666
+        },
+        {
+          "threshold": 0.45,
+          "far": 8.333333333333333e-05,
+          "tar": 0.5835
+        },
+        {
+          "threshold": 0.5,
+          "far": 8.333333333333333e-05,
+          "tar": 0.4685
+        }
+      ]
+    }
+  },
+  "notes": [
+    "lfw acc10fold uses verification_metrics.ten_fold (per-fold optimal threshold on the fold itself, ties to lowest threshold). The bench_faceid.py held-out-train-fold-threshold protocol gives 0.9902\u00b10.0038 on this run; the committed results-lfw.json continuity number 0.9903 used that protocol with the same auraface flip-TTA embedding path.",
+    "bundle coherence cross-check: the bundle's own aligned-LFW annotation (lfw_ann.txt, 6,000 pairs) through the identical embedding path gives eer=0.0067 and best-threshold accuracy 0.9948 on its 112x112 crops, vs eer=0.0127 for the deepfunneled detect+warp lane; the bundle data and the pipeline are consistent.",
+    "aligned sets (agedb30, calfw, cplfw): pre-aligned 112x112 crops embedded directly without detection; the shipped protocols define no folds, so each set reports acc_at_045 = verification_metrics.fold_accuracy at the fixed 0.45 line plus eer and tar_table; acc10fold is reported for lfw only.",
+    "aligned bundle annotations consumed: agedb_30_ann.txt, calfw_ann.txt, cplfw_ann.txt at the bundle root, label-first '<1|0> <img1> <img2>' format, 6,000 pairs (3,000 genuine / 3,000 impostor) per set, paths relative to the bundle root.",
+    "rgb grant calibration pools the impostor and genuine cosine scores of all scored pairs across the four sets above; grant rule is score > threshold; far/tar fractions use strict inequality; grant_recommendation is the candidate threshold with realized FAR <= 1e-3 and the best TAR (lowest threshold on ties)."
+  ]
+}

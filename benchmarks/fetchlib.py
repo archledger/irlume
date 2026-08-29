@@ -85,16 +85,19 @@ def safe_extract_zip(
 
 
 def render_provenance(
-    spec: DatasetSpec,
-    hashes: dict[str, str],
-    terms_quoted: str,
-) -> str:
+    spec,
+    hashes,
+    terms_quoted,
+    now=None,
+):
+    stamp = now or datetime.datetime.now(datetime.UTC)
+    stamp = stamp.replace(microsecond=0)
     lines = [
         f"# PROVENANCE: {spec.name}",
         "",
         f"- source: {spec.source} repo {spec.repo}",
         f"- url: {spec.provenance_url}",
-        f"- downloaded (UTC): {datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()}",
+        f"- downloaded (UTC): {stamp.isoformat()}",
         f"- license note: {spec.license_note}",
         f"- terms quoted from source page: {terms_quoted}",
         f"- notes: {spec.notes}",

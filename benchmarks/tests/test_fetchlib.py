@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import zipfile
 from pathlib import Path
@@ -75,9 +76,15 @@ def test_render_provenance_is_deterministic_markdown(tmp_path):
     from datasets import get_dataset
 
     spec = get_dataset("wider_face")
-    md1 = render_provenance(spec, {"data/WIDER_val.zip": "ab" * 32}, "TERMS")
-    md2 = render_provenance(spec, {"data/WIDER_val.zip": "ab" * 32}, "TERMS")
+    fixed = datetime.datetime(2026, 8, 30, 12, 0, 0, tzinfo=datetime.UTC)
+    md1 = render_provenance(
+        spec, {"data/WIDER_val.zip": "ab" * 32}, "TERMS", now=fixed
+    )
+    md2 = render_provenance(
+        spec, {"data/WIDER_val.zip": "ab" * 32}, "TERMS", now=fixed
+    )
     assert md1 == md2
+    assert "downloaded (UTC): 2026-08-30T12:00:00+00:00" in md1
     assert "CUHK-CSE/wider_face" in md1
     assert "ab" * 32 in md1
     assert "TERMS" in md1

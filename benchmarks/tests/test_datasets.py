@@ -1,0 +1,51 @@
+import pytest
+
+from datasets import DatasetFile, DatasetSpec, get_dataset, list_datasets
+
+
+def test_wider_face_spec_is_complete():
+    spec = get_dataset("wider_face")
+    assert spec.source == "hf"
+    assert spec.repo == "CUHK-CSE/wider_face"
+    paths = {f.path for f in spec.files}
+    assert "data/WIDER_train.zip" in paths
+    assert "data/WIDER_val.zip" in paths
+    assert "data/wider_face_split.zip" in paths
+    assert all(f.extract for f in spec.files)
+    assert spec.provenance_url.startswith("https://huggingface.co/datasets/")
+    assert "research" in spec.license_note.lower()
+    assert spec.notes
+
+
+def test_every_entry_has_required_fields():
+    for name in list_datasets():
+        spec = get_dataset(name)
+        assert spec.name == name
+        assert spec.source in ("hf", "kaggle")
+        assert spec.repo
+        assert spec.files
+        assert spec.license_note
+        assert spec.provenance_url
+        assert spec.notes
+
+
+def test_unknown_name_raises_keyerror_with_candidates():
+    with pytest.raises(KeyError) as e:
+        get_dataset("no_such_set")
+    assert "no_such_set" in str(e.value)
+    assert "wider_face" in str(e.value)
+
+
+def test_expected_hashes_are_64_hex_or_none():
+    for name in list_datasets():
+        for f in get_dataset(name).files:
+            if f.sha256_expected is not None:
+                assert len(f.sha256_expected) == 64
+                int(f.sha256_expected, 16)
+
+
+def test_no_em_dashes_anywhere():
+    import datasets as m
+    import inspect
+    src = inspect.getsource(m)
+    assert "\u2014" not in src

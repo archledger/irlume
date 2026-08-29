@@ -66,13 +66,17 @@ pub fn method() -> Method {
 }
 
 /// Persist the active method (creates `/etc/irlume` if needed; needs root).
+/// Atomic: a crash or full disk mid-write must not leave a truncated file,
+/// because a truncated/empty method parses as `Auto` (face on), silently
+/// undoing an operator's `fingerprint` choice (2026-08-29 audit).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn set_method(m: Method) -> irlume_common::Result<()> {
     let p = path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
     }
-    std::fs::write(&p, m.as_str()).map_err(|e| irlume_common::Error::Io(e.to_string()))
+    irlume_common::write_atomic_preserving(&p, m.as_str().as_bytes(), 0o644)
+        .map_err(|e| irlume_common::Error::Io(e.to_string()))
 }
 
 #[cfg(test)]
@@ -156,6 +160,16 @@ mod tests {
         set_method(Method::Auto).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "auto");
         assert_eq!(method(), Method::Auto);
+
+        // A rewrite of an existing TIGHT file must not come back wider: the
+        // atomic write preserves the deployed mode (2026-08-29 audit).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+            set_method(Method::Face).unwrap();
+            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "method rewrite must preserve a 0600 mode");
+        }
 
         std::env::remove_var("IRLUME_METHOD_CONF");
         let _ = std::fs::remove_dir_all(&dir);

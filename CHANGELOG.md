@@ -189,6 +189,36 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **Security audit hardening batch (full report:
+  `docs/research/2026-08-29-security-audit.md`).** A workspace-wide audit
+  (context dossiers, adversarial verification, semgrep, 101M-execution fuzz
+  campaigns) confirmed the standing threat model held; four discipline
+  gaps it found are closed here. `write_pam_edit` is now an atomic
+  temp+rename+fsync write that preserves the existing file mode instead of
+  a truncate-in-place write that forced 0644 (a crash could truncate a PAM
+  stack; a 0600 stack file came back world-readable). `set_method` writes
+  `/etc/irlume/method` atomically (a truncated file parses as face-on,
+  silently undoing an operator's fingerprint choice). Peer-supplied PAM
+  service strings are sanitized (control characters replaced, length
+  clamped) before reaching the journal, so a local peer can no longer
+  forge `irlumed:` lines via embedded newlines. A failed socket `chmod` is
+  now reported instead of silently discarded.
+
+- **Code scanning no longer buries real alerts under test-fixture noise.**
+  CodeQL's Rust extractor does not evaluate `cfg` attributes, so its two
+  fixture-sensitive queries (`rust/cleartext-logging`,
+  `rust/hard-coded-cryptographic-value`) fired on inline
+  `#[cfg(test)] mod tests` code: 139 false-positive alerts in one run
+  (test passwords like `b"correct horse battery staple"`, salt and
+  key-length fixtures, a public NIST vector, and `panic!` messages
+  printing enum Debug output), regenerating with new alert numbers every
+  time test lines drift. The checked-in CodeQL workflow now applies two
+  `query-filters` that exclude exactly those two queries while every
+  other default-suite query keeps running for all three languages, and
+  the 139 standing alerts were dismissed with per-alert reasoning. The
+  rationale and the re-enable condition live in
+  `.github/codeql/codeql-config.yml`.
+
 - **`ir-setup` evidence names the accepted face-authentication mode (#572).**
   The undo record's evidence now states which D1/D2 mode the camera actually
   accepted (for example "D1 (alternative illumination)"), not just that a

@@ -327,7 +327,12 @@ fn main() {
     // from SocketMode= in the unit, and chmod'ing systemd's socket behind its
     // back would drift from what the unit says.
     if !socket_activated() {
-        set_mode(&socket, DAEMON_SOCKET_MODE);
+        if let Err(e) = set_mode(&socket, DAEMON_SOCKET_MODE) {
+            // Silent failure here would leave the socket at the umask mode
+            // with no trace, and face auth would just stop working for part
+            // of the fleet (2026-08-29 audit: the error was discarded).
+            eprintln!("irlumed: WARNING: could not set {DAEMON_SOCKET_MODE:o} on {socket}: {e}");
+        }
     }
     eprintln!("irlumed: socket ready at {socket}; requests queue while startup finishes");
 
@@ -2044,7 +2049,7 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
         if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
             eprintln!(
                 "irlumed: UnsealKeyring refused for service '{}' ({class:?})",
-                service.as_deref().unwrap_or("?")
+                journal_safe(service.as_deref().unwrap_or("?"))
             );
             return Response::Error(format!("keyring unseal not allowed for {class:?}"));
         }
@@ -3626,7 +3631,10 @@ fn dispatch_scoped(
                     .unwrap_or(SessionState::Cold);
                 let class = classify(service.as_deref().unwrap_or(""), session);
                 if class != OperationClass::ScreenUnlock {
-                    eprintln!("irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password", service.as_deref().unwrap_or("?"));
+                    eprintln!(
+                        "irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password",
+                        journal_safe(service.as_deref().unwrap_or("?"))
+                    );
                     return Response::AuthResult {
                         granted: false,
                         score: 0.0,
@@ -3651,7 +3659,10 @@ fn dispatch_scoped(
                 use irlume_core::biopolicy::{classify, decide, Action, SessionState, Tier};
                 let svc = service.as_deref().unwrap_or("");
                 if decide(classify(svc, SessionState::Cold), Tier::Secure) == Action::Deny {
-                    eprintln!("irlumed: biopolicy denies verify for service '{svc}' -> password");
+                    eprintln!(
+                        "irlumed: biopolicy denies verify for service '{}' -> password",
+                        journal_safe(svc)
+                    );
                     return Response::AuthResult {
                         granted: false,
                         score: 0.0,
@@ -4074,7 +4085,10 @@ fn dispatch_scoped(
                 use irlume_core::biopolicy::{classify, OperationClass, SessionState};
                 let svc = service.as_deref().unwrap_or("");
                 if classify(svc, SessionState::Cold) == OperationClass::AppConsent {
-                    eprintln!("irlumed: UnsealPassword refused for polkit service '{svc}' (verify-only class)");
+                    eprintln!(
+                    "irlumed: UnsealPassword refused for polkit service '{}' (verify-only class)",
+                    journal_safe(svc)
+                );
                     return Response::Error(format!(
                         "'{svc}' is verify-only: a polkit prompt never releases the credential"
                     ));
@@ -4106,7 +4120,10 @@ fn dispatch_scoped(
                 // is Secure tier.
                 let action = decide(classify(svc, SessionState::Cold), Tier::Secure);
                 if action != Action::Unseal {
-                    eprintln!("irlumed: biopolicy denies unseal for service '{svc}' ({action:?}) -> password");
+                    eprintln!(
+                    "irlumed: biopolicy denies unseal for service '{}' ({action:?}) -> password",
+                    journal_safe(svc)
+                );
                     return Response::Error(format!(
                         "biopolicy: '{svc}' may not release the credential"
                     ));
@@ -4771,9 +4788,34 @@ fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
 /// group-restricted mode was removed rather than repaired.
 const DAEMON_SOCKET_MODE: u32 = 0o666;
 
-fn set_mode(path: &str, mode: u32) {
+fn set_mode(path: &str, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Peer-supplied text (the PAM service string) must never reach the journal
+/// raw: a local peer could otherwise forge `irlumed:` lines by embedding
+/// newlines in its service name (2026-08-29 audit). Newlines and tabs become
+/// spaces, other control characters become `?`, and the result is clamped.
+fn journal_safe(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out = String::with_capacity(s.len().min(MAX + 3));
+    let mut clamped = false;
+    for c in s.chars() {
+        if out.chars().count() >= MAX {
+            clamped = true;
+            break;
+        }
+        match c {
+            '\n' | '\r' | '\t' => out.push(' '),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    if clamped {
+        out.push_str("...");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -8068,12 +8110,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("sock-standin");
         std::fs::write(&f, b"").unwrap();
-        set_mode(f.to_str().unwrap(), 0o660);
+        set_mode(f.to_str().unwrap(), 0o660).unwrap();
         let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o660);
-        // Best-effort on a missing path: must not panic.
-        set_mode("/nonexistent/irlume-test/sock", 0o666);
+        // A missing path is now a REPORTED error, not a silently discarded
+        // one: the caller (the socket setup) journal-warns on it.
+        assert!(
+            set_mode("/nonexistent/irlume-test/sock", 0o666).is_err(),
+            "a failed chmod must surface so the socket mode is never silently wrong"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_safe_strips_forging_characters_and_clamps() {
+        // A local peer controls its service string; embedded newlines must not
+        // reach the journal or they forge additional `irlumed:` lines.
+        assert_eq!(
+            journal_safe("sddm\nirlumed: face granted for alice"),
+            "sddm irlumed: face granted for alice"
+        );
+        assert_eq!(journal_safe("a\tb\rc"), "a b c");
+        assert_eq!(journal_safe("ctl\x01\x7f"), "ctl??");
+        assert_eq!(journal_safe("plain-sddm"), "plain-sddm");
+        let long = "x".repeat(200);
+        let out = journal_safe(&long);
+        assert_eq!(out.len(), 64 + 3, "clamped to 64 plus an ellipsis marker");
+        assert!(out.ends_with("..."));
     }
 
     #[test]

@@ -405,17 +405,20 @@ fn unwire_omarchy() -> bool {
 }
 
 /// One PAM edit with the same discipline pamwire uses: back the original up
-/// once beside the file, write the new content, keep mode 0644.
+/// once beside the file, write the new content ATOMICALLY (temp + rename +
+/// fsync, so a crash or full disk mid-edit leaves the previous bytes intact
+/// instead of a truncated auth stack), and preserve the existing file's mode
+/// rather than forcing 0644 (2026-08-29 audit: a 0600 stack file came back
+/// world-readable).
 fn write_pam_edit(path: &str, next: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
     let backup = format!("{path}.pre-irlume");
     if !std::path::Path::new(&backup).exists() {
         if let Ok(current) = std::fs::read_to_string(path) {
             let _ = std::fs::write(&backup, current);
         }
     }
-    std::fs::write(path, next).is_ok()
-        && std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).is_ok()
+    irlume_common::write_atomic_preserving(std::path::Path::new(path), next.as_bytes(), 0o644)
+        .is_ok()
 }
 
 fn enable(user: &str, args: &[String]) -> ExitCode {
@@ -1158,6 +1161,32 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_pam_edit_preserves_a_tighter_existing_mode_and_replaces_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "irlume-pamedit-mode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "auth include system-auth\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(write_pam_edit(
+            path.to_str().unwrap(),
+            "auth sufficient pam_fprintd.so\nauth include system-auth\n"
+        ));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a rewrite of a 0600 PAM file must not widen it to 0644"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "auth sufficient pam_fprintd.so\nauth include system-auth\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn omarchy_wire_inserts_the_pair_at_the_top_of_a_bare_stack() {

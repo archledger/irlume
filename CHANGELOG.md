@@ -189,6 +189,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- **Security audit hardening batch (full report:
+  `docs/research/2026-08-29-security-audit.md`).** A workspace-wide audit
+  (context dossiers, adversarial verification, semgrep, 101M-execution fuzz
+  campaigns) confirmed the standing threat model held; four discipline
+  gaps it found are closed here. `write_pam_edit` is now an atomic
+  temp+rename+fsync write that preserves the existing file mode instead of
+  a truncate-in-place write that forced 0644 (a crash could truncate a PAM
+  stack; a 0600 stack file came back world-readable). `set_method` writes
+  `/etc/irlume/method` atomically (a truncated file parses as face-on,
+  silently undoing an operator's fingerprint choice). Peer-supplied PAM
+  service strings are sanitized (control characters replaced, length
+  clamped) before reaching the journal, so a local peer can no longer
+  forge `irlumed:` lines via embedded newlines. A failed socket `chmod` is
+  now reported instead of silently discarded.
+
 - **Code scanning no longer buries real alerts under test-fixture noise.**
   CodeQL's Rust extractor does not evaluate `cfg` attributes, so its two
   fixture-sensitive queries (`rust/cleartext-logging`,

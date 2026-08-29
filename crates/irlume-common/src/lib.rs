@@ -303,6 +303,33 @@ pub fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], mode: u32) -> std
     }
 }
 
+/// [`write_atomic_mode`] that keeps the mode of an EXISTING file and only uses
+/// `default_mode` when creating one.
+///
+/// For rewrite-in-place surfaces whose current mode is the deployed truth: a
+/// PAM stack a distro shipped 0600 must not come back 0644 because our edit
+/// replaced the file (2026-08-29 audit; `write_pam_edit` used to force 0644).
+/// The umask ceiling note of [`write_atomic_mode`] applies, so the replacement
+/// can only come out EQUAL OR TIGHTER than the mode being preserved, never
+/// wider.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn write_atomic_preserving(
+    path: &std::path::Path,
+    bytes: &[u8],
+    default_mode: u32,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(default_mode);
+        write_atomic_mode(path, bytes, mode)
+    }
+    #[cfg(not(unix))]
+    write_atomic_mode(path, bytes, default_mode)
+}
+
 /// How far an atomic write got.
 ///
 /// "It returned an error" and "nothing became visible" are not the same thing,

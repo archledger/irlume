@@ -1590,6 +1590,7 @@ mod worker_engine {
                     capture_failures: 0,
                     rate_shortfall_failures: 0,
                     continuity_facts: Default::default(),
+                    capture_failure_facts: Default::default(),
                 },
                 concurrent: PairSample {
                     rgb_mean: 140.0,
@@ -1610,9 +1611,37 @@ mod worker_engine {
                     capture_failures: 0,
                     rate_shortfall_failures: 0,
                     continuity_facts: Default::default(),
+                    capture_failure_facts: Default::default(),
                 },
                 trailing_sequential_control: true,
             }
+        }
+
+        /// #606: the cannot-stream branch names the per-round failure facts
+        /// with counts, so the verdict says how the arm died, not just that
+        /// it did.
+        #[test]
+        fn cannot_stream_verdict_names_capture_failure_facts() {
+            let mut report = healthy_concurrent(6, 6);
+            report.concurrent = PairSample {
+                failed: 6,
+                capture_failure_facts: [("stream-delivery-failure", 6usize)].into_iter().collect(),
+                ..Default::default()
+            };
+            report.trailing_sequential_control = true;
+            let msg = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::ConcurrentUnavailable),
+                6,
+            );
+            assert!(
+                msg.starts_with("capture mode sequential for this camera"),
+                "the persisted verdict leads: {msg}"
+            );
+            assert!(
+                msg.contains("all 6 concurrent attempts errored (6x stream-delivery-failure)"),
+                "the failure mode is named with its count: {msg}"
+            );
         }
 
         /// #586 exactly: full brightness retention (100% RGB, 102% IR) with
@@ -3216,10 +3245,25 @@ fn camera_tune_verdict_message(
     if report.concurrent_impossible() {
         // Observed counts, not the requested round count: a sequential arm
         // can complete fewer rounds than were asked for, and "measured fine"
-        // must not overstate its evidence.
+        // must not overstate its evidence. Name the per-round failure facts
+        // (#606): "all N errored" alone cannot say the rounds died at stream
+        // delivery, which is the fact a stored verdict and a support reader
+        // need months later.
+        let mut facts: Vec<(&&str, &usize)> =
+            report.concurrent.capture_failure_facts.iter().collect();
+        facts.sort_by(|a, b| b.1.cmp(a.1));
+        let detail = if facts.is_empty() {
+            String::new()
+        } else {
+            let named: Vec<String> = facts
+                .iter()
+                .map(|(fact, count)| format!("{count}x {fact}"))
+                .collect();
+            format!(" ({})", named.join("; "))
+        };
         return format!(
             "capture mode sequential for this camera: it cannot stream RGB and IR \
-             at once (all {} concurrent attempts errored; {} sequential \
+             at once (all {} concurrent attempts errored{detail}; {} sequential \
              round(s) completed, {} errored; a trailing one-at-a-time \
              control confirmed the camera still answers)",
             report.concurrent.failed, report.sequential.rounds, report.sequential.failed,

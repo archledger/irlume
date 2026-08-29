@@ -45,7 +45,7 @@ pub(crate) fn stage_statuses() -> Vec<StageStatus> {
         ),
         (
             "landmarks",
-            "face_landmark_detector.tflite",
+            "face_landmarks_detector.tflite",
             "IRLUME_MESH_MODEL",
             false,
         ),
@@ -89,7 +89,7 @@ pub(crate) fn recognizer_space_for(name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::recognizer_space_for;
+    use super::{recognizer_space_for, stage_statuses};
 
     #[test]
     fn forget_model_accepts_shipped_and_literal_spaces_only() {
@@ -108,5 +108,49 @@ mod tests {
         // must be refused, not silently interpreted.
         assert!(recognizer_space_for("buffalo").is_err());
         assert!(recognizer_space_for("embed:xyz").is_err());
+    }
+
+    /// doctor's stage table must search for the files the package actually
+    /// ships: the packaged unit pins every model path the daemon loads, so a
+    /// filename drifting from it reports a capability as missing while the
+    /// daemon is using it (#600).
+    #[test]
+    fn stage_filenames_match_the_packaged_unit() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/irlumed.service"
+        ))
+        .expect("packaging/systemd/irlumed.service readable from the workspace");
+        let env_for = [
+            ("detection", "IRLUME_DET_MODEL"),
+            ("landmarks", "IRLUME_MESH_MODEL"),
+            ("recognition", "IRLUME_MODEL"),
+        ];
+        for stage in stage_statuses() {
+            let file = stage.file.expect("every stage names its model file");
+            let env = env_for
+                .iter()
+                .find(|(name, _)| *name == stage.stage)
+                .expect("stage covered by the test table")
+                .1;
+            let prefix = format!("Environment=\"{env}=");
+            let line = unit
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("{env} is pinned in the packaged unit"));
+            let pinned = line
+                .strip_prefix(&prefix)
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or_else(|| panic!("{env} line is a quoted absolute path"));
+            let pinned_name = std::path::Path::new(pinned)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("pinned path has a file name");
+            assert_eq!(
+                pinned_name, file,
+                "doctor's {} stage must search for the file the unit loads",
+                stage.stage
+            );
+        }
     }
 }

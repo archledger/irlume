@@ -818,6 +818,13 @@ pub struct ArmEvidence {
     /// Failed rounds carrying typed below-floor delivery evidence.
     #[serde(default)]
     rate_shortfall_failures: u32,
+    /// Per-fact counts of capture-level round failures (#606), naming HOW an
+    /// arm's rounds errored (stream delivery, rate-window establishment).
+    /// Additive and defaulted, like `rate_shortfall_failures` before it, so
+    /// schema-version-2 records written without this field still parse and
+    /// revalidate.
+    #[serde(default)]
+    capture_failure_facts: std::collections::BTreeMap<String, u32>,
     rgb_mean: f32,
     ir_mean: f32,
     elapsed_ms: u64,
@@ -846,6 +853,7 @@ impl ArmEvidence {
         arm_failures: u32,
         capture_failures: u32,
         rate_shortfall_failures: u32,
+        capture_failure_facts: std::collections::BTreeMap<String, u32>,
         rgb_mean: f32,
         ir_mean: f32,
         elapsed_ms: u64,
@@ -866,6 +874,7 @@ impl ArmEvidence {
             arm_failures,
             capture_failures,
             rate_shortfall_failures,
+            capture_failure_facts,
             rgb_mean,
             ir_mean,
             elapsed_ms,
@@ -1633,8 +1642,25 @@ mod tests {
 
     fn arm(rounds: u32) -> ArmEvidence {
         ArmEvidence::new(
-            rounds, rounds, 0, rounds, rounds, rounds, rounds, 0, 0, 0, 0, 0, 0, 0, 0, 140.0,
-            120.0, 850,
+            rounds,
+            rounds,
+            0,
+            rounds,
+            rounds,
+            rounds,
+            rounds,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Default::default(),
+            140.0,
+            120.0,
+            850,
         )
         .unwrap()
     }
@@ -1742,6 +1768,40 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
+    /// #606: `capture_failure_facts` is additive. A schema-version-2 record
+    /// written before the field existed must still parse, revalidate, and
+    /// authorize the exact same context, so stored authority survives the
+    /// upgrade and a downgrade can still read new records (serde ignores the
+    /// unknown key on the old binary).
+    #[test]
+    fn records_written_before_failure_facts_still_authorize() {
+        fn strip_facts(value: &mut serde_json::Value) {
+            if let serde_json::Value::Object(map) = value {
+                map.remove("capture_failure_facts");
+                for (_, nested) in map.iter_mut() {
+                    strip_facts(nested);
+                }
+            }
+        }
+        let attempt = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
+        let record =
+            CaptureQualificationRecord::new(1, attempt.clone(), Some(attempt.clone())).unwrap();
+        let json = record.to_json().unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        strip_facts(&mut legacy);
+        assert!(
+            !legacy.to_string().contains("capture_failure_facts"),
+            "fixture genuinely models a pre-field record"
+        );
+        let parsed = CaptureQualificationRecord::from_json(legacy.to_string().as_bytes())
+            .expect("a pre-field schema-version-2 record parses and revalidates");
+        assert_eq!(
+            parsed.resolve(attempt.context()),
+            QualificationResolution::ConcurrentQualified,
+            "stored authority is untouched by the additive field"
+        );
+    }
+
     #[test]
     fn one_stream_tuple_change_invalidates_concurrent_authority() {
         let attempt = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
@@ -1769,7 +1829,25 @@ mod tests {
             ctx,
             arm(6),
             ArmEvidence::new(
-                6, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 80.0, 90.0, 2_000,
+                6,
+                3,
+                3,
+                3,
+                3,
+                3,
+                3,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                3,
+                0,
+                Default::default(),
+                80.0,
+                90.0,
+                2_000,
             )
             .unwrap(),
             false,
@@ -1811,11 +1889,52 @@ mod tests {
         )
         .is_err());
         assert!(
-            ArmEvidence::new(1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1).is_err(),
+            ArmEvidence::new(
+                1,
+                1,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Default::default(),
+                1.0,
+                1.0,
+                1
+            )
+            .is_err(),
             "one completed round cannot both match and fail the same contract"
         );
-        let partial_rate_failure =
-            ArmEvidence::new(6, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1.0, 1.0, 1).unwrap();
+        let partial_rate_failure = ArmEvidence::new(
+            6,
+            1,
+            0,
+            1,
+            0,
+            1,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Default::default(),
+            1.0,
+            1.0,
+            1,
+        )
+        .unwrap();
         assert!(
             QualificationAttempt::new(
                 1,
@@ -1829,8 +1948,28 @@ mod tests {
             .is_err(),
             "one rate-failed frame cannot authorize a six-round sequential verdict"
         );
-        let typed_rate_shortfall =
-            ArmEvidence::new(6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0.0, 0.0, 1).unwrap();
+        let typed_rate_shortfall = ArmEvidence::new(
+            6,
+            0,
+            6,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            6,
+            Default::default(),
+            0.0,
+            0.0,
+            1,
+        )
+        .unwrap();
         assert!(
             QualificationAttempt::new(
                 1,
@@ -2010,7 +2149,25 @@ mod tests {
             conclusive.context().clone(),
             arm(6),
             ArmEvidence::new(
-                6, 4, 2, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 2, 0, 80.0, 90.0, 2_000,
+                6,
+                4,
+                2,
+                4,
+                4,
+                4,
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+                0,
+                Default::default(),
+                80.0,
+                90.0,
+                2_000,
             )
             .unwrap(),
             false,

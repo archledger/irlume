@@ -4114,6 +4114,7 @@ impl<'a> RgbSession<'a> {
         }
         let device = self.cam.device.clone();
         let progress = self.progress.clone();
+        let warmup_started = std::time::Instant::now();
         warm_up_stream(&device, &mut self.stream, &progress)?;
         for _ in 0..AE_WARMUP {
             self.cam
@@ -4125,6 +4126,11 @@ impl<'a> RgbSession<'a> {
                 .map_err(|e| map_io(&device, e))?; // discard while AE settles
         }
         self.warmed = true;
+        irlume_common::dlog!(
+            "[capture-stage] warmup {device}: {}ms (stream recovery discards plus \
+             AE settle; the delivered-rate window fills during these)",
+            warmup_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -4147,6 +4153,7 @@ impl<'a> RgbSession<'a> {
         let format =
             frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         let mut frames = Vec::with_capacity(n.max(1));
+        let burst_started = std::time::Instant::now();
         for _ in 0..n.max(1) {
             self.cam
                 .lease
@@ -4156,6 +4163,13 @@ impl<'a> RgbSession<'a> {
                 .stream
                 .next()
                 .map_err(|error| map_delivery(&device, error))?;
+            if frames.is_empty() {
+                irlume_common::dlog!(
+                    "[capture-stage] first-frame {device}: {}ms after warmup \
+                     (the gated delivery window fills here)",
+                    burst_started.elapsed().as_millis()
+                );
+            }
             let taken = std::time::Instant::now();
             let data = match &chosen {
                 b"NV12" => nv12_to_rgb(buf, w, h),
@@ -4221,12 +4235,41 @@ pub fn capture_rgb_burst_with_progress(
     n: usize,
     progress: &Progress,
 ) -> irlume_common::Result<Vec<Frame>> {
+    let opened = std::time::Instant::now();
     let cam = RgbCamera::open(device)?;
+    let open_ms = opened.elapsed().as_millis();
+    let armed = std::time::Instant::now();
     let mut session = cam.session_with_progress(progress)?;
+    let arm_ms = armed.elapsed().as_millis();
+    let captured = std::time::Instant::now();
     let frames = session.burst(n);
+    let capture_ms = captured.elapsed().as_millis();
     // Drop the stream before `cam`: the session borrows the device.
     drop(session);
+    irlume_common::dlog!(
+        "{}",
+        capture_stage_summary("rgb", device, open_ms, arm_ms, capture_ms)
+    );
     frames
+}
+
+/// One debug-trace line naming where a one-shot capture's wall time went.
+/// The sequential path measured ~89% ramp on some hosts (#606 follow-up), and
+/// the next tuning decision needs that ramp attributed: device open and
+/// negotiation, session arm (buffer claim plus stream start), and the capture
+/// itself (warmup discards, rate-window fill, burst). Numbers only, per the
+/// diagnostic-trace policy: never frames, embeddings, or identities.
+fn capture_stage_summary(
+    role: &str,
+    device: &str,
+    open_ms: u128,
+    arm_ms: u128,
+    capture_ms: u128,
+) -> String {
+    format!(
+        "[capture-stage] {role} {device}: open={open_ms}ms arm={arm_ms}ms \
+         capture(warmup+fill+burst)={capture_ms}ms"
+    )
 }
 
 /// The uncompressed RGB fourccs the capture path can decode, best first.
@@ -4839,11 +4882,21 @@ pub fn capture_ir_with_stats_and_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    let opened = std::time::Instant::now();
     let cam = IrCamera::open(device)?;
+    let open_ms = opened.elapsed().as_millis();
+    let armed = std::time::Instant::now();
     let mut session = cam.session_with_progress(progress)?;
+    let arm_ms = armed.elapsed().as_millis();
+    let captured = std::time::Instant::now();
     let shot = session.capture_with_stats();
+    let capture_ms = captured.elapsed().as_millis();
     // Drop the stream before `cam`: the session borrows the device.
     drop(session);
+    irlume_common::dlog!(
+        "{}",
+        capture_stage_summary("ir", device, open_ms, arm_ms, capture_ms)
+    );
     shot
 }
 
@@ -5004,6 +5057,7 @@ impl IrCamera {
         // restore while the stream was still live, the very mid-stream write
         // this change removes. Assigned further down, once the stream exists.
         let mode;
+        let arm_alloc_started = std::time::Instant::now();
         let mut stream = TrackedStream::new(
             SafeStream::open(
                 V4l2CameraState::with_ir_interval(
@@ -5021,12 +5075,15 @@ impl IrCamera {
                 self.accepted_interval,
             ),
         );
+        let alloc_ms = arm_alloc_started.elapsed().as_millis();
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
         // buffers; STREAMON happens on the first dequeue, which is inside
         // `warm_up_stream` below. This is the window, and it is the only one.
+        let meta_started = std::time::Instant::now();
         let mut meta = ir_metadata::IlluminationLog::open(&self.device);
+        let metadata_ms = meta_started.elapsed().as_millis();
         // BEFORE the warm-up, because the warm-up's first dequeue is STREAMON.
         // Microsoft's sequence sets the property and THEN starts streaming, and
         // this ran the other way round: every authentication set the mode under
@@ -5051,6 +5108,7 @@ impl IrCamera {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        let emitter_started = std::time::Instant::now();
         mode = enable_ir_emitter_privacy_bounded(
             &self.device,
             &self.dev,
@@ -5058,21 +5116,31 @@ impl IrCamera {
             self.lease.clone(),
             "before Face Authentication D1",
         )?;
+        let emitter_ms = emitter_started.elapsed().as_millis();
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
+        let warmup_started = std::time::Instant::now();
         warm_up_stream(&self.device, &mut stream, progress)?;
+        let warmup_ms = warmup_started.elapsed().as_millis();
         // Rate establishment internally discards more frames than the metadata
         // ring can hold. Drain those records now, after the fill, so buffers are
         // requeued before the first frame a caller can observe.
-        fill_rate_then_drain_metadata(
+        let fill_started = std::time::Instant::now();
+        let fill_result = fill_rate_then_drain_metadata(
             || stream.fill_rate_evidence(),
             || {
                 if let Some(log) = meta.as_mut() {
                     log.drain();
                 }
             },
-        )
-        .map_err(|error| map_io(&self.device, error))?;
+        );
+        let fill_ms = fill_started.elapsed().as_millis();
+        irlume_common::dlog!(
+            "[capture-stage] ir-arm {}: alloc={alloc_ms}ms metadata={metadata_ms}ms \
+             emitter={emitter_ms}ms warmup(streamon+flush)={warmup_ms}ms rate-fill={fill_ms}ms",
+            self.device
+        );
+        fill_result.map_err(|error| map_io(&self.device, error))?;
         Ok(IrSession {
             cam: self,
             stream,
@@ -6462,6 +6530,12 @@ pub struct PairSample {
     /// diagnostic detail; deliberately NOT carried into the persisted
     /// ArmEvidence, whose schema stays untouched.
     pub continuity_facts: std::collections::BTreeMap<&'static str, usize>,
+    /// Per-fact counts of capture-level round failures (#606): an aggregate
+    /// count cannot say HOW a concurrent arm refused to stream. Rounds whose
+    /// leg errored at delivery are named here, and the map is mirrored into
+    /// the persisted ArmEvidence (additive, serde-defaulted) so a stored
+    /// verdict names its facts months later.
+    pub capture_failure_facts: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl PairSample {
@@ -7435,6 +7509,15 @@ fn qualification_arm(
     let requested_rounds = count(requested_rounds, "round")?;
     let completed_rounds = count(sample.rounds, "completed")?;
     let failed_rounds = count(sample.failed, "failure")?;
+    let capture_failure_facts = sample
+        .capture_failure_facts
+        .iter()
+        .map(|(fact, value)| {
+            u32::try_from(*value)
+                .map(|value| ((*fact).to_string(), value))
+                .map_err(|_| Error::Hardware("capture qualification fact count overflow".into()))
+        })
+        .collect::<std::result::Result<std::collections::BTreeMap<String, u32>, _>>()?;
     if !sample.total_ms.is_finite() || sample.total_ms < 0.0 || sample.total_ms > u64::MAX as f32 {
         return Err(Error::Hardware(
             "capture qualification elapsed time is invalid".into(),
@@ -7456,6 +7539,7 @@ fn qualification_arm(
         count(sample.arm_failures, "arm-failure")?,
         count(sample.capture_failures, "capture-failure")?,
         count(sample.rate_shortfall_failures, "rate-shortfall-failure")?,
+        capture_failure_facts,
         sample.rgb_mean,
         sample.ir_mean,
         sample.total_ms.round() as u64,
@@ -7555,6 +7639,17 @@ fn held_concurrent_arm<'d>(
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             accumulate(into, &mut continuity, &rgb, &ir, t0.elapsed(), context);
         }
+        // #606: the verdict names these facts only when the whole probe is
+        // conclusive, so a dark-scene inconclusive run used to leave the
+        // concurrent arm's failure mode unreadable. Say them when they
+        // happened, whatever the scene.
+        if !into.continuity_facts.is_empty() || !into.capture_failure_facts.is_empty() {
+            irlume_common::dlog!(
+                "[capture-stage] concurrent-arm facts: continuity={:?} capture={:?}",
+                into.continuity_facts,
+                into.capture_failure_facts
+            );
+        }
         Ok(())
     }
 }
@@ -7578,6 +7673,10 @@ fn record_concurrent_establishment_failure(
     );
     into.failed += rounds;
     into.capture_failures += rounds;
+    *into
+        .capture_failure_facts
+        .entry("rate-window-establishment")
+        .or_insert(0) += rounds;
 }
 
 /// [`measure_contention_with_progress`] over injected captures and an
@@ -7998,6 +8097,15 @@ fn accumulate(
             into.rate_shortfall_failures += 1;
         } else {
             into.capture_failures += 1;
+            // #606: open and arm failures are counted separately above, so a
+            // leg erroring here failed at delivery by construction. Name it:
+            // the count alone cannot distinguish this camera from one whose
+            // rounds die mid-stream for other reasons, and the stored verdict
+            // is all a future support reader has.
+            *into
+                .capture_failure_facts
+                .entry("stream-delivery-failure")
+                .or_insert(0) += 1;
         }
         return;
     };
@@ -11902,6 +12010,7 @@ mod tests {
                 capture_failures: failed,
                 rate_shortfall_failures: 0,
                 continuity_facts: Default::default(),
+                capture_failure_facts: Default::default(),
             };
             ContentionReport {
                 sequential: sample(seq),
@@ -12247,6 +12356,107 @@ mod tests {
             capture_qualification::AttemptOutcome::SequentialRequired(
                 capture_qualification::SequentialReason::DeliveredRateShortfall
             )
+        );
+    }
+
+    /// #606: an errored round names its failure fact. The typed rate bucket
+    /// stays separate, so the map's total always equals capture_failures.
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn capture_failure_facts_name_errored_rounds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rgb_calls = AtomicUsize::new(0);
+        let rgb = || {
+            let call = rgb_calls.fetch_add(1, Ordering::SeqCst);
+            if (2..4).contains(&call) {
+                Err(Error::Hardware(
+                    "/dev/video4: the camera never delivered".into(),
+                ))
+            } else {
+                Ok(frame(&[120; 4]))
+            }
+        };
+        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let report =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("errored concurrent rounds are a measurement, not a probe abort");
+        assert_eq!(report.concurrent.failed, 2);
+        assert_eq!(report.concurrent.capture_failures, 2);
+        assert_eq!(
+            report
+                .concurrent
+                .capture_failure_facts
+                .get("stream-delivery-failure"),
+            Some(&2),
+            "each errored round records the nameable delivery fact"
+        );
+        assert_eq!(
+            report
+                .concurrent
+                .capture_failure_facts
+                .values()
+                .sum::<usize>(),
+            report.concurrent.capture_failures,
+            "the facts account for every capture failure, nothing else"
+        );
+        assert_eq!(report.concurrent.rate_shortfall_failures, 0);
+    }
+
+    /// #606: a pair that cannot even establish its rate windows names that
+    /// fact, distinct from a round that died mid-arm.
+    #[test]
+    fn establishment_failure_names_its_fact() {
+        let mut sample = PairSample::default();
+        record_concurrent_establishment_failure(&mut sample, 6, &"synthetic refusal");
+        assert_eq!(sample.failed, 6);
+        assert_eq!(sample.capture_failures, 6);
+        assert_eq!(
+            sample
+                .capture_failure_facts
+                .get("rate-window-establishment"),
+            Some(&6)
+        );
+    }
+
+    /// #606: the fact map survives the conversion into the persisted
+    /// ArmEvidence and round-trips, so a stored verdict names its facts.
+    #[test]
+    fn qualification_arm_carries_capture_failure_facts() {
+        let mut sample = PairSample {
+            rounds: 6,
+            contract_rounds: 6,
+            rate_floor_rounds: 6,
+            continuous_rounds: 6,
+            active_ir_rounds: 6,
+            total_ms: 1_000.0,
+            ..Default::default()
+        };
+        sample
+            .capture_failure_facts
+            .insert("stream-delivery-failure", 6);
+        let arm = qualification_arm(&sample, 6).expect("valid arm");
+        let json = serde_json::to_string(&arm).unwrap();
+        assert!(
+            json.contains("\"stream-delivery-failure\":6"),
+            "the persisted form carries the fact: {json}"
+        );
+        let parsed: capture_qualification::ArmEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, arm);
+    }
+
+    /// The capture-stage trace line names every span with numbers only, so
+    /// the diagnostic-trace policy (never frames or embeddings) holds and the
+    /// format stays stable for journal tooling.
+    #[test]
+    fn capture_stage_summary_names_every_span_with_numbers_only() {
+        let line = capture_stage_summary("ir", "/dev/video6", 12, 34, 5678);
+        assert_eq!(
+            line,
+            "[capture-stage] ir /dev/video6: open=12ms arm=34ms capture(warmup+fill+burst)=5678ms"
+        );
+        assert!(
+            !line.contains('\u{2014}'),
+            "no em dashes in trace vocabulary"
         );
     }
 

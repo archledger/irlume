@@ -1,6 +1,6 @@
 # ADR-0018: Owner opt-in waiver of the privileged typed confirmation
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-08-29
 **Amends:**
 [ADR-0010](0010-conventional-face-intent-confirmation.md),

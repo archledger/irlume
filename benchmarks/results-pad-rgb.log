@@ -1,0 +1,841 @@
+[ WARN:0@0.044] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+[casia] 500/123533 frames
+[casia] 1000/123533 frames
+[casia] 1500/123533 frames
+[casia] 2000/123533 frames
+[casia] 2500/123533 frames
+[casia] 3000/123533 frames
+[casia] 3500/123533 frames
+[casia] 4000/123533 frames
+[casia] 4500/123533 frames
+[casia] 5000/123533 frames
+[casia] 5500/123533 frames
+[casia] 6000/123533 frames
+[casia] 6500/123533 frames
+[casia] 7000/123533 frames
+[casia] 7500/123533 frames
+[casia] 8000/123533 frames
+[casia] 8500/123533 frames
+[casia] 9000/123533 frames
+[casia] 9500/123533 frames
+[casia] 10000/123533 frames
+[casia] 10500/123533 frames
+[casia] 11000/123533 frames
+[casia] 11500/123533 frames
+[casia] 12000/123533 frames
+[casia] 12500/123533 frames
+[casia] 13000/123533 frames
+[casia] 13500/123533 frames
+[casia] 14000/123533 frames
+[casia] 14500/123533 frames
+[casia] 15000/123533 frames
+[casia] 15500/123533 frames
+[casia] 16000/123533 frames
+[casia] 16500/123533 frames
+[casia] 17000/123533 frames
+[casia] 17500/123533 frames
+[casia] 18000/123533 frames
+[casia] 18500/123533 frames
+[casia] 19000/123533 frames
+[casia] 19500/123533 frames
+[casia] 20000/123533 frames
+[casia] 20500/123533 frames
+[casia] 21000/123533 frames
+[casia] 21500/123533 frames
+[casia] 22000/123533 frames
+[casia] 22500/123533 frames
+[casia] 23000/123533 frames
+[casia] 23500/123533 frames
+[casia] 24000/123533 frames
+[casia] 24500/123533 frames
+[casia] 25000/123533 frames
+[casia] 25500/123533 frames
+[casia] 26000/123533 frames
+[casia] 26500/123533 frames
+[casia] 27000/123533 frames
+[casia] 27500/123533 frames
+[casia] 28000/123533 frames
+[casia] 28500/123533 frames
+[casia] 29000/123533 frames
+[casia] 29500/123533 frames
+[casia] 30000/123533 frames
+[casia] 30500/123533 frames
+[casia] 31000/123533 frames
+[casia] 31500/123533 frames
+[casia] 32000/123533 frames
+[casia] 32500/123533 frames
+[casia] 33000/123533 frames
+[casia] 33500/123533 frames
+[casia] 34000/123533 frames
+[casia] 34500/123533 frames
+[casia] 35000/123533 frames
+[casia] 35500/123533 frames
+[casia] 36000/123533 frames
+[casia] 36500/123533 frames
+[casia] 37000/123533 frames
+[casia] 37500/123533 frames
+[casia] 38000/123533 frames
+[casia] 38500/123533 frames
+[casia] 39000/123533 frames
+[casia] 39500/123533 frames
+[casia] 40000/123533 frames
+[casia] 40500/123533 frames
+[casia] 41000/123533 frames
+[casia] 41500/123533 frames
+[casia] 42000/123533 frames
+[casia] 42500/123533 frames
+[casia] 43000/123533 frames
+[casia] 43500/123533 frames
+[casia] 44000/123533 frames
+[casia] 44500/123533 frames
+[casia] 45000/123533 frames
+[casia] 45500/123533 frames
+[casia] 46000/123533 frames
+[casia] 46500/123533 frames
+[casia] 47000/123533 frames
+[casia] 47500/123533 frames
+[casia] 48000/123533 frames
+[casia] 48500/123533 frames
+[casia] 49000/123533 frames
+[casia] 49500/123533 frames
+[casia] 50000/123533 frames
+[casia] 50500/123533 frames
+[casia] 51000/123533 frames
+[casia] 51500/123533 frames
+[casia] 52000/123533 frames
+[casia] 52500/123533 frames
+[casia] 53000/123533 frames
+[casia] 53500/123533 frames
+[casia] 54000/123533 frames
+[casia] 54500/123533 frames
+[casia] 55000/123533 frames
+[casia] 55500/123533 frames
+[casia] 56000/123533 frames
+[casia] 56500/123533 frames
+[casia] 57000/123533 frames
+[casia] 57500/123533 frames
+[casia] 58000/123533 frames
+[casia] 58500/123533 frames
+[casia] 59000/123533 frames
+[casia] 59500/123533 frames
+[casia] 60000/123533 frames
+[casia] 60500/123533 frames
+[casia] 61000/123533 frames
+[casia] 61500/123533 frames
+[casia] 62000/123533 frames
+[casia] 62500/123533 frames
+[casia] 63000/123533 frames
+[casia] 63500/123533 frames
+[casia] 64000/123533 frames
+[casia] 64500/123533 frames
+[casia] 65000/123533 frames
+[casia] 65500/123533 frames
+[casia] 66000/123533 frames
+[casia] 66500/123533 frames
+[casia] 67000/123533 frames
+[casia] 67500/123533 frames
+[casia] 68000/123533 frames
+[casia] 68500/123533 frames
+[casia] 69000/123533 frames
+[casia] 69500/123533 frames
+[casia] 70000/123533 frames
+[casia] 70500/123533 frames
+[casia] 71000/123533 frames
+[casia] 71500/123533 frames
+[casia] 72000/123533 frames
+[casia] 72500/123533 frames
+[casia] 73000/123533 frames
+[casia] 73500/123533 frames
+[casia] 74000/123533 frames
+[casia] 74500/123533 frames
+[casia] 75000/123533 frames
+[casia] 75500/123533 frames
+[casia] 76000/123533 frames
+[casia] 76500/123533 frames
+[casia] 77000/123533 frames
+[casia] 77500/123533 frames
+[casia] 78000/123533 frames
+[casia] 78500/123533 frames
+[casia] 79000/123533 frames
+[casia] 79500/123533 frames
+[casia] 80000/123533 frames
+[casia] 80500/123533 frames
+[casia] 81000/123533 frames
+[casia] 81500/123533 frames
+[casia] 82000/123533 frames
+[casia] 82500/123533 frames
+[casia] 83000/123533 frames
+[casia] 83500/123533 frames
+[casia] 84000/123533 frames
+[casia] 84500/123533 frames
+[casia] 85000/123533 frames
+[casia] 85500/123533 frames
+[casia] 86000/123533 frames
+[casia] 86500/123533 frames
+[casia] 87000/123533 frames
+[casia] 87500/123533 frames
+[casia] 88000/123533 frames
+[casia] 88500/123533 frames
+[casia] 89000/123533 frames
+[casia] 89500/123533 frames
+[casia] 90000/123533 frames
+[casia] 90500/123533 frames
+[casia] 91000/123533 frames
+[casia] 91500/123533 frames
+[casia] 92000/123533 frames
+[casia] 92500/123533 frames
+[casia] 93000/123533 frames
+[casia] 93500/123533 frames
+[casia] 94000/123533 frames
+[casia] 94500/123533 frames
+[casia] 95000/123533 frames
+[casia] 95500/123533 frames
+[casia] 96000/123533 frames
+[casia] 96500/123533 frames
+[casia] 97000/123533 frames
+[casia] 97500/123533 frames
+[casia] 98000/123533 frames
+[casia] 98500/123533 frames
+[casia] 99000/123533 frames
+[casia] 99500/123533 frames
+[casia] 100000/123533 frames
+[casia] 100500/123533 frames
+[casia] 101000/123533 frames
+[casia] 101500/123533 frames
+[casia] 102000/123533 frames
+[casia] 102500/123533 frames
+[casia] 103000/123533 frames
+[casia] 103500/123533 frames
+[casia] 104000/123533 frames
+[casia] 104500/123533 frames
+[casia] 105000/123533 frames
+[casia] 105500/123533 frames
+[casia] 106000/123533 frames
+[casia] 106500/123533 frames
+[casia] 107000/123533 frames
+[casia] 107500/123533 frames
+[casia] 108000/123533 frames
+[casia] 108500/123533 frames
+[casia] 109000/123533 frames
+[casia] 109500/123533 frames
+[casia] 110000/123533 frames
+[casia] 110500/123533 frames
+[casia] 111000/123533 frames
+[casia] 111500/123533 frames
+[casia] 112000/123533 frames
+[casia] 112500/123533 frames
+[casia] 113000/123533 frames
+[casia] 113500/123533 frames
+[casia] 114000/123533 frames
+[casia] 114500/123533 frames
+[casia] 115000/123533 frames
+[casia] 115500/123533 frames
+[casia] 116000/123533 frames
+[casia] 116500/123533 frames
+[casia] 117000/123533 frames
+[casia] 117500/123533 frames
+[casia] 118000/123533 frames
+[casia] 118500/123533 frames
+[casia] 119000/123533 frames
+[casia] 119500/123533 frames
+[casia] 120000/123533 frames
+[casia] 120500/123533 frames
+[casia] 121000/123533 frames
+[casia] 121500/123533 frames
+[casia] 122000/123533 frames
+[casia] 122500/123533 frames
+[casia] 123000/123533 frames
+[casia] 123500/123533 frames
+{"images": 123533, "scored": 123533, "detected": 123214, "apcer": 0.4701160802663547, "bpcer": 0.1412914691943128, "auc": 0.6099671527404322, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.18000539908215604, "bpcer": 0.9999012638230648}, {"threshold": 0.45, "apcer": 0.33467110591199495, "bpcer": 0.7966034755134281}, {"threshold": 0.5, "apcer": 0.3916854134797084, "bpcer": 0.3570300157977883}, {"threshold": 0.55, "apcer": 0.4701160802663547, "bpcer": 0.1412914691943128}, {"threshold": 0.6, "apcer": 0.6367497525420679, "bpcer": 0.011749605055292258}, {"threshold": 0.7, "apcer": 0.9739224331863583, "bpcer": 0.0}], "per_split": {"train": {"images": 57747, "detected": 57521, "apcer": 0.5328728707935189, "bpcer": 0.11331474564679889, "auc": 0.5640491351395157, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.19300477773161612, "bpcer": 1.0}, {"threshold": 0.45, "apcer": 0.3763502285002077, "bpcer": 0.7461728654847704}, {"threshold": 0.5, "apcer": 0.4437058579144163, "bpcer": 0.3983902362039034}, {"threshold": 0.55, "apcer": 0.5328728707935189, "bpcer": 0.11331474564679889}, {"threshold": 0.6, "apcer": 0.6946925633568758, "bpcer": 0.010679151980640749}, {"threshold": 0.7, "apcer": 0.9929891981719984, "bpcer": 0.0}]}, "test": {"images": 65786, "detected": 65693, "apcer": 0.4701160802663547, "bpcer": 0.1412914691943128, "auc": 0.6099671527404322, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.18000539908215604, "bpcer": 0.9999012638230648}, {"threshold": 0.45, "apcer": 0.33467110591199495, "bpcer": 0.7966034755134281}, {"threshold": 0.5, "apcer": 0.3916854134797084, "bpcer": 0.3570300157977883}, {"threshold": 0.55, "apcer": 0.4701160802663547, "bpcer": 0.1412914691943128}, {"threshold": 0.6, "apcer": 0.6367497525420679, "bpcer": 0.011749605055292258}, {"threshold": 0.7, "apcer": 0.9739224331863583, "bpcer": 0.0}]}}, "per_condition": {"train_live": {"images": 19011, "detected": 19009, "n_scores": 19009}, "train_spoof": {"images": 38736, "detected": 38512, "n_scores": 38512}, "test_live": {"images": 10128, "detected": 10128, "n_scores": 10128}, "test_spoof": {"images": 55658, "detected": 55565, "n_scores": 55565}}, "wall_s": 2126.1}
+merged casia_fasd into /home/archledger/irlume-bench/benchmarks/results-pad-rgb.json
+[ WARN:0@0.054] global net_impl_backend.cpp:345 setPreferableTarget Targets are not supported by the new graph engine for now
+{"clips": 703, "images": 1701, "scored": 1701, "detected": 1701, "voted": {"apcer": 0.8416666666666667, "bpcer": 0.0, "auc": 0.9311386459345643, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.011111111111111112, "bpcer": 0.673469387755102}, {"threshold": 0.45, "apcer": 0.2972222222222222, "bpcer": 0.026239067055393587}, {"threshold": 0.5, "apcer": 0.5944444444444444, "bpcer": 0.0058309037900874635}, {"threshold": 0.55, "apcer": 0.8416666666666667, "bpcer": 0.0}, {"threshold": 0.6, "apcer": 0.9527777777777777, "bpcer": 0.0}, {"threshold": 0.7, "apcer": 1.0, "bpcer": 0.0}]}, "frame_level": {"apcer": 0.7569955817378498, "bpcer": 0.0, "auc": 0.8950888160860809, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.04050073637702504, "bpcer": 0.673469387755102}, {"threshold": 0.45, "apcer": 0.3431516936671576, "bpcer": 0.026239067055393587}, {"threshold": 0.5, "apcer": 0.5743740795287187, "bpcer": 0.0058309037900874635}, {"threshold": 0.55, "apcer": 0.7569955817378498, "bpcer": 0.0}, {"threshold": 0.6, "apcer": 0.9013254786450663, "bpcer": 0.0}, {"threshold": 0.7, "apcer": 0.9977908689248896, "bpcer": 0.0}]}, "wall_s": 40.4}
+merged oulu_npu into /home/archledger/irlume-bench/benchmarks/results-pad-rgb.json
+[celeba] shard 0 done: 911 scored, 0 skipped, 12.3s
+[celeba] shard 1 done: 911 scored, 0 skipped, 11.2s
+[celeba] shard 2 done: 911 scored, 0 skipped, 10.6s
+[celeba] shard 3 done: 911 scored, 0 skipped, 12.5s
+[celeba] shard 4 done: 911 scored, 0 skipped, 10.6s
+[celeba] shard 5 done: 911 scored, 0 skipped, 10.8s
+[celeba] shard 6 done: 911 scored, 0 skipped, 10.9s
+[celeba] shard 7 done: 911 scored, 0 skipped, 12.1s
+[celeba] shard 8 done: 911 scored, 0 skipped, 11.4s
+[celeba] shard 9 done: 911 scored, 0 skipped, 12.4s
+[celeba] shard 10 done: 911 scored, 0 skipped, 10.9s
+[celeba] shard 11 done: 911 scored, 0 skipped, 11.0s
+[celeba] shard 12 done: 911 scored, 0 skipped, 10.2s
+[celeba] shard 13 done: 911 scored, 0 skipped, 11.9s
+[celeba] shard 14 done: 911 scored, 0 skipped, 12.4s
+[celeba] shard 15 done: 911 scored, 0 skipped, 10.9s
+[celeba] shard 16 done: 911 scored, 0 skipped, 10.5s
+[celeba] shard 17 done: 911 scored, 0 skipped, 11.0s
+[celeba] shard 18 done: 911 scored, 0 skipped, 12.0s
+[celeba] shard 19 done: 911 scored, 0 skipped, 12.1s
+[celeba] shard 20 done: 911 scored, 0 skipped, 9.8s
+[celeba] shard 21 done: 911 scored, 0 skipped, 11.1s
+[celeba] shard 22 done: 911 scored, 0 skipped, 11.1s
+[celeba] shard 23 done: 911 scored, 0 skipped, 10.2s
+[celeba] shard 24 done: 911 scored, 0 skipped, 10.4s
+[celeba] shard 25 done: 911 scored, 0 skipped, 10.7s
+[celeba] shard 26 done: 911 scored, 0 skipped, 10.9s
+[celeba] shard 27 done: 911 scored, 0 skipped, 11.1s
+[celeba] shard 28 done: 911 scored, 0 skipped, 11.8s
+[celeba] shard 29 done: 911 scored, 0 skipped, 10.3s
+[celeba] shard 30 done: 911 scored, 0 skipped, 10.7s
+[celeba] shard 31 done: 911 scored, 0 skipped, 10.3s
+[celeba] shard 32 done: 911 scored, 0 skipped, 11.6s
+[celeba] shard 33 done: 911 scored, 0 skipped, 10.8s
+[celeba] shard 34 done: 911 scored, 0 skipped, 11.0s
+[celeba] shard 35 done: 911 scored, 0 skipped, 10.7s
+[celeba] shard 36 done: 911 scored, 0 skipped, 10.8s
+[celeba] shard 37 done: 911 scored, 0 skipped, 10.6s
+[celeba] shard 38 done: 911 scored, 0 skipped, 11.6s
+[celeba] shard 39 done: 911 scored, 0 skipped, 10.8s
+[celeba] shard 40 done: 911 scored, 0 skipped, 11.8s
+[celeba] shard 41 done: 910 scored, 0 skipped, 10.1s
+[celeba] shard 42 done: 910 scored, 0 skipped, 11.2s
+[celeba] shard 43 done: 910 scored, 0 skipped, 11.3s
+[celeba] shard 44 done: 910 scored, 0 skipped, 10.6s
+[celeba] shard 45 done: 910 scored, 0 skipped, 12.0s
+[celeba] shard 46 done: 910 scored, 0 skipped, 10.6s
+[celeba] shard 47 done: 910 scored, 0 skipped, 10.5s
+[celeba] shard 48 done: 910 scored, 0 skipped, 11.4s
+[celeba] shard 49 done: 910 scored, 0 skipped, 10.2s
+[celeba] shard 50 done: 910 scored, 0 skipped, 11.9s
+[celeba] shard 51 done: 910 scored, 0 skipped, 10.6s
+[celeba] shard 52 done: 910 scored, 0 skipped, 10.9s
+[celeba] shard 53 done: 910 scored, 0 skipped, 10.5s
+[celeba] shard 54 done: 910 scored, 0 skipped, 11.5s
+[celeba] shard 55 done: 910 scored, 0 skipped, 11.9s
+[celeba] shard 56 done: 910 scored, 0 skipped, 10.4s
+[celeba] shard 57 done: 910 scored, 0 skipped, 11.2s
+[celeba] shard 58 done: 910 scored, 0 skipped, 10.5s
+[celeba] shard 59 done: 910 scored, 0 skipped, 11.1s
+[celeba] shard 60 done: 910 scored, 0 skipped, 10.8s
+[celeba] shard 61 done: 910 scored, 0 skipped, 11.3s
+[celeba] shard 62 done: 910 scored, 0 skipped, 10.6s
+[celeba] shard 63 done: 910 scored, 0 skipped, 11.2s
+[celeba] shard 64 done: 910 scored, 0 skipped, 11.4s
+[celeba 65/167] 1024/4516 rows
+[celeba 65/167] 2048/4516 rows
+[celeba 65/167] 3072/4516 rows
+[celeba 65/167] 4096/4516 rows
+[celeba] shard 65 done: 4516 scored, 0 skipped, 37.5s
+[celeba 66/167] 1024/4516 rows
+[celeba 66/167] 2048/4516 rows
+[celeba 66/167] 3072/4516 rows
+[celeba 66/167] 4096/4516 rows
+[celeba] shard 66 done: 4516 scored, 0 skipped, 37.6s
+[celeba 67/167] 1024/4516 rows
+[celeba 67/167] 2048/4516 rows
+[celeba 67/167] 3072/4516 rows
+[celeba 67/167] 4096/4516 rows
+[celeba] shard 67 done: 4516 scored, 0 skipped, 37.4s
+[celeba 68/167] 1024/4516 rows
+[celeba 68/167] 2048/4516 rows
+[celeba 68/167] 3072/4516 rows
+[celeba 68/167] 4096/4516 rows
+[celeba] shard 68 done: 4516 scored, 0 skipped, 38.4s
+[celeba 69/167] 1024/4516 rows
+[celeba 69/167] 2048/4516 rows
+[celeba 69/167] 3072/4516 rows
+[celeba 69/167] 4096/4516 rows
+[celeba] shard 69 done: 4516 scored, 0 skipped, 37.4s
+[celeba 70/167] 1024/4516 rows
+[celeba 70/167] 2048/4516 rows
+[celeba 70/167] 3072/4516 rows
+[celeba 70/167] 4096/4516 rows
+[celeba] shard 70 done: 4516 scored, 0 skipped, 37.6s
+[celeba 71/167] 1024/4516 rows
+[celeba 71/167] 2048/4516 rows
+[celeba 71/167] 3072/4516 rows
+[celeba 71/167] 4096/4516 rows
+[celeba] shard 71 done: 4516 scored, 0 skipped, 38.3s
+[celeba 72/167] 1024/4516 rows
+[celeba 72/167] 2048/4516 rows
+[celeba 72/167] 3072/4516 rows
+[celeba 72/167] 4096/4516 rows
+[celeba] shard 72 done: 4516 scored, 0 skipped, 37.8s
+[celeba 73/167] 1024/4516 rows
+[celeba 73/167] 2048/4516 rows
+[celeba 73/167] 3072/4516 rows
+[celeba 73/167] 4096/4516 rows
+[celeba] shard 73 done: 4516 scored, 0 skipped, 37.7s
+[celeba 74/167] 1024/4516 rows
+[celeba 74/167] 2048/4516 rows
+[celeba 74/167] 3072/4516 rows
+[celeba 74/167] 4096/4516 rows
+[celeba] shard 74 done: 4516 scored, 0 skipped, 37.6s
+[celeba 75/167] 1024/4516 rows
+[celeba 75/167] 2048/4516 rows
+[celeba 75/167] 3072/4516 rows
+[celeba 75/167] 4096/4516 rows
+[celeba] shard 75 done: 4516 scored, 0 skipped, 38.6s
+[celeba 76/167] 1024/4516 rows
+[celeba 76/167] 2048/4516 rows
+[celeba 76/167] 3072/4516 rows
+[celeba 76/167] 4096/4516 rows
+[celeba] shard 76 done: 4516 scored, 0 skipped, 38.0s
+[celeba 77/167] 1024/4516 rows
+[celeba 77/167] 2048/4516 rows
+[celeba 77/167] 3072/4516 rows
+[celeba 77/167] 4096/4516 rows
+[celeba] shard 77 done: 4516 scored, 0 skipped, 37.3s
+[celeba 78/167] 1024/4516 rows
+[celeba 78/167] 2048/4516 rows
+[celeba 78/167] 3072/4516 rows
+[celeba 78/167] 4096/4516 rows
+[celeba] shard 78 done: 4516 scored, 0 skipped, 37.7s
+[celeba 79/167] 1024/4516 rows
+[celeba 79/167] 2048/4516 rows
+[celeba 79/167] 3072/4516 rows
+[celeba 79/167] 4096/4516 rows
+[celeba] shard 79 done: 4516 scored, 0 skipped, 37.4s
+[celeba 80/167] 1024/4516 rows
+[celeba 80/167] 2048/4516 rows
+[celeba 80/167] 3072/4516 rows
+[celeba 80/167] 4096/4516 rows
+[celeba] shard 80 done: 4516 scored, 0 skipped, 37.7s
+[celeba 81/167] 1024/4516 rows
+[celeba 81/167] 2048/4516 rows
+[celeba 81/167] 3072/4516 rows
+[celeba 81/167] 4096/4516 rows
+[celeba] shard 81 done: 4516 scored, 0 skipped, 37.7s
+[celeba 82/167] 1024/4516 rows
+[celeba 82/167] 2048/4516 rows
+[celeba 82/167] 3072/4516 rows
+[celeba 82/167] 4096/4516 rows
+[celeba] shard 82 done: 4516 scored, 0 skipped, 37.2s
+[celeba 83/167] 1024/4516 rows
+[celeba 83/167] 2048/4516 rows
+[celeba 83/167] 3072/4516 rows
+[celeba 83/167] 4096/4516 rows
+[celeba] shard 83 done: 4516 scored, 0 skipped, 37.7s
+[celeba 84/167] 1024/4516 rows
+[celeba 84/167] 2048/4516 rows
+[celeba 84/167] 3072/4516 rows
+[celeba 84/167] 4096/4516 rows
+[celeba] shard 84 done: 4516 scored, 0 skipped, 37.9s
+[celeba 85/167] 1024/4516 rows
+[celeba 85/167] 2048/4516 rows
+[celeba 85/167] 3072/4516 rows
+[celeba 85/167] 4096/4516 rows
+[celeba] shard 85 done: 4516 scored, 0 skipped, 37.5s
+[celeba 86/167] 1024/4516 rows
+[celeba 86/167] 2048/4516 rows
+[celeba 86/167] 3072/4516 rows
+[celeba 86/167] 4096/4516 rows
+[celeba] shard 86 done: 4516 scored, 0 skipped, 36.9s
+[celeba 87/167] 1024/4516 rows
+[celeba 87/167] 2048/4516 rows
+[celeba 87/167] 3072/4516 rows
+[celeba 87/167] 4096/4516 rows
+[celeba] shard 87 done: 4516 scored, 0 skipped, 37.7s
+[celeba 88/167] 1024/4516 rows
+[celeba 88/167] 2048/4516 rows
+[celeba 88/167] 3072/4516 rows
+[celeba 88/167] 4096/4516 rows
+[celeba] shard 88 done: 4516 scored, 0 skipped, 37.6s
+[celeba 89/167] 1024/4516 rows
+[celeba 89/167] 2048/4516 rows
+[celeba 89/167] 3072/4516 rows
+[celeba 89/167] 4096/4516 rows
+[celeba] shard 89 done: 4516 scored, 0 skipped, 37.5s
+[celeba 90/167] 1024/4516 rows
+[celeba 90/167] 2048/4516 rows
+[celeba 90/167] 3072/4516 rows
+[celeba 90/167] 4096/4516 rows
+[celeba] shard 90 done: 4516 scored, 0 skipped, 37.4s
+[celeba 91/167] 1024/4516 rows
+[celeba 91/167] 2048/4516 rows
+[celeba 91/167] 3072/4516 rows
+[celeba 91/167] 4096/4516 rows
+[celeba] shard 91 done: 4516 scored, 0 skipped, 36.8s
+[celeba 92/167] 1024/4516 rows
+[celeba 92/167] 2048/4516 rows
+[celeba 92/167] 3072/4516 rows
+[celeba 92/167] 4096/4516 rows
+[celeba] shard 92 done: 4516 scored, 0 skipped, 37.6s
+[celeba 93/167] 1024/4516 rows
+[celeba 93/167] 2048/4516 rows
+[celeba 93/167] 3072/4516 rows
+[celeba 93/167] 4096/4516 rows
+[celeba] shard 93 done: 4516 scored, 0 skipped, 38.3s
+[celeba 94/167] 1024/4516 rows
+[celeba 94/167] 2048/4516 rows
+[celeba 94/167] 3072/4516 rows
+[celeba 94/167] 4096/4516 rows
+[celeba] shard 94 done: 4516 scored, 0 skipped, 37.8s
+[celeba 95/167] 1024/4516 rows
+[celeba 95/167] 2048/4516 rows
+[celeba 95/167] 3072/4516 rows
+[celeba 95/167] 4096/4516 rows
+[celeba] shard 95 done: 4516 scored, 0 skipped, 37.7s
+[celeba 96/167] 1024/4516 rows
+[celeba 96/167] 2048/4516 rows
+[celeba 96/167] 3072/4516 rows
+[celeba 96/167] 4096/4516 rows
+[celeba] shard 96 done: 4516 scored, 0 skipped, 36.9s
+[celeba 97/167] 1024/4516 rows
+[celeba 97/167] 2048/4516 rows
+[celeba 97/167] 3072/4516 rows
+[celeba 97/167] 4096/4516 rows
+[celeba] shard 97 done: 4516 scored, 0 skipped, 37.9s
+[celeba 98/167] 1024/4516 rows
+[celeba 98/167] 2048/4516 rows
+[celeba 98/167] 3072/4516 rows
+[celeba 98/167] 4096/4516 rows
+[celeba] shard 98 done: 4516 scored, 0 skipped, 37.7s
+[celeba 99/167] 1024/4516 rows
+[celeba 99/167] 2048/4516 rows
+[celeba 99/167] 3072/4516 rows
+[celeba 99/167] 4096/4516 rows
+[celeba] shard 99 done: 4516 scored, 0 skipped, 37.4s
+[celeba 100/167] 1024/4516 rows
+[celeba 100/167] 2048/4516 rows
+[celeba 100/167] 3072/4516 rows
+[celeba 100/167] 4096/4516 rows
+[celeba] shard 100 done: 4516 scored, 0 skipped, 37.5s
+[celeba 101/167] 1024/4516 rows
+[celeba 101/167] 2048/4516 rows
+[celeba 101/167] 3072/4516 rows
+[celeba 101/167] 4096/4516 rows
+[celeba] shard 101 done: 4516 scored, 0 skipped, 38.4s
+[celeba 102/167] 1024/4516 rows
+[celeba 102/167] 2048/4516 rows
+[celeba 102/167] 3072/4516 rows
+[celeba 102/167] 4096/4516 rows
+[celeba] shard 102 done: 4516 scored, 0 skipped, 37.4s
+[celeba 103/167] 1024/4516 rows
+[celeba 103/167] 2048/4516 rows
+[celeba 103/167] 3072/4516 rows
+[celeba 103/167] 4096/4516 rows
+[celeba] shard 103 done: 4516 scored, 0 skipped, 38.2s
+[celeba 104/167] 1024/4516 rows
+[celeba 104/167] 2048/4516 rows
+[celeba 104/167] 3072/4516 rows
+[celeba 104/167] 4096/4516 rows
+[celeba] shard 104 done: 4516 scored, 0 skipped, 37.1s
+[celeba 105/167] 1024/4515 rows
+[celeba 105/167] 2048/4515 rows
+[celeba 105/167] 3072/4515 rows
+[celeba 105/167] 4096/4515 rows
+[celeba] shard 105 done: 4515 scored, 0 skipped, 37.3s
+[celeba 106/167] 1024/4515 rows
+[celeba 106/167] 2048/4515 rows
+[celeba 106/167] 3072/4515 rows
+[celeba 106/167] 4096/4515 rows
+[celeba] shard 106 done: 4515 scored, 0 skipped, 38.2s
+[celeba 107/167] 1024/4515 rows
+[celeba 107/167] 2048/4515 rows
+[celeba 107/167] 3072/4515 rows
+[celeba 107/167] 4096/4515 rows
+[celeba] shard 107 done: 4515 scored, 0 skipped, 37.8s
+[celeba 108/167] 1024/4515 rows
+[celeba 108/167] 2048/4515 rows
+[celeba 108/167] 3072/4515 rows
+[celeba 108/167] 4096/4515 rows
+[celeba] shard 108 done: 4515 scored, 0 skipped, 37.2s
+[celeba 109/167] 1024/4515 rows
+[celeba 109/167] 2048/4515 rows
+[celeba 109/167] 3072/4515 rows
+[celeba 109/167] 4096/4515 rows
+[celeba] shard 109 done: 4515 scored, 0 skipped, 37.9s
+[celeba 110/167] 1024/4515 rows
+[celeba 110/167] 2048/4515 rows
+[celeba 110/167] 3072/4515 rows
+[celeba 110/167] 4096/4515 rows
+[celeba] shard 110 done: 4515 scored, 0 skipped, 37.2s
+[celeba 111/167] 1024/4515 rows
+[celeba 111/167] 2048/4515 rows
+[celeba 111/167] 3072/4515 rows
+[celeba 111/167] 4096/4515 rows
+[celeba] shard 111 done: 4515 scored, 0 skipped, 37.4s
+[celeba 112/167] 1024/4515 rows
+[celeba 112/167] 2048/4515 rows
+[celeba 112/167] 3072/4515 rows
+[celeba 112/167] 4096/4515 rows
+[celeba] shard 112 done: 4515 scored, 0 skipped, 37.8s
+[celeba 113/167] 1024/4515 rows
+[celeba 113/167] 2048/4515 rows
+[celeba 113/167] 3072/4515 rows
+[celeba 113/167] 4096/4515 rows
+[celeba] shard 113 done: 4515 scored, 0 skipped, 37.3s
+[celeba 114/167] 1024/4515 rows
+[celeba 114/167] 2048/4515 rows
+[celeba 114/167] 3072/4515 rows
+[celeba 114/167] 4096/4515 rows
+[celeba] shard 114 done: 4515 scored, 0 skipped, 37.7s
+[celeba 115/167] 1024/4515 rows
+[celeba 115/167] 2048/4515 rows
+[celeba 115/167] 3072/4515 rows
+[celeba 115/167] 4096/4515 rows
+[celeba] shard 115 done: 4515 scored, 0 skipped, 37.7s
+[celeba 116/167] 1024/4515 rows
+[celeba 116/167] 2048/4515 rows
+[celeba 116/167] 3072/4515 rows
+[celeba 116/167] 4096/4515 rows
+[celeba] shard 116 done: 4515 scored, 0 skipped, 37.5s
+[celeba 117/167] 1024/4515 rows
+[celeba 117/167] 2048/4515 rows
+[celeba 117/167] 3072/4515 rows
+[celeba 117/167] 4096/4515 rows
+[celeba] shard 117 done: 4515 scored, 0 skipped, 37.4s
+[celeba 118/167] 1024/4515 rows
+[celeba 118/167] 2048/4515 rows
+[celeba 118/167] 3072/4515 rows
+[celeba 118/167] 4096/4515 rows
+[celeba] shard 118 done: 4515 scored, 0 skipped, 37.1s
+[celeba 119/167] 1024/4515 rows
+[celeba 119/167] 2048/4515 rows
+[celeba 119/167] 3072/4515 rows
+[celeba 119/167] 4096/4515 rows
+[celeba] shard 119 done: 4515 scored, 0 skipped, 38.2s
+[celeba 120/167] 1024/4515 rows
+[celeba 120/167] 2048/4515 rows
+[celeba 120/167] 3072/4515 rows
+[celeba 120/167] 4096/4515 rows
+[celeba] shard 120 done: 4515 scored, 0 skipped, 37.1s
+[celeba 121/167] 1024/4515 rows
+[celeba 121/167] 2048/4515 rows
+[celeba 121/167] 3072/4515 rows
+[celeba 121/167] 4096/4515 rows
+[celeba] shard 121 done: 4515 scored, 0 skipped, 37.1s
+[celeba 122/167] 1024/4515 rows
+[celeba 122/167] 2048/4515 rows
+[celeba 122/167] 3072/4515 rows
+[celeba 122/167] 4096/4515 rows
+[celeba] shard 122 done: 4515 scored, 0 skipped, 38.4s
+[celeba 123/167] 1024/4515 rows
+[celeba 123/167] 2048/4515 rows
+[celeba 123/167] 3072/4515 rows
+[celeba 123/167] 4096/4515 rows
+[celeba] shard 123 done: 4515 scored, 0 skipped, 37.3s
+[celeba 124/167] 1024/4515 rows
+[celeba 124/167] 2048/4515 rows
+[celeba 124/167] 3072/4515 rows
+[celeba 124/167] 4096/4515 rows
+[celeba] shard 124 done: 4515 scored, 0 skipped, 37.8s
+[celeba 125/167] 1024/4515 rows
+[celeba 125/167] 2048/4515 rows
+[celeba 125/167] 3072/4515 rows
+[celeba 125/167] 4096/4515 rows
+[celeba] shard 125 done: 4515 scored, 0 skipped, 37.8s
+[celeba 126/167] 1024/4515 rows
+[celeba 126/167] 2048/4515 rows
+[celeba 126/167] 3072/4515 rows
+[celeba 126/167] 4096/4515 rows
+[celeba] shard 126 done: 4515 scored, 0 skipped, 37.1s
+[celeba 127/167] 1024/4515 rows
+[celeba 127/167] 2048/4515 rows
+[celeba 127/167] 3072/4515 rows
+[celeba 127/167] 4096/4515 rows
+[celeba] shard 127 done: 4515 scored, 0 skipped, 38.1s
+[celeba 128/167] 1024/4515 rows
+[celeba 128/167] 2048/4515 rows
+[celeba 128/167] 3072/4515 rows
+[celeba 128/167] 4096/4515 rows
+[celeba] shard 128 done: 4515 scored, 0 skipped, 38.2s
+[celeba 129/167] 1024/4515 rows
+[celeba 129/167] 2048/4515 rows
+[celeba 129/167] 3072/4515 rows
+[celeba 129/167] 4096/4515 rows
+[celeba] shard 129 done: 4515 scored, 0 skipped, 37.4s
+[celeba 130/167] 1024/4515 rows
+[celeba 130/167] 2048/4515 rows
+[celeba 130/167] 3072/4515 rows
+[celeba 130/167] 4096/4515 rows
+[celeba] shard 130 done: 4515 scored, 0 skipped, 37.5s
+[celeba 131/167] 1024/4515 rows
+[celeba 131/167] 2048/4515 rows
+[celeba 131/167] 3072/4515 rows
+[celeba 131/167] 4096/4515 rows
+[celeba] shard 131 done: 4515 scored, 0 skipped, 37.7s
+[celeba 132/167] 1024/4515 rows
+[celeba 132/167] 2048/4515 rows
+[celeba 132/167] 3072/4515 rows
+[celeba 132/167] 4096/4515 rows
+[celeba] shard 132 done: 4515 scored, 0 skipped, 37.9s
+[celeba 133/167] 1024/4515 rows
+[celeba 133/167] 2048/4515 rows
+[celeba 133/167] 3072/4515 rows
+[celeba 133/167] 4096/4515 rows
+[celeba] shard 133 done: 4515 scored, 0 skipped, 37.3s
+[celeba 134/167] 1024/4515 rows
+[celeba 134/167] 2048/4515 rows
+[celeba 134/167] 3072/4515 rows
+[celeba 134/167] 4096/4515 rows
+[celeba] shard 134 done: 4515 scored, 0 skipped, 37.9s
+[celeba 135/167] 1024/4515 rows
+[celeba 135/167] 2048/4515 rows
+[celeba 135/167] 3072/4515 rows
+[celeba 135/167] 4096/4515 rows
+[celeba] shard 135 done: 4515 scored, 0 skipped, 37.6s
+[celeba 136/167] 1024/4515 rows
+[celeba 136/167] 2048/4515 rows
+[celeba 136/167] 3072/4515 rows
+[celeba 136/167] 4096/4515 rows
+[celeba] shard 136 done: 4515 scored, 0 skipped, 37.6s
+[celeba 137/167] 1024/4515 rows
+[celeba 137/167] 2048/4515 rows
+[celeba 137/167] 3072/4515 rows
+[celeba 137/167] 4096/4515 rows
+[celeba] shard 137 done: 4515 scored, 0 skipped, 37.6s
+[celeba 138/167] 1024/4515 rows
+[celeba 138/167] 2048/4515 rows
+[celeba 138/167] 3072/4515 rows
+[celeba 138/167] 4096/4515 rows
+[celeba] shard 138 done: 4515 scored, 0 skipped, 37.3s
+[celeba 139/167] 1024/4515 rows
+[celeba 139/167] 2048/4515 rows
+[celeba 139/167] 3072/4515 rows
+[celeba 139/167] 4096/4515 rows
+[celeba] shard 139 done: 4515 scored, 0 skipped, 38.3s
+[celeba 140/167] 1024/4515 rows
+[celeba 140/167] 2048/4515 rows
+[celeba 140/167] 3072/4515 rows
+[celeba 140/167] 4096/4515 rows
+[celeba] shard 140 done: 4515 scored, 0 skipped, 36.9s
+[celeba 141/167] 1024/4515 rows
+[celeba 141/167] 2048/4515 rows
+[celeba 141/167] 3072/4515 rows
+[celeba 141/167] 4096/4515 rows
+[celeba] shard 141 done: 4515 scored, 0 skipped, 37.7s
+[celeba 142/167] 1024/4515 rows
+[celeba 142/167] 2048/4515 rows
+[celeba 142/167] 3072/4515 rows
+[celeba 142/167] 4096/4515 rows
+[celeba] shard 142 done: 4515 scored, 0 skipped, 37.4s
+[celeba 143/167] 1024/4515 rows
+[celeba 143/167] 2048/4515 rows
+[celeba 143/167] 3072/4515 rows
+[celeba 143/167] 4096/4515 rows
+[celeba] shard 143 done: 4515 scored, 0 skipped, 38.0s
+[celeba 144/167] 1024/4515 rows
+[celeba 144/167] 2048/4515 rows
+[celeba 144/167] 3072/4515 rows
+[celeba 144/167] 4096/4515 rows
+[celeba] shard 144 done: 4515 scored, 0 skipped, 37.4s
+[celeba 145/167] 1024/4515 rows
+[celeba 145/167] 2048/4515 rows
+[celeba 145/167] 3072/4515 rows
+[celeba 145/167] 4096/4515 rows
+[celeba] shard 145 done: 4515 scored, 0 skipped, 37.6s
+[celeba 146/167] 1024/4515 rows
+[celeba 146/167] 2048/4515 rows
+[celeba 146/167] 3072/4515 rows
+[celeba 146/167] 4096/4515 rows
+[celeba] shard 146 done: 4515 scored, 0 skipped, 37.6s
+[celeba 147/167] 1024/4515 rows
+[celeba 147/167] 2048/4515 rows
+[celeba 147/167] 3072/4515 rows
+[celeba 147/167] 4096/4515 rows
+[celeba] shard 147 done: 4515 scored, 0 skipped, 37.4s
+[celeba 148/167] 1024/4515 rows
+[celeba 148/167] 2048/4515 rows
+[celeba 148/167] 3072/4515 rows
+[celeba 148/167] 4096/4515 rows
+[celeba] shard 148 done: 4515 scored, 0 skipped, 37.8s
+[celeba 149/167] 1024/4515 rows
+[celeba 149/167] 2048/4515 rows
+[celeba 149/167] 3072/4515 rows
+[celeba 149/167] 4096/4515 rows
+[celeba] shard 149 done: 4515 scored, 0 skipped, 37.4s
+[celeba 150/167] 1024/4515 rows
+[celeba 150/167] 2048/4515 rows
+[celeba 150/167] 3072/4515 rows
+[celeba 150/167] 4096/4515 rows
+[celeba] shard 150 done: 4515 scored, 0 skipped, 37.2s
+[celeba 151/167] 1024/4515 rows
+[celeba 151/167] 2048/4515 rows
+[celeba 151/167] 3072/4515 rows
+[celeba 151/167] 4096/4515 rows
+[celeba] shard 151 done: 4515 scored, 0 skipped, 37.2s
+[celeba 152/167] 1024/4515 rows
+[celeba 152/167] 2048/4515 rows
+[celeba 152/167] 3072/4515 rows
+[celeba 152/167] 4096/4515 rows
+[celeba] shard 152 done: 4515 scored, 0 skipped, 37.1s
+[celeba 153/167] 1024/4515 rows
+[celeba 153/167] 2048/4515 rows
+[celeba 153/167] 3072/4515 rows
+[celeba 153/167] 4096/4515 rows
+[celeba] shard 153 done: 4515 scored, 0 skipped, 37.5s
+[celeba 154/167] 1024/4515 rows
+[celeba 154/167] 2048/4515 rows
+[celeba 154/167] 3072/4515 rows
+[celeba 154/167] 4096/4515 rows
+[celeba] shard 154 done: 4515 scored, 0 skipped, 37.0s
+[celeba 155/167] 1024/4515 rows
+[celeba 155/167] 2048/4515 rows
+[celeba 155/167] 3072/4515 rows
+[celeba 155/167] 4096/4515 rows
+[celeba] shard 155 done: 4515 scored, 0 skipped, 37.7s
+[celeba 156/167] 1024/4515 rows
+[celeba 156/167] 2048/4515 rows
+[celeba 156/167] 3072/4515 rows
+[celeba 156/167] 4096/4515 rows
+[celeba] shard 156 done: 4515 scored, 0 skipped, 37.8s
+[celeba 157/167] 1024/4515 rows
+[celeba 157/167] 2048/4515 rows
+[celeba 157/167] 3072/4515 rows
+[celeba 157/167] 4096/4515 rows
+[celeba] shard 157 done: 4515 scored, 0 skipped, 37.1s
+[celeba 158/167] 1024/5194 rows
+[celeba 158/167] 2048/5194 rows
+[celeba 158/167] 3072/5194 rows
+[celeba 158/167] 4096/5194 rows
+[celeba 158/167] 5120/5194 rows
+[celeba] shard 158 done: 5194 scored, 0 skipped, 43.9s
+[celeba 159/167] 1024/5193 rows
+[celeba 159/167] 2048/5193 rows
+[celeba 159/167] 3072/5193 rows
+[celeba 159/167] 4096/5193 rows
+[celeba 159/167] 5120/5193 rows
+[celeba] shard 159 done: 5193 scored, 0 skipped, 42.9s
+[celeba 160/167] 1024/5193 rows
+[celeba 160/167] 2048/5193 rows
+[celeba 160/167] 3072/5193 rows
+[celeba 160/167] 4096/5193 rows
+[celeba 160/167] 5120/5193 rows
+[celeba] shard 160 done: 5193 scored, 0 skipped, 42.9s
+[celeba 161/167] 1024/5193 rows
+[celeba 161/167] 2048/5193 rows
+[celeba 161/167] 3072/5193 rows
+[celeba 161/167] 4096/5193 rows
+[celeba 161/167] 5120/5193 rows
+[celeba] shard 161 done: 5193 scored, 0 skipped, 43.8s
+[celeba 162/167] 1024/5193 rows
+[celeba 162/167] 2048/5193 rows
+[celeba 162/167] 3072/5193 rows
+[celeba 162/167] 4096/5193 rows
+[celeba 162/167] 5120/5193 rows
+[celeba] shard 162 done: 5193 scored, 0 skipped, 43.3s
+[celeba 163/167] 1024/5193 rows
+[celeba 163/167] 2048/5193 rows
+[celeba 163/167] 3072/5193 rows
+[celeba 163/167] 4096/5193 rows
+[celeba 163/167] 5120/5193 rows
+[celeba] shard 163 done: 5193 scored, 0 skipped, 43.0s
+[celeba 164/167] 1024/5193 rows
+[celeba 164/167] 2048/5193 rows
+[celeba 164/167] 3072/5193 rows
+[celeba 164/167] 4096/5193 rows
+[celeba 164/167] 5120/5193 rows
+[celeba] shard 164 done: 5193 scored, 0 skipped, 43.6s
+[celeba 165/167] 1024/5193 rows
+[celeba 165/167] 2048/5193 rows
+[celeba 165/167] 3072/5193 rows
+[celeba 165/167] 4096/5193 rows
+[celeba 165/167] 5120/5193 rows
+[celeba] shard 165 done: 5193 scored, 0 skipped, 43.9s
+[celeba 166/167] 1024/5193 rows
+[celeba 166/167] 2048/5193 rows
+[celeba 166/167] 3072/5193 rows
+[celeba 166/167] 4096/5193 rows
+[celeba 166/167] 5120/5193 rows
+[celeba] shard 166 done: 5193 scored, 0 skipped, 43.5s
+[celeba] all shards scored in 4606.7s
+{"images": 525864, "scored": 525864, "detected": 525864, "apcer": 0.6436865021770682, "bpcer": 0.05281369513749772, "auc": 0.6764737558070265, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.1615244159370757, "bpcer": 0.797911734353184}, {"threshold": 0.45, "apcer": 0.3854113020272485, "bpcer": 0.33903964062405145}, {"threshold": 0.5, "apcer": 0.5175570017322908, "bpcer": 0.14915315971589874}, {"threshold": 0.55, "apcer": 0.6436865021770682, "bpcer": 0.05281369513749772}, {"threshold": 0.6, "apcer": 0.7478580457886606, "bpcer": 0.014751411400473502}, {"threshold": 0.7, "apcer": 0.9032960344585421, "bpcer": 0.00048564317367813997}], "per_species": [{"species": "spoof", "n": 42718, "caught": 15221, "tpr": 0.3563134978229318}], "per_split": {"test": {"scored": 59191, "apcer": 0.6436865021770682, "bpcer": 0.05281369513749772, "auc": 0.6764737558070265, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.1615244159370757, "bpcer": 0.797911734353184}, {"threshold": 0.45, "apcer": 0.3854113020272485, "bpcer": 0.33903964062405145}, {"threshold": 0.5, "apcer": 0.5175570017322908, "bpcer": 0.14915315971589874}, {"threshold": 0.55, "apcer": 0.6436865021770682, "bpcer": 0.05281369513749772}, {"threshold": 0.6, "apcer": 0.7478580457886606, "bpcer": 0.014751411400473502}, {"threshold": 0.7, "apcer": 0.9032960344585421, "bpcer": 0.00048564317367813997}]}, "train": {"scored": 419935, "apcer": 0.46183938106134903, "bpcer": 0.045697493517718235, "auc": 0.7647177359429539, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.14398677854055428, "bpcer": 0.7608850475367329}, {"threshold": 0.45, "apcer": 0.28888888888888886, "bpcer": 0.2948522039757995}, {"threshold": 0.5, "apcer": 0.3700809996004504, "bpcer": 0.1265894554883319}, {"threshold": 0.55, "apcer": 0.46183938106134903, "bpcer": 0.045697493517718235}, {"threshold": 0.6, "apcer": 0.5671679197994988, "bpcer": 0.01698876404494382}, {"threshold": 0.7, "apcer": 0.8205768043296647, "bpcer": 0.002184961106309421}]}, "valid": {"scored": 46738, "apcer": 0.4605220121672009, "bpcer": 0.04726552833457065, "auc": 0.763956052234078, "threshold_sweep": [{"threshold": 0.35, "apcer": 0.14185255445803624, "bpcer": 0.7629918337045286}, {"threshold": 0.45, "apcer": 0.2901484921829005, "bpcer": 0.30332838406335066}, {"threshold": 0.5, "apcer": 0.3684830247923072, "bpcer": 0.13146498391487255}, {"threshold": 0.55, "apcer": 0.4605220121672009, "bpcer": 0.04726552833457065}, {"threshold": 0.6, "apcer": 0.5661019166612155, "bpcer": 0.018188567186340016}, {"threshold": 0.7, "apcer": 0.8195198534702689, "bpcer": 0.0022890373669883692}]}}, "skipped_no_usable_bbox": 0}
+merged celeba_spoof into /home/archledger/irlume-bench/benchmarks/results-pad-rgb.json
+ALL-DONE

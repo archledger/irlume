@@ -467,6 +467,26 @@ fn flood_reason(ambient: f32) -> String {
          lamps wash out the emitter); turn away from the light or use your password"
     )
 }
+
+/// Whether the corneal glint says the eyes are off the lens while the head
+/// stayed inside the permissive frontal gate. The glint stays a REASON
+/// SELECTOR only, never decisive (#616 step 1): it reframes a just-flat
+/// center/edge reading as the angle artifact it is, the same way ambient
+/// flood reframes it. An unreadable glint is no evidence of anything.
+fn eyes_off_lens(glint: Option<f32>) -> bool {
+    glint.is_some_and(|g| g < GLINT_MIN)
+}
+
+/// The actionable rejection for a face whose flat reading is explained by
+/// averted eyes rather than by a two-dimensional source.
+fn off_axis_reason(ratio: f32, glint: Option<f32>) -> String {
+    let glint = glint.unwrap_or_default();
+    format!(
+        "IR reads flat (center/edge {ratio:.2}) with the eyes off the lens \
+         (glint {glint:.0} against the {GLINT_MIN:.0} an on-lens eye returns); \
+         look straight at the camera or use your password"
+    )
+}
 /// Eye IR peak above this counts as a corneal glint (supporting cue).
 ///
 /// Supporting-only is load-bearing, not caution (#174, measured 2026-08-04):
@@ -575,6 +595,8 @@ impl LivenessGate {
         if !cues.center_edge_ratio_ok {
             let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
+            } else if eyes_off_lens(s.ir_eye_glint) {
+                off_axis_reason(s.ir_center_edge_ratio, s.ir_eye_glint)
             } else {
                 format!(
                     "IR too flat (center/edge {:.2}); looks 2D, not a 3D face",
@@ -681,6 +703,8 @@ impl LivenessGate {
         if !cues.center_edge_ratio_ok {
             let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
+            } else if eyes_off_lens(s.ir_eye_glint) {
+                off_axis_reason(s.ir_center_edge_ratio, s.ir_eye_glint)
             } else {
                 format!("IR too flat (center/edge {:.2})", s.ir_center_edge_ratio)
             };
@@ -1667,6 +1691,48 @@ mod tests {
             // always yields a number (#358).
             ir_saturated_frac: Some(0.0),
             ..Default::default() // frontal pose
+        }
+    }
+
+    /// #616 step 1, the case observed on real hardware in the omarchy thread:
+    /// a head inside the permissive frontal gate but eyes off the lens reads
+    /// just under the center/edge bar and was called "looks 2D". The glint is
+    /// the eyes-on-lens instrument, so a readable glint below the corneal
+    /// threshold reframes the flat reading as an angle artifact: the verdict
+    /// stays Spoof (fail closed) and the reason names the fixable condition,
+    /// exactly the ambient-flood precedent.
+    #[test]
+    fn flat_with_eyes_off_the_lens_names_looking_not_spoof_shape() {
+        let mut s = live_signals();
+        s.ir_center_edge_ratio = 1.0; // just under the 1.03 bar
+        s.ir_eye_glint = Some(72.0); // readable, eyes off the lens
+        let (verdict, _, why) = LivenessGate.evaluate(&s);
+        assert_eq!(verdict, Verdict::Spoof, "still denied, fail closed: {why}");
+        assert!(
+            why.contains("look straight at the camera"),
+            "the reason names the fixable condition: {why}"
+        );
+        assert!(!why.contains("looks 2D"), "not a spoof accusation: {why}");
+        // The dark path keeps the same split: both evaluators rule.
+        let (verdict, _, why) = LivenessGate.evaluate_ir_only(&s);
+        assert_eq!(verdict, Verdict::Spoof, "dark path still denied: {why}");
+        assert!(
+            why.contains("look straight at the camera"),
+            "dark path names the condition too: {why}"
+        );
+    }
+
+    /// Eyes ON the lens and flat means flat: the spoof wording stands, and so
+    /// does an unreadable glint, which is no evidence of anything.
+    #[test]
+    fn flat_with_eyes_on_or_unreadable_lens_keeps_the_spoof_wording() {
+        for glint in [Some(251.0), None] {
+            let mut s = live_signals();
+            s.ir_center_edge_ratio = 1.0;
+            s.ir_eye_glint = glint;
+            let (verdict, _, why) = LivenessGate.evaluate(&s);
+            assert_eq!(verdict, Verdict::Spoof, "{why}");
+            assert!(why.contains("looks 2D"), "no reattribution: {why}");
         }
     }
 

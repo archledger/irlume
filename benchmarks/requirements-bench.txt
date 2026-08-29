@@ -1,0 +1,10 @@
+# onnxruntime-gpu is pinned to 1.27.0 because the committed `results-*.json` were
+# produced with it (benchmarks/README.md, Environment section). If
+# `opencv-python-headless==5.0.0` fails to resolve at install time, fall back to
+# the newest 5.x and record the exact resolved version in every result JSON
+# (`runtime.cvd` field, already planned in Task 7).
+onnxruntime-gpu==1.27.0
+opencv-python-headless==5.0.0
+numpy>=2.0,<3
+requests>=2.32,<3
+pytest>=8

@@ -5186,4 +5186,78 @@ auth required pam_fprintd.so\n\
         let msg = wire_service(&svc, false, true, &wire).unwrap();
         assert!(msg.message.contains("not wired"), "{msg}");
     }
+
+    // ---- distro-PAM layout matrix (2026-08-30 survey) ----------------------
+    //
+    // The fixtures under tests/fixtures/pam/<distro>/ are the REAL shipped
+    // service files, extracted from each family's container image with the
+    // display managers installed (see docs/research/2026-08-30-distro-pam-
+    // matrix.md for provenance). The survey question: does the wiring recipe
+    // place its line on every dialect a user can actually meet?
+
+    fn fixture(distro: &str, service: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pam")
+            .join(distro)
+            .join(service);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The include dialects (Debian @include, Arch include system-*) take the
+    /// `sufficient` line; the substack dialects (Fedora password-auth,
+    /// openSUSE common-auth) are atomic for jump counting and take the
+    /// [success=1] jump stanza. Both must WIRE, not no-op, on every family's
+    /// real file.
+    #[test]
+    fn the_wiring_recipe_wires_every_real_distro_dialect() {
+        let expect_sufficient = ["arch", "debian"];
+        let expect_jump = ["fedora", "opensuse"];
+        for distro in ["arch", "debian", "fedora", "opensuse"] {
+            for service in ["sddm", "gdm-password", "lightdm"] {
+                let stock = fixture(distro, service);
+                let (wired, changed) = wire_greeter_impl(&stock, true, true, false);
+                assert!(
+                    changed,
+                    "{distro}/{service}: the recipe refused to wire the real shipped file"
+                );
+                assert!(
+                    wired.contains("pam_irlume.so"),
+                    "{distro}/{service}: the module must land in the stack"
+                );
+                // The original auth carrier line survives below our line.
+                let carrier = ["include", "substack", "@include"]
+                    .iter()
+                    .find(|k| stock.contains(&format!(" {k} ")))
+                    .or_else(|| {
+                        ["@include", "include", "substack"]
+                            .iter()
+                            .find(|k| stock.contains(*k))
+                    });
+                if let Some(kind) = carrier {
+                    assert!(
+                        wired.contains(kind),
+                        "{distro}/{service}: the original {kind} line must survive"
+                    );
+                }
+                let got_sufficient = wired.contains("sufficient   pam_irlume.so unseal")
+                    || wired.contains("sufficient pam_irlume.so unseal");
+                let got_jump = wired.contains("success=1 default=ignore");
+                if expect_sufficient.contains(&distro) {
+                    assert!(
+                        got_sufficient && !got_jump,
+                        "{distro}/{service}: the include dialect takes the sufficient line"
+                    );
+                } else if expect_jump.contains(&distro) {
+                    assert!(
+                        got_jump && !got_sufficient,
+                        "{distro}/{service}: the substack dialect takes the jump stanza"
+                    );
+                }
+                // Idempotence on the real files too: a second pass changes
+                // nothing.
+                let (_, again) = wire_greeter_impl(&wired, true, true, false);
+                assert!(!again, "{distro}/{service}: rewiring must be a no-op");
+            }
+        }
+    }
 }

@@ -527,7 +527,7 @@ fn ir_preflight_subject_lit(face_mean: Option<f32>) -> irlume_common::Result<boo
 /// This never searches for an unknown control: capture applies only the
 /// env override, persisted conf, or built-in table (#159's rule). A face
 /// the emitter does not light is the honest dark verdict; no face at all
-/// is inconclusive ([`ir_preflight_subject_lit`]).
+/// is inconclusive (`ir_preflight_subject_lit`).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn apply_known_ir_emitter_subject_region(
     device: &str,

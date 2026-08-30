@@ -60,7 +60,7 @@ OP_SCORE = 0.6
 YUNET_MODEL = "face_detection_yunet_2023mar.onnx"
 FLIR_MODEL = "flir.onnx"
 IR_THRESHOLD = 0.9
-SWEEP = (0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
+SWEEP = (0.1, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
 PAD = 16
 OUT_SIZE = 112
 MODEL_SQUARE = 128
@@ -119,28 +119,34 @@ def pad_ir_input(gray: "np.ndarray", bbox: list[float]) -> "np.ndarray":
     # Crop offsets center the (possibly clamped) region in the square.
     xo = (dst - (b[2] - b[0] + 1)) // 2
     yo = (dst - (b[3] - b[1] + 1)) // 2
-    scale = dst / MODEL_SQUARE
+    scale = np.float32(dst) / np.float32(MODEL_SQUARE)
     oy, ox = np.mgrid[0:OUT_SIZE, 0:OUT_SIZE]
-    fx = (ox + CROP_MARGIN + 0.5) * scale - 0.5 - xo + b[0]
-    fy = (oy + CROP_MARGIN + 0.5) * scale - 0.5 - yo + b[1]
+    sqx = (ox + CROP_MARGIN).astype(np.float32) + np.float32(0.5)
+    sqy = (oy + CROP_MARGIN).astype(np.float32) + np.float32(0.5)
+    sqx = sqx * scale - np.float32(0.5)
+    sqy = sqy * scale - np.float32(0.5)
+    fx = sqx - np.float32(xo) + np.float32(b[0])
+    fy = sqy - np.float32(yo) + np.float32(b[1])
     outside = (
-        (fx < b[0] - 0.5) | (fy < b[1] - 0.5)
-        | (fx > b[2] + 0.5) | (fy > b[3] + 0.5)
+        (fx < np.float32(b[0]) - np.float32(0.5))
+        | (fy < np.float32(b[1]) - np.float32(0.5))
+        | (fx > np.float32(b[2]) + np.float32(0.5))
+        | (fy > np.float32(b[3]) + np.float32(0.5))
     )
-    x0 = np.floor(fx).astype(np.int64)
-    y0 = np.floor(fy).astype(np.int64)
-    dx = fx - x0
-    dy = fy - y0
+    x0 = np.floor(fx).astype(np.int32)
+    y0 = np.floor(fy).astype(np.int32)
+    dx = fx - x0.astype(np.float32)
+    dy = fy - y0.astype(np.float32)
     x0c = np.clip(x0, 0, w - 1)
     x1c = np.clip(x0 + 1, 0, w - 1)
     y0c = np.clip(y0, 0, h - 1)
     y1c = np.clip(y0 + 1, 0, h - 1)
     g = gray.astype(np.float32)
-    top = g[y0c, x0c] * (1.0 - dx) + g[y0c, x1c] * dx
-    bot = g[y1c, x0c] * (1.0 - dx) + g[y1c, x1c] * dx
-    sampled = top * (1.0 - dy) + bot * dy
-    vals = np.where(outside, 127.0, sampled)
-    plane = ((vals - 127.5) * 0.0078125).astype(np.float32)
+    top = g[y0c, x0c] * (np.float32(1.0) - dx) + g[y0c, x1c] * dx
+    bot = g[y1c, x0c] * (np.float32(1.0) - dx) + g[y1c, x1c] * dx
+    sampled = top * (np.float32(1.0) - dy) + bot * dy
+    vals = np.where(outside, np.float32(127.0), sampled)
+    plane = ((vals - np.float32(127.5)) * np.float32(0.0078125)).astype(np.float32)
     return np.stack([plane, plane, plane])[np.newaxis]
 
 
@@ -187,6 +193,7 @@ def merge_section(args, key: str, section: dict, notes: list[str]) -> None:
         try:
             result = json.loads(args.out.read_text())
         except json.JSONDecodeError:
+            print(f"warning: {args.out} is not valid JSON, resetting", flush=True)
             result = {}
     result["runtime"] = {
         "ort_version": ort.__version__,
@@ -211,25 +218,36 @@ def merge_section(args, key: str, section: dict, notes: list[str]) -> None:
 
 
 def run_group(
-    det, flir: FlirScorer, files: list[Path], tag: str
-) -> list[float]:
+    det, flir: FlirScorer, files: list[Path], tag: str, rel_root: Path
+) -> tuple[list[float], list[dict], int, int]:
     scores: list[float] = []
+    flagged: list[dict] = []
+    read_failures = 0
+    detect_failures = 0
     t0 = time.time()
     for i, path in enumerate(files, 1):
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if img is None:
+            read_failures += 1
             continue
         box = best_face(det, img)
         if box is None:
+            detect_failures += 1
             continue
-        scores.append(flir.score(pad_ir_input(img[:, :, 0], box)))
+        s = flir.score(pad_ir_input(img[:, :, 0], box))
+        scores.append(s)
+        if s >= IR_THRESHOLD:
+            flagged.append(
+                {"path": str(path.relative_to(rel_root)), "score": s}
+            )
         if i % 500 == 0:
             print(f"[{tag}] {i}/{len(files)} frames", flush=True)
     print(
-        f"[{tag}] {len(scores)} scored in {time.time() - t0:.1f}s",
+        f"[{tag}] {len(scores)} scored ({read_failures} read failures, "
+        f"{detect_failures} detect failures) in {time.time() - t0:.1f}s",
         flush=True,
     )
-    return scores
+    return scores, flagged, read_failures, detect_failures
 
 
 def run_cbsr(args, det, flir) -> None:
@@ -237,14 +255,20 @@ def run_cbsr(args, det, flir) -> None:
     files = collect_files(args.cbsr_root, (".bmp",))
     if not files:
         raise SystemExit(f"error: no .bmp frames under {args.cbsr_root}")
-    scores = run_group(det, flir, files, "cbsr")
+    scores, flagged, read_fail, detect_fail = run_group(
+        det, flir, files, "cbsr", args.cbsr_root
+    )
     p50, p10 = score_stats(scores)
     section = {
         "frames": len(files),
         "scored": len(scores),
+        "read_failures": read_fail,
+        "detect_failures": detect_fail,
         "flagged_rate_at_wired": flagged_rate(scores, IR_THRESHOLD),
         "score_p50": p50,
         "score_p10": p10,
+        "score_max": max(scores) if scores else 0.0,
+        "flagged_frames": flagged,
         "threshold_sweep": sweep_rows(scores),
         "wall_s": round(time.time() - t0, 1),
     }
@@ -293,31 +317,47 @@ def run_oulu(args, det, flir) -> None:
         by_lighting.setdefault(p.relative_to(ni).parts[0], []).append(p)
     per_lighting = []
     all_scores: list[float] = []
+    all_flagged: list[dict] = []
+    tot_read_fail = 0
+    tot_detect_fail = 0
     tot_frames = 0
     for lighting in sorted(by_lighting):
-        scores = run_group(det, flir, by_lighting[lighting], f"oulu-{lighting}")
+        scores, flagged, read_fail, detect_fail = run_group(
+            det, flir, by_lighting[lighting], f"oulu-{lighting}", ni
+        )
         p50, p10 = score_stats(scores)
         per_lighting.append(
             {
                 "lighting": lighting,
                 "frames": len(by_lighting[lighting]),
                 "scored": len(scores),
+                "read_failures": read_fail,
+                "detect_failures": detect_fail,
                 "flagged_rate_at_wired": flagged_rate(scores, IR_THRESHOLD),
                 "score_p50": p50,
                 "score_p10": p10,
+                "score_max": max(scores) if scores else 0.0,
+                "threshold_sweep": sweep_rows(scores),
             }
         )
         tot_frames += len(by_lighting[lighting])
+        tot_read_fail += read_fail
+        tot_detect_fail += detect_fail
         all_scores.extend(scores)
+        all_flagged.extend(flagged)
     p50, p10 = score_stats(all_scores)
     section = {
         "per_lighting": per_lighting,
         "overall": {
             "frames": tot_frames,
             "scored": len(all_scores),
+            "read_failures": tot_read_fail,
+            "detect_failures": tot_detect_fail,
             "flagged_rate_at_wired": flagged_rate(all_scores, IR_THRESHOLD),
             "score_p50": p50,
             "score_p10": p10,
+            "score_max": max(all_scores) if all_scores else 0.0,
+            "flagged_frames": all_flagged,
             "threshold_sweep": sweep_rows(all_scores),
         },
         "wall_s": round(time.time() - t0, 1),
@@ -336,7 +376,10 @@ def run_oulu(args, det, flir) -> None:
             "sub-threshold tail of the three lightings: 59 frames >= 0.1, "
             "max 0.8204); the only wired-line flags are 4/10,379 Strong "
             "frames concentrated in two subjects (P049 Disgust 010-012, "
-            "P012 Happiness 017; max 0.9606); Weak 0/10,834. The fleet "
+            "P012 Happiness 017; max 0.9606); Weak 0/10,834. Every figure "
+            "in this note is a committed field: per_lighting "
+            "threshold_sweep at 0.1, per_lighting score_max, and the "
+            "flagged_frames list. The fleet "
             "dim-strobe genuine failure regime (models/README.md) does not "
             "reproduce at frame level on this mirror through this chain "
             "and remains fleet-measurement evidence."

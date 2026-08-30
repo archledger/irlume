@@ -1500,16 +1500,23 @@ pub fn login_apply(args: &[String]) -> ExitCode {
         //
         // On disable the marker goes entirely, because a disable unwires every
         // surface including those two.
-        let (with_sudo, with_polkit, _) = crate::pamwire::read_wired_marker().unwrap_or_default();
+        let marker = crate::pamwire::read_wired_marker().unwrap_or_default();
         // `with_lock` records whether the lock screen IS wired, not whether this
         // was an enable. Passing `enable` claimed one on every host, including
         // those that wire no lock screen at all, and reconcile then reads a
-        // surface that was never ours as a regression to repair.
+        // surface that was never ours as a regression to repair. The yield
+        // intent mirrors the human path (#607): recorded when the apply wanted
+        // face-on-lock and the dedicated Omarchy lane suppressed it.
         crate::pamwire::write_wired_marker(
             enable,
-            with_sudo,
-            with_polkit,
-            enable && crate::pamwire::lock_wired(),
+            &crate::pamwire::WiredMarker {
+                sudo: marker.sudo,
+                polkit: marker.polkit,
+                lock: enable && crate::pamwire::lock_wired(),
+                face_lock_intent: crate::pamwire::marker_face_lock_intent(
+                    enable && crate::pamwire::wants().face_lock,
+                ),
+            },
         );
     }
     let changes: Vec<Value> = applied

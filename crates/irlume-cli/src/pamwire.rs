@@ -66,15 +66,17 @@ struct Svc {
 const GREETERS: &[Svc] = &[
     Svc {
         etc: "/etc/pam.d/gdm-password",
-        vendor: None,
+        vendor: Some("/usr/lib/pam.d/gdm-password"),
     }, // GNOME / GDM
     Svc {
         etc: "/etc/pam.d/sddm",
-        vendor: None,
+        // openSUSE ships this only in the vendor dir (2026-08-30 survey);
+        // families with a real /etc file never consult the vendor path.
+        vendor: Some("/usr/lib/pam.d/sddm"),
     },
     Svc {
         etc: "/etc/pam.d/lightdm",
-        vendor: None,
+        vendor: Some("/usr/lib/pam.d/lightdm"),
     },
     Svc {
         etc: "/etc/pam.d/plasmalogin",
@@ -3035,6 +3037,73 @@ mod tests {
     fn kde_lock_service_carries_the_arch_vendor_path() {
         assert_eq!(LOCKSCREEN.etc, "/etc/pam.d/kde");
         assert_eq!(LOCKSCREEN.vendor, Some("/usr/lib/pam.d/kde"));
+    }
+
+    /// The 2026-08-30 distro-PAM survey's one real gap: openSUSE ships its DM
+    /// PAM services ONLY under /usr/lib/pam.d (verified on Tumbleweed:
+    /// /etc/pam.d holds just the pam-config-generated common/postlogin set),
+    /// so sddm/gdm-password/lightdm read NotInstalled there and the wiring
+    /// skipped the whole distro. The vendor paths make wire_service
+    /// materialize /etc overrides exactly as it already does for plasmalogin
+    /// and kde on other layouts; on families that ship /etc/pam.d directly
+    /// the vendor path is never consulted.
+    #[test]
+    fn the_dm_greeters_carry_vendor_paths_for_the_suse_layout() {
+        for (etc, vendor) in [
+            ("/etc/pam.d/sddm", "/usr/lib/pam.d/sddm"),
+            ("/etc/pam.d/gdm-password", "/usr/lib/pam.d/gdm-password"),
+            ("/etc/pam.d/lightdm", "/usr/lib/pam.d/lightdm"),
+        ] {
+            let svc = GREETERS
+                .iter()
+                .find(|s| s.etc == etc)
+                .unwrap_or_else(|| panic!("{etc} missing"));
+            assert_eq!(svc.vendor, Some(vendor), "{etc}");
+        }
+        // No accidental over-reach: greeters without a verified vendor-only
+        // layout keep vendor: None (the /etc file is the only copy families
+        // ship for these today).
+        for etc in [
+            "/etc/pam.d/greetd",
+            "/etc/pam.d/ly",
+            "/etc/pam.d/cosmic-greeter",
+        ] {
+            let svc = GREETERS
+                .iter()
+                .find(|s| s.etc == etc)
+                .unwrap_or_else(|| panic!("{etc} missing"));
+            assert_eq!(svc.vendor, None, "{etc}");
+        }
+    }
+
+    /// End to end on the survey's openSUSE fixture: a vendor-only sddm (the
+    /// exact bytes Tumbleweed ships in /usr/lib/pam.d) materializes an /etc
+    /// override carrying the face line, through the same wire_service path a
+    /// real `login enable --apply` runs.
+    #[test]
+    fn a_suse_vendor_only_sddm_materializes_and_wires() {
+        let dir = TestDir::new("suse-sddm");
+        let vendor = dir.0.join("sddm.vendor");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pam/opensuse/sddm");
+        std::fs::write(
+            &vendor,
+            std::fs::read_to_string(&fixture).expect("the openSUSE sddm fixture"),
+        )
+        .unwrap();
+        let svc = Svc {
+            etc: leak(&dir.0.join("sddm")),
+            vendor: Some(leak(&vendor)),
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+        let msg = wire_service(&svc, true, true, &wire).expect("materialize + wire");
+        assert!(msg.message.contains("materialized override from"), "{msg}");
+        let materialized = std::fs::read_to_string(dir.0.join("sddm")).unwrap();
+        assert!(materialized.contains("pam_irlume.so"));
+        assert!(
+            materialized.contains("substack       common-auth"),
+            "the vendor stack's carrier line survives: {materialized}"
+        );
     }
 
     /// Self-cleaning scratch dir for the wire_service file tests.

@@ -1,0 +1,30 @@
+#
+# The PAM configuration file for the Shadow `login' service
+#
+
+# Enforce a minimal delay in case of failure (in microseconds).
+# (Replaces the `FAIL_DELAY' setting from login.defs)
+# Note that other modules may require another minimal delay. (for example,
+# to disable any delay, you should add the nodelay option to pam_unix)
+auth       optional   pam_faildelay.so  delay=3000000
+
+# Outputs an issue file prior to each login prompt (Replaces the
+# ISSUE_FILE option from login.defs). Uncomment for use
+# auth       required   pam_issue.so issue=/etc/issue
+
+# Disallows other than root logins when /etc/nologin exists
+# (Replaces the `NOLOGINS_FILE' option from login.defs)
+auth       requisite  pam_nologin.so
+
+# SELinux needs to be the first session rule. This ensures that any
+# lingering context has been cleared. Without this it is possible
+=====AUTH-UPDATE-MANAGED
+/etc/pam.d/common-account
+/etc/pam.d/common-auth
+/etc/pam.d/common-password
+/etc/pam.d/common-session
+/etc/pam.d/common-session-noninteractive
+=====PAM-CONFIGS
+mkhomedir
+systemd
+unix

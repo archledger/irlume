@@ -1194,3 +1194,151 @@ fn profiles_accepts_a_flag_before_the_subcommand() {
     assert_eq!(code, 0, "stdout={out} stderr={err}");
     assert!(out.contains("Face Profile 1"), "stdout={out} stderr={err}");
 }
+
+// The flags-first grammar is documented for every per-user subcommand
+// command (the global `--user U` convention plus each usage line), but the
+// dispatcher bound every subcommand to position 1, so keyring, recovery, and
+// fingerprint all answered usage on their own documented shape. #637 fixed
+// profiles; these pin the same rule for the rest through the shared scanner.
+#[test]
+fn keyring_accepts_a_flag_before_the_subcommand_and_keeps_the_user() {
+    let sb = Sandbox::new("keyring-flag-first");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = seen.clone();
+    serve(&sb.sock(), move |req| {
+        if let Request::KeyringInfo { user } = &req {
+            sink.lock().unwrap().push(user.clone());
+        }
+        match req {
+            Request::Ping => Response::Pong,
+            Request::KeyringInfo { .. } => Response::KeyringInfo {
+                armed: false,
+                policy: None,
+                pcrs: vec![],
+                drifted: None,
+                kind: None,
+            },
+            _ => Response::Error("unexpected request".into()),
+        }
+    });
+    let (code, out, err) = run(
+        &mut sb.cmd(&["keyring", "--user", "tester", "status"]),
+        "keyring --user tester status",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(!err.contains("usage: irlume keyring"), "stderr={err}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["tester".to_string()],
+        "the flag's value reached the daemon, not the subcommand slot"
+    );
+}
+
+#[test]
+fn recovery_accepts_a_flag_before_the_subcommand() {
+    let sb = Sandbox::new("recovery-flag-first");
+    serve(&sb.sock(), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+            encrypted: false,
+            recovery_set: false,
+            tpm_present: true,
+            key_present: false,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let (code, out, err) = run(
+        &mut sb.cmd(&["recovery", "--user", "tester", "status"]),
+        "recovery --user tester status",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(!err.contains("usage: irlume recovery"), "stderr={err}");
+}
+
+#[test]
+fn fingerprint_accepts_a_flag_before_the_subcommand() {
+    // status answers without fprintd installed (it reports the absence), so
+    // the discriminating assertion is the usage line: the position-1 binding
+    // turned the documented order into a usage error before the scan existed.
+    let sb = Sandbox::new("fingerprint-flag-first");
+    let (code, out, err) = run(
+        &mut sb.cmd(&["fingerprint", "--user", "tester", "status"]),
+        "fingerprint --user tester status",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(!err.contains("usage: irlume fingerprint"), "stderr={err}");
+    assert!(out.contains("[fingerprint]"), "stdout={out}");
+}
+
+/// The scanner's hard case: a username that IS a subcommand name. `--user
+/// list` must consume `list` as the flag's value, leaving `add-scan` the
+/// subcommand; a position-blind scan would send ListProfiles instead of the
+/// requested AddScan.
+#[test]
+fn a_username_matching_a_subcommand_is_not_eaten_by_the_scan() {
+    let sb = Sandbox::new("profiles-user-named-list");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let sink = seen.clone();
+    serve(&sb.sock(), move |req| {
+        if let Request::AddScan { user, profile, .. } = &req {
+            sink.lock().unwrap().push((user.clone(), profile.clone()));
+        }
+        match req {
+            Request::Ping => Response::Pong,
+            Request::AddScan { .. } => Response::Enrolled {
+                profile: "p".into(),
+                created: true,
+                added: 1,
+                total: 1,
+                room: None,
+                added_scans: vec!["scan-1".into()],
+                ambient_lit: None,
+            },
+            _ => Response::Error("unexpected request".into()),
+        }
+    });
+    let (code, out, err) = run(
+        &mut sb.cmd(&["profiles", "--user", "list", "add-scan", "--profile", "p"]),
+        "profiles --user list add-scan --profile p",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("list".to_string(), "p".to_string())],
+        "user 'list' was the flag value, 'add-scan' the subcommand"
+    );
+}
+
+/// forget-model's model name is the one positional in the profiles family,
+/// and it used to be read at a fixed index (args[2]); under the now-reachable
+/// flags-first shape that index points at the flag's value. The positional
+/// must be the first non-flag token after the subcommand.
+#[test]
+fn forget_model_finds_its_positional_after_a_leading_flag() {
+    let sb = Sandbox::new("profiles-forget-flag-first");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let sink = seen.clone();
+    serve(&sb.sock(), move |req| {
+        if let Request::ForgetRecognizer { user, space } = &req {
+            sink.lock().unwrap().push((user.clone(), space.clone()));
+        }
+        match req {
+            Request::Ping => Response::Pong,
+            Request::ForgetRecognizer { .. } => Response::Ok("forgotten".into()),
+            _ => Response::Error("unexpected request".into()),
+        }
+    });
+    let (code, out, err) = run(
+        &mut sb.cmd(&["profiles", "--user", "tester", "forget-model", "shipped"]),
+        "profiles --user tester forget-model shipped",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            "tester".to_string(),
+            irlume_core::storage::LEGACY_RECOGNIZER_SPACE.to_string()
+        )],
+        "the model name after the subcommand reached the daemon"
+    );
+}

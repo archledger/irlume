@@ -825,6 +825,12 @@ pub struct ArmEvidence {
     /// revalidate.
     #[serde(default)]
     capture_failure_facts: std::collections::BTreeMap<String, u32>,
+    /// Burst frames the camera's illumination metadata classified as lit or
+    /// dark, summed over the arm's completed rounds (#606). Additive and
+    /// defaulted like `capture_failure_facts`, so schema-2 records written
+    /// before the field still parse and revalidate.
+    #[serde(default)]
+    ir_camera_classified_frames: u32,
     rgb_mean: f32,
     ir_mean: f32,
     elapsed_ms: u64,
@@ -854,6 +860,7 @@ impl ArmEvidence {
         capture_failures: u32,
         rate_shortfall_failures: u32,
         capture_failure_facts: std::collections::BTreeMap<String, u32>,
+        ir_camera_classified_frames: u32,
         rgb_mean: f32,
         ir_mean: f32,
         elapsed_ms: u64,
@@ -875,12 +882,20 @@ impl ArmEvidence {
             capture_failures,
             rate_shortfall_failures,
             capture_failure_facts,
+            ir_camera_classified_frames,
             rgb_mean,
             ir_mean,
             elapsed_ms,
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Burst frames the camera's illumination metadata classified as lit or
+    /// dark across the arm's completed rounds (#606).
+    #[must_use]
+    pub const fn ir_camera_classified_frames(&self) -> u32 {
+        self.ir_camera_classified_frames
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
@@ -1641,6 +1656,10 @@ mod tests {
     }
 
     fn arm(rounds: u32) -> ArmEvidence {
+        arm_with_ir_classified(rounds, 0)
+    }
+
+    fn arm_with_ir_classified(rounds: u32, ir_camera_classified: u32) -> ArmEvidence {
         ArmEvidence::new(
             rounds,
             rounds,
@@ -1658,11 +1677,32 @@ mod tests {
             0,
             0,
             Default::default(),
+            ir_camera_classified,
             140.0,
             120.0,
             850,
         )
         .unwrap()
+    }
+
+    /// #606: the illumination-metadata classified-frame count is additive and
+    /// defaulted: schema-2 records written before the field still parse and
+    /// revalidate, and new records round-trip it.
+    #[test]
+    fn ir_camera_classified_frames_is_additive_and_round_trips() {
+        assert_eq!(arm(6).ir_camera_classified_frames(), 0);
+        // A record serialized before the field existed decodes with zero.
+        let json = serde_json::to_value(arm_with_ir_classified(6, 47)).unwrap();
+        let mut legacy = json.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("ir_camera_classified_frames");
+        let decoded: ArmEvidence = serde_json::from_value(legacy).expect("legacy record parses");
+        assert_eq!(decoded.ir_camera_classified_frames(), 0);
+        // And a new record round-trips the value.
+        let back: ArmEvidence = serde_json::from_value(json).expect("the new record round-trips");
+        assert_eq!(back.ir_camera_classified_frames(), 47);
     }
 
     fn concurrent_attempt(port: &str) -> QualificationAttempt {
@@ -1845,6 +1885,7 @@ mod tests {
                 3,
                 0,
                 Default::default(),
+                0,
                 80.0,
                 90.0,
                 2_000,
@@ -1906,6 +1947,7 @@ mod tests {
                 0,
                 0,
                 Default::default(),
+                0,
                 1.0,
                 1.0,
                 1
@@ -1930,6 +1972,7 @@ mod tests {
             0,
             0,
             Default::default(),
+            0,
             1.0,
             1.0,
             1,
@@ -1965,6 +2008,7 @@ mod tests {
             0,
             6,
             Default::default(),
+            0,
             0.0,
             0.0,
             1,
@@ -2165,6 +2209,7 @@ mod tests {
                 2,
                 0,
                 Default::default(),
+                0,
                 80.0,
                 90.0,
                 2_000,

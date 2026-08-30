@@ -6536,6 +6536,13 @@ pub struct PairSample {
     /// the persisted ArmEvidence (additive, serde-defaulted) so a stored
     /// verdict names its facts months later.
     pub capture_failure_facts: std::collections::BTreeMap<&'static str, usize>,
+    /// Burst frames the camera's own illumination metadata classified as lit
+    /// or dark, summed over the arm's completed rounds (#606). The T14s
+    /// report: a concurrent arm can deliver every buffer yet classify ZERO
+    /// frames while the sequential arm classifies fine, so a signal-loss
+    /// verdict needs this count to say whether the brightness collapsed with
+    /// a silent metadata path or on a camera that reports nothing either way.
+    pub ir_camera_classified_frames: usize,
 }
 
 impl PairSample {
@@ -7540,6 +7547,7 @@ fn qualification_arm(
         count(sample.capture_failures, "capture-failure")?,
         count(sample.rate_shortfall_failures, "rate-shortfall-failure")?,
         capture_failure_facts,
+        count(sample.ir_camera_classified_frames, "ir-camera-classified")?,
         sample.rgb_mean,
         sample.ir_mean,
         sample.total_ms.round() as u64,
@@ -8113,6 +8121,10 @@ fn accumulate(
     let mix = |old: f32, new: f32| (old * n + new) / (n + 1.0);
     into.rgb_mean = mix(into.rgb_mean, frame_mean(&rgb.data));
     into.ir_mean = mix(into.ir_mean, ir_stats.lit_mean);
+    // #606: fold the camera's own illumination-metadata classification count
+    // beside the brightness it gated on, so the arm can name a metadata path
+    // that went silent under concurrency.
+    into.ir_camera_classified_frames += ir_stats.camera_classified_frames;
     into.total_ms = mix(into.total_ms, elapsed.as_millis() as f32);
     into.rounds += 1;
 
@@ -11989,6 +12001,7 @@ mod tests {
                 rate_shortfall_failures: 0,
                 continuity_facts: Default::default(),
                 capture_failure_facts: Default::default(),
+                ir_camera_classified_frames: 0,
             };
             ContentionReport {
                 sequential: sample(seq),
@@ -12378,6 +12391,49 @@ mod tests {
             "the facts account for every capture failure, nothing else"
         );
         assert_eq!(report.concurrent.rate_shortfall_failures, 0);
+    }
+
+    /// #606: how many burst frames the camera's own illumination metadata
+    /// classified folds into each arm, so a verdict can name a metadata path
+    /// that went silent exactly under concurrency (the T14s signature:
+    /// sequential rounds classify, concurrent rounds deliver buffers but
+    /// classify nothing).
+    #[test]
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    fn ir_camera_classified_counts_fold_into_the_arm() {
+        let rgb = || Ok(frame(&[120; 4]));
+        let ir = || {
+            let mut s = stats(60.0);
+            s.camera_classified_frames = 7;
+            s.camera_lit_frames = 7;
+            Ok((frame(&[20; 4]), s))
+        };
+        let report =
+            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("the probe completes");
+        assert_eq!(
+            report.sequential.ir_camera_classified_frames, 14,
+            "two sequential rounds of 7 classified frames"
+        );
+        assert_eq!(
+            report.concurrent.ir_camera_classified_frames, 14,
+            "the concurrent arm folds the same per-round count"
+        );
+    }
+
+    /// #606: the folded count survives into the persisted ArmEvidence.
+    #[test]
+    fn qualification_arm_carries_the_ir_camera_classified_count() {
+        let sample = PairSample {
+            rounds: 2,
+            ir_camera_classified_frames: 23,
+            rgb_mean: 100.0,
+            ir_mean: 60.0,
+            total_ms: 10.0,
+            ..PairSample::default()
+        };
+        let evidence = qualification_arm(&sample, 2).expect("bounded counts");
+        assert_eq!(evidence.ir_camera_classified_frames(), 23);
     }
 
     /// #606: a pair that cannot even establish its rate windows names that

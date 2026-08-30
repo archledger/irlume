@@ -1591,6 +1591,7 @@ mod worker_engine {
                     rate_shortfall_failures: 0,
                     continuity_facts: Default::default(),
                     capture_failure_facts: Default::default(),
+                    ir_camera_classified_frames: 0,
                 },
                 concurrent: PairSample {
                     rgb_mean: 140.0,
@@ -1612,9 +1613,66 @@ mod worker_engine {
                     rate_shortfall_failures: 0,
                     continuity_facts: Default::default(),
                     capture_failure_facts: Default::default(),
+                    ir_camera_classified_frames: 0,
                 },
                 trailing_sequential_control: true,
             }
+        }
+
+        /// #606: a signal-loss verdict whose concurrent arm classified ZERO
+        /// illumination-metadata frames while the sequential arm classified
+        /// some names that divergence: brightness collapsed AND the camera's
+        /// own metadata path went silent exactly under concurrency, which is
+        /// a different finding from plain dimming and the fact a support
+        /// reader needs months later (the T14s report).
+        #[test]
+        fn signal_loss_names_a_metadata_path_that_went_silent() {
+            let mut report = healthy_concurrent(6, 6);
+            report.sequential.ir_camera_classified_frames = 60;
+            report.concurrent.ir_camera_classified_frames = 0;
+            report.concurrent.ir_mean = 30.0;
+            let message = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::SignalLoss),
+                6,
+            );
+            assert!(
+                message.contains(
+                    "illumination metadata classified 60 frame(s) \
+                 sequentially and 0 concurrently"
+                ),
+                "the divergence is named with counts: {message}"
+            );
+            // Plain dimming with a healthy metadata path stays plain.
+            let mut healthy = healthy_concurrent(6, 6);
+            healthy.sequential.ir_camera_classified_frames = 60;
+            healthy.concurrent.ir_camera_classified_frames = 58;
+            healthy.concurrent.ir_mean = 30.0;
+            let plain = camera_tune_verdict_message(
+                &healthy,
+                AttemptOutcome::SequentialRequired(SequentialReason::SignalLoss),
+                6,
+            );
+            assert!(
+                !plain.contains("illumination metadata"),
+                "no divergence, no metadata clause: {plain}"
+            );
+            // A camera that reports nothing in EITHER arm (metadata-less
+            // hardware) also keeps the plain wording: silence alone, with no
+            // sequential baseline, is not a divergence.
+            let mut silent = healthy_concurrent(6, 6);
+            silent.sequential.ir_camera_classified_frames = 0;
+            silent.concurrent.ir_camera_classified_frames = 0;
+            silent.concurrent.ir_mean = 30.0;
+            let plain = camera_tune_verdict_message(
+                &silent,
+                AttemptOutcome::SequentialRequired(SequentialReason::SignalLoss),
+                6,
+            );
+            assert!(
+                !plain.contains("illumination metadata"),
+                "no sequential baseline, no metadata clause: {plain}"
+            );
         }
 
         /// #606: the cannot-stream branch names the per-round failure facts
@@ -3472,7 +3530,34 @@ fn camera_tune_verdict_message(
                      so the safe one-at-a-time mode is what was measured and persisted",
                     rounds - report.concurrent.rate_floor_rounds.min(rounds),
                 ),
-                _ => format!(
+                irlume_auth::SequentialReason::SignalLoss => {
+                    // #606 (the T14s report): a concurrent arm that classified
+                    // ZERO illumination-metadata frames while the sequential
+                    // arm classified some lost brightness AND the camera's own
+                    // metadata path went silent exactly under concurrency.
+                    // That combination is a different finding from plain
+                    // dimming and the fact a support reader needs months
+                    // later, so it is named with counts; a healthy metadata
+                    // path keeps the plain retention wording.
+                    let metadata_silent = report.concurrent.ir_camera_classified_frames == 0
+                        && report.sequential.ir_camera_classified_frames > 0;
+                    let detail = if metadata_silent {
+                        format!(
+                            "; the camera's illumination metadata classified {} frame(s) \
+                             sequentially and 0 concurrently",
+                            report.sequential.ir_camera_classified_frames
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{retention}{detail}, but the safe one-at-a-time mode is what was \
+                         measured and persisted"
+                    )
+                }
+                // Unreachable behind the concurrent_impossible() early return
+                // above; rendered defensively so the match stays exhaustive.
+                irlume_auth::SequentialReason::ConcurrentUnavailable => format!(
                     "{retention}, but the safe one-at-a-time mode is what was \
                      measured and persisted"
                 ),

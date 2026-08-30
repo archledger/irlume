@@ -1154,3 +1154,43 @@ fn logs_reports_when_journalctl_cannot_be_run() {
     assert_eq!(code, 1);
     assert!(err.contains("could not run journalctl"), "{err}");
 }
+
+// `profiles` takes its subcommand from the arguments, not from position 1. The
+// usage line documents `irlume profiles [--user U] <subcommand>`, and the
+// machine path already matches on presence for exactly this reason, but the
+// human path read args[1]: `profiles --user tester list` made "--user" the
+// subcommand and answered usage on a well-formed command.
+#[test]
+fn profiles_accepts_a_flag_before_the_subcommand() {
+    let sb = Sandbox::new("profiles-flag-first");
+    serve(&sb.sock(), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::ListProfiles { .. } => Response::Enrollment {
+            profiles: one_profile(),
+            require_eyes_open: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
+        },
+        _ => Response::Error("unexpected".into()),
+    });
+
+    let (code, out, err) = run(
+        &mut sb.cmd(&["profiles", "--user", "tester", "list"]),
+        "profiles --user tester list",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(out.contains("Face Profile 1"), "stdout={out} stderr={err}");
+    assert!(
+        !err.contains("usage: irlume profiles"),
+        "the documented order must not print usage; stderr={err}"
+    );
+
+    // The `--flag=value` spelling carries its own value, so the subcommand is
+    // the very next argument rather than one further along.
+    let (code, out, err) = run(
+        &mut sb.cmd(&["profiles", "--user=tester", "list"]),
+        "profiles --user=tester list",
+    );
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(out.contains("Face Profile 1"), "stdout={out} stderr={err}");
+}

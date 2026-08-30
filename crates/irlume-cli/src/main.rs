@@ -168,7 +168,7 @@ fn main() -> std::process::ExitCode {
         {
             machine::profiles_list(&args)
         }
-        (Some("profiles"), sub) => profiles(sub, &args),
+        (Some("profiles"), _) => profiles(profiles_sub(&args), &args),
         (Some("verify"), _) => verify(&args),
         (Some("enrolldev"), _) => enrolldev(&args),
         (Some("keyring"), sub) => keyring(sub, &args),
@@ -373,6 +373,32 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
 /// inside single quotes.
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// The `profiles` subcommand, wherever it sits among the flags.
+///
+/// The usage line documents `irlume profiles [--user U] <subcommand>`, and the
+/// machine path above already matches on presence rather than position for the
+/// same reason. Reading `args[1]` made a leading flag the subcommand, so the
+/// documented order answered usage on a well-formed command: `profiles --user
+/// tester list` looked for a subcommand named `--user`.
+///
+/// A flag spelled `--flag value` carries its value in the next argument, so the
+/// scan steps over it; `--flag=value` carries its own and does not.
+fn profiles_sub(args: &[String]) -> Option<&str> {
+    const VALUED: [&str; 5] = ["--user", "--profile", "--scans", "--name", "--scan"];
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !a.starts_with('-') {
+            return Some(a);
+        }
+        if VALUED.contains(&a) {
+            i += 1;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// `irlume profiles [list|add-scan|rename|delete|eyes-open] ...`: manage the up-

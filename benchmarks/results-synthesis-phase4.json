@@ -1,0 +1,164 @@
+{
+  "runtime": {
+    "phase": "4",
+    "basis": "source-read of crates/irlume-core/src/lib.rs and crates/irlume-auth/src/lib.rs at calib/phase4 base 1146e473; phase evidence files as cited",
+    "note": "mechanism inventory + decisions ledger; no runtime value changed in this phase"
+  },
+  "mechanisms": [
+    {
+      "constant": "RGB_MATCH_THRESHOLD",
+      "value": 0.55,
+      "source": "crates/irlume-core/src/lib.rs:91",
+      "consumer": "irlume-auth lib.rs:2635 -> rgb_threshold; primary RGB match + rgb_primary_grant_admissible (RGB-primary arm, concurrent pairs only)",
+      "spectrum": "RGB embeddings vs enrolled RGB templates (glintr100 cosine)",
+      "evidence": "in-source: docs/FAIRNESS.md per-group FMR analysis + live genuine margin (min 0.71 / mean 0.85); phase 2 pooled mirror sweep stops at 0.50 and uses seeded gallery/probe protocols, so it does not cover this operating point",
+      "coverage": "phase evidence does not measure the wired value"
+    },
+    {
+      "constant": "IR_MATCH_THRESHOLD",
+      "value": 0.55,
+      "source": "crates/irlume-core/src/lib.rs:104",
+      "consumer": "dim-light IR fallback arm: irlume-auth lib.rs:5347-5352, effective bar = scaled_threshold(base, n_templates) + IR_FALLBACK_MARGIN 0.05 (>= 0.60)",
+      "spectrum": "IR embeddings vs enrolled IR templates",
+      "evidence": "in-source: full CBSR NIR bench (197 ids, 7.72M impostor pairs; 0.55 -> FAR 1.3e-3 / FRR 1.7%); phase 2 NIR pooled row at 0.55 FAR 1.125e-3 (weaker protocol, consistent direction)",
+      "coverage": "deployment-shaped evidence in-source; phase 2 is cross-check material"
+    },
+    {
+      "constant": "IR_DARK_MATCH_THRESHOLD",
+      "value": 0.635,
+      "source": "crates/irlume-core/src/lib.rs:133",
+      "consumer": "pure-dark IR-only path: irlume-auth lib.rs:5524-5532, scaled by templates (ADR-0016)",
+      "spectrum": "IR only (no RGB evidence on this path)",
+      "evidence": "in-source: CBSR deployment-shaped OR-arm 0.635 -> FAR 1.24e-4 / FRR 0.68%; Tufts cross-spectral ~4.9e-5; live dark session 2026-08-23 genuine min 0.884 vs bar 0.685",
+      "coverage": "phase 2 did not sweep this high on its mirrors; runtime evidence stands"
+    },
+    {
+      "constant": "IR_ADAPTED_MATCH_THRESHOLD",
+      "value": 0.4,
+      "source": "crates/irlume-core/src/lib.rs:143",
+      "consumer": "only when a user supplies a custom 512->512 IR adapter (none ships)",
+      "spectrum": "adapted IR embeddings",
+      "evidence": "in-source: CBSR+Oulu academic distribution FAR table",
+      "coverage": "out of campaign scope (non-default path)"
+    },
+    {
+      "constant": "IR_FALLBACK_MARGIN / TEMPLATE_SCALE_STEP / TEMPLATE_SCALE_MAX_BUMP",
+      "value": "0.05 / 0.015 / 0.10",
+      "source": "crates/irlume-core/src/lib.rs:151,163,166 (scaled_threshold at :172)",
+      "consumer": "threshold shaping for fallback arm and template count",
+      "spectrum": "both",
+      "evidence": "in-source rationale; not swept by any phase",
+      "coverage": "no phase evidence; unchanged"
+    },
+    {
+      "constant": "VIT_PAD_THRESHOLD / VIT_PAD_VOTE_N",
+      "value": "0.55 / 5",
+      "source": "crates/irlume-auth/src/lib.rs:350,356",
+      "consumer": "RGB PAD deny line, rolling 5-frame-median vote, deny-only",
+      "spectrum": "RGB m96 chips",
+      "evidence": "phase 3 (results-pad-rgb.json): transfer failure on CelebA-Spoof test makes public tuning invalid; decline stands",
+      "coverage": "measured, decision = keep"
+    },
+    {
+      "constant": "IR_PAD_THRESHOLD",
+      "value": 0.9,
+      "source": "crates/irlume-auth/src/lib.rs:364",
+      "consumer": "FLIR IR PAD deny line, lit-phase IR frames, deny-only",
+      "spectrum": "IR 112x112 chips",
+      "evidence": "phase 3 (results-pad-ir.json): genuine-side flag rate 1/3,940 CBSR + 4/31,995 Oulu incl. Dark; banner floor 0.941 above the line",
+      "coverage": "measured, decision = keep"
+    },
+    {
+      "constant": "MAX_CROSS_SPECTRUM_SKEW / SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW",
+      "value": "3s / 8s",
+      "source": "crates/irlume-auth/src/lib.rs:426,479",
+      "consumer": "schedule gates (concurrent pairing ceiling; ADR-0014 sequential budget), not score thresholds",
+      "spectrum": "n/a",
+      "evidence": "ADR-0014 + fleet measurement history",
+      "coverage": "out of score-threshold scope"
+    },
+    {
+      "constant": "ir_center_edge_ratio (per-user floor)",
+      "value": "per-enrollment calibrated",
+      "source": "crates/irlume-auth/src/lib.rs:142,290",
+      "consumer": "per-user IR print-species floor alongside FLIR + IR physics",
+      "spectrum": "IR",
+      "evidence": "ADR-0002 species map",
+      "coverage": "fleet-calibrated by construction; no public set labels this"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "RGB recognizer threshold",
+      "wired": "RGB_MATCH_THRESHOLD 0.55",
+      "phase_evidence": "phase 2 results-recognition.json (pooled RGB sweep 0.30-0.50; grant rule 0.35)",
+      "recommendation": "keep",
+      "reason": "phase 2's sweep never measured 0.55 and its seeded mirror protocols are weaker than the wired value's deployment-shaped evidence (FAIRNESS.md per-group FMR + live genuine margin); its 0.35 row (FAR 6.67e-4) trades 20x FAR for +0.20 TAR and is monitoring material, not an operating-point authority",
+      "gate": "none (no change proposed)"
+    },
+    {
+      "id": "D2",
+      "decision": "phase 2 report runtime claim",
+      "wired": "n/a (documentation)",
+      "phase_evidence": "phase 2 report line 65 calls 0.45 'the fixed grant line'; runtime constant is 0.55",
+      "recommendation": "correct the doc in this PR",
+      "reason": "0.45 is the aligned-set evaluation convention (acc@0.45 columns), not irlume's wired line; the misstatement is corrected and the synthesis carries the true inventory",
+      "gate": "none (docs truth)"
+    },
+    {
+      "id": "D3",
+      "decision": "IR thresholds (fallback 0.55+0.05, dark 0.635)",
+      "wired": "IR_MATCH_THRESHOLD 0.55 (+margin), IR_DARK_MATCH_THRESHOLD 0.635",
+      "phase_evidence": "phase 2 NIR pooled table (0.55 FAR 1.125e-3; 0.6 FAR 0.0)",
+      "recommendation": "keep",
+      "reason": "runtime bars carry deployment-shaped OR-arm and live-session evidence; phase 2's cross-modality finding (a single cosine line cannot serve both spectra) is ALREADY the runtime's design: RGB and IR bars are separate constants",
+      "gate": "none"
+    },
+    {
+      "id": "D4",
+      "decision": "ViT RGB PAD line + vote",
+      "wired": "0.55, vote 5",
+      "phase_evidence": "phase 3 results-pad-rgb.json",
+      "recommendation": "keep (decline stands)",
+      "reason": "public protocols fail transfer for this model; tuning against them tunes to a distribution it does not carry",
+      "gate": "none"
+    },
+    {
+      "id": "D5",
+      "decision": "FLIR IR PAD line",
+      "wired": "0.9",
+      "phase_evidence": "phase 3 results-pad-ir.json",
+      "recommendation": "keep (decline stands)",
+      "reason": "genuine-side margin reproduced and wide incl. dark lighting; attack floor above the line",
+      "gate": "none"
+    },
+    {
+      "id": "D6",
+      "decision": "detection + landmarks constants",
+      "wired": "YuNet 0.6 / 640 / BlazeFace rescue-only / mesh-refined alignment",
+      "phase_evidence": "phase 1 results (detection sweeps, cascade rescue counts, mesh IoU gains)",
+      "recommendation": "keep (declines stand)",
+      "reason": "see phase 1 report section 4; WFLW standalone deficit maps to no runtime path (mesh consumes YuNet-primary or BlazeFace-rescue boxes in-pipeline, never standalone loose crops)",
+      "gate": "none"
+    },
+    {
+      "id": "D7",
+      "decision": "RGB PAD replacement candidate (anti-spoof-mn3, Apache-2.0)",
+      "wired": "n/a (candidate)",
+      "phase_evidence": "results-pad-rgb-mn3.json (this phase) + docs/pad-results/2026-07-17-third-party-pad-candidates.md",
+      "recommendation": "do not ship",
+      "reason": "deployment-side veto stands (genuine saturation in lit indoor, the dominant login condition, measured 2026-07-17); this phase's run quantifies the public home-domain side for the candidate table",
+      "gate": "none (verdict is no-swap)"
+    },
+    {
+      "id": "D8",
+      "decision": "phone-at-login-distance ViT row (campaign success criterion)",
+      "wired": "n/a (measurement)",
+      "phase_evidence": "models/README.md:32 discloses the gap; IR-path phone rows exist (2026-06-30 selftest: phone_replay 20, APCER 0.0%, caught by face_in_ir x20); ViT banner rows exist (0.594-0.656 caught)",
+      "recommendation": "declined with evidence; fleet capture proposal listed",
+      "reason": "no public set labels the species (binary CelebA mirror, species-less CASIA/Oulu mirrors); closing it needs a 20-attempt phone_replay fleet session against the ViT alarm path, in-person",
+      "gate": "user session needed if the row is wanted"
+    }
+  ]
+}

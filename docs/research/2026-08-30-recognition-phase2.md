@@ -62,9 +62,15 @@ the license-over-peak-accuracy tradeoff vs InsightFace buffalo (99.4% LFW,
 non-commercial) is already the committed position (`benchmarks/README.md`,
 `models/README.md`). Data+pipeline coherence is evidenced by the bundle-LFW
 crosscheck above; the w600k_r50 reference anchor was not runnable (absent from
-the measurement host; a new download was out of scope). The fixed 0.45 grant
-line sits far above this recognizer's optimal band (0.21-0.24) on these sets,
-which the calibration table in section 4 quantifies.
+the measurement host; a new download was out of scope). CORRECTION (Phase 4,
+2026-08-30): an earlier revision of this report called 0.45 "the fixed grant
+line"; that was wrong. 0.45 is the aligned-set evaluation convention (the
+`acc@0.45` columns), and irlume's wired RGB line is `RGB_MATCH_THRESHOLD`
+0.55 (`crates/irlume-core/src/lib.rs:91`), which this phase's pooled sweep
+(0.30 to 0.50) never measured. Section 4's grant recommendations are
+mirror-protocol comparisons, not operating-point proposals for the wired
+constants; the mechanism inventory and final dispositions live in
+`docs/research/2026-08-30-calibration-synthesis-phase4.md`.
 
 ## 2. CFP pose track (CFP-W, wild images, detect+warp)
 

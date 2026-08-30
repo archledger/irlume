@@ -1739,6 +1739,36 @@ mod worker_engine {
             assert!(msg.starts_with("capture mode sequential for this camera"));
             assert!(msg.contains("delivered-rate"), "{msg}");
         }
+
+        /// #612: an inconclusive probe that leaves a previous authority in
+        /// force must not tell the operator nothing is stored. The message
+        /// names the stored verdict instead of the bare "left unmeasured".
+        #[test]
+        fn inconclusive_probe_message_distinguishes_a_stored_verdict_in_force() {
+            use super::super::inconclusive_probe_message;
+            let why = "the probe did not complete 5 clean rounds in both capture modes";
+            // No authority in force: today's honest wording stands verbatim.
+            let none = inconclusive_probe_message(why, None);
+            assert!(none.starts_with("capture mode left unmeasured"), "{none}");
+            // A sequential authority in force: the stored verdict governs and
+            // is named with its reason.
+            let sequential = inconclusive_probe_message(
+                why,
+                Some(&AttemptOutcome::SequentialRequired(
+                    SequentialReason::SignalLoss,
+                )),
+            );
+            assert!(sequential.contains("stored verdict"), "{sequential}");
+            assert!(sequential.contains("sequential"), "{sequential}");
+            assert!(sequential.contains("signal_loss"), "{sequential}");
+            assert!(!sequential.contains("left unmeasured"), "{sequential}");
+            // A concurrent authority in force: same honesty, its own mode.
+            let concurrent =
+                inconclusive_probe_message(why, Some(&AttemptOutcome::ConcurrentQualified));
+            assert!(concurrent.contains("concurrent"), "{concurrent}");
+            assert!(concurrent.contains("stored verdict"), "{concurrent}");
+            assert!(!concurrent.contains("left unmeasured"), "{concurrent}");
+        }
     }
 
     #[cfg(test)]
@@ -3215,38 +3245,39 @@ fn run_capture_mode_probe(
             .as_ref()
             .map(irlume_auth::CaptureQualificationRecord::revision)
     };
-    match store.save_attempt(attempt, expected_revision) {
-        Ok(_) => {}
+    let stored = match store.save_attempt(attempt, expected_revision) {
+        Ok(record) => record,
         Err(irlume_auth::QualificationStoreError::StaleRevision { .. })
             if policy == ProbeStore::AutomaticIfAbsent =>
         {
             return Ok(
                 "capture qualification changed while the automatic probe ran; \
-                 keeping the newer record and discarding this measurement"
+                  keeping the newer record and discarding this measurement"
                     .into(),
             );
         }
         Err(error) => return Err(error.to_string()),
-    }
+    };
 
     if !conclusive {
         // Not an error: the pair stays unmeasured, which the sequential
         // default already makes safe, and the caller's work proceeds. Name
         // the reason that actually blocked storing: thin evidence and dim
-        // light are different problems with different fixes.
+        // light are different problems with different fixes. When a previous
+        // verdict remains in force it must be named too (#612): "nothing was
+        // stored" read as "there is nothing stored to reconsider".
         let why = if probe_rounds_complete(report, rounds) {
             format!(
                 "the probe ran in a dim scene (RGB mean {:.0}), where a clean \
-                 concurrent reading proves nothing",
+                  concurrent reading proves nothing",
                 report.sequential.rgb_mean
             )
         } else {
             format!("the probe did not complete {rounds} clean rounds in both capture modes")
         };
-        return Ok(format!(
-            "capture mode left unmeasured: {why}; captures stay one at a time (the safe \
-             default). Run `sudo irlume camera-tune` with the room lit to store a \
-             measured verdict"
+        return Ok(inconclusive_probe_message(
+            &why,
+            stored.authoritative().map(|attempt| attempt.outcome()),
         ));
     }
     if policy == ProbeStore::ExplicitReplace {
@@ -3257,6 +3288,52 @@ fn run_capture_mode_probe(
         persisted_outcome,
         rounds,
     ))
+}
+
+/// The message for a probe whose attempt was inconclusive, so no NEW verdict
+/// was stored (#612). With no authority in force the operator genuinely has
+/// nothing stored, and the classic "left unmeasured" wording stands. With an
+/// authority in force, that wording told the operator there was nothing
+/// stored to reconsider, which was false: the stored verdict still governs
+/// capture, and the message must say so. Pure over its inputs, so the wording
+/// is testable without hardware.
+fn inconclusive_probe_message(
+    why: &str,
+    stored_verdict: Option<&irlume_auth::AttemptOutcome>,
+) -> String {
+    let Some(verdict) = stored_verdict else {
+        return format!(
+            "capture mode left unmeasured: {why}; captures stay one at a time (the safe \
+              default). Run `sudo irlume camera-tune` with the room lit to store a \
+              measured verdict"
+        );
+    };
+    // `camera-mode`'s snake_case vocabulary, so both surfaces name the same
+    // facts the same way.
+    let governed = match verdict {
+        irlume_auth::AttemptOutcome::ConcurrentQualified => {
+            "capture mode stays concurrent for this camera".to_owned()
+        }
+        irlume_auth::AttemptOutcome::SequentialRequired(reason) => {
+            let reason = match reason {
+                irlume_auth::SequentialReason::ConcurrentUnavailable => "concurrent_unavailable",
+                irlume_auth::SequentialReason::DeliveredRateShortfall => "delivered_rate_shortfall",
+                irlume_auth::SequentialReason::SignalLoss => "signal_loss",
+                irlume_auth::SequentialReason::InvalidProvenance => "invalid_provenance",
+            };
+            format!("capture mode stays sequential for this camera (reason {reason})")
+        }
+        // A stored authority is never inconclusive (record validation rejects
+        // it); render defensively without naming a mode.
+        irlume_auth::AttemptOutcome::Inconclusive(_) => {
+            "capture mode stays as already measured for this camera".to_owned()
+        }
+    };
+    format!(
+        "{governed}: the stored verdict remains in force. This probe was inconclusive \
+          ({why}) and stored no new verdict; run `sudo irlume camera-tune` with the room \
+          lit to attempt a fresh measurement"
+    )
 }
 
 /// The camera-tune summary, phrased from the AUTHORITATIVE persisted verdict

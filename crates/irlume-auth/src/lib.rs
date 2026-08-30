@@ -306,6 +306,44 @@ fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
     ir_available && !force_rgb_only
 }
 
+/// A dark IR preflight would store an RGB-only enrollment. On a pair that
+/// does not authorize concurrent capture, identity requires an IR-verified
+/// match (ADR-0014), so such a profile could never grant: refuse it up front
+/// instead of storing an enrollment that will be refused at every later
+/// attempt (#618). `pair_qualifies_concurrent` is only consulted when the
+/// preflight measured dark, so a lit enrollment never pays a store read.
+fn dark_ir_rgb_only_enrollment_refusal(
+    pair_qualifies_concurrent: impl FnOnce() -> bool,
+) -> irlume_common::Result<()> {
+    if pair_qualifies_concurrent() {
+        return Ok(());
+    }
+    Err(irlume_common::Error::Protocol(
+        "the IR stream measured dark, and this camera pair authenticates by IR: \
+         an RGB-only profile could never unlock it. Check the lighting and the \
+         emitter (`sudo irlume ir-setup`), then enroll again"
+            .into(),
+    ))
+}
+
+/// Whether the stored qualification authorizes CONCURRENT capture for this
+/// pair: the only pair shape an RGB-only enrollment can ever authenticate on
+/// (rgb-primary admission requires a non-sequential pair). Absent, unreadable,
+/// and context-mismatched records all read "not concurrent": the unmeasured
+/// default captures one frame at a time, and so does a stored sequential
+/// verdict. No camera is opened; the store is the whole question.
+fn pair_qualifies_concurrent(rgb_dev: &str, ir_dev: &str) -> bool {
+    let resolved = (|| {
+        let context = current_capture_qualification_context(rgb_dev, ir_dev).ok()?;
+        let record = QualificationStore::system().load(&context).ok()??;
+        Some(matches!(
+            record.resolve(&context),
+            QualificationResolution::ConcurrentQualified
+        ))
+    })();
+    resolved.unwrap_or(false)
+}
+
 struct EnrollmentCapturePolicy<'a> {
     mode: &'a CaptureModeSelection,
     use_ir: bool,
@@ -1246,6 +1284,24 @@ fn unavailable_capture_mode_selection() -> CaptureModeSelection {
     }
 }
 
+/// The capture selection for a DELIBERATE RGB-only enrollment: sequential by
+/// construction (one camera, one stream), labeled so it can never be misread
+/// as "no stored qualification decided this" the way `unavailable_capture_mode_selection`'s
+/// `from default` was (#618). This is a choice, not an availability failure.
+fn rgb_only_enrollment_capture_mode_selection() -> CaptureModeSelection {
+    CaptureModeSelection {
+        sequential: true,
+        source: RGB_ONLY_ENROLLMENT_CAPTURE_MODE_SOURCE,
+        runtime_key: None,
+        runtime_contract: None,
+        // The share-safe vocabulary has no "IR skipped by request" state; the
+        // operation genuinely runs RGB-only, which is what NoIrPair names.
+        qualification_state: irlume_common::diagnostics::QualificationState::NoIrPair,
+        qualification_reason: None,
+        operation_demoted: std::cell::Cell::new(false),
+    }
+}
+
 fn capture_mode_selection(
     rgb_camera: &irlume_camera::RgbCamera,
     ir_camera: &irlume_camera::IrCamera,
@@ -1420,6 +1476,10 @@ fn self_heal_may_recapture(
 const ENV_CAPTURE_MODE_SOURCE: &str = "IRLUME_SEQUENTIAL_CAPTURE";
 const STORED_CAPTURE_MODE_SOURCE: &str = "qualification-v2";
 const RUNTIME_CAPTURE_MODE_SOURCE: &str = "runtime-health";
+/// The `mode_source` the deliberate RGB-only enrollment selection carries, so
+/// the enroll journal can never read it as the unmeasured default (#618: the
+/// `from default` line was read as the stored qualification failing to load).
+const RGB_ONLY_ENROLLMENT_CAPTURE_MODE_SOURCE: &str = "rgb-only-enrollment";
 
 /// Evidence that makes this daemon process stop attempting concurrent capture
 /// for one exact qualification context. This is deliberately not serialized:
@@ -5815,11 +5875,16 @@ impl Engine {
         // mode exists for exactly the cameras that cannot sustain both
         // streams, so on them this loop takes the per-frame path, which
         // opens one stream at a time and releases it before the other.
-        let mut capture_mode = cams
-            .as_ref()
-            .map_or_else(unavailable_capture_mode_selection, |(rgb, ir)| {
-                capture_mode_selection_with_diagnostics(rgb, ir, diagnostics)
-            });
+        let mut capture_mode = if use_ir {
+            cams.as_ref()
+                .map_or_else(unavailable_capture_mode_selection, |(rgb, ir)| {
+                    capture_mode_selection_with_diagnostics(rgb, ir, diagnostics)
+                })
+        } else {
+            // Not an availability failure: this request chose RGB-only, and
+            // the journal must not read it as the unmeasured default (#618).
+            rgb_only_enrollment_capture_mode_selection()
+        };
         emit_capture_context(&capture_mode, use_ir, diagnostics);
         if cams.is_none() && use_ir {
             diagnostics.emit_share_safe(
@@ -6242,7 +6307,18 @@ impl Engine {
                 )));
             }
         }
-        let force_rgb_only = !self.ir_available || !ir_preflight();
+        // A dark IR preflight downgrades to RGB-only convenience capture,
+        // which on a non-concurrent pair stores a profile that could never
+        // authenticate: refuse it before any camera work (#618). Only the
+        // dark case pays the store read; the preflight itself still runs
+        // only when an IR pair exists (the && short-circuits).
+        let preflight_dark = self.ir_available && !ir_preflight();
+        if preflight_dark {
+            dark_ir_rgb_only_enrollment_refusal(|| {
+                pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
+            })?;
+        }
+        let force_rgb_only = !self.ir_available || preflight_dark;
         // Probe scan first: it decides whether this face merges into an existing
         // profile, and therefore how many scans to capture at all. A profile
         // with 5 free slots gets a 5-scan top-up instead of a 10-scan session
@@ -6548,7 +6624,16 @@ impl Engine {
                 loaded recognizer"
             )));
         }
-        let force_rgb_only = !self.ir_available || !ir_preflight();
+        // Same gate as enrollment (#618): a dark preflight on a
+        // non-concurrent pair would add RGB-only scans to a profile that
+        // authenticates by IR.
+        let preflight_dark = self.ir_available && !ir_preflight();
+        if preflight_dark {
+            dark_ir_rgb_only_enrollment_refusal(|| {
+                pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
+            })?;
+        }
+        let force_rgb_only = !self.ir_available || preflight_dark;
         let want = count.clamp(1, room);
         let mut observed = CaptureShape::default();
         let captured = self.capture_scans(
@@ -10816,6 +10901,83 @@ mod engine_tests {
         assert!(enrollment_ir_enabled(true, false));
         assert!(!enrollment_ir_enabled(true, true));
         assert!(!enrollment_ir_enabled(false, false));
+    }
+
+    #[test]
+    fn dark_ir_refusal_gate_is_decided_by_the_pair_qualification() {
+        // A pair without concurrent authorization (sequential verdict, or the
+        // unmeasured sequential default) refuses; the only pair shape an
+        // RGB-only enrollment can ever grant on does not.
+        assert!(dark_ir_rgb_only_enrollment_refusal(|| false).is_err());
+        assert!(dark_ir_rgb_only_enrollment_refusal(|| true).is_ok());
+    }
+
+    #[test]
+    fn rgb_only_enrollment_selection_is_not_misread_as_the_unmeasured_default() {
+        // #618: the enroll journal printed `from default` for the deliberate
+        // RGB-only enrollment selection, which read as "the stored
+        // qualification is not in effect". The selection must name itself.
+        let selection = rgb_only_enrollment_capture_mode_selection();
+        assert!(selection.is_sequential());
+        assert_eq!(selection.source, RGB_ONLY_ENROLLMENT_CAPTURE_MODE_SOURCE);
+        assert_ne!(selection.source, "default");
+    }
+
+    #[test]
+    fn dark_ir_preflight_refuses_enrollment_that_could_never_authenticate() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("dark-ir-enroll");
+        s.engine.ir_available = true;
+        // A dark preflight on a pair the empty sandbox store cannot authorize
+        // (no concurrent qualification) must refuse up front instead of
+        // storing an RGB-only profile: on a sequential pair identity requires
+        // an IR-verified match, so that profile would be refused forever.
+        let err = s
+            .engine
+            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, || false)
+            .unwrap_err();
+        assert!(err.to_string().contains("authenticates by IR"), "{err}");
+        assert!(err.to_string().contains("could never unlock"), "{err}");
+        assert!(
+            !dir.join("irlume-test-dark.json").exists(),
+            "a refused enrollment must not store anything"
+        );
+        // A lit preflight passes the gate and fails later at the camera for a
+        // camera reason: the dark-IR refusal must not fire.
+        let err = s
+            .engine
+            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, || true)
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("authenticates by IR"),
+            "a lit preflight must not hit the dark-IR refusal: {err}"
+        );
+        // add-scan shares the same gate.
+        let mut e = Enrollment::new("irlume-test-dark2");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &e);
+        let err = s
+            .engine
+            .add_scan_with_ir_preflight("irlume-test-dark2", "P1", 1, || false)
+            .unwrap_err();
+        assert!(err.to_string().contains("authenticates by IR"), "{err}");
+        // The convenience tier is untouched: with no IR pair at all the
+        // preflight must not even be consulted, and the enrollment proceeds.
+        s.engine.ir_available = false; // restore the shared baseline
+        let err = s
+            .engine
+            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, || {
+                panic!("the preflight must not run when no IR pair exists")
+            })
+            .unwrap_err();
+        assert!(!err.to_string().contains("authenticates by IR"), "{err}");
+        teardown_sandbox(&dir);
     }
 
     #[test]

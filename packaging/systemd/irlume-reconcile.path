@@ -18,6 +18,13 @@ PathModified=/etc/pam.d/cosmic-greeter
 PathModified=/etc/pam.d/greetd
 PathModified=/etc/pam.d/kde
 PathModified=/etc/pam.d/polkit-1
+# The Omarchy lock pair (#607): the dedicated face lane appearing must yield
+# the stock password lane, and it disappearing must reclaim it. The timer
+# backstop covers the cases a file watch cannot see (renames, and possibly
+# deletion of the face lane file; systemd does not document waking Path
+# units for a watched file's removal).
+PathModified=/etc/pam.d/omarchy-lock-face
+PathModified=/etc/pam.d/omarchy-lock-password
 Unit=irlume-reconcile.service
 
 [Install]

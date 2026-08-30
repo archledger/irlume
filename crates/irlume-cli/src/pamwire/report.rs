@@ -260,6 +260,18 @@ pub(super) fn status_report_for(omarchy: bool, cinnamon: bool) -> Vec<(String, b
     out
 }
 
+/// The line `status` prints when the stock Omarchy lock lane is yielded to
+/// the dedicated face lane (#607). Without it, the stock row's "not wired"
+/// reads as broken rather than deliberate. Pure so the wording is pinned.
+pub(super) fn yield_notice_for(omarchy: bool, face_lane_present: bool) -> Option<String> {
+    (omarchy && face_lane_present).then(|| {
+        format!(
+            "  omarchy: face-on-lock is yielded to the dedicated lane ({})",
+            super::OMARCHY_FACE_LANE
+        )
+    })
+}
+
 pub(super) fn status() -> ExitCode {
     println!("[login] wiring status (face auth in PAM):");
     if let Some(dm) = active_display_manager() {
@@ -297,6 +309,14 @@ pub(super) fn status() -> ExitCode {
     if any_ondemand {
         println!("  on-demand: {ONDEMAND_HINT}");
     }
+    // #607: say WHY the stock Omarchy lock row shows not wired when the
+    // dedicated lane owns face-on-lock.
+    if let Some(line) = yield_notice_for(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new(super::OMARCHY_FACE_LANE).exists(),
+    ) {
+        println!("{line}");
+    }
     // A greeter can be correctly wired and still leave the wallet locked, so
     // this is reported next to the wiring rather than left to `doctor`: it is
     // the difference between "face logs me in" and "face logs me in AND my
@@ -322,6 +342,24 @@ pub(super) fn status() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #607: the yield notice exists exactly when both lane facts hold, and a
+    /// non-Omarchy host never sees it.
+    #[test]
+    fn yield_notice_names_the_dedicated_lane_only_when_yielding() {
+        assert!(yield_notice_for(true, true).is_some());
+        assert!(yield_notice_for(false, true).is_none());
+        assert!(yield_notice_for(true, false).is_none());
+        let line = yield_notice_for(true, true).unwrap();
+        assert!(
+            line.contains("omarchy-lock-face"),
+            "must name the dedicated lane: {line}"
+        );
+        assert!(
+            line.contains("yielded"),
+            "must say what state the stock row is in: {line}"
+        );
+    }
 
     /// #584/#585 made the lock surface environment-aware; the status report
     /// must follow the SAME surface the wiring writes, or `login status`

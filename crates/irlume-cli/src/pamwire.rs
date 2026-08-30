@@ -150,6 +150,69 @@ fn lock_surface_for(omarchy: bool, cinnamon: bool) -> LockSurface {
         (&LOCKSCREEN, wire_lock)
     }
 }
+
+/// Omarchy's dedicated face lock lane: created by
+/// `omarchy-setup-security-face`, deleted by `omarchy-remove-security-face`,
+/// and wired by Omarchy itself. While it exists it owns face-on-lock, and the
+/// stock password lane below must not ALSO carry the face line: a face miss
+/// there spends a real `pam_faillock` strike (deny=10) on a surface the
+/// operator did not choose, the #584 collision arriving uninvited (#607).
+const OMARCHY_FACE_LANE: &str = "/etc/pam.d/omarchy-lock-face";
+
+/// Testable core of [`stock_lane_yielded`]: both facts, nothing else.
+fn stock_lane_yielded_for(omarchy: bool, face_lane_present: bool) -> bool {
+    omarchy && face_lane_present
+}
+
+/// Whether the dedicated Omarchy face lane exists and therefore owns
+/// face-on-lock for this machine right now.
+fn stock_lane_yielded() -> bool {
+    stock_lane_yielded_for(
+        irlume_common::platform::omarchy_present(),
+        std::path::Path::new(OMARCHY_FACE_LANE).exists(),
+    )
+}
+
+/// The yield fact the marker records (#607): an enable WANTED face-on-lock and
+/// the dedicated lane suppressed the wiring. Testable core so the complement
+/// property with the effective want stays pinned.
+fn marker_face_lock_intent_for(want_face_lock: bool, yielded: bool) -> bool {
+    want_face_lock && yielded
+}
+
+/// Whether THIS apply should record the yield intent.
+pub(crate) fn marker_face_lock_intent(want_face_lock: bool) -> bool {
+    marker_face_lock_intent_for(want_face_lock, stock_lane_yielded())
+}
+
+/// The reclaim read, as posted on #607: intent recorded, omarchy, the
+/// dedicated lane gone, the stock lane not wired. Testable core; the caller
+/// supplies "marker present" by having read one at all.
+fn lane_reclaim_for(
+    face_lock_intent: bool,
+    omarchy: bool,
+    face_lane_present: bool,
+    stock_lane_wired: bool,
+) -> bool {
+    face_lock_intent && omarchy && !face_lane_present && !stock_lane_wired
+}
+
+/// The reverse regression: the dedicated lane APPEARED while our face line
+/// still sits in the stock lane. Reconcile then re-applies, and the apply's
+/// own yield removes the stock line. Only for a lane the marker says is ours
+/// (`with_lock`) and a face want that still holds; testable core. The want is
+/// a closure so production can keep the daemon roundtrip (`wants()`) off the
+/// common path: `&&` short-circuits and never calls it unless the four cheap
+/// facts already demand a decision.
+fn lane_yield_for<F: FnOnce() -> bool>(
+    omarchy: bool,
+    face_lane_present: bool,
+    stock_lane_wired: bool,
+    with_lock: bool,
+    face_lock_wanted: F,
+) -> bool {
+    omarchy && face_lane_present && stock_lane_wired && with_lock && face_lock_wanted()
+}
 /// GDM uses a SEPARATE PAM service for fingerprint logins (`gdm-fingerprint`),
 /// distinct from `gdm-password` (password/face). It runs pam_fprintd then
 /// pam_gnome_keyring, which finds no password and leaves the wallet locked. We
@@ -201,15 +264,26 @@ fn wired_marker_path() -> std::path::PathBuf {
     irlume_common::state_dir().join("login.wired")
 }
 
+/// The facts the self-heal marker records (#607 grew `face_lock_intent`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WiredMarker {
+    pub(crate) sudo: bool,
+    pub(crate) polkit: bool,
+    /// Whether the lock surface is OBSERVED wired. Stays an observation: the
+    /// invariant `with_lock=true` implies a surface irlume really wired is
+    /// what keeps reconcile from chasing a lock screen that was never ours.
+    pub(crate) lock: bool,
+    /// Whether an enable WANTED face-on-lock and the wiring was suppressed
+    /// because Omarchy's dedicated face lane exists (#607). The recorded
+    /// intent reconcile replays when that lane later disappears; absent in
+    /// markers written before #607, defaulting false.
+    pub(crate) face_lock_intent: bool,
+}
+
 /// Persist (on enable) or remove (on disable) the wiring marker. The body is a
 /// tiny stable key=value record of the extra scopes so reconcile re-applies the
 /// same `--with-sudo` / `--with-polkit` choice, not a bare login wiring.
-pub(crate) fn write_wired_marker(
-    enable: bool,
-    with_sudo: bool,
-    with_polkit: bool,
-    with_lock: bool,
-) {
+pub(crate) fn write_wired_marker(enable: bool, marker: &WiredMarker) {
     let path = wired_marker_path();
     if !enable {
         let _ = std::fs::remove_file(&path);
@@ -218,11 +292,19 @@ pub(crate) fn write_wired_marker(
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // with_lock records whether we actually wired the KDE lock screen, so a later
+    let WiredMarker {
+        sudo: with_sudo,
+        polkit: with_polkit,
+        lock: with_lock,
+        face_lock_intent,
+    } = marker;
+    // with_lock records whether we actually wired the lock screen, so a later
     // absence of /etc/pam.d/kde is only a regression when it was ours to maintain
     // (a Plasma package's vendor /usr/lib/pam.d/kde on a GNOME box must not read
     // as a regression and loop reconcile forever).
-    let body = format!("with_sudo={with_sudo}\nwith_polkit={with_polkit}\nwith_lock={with_lock}\n");
+    let body = format!(
+        "with_sudo={with_sudo}\nwith_polkit={with_polkit}\nwith_lock={with_lock}\nface_lock_intent={face_lock_intent}\n"
+    );
     // 0600, root-owned (enable/reconcile run as root): the marker must not be
     // plantable by a non-root user, since reconcile trusts its with_sudo flag.
     // A silent failure would leave self-heal disabled without the user knowing,
@@ -241,12 +323,12 @@ pub(crate) fn write_wired_marker(
     }
 }
 
-/// Re-read the marker's recorded flags. Returns `None` when login was never
+/// Re-read the marker's recorded facts. Returns `None` when login was never
 /// enabled (no marker), so reconcile does nothing on machines that opted out.
-pub(crate) fn read_wired_marker() -> Option<(bool, bool, bool)> {
+pub(crate) fn read_wired_marker() -> Option<WiredMarker> {
     let path = wired_marker_path();
     // In production (default state dir) the marker must be root-owned: reconcile
-    // acts on its with_sudo flag as root, so a marker a non-root user could plant
+    // acts on its sudo flag as root, so a marker a non-root user could plant
     // (were /var/lib/irlume perms ever to slip) must not drive wiring. Skipped
     // under an IRLUME_STATE_DIR sandbox (tests/dev), where it is user-owned and
     // reconcile never runs from the system path unit anyway.
@@ -270,8 +352,15 @@ pub(crate) fn read_wired_marker() -> Option<(bool, bool, bool)> {
     };
     // with_lock absent in a marker written before this field existed: default
     // false, so an old marker never triggers a false lock-screen regression; the
-    // next `login enable` / adopt rewrites it with the real value.
-    Some((flag("with_sudo"), flag("with_polkit"), flag("with_lock")))
+    // next `login enable` / adopt rewrites it with the real value. Same default
+    // for face_lock_intent (#607): an old marker records no yield, so it can
+    // never drive a reclaim on its own.
+    Some(WiredMarker {
+        sudo: flag("with_sudo"),
+        polkit: flag("with_polkit"),
+        lock: flag("with_lock"),
+        face_lock_intent: flag("face_lock_intent"),
+    })
 }
 
 /// Idempotent repair entry point, meant to run unattended from a systemd path
@@ -289,7 +378,13 @@ fn reconcile() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let Some((with_sudo, with_polkit, with_lock)) = read_wired_marker() else {
+    let Some(WiredMarker {
+        sudo: with_sudo,
+        polkit: with_polkit,
+        lock: with_lock,
+        face_lock_intent,
+    }) = read_wired_marker()
+    else {
         // No marker. Two sub-cases:
         //  - Login IS currently wired (an upgrade from a pre-marker version, or
         //    a hand-wired install): ADOPT the existing wiring into a marker so a
@@ -313,7 +408,15 @@ fn reconcile() -> ExitCode {
         let (lock_svc, _) = lock_surface();
         let with_lock =
             Path::new(lock_svc.etc).exists() && file_has_module(Path::new(lock_svc.etc));
-        write_wired_marker(true, with_sudo, with_polkit, with_lock);
+        write_wired_marker(
+            true,
+            &WiredMarker {
+                sudo: with_sudo,
+                polkit: with_polkit,
+                lock: with_lock,
+                face_lock_intent: false,
+            },
+        );
         eprintln!(
             "[login] adopted the existing face-login wiring into the self-heal marker \
              (sudo={with_sudo}, polkit={with_polkit}, lock={with_lock}); a future distro PAM \
@@ -334,15 +437,35 @@ fn reconcile() -> ExitCode {
     let with_sudo = with_sudo || file_sudo;
     let with_polkit = with_polkit || file_polkit;
     if adopted && effective_uid() == 0 {
-        write_wired_marker(true, with_sudo, with_polkit, with_lock);
+        write_wired_marker(
+            true,
+            &WiredMarker {
+                sudo: with_sudo,
+                polkit: with_polkit,
+                lock: with_lock,
+                face_lock_intent,
+            },
+        );
         eprintln!(
             "[login] adopted wired surfaces the marker missed \
              (sudo={with_sudo}, polkit={with_polkit})"
         );
     }
+    // #607: the Omarchy lane pair is its own regression shape. The lane facts
+    // are read once here and given to both pure cores, so this check and
+    // `reconcile_needed` cannot disagree about them.
+    let omarchy = irlume_common::platform::omarchy_present();
+    let face_lane_present = Path::new(OMARCHY_FACE_LANE).exists();
+    let stock_wired = lock_wired();
+    let reclaim = lane_reclaim_for(face_lock_intent, omarchy, face_lane_present, stock_wired);
+    let lane_yield = lane_yield_for(omarchy, face_lane_present, stock_wired, with_lock, || {
+        wants().face_lock
+    });
     if active_login_wired()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)
+        && !reclaim
+        && !lane_yield
     {
         // Still intact; the common case after a spurious file-change event.
         // Every surface the marker claims must be checked, not just the login
@@ -354,7 +477,13 @@ fn reconcile() -> ExitCode {
         eprintln!("[login] reconcile needs root; run: sudo irlume login reconcile");
         return ExitCode::FAILURE;
     }
-    eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
+    if reclaim {
+        eprintln!("[login] the dedicated Omarchy face lane is gone; restoring the stock lock lane");
+    } else if lane_yield {
+        eprintln!("[login] the dedicated Omarchy face lane exists; yielding the stock lock lane");
+    } else {
+        eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
+    }
     // The lock is already held above; taking it again would deadlock.
     act_holding_lock(true, true, with_sudo, with_polkit)
 }
@@ -497,14 +626,27 @@ fn surfaces_regressed(
 /// condition `login reconcile` repairs. The TUI's Repair tab uses this to offer
 /// the fix.
 pub(crate) fn reconcile_needed() -> bool {
-    match read_wired_marker() {
-        Some((with_sudo, with_polkit, with_lock)) => {
-            !active_login_wired()
-                || lockscreen_regressed(with_lock)
-                || wired_surface_regressed(with_sudo, with_polkit)
-        }
-        None => false,
-    }
+    let Some(WiredMarker {
+        sudo: with_sudo,
+        polkit: with_polkit,
+        lock: with_lock,
+        face_lock_intent,
+    }) = read_wired_marker()
+    else {
+        return false;
+    };
+    // The same #607 lane facts reconcile reads, so the TUI Repair offer and
+    // the self-heal itself cannot disagree.
+    let omarchy = irlume_common::platform::omarchy_present();
+    let face_lane_present = Path::new(OMARCHY_FACE_LANE).exists();
+    let stock_wired = lock_wired();
+    !active_login_wired()
+        || lockscreen_regressed(with_lock)
+        || wired_surface_regressed(with_sudo, with_polkit)
+        || lane_reclaim_for(face_lock_intent, omarchy, face_lane_present, stock_wired)
+        || lane_yield_for(omarchy, face_lane_present, stock_wired, with_lock, || {
+            wants().face_lock
+        })
 }
 
 pub(crate) fn login_wired() -> bool {
@@ -909,7 +1051,14 @@ fn walk_surfaces(enable: bool, with_sudo: bool, with_polkit: bool, visit: &mut S
         visit(s, ROLE_LOGIN_FP, &fp_wire, fp_keyring);
     }
     let (lock_svc, lock_wire) = lock_surface();
-    visit(lock_svc, ROLE_LOCK, &lock_wire, face_lock);
+    // #607: the dedicated Omarchy face lane owns face-on-lock when it exists,
+    // so the stock lane neither gains nor keeps our line (want=false unwires).
+    visit(
+        lock_svc,
+        ROLE_LOCK,
+        &lock_wire,
+        face_lock && !stock_lane_yielded(),
+    );
     if sudo_in_scope(enable, with_sudo) {
         visit(
             &Svc {
@@ -1423,7 +1572,21 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
     // A separate lock service (KDE `kde`) is a WARM screen unlock: the module
     // short-circuits (no `kr`), so the keyring (already open) isn't re-touched.
     let (lock_svc, lock_wire) = lock_surface();
-    do_svc(lock_svc, &lock_wire, want_face_lock);
+    // #607: with Omarchy's dedicated face lane present, the stock password lane
+    // yields: want=false means unwire, which also removes our line if an older
+    // enable had put it there.
+    let lock_lane_yielded = want_face_lock && stock_lane_yielded();
+    do_svc(
+        lock_svc,
+        &lock_wire,
+        want_face_lock && !stock_lane_yielded(),
+    );
+    if lock_lane_yielded {
+        println!(
+            "  omarchy: the dedicated face lane ({OMARCHY_FACE_LANE}) owns the lock screen;\n  \
+             leaving the stock password lane untouched; removing the dedicated lane restores it"
+        );
+    }
     if sudo_in_scope(enable, with_sudo) {
         match wire_service(
             &Svc {
@@ -1487,9 +1650,29 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
             let obs_sudo = Path::new(SUDO).exists() && file_has_module(Path::new(SUDO));
             let obs_polkit = polkit_wired() == Some(true);
             let obs_lock = lock_wired();
-            write_wired_marker(enable, obs_sudo, obs_polkit, obs_lock);
+            // #607: alongside the observed facts, record the yield intent when
+            // this apply wanted face-on-lock and the dedicated Omarchy lane
+            // suppressed it, so a later lane removal can reclaim. Everywhere
+            // else the marker stays purely observational.
+            write_wired_marker(
+                true,
+                &WiredMarker {
+                    sudo: obs_sudo,
+                    polkit: obs_polkit,
+                    lock: obs_lock,
+                    face_lock_intent: marker_face_lock_intent(want_face_lock),
+                },
+            );
         } else {
-            write_wired_marker(enable, with_sudo, with_polkit, want_face_lock);
+            write_wired_marker(
+                false,
+                &WiredMarker {
+                    sudo: with_sudo,
+                    polkit: with_polkit,
+                    lock: want_face_lock,
+                    face_lock_intent: false,
+                },
+            );
         }
         // Say it at the moment the user wired it, not only when they next run
         // `login status`: a wallet that still prompts after `enable --apply`
@@ -4419,23 +4602,231 @@ auth required pam_fprintd.so\n\
         assert_eq!(read_wired_marker(), None);
         // Enable with only --with-polkit is recorded (sudo=false, polkit=true,
         // lock=false).
-        write_wired_marker(true, false, true, false);
-        assert_eq!(read_wired_marker(), Some((false, true, false)));
+        write_wired_marker(
+            true,
+            &WiredMarker {
+                sudo: false,
+                polkit: true,
+                lock: false,
+                face_lock_intent: false,
+            },
+        );
+        assert_eq!(
+            read_wired_marker(),
+            Some(WiredMarker {
+                sudo: false,
+                polkit: true,
+                lock: false,
+                face_lock_intent: false,
+            })
+        );
         // Re-enable with both flags + the lock screen overwrites cleanly.
-        write_wired_marker(true, true, true, true);
-        assert_eq!(read_wired_marker(), Some((true, true, true)));
+        write_wired_marker(
+            true,
+            &WiredMarker {
+                sudo: true,
+                polkit: true,
+                lock: true,
+                face_lock_intent: false,
+            },
+        );
+        assert_eq!(
+            read_wired_marker(),
+            Some(WiredMarker {
+                sudo: true,
+                polkit: true,
+                lock: true,
+                face_lock_intent: false,
+            })
+        );
         // A marker written before with_lock existed (only the two flags) reads
         // back with lock=false, so it never triggers a false lock regression.
         irlume_common::write_0600(&wired_marker_path(), b"with_sudo=true\nwith_polkit=false\n")
             .unwrap();
-        assert_eq!(read_wired_marker(), Some((true, false, false)));
+        assert_eq!(
+            read_wired_marker(),
+            Some(WiredMarker {
+                sudo: true,
+                polkit: false,
+                lock: false,
+                face_lock_intent: false,
+            })
+        );
         // Disable clears the marker so the self-heal service stays quiet.
-        write_wired_marker(false, false, false, false);
+        write_wired_marker(false, &WiredMarker::default());
         assert_eq!(read_wired_marker(), None);
         match old {
             Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
             None => std::env::remove_var("IRLUME_STATE_DIR"),
         }
+    }
+
+    // ---- #607: yield the stock Omarchy lock lane to the dedicated lane ----
+
+    #[test]
+    fn omarchy_dedicated_lane_yields_only_when_both_facts_hold() {
+        assert!(!stock_lane_yielded_for(false, false));
+        assert!(
+            !stock_lane_yielded_for(false, true),
+            "a non-Omarchy host never yields"
+        );
+        assert!(
+            !stock_lane_yielded_for(true, false),
+            "no dedicated lane, nothing to yield to"
+        );
+        assert!(stock_lane_yielded_for(true, true));
+    }
+
+    /// The effective lock want and the recorded yield intent are complements:
+    /// exactly one of them is true whenever face-on-lock was wanted, and the
+    /// intent can never survive into a state where the wiring also happened.
+    #[test]
+    fn the_effective_lock_want_and_the_yield_intent_partition_face_lock() {
+        for face_lock in [false, true] {
+            for omarchy in [false, true] {
+                for lane in [false, true] {
+                    let yielded = stock_lane_yielded_for(omarchy, lane);
+                    let effective = face_lock && !yielded;
+                    let intent = marker_face_lock_intent_for(face_lock, yielded);
+                    assert!(
+                        !(effective && intent),
+                        "wired and yielded at once: face_lock={face_lock} omarchy={omarchy} lane={lane}"
+                    );
+                    assert_eq!(
+                        effective || intent,
+                        face_lock,
+                        "face_lock={face_lock} omarchy={omarchy} lane={lane}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wired_marker_round_trips_face_lock_intent_and_defaults_false() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TestDir::new("wired-marker-intent");
+        let old = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &dir.0);
+        // An enable that wanted face-on-lock but yielded to the dedicated lane
+        // records the intent, with the observed lock still false.
+        write_wired_marker(
+            true,
+            &WiredMarker {
+                sudo: false,
+                polkit: false,
+                lock: false,
+                face_lock_intent: true,
+            },
+        );
+        assert_eq!(
+            read_wired_marker(),
+            Some(WiredMarker {
+                sudo: false,
+                polkit: false,
+                lock: false,
+                face_lock_intent: true,
+            })
+        );
+        // A marker written before #607 (no intent line) reads intent=false, so
+        // an old marker can never trigger a reclaim on its own.
+        irlume_common::write_0600(
+            &wired_marker_path(),
+            b"with_sudo=true\nwith_polkit=false\nwith_lock=true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_wired_marker(),
+            Some(WiredMarker {
+                sudo: true,
+                polkit: false,
+                lock: true,
+                face_lock_intent: false,
+            })
+        );
+        match old {
+            Some(v) => std::env::set_var("IRLUME_STATE_DIR", v),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+    }
+
+    /// The reclaim is the exact posted read: marker present (the caller's
+    /// context), intent recorded, omarchy, dedicated lane gone, stock lane not
+    /// wired. Every missing fact must veto it.
+    #[test]
+    fn reclaim_needs_every_condition_of_the_posted_read() {
+        assert!(lane_reclaim_for(true, true, false, false));
+        assert!(
+            !lane_reclaim_for(false, true, false, false),
+            "no recorded intent, no reclaim"
+        );
+        assert!(!lane_reclaim_for(true, false, false, false), "not omarchy");
+        assert!(
+            !lane_reclaim_for(true, true, true, false),
+            "the dedicated lane still exists"
+        );
+        assert!(
+            !lane_reclaim_for(true, true, false, true),
+            "the stock lane is already wired"
+        );
+    }
+
+    /// The reverse direction: the dedicated lane APPEARED while our face line
+    /// sits in the stock lane. Only a lane we maintain, for a face want that
+    /// still holds, on omarchy, with something to remove.
+    #[test]
+    fn yield_on_lane_appear_needs_our_wire_and_a_live_face_want() {
+        assert!(lane_yield_for(true, true, true, true, || true));
+        assert!(
+            !lane_yield_for(false, true, true, true, || true),
+            "not omarchy"
+        );
+        assert!(
+            !lane_yield_for(true, false, true, true, || true),
+            "no dedicated lane"
+        );
+        assert!(
+            !lane_yield_for(true, true, false, true, || true),
+            "stock lane not wired: nothing to yield"
+        );
+        assert!(
+            !lane_yield_for(true, true, true, false, || true),
+            "the marker never said the lock was ours"
+        );
+        assert!(
+            !lane_yield_for(true, true, true, true, || false),
+            "face-on-lock is no longer wanted"
+        );
+        // Laziness is part of the contract: the want probe must never run when
+        // the cheap facts already decided (production points it at the daemon).
+        let mut probed = false;
+        assert!(!lane_yield_for(true, true, true, false, || {
+            probed = true;
+            true
+        }));
+        assert!(!probed, "the want probe ran although with_lock=false");
+    }
+
+    /// The path unit must watch both Omarchy lanes so setup and removal reach
+    /// reconcile without waiting for the timer backstop. Pinned from the repo
+    /// because nothing else keeps the unit's list honest against the surfaces.
+    #[test]
+    fn reconcile_path_unit_watches_both_omarchy_lanes() {
+        let unit = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/systemd/irlume-reconcile.path"
+        ))
+        .expect("the unit file ships in the repo");
+        assert!(
+            unit.contains("PathModified=/etc/pam.d/omarchy-lock-face"),
+            "setup of the dedicated lane must wake reconcile"
+        );
+        assert!(
+            unit.contains("PathModified=/etc/pam.d/omarchy-lock-password"),
+            "removal of the dedicated lane must wake reconcile"
+        );
     }
 
     #[test]

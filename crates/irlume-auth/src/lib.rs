@@ -99,6 +99,12 @@ pub struct Engine {
     /// threading a verdict through every one of them would obscure them for no
     /// gain. `NoGesture` is the fail-closed default and reset value.
     head_consent_before_match: HeadConsentVerdict,
+    /// The facts snapshot of the most recent authentication attempt's
+    /// assessment. Set where the assessment binds in `authenticate_once`,
+    /// read by the retry loop to write the situation line of a FAILED
+    /// attempt (#616 step 2); every attempt refreshes it before any Outcome
+    /// exists, so it can never be read stale.
+    last_attempt_facts: AttemptFacts,
     /// Asked between whole captures: "should this long operation stop now?".
     ///
     /// The daemon points this at its arbiter so an enrolment yields the camera
@@ -304,6 +310,129 @@ struct CapturedScan {
 /// Physical IR presence alone must not undo that request-scoped decision.
 fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
     ir_available && !force_rgb_only
+}
+
+/// One failed authentication attempt's situation, in the stable vocabulary a
+/// person reads in `irlume logs` (#616 step 2). Reporting only: derived from
+/// facts the attempt already measured, it gates nothing, scores nothing, and
+/// moves no bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptSituation {
+    NoFace,
+    TooFar,
+    OffCenter,
+    LookingAway,
+    TooDark,
+    GlintBelow,
+    BelowScore,
+    Spoof,
+    Declined,
+    Other,
+}
+
+/// The situation label exactly as it appears in the journal: one stable
+/// string each, so `irlume logs` greps by situation.
+const fn attempt_situation_label(situation: AttemptSituation) -> &'static str {
+    match situation {
+        AttemptSituation::NoFace => "no face",
+        AttemptSituation::TooFar => "too far",
+        AttemptSituation::OffCenter => "off-center",
+        AttemptSituation::LookingAway => "looking away",
+        AttemptSituation::TooDark => "too dark",
+        AttemptSituation::GlintBelow => "glint below",
+        AttemptSituation::BelowScore => "below score",
+        AttemptSituation::Spoof => "spoof",
+        AttemptSituation::Declined => "declined",
+        AttemptSituation::Other => "other",
+    }
+}
+
+/// The measured facts one attempt's situation is read from: a Copy snapshot
+/// of the [`Assessment`] the attempt produced. The RGB face center is
+/// normalized (0..1), exactly as the liveness `FaceBox` carries it.
+#[derive(Debug, Clone, Copy, Default)]
+struct AttemptFacts {
+    rgb_face: Option<(f32, f32)>,
+    face_frac: f32,
+    yaw_asym: f32,
+    rgb_face_brightness: f32,
+    glint: Option<f32>,
+    ir_bright: f32,
+}
+
+impl AttemptFacts {
+    fn from_assessment(a: &Assessment) -> Self {
+        Self {
+            rgb_face: a.signals.rgb_face.map(|f| (f.cx, f.cy)),
+            face_frac: a.signals.face_frac,
+            yaw_asym: a.signals.head_yaw_asym,
+            rgb_face_brightness: a.signals.rgb_face_brightness,
+            glint: a.signals.ir_eye_glint,
+            ir_bright: a.ir_brightness,
+        }
+    }
+}
+
+/// Classify one failed attempt. Precedence mirrors the framing guide's
+/// severity order, usability situations first, so a genuine user's #617
+/// shape (a Spoof verdict on a turned head) reads `looking away` rather
+/// than the attack label. Dark-path attempts enter with no RGB face by
+/// design and fall through to the IR facts and the outcome kind.
+fn auth_attempt_situation(kind: OutcomeKind, f: &AttemptFacts) -> AttemptSituation {
+    if kind == OutcomeKind::GestureDeclined {
+        return AttemptSituation::Declined;
+    }
+    // No detection in either spectrum: face_frac is the IR face's share on
+    // the pair path and the RGB face's on the RGB-only path, so zero with no
+    // RGB face means nothing was seen anywhere.
+    if kind == OutcomeKind::NoFace || (f.rgb_face.is_none() && f.face_frac <= 0.0) {
+        return AttemptSituation::NoFace;
+    }
+    if f.face_frac > 0.0 && f.face_frac < MIN_FRAC {
+        return AttemptSituation::TooFar;
+    }
+    if let Some((cx, cy)) = f.rgb_face {
+        if (cx - 0.5).abs() > CENTER_TOL || (cy - 0.5).abs() > CENTER_TOL {
+            return AttemptSituation::OffCenter;
+        }
+    }
+    if f.yaw_asym > FRAME_YAW_ASYM_MAX {
+        return AttemptSituation::LookingAway;
+    }
+    if f.rgb_face.is_some() && f.rgb_face_brightness < DIM {
+        return AttemptSituation::TooDark;
+    }
+    if f.glint.is_some_and(|g| g < irlume_liveness::GLINT_MIN) {
+        return AttemptSituation::GlintBelow;
+    }
+    if kind == OutcomeKind::BelowThreshold {
+        return AttemptSituation::BelowScore;
+    }
+    if matches!(kind, OutcomeKind::Spoof | OutcomeKind::SpoofNoIrFace) {
+        return AttemptSituation::Spoof;
+    }
+    AttemptSituation::Other
+}
+
+/// One journal line per failed attempt (#616 step 2): the situation label,
+/// then the measured numbers in a fixed order. Numbers only; no threshold
+/// values (those stay in the verdict lines). A glint that railed or was
+/// never measured prints `n/a`, the #222 rule: a maximum nobody could
+/// measure must not appear as one that was.
+fn attempt_situation_line(kind: OutcomeKind, score: f32, f: &AttemptFacts) -> String {
+    format!(
+        "attempt: {}; face_frac={:.2} yaw={:.2} glint={} ir_bright={:.0} rgb_bright={:.0} \
+         score={:.2}",
+        attempt_situation_label(auth_attempt_situation(kind, f)),
+        f.face_frac,
+        f.yaw_asym,
+        f.glint
+            .map(|g| format!("{g:.2}"))
+            .unwrap_or_else(|| "n/a".into()),
+        f.ir_bright,
+        f.rgb_face_brightness,
+        score,
+    )
 }
 
 /// A dark IR preflight would store an RGB-only enrollment. On a pair that
@@ -2712,6 +2841,7 @@ impl Engine {
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             head_consent_before_match: HeadConsentVerdict::NoGesture,
             stop_requested: None,
+            last_attempt_facts: AttemptFacts::default(),
         })
     }
 
@@ -5174,6 +5304,16 @@ impl Engine {
                 }
             };
             *costliest_attempt = (*costliest_attempt).max(attempt_started.elapsed());
+            // One situation line per FAILED attempt (#616 step 2), including
+            // attempts the grace window retries: the "why did it fail" a
+            // person reads in `irlume logs`, from the facts this attempt
+            // measured. A granted attempt says nothing.
+            if !out.granted {
+                irlume_common::dlog!(
+                    "{}",
+                    attempt_situation_line(out.kind, out.score, &self.last_attempt_facts)
+                );
+            }
             let expired = std::time::Instant::now() >= deadline;
             let retry_wont_fit = !expired
                 && presence_retryable(&out)
@@ -5246,6 +5386,9 @@ impl Engine {
             }
             Err(error) => return Err(error.into_inner()),
         };
+        // The situation line of a failed attempt reads THIS attempt's facts
+        // (#616 step 2): snapshot them before any Outcome branch returns.
+        self.last_attempt_facts = AttemptFacts::from_assessment(&a);
 
         // An unreadable frame is reported as unreadable before anything derived
         // from it is consulted. Uncertain is the only verdict this promotes; a
@@ -6731,13 +6874,11 @@ impl Engine {
         user: Option<&str>,
     ) -> irlume_common::Result<irlume_common::PositionReport> {
         use irlume_common::PositionReport;
-        // Face width as a fraction of frame width.
-        const MIN_FRAC: f32 = 0.12;
+        // Face width as a fraction of frame width; center tolerance; dim-face
+        // luma bound. MIN_FRAC, CENTER_TOL, and DIM are module-level (shared
+        // with the attempt situation line, #616 step 2); only the upper
+        // bounds stay local to the guide.
         const MAX_FRAC: f32 = 0.55;
-        // Max face-center offset from frame center, fraction of frame size.
-        const CENTER_TOL: f32 = 0.18;
-        // Mean face luma bounds, 0-255 BT.601.
-        const DIM: f32 = 55.0;
         const BRIGHT: f32 = 235.0;
         // This user's calibrated pitch neutral, if any (read-only; absent = global default).
         let pitch_neutral = user
@@ -6849,6 +6990,18 @@ impl Engine {
 /// recentres a tighter `neutral ± PITCH_TOL` window on the user's own camera.
 /// Yaw is camera-independent (0 = frontal on any rig) so it stays moderately tight.
 const FRAME_YAW_ASYM_MAX: f32 = 0.36;
+/// Face width as a fraction of frame width below which a face is too far
+/// away to be useful. The framing guide's bar (`position_sample`), hoisted
+/// module-level so the attempt situation line (#616 step 2) names `too far`
+/// by the SAME bar the enrollment guide coaches to.
+const MIN_FRAC: f32 = 0.12;
+/// Max face-center offset from frame center, fraction of frame size, before
+/// the framing guide says `Center your face in the frame`; the situation
+/// line's `off-center` uses it unchanged.
+const CENTER_TOL: f32 = 0.18;
+/// Mean face luma (0-255 BT.601) below which the framing guide says the face
+/// is too dim; the situation line's `too dark` uses it unchanged.
+const DIM: f32 = 55.0;
 const FRAME_PITCH_MIN: f32 = 0.28;
 const FRAME_PITCH_MAX: f32 = 0.75;
 /// Half-width of the pitch window once the user's neutral is known. Tighter than
@@ -10921,6 +11074,230 @@ mod engine_tests {
         assert!(selection.is_sequential());
         assert_eq!(selection.source, RGB_ONLY_ENROLLMENT_CAPTURE_MODE_SOURCE);
         assert_ne!(selection.source, "default");
+    }
+
+    #[test]
+    fn attempt_situation_line_names_every_vocabulary_shape() {
+        use super::{attempt_situation_line, AttemptFacts, AttemptSituation, OutcomeKind};
+        // The #616 step 2 vocabulary: one stable label per failed-attempt
+        // shape, the measured numbers alongside, never a threshold value.
+        let frontal = AttemptFacts {
+            rgb_face: Some((0.5, 0.5)),
+            face_frac: 0.30,
+            yaw_asym: 0.10,
+            rgb_face_brightness: 120.0,
+            glint: Some(250.0),
+            ir_bright: 140.0,
+        };
+        let line = |kind, score, facts: &AttemptFacts| {
+            let text = attempt_situation_line(kind, score, facts);
+            assert!(text.starts_with("attempt: "), "stable prefix: {text}");
+            text
+        };
+        assert!(line(OutcomeKind::GestureDeclined, 0.0, &frontal).starts_with("attempt: declined;"));
+        assert!(line(
+            OutcomeKind::NoFace,
+            0.0,
+            &AttemptFacts {
+                rgb_face: None,
+                ..frontal
+            }
+        )
+        .starts_with("attempt: no face;"));
+        assert!(line(
+            OutcomeKind::Uncertain,
+            0.0,
+            &AttemptFacts {
+                face_frac: 0.08,
+                ..frontal
+            }
+        )
+        .starts_with("attempt: too far;"));
+        assert!(line(
+            OutcomeKind::Uncertain,
+            0.0,
+            &AttemptFacts {
+                rgb_face: Some((0.85, 0.5)),
+                ..frontal
+            }
+        )
+        .starts_with("attempt: off-center;"));
+        assert!(line(
+            OutcomeKind::Spoof,
+            0.0,
+            &AttemptFacts {
+                yaw_asym: 0.52,
+                glint: Some(72.0),
+                ..frontal
+            }
+        )
+        .starts_with("attempt: looking away;"));
+        assert!(line(
+            OutcomeKind::Uncertain,
+            0.0,
+            &AttemptFacts {
+                rgb_face_brightness: 30.0,
+                ..frontal
+            }
+        )
+        .starts_with("attempt: too dark;"));
+        assert!(line(
+            OutcomeKind::Uncertain,
+            0.0,
+            &AttemptFacts {
+                glint: Some(72.0),
+                ..frontal
+            }
+        )
+        .starts_with("attempt: glint below;"));
+        assert!(
+            line(OutcomeKind::BelowThreshold, 0.44, &frontal).starts_with("attempt: below score;")
+        );
+        assert!(line(OutcomeKind::Spoof, 0.0, &frontal).starts_with("attempt: spoof;"));
+        assert!(line(OutcomeKind::OtherDeny, 0.0, &frontal).starts_with("attempt: other;"));
+        // Every vocabulary label is reachable and the enum stays closed.
+        assert_eq!(
+            super::attempt_situation_label(AttemptSituation::LookingAway),
+            "looking away"
+        );
+    }
+
+    #[test]
+    fn attempt_situation_line_is_numbers_only_and_stable() {
+        use super::{attempt_situation_line, AttemptFacts, OutcomeKind};
+        // One exact rendering pins the format: fixed field order, n/a for an
+        // unmeasured glint (a railed peak measured nothing, #222), and no
+        // threshold values anywhere in the line.
+        let facts = AttemptFacts {
+            rgb_face: None,
+            face_frac: 0.0,
+            yaw_asym: 0.10,
+            rgb_face_brightness: 0.0,
+            glint: None,
+            ir_bright: 140.0,
+        };
+        assert_eq!(
+            attempt_situation_line(OutcomeKind::NoFace, 0.0, &facts),
+            "attempt: no face; face_frac=0.00 yaw=0.10 glint=n/a ir_bright=140 rgb_bright=0 score=0.00"
+        );
+    }
+
+    #[test]
+    fn attempt_situation_precedence_explains_the_user_before_the_attack_label() {
+        use super::{auth_attempt_situation, AttemptFacts, AttemptSituation, OutcomeKind};
+        // The #617 lesson lives here too: a live person glancing sideways
+        // produced a Spoof verdict; the situation names looking away.
+        let turned = AttemptFacts {
+            rgb_face: Some((0.5, 0.5)),
+            face_frac: 0.30,
+            yaw_asym: 0.52,
+            rgb_face_brightness: 120.0,
+            glint: Some(72.0),
+            ir_bright: 140.0,
+        };
+        assert_eq!(
+            auth_attempt_situation(OutcomeKind::Spoof, &turned),
+            AttemptSituation::LookingAway
+        );
+        // The framing guide's severity order holds: a tiny face that is also
+        // off-center names too far first.
+        let messy = AttemptFacts {
+            face_frac: 0.08,
+            rgb_face: Some((0.85, 0.5)),
+            ..turned
+        };
+        assert_eq!(
+            auth_attempt_situation(OutcomeKind::Uncertain, &messy),
+            AttemptSituation::TooFar
+        );
+        // A genuine below-threshold miss with clean framing names below score.
+        let clean = AttemptFacts {
+            yaw_asym: 0.10,
+            glint: Some(250.0),
+            ..turned
+        };
+        assert_eq!(
+            auth_attempt_situation(OutcomeKind::BelowThreshold, &clean),
+            AttemptSituation::BelowScore
+        );
+        // The dark path enters with no RGB face by design; its failures are
+        // not "no face" when the IR side saw one.
+        assert_eq!(
+            auth_attempt_situation(
+                OutcomeKind::BelowThreshold,
+                &AttemptFacts {
+                    rgb_face: None,
+                    face_frac: 0.28,
+                    yaw_asym: 0.10,
+                    glint: Some(250.0),
+                    ..turned
+                }
+            ),
+            AttemptSituation::BelowScore
+        );
+        // No detection anywhere is no face, whatever the kind claims.
+        assert_eq!(
+            auth_attempt_situation(
+                OutcomeKind::Uncertain,
+                &AttemptFacts {
+                    rgb_face: None,
+                    face_frac: 0.0,
+                    glint: None,
+                    ir_bright: 0.0,
+                    ..turned
+                }
+            ),
+            AttemptSituation::NoFace
+        );
+    }
+
+    #[test]
+    fn attempt_facts_snapshot_the_assessment() {
+        use super::AttemptFacts;
+        use irlume_liveness::{FaceBox, Signals, Verdict};
+        let a = super::Assessment {
+            verdict: Verdict::Uncertain,
+            reason: "test".into(),
+            embedding: None,
+            ir_embedding: None,
+            signals: Signals {
+                rgb_face: Some(FaceBox {
+                    cx: 0.25,
+                    cy: 0.75,
+                    score: 0.9,
+                }),
+                ir_face: Some(FaceBox {
+                    cx: 0.5,
+                    cy: 0.5,
+                    score: 0.8,
+                }),
+                ir_face_brightness: 150.0,
+                ir_center_edge_ratio: 1.2,
+                ir_eye_glint: None,
+                head_yaw_asym: 0.42,
+                head_pitch_frac: 0.5,
+                ir_ambient: 30.0,
+                face_frac: 0.22,
+                ir_saturated_frac: None,
+                ir_ceiling_known: false,
+                rgb_face_brightness: 90.0,
+                rgb_moire_score: 0.0,
+                rgb_specular_frac: 0.0,
+            },
+            ir_center_edge_ratio: 1.2,
+            ir_brightness: 150.0,
+            ir_ambient_share: None,
+            rgb_frame_mean: 60.0,
+            shipped_ir_fake: None,
+            sequential_pair: false,
+        };
+        let facts = AttemptFacts::from_assessment(&a);
+        assert_eq!(facts.rgb_face, Some((0.25, 0.75)));
+        assert_eq!(facts.face_frac, 0.22);
+        assert_eq!(facts.yaw_asym, 0.42);
+        assert_eq!(facts.rgb_face_brightness, 90.0);
+        assert_eq!(facts.glint, None);
+        assert_eq!(facts.ir_bright, 150.0);
     }
 
     #[test]

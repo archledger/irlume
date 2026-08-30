@@ -3464,8 +3464,8 @@ fn enrollment_capture_uses_ir<E>(emitter: &Result<bool, E>) -> bool {
     !matches!(emitter, Ok(false))
 }
 
-fn prepare_enrollment_ir(device: &str) -> bool {
-    let emitter = irlume_auth::apply_known_ir_emitter(device);
+fn prepare_enrollment_ir(device: &str, det: &mut irlume_auth::Detector) -> bool {
+    let emitter = irlume_auth::apply_known_ir_emitter_subject_region(device, det);
     match &emitter {
         Ok(true) => {}
         Ok(false) => eprintln!(
@@ -4005,7 +4005,7 @@ fn dispatch_scoped(
                     &user,
                     profile,
                     want,
-                    || prepare_enrollment_ir(&ir_dev),
+                    |det| prepare_enrollment_ir(&ir_dev, det),
                     scope,
                 ) {
                     Ok(outcome) => enroll_response(outcome),
@@ -4072,8 +4072,8 @@ fn dispatch_scoped(
             report_enrollment,
         } => {
             let ir_dev = engine.ir_device().to_owned();
-            match engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), || {
-                prepare_enrollment_ir(&ir_dev)
+            match engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), |det| {
+                prepare_enrollment_ir(&ir_dev, det)
             }) {
                 // The structured reply, opted into: the TUI needs the
                 // ambient-lit count of EVERY scan for the #312 completion

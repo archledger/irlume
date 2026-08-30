@@ -8763,28 +8763,6 @@ pub fn list_ir_controls(device: &str) -> irlume_common::Result<Vec<String>> {
     ir_emitter::describe_units(device).map_err(|e| map_io(device, e))
 }
 
-/// Apply the KNOWN emitter control (env override, persisted conf, or the
-/// built-in table) and report whether IR came up lit.
-///
-/// This never searches for an unknown control, and nothing that runs without the
-/// user asking for it may ever do so. Blind extension-unit writes destroyed a
-/// reporter's camera in #159: guessed `SET_CUR` payloads on an undocumented
-/// vendor unit of a Lenovo ThinkPad camera left it unable to enumerate on the bus,
-/// and neither a power cycle nor the laptop's reset hole brought it back.
-///
-/// Discovery is now an explicit, acknowledged operation (`irlume ir-setup`), not
-/// a side effect of starting the daemon or enrolling a face. A dark IR frame
-/// means the room is dark, or nobody is in front of the camera, or the emitter
-/// needs a control this machine does not know. None of those justify writing
-/// guessed values to camera firmware.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn apply_known_ir_emitter(device: &str) -> irlume_common::Result<bool> {
-    let mean_of =
-        |f: &Frame| f.data.iter().map(|&p| p as f64).sum::<f64>() / f.data.len().max(1) as f64;
-    // capture_ir applies the known control on open; see `ir_emitter::enable`.
-    Ok(mean_of(&capture_ir(device)?) >= ir_emitter::IR_LIT_MEAN as f64)
-}
-
 /// Replicate an 8-bit greyscale buffer into interleaved RGB8 (for feeding the
 /// RGB-trained detector on an IR frame).
 pub fn grey_to_rgb(grey: &[u8]) -> Vec<u8> {

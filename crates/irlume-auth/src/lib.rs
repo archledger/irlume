@@ -10,23 +10,13 @@
 
 use irlume_common::config::HeadConsentPolicy;
 use irlume_liveness::{LivenessGate, Signals, Verdict};
-use irlume_vision::{align, Adapter, Detection, Detector, Embedder, Landmarks5, EMBED_DIM};
+use irlume_vision::{align, Adapter, Detection, Embedder, Landmarks5, EMBED_DIM};
 
 pub use irlume_camera::capture_qualification::{
     AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationMismatch,
     QualificationResolution, QualificationStore, QualificationStoreError, SequentialReason,
 };
 pub use irlume_camera::lease;
-/// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
-/// the daemon. See [`irlume_camera::setup_ir_emitter`].
-pub use irlume_camera::{
-    apply_known_ir_emitter, current_capture_qualification_context, list_ir_controls,
-    measure_capture_qualification_with_progress, measure_contention,
-    measure_contention_with_progress, no_progress, setup_ir_emitter, store_capture_mode,
-    store_capture_mode_if_absent, stored_capture_mode, stored_capture_qualification, CaptureMode,
-    CaptureModeOrigin, CaptureQualificationMeasurement, ContentionReport, MeasurementSource,
-    PairSample, Progress, StoreIfAbsent,
-};
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
 /// (#187), so this is the only path to a listing.
@@ -39,6 +29,16 @@ pub use irlume_camera::{
 /// devices without depending on the camera crate directly. See
 /// [`irlume_camera::select_pair`].
 pub use irlume_camera::{capabilities, device_identity, select_pair, select_rgb};
+/// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
+/// the daemon. See [`irlume_camera::setup_ir_emitter`].
+pub use irlume_camera::{
+    current_capture_qualification_context, list_ir_controls,
+    measure_capture_qualification_with_progress, measure_contention,
+    measure_contention_with_progress, no_progress, setup_ir_emitter, store_capture_mode,
+    store_capture_mode_if_absent, stored_capture_mode, stored_capture_qualification, CaptureMode,
+    CaptureModeOrigin, CaptureQualificationMeasurement, ContentionReport, MeasurementSource,
+    PairSample, Progress, StoreIfAbsent,
+};
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
@@ -133,6 +133,9 @@ impl Rescue {
 
 /// Assurance tier of this engine, derived from the available camera hardware.
 pub use irlume_core::biopolicy::Tier;
+/// The vision detector, re-exported for the daemon's enrollment preflight
+/// closure signature (#613: the preflight measures the detected face region).
+pub use irlume_vision::Detector;
 
 /// What one capture+assessment produced.
 pub struct Assessment {
@@ -471,6 +474,80 @@ fn pair_qualifies_concurrent(rgb_dev: &str, ir_dev: &str) -> bool {
         ))
     })();
     resolved.unwrap_or(false)
+}
+
+/// Mean of the GREY bytes inside a pixel bbox (x1, y1, x2, y2), clamped to
+/// the frame. Zero for a degenerate box: an empty region measures nothing
+/// and must not read as dark-by-arithmetic. Pure, so the #613 semantics
+/// (measure the subject, not the frame) are testable without a camera.
+fn grey_mean_in_bbox(data: &[u8], width: u32, height: u32, bbox: &[f32; 4]) -> f32 {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || data.len() < w * h {
+        return 0.0;
+    }
+    let clamp = |v: f32, max: usize| v.clamp(0.0, max as f32) as usize;
+    let (x1, y1, x2, y2) = (
+        clamp(bbox[0], w),
+        clamp(bbox[1], h),
+        clamp(bbox[2], w),
+        clamp(bbox[3], h),
+    );
+    let count = (x2.saturating_sub(x1)) * (y2.saturating_sub(y1));
+    if count == 0 {
+        return 0.0;
+    }
+    let sum: u64 = (y1..y2)
+        .flat_map(|y| (x1..x2).map(move |x| y * w + x))
+        .map(|i| data[i] as u64)
+        .sum();
+    sum as f32 / count as f32
+}
+
+/// The enrollment preflight's verdict from the detected face's region mean:
+/// lit when the subject is lit, dark only when a PRESENT face is unlit
+/// (#613/#618). `None` (no face in the frame) is inconclusive, never dark:
+/// an empty frame cannot testify about the emitter, and the dark refusal
+/// must not fire on it. Pure over the measured mean.
+fn ir_preflight_subject_lit(face_mean: Option<f32>) -> irlume_common::Result<bool> {
+    match face_mean {
+        Some(mean) => Ok(mean >= irlume_camera::ir_emitter::IR_LIT_MEAN),
+        None => Err(irlume_common::Error::Hardware(
+            "no face in the IR preflight frame; the emitter check is inconclusive".into(),
+        )),
+    }
+}
+
+/// Apply the KNOWN emitter control, capture one IR frame, and measure the
+/// SUBJECT: the mean inside the detected face's region (#613). An emitter
+/// lights the person, not the frame: on a camera whose working emitter
+/// lights only the face centre, the whole-frame mean reads ~20 while the
+/// face reads 137-158, which is what made the preflight call a working
+/// camera dark and store dead RGB-only profiles (#618).
+///
+/// This never searches for an unknown control: capture applies only the
+/// env override, persisted conf, or built-in table (#159's rule). A face
+/// the emitter does not light is the honest dark verdict; no face at all
+/// is inconclusive ([`ir_preflight_subject_lit`]).
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn apply_known_ir_emitter_subject_region(
+    device: &str,
+    det: &mut irlume_vision::Detector,
+) -> irlume_common::Result<bool> {
+    let frame = irlume_camera::capture_ir(device)?;
+    let grey_rgb = irlume_camera::grey_to_rgb(&frame.data);
+    let faces = det.detect(&align::RgbView {
+        data: &grey_rgb,
+        width: frame.width,
+        height: frame.height,
+    })?;
+    let face_mean = top_detection(&faces)
+        .map(|top| grey_mean_in_bbox(&frame.data, frame.width, frame.height, &top.bbox));
+    let verdict = ir_preflight_subject_lit(face_mean)?;
+    irlume_common::dlog!(
+        "preflight(ir subject): face_mean={:.0} lit={verdict}",
+        face_mean.unwrap_or(0.0)
+    );
+    Ok(verdict)
 }
 
 struct EnrollmentCapturePolicy<'a> {
@@ -6397,19 +6474,21 @@ impl Engine {
         profile_name: Option<String>,
         want: usize,
     ) -> irlume_common::Result<EnrollOutcome> {
-        self.enroll_profile_with_capture_policy(user, profile_name, want, || true, &())
+        self.enroll_profile_with_capture_policy(user, profile_name, want, |_| true, &())
     }
 
     /// Run a user-present IR readiness check only after the enrollment's
     /// storage-only refusal gates pass, then keep its answer for every capture
-    /// in this request.
+    /// in this request. The closure receives the engine's detector: the
+    /// preflight measures the detected FACE's region, not the whole frame
+    /// (#613), and detection needs the loaded model.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn enroll_profile_with_ir_preflight(
         &mut self,
         user: &str,
         profile_name: Option<String>,
         want: usize,
-        ir_preflight: impl FnOnce() -> bool,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
     ) -> irlume_common::Result<EnrollOutcome> {
         self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, &())
     }
@@ -6422,7 +6501,7 @@ impl Engine {
         user: &str,
         profile_name: Option<String>,
         want: usize,
-        ir_preflight: impl FnOnce() -> bool,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<EnrollOutcome> {
         self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, diagnostics)
@@ -6433,7 +6512,7 @@ impl Engine {
         user: &str,
         profile_name: Option<String>,
         want: usize,
-        ir_preflight: impl FnOnce() -> bool,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<EnrollOutcome> {
         use irlume_core::storage::{
@@ -6455,7 +6534,7 @@ impl Engine {
         // authenticate: refuse it before any camera work (#618). Only the
         // dark case pays the store read; the preflight itself still runs
         // only when an IR pair exists (the && short-circuits).
-        let preflight_dark = self.ir_available && !ir_preflight();
+        let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
         if preflight_dark {
             dark_ir_rgb_only_enrollment_refusal(|| {
                 pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
@@ -6724,7 +6803,7 @@ impl Engine {
         profile_name: &str,
         count: usize,
     ) -> irlume_common::Result<AddScanOutcome> {
-        self.add_scan_with_capture_policy(user, profile_name, count, || true)
+        self.add_scan_with_capture_policy(user, profile_name, count, |_| true)
     }
 
     /// Run a user-present IR readiness check only after the target profile and
@@ -6735,7 +6814,7 @@ impl Engine {
         user: &str,
         profile_name: &str,
         count: usize,
-        ir_preflight: impl FnOnce() -> bool,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
     ) -> irlume_common::Result<AddScanOutcome> {
         self.add_scan_with_capture_policy(user, profile_name, count, ir_preflight)
     }
@@ -6745,7 +6824,7 @@ impl Engine {
         user: &str,
         profile_name: &str,
         count: usize,
-        ir_preflight: impl FnOnce() -> bool,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
     ) -> irlume_common::Result<AddScanOutcome> {
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
         let mut enr = storage::load(user)?
@@ -6770,7 +6849,7 @@ impl Engine {
         // Same gate as enrollment (#618): a dark preflight on a
         // non-concurrent pair would add RGB-only scans to a profile that
         // authenticates by IR.
-        let preflight_dark = self.ir_available && !ir_preflight();
+        let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
         if preflight_dark {
             dark_ir_rgb_only_enrollment_refusal(|| {
                 pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
@@ -11029,7 +11108,7 @@ mod engine_tests {
                 "irlume-test-enroll",
                 Some("Work Laptop".into()),
                 3,
-                || {
+                |_| {
                     emitter_touched.set(true);
                     true
                 },
@@ -11301,6 +11380,64 @@ mod engine_tests {
     }
 
     #[test]
+    fn grey_mean_in_bbox_measures_only_the_face_region() {
+        use super::grey_mean_in_bbox;
+        // A 8x4 grey frame: dark everywhere except a bright face region.
+        let (w, h) = (8u32, 4u32);
+        let mut data = vec![10u8; (w * h) as usize];
+        // Face box: x 2..=5, y 1..=2 (pixels), all at 200.
+        for y in 1..=2 {
+            for x in 2..=5 {
+                data[(y * w + x) as usize] = 200;
+            }
+        }
+        let mean = grey_mean_in_bbox(&data, w, h, &[2.0, 1.0, 6.0, 3.0]);
+        assert_eq!(mean, 200.0, "the region mean, not the frame mean");
+        // The whole frame including the dark surround reads far lower: that
+        // gap is exactly the #613 defect this helper exists to close.
+        let whole = grey_mean_in_bbox(&data, w, h, &[0.0, 0.0, w as f32, h as f32]);
+        assert!(whole < 60.0, "whole-frame mean stays low: {whole}");
+        // Clamping: a box that runs past the frame edge measures exactly the
+        // pixels that exist. Hand-computed: x 2..8, y 1..2 holds four bright
+        // pixels (200) and two dark ones (10) => (4*200 + 2*10) / 6.
+        let clamped = grey_mean_in_bbox(&data, w, h, &[2.0, 1.0, 99.0, 2.0]);
+        assert!(
+            (clamped - 820.0 / 6.0).abs() < 0.01,
+            "hand-computed: {clamped}"
+        );
+        // A box entirely outside the face reads the surround, never indexes
+        // out of bounds.
+        assert_eq!(
+            grey_mean_in_bbox(&data, w, h, &[6.0, 3.0, 99.0, 99.0]),
+            10.0
+        );
+        // A degenerate box measures nothing and says so with 0.0.
+        assert_eq!(grey_mean_in_bbox(&data, w, h, &[3.0, 2.0, 3.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn subject_region_preflight_is_dark_only_for_a_present_unlit_face() {
+        use super::ir_preflight_subject_lit;
+        // #613's camera: the whole frame reads ~20 while the lit face reads
+        // 137-158. Measured at the face, the working camera is clearly lit.
+        assert!(matches!(ir_preflight_subject_lit(Some(137.0)), Ok(true)));
+        assert!(matches!(ir_preflight_subject_lit(Some(158.0)), Ok(true)));
+        // A present face the emitter does not light is the honest dark case
+        // (#618's refusal trigger): the sock measurement, face region 0.
+        assert!(matches!(ir_preflight_subject_lit(Some(19.0)), Ok(false)));
+        assert!(matches!(ir_preflight_subject_lit(Some(0.0)), Ok(false)));
+        // No face in the preflight frame is INCONCLUSIVE, never dark: an
+        // empty frame cannot testify about the emitter, and a dark refusal
+        // must not fire on it.
+        let no_face = ir_preflight_subject_lit(None);
+        assert!(no_face.is_err(), "no face is inconclusive: {no_face:?}");
+        assert!(
+            no_face.unwrap_err().to_string().contains("inconclusive"),
+            "the error names its meaning"
+        );
+    }
+
+    #[test]
     fn dark_ir_preflight_refuses_enrollment_that_could_never_authenticate() {
         let _g = env_guard();
         let mut s = shared();
@@ -11312,7 +11449,7 @@ mod engine_tests {
         // an IR-verified match, so that profile would be refused forever.
         let err = s
             .engine
-            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, || false)
+            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, |_| false)
             .unwrap_err();
         assert!(err.to_string().contains("authenticates by IR"), "{err}");
         assert!(err.to_string().contains("could never unlock"), "{err}");
@@ -11324,7 +11461,7 @@ mod engine_tests {
         // camera reason: the dark-IR refusal must not fire.
         let err = s
             .engine
-            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, || true)
+            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, |_| true)
             .unwrap_err();
         assert!(
             !err.to_string().contains("authenticates by IR"),
@@ -11341,7 +11478,7 @@ mod engine_tests {
         write_enrollment(&dir, &e);
         let err = s
             .engine
-            .add_scan_with_ir_preflight("irlume-test-dark2", "P1", 1, || false)
+            .add_scan_with_ir_preflight("irlume-test-dark2", "P1", 1, |_| false)
             .unwrap_err();
         assert!(err.to_string().contains("authenticates by IR"), "{err}");
         // The convenience tier is untouched: with no IR pair at all the
@@ -11349,7 +11486,7 @@ mod engine_tests {
         s.engine.ir_available = false; // restore the shared baseline
         let err = s
             .engine
-            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, || {
+            .enroll_profile_with_ir_preflight("irlume-test-dark", None, 1, |_| {
                 panic!("the preflight must not run when no IR pair exists")
             })
             .unwrap_err();
@@ -11368,7 +11505,7 @@ mod engine_tests {
         let emitter_touched = std::cell::Cell::new(false);
         let err = s
             .engine
-            .add_scan_with_ir_preflight("irlume-test-ghost", "P1", 1, || {
+            .add_scan_with_ir_preflight("irlume-test-ghost", "P1", 1, |_| {
                 emitter_touched.set(true);
                 true
             })

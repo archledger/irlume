@@ -93,7 +93,10 @@ impl EmitterControl {
 /// question about whether writing the control changed anything, and it is
 /// answered by a lift over the emitter-off baseline. The same camera here has
 /// measured anywhere from 38 to 168 depending only on what was in front of it.
-pub(crate) const IR_LIT_MEAN: f32 = 40.0;
+///
+/// Public for the enrollment preflight's subject-region measure (#613): the
+/// bar is shared, what it is measured against is the detected face's region.
+pub const IR_LIT_MEAN: f32 = 40.0;
 /// Minimum mean lift over the emitter-off baseline before [`discover`]
 /// calls a control a success; filters ambient flicker and exposure drift.
 const AUTOCONF_MIN_LIFT: f32 = 20.0;

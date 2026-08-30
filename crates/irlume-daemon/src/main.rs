@@ -1645,6 +1645,50 @@ mod worker_engine {
             );
         }
 
+        /// #616 step 3: the ONE wire site that carries an engine outcome onto
+        /// an `AuthResult` also carries the final failed attempt's situation
+        /// label, so pam_irlume can word its prompt. Every OTHER construction
+        /// site (the root gate and the policy early-returns above the camera)
+        /// sends an EMPTY situation: there is nothing usability-shaped to say
+        /// about a refusal that never looked at a face. Field presence at
+        /// every site is the compiler's job once the field exists; this pins
+        /// the VALUES. Needles are assembled from pieces so this test's own
+        /// source cannot satisfy them.
+        #[test]
+        fn the_engine_outcome_wire_carries_the_attempt_situation() {
+            let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+            let text = std::fs::read_to_string(&src).expect("read the daemon source");
+            // Whitespace-flattened so rustfmt's line wrapping cannot break
+            // the needle.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let head = [
+                "situation: if o.granted { String::new() } else { ",
+                "engine",
+            ]
+            .concat();
+            let sites: Vec<usize> = flat.match_indices(&head).map(|(i, _)| i).collect();
+            let getter = ["last_attempt_situation", "_label"].concat();
+            assert_eq!(
+                sites.len(),
+                1,
+                "exactly one site carries the engine's situation label"
+            );
+            let tail = &flat[sites[0]..sites[0] + 300];
+            assert!(
+                tail.contains(&getter) && tail.contains(".unwrap_or_default()"),
+                "the wire reads the engine's getter and defaults to empty when \
+                 nothing ran"
+            );
+            let empty = ["situation: String::new", "(),"].concat();
+            assert_eq!(
+                flat.matches(&empty).count(),
+                5,
+                "the five pre-camera refusal sites (root gate + four policy \
+                 early-returns) each send an empty situation; a new site must \
+                 consciously pick wire-or-empty and update this pin"
+            );
+        }
+
         #[test]
         fn cannot_stream_verdict_names_capture_failure_facts() {
             let mut report = healthy_concurrent(6, 6);
@@ -2946,6 +2990,7 @@ fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
         reason: "privileged face authentication requires PAM conversation confirmation".into(),
         declined_by_gesture: false,
         refused_by_policy: true,
+        situation: String::new(),
     })
 }
 
@@ -3758,6 +3803,7 @@ fn dispatch_scoped(
                     reason: "face auth disabled: the configured method is fingerprint".into(),
                     declined_by_gesture: false,
                     refused_by_policy: true,
+                    situation: String::new(),
                 };
             }
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
@@ -3797,6 +3843,7 @@ fn dispatch_scoped(
                         ),
                         declined_by_gesture: false,
                         refused_by_policy: true,
+                        situation: String::new(),
                     };
                 }
             }
@@ -3823,6 +3870,7 @@ fn dispatch_scoped(
                         reason: format!("biopolicy: face may not satisfy '{svc}'"),
                         declined_by_gesture: false,
                         refused_by_policy: true,
+                        situation: String::new(),
                     };
                 }
             }
@@ -3835,6 +3883,7 @@ fn dispatch_scoped(
                     reason: "too many recent face attempts; use your password".into(),
                     declined_by_gesture: false,
                     refused_by_policy: true,
+                    situation: String::new(),
                 };
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
@@ -3875,6 +3924,18 @@ fn dispatch_scoped(
                         // at (or looked for). The policy refusals return above,
                         // before the camera.
                         refused_by_policy: false,
+                        // #616 step 3: the final failed attempt's situation,
+                        // in the stable journal vocabulary, for pam's action
+                        // wording; empty on a grant and on every pre-camera
+                        // refusal (they send `situation: String::new()`).
+                        situation: if o.granted {
+                            String::new()
+                        } else {
+                            engine
+                                .last_attempt_situation_label()
+                                .unwrap_or_default()
+                                .to_string()
+                        },
                         reason: o.reason,
                     }
                 }
@@ -6443,6 +6504,7 @@ mod tests {
                     reason,
                     declined_by_gesture,
                     refused_by_policy,
+                    situation: _,
                 }) => {
                     assert!(!granted && !live && !declined_by_gesture);
                     assert_eq!(score, 0.0);
@@ -6940,6 +7002,7 @@ mod tests {
                     reason,
                     declined_by_gesture: false,
                     refused_by_policy: true,
+                    situation: _,
                 } => {
                     assert_eq!(score, 0.0);
                     assert_eq!(
@@ -8706,6 +8769,7 @@ mod tests {
                 reason,
                 declined_by_gesture,
                 refused_by_policy,
+                situation: _,
             } => {
                 assert!(!granted && !live);
                 assert_eq!(score, 0.0);

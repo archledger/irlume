@@ -65,3 +65,62 @@ fn every_failed_attempt_emits_exactly_one_situation_line() {
          definition and the single emission site"
     );
 }
+
+/// #616 step 3: the FINAL failed attempt's situation must be readable from
+/// the engine, because the daemon puts it on the wire and pam_irlume turns
+/// it into action wording at the prompt. The store happens under the SAME
+/// `!out.granted` guard that journals the line, so the wire can never
+/// disagree with the journal about what the situation was, and a granted
+/// final attempt clears it so a stale label can never reach a prompt.
+#[test]
+fn the_final_failed_attempts_situation_is_exposed_for_the_prompt() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let text = std::fs::read_to_string(&src).expect("read irlume-auth/src/lib.rs");
+
+    // The engine keeps the classified situation beside the facts snapshot.
+    assert!(
+        text.contains("    last_attempt_situation: Option<AttemptSituation>,"),
+        "the engine must store the classified situation for the wire"
+    );
+
+    // The store and the clear both live in the retry loop: set under the
+    // failed-attempt guard that emits the journal line, cleared on a grant.
+    // Whitespace-flattened so rustfmt's line wrapping cannot break the
+    // needles.
+    let loop_start = text
+        .find("    fn authentication_attempt_loop(")
+        .expect("the grace-retry loop exists");
+    let loop_end = text[loop_start..]
+        .find("\n    fn authenticate_once(")
+        .map(|offset| loop_start + offset)
+        .expect("authenticate_once follows the loop");
+    let retry_loop = &text[loop_start..loop_end];
+    let flat = retry_loop.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guard = flat
+        .find("if !out.granted {")
+        .expect("the loop guards the emission on a failed outcome");
+    let store = flat[guard..]
+        .find("self.last_attempt_situation = Some(auth_attempt_situation(")
+        .expect("the guard stores the classified situation for the wire");
+    // And it stores before the guard closes: the next statement after the
+    // store must still be inside the guard (the else-clear follows the
+    // guard's close, never the store).
+    let guard_close = flat[guard..]
+        .find("} else {")
+        .expect("the guard closes with an else for the grant clear");
+    assert!(store < guard_close, "the store sits inside the guard");
+    assert!(
+        flat.contains("self.last_attempt_situation = None;"),
+        "a granted final attempt must clear the stored situation"
+    );
+
+    // Exactly one public getter in production: the label the daemon wires.
+    let production = &text[..text.find("\nmod tests").expect("tests module exists")];
+    assert_eq!(
+        production
+            .matches("pub fn last_attempt_situation_label")
+            .count(),
+        1,
+        "exactly one public situation getter may exist"
+    );
+}

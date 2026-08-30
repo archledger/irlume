@@ -105,6 +105,12 @@ pub struct Engine {
     /// attempt (#616 step 2); every attempt refreshes it before any Outcome
     /// exists, so it can never be read stale.
     last_attempt_facts: AttemptFacts,
+    /// The classified situation of the most recent FAILED attempt (#616
+    /// step 3): stored under the same `!out.granted` guard that journals
+    /// the situation line, cleared by a granted final attempt, and exposed
+    /// read-only as the label the daemon wires onto `AuthResult` for
+    /// pam_irlume's prompt wording. Reporting only: it gates nothing.
+    last_attempt_situation: Option<AttemptSituation>,
     /// Asked between whole captures: "should this long operation stop now?".
     ///
     /// The daemon points this at its arbiter so an enrolment yields the camera
@@ -2919,6 +2925,7 @@ impl Engine {
             head_consent_before_match: HeadConsentVerdict::NoGesture,
             stop_requested: None,
             last_attempt_facts: AttemptFacts::default(),
+            last_attempt_situation: None,
         })
     }
 
@@ -5330,6 +5337,15 @@ impl Engine {
         .0
     }
 
+    /// The stable situation label of the final FAILED authentication
+    /// attempt (#616 step 3), for the daemon to carry on `AuthResult`:
+    /// `None` when the final attempt granted or nothing ran, so a stale
+    /// label can never reach a prompt. Read-only reporting; gates nothing,
+    /// scores nothing, moves no bar.
+    pub fn last_attempt_situation_label(&self) -> Option<&'static str> {
+        self.last_attempt_situation.map(attempt_situation_label)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn authentication_attempt_loop(
         &mut self,
@@ -5390,6 +5406,15 @@ impl Engine {
                     "{}",
                     attempt_situation_line(out.kind, out.score, &self.last_attempt_facts)
                 );
+                // #616 step 3: the wire reads what the journal just said.
+                // Same guard, same facts: the prompt situation can never
+                // disagree with the journaled one.
+                self.last_attempt_situation =
+                    Some(auth_attempt_situation(out.kind, &self.last_attempt_facts));
+            } else {
+                // A granted final attempt clears the label, so a later
+                // reader can never prompt off a stale failure.
+                self.last_attempt_situation = None;
             }
             let expired = std::time::Instant::now() >= deadline;
             let retry_wont_fit = !expired

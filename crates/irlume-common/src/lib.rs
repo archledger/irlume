@@ -833,6 +833,15 @@ pub enum Response {
         /// daemon that never sets it decodes as `false` (no abort).
         #[serde(default)]
         declined_by_gesture: bool,
+        /// The final FAILED attempt's situation, in the #616 step 2 stable
+        /// vocabulary ("no face", "too far", ...), carried so pam_irlume can
+        /// word its prompt (#616 step 3). Empty on a grant, on every
+        /// pre-camera policy refusal, and from an older daemon
+        /// (`#[serde(default)]`); attack-shaped labels are carried too, but
+        /// the PAM layer stays silent on them: no threshold value ever
+        /// reaches a prompt surface.
+        #[serde(default)]
+        situation: String,
     },
     Profiles(Vec<String>),
     /// Answer to [`Request::ListCameras`]: every physical camera exposing an
@@ -1227,6 +1236,28 @@ pub(crate) mod testenv {
 #[cfg(test)]
 mod tests {
 
+    /// `AuthResult.situation` (#616 step 3) is `#[serde(default)]` so an
+    /// OLDER daemon's reply, which predates the field, still decodes: the
+    /// empty string means "no situation to prompt on" and pam stays silent.
+    /// Round-trips when set, so the daemon's label reaches pam verbatim.
+    #[test]
+    fn auth_result_situation_defaults_empty_for_old_daemons() {
+        let old = r#"{"AuthResult":{"granted":false,"score":0.25,"live":false,"reason":"no match","refused_by_policy":false,"declined_by_gesture":false}}"#;
+        match serde_json::from_str::<Response>(old).expect("old reply decodes") {
+            Response::AuthResult { situation, .. } => {
+                assert_eq!(situation, "", "an old daemon decodes with no situation");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let new = r#"{"AuthResult":{"granted":false,"score":0.25,"live":false,"reason":"no match","refused_by_policy":false,"declined_by_gesture":false,"situation":"too far"}}"#;
+        match serde_json::from_str::<Response>(new).expect("new reply decodes") {
+            Response::AuthResult { situation, .. } => {
+                assert_eq!(situation, "too far", "the label round-trips verbatim");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     /// The delivered-rate DTO is a plain serializable carrier: snake_case JSON
     /// round-trips every field, and the typed error keeps a stable,
     /// machine-parseable message with the evidence recoverable from the payload
@@ -1394,6 +1425,7 @@ mod tests {
             reason: "no match".into(),
             declined_by_gesture: true,
             refused_by_policy: false,
+            situation: "too far".into(),
         };
         let mut v = serde_json::to_value(&full).expect("serialize");
         let obj = v

@@ -352,6 +352,7 @@ fn grant() -> Response {
         reason: "match".into(),
         declined_by_gesture: false,
         refused_by_policy: false,
+        situation: String::new(),
     }
 }
 
@@ -639,6 +640,7 @@ fn pamwrap_face_denial_clears_yes_before_password_fallback() {
         reason: "no match".into(),
         declined_by_gesture: false,
         refused_by_policy: false,
+        situation: String::new(),
     });
     let checker = h.token_checker("face-denial", FIXED_TEST_TOKEN);
     h.write_service(
@@ -987,6 +989,7 @@ fn pamwrap_polkit_confirmation_precedes_the_optional_gesture() {
         reason: "face not granted".into(),
         declined_by_gesture: false,
         refused_by_policy: false,
+        situation: String::new(),
     });
 
     // A plain verify (no `unseal`) on the polkit service.
@@ -1065,6 +1068,7 @@ fn pamwrap_polkit_migration_remedy_tracks_the_environment_override() {
         reason: "face not granted".into(),
         declined_by_gesture: false,
         refused_by_policy: false,
+        situation: String::new(),
     });
     h.write_service("polkit-1", &[h.auth_line("required", "")]);
     h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=nod\n"));
@@ -1128,6 +1132,7 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
         reason: "denied".into(),
         declined_by_gesture: d.load(Ordering::SeqCst),
         refused_by_policy: false,
+        situation: String::new(),
     });
     h.write_settings(Some("service_gesture.polkit-1=1\nservice_gesture.sudo=1\n"));
 
@@ -1355,6 +1360,7 @@ fn pamwrap_wait_mode_retries_until_a_match() {
                     reason: "below threshold".into(),
                     declined_by_gesture: false,
                     refused_by_policy: false,
+                    situation: String::new(),
                 }
             } else {
                 grant()
@@ -1737,5 +1743,79 @@ fn pamwrap_secret_stash_replaces_and_completes_without_printing() {
             "the replaced stash must read back the exact live secret"
         ),
         other => panic!("expected ResealPassword, daemon saw {other:?}"),
+    }
+}
+
+/// #616 step 3: a denied verify whose situation is usability-shaped puts
+/// ONE action-oriented line at the prompt, and the stack still cascades to
+/// the password (IGNORE, no abort).
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_usability_situation_prompts_one_action_line() {
+    let Some(h) = Harness::try_new("situation-prompt") else {
+        return;
+    };
+    h.write_service("irlume-lock", &[h.auth_line("required", "")]);
+    serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => Response::AuthResult {
+            granted: false,
+            score: 0.10,
+            live: false,
+            reason: "no match".into(),
+            declined_by_gesture: false,
+            refused_by_policy: false,
+            situation: "too far".into(),
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (ok, out) = h.run("irlume-lock", &["authenticate"], "\n", None);
+    assert!(!ok, "a denial must not authenticate: {out}");
+    assert!(
+        out.contains("irlume: come closer"),
+        "the action wording reached the prompt: {out}"
+    );
+}
+
+/// The attacker-oracle split of #616 step 3: an attack-shaped situation
+/// names NOTHING at the prompt. No cue name, no action wording, nothing a
+/// presentation attacker could tune against; the numbers live in the
+/// journal and diagnostic trace, root-visible.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_attack_situation_stays_silent_at_the_prompt() {
+    let Some(h) = Harness::try_new("situation-silent") else {
+        return;
+    };
+    h.write_service("irlume-lock", &[h.auth_line("required", "")]);
+    serve(&h.socket, |req| match req {
+        Request::Authenticate { .. } => Response::AuthResult {
+            granted: false,
+            score: 0.10,
+            live: false,
+            reason: "no match".into(),
+            declined_by_gesture: false,
+            refused_by_policy: false,
+            situation: "spoof".into(),
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+
+    let (ok, out) = h.run("irlume-lock", &["authenticate"], "\n", None);
+    assert!(!ok, "a denial must not authenticate: {out}");
+    for absent in [
+        "spoof",
+        "glint",
+        "look at the camera",
+        "look directly at the camera",
+        "come closer",
+        "center your face",
+        "add light",
+    ] {
+        assert!(
+            !out.contains(absent),
+            "an attack-shaped situation must name nothing at the prompt \
+         ({absent} leaked): {out}"
+        );
     }
 }

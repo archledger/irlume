@@ -834,12 +834,35 @@ fn read_stdout_bounded(
     }
 }
 
+/// #616 step 3: action wording for a failed attempt's situation, mapped
+/// from the daemon-reported stable vocabulary. Usability situations tell
+/// the person what to DO; attack-shaped situations (`spoof`, `glint
+/// below`, `below score`), `declined`, `other`, and unknown or empty
+/// labels return `None` and stay SILENT at the prompt: wording that names
+/// the cue that fired is a free oracle for a presentation attacker tuning
+/// a spoof, and no threshold value ever reaches a prompt surface (the
+/// numbers live in the journal and the diagnostic trace, root-visible).
+fn situation_prompt(situation: &str) -> Option<&'static str> {
+    match situation {
+        "no face" => Some("look at the camera"),
+        "too far" => Some("come closer"),
+        "off-center" => Some("center your face in the frame"),
+        "looking away" => Some("look directly at the camera"),
+        "too dark" => Some("it is too dark to see your face; add light"),
+        _ => None,
+    }
+}
+
 /// One verify attempt (sudo / polkit / in-session unlock): no password released.
 /// Returns `SUCCESS` on a live match; `ABORT` on a DELIBERATE head-shake decline
 /// at a polkit consent dialog, so the whole stack aborts and the agent closes its
 /// window; and `IGNORE` on anything else so the password fallback survives. Passes
 /// the PAM service so the daemon can apply tier×operation-class gating (an RGB-only
 /// convenience device honours only a screen-unlock service).
+///
+/// #616 step 3: a denial whose situation is usability-shaped also puts ONE
+/// action-oriented line at the prompt via [`situation_prompt`] before the
+/// password fallback.
 fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestation>) -> PamError {
     let service = pamh
         .get_service()
@@ -877,6 +900,23 @@ fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestat
             declined_by_gesture: true,
             ..
         }) if is_polkit_consent => PamError::ABORT,
+        // #616 step 3: a usability situation gets ONE best-effort action
+        // line at the prompt (some agents never display module info text;
+        // the XFCE lesson), numbers-free by construction. Attack-shaped
+        // situations map to nothing and stay silent: wording that names the
+        // cue that fired is a free oracle for a presentation attacker
+        // tuning a spoof, and no threshold value ever reaches a prompt
+        // surface (the numbers live in the journal and trace, root-visible).
+        Ok(Response::AuthResult {
+            granted: false,
+            situation,
+            ..
+        }) => {
+            if let Some(action) = situation_prompt(&situation) {
+                let _ = pamh.info(&format!("irlume: {action}"));
+            }
+            PamError::IGNORE
+        }
         _ => PamError::IGNORE,
     }
 }
@@ -1331,5 +1371,103 @@ mod tests {
         assert!(got.is_none(), "output past the cap must read as failure");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    /// #616 step 3: usability situations get one action-oriented line at the
+    /// prompt; attack-shaped situations stay SILENT (wording that names the
+    /// cue that fired is a free oracle for a presentation attacker tuning a
+    /// spoof). Hand-written expectations: the table IS the contract.
+    #[test]
+    fn usability_situations_get_action_wording_attack_signals_stay_silent() {
+        use super::situation_prompt;
+        assert_eq!(situation_prompt("no face"), Some("look at the camera"));
+        assert_eq!(situation_prompt("too far"), Some("come closer"));
+        assert_eq!(
+            situation_prompt("off-center"),
+            Some("center your face in the frame")
+        );
+        assert_eq!(
+            situation_prompt("looking away"),
+            Some("look directly at the camera")
+        );
+        assert_eq!(
+            situation_prompt("too dark"),
+            Some("it is too dark to see your face; add light")
+        );
+        for silent in [
+            "spoof",
+            "glint below",
+            "below score",
+            "declined",
+            "other",
+            "",
+            "too farfetched",
+        ] {
+            assert_eq!(
+                situation_prompt(silent),
+                None,
+                "{silent:?} must stay silent at the prompt"
+            );
+        }
+    }
+
+    /// The #616 step 3 split: rich numbers live in the journal and the
+    /// diagnostic trace, NEVER at a prompt surface. No mapped wording may
+    /// carry a digit, so no threshold value can leak through a label.
+    #[test]
+    fn no_prompt_wording_ever_carries_a_number() {
+        use super::situation_prompt;
+        for label in [
+            "no face",
+            "too far",
+            "off-center",
+            "looking away",
+            "too dark",
+        ] {
+            if let Some(text) = situation_prompt(label) {
+                assert!(
+                    !text.bytes().any(|b| b.is_ascii_digit()),
+                    "prompt wording must carry no numbers: {text}"
+                );
+            }
+        }
+    }
+
+    /// #616 step 3 wiring: `try_verify` turns the daemon's situation label
+    /// into ONE best-effort info line before cascading to the password.
+    /// Pinned against the source the way the auth crate pins its seams: no
+    /// camera-less test can drive a full reply through the PAM stack.
+    #[test]
+    fn try_verify_prompts_one_action_line_from_the_reply_situation() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let text = std::fs::read_to_string(&src).expect("read irlume-pam/src/lib.rs");
+        let fn_start = text.find("fn try_verify(").expect("try_verify exists");
+        let fn_end = text[fn_start..]
+            .find("\n/// One unseal attempt")
+            .map(|offset| fn_start + offset)
+            .expect("the unseal helper follows try_verify");
+        let body = &text[fn_start..fn_end];
+        // Assembled from pieces so this test's own source cannot satisfy the
+        // needle it searches for (the auth crate's tripwire idiom).
+        let info_call = ["pamh.info(&format!(\"irlume: {", "action}\"))"].concat();
+        let arm = body
+            .find("situation,")
+            .expect("try_verify binds the reply's situation");
+        let consult = body[arm..]
+            .find("situation_prompt(&situation)")
+            .expect("the situation is mapped through the prompt table");
+        let emit = body[arm..]
+            .find(&info_call)
+            .expect("the action line is emitted once, best-effort");
+        assert!(
+            consult < emit,
+            "the mapping is consulted before the emission"
+        );
+        // And the mapping is best-effort: an info failure never changes the
+        // return code (the emission's result is discarded).
+        assert!(
+            body[arm..].contains("let _ = "),
+            "the info emission must be best-effort"
+        );
     }
 }

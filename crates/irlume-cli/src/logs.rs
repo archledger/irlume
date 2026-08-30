@@ -202,7 +202,7 @@ fn debug(action: Option<&str>) -> ExitCode {
                 eprintln!("[logs] could not write {DROPIN}: {e}");
                 return ExitCode::FAILURE;
             }
-            restart_daemon();
+            restart_daemon_and_wait();
             println!("[logs] tracing ON: the daemon now logs per-stage pipeline lines (capture/detect/liveness cues/match scores; numbers only, never frames or embeddings).");
             println!("[logs] ⚠ while on, DENIED attempts log their score vs threshold: feedback a journal-reader could use to tune a spoof. Diagnose, then turn it off:");
             println!("[logs] watch live with:  irlume logs -f    ·   turn off with:  sudo irlume logs debug off");
@@ -225,7 +225,7 @@ fn debug(action: Option<&str>) -> ExitCode {
                 }
             }
             let _ = std::fs::remove_dir(DROPIN_DIR); // only if now empty
-            restart_daemon();
+            restart_daemon_and_wait();
             println!("[logs] tracing off");
             ExitCode::SUCCESS
         }
@@ -237,6 +237,59 @@ fn debug(action: Option<&str>) -> ExitCode {
             eprintln!("[logs] unknown: 'debug {other}' (use: debug [on|off])");
             ExitCode::from(2)
         }
+    }
+}
+
+/// What `logs debug on|off` prints BEFORE the daemon restarts (#562): the
+/// restart was silent, so anyone mid-testing got a surprise stop/start and a
+/// request fired right after the command could race the model load.
+fn restart_notice() -> &'static str {
+    "[logs] restarting irlumed to apply the tracing change (takes a few seconds; \
+     wait for 'serving on /run/irlume.sock')"
+}
+
+/// Testable core of [`wait_for_serving`]: poll `probe` until it first answers
+/// true (serving) or `deadline` passes. Pure polling policy, no clock of its
+/// own beyond `Instant::now`, so a test drives it with an already-passed
+/// deadline for the timeout arm.
+fn wait_for_serving_with(mut probe: impl FnMut() -> bool, deadline: std::time::Instant) -> bool {
+    loop {
+        if probe() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Wait until the daemon answers Ping as Running again (a restart spends a
+/// few seconds loading models first; 21s measured on one host, so the budget
+/// is generous). Returns whether serving was confirmed.
+fn wait_for_serving() -> bool {
+    wait_for_serving_with(
+        || {
+            crate::commands::classify_reach(irlume_common::client::request_poll(
+                &irlume_common::Request::Ping,
+            )) == crate::commands::DaemonReach::Running
+        },
+        std::time::Instant::now() + std::time::Duration::from_secs(45),
+    )
+}
+
+/// Announce the restart, apply it, and hold the command until the daemon is
+/// serving again so scripted flows cannot race the model load (#562).
+fn restart_daemon_and_wait() {
+    println!("{}", restart_notice());
+    restart_daemon();
+    if wait_for_serving() {
+        println!("[logs] daemon serving again");
+    } else {
+        eprintln!(
+            "[logs] tracing set, but the daemon did not confirm serving within 45s; \
+             check: systemctl status irlumed"
+        );
     }
 }
 
@@ -391,6 +444,73 @@ mod tests {
         assert!(
             with_value.contains("'2 fortnights'"),
             "must name the rejected value: {with_value}"
+        );
+    }
+
+    // ---- #562: the restart is announced before it happens ----
+
+    /// The notice names the restart, the wait, and the serving line that ends
+    /// it, so the restart is never a surprise mid-test.
+    #[test]
+    fn the_restart_notice_names_what_and_how_long() {
+        let notice = restart_notice();
+        assert!(notice.contains("restarting irlumed"), "{notice}");
+        assert!(
+            notice.contains("serving on /run/irlume.sock"),
+            "the wait's end condition is named: {notice}"
+        );
+    }
+
+    /// The serving wait stops on the probe's first serving answer...
+    #[test]
+    fn wait_for_serving_returns_once_the_probe_answers() {
+        let mut calls = 0;
+        let served = wait_for_serving_with(
+            || {
+                calls += 1;
+                true
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert!(served);
+        assert_eq!(calls, 1, "the first serving answer stops the wait");
+    }
+
+    /// ...and gives up at the deadline when nothing ever answers.
+    #[test]
+    fn wait_for_serving_times_out_when_nothing_answers() {
+        let gave_up = wait_for_serving_with(|| false, std::time::Instant::now());
+        assert!(!gave_up);
+    }
+
+    /// The acceptance IS the order: the notice prints before the restart
+    /// fires, and both toggle paths go through the announcing wrapper. Pinned
+    /// against the source (the daemon's startup-glue idiom) because the order
+    /// lives in glue no behavioral test can drive without systemd.
+    #[test]
+    fn the_notice_precedes_the_restart_and_both_toggles_use_it() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logs.rs"),
+        )
+        .expect("read own source");
+        let production = &src[..src.find("\nmod tests").expect("tests module exists")];
+        let flat = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        let region_start = flat
+            .find("fn restart_daemon_and_wait()")
+            .expect("wrapper exists");
+        let region = &flat[region_start..];
+        let notice_at = region
+            .find("println!(\"{}\", restart_notice());")
+            .expect("notice printed");
+        let restart_at = region.find("restart_daemon();").expect("restart called");
+        assert!(
+            notice_at < restart_at,
+            "the notice must print before the restart fires"
+        );
+        assert_eq!(
+            flat.matches("restart_daemon_and_wait();").count(),
+            2,
+            "exactly the two toggle paths (on and off) use the announcing wrapper"
         );
     }
 }

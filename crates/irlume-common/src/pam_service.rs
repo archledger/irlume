@@ -62,6 +62,13 @@ pub const SERVICES: &[(&str, ServiceKind)] = &[
     ("swaylock", ServiceKind::ScreenUnlock),
     ("i3lock", ServiceKind::ScreenUnlock),
     ("hyprlock", ServiceKind::ScreenUnlock),
+    // gtklock: upstream calls pam_start("gtklock", ...) (src/auth.c) and the
+    // Arch extra package ships /etc/pam.d/gtklock.
+    ("gtklock", ServiceKind::ScreenUnlock),
+    // waylock: upstream calls pam_start("waylock", ...) (src/auth.zig); it
+    // does NOT reuse swaylock's name, and the Arch extra package ships
+    // /etc/pam.d/waylock.
+    ("waylock", ServiceKind::ScreenUnlock),
     ("omarchy-lock-face", ServiceKind::ScreenUnlock),
     // The stock Omarchy lock's password lane: with the distro's autologin
     // default, this is where a cold boot actually prompts, and pam_irlume
@@ -206,6 +213,22 @@ mod tests {
             classify("cinnamon-screensaver"),
             Some(ServiceKind::ScreenUnlock)
         );
+    }
+
+    /// gtklock starts its OWN PAM service (upstream pam_start("gtklock", ...)
+    /// in src/auth.c; Arch extra ships /etc/pam.d/gtklock): a live-session
+    /// screen unlock (#563).
+    #[test]
+    fn gtklock_is_screen_unlock() {
+        assert_eq!(classify("gtklock"), Some(ServiceKind::ScreenUnlock));
+    }
+
+    /// waylock starts its OWN PAM service (upstream pam_start("waylock", ...)
+    /// in src/auth.zig, NOT swaylock's name; Arch extra ships
+    /// /etc/pam.d/waylock): a live-session screen unlock (#563).
+    #[test]
+    fn waylock_is_screen_unlock() {
+        assert_eq!(classify("waylock"), Some(ServiceKind::ScreenUnlock));
     }
 
     /// The divergence that prompted this: doas was Elevation for the policy and

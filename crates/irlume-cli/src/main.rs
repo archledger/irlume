@@ -171,10 +171,10 @@ fn main() -> std::process::ExitCode {
         (Some("profiles"), _) => profiles(profiles_sub(&args), &args),
         (Some("verify"), _) => verify(&args),
         (Some("enrolldev"), _) => enrolldev(&args),
-        (Some("keyring"), sub) => keyring(sub, &args),
-        (Some("recovery"), sub) => recovery::run(sub, &args),
+        (Some("keyring"), _) => keyring(keyring_sub(&args), &args),
+        (Some("recovery"), _) => recovery::run(recovery_sub(&args), &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
-        (Some("fingerprint"), sub) => fingerprint::run(sub, &args),
+        (Some("fingerprint"), _) => fingerprint::run(fingerprint_sub(&args), &args),
         (Some("login"), _)
             if args.iter().any(|a| a == "status") && args.iter().any(|a| a == "--json") =>
         {
@@ -375,6 +375,44 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// The flags the profiles family reads as `--flag value` pairs. Kept beside
+/// the scanner that steps over them, and pinned against the parsers by a
+/// source-scan test, so a new valued flag cannot silently desync the scan.
+const PROFILES_VALUED: [&str; 5] = ["--user", "--profile", "--scans", "--name", "--scan"];
+
+/// Scan an argument list for its subcommand: the first token that is neither
+/// a flag nor the value of a `--flag value` pair, starting after the command
+/// word. `--flag=value` spellings carry their own value and need no step.
+///
+/// This is the shared core behind the flags-first grammar the usage lines
+/// document (`irlume <command> [--user U] <subcommand>`, #637 for profiles,
+/// the same rule since extended to every per-user subcommand command); the
+/// dispatcher used to bind each subcommand to position 1, so a leading flag
+/// displaced it and a well-formed command answered usage.
+fn subcommand_after_valued<'a>(args: &'a [String], valued: &[&str]) -> Option<&'a str> {
+    subcommand_index_after_valued(args, valued).map(|(sub, _)| sub)
+}
+
+/// The scanner's index form: forget-model reads a POSITIONAL after the
+/// subcommand, so it needs where the subcommand landed, not just what it is.
+fn subcommand_index_after_valued<'a>(
+    args: &'a [String],
+    valued: &[&str],
+) -> Option<(&'a str, usize)> {
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !a.starts_with('-') {
+            return Some((a, i));
+        }
+        if valued.contains(&a) {
+            i += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The `profiles` subcommand, wherever it sits among the flags.
 ///
 /// The usage line documents `irlume profiles [--user U] <subcommand>`, and the
@@ -382,23 +420,33 @@ fn shell_single_quote(value: &str) -> String {
 /// same reason. Reading `args[1]` made a leading flag the subcommand, so the
 /// documented order answered usage on a well-formed command: `profiles --user
 /// tester list` looked for a subcommand named `--user`.
-///
-/// A flag spelled `--flag value` carries its value in the next argument, so the
-/// scan steps over it; `--flag=value` carries its own and does not.
 fn profiles_sub(args: &[String]) -> Option<&str> {
-    const VALUED: [&str; 5] = ["--user", "--profile", "--scans", "--name", "--scan"];
-    let mut i = 1;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if !a.starts_with('-') {
-            return Some(a);
-        }
-        if VALUED.contains(&a) {
-            i += 1;
-        }
-        i += 1;
-    }
-    None
+    subcommand_after_valued(args, &PROFILES_VALUED)
+}
+
+/// The same flags-first grammar for the other per-user subcommand commands;
+/// each takes exactly the global `--user` as its only valued flag.
+fn keyring_sub(args: &[String]) -> Option<&str> {
+    subcommand_after_valued(args, &["--user"])
+}
+
+fn recovery_sub(args: &[String]) -> Option<&str> {
+    subcommand_after_valued(args, &["--user"])
+}
+
+fn fingerprint_sub(args: &[String]) -> Option<&str> {
+    subcommand_after_valued(args, &["--user"])
+}
+
+/// The first bare token after the subcommand (forget-model's model name): the
+/// one positional in the profiles family, which used to be read at a fixed
+/// index that a leading flag displaces.
+fn positional_after_subcommand(args: &[String]) -> Option<&str> {
+    let (_, sub_at) = subcommand_index_after_valued(args, &PROFILES_VALUED)?;
+    args[sub_at + 1..]
+        .iter()
+        .map(String::as_str)
+        .find(|a| !a.starts_with('-'))
 }
 
 /// `irlume profiles [list|add-scan|rename|delete|eyes-open] ...`: manage the up-
@@ -454,14 +502,12 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
             None => return usage_profiles(),
         },
         Some("forget-model") => {
-            // Positional: `irlume profiles forget-model <model>` (args[0] is
-            // "profiles", args[1] the subcommand). A flag must not be read as
-            // the model name when the positional is missing.
-            match args
-                .get(2)
-                .map(String::as_str)
-                .filter(|a| !a.starts_with("--"))
-            {
+            // Positional: `irlume profiles [flags] forget-model <model>`.
+            // Read AFTER the scanned subcommand, not at a fixed index: the
+            // flags-first grammar puts the flag values where args[2] used to
+            // be. A flag must not be read as the model name when the
+            // positional is missing.
+            match positional_after_subcommand(args) {
                 Some(name) => match crate::models::recognizer_space_for(name) {
                     Ok(space) => Request::ForgetRecognizer { user, space },
                     Err(e) => {
@@ -4483,6 +4529,89 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- the shared flags-first subcommand scanner ----
+
+    /// One scanner serves every `<command> [--user U] <subcommand>` command,
+    /// so its whole behavior is pinned here once: the valued-flag step-over
+    /// (both spellings), the fallback to None, and tolerance of unknown
+    /// boolean flags.
+    #[test]
+    fn subcommand_after_valued_scans_past_flags_and_their_values() {
+        let profiles = &["--user", "--profile", "--scans", "--name", "--scan"];
+        let args = argv(&["profiles", "--user", "list", "add-scan"]);
+        assert_eq!(subcommand_after_valued(&args, profiles), Some("add-scan"));
+        // The `--flag=value` spelling carries its own value.
+        let args = argv(&["profiles", "--user=tester", "list"]);
+        assert_eq!(subcommand_after_valued(&args, profiles), Some("list"));
+        // Subcommand first: unchanged.
+        let args = argv(&["profiles", "list"]);
+        assert_eq!(subcommand_after_valued(&args, profiles), Some("list"));
+        // No subcommand at all: the last token was a valued flag's payload.
+        let args = argv(&["profiles", "--user", "tester"]);
+        assert_eq!(subcommand_after_valued(&args, profiles), None);
+        // An unknown boolean flag does not swallow the subcommand.
+        let args = argv(&["profiles", "--verbose", "list"]);
+        assert_eq!(subcommand_after_valued(&args, profiles), Some("list"));
+        // The per-user commands share only --user.
+        let args = argv(&["keyring", "--user", "tester", "status"]);
+        assert_eq!(subcommand_after_valued(&args, &["--user"]), Some("status"));
+    }
+
+    /// Drift tripwire: every valued flag the profiles family READS must be in
+    /// the scanner's VALUED list, or a flags-first caller's value would be
+    /// mistaken for the subcommand. Source-scanned the daemon-pin way: the
+    /// `flag(args, "--x")` reads name exactly what a value can follow.
+    #[test]
+    fn the_scanner_knows_every_valued_flag_profiles_reads() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("read own source");
+        let start = src.find("fn profiles(sub:").expect("profiles exists");
+        let end = src[start..]
+            .find("\nfn ")
+            .map(|o| start + o)
+            .expect("another fn follows profiles");
+        let region = &src[start..end];
+        let mut read: Vec<&str> = Vec::new();
+        // Only the `flag(args, "--x")` call sites: a value can follow exactly
+        // those, and unrelated string literals (usage prose, startswith
+        // comparisons) must not pollute the list.
+        let needle = "flag(args, \"";
+        let mut at = 0;
+        while let Some(hit) = region[at..].find(needle) {
+            let hit_at = at + hit;
+            // A word boundary before `flag`: `scans_flag(args, "profiles")`
+            // passes a MESSAGE TAG, not a flag name, and must not match.
+            let boundary = match region[..hit_at].chars().next_back() {
+                Some(c) => !(c.is_ascii_alphanumeric() || c == '_'),
+                None => true,
+            };
+            let from = hit_at + needle.len();
+            let to = region[from..]
+                .find('"')
+                .map(|o| from + o)
+                .expect("closed quote");
+            if boundary {
+                read.push(&region[from..to]);
+            }
+            at = to;
+        }
+        // --user reaches profiles through user_arg/flag ABOVE the region, so
+        // it is asserted directly alongside everything the region reads.
+        read.push("--user");
+        read.sort_unstable();
+        read.dedup();
+        let valued = PROFILES_VALUED.to_vec();
+        for flag in read {
+            assert!(
+                valued.contains(&flag),
+                "{flag} is read as a valued flag by profiles but the scanner does not \
+                 step over it; a flags-first caller's value would become the subcommand"
+            );
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ semantics match the ViT lane: higher = more spoof-like, APCER/BPCER from
 pad_score at the same threshold grid plus the author-demo 0.4 line."""
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -56,6 +57,14 @@ def candidate_input(img: "np.ndarray", box: list[float]) -> "np.ndarray":
 
 class Mn3Scorer:
     def __init__(self, models_dir: Path):
+        path = models_dir / MN3_MODEL
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != MN3_SHA256:
+            raise SystemExit(
+                f"error: {path} sha256 {digest} does not match the recorded "
+                f"{MN3_SHA256}; aborting before any measurement"
+            )
+        print(f"mn3 artifact sha256 verified: {digest}", flush=True)
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         available = ort.get_available_providers()
         providers = [p for p in providers if p in available] or ["CPUExecutionProvider"]

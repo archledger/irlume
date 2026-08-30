@@ -63,7 +63,9 @@ path). D2 is the phase 2 report correction committed here. D7 and D8 below.
 The one motivated replacement evaluation. Artifact: Intel OMZ
 `anti-spoof-mn3`, Apache-2.0, trained on CelebA-Spoof, 12 MB, sha256
 `c4c99af04603b62d7e44f6f4daeb33e0daeccc696008c0b1d62f6f5cebbb3262`
-(verified before the run). Publisher preprocessing (raw bbox crop, 128x128,
+(enforced at load by the lane, which aborts on any digest mismatch; for
+the committed run the digest was also verified on both hosts before
+launch). Publisher preprocessing (raw bbox crop, 128x128,
 per-channel mean/scale, softmax baked in) through the identical walks,
 detection convention, thresholds, and metrics as the ViT lane. Comparison at
 each model's own operating line (mn3 at the author 0.4, ViT at the wired

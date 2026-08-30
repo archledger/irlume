@@ -13,6 +13,11 @@ Conventions that apply everywhere:
 - `irlume tui` wraps most of these in a guided interface. If you forget a
   command, the TUI is the fallback: enrollment, profiles, wiring, keyring,
   recovery, and fingerprint are all reachable from it.
+- Several commands take `--json` for machine-readable output (marked per row
+  below). Integrations also declare the contract version they implement with
+  `--contract N` anywhere in the invocation; omitted always means 1, and an
+  unimplemented one is refused before anything runs. The stable shapes are
+  specified in [MACHINE-API.md](MACHINE-API.md).
 
 ## Setup and status
 
@@ -69,7 +74,7 @@ Conventions that apply everywhere:
 | `irlume camera-mode` | no | ask the daemon which schedule is active for its exact open pair. Reports qualified concurrent, measured sequential and its reason, no authority, changed/unreadable context, an environment override, or generation-scoped runtime degradation and its cause. It also prints the exact requested/accepted stream and USB context used by v2. RGB-only hosts report `no_ir_pair` without trying to open IR. The CLI does not read legacy `capture_mode.*` entries from `cameras.conf` or open cameras itself |
 | `irlume camera census [--json]` | no | classify every camera-like device on the machine (UVC RGB/IR pairs, metadata-only nodes, Y8-only sensors, dummies, MIPI pipelines and bridges, unreadable nodes, USB camera-class devices with no driver), printing the evidence each classification keyed on (#575). `--json` is the machine API document; the hardware-report template asks for it as an attachment |
 | `irlume camera diagnostics --json` | no | machine-readable delivered-rate evidence for the configured pair: exact requested/accepted/delivered rationals per role, sequence gaps and drops, timestamp clock/source, RGB/IR skew, and the MS-XU illumination stream state (node present/absent, frames classified/lit, ambient observed). An under-rate stream is a measured `fail` object, never prose. See [MACHINE-API.md](MACHINE-API.md) |
-| `irlume models …` | — | removed (ADR-0015): third-party/bring-your-own model support is gone; irlume ships its full model set and the command answers with a notice. Check installed weights with `irlume doctor` |
+| `irlume models list --json` | no | the one surviving models subcommand (ADR-0015): the machine model listing. All other models subcommands are removed and answer with a notice. Check installed weights with `irlume doctor` |
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, then print the package-removal command |
 

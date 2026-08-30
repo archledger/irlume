@@ -68,7 +68,7 @@ import numpy as np
 import onnxruntime as ort
 
 from letterbox import letterbox_image, restore_boxes
-from pad_score import apcer_bpcer, roc_auc, species_breakdown
+from pad_score import apcer_bpcer, median_vote, roc_auc, species_breakdown
 
 OP_INPUT = 640
 OP_SCORE = 0.6
@@ -162,6 +162,7 @@ def merge_section(args, key: str, section: dict, notes: list[str]) -> None:
         try:
             result = json.loads(args.out.read_text())
         except json.JSONDecodeError:
+            print(f"warning: {args.out} is not valid JSON, resetting", flush=True)
             result = {}
     result["runtime"] = {
         "ort_version": ort.__version__,
@@ -289,7 +290,7 @@ def run_oulu(args, det, vit) -> None:
             by_clip.setdefault(clip, []).append(s)
             frames[label].append(s)
         for clip, ss in sorted(by_clip.items()):
-            vote = float(np.median(ss))
+            vote = float(median_vote(ss))
             clips.setdefault(label, {})[clip] = vote
             per_video.append(
                 {"clip": clip, "cls": label, "n_frames": len(ss), "vote": round(vote, 6)}

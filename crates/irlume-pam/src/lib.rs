@@ -849,6 +849,9 @@ fn situation_prompt(situation: &str) -> Option<&'static str> {
         "off-center" => Some("center your face in the frame"),
         "looking away" => Some("look directly at the camera"),
         "too dark" => Some("it is too dark to see your face; add light"),
+        "IR source" => {
+            Some("an IR-bright source is overwhelming the camera; reposition or use your password")
+        }
         _ => None,
     }
 }
@@ -1411,11 +1414,21 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(non_snake_case)]
+    fn IR_source_situation_gets_action_wording() {
+        use super::situation_prompt;
+        assert_eq!(
+            situation_prompt("IR source"),
+            Some("an IR-bright source is overwhelming the camera; reposition or use your password")
+        );
+    }
+
     /// The #616 step 3 split: rich numbers live in the journal and the
     /// diagnostic trace, NEVER at a prompt surface. No mapped wording may
     /// carry a digit, so no threshold value can leak through a label.
     #[test]
-    fn no_prompt_wording_ever_carries_a_number() {
+    fn no_situation_prompt_wording_ever_carries_a_number() {
         use super::situation_prompt;
         for label in [
             "no face",
@@ -1423,6 +1436,7 @@ mod tests {
             "off-center",
             "looking away",
             "too dark",
+            "IR source",
         ] {
             if let Some(text) = situation_prompt(label) {
                 assert!(

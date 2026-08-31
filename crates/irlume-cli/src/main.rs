@@ -2409,6 +2409,7 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
                 ir_top_face.map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
+            ir_persistent_saturated_frac: ir_stats.persistent_saturated_frac,
             ir_ceiling_known: ir_stats.white_level.is_some(),
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,

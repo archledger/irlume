@@ -7153,6 +7153,8 @@ pub struct StoredCaptureQualificationState {
     pub resolution: capture_qualification::QualificationResolution,
     pub runtime_key: String,
     pub last_attempt_outcome: Option<capture_qualification::AttemptOutcome>,
+    pub authoritative_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
+    pub latest_attempt_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
 }
 
 /// Exact live contract a concurrent production pair must satisfy before use.
@@ -7491,20 +7493,42 @@ fn resolve_capture_qualification_state(
     let record = capture_qualification::QualificationStore::system()
         .load(&context)
         .map_err(|error| Error::Hardware(error.to_string()))?;
+    Ok(resolve_capture_qualification_record(
+        &context,
+        runtime_key,
+        record,
+    ))
+}
+
+fn resolve_capture_qualification_record(
+    context: &capture_qualification::QualificationContext,
+    runtime_key: String,
+    record: Option<capture_qualification::CaptureQualificationRecord>,
+) -> StoredCaptureQualificationState {
     let last_attempt_outcome = record
         .as_ref()
         .map(|record| record.last_attempt().outcome().clone());
+    let latest_attempt_rate_shortfalls = record
+        .as_ref()
+        .map(|record| record.last_attempt().rate_shortfalls());
+    let authoritative_rate_shortfalls = record.as_ref().and_then(|record| {
+        record
+            .authoritative()
+            .map(capture_qualification::QualificationAttempt::rate_shortfalls)
+    });
     let resolution = record.map_or(
         capture_qualification::QualificationResolution::Unqualified(
             capture_qualification::QualificationMismatch::NoAuthority,
         ),
-        |record| record.resolve(&context),
+        |record| record.resolve(context),
     );
-    Ok(StoredCaptureQualificationState {
+    StoredCaptureQualificationState {
         resolution,
         runtime_key,
         last_attempt_outcome,
-    })
+        authoritative_rate_shortfalls,
+        latest_attempt_rate_shortfalls,
+    }
 }
 
 fn qualification_arm(
@@ -11710,6 +11734,119 @@ mod tests {
 
     fn runtime_gate_contract() -> RuntimePairContract {
         runtime_gate_contract_with_interval((2, 15))
+    }
+
+    fn qualification_arm_with_shortfalls(
+        completed_rounds: u32,
+        failed_rounds: u32,
+        rate_shortfalls: irlume_common::diagnostics::RateShortfallsByRole,
+    ) -> capture_qualification::ArmEvidence {
+        capture_qualification::ArmEvidence::new(
+            6,
+            completed_rounds,
+            failed_rounds,
+            completed_rounds,
+            completed_rounds,
+            completed_rounds,
+            completed_rounds,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            failed_rounds,
+            rate_shortfalls,
+            Default::default(),
+            0,
+            100.0,
+            100.0,
+            1_000,
+        )
+        .unwrap()
+    }
+
+    fn qualification_shortfall(
+        role: irlume_common::diagnostics::CameraRoleLabel,
+        failure_count: u32,
+    ) -> irlume_common::diagnostics::RateShortfallEvidence {
+        irlume_common::diagnostics::RateShortfallEvidence {
+            role,
+            failure_count,
+            delivered_num: 10,
+            delivered_den: 1,
+            floor_num: 15,
+            floor_den: 1,
+            tolerance_percent: 98,
+            window_count: 30,
+            window_span_us: 3_000_000,
+        }
+    }
+
+    #[test]
+    fn inconclusive_attempt_preserves_authoritative_rate_shortfalls() {
+        use capture_qualification::{
+            AttemptOutcome, CaptureQualificationRecord, InconclusiveReason, QualificationAttempt,
+            QualificationResolution, SequentialReason,
+        };
+        use irlume_common::diagnostics::{
+            CameraRoleLabel, RateShortfallsByArm, RateShortfallsByRole,
+        };
+
+        let context = runtime_gate_contract().context().clone();
+        let healthy = qualification_arm_with_shortfalls(6, 0, RateShortfallsByRole::default());
+        let authoritative_shortfalls = RateShortfallsByRole {
+            rgb: Some(qualification_shortfall(CameraRoleLabel::Rgb, 4)),
+            ir: None,
+        };
+        let authoritative = QualificationAttempt::new(
+            1_786_944_000,
+            context.clone(),
+            healthy.clone(),
+            qualification_arm_with_shortfalls(0, 6, authoritative_shortfalls.clone()),
+            true,
+            AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+            None,
+        )
+        .unwrap();
+        let latest_shortfalls = RateShortfallsByRole {
+            rgb: None,
+            ir: Some(qualification_shortfall(CameraRoleLabel::Ir, 1)),
+        };
+        let latest = QualificationAttempt::new(
+            1_786_944_001,
+            context.clone(),
+            healthy,
+            qualification_arm_with_shortfalls(4, 2, latest_shortfalls.clone()),
+            false,
+            AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds),
+            None,
+        )
+        .unwrap();
+        let record = CaptureQualificationRecord::new(2, latest, Some(authoritative)).unwrap();
+
+        let state =
+            resolve_capture_qualification_record(&context, "runtime-key".into(), Some(record));
+
+        assert_eq!(
+            state.resolution,
+            QualificationResolution::SequentialRequired(SequentialReason::DeliveredRateShortfall)
+        );
+        assert_eq!(
+            state.authoritative_rate_shortfalls,
+            Some(RateShortfallsByArm {
+                sequential: Some(RateShortfallsByRole::default()),
+                concurrent: Some(authoritative_shortfalls),
+            })
+        );
+        assert_eq!(
+            state.latest_attempt_rate_shortfalls,
+            Some(RateShortfallsByArm {
+                sequential: Some(RateShortfallsByRole::default()),
+                concurrent: Some(latest_shortfalls),
+            })
+        );
     }
 
     #[test]

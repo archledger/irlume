@@ -6,8 +6,9 @@
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
     CaptureSchedule, CaptureScheduleSource, DigestToken, ExactStreamContract, ProbeOutcome,
-    ProbeRoleOutcome, QualificationReason, QualificationState, RuntimeViolationLabel,
-    ShareSafeEventKind, SupportProbeResult, SupportSnapshot, SupportUnavailable, UnavailableReason,
+    ProbeRoleOutcome, QualificationReason, QualificationState, RateShortfallEvidence,
+    RateShortfallsByArm, RateShortfallsByRole, RuntimeViolationLabel, ShareSafeEventKind,
+    SupportProbeResult, SupportSnapshot, SupportUnavailable, UnavailableReason,
 };
 use irlume_common::{Request, Response};
 use serde::Serialize;
@@ -379,6 +380,16 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
                 .unwrap_or("none"),
         )
         .unwrap();
+        write_rate_shortfall_section(
+            &mut body,
+            "authoritative",
+            capture.authoritative_rate_shortfalls.as_ref(),
+        );
+        write_rate_shortfall_section(
+            &mut body,
+            "latest-attempt",
+            capture.latest_attempt_rate_shortfalls.as_ref(),
+        );
     }
 
     writeln!(body).unwrap();
@@ -726,6 +737,59 @@ fn optional_digest_token_text(value: Option<DigestToken>) -> String {
     value.map_or_else(|| "none".into(), digest_token_text)
 }
 
+fn write_rate_shortfall_role(
+    body: &mut String,
+    arm: &str,
+    role: &str,
+    evidence: &RateShortfallEvidence,
+) {
+    let plural = if evidence.failure_count == 1 { "" } else { "s" };
+    writeln!(
+        body,
+        "    {arm} {role}: {} shortfall{plural}, worst delivered {}/{} fps, required {}/{} fps, tolerance {}%, window {} deltas over {}us",
+        evidence.failure_count,
+        evidence.delivered_num,
+        evidence.delivered_den,
+        evidence.floor_num,
+        evidence.floor_den,
+        evidence.tolerance_percent,
+        evidence.window_count,
+        evidence.window_span_us,
+    )
+    .unwrap();
+}
+
+fn write_rate_shortfall_arm(body: &mut String, arm: &str, evidence: Option<&RateShortfallsByRole>) {
+    let Some(evidence) = evidence else {
+        writeln!(body, "    {arm}: legacy unknown").unwrap();
+        return;
+    };
+    if evidence.rgb.is_none() && evidence.ir.is_none() {
+        writeln!(body, "    {arm}: measured, no delivered-rate shortfalls").unwrap();
+        return;
+    }
+    if let Some(rgb) = &evidence.rgb {
+        write_rate_shortfall_role(body, arm, "RGB", rgb);
+    }
+    if let Some(ir) = &evidence.ir {
+        write_rate_shortfall_role(body, arm, "IR", ir);
+    }
+}
+
+fn write_rate_shortfall_section(
+    body: &mut String,
+    authority: &str,
+    evidence: Option<&RateShortfallsByArm>,
+) {
+    let Some(evidence) = evidence else {
+        writeln!(body, "  {authority} rate shortfalls: unavailable").unwrap();
+        return;
+    };
+    writeln!(body, "  {authority} rate shortfalls").unwrap();
+    write_rate_shortfall_arm(body, "sequential", evidence.sequential.as_ref());
+    write_rate_shortfall_arm(body, "concurrent", evidence.concurrent.as_ref());
+}
+
 fn stream_contract_text(value: &ExactStreamContract) -> String {
     let fourcc = std::str::from_utf8(value.fourcc.as_bytes()).unwrap_or("????");
     format!(
@@ -810,8 +874,8 @@ mod tests {
     use super::*;
     use irlume_common::diagnostics::{
         CameraRoleLabel, CaptureStatus, DigestToken, ExactFraction, ExactStreamContract, FourCc,
-        QualificationReason, QualificationState, RuntimeViolationLabel, SafeLabel,
-        SanitizedCameraContext,
+        QualificationReason, QualificationState, RateShortfallEvidence, RateShortfallsByArm,
+        RateShortfallsByRole, RuntimeViolationLabel, SafeLabel, SanitizedCameraContext,
     };
 
     fn fixture_report() -> SupportReport {
@@ -836,7 +900,10 @@ mod tests {
         }
     }
 
-    fn fixture_camera_report() -> SupportReport {
+    fn fixture_camera_report_with_rate_shortfalls(
+        authoritative_rate_shortfalls: Option<RateShortfallsByArm>,
+        latest_attempt_rate_shortfalls: Option<RateShortfallsByArm>,
+    ) -> SupportReport {
         let stream = ExactStreamContract {
             width: 640,
             height: 480,
@@ -869,6 +936,8 @@ mod tests {
             qualification_reason: Some(QualificationReason::DeliveredRateShortfall),
             qualification_context: Some(DigestToken::from_bytes([0x34; 8])),
             runtime_degradation: Some(RuntimeViolationLabel::DeliveredRateShortfall),
+            authoritative_rate_shortfalls,
+            latest_attempt_rate_shortfalls,
         };
         let mut report = fixture_report();
         report.daemon = Some(SupportSnapshot::bounded(
@@ -880,6 +949,45 @@ mod tests {
             Vec::new(),
         ));
         report
+    }
+
+    fn fixture_camera_report() -> SupportReport {
+        fixture_camera_report_with_rate_shortfalls(
+            Some(RateShortfallsByArm {
+                sequential: None,
+                concurrent: Some(RateShortfallsByRole {
+                    rgb: Some(RateShortfallEvidence {
+                        role: CameraRoleLabel::Rgb,
+                        failure_count: 4,
+                        delivered_num: 10,
+                        delivered_den: 1,
+                        floor_num: 15,
+                        floor_den: 1,
+                        tolerance_percent: 98,
+                        window_count: 30,
+                        window_span_us: 3_000_000,
+                    }),
+                    ir: None,
+                }),
+            }),
+            Some(RateShortfallsByArm {
+                sequential: Some(RateShortfallsByRole::default()),
+                concurrent: Some(RateShortfallsByRole {
+                    rgb: None,
+                    ir: Some(RateShortfallEvidence {
+                        role: CameraRoleLabel::Ir,
+                        failure_count: 1,
+                        delivered_num: 14,
+                        delivered_den: 1,
+                        floor_num: 15,
+                        floor_den: 1,
+                        tolerance_percent: 98,
+                        window_count: 30,
+                        window_span_us: 3_000_000,
+                    }),
+                }),
+            }),
+        )
     }
 
     #[test]
@@ -909,8 +1017,38 @@ mod tests {
         assert!(text.contains(
             "contexts: runtime=5656565656565656 qualification=3434343434343434 degradation=delivered_rate_shortfall"
         ));
+        assert!(text.contains("authoritative rate shortfalls"));
+        assert!(text
+            .contains("concurrent RGB: 4 shortfalls, worst delivered 10/1 fps, required 15/1 fps"));
+        assert!(text.contains("latest-attempt rate shortfalls"));
+        assert!(text.contains("sequential: measured, no delivered-rate shortfalls"));
+        assert!(text
+            .contains("concurrent IR: 1 shortfall, worst delivered 14/1 fps, required 15/1 fps"));
         assert!(!text.contains("/dev/video"));
         assert!(!text.contains("raw-serial"));
+    }
+
+    #[test]
+    fn human_report_distinguishes_legacy_unknown_rate_shortfall_arms() {
+        let report = fixture_camera_report_with_rate_shortfalls(
+            Some(RateShortfallsByArm::default()),
+            Some(RateShortfallsByArm::default()),
+        );
+        let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+
+        assert!(text.contains("authoritative rate shortfalls"));
+        assert!(text.contains("sequential: legacy unknown"));
+        assert!(text.contains("concurrent: legacy unknown"));
+        assert!(text.contains("latest-attempt rate shortfalls"));
+    }
+
+    #[test]
+    fn human_report_marks_absent_rate_shortfall_sections_unavailable() {
+        let report = fixture_camera_report_with_rate_shortfalls(None, None);
+        let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+
+        assert!(text.contains("authoritative rate shortfalls: unavailable"));
+        assert!(text.contains("latest-attempt rate shortfalls: unavailable"));
     }
 
     #[test]

@@ -1017,13 +1017,15 @@ mod tests {
         assert!(text.contains(
             "contexts: runtime=5656565656565656 qualification=3434343434343434 degradation=delivered_rate_shortfall"
         ));
-        assert!(text.contains("authoritative rate shortfalls"));
-        assert!(text
-            .contains("concurrent RGB: 4 shortfalls, worst delivered 10/1 fps, required 15/1 fps"));
-        assert!(text.contains("latest-attempt rate shortfalls"));
-        assert!(text.contains("sequential: measured, no delivered-rate shortfalls"));
-        assert!(text
-            .contains("concurrent IR: 1 shortfall, worst delivered 14/1 fps, required 15/1 fps"));
+        let rate_sections = concat!(
+            "  authoritative rate shortfalls\n",
+            "    sequential: legacy unknown\n",
+            "    concurrent RGB: 4 shortfalls, worst delivered 10/1 fps, required 15/1 fps, tolerance 98%, window 30 deltas over 3000000us\n",
+            "  latest-attempt rate shortfalls\n",
+            "    sequential: measured, no delivered-rate shortfalls\n",
+            "    concurrent IR: 1 shortfall, worst delivered 14/1 fps, required 15/1 fps, tolerance 98%, window 30 deltas over 3000000us",
+        );
+        assert!(text.contains(rate_sections));
         assert!(!text.contains("/dev/video"));
         assert!(!text.contains("raw-serial"));
     }

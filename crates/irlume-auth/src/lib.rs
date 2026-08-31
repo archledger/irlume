@@ -331,6 +331,7 @@ enum AttemptSituation {
     TooFar,
     OffCenter,
     LookingAway,
+    IrSource,
     TooDark,
     GlintBelow,
     BelowScore,
@@ -347,6 +348,7 @@ const fn attempt_situation_label(situation: AttemptSituation) -> &'static str {
         AttemptSituation::TooFar => "too far",
         AttemptSituation::OffCenter => "off-center",
         AttemptSituation::LookingAway => "looking away",
+        AttemptSituation::IrSource => "IR source",
         AttemptSituation::TooDark => "too dark",
         AttemptSituation::GlintBelow => "glint below",
         AttemptSituation::BelowScore => "below score",
@@ -367,6 +369,7 @@ struct AttemptFacts {
     rgb_face_brightness: f32,
     glint: Option<f32>,
     ir_bright: f32,
+    persistent_ir_source_overwhelms: bool,
 }
 
 impl AttemptFacts {
@@ -378,6 +381,7 @@ impl AttemptFacts {
             rgb_face_brightness: a.signals.rgb_face_brightness,
             glint: a.signals.ir_eye_glint,
             ir_bright: a.ir_brightness,
+            persistent_ir_source_overwhelms: a.signals.persistent_ir_source_overwhelms(),
         }
     }
 }
@@ -407,6 +411,9 @@ fn auth_attempt_situation(kind: OutcomeKind, f: &AttemptFacts) -> AttemptSituati
     }
     if f.yaw_asym > FRAME_YAW_ASYM_MAX {
         return AttemptSituation::LookingAway;
+    }
+    if f.persistent_ir_source_overwhelms {
+        return AttemptSituation::IrSource;
     }
     if f.rgb_face.is_some() && f.rgb_face_brightness < DIM {
         return AttemptSituation::TooDark;
@@ -3671,6 +3678,7 @@ impl Engine {
             face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
             // RGB-only path: no IR frame exists to clip.
             ir_saturated_frac: None,
+            ir_persistent_saturated_frac: None,
             ir_ceiling_known: false,
             rgb_face_brightness: rgb_brightness,
             rgb_specular_frac: rgb_specular,
@@ -4465,6 +4473,7 @@ impl Engine {
                 ir_top.as_ref().map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
+            ir_persistent_saturated_frac: ir_stats.persistent_saturated_frac,
             // Whether the FORMAT could be measured, which is not the same
             // question as whether this capture produced a number: the call
             // above also yields None when no face was found (#358).
@@ -11290,6 +11299,7 @@ mod engine_tests {
             rgb_face_brightness: 120.0,
             glint: Some(250.0),
             ir_bright: 140.0,
+            persistent_ir_source_overwhelms: false,
         };
         let line = |kind, score, facts: &AttemptFacts| {
             let text = attempt_situation_line(kind, score, facts);
@@ -11377,6 +11387,7 @@ mod engine_tests {
             rgb_face_brightness: 0.0,
             glint: None,
             ir_bright: 140.0,
+            persistent_ir_source_overwhelms: false,
         };
         assert_eq!(
             attempt_situation_line(OutcomeKind::NoFace, 0.0, &facts),
@@ -11396,6 +11407,7 @@ mod engine_tests {
             rgb_face_brightness: 120.0,
             glint: Some(72.0),
             ir_bright: 140.0,
+            persistent_ir_source_overwhelms: false,
         };
         assert_eq!(
             auth_attempt_situation(OutcomeKind::Spoof, &turned),
@@ -11481,6 +11493,7 @@ mod engine_tests {
                 ir_ambient: 30.0,
                 face_frac: 0.22,
                 ir_saturated_frac: None,
+                ir_persistent_saturated_frac: None,
                 ir_ceiling_known: false,
                 rgb_face_brightness: 90.0,
                 rgb_moire_score: 0.0,
@@ -11500,6 +11513,155 @@ mod engine_tests {
         assert_eq!(facts.rgb_face_brightness, 90.0);
         assert_eq!(facts.glint, None);
         assert_eq!(facts.ir_bright, 150.0);
+        assert!(!facts.persistent_ir_source_overwhelms);
+    }
+
+    #[test]
+    fn ir_source_situation_requires_persistent_clipping_and_a_failed_cue() {
+        use super::{
+            auth_attempt_situation, liveness_deny_kind, Assessment, AttemptFacts, AttemptSituation,
+            OutcomeKind,
+        };
+        use irlume_liveness::{FaceBox, LivenessGate, Signals, Verdict};
+
+        let base = Signals {
+            rgb_face: Some(FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face: Some(FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face_brightness: 90.0,
+            ir_center_edge_ratio: 1.2,
+            ir_eye_glint: Some(220.0),
+            face_frac: 0.30,
+            ir_saturated_frac: Some(0.0),
+            ir_ceiling_known: true,
+            rgb_face_brightness: 120.0,
+            ..Default::default()
+        };
+        let situation = |signals: Signals, kind: OutcomeKind| {
+            let ir_brightness = signals.ir_face_brightness;
+            let assessment = Assessment {
+                verdict: Verdict::Spoof,
+                reason: "failed liveness assessment".into(),
+                embedding: None,
+                ir_embedding: None,
+                signals,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness,
+                ir_ambient_share: None,
+                rgb_frame_mean: 0.0,
+                shipped_ir_fake: None,
+                sequential_pair: false,
+            };
+            auth_attempt_situation(kind, &AttemptFacts::from_assessment(&assessment))
+        };
+
+        for cue in ["dark", "flat"] {
+            let mut thinkpad = base.clone();
+            thinkpad.ir_persistent_saturated_frac = Some(0.1702);
+            match cue {
+                "dark" => {
+                    thinkpad.ir_face_brightness = 20.0;
+                    thinkpad.rgb_face_brightness = 30.0;
+                }
+                "flat" => thinkpad.ir_center_edge_ratio = 1.0,
+                _ => unreachable!(),
+            }
+            let (verdict, _, reason) = LivenessGate::new().evaluate(&thinkpad);
+            assert_eq!(verdict, Verdict::Spoof, "{cue}: {reason}");
+            let kind = liveness_deny_kind(verdict, &reason);
+            assert_eq!(kind, OutcomeKind::Spoof, "{cue}: {reason}");
+            assert_eq!(
+                situation(thinkpad.clone(), kind),
+                AttemptSituation::IrSource,
+                "{cue}: {reason}"
+            );
+
+            let mut turned = thinkpad;
+            turned.head_yaw_asym = 0.52;
+            assert_eq!(
+                situation(turned, kind),
+                AttemptSituation::LookingAway,
+                "framing and orientation must keep precedence"
+            );
+        }
+
+        for fraction in [Some(0.0031), None] {
+            let mut dark = base.clone();
+            dark.ir_face_brightness = 20.0;
+            dark.ir_persistent_saturated_frac = fraction;
+            let (verdict, _, reason) = LivenessGate::new().evaluate(&dark);
+            assert_eq!(verdict, Verdict::Spoof, "fraction {fraction:?}: {reason}");
+            let kind = liveness_deny_kind(verdict, &reason);
+            assert_eq!(
+                situation(dark, kind),
+                AttemptSituation::Spoof,
+                "fraction {fraction:?}: {reason}"
+            );
+        }
+
+        let mut healthy = base;
+        healthy.ir_persistent_saturated_frac = Some(0.1702);
+        let (verdict, _, reason) = LivenessGate::new().evaluate(&healthy);
+        assert_eq!(verdict, Verdict::Live, "{reason}");
+        assert_eq!(
+            situation(healthy, OutcomeKind::BelowThreshold),
+            AttemptSituation::BelowScore,
+            "persistent clipping without a dark or flat cue is not IR source"
+        );
+        assert_eq!(
+            super::attempt_situation_label(AttemptSituation::IrSource),
+            "IR source"
+        );
+    }
+
+    #[test]
+    fn ir_source_rewording_does_not_change_the_liveness_deny_kind() {
+        use irlume_liveness::{FaceBox, LivenessGate, Signals, Verdict};
+
+        let old = Signals {
+            rgb_face: Some(FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face: Some(FaceBox {
+                cx: 0.5,
+                cy: 0.5,
+                score: 0.9,
+            }),
+            ir_face_brightness: 90.0,
+            ir_center_edge_ratio: 1.0,
+            ir_eye_glint: Some(220.0),
+            ir_saturated_frac: Some(0.0),
+            ir_persistent_saturated_frac: Some(0.0031),
+            ir_ceiling_known: true,
+            ..Default::default()
+        };
+        let mut reworded = old.clone();
+        reworded.ir_persistent_saturated_frac = Some(0.1702);
+
+        let gate = LivenessGate::new();
+        let (old_verdict, _, old_reason) = gate.evaluate(&old);
+        let (new_verdict, _, new_reason) = gate.evaluate(&reworded);
+        assert_eq!(old_verdict, Verdict::Spoof, "{old_reason}");
+        assert_eq!(new_verdict, Verdict::Spoof, "{new_reason}");
+        assert!(!old_reason.contains("IR-bright source"), "{old_reason}");
+        assert!(new_reason.contains("IR-bright source"), "{new_reason}");
+        assert_eq!(
+            super::liveness_deny_kind(old_verdict, &old_reason),
+            super::liveness_deny_kind(new_verdict, &new_reason)
+        );
+        assert_eq!(
+            super::liveness_deny_kind(new_verdict, &new_reason),
+            super::OutcomeKind::Spoof
+        );
     }
 
     #[test]

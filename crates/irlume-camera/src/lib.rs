@@ -376,6 +376,19 @@ pub struct IrCaptureStats {
     /// add a ceiling here without first adding something that guarantees the
     /// selected node is an emitter-lit IR source (#385).
     pub white_level: Option<u8>,
+    /// Whole-frame clipping in the selected metadata-lit frame. This is
+    /// diagnostic evidence only, not a grant gate. `None` means the capture
+    /// lacked either a sensor ceiling or explicit lit metadata.
+    pub lit_saturated_frac: Option<f32>,
+    /// Whole-frame clipping in the selected frame's adjacent metadata-dark
+    /// partner. This is diagnostic evidence only, not a grant gate. `None`
+    /// means no explicit adjacent ambient partner was available.
+    pub ambient_saturated_frac: Option<f32>,
+    /// Whole-frame clipping at the same pixel positions in both the selected
+    /// metadata-lit frame and its metadata-dark partner. This is diagnostic
+    /// evidence only, not a grant gate. `None` means the paired measurement
+    /// was unavailable or the decoded frame dimensions disagreed.
+    pub persistent_saturated_frac: Option<f32>,
     /// The gate frame's RAW pixels, present only when the returned frame is no
     /// longer them: ambient subtraction replaces the payload, and a caller
     /// measuring clipping must not measure the replacement.
@@ -390,6 +403,60 @@ pub struct IrCaptureStats {
     ///
     /// `None` means the returned frame IS the raw gate frame, so measure that.
     pub saturation_frame: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PairedSaturationEvidence {
+    lit_saturated_frac: Option<f32>,
+    ambient_saturated_frac: Option<f32>,
+    persistent_saturated_frac: Option<f32>,
+}
+
+fn paired_saturation_evidence(
+    frames: &[Vec<u8>],
+    means: &[f64],
+    flags: &[Option<ir_metadata::Illumination>],
+    lit_i: usize,
+    white_level: Option<u8>,
+) -> PairedSaturationEvidence {
+    let Some(white) = white_level else {
+        return PairedSaturationEvidence::default();
+    };
+    if !matches!(flags.get(lit_i), Some(Some(ir_metadata::Illumination::Lit))) {
+        return PairedSaturationEvidence::default();
+    }
+    let Some(lit) = frames.get(lit_i).filter(|frame| !frame.is_empty()) else {
+        return PairedSaturationEvidence::default();
+    };
+
+    let mut evidence = PairedSaturationEvidence {
+        lit_saturated_frac: Some(ir_probe::saturated_fraction(lit, white) as f32),
+        ..PairedSaturationEvidence::default()
+    };
+    let Some(ambient_i) = ir_metadata::ambient_partner(lit_i, means, flags) else {
+        return evidence;
+    };
+    if !matches!(
+        flags.get(ambient_i),
+        Some(Some(ir_metadata::Illumination::Dark))
+    ) {
+        return evidence;
+    }
+    let Some(ambient) = frames.get(ambient_i).filter(|frame| !frame.is_empty()) else {
+        return evidence;
+    };
+
+    evidence.ambient_saturated_frac = Some(ir_probe::saturated_fraction(ambient, white) as f32);
+    if lit.len() == ambient.len() {
+        evidence.persistent_saturated_frac = Some(
+            lit.iter()
+                .zip(ambient)
+                .filter(|(lit, ambient)| **lit >= white && **ambient >= white)
+                .count() as f32
+                / lit.len() as f32,
+        );
+    }
+    evidence
 }
 
 /// Default `--rgb`/`--ir` flag values for the dev diagnostic tools, and the
@@ -5367,6 +5434,8 @@ impl IrSession<'_> {
         });
         let best_i =
             ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref()).unwrap_or(0);
+        let paired_saturation =
+            paired_saturation_evidence(&frames, &means, &flags, best_i, white_level);
         let mut best = Some(frames[best_i].clone());
 
         // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in. On a
@@ -5594,6 +5663,9 @@ impl IrSession<'_> {
                 camera_classified_frames: from_camera,
                 camera_lit_frames: ir_metadata::count_lit(&flags),
                 white_level,
+                lit_saturated_frac: paired_saturation.lit_saturated_frac,
+                ambient_saturated_frac: paired_saturation.ambient_saturated_frac,
+                persistent_saturated_frac: paired_saturation.persistent_saturated_frac,
             },
         ))
     }
@@ -9145,6 +9217,9 @@ mod tests {
             camera_classified_frames: 12,
             camera_lit_frames: 5,
             white_level: None,
+            lit_saturated_frac: None,
+            ambient_saturated_frac: None,
+            persistent_saturated_frac: None,
             saturation_frame: None,
         };
         let state = illumination_state(Present, Some(&stats));
@@ -12253,6 +12328,9 @@ mod tests {
             camera_classified_frames: 0,
             camera_lit_frames: 0,
             white_level: None,
+            lit_saturated_frac: None,
+            ambient_saturated_frac: None,
+            persistent_saturated_frac: None,
             saturation_frame: None,
         }
     }
@@ -13004,6 +13082,125 @@ mod tests {
         );
         assert_eq!(ir_probe::saturated_fraction(&[0, 1, 254], u8::MAX), 0.0);
         assert_eq!(ir_probe::saturated_fraction(&[], u8::MAX), 0.0);
+    }
+
+    #[test]
+    fn persistent_saturation_matches_thinkpad_field_measurement() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let mut ambient = vec![0; 10_000];
+        ambient[..1_702].fill(u8::MAX);
+        let mut lit = ambient.clone();
+        lit[1_702..1_725].fill(u8::MAX);
+        let evidence = paired_saturation_evidence(
+            &[ambient, lit],
+            &[0.0, 0.0],
+            &[Some(Dark), Some(Lit)],
+            1,
+            Some(u8::MAX),
+        );
+
+        assert_eq!(evidence.lit_saturated_frac, Some(0.1725));
+        assert_eq!(evidence.ambient_saturated_frac, Some(0.1702));
+        assert_eq!(evidence.persistent_saturated_frac, Some(0.1702));
+    }
+
+    #[test]
+    fn persistent_saturation_distinguishes_brio_emitter_clipping() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let mut ambient = vec![0; 10_000];
+        ambient[..31].fill(u8::MAX);
+        let mut lit = ambient.clone();
+        lit[31..1_403].fill(u8::MAX);
+        let evidence = paired_saturation_evidence(
+            &[ambient, lit],
+            &[0.0, 0.0],
+            &[Some(Dark), Some(Lit)],
+            1,
+            Some(u8::MAX),
+        );
+
+        assert_eq!(evidence.lit_saturated_frac, Some(0.1403));
+        assert_eq!(evidence.ambient_saturated_frac, Some(0.0031));
+        assert_eq!(evidence.persistent_saturated_frac, Some(0.0031));
+    }
+
+    #[test]
+    fn persistent_saturation_is_unavailable_without_required_evidence() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let frames = [vec![u8::MAX; 4], vec![u8::MAX; 4]];
+        let means = [255.0, 255.0];
+
+        let no_ceiling =
+            paired_saturation_evidence(&frames, &means, &[Some(Dark), Some(Lit)], 1, None);
+        assert_eq!(no_ceiling.lit_saturated_frac, None);
+        assert_eq!(no_ceiling.ambient_saturated_frac, None);
+        assert_eq!(no_ceiling.persistent_saturated_frac, None);
+
+        let selected_dark =
+            paired_saturation_evidence(&frames, &means, &[Some(Lit), Some(Dark)], 1, Some(u8::MAX));
+        assert_eq!(selected_dark.lit_saturated_frac, None);
+        assert_eq!(selected_dark.ambient_saturated_frac, None);
+        assert_eq!(selected_dark.persistent_saturated_frac, None);
+
+        let no_dark_partner =
+            paired_saturation_evidence(&frames, &means, &[None, Some(Lit)], 1, Some(u8::MAX));
+        assert_eq!(no_dark_partner.lit_saturated_frac, Some(1.0));
+        assert_eq!(no_dark_partner.ambient_saturated_frac, None);
+        assert_eq!(no_dark_partner.persistent_saturated_frac, None);
+    }
+
+    #[test]
+    fn persistent_saturation_requires_equal_nonempty_frames_for_overlap() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let evidence = paired_saturation_evidence(
+            &[vec![u8::MAX; 3], vec![u8::MAX; 4]],
+            &[0.0, 0.0],
+            &[Some(Dark), Some(Lit)],
+            1,
+            Some(u8::MAX),
+        );
+
+        assert_eq!(evidence.lit_saturated_frac, Some(1.0));
+        assert_eq!(evidence.ambient_saturated_frac, Some(1.0));
+        assert_eq!(evidence.persistent_saturated_frac, None);
+    }
+
+    #[test]
+    fn persistent_saturation_is_unavailable_for_an_empty_lit_frame() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let evidence = paired_saturation_evidence(
+            &[vec![u8::MAX; 4], Vec::new()],
+            &[255.0, 0.0],
+            &[Some(Dark), Some(Lit)],
+            1,
+            Some(u8::MAX),
+        );
+
+        assert_eq!(evidence.lit_saturated_frac, None);
+        assert_eq!(evidence.ambient_saturated_frac, None);
+        assert_eq!(evidence.persistent_saturated_frac, None);
+    }
+
+    #[test]
+    fn persistent_saturation_is_unavailable_for_an_empty_dark_frame() {
+        use ir_metadata::Illumination::{Dark, Lit};
+
+        let evidence = paired_saturation_evidence(
+            &[Vec::new(), vec![u8::MAX; 4]],
+            &[0.0, 255.0],
+            &[Some(Dark), Some(Lit)],
+            1,
+            Some(u8::MAX),
+        );
+
+        assert_eq!(evidence.lit_saturated_frac, Some(1.0));
+        assert_eq!(evidence.ambient_saturated_frac, None);
+        assert_eq!(evidence.persistent_saturated_frac, None);
     }
 
     /// The whole of #394: a limited-range stream rails at 235, and counting

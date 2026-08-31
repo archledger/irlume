@@ -148,6 +148,11 @@ pub struct Signals {
     /// [`face_frac`]: Self::face_frac
     /// [`ir_center_edge_ratio`]: Self::ir_center_edge_ratio
     pub ir_saturated_frac: Option<f32>,
+    /// Fraction (0-1) of the whole IR frame saturated in both the selected lit
+    /// frame and its adjacent explicit dark frame. `None` means the diagnostic
+    /// evidence was unavailable. This can reword an existing denial but cannot
+    /// grant or deny by itself.
+    pub ir_persistent_saturated_frac: Option<f32>,
 }
 
 impl Default for Signals {
@@ -162,6 +167,7 @@ impl Default for Signals {
             head_pitch_frac: 0.5, // frontal
             face_frac: 0.0,
             ir_saturated_frac: None,
+            ir_persistent_saturated_frac: None,
             rgb_face_brightness: 0.0,
             rgb_specular_frac: 0.0,
             rgb_moire_score: 0.0,
@@ -446,6 +452,22 @@ pub const MIN_CENTER_EDGE_RATIO: f32 = 1.03;
 /// constant should know the population it is fitted to is GREY8 only.
 pub const IR_SATURATED_FRAC_MAX: f32 = 0.10;
 
+/// Persistent whole-frame saturation above this fraction can explain an
+/// already-dark or already-flat IR reading. This is a reason selector, not a
+/// grant or denial threshold.
+pub const IR_PERSISTENT_SATURATED_FRAC_MIN: f32 = 0.10;
+
+impl Signals {
+    /// Whether persistent external IR saturation explains an existing dark or
+    /// flat denial.
+    pub fn persistent_ir_source_overwhelms(&self) -> bool {
+        self.ir_persistent_saturated_frac
+            .is_some_and(|fraction| fraction > IR_PERSISTENT_SATURATED_FRAC_MIN)
+            && (self.ir_face_brightness < IR_FACE_MIN_BRIGHTNESS
+                || self.ir_center_edge_ratio < MIN_CENTER_EDGE_RATIO)
+    }
+}
+
 /// Ambient IR (see [`Signals::ir_ambient`]) above which the brightness and
 /// center/edge cues are physically starved rather than measuring a spoof: the scene's
 /// own infrared swamps the emitter, so the strobe adds almost nothing to read
@@ -459,6 +481,13 @@ pub const IR_SATURATED_FRAC_MAX: f32 = 0.10;
 /// sky, sun, and strong lamps look identical in IR), so the message names
 /// examples, not a diagnosis.
 pub const IR_AMBIENT_FLOOD: f32 = 170.0;
+
+/// The actionable rejection for a dark or flat reading explained by a
+/// persistent external IR source.
+fn persistent_ir_source_reason() -> String {
+    "a persistent IR-bright source overwhelms the camera; reposition away from it or use your password"
+        .into()
+}
 
 /// The actionable rejection for ambient-flooded IR scenes.
 fn flood_reason(ambient: f32) -> String {
@@ -579,7 +608,9 @@ impl LivenessGate {
         // IR skin reflectance: the face region must be brightly lit.
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
-            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+            let reason = if s.persistent_ir_source_overwhelms() {
+                persistent_ir_source_reason()
+            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
             } else {
                 format!(
@@ -593,7 +624,9 @@ impl LivenessGate {
         // Anti-flat: a real 3D face shows center-vs-edge IR falloff.
         cues.center_edge_ratio_ok = s.ir_center_edge_ratio >= MIN_CENTER_EDGE_RATIO;
         if !cues.center_edge_ratio_ok {
-            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+            let reason = if s.persistent_ir_source_overwhelms() {
+                persistent_ir_source_reason()
+            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
             } else if eyes_off_lens(s.ir_eye_glint) {
                 off_axis_reason(s.ir_center_edge_ratio, s.ir_eye_glint)
@@ -692,7 +725,9 @@ impl LivenessGate {
         }
         cues.ir_reflectance_ok = s.ir_face_brightness >= IR_FACE_MIN_BRIGHTNESS;
         if !cues.ir_reflectance_ok {
-            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+            let reason = if s.persistent_ir_source_overwhelms() {
+                persistent_ir_source_reason()
+            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
             } else {
                 format!("IR face too dark ({:.0})", s.ir_face_brightness)
@@ -701,7 +736,9 @@ impl LivenessGate {
         }
         cues.center_edge_ratio_ok = s.ir_center_edge_ratio >= MIN_CENTER_EDGE_RATIO;
         if !cues.center_edge_ratio_ok {
-            let reason = if s.ir_ambient >= IR_AMBIENT_FLOOD {
+            let reason = if s.persistent_ir_source_overwhelms() {
+                persistent_ir_source_reason()
+            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
                 flood_reason(s.ir_ambient)
             } else if eyes_off_lens(s.ir_eye_glint) {
                 off_axis_reason(s.ir_center_edge_ratio, s.ir_eye_glint)
@@ -1690,7 +1727,104 @@ mod tests {
             // cannot reach, because a measurable format with a face present
             // always yields a number (#358).
             ir_saturated_frac: Some(0.0),
+            ir_persistent_saturated_frac: None,
             ..Default::default() // frontal pose
+        }
+    }
+
+    #[test]
+    fn persistent_ir_source_rewords_existing_denials_on_both_paths() {
+        let gate = LivenessGate::new();
+        for cue in ["dark", "flat"] {
+            let mut s = live_signals();
+            s.ir_persistent_saturated_frac = Some(0.1702); // ThinkPad field evidence
+            match cue {
+                "dark" => s.ir_face_brightness = 20.0,
+                "flat" => s.ir_center_edge_ratio = 1.0,
+                _ => unreachable!(),
+            }
+
+            for (path, (verdict, _, reason)) in [
+                ("cross-spectrum", gate.evaluate(&s)),
+                ("ir-only", gate.evaluate_ir_only(&s)),
+            ] {
+                assert_eq!(verdict, Verdict::Spoof, "{path}/{cue}: {reason}");
+                assert!(
+                    reason.contains("IR-bright source"),
+                    "{path}/{cue}: {reason}"
+                );
+                assert!(reason.contains("reposition"), "{path}/{cue}: {reason}");
+                assert!(reason.contains("password"), "{path}/{cue}: {reason}");
+                assert!(!reason.contains("ir-setup"), "{path}/{cue}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_ir_source_boundary_rewords_only_above_ten_percent() {
+        let gate = LivenessGate::new();
+        for (fraction, reworded) in [
+            (None, false),
+            (Some(0.0031), false), // BRIO field evidence
+            (Some(0.10), false),
+            (Some(0.1001), true),
+        ] {
+            for cue in ["dark", "flat"] {
+                let mut s = live_signals();
+                s.ir_persistent_saturated_frac = fraction;
+                match cue {
+                    "dark" => s.ir_face_brightness = 20.0,
+                    "flat" => s.ir_center_edge_ratio = 1.0,
+                    _ => unreachable!(),
+                }
+
+                for (path, (verdict, _, reason), old_reason) in [
+                    (
+                        "cross-spectrum",
+                        gate.evaluate(&s),
+                        match cue {
+                            "dark" => "IR face too dark (20); not reflecting IR like skin",
+                            "flat" => "IR too flat (center/edge 1.00); looks 2D, not a 3D face",
+                            _ => unreachable!(),
+                        },
+                    ),
+                    (
+                        "ir-only",
+                        gate.evaluate_ir_only(&s),
+                        match cue {
+                            "dark" => "IR face too dark (20)",
+                            "flat" => "IR too flat (center/edge 1.00)",
+                            _ => unreachable!(),
+                        },
+                    ),
+                ] {
+                    assert_eq!(verdict, Verdict::Spoof, "{path}/{cue}: {reason}");
+                    if reworded {
+                        assert_ne!(reason, old_reason, "{path}/{cue} at {fraction:?}");
+                        assert!(
+                            reason.contains("IR-bright source"),
+                            "{path}/{cue} at {fraction:?}: {reason}"
+                        );
+                    } else {
+                        assert_eq!(reason, old_reason, "{path}/{cue} at {fraction:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persistent_ir_source_evidence_alone_changes_no_verdict() {
+        let gate = LivenessGate::new();
+        let mut s = live_signals();
+        s.ir_persistent_saturated_frac = Some(0.1702);
+
+        assert!(!s.persistent_ir_source_overwhelms());
+        for (path, (verdict, _, reason)) in [
+            ("cross-spectrum", gate.evaluate(&s)),
+            ("ir-only", gate.evaluate_ir_only(&s)),
+        ] {
+            assert_eq!(verdict, Verdict::Live, "{path}: {reason}");
         }
     }
 

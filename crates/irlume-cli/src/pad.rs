@@ -157,6 +157,7 @@ fn capture_once(
             ir_top.as_ref().map(|f| &f.bbox),
             ir_stats.white_level,
         ),
+        ir_persistent_saturated_frac: ir_stats.persistent_saturated_frac,
         // Set from the SAME white level the fraction above is computed from.
         // `Signals::default()` says false, the fail-safe answer for a struct
         // nobody filled in, and `..Default::default()` below would silently

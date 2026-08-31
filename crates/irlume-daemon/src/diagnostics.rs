@@ -659,6 +659,8 @@ mod tests {
             qualification_reason: None,
             qualification_context: Some(DigestToken::from_bytes([2; 8])),
             runtime_degradation: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
         };
 
         operation.publish_support_context(capture.clone(), vec![camera()]);

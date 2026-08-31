@@ -1566,8 +1566,30 @@ mod worker_engine {
 
     #[cfg(test)]
     mod tune_message_tests {
-        use super::super::camera_tune_verdict_message;
+        use super::super::{camera_tune_verdict_message, incomplete_probe_why};
         use irlume_auth::{AttemptOutcome, ContentionReport, PairSample, SequentialReason};
+        use irlume_common::diagnostics::{
+            CameraRoleLabel, RateShortfallEvidence, RateShortfallsByRole,
+        };
+
+        fn rate_shortfall(
+            role: CameraRoleLabel,
+            failure_count: u32,
+            delivered_num: u64,
+            floor_num: u32,
+        ) -> RateShortfallEvidence {
+            RateShortfallEvidence {
+                role,
+                failure_count,
+                delivered_num,
+                delivered_den: 1,
+                floor_num,
+                floor_den: 1,
+                tolerance_percent: 98,
+                window_count: 30,
+                window_span_us: 3_000_000,
+            }
+        }
 
         fn healthy_concurrent(rounds: usize, continuous: usize) -> ContentionReport {
             ContentionReport {
@@ -1589,6 +1611,7 @@ mod worker_engine {
                     arm_failures: 0,
                     capture_failures: 0,
                     rate_shortfall_failures: 0,
+                    rate_shortfalls: Default::default(),
                     continuity_facts: Default::default(),
                     capture_failure_facts: Default::default(),
                     ir_camera_classified_frames: 0,
@@ -1611,6 +1634,7 @@ mod worker_engine {
                     arm_failures: 0,
                     capture_failures: 0,
                     rate_shortfall_failures: 0,
+                    rate_shortfalls: Default::default(),
                     continuity_facts: Default::default(),
                     capture_failure_facts: Default::default(),
                     ir_camera_classified_frames: 0,
@@ -1840,6 +1864,114 @@ mod worker_engine {
             );
             assert!(msg.starts_with("capture mode sequential for this camera"));
             assert!(msg.contains("delivered-rate"), "{msg}");
+        }
+
+        #[test]
+        fn rate_shortfall_verdict_names_one_role_with_exact_facts() {
+            let mut report = healthy_concurrent(5, 5);
+            report.concurrent.rate_floor_rounds = 1;
+            report.concurrent.rate_shortfall_failures = 4;
+            report.concurrent.rate_shortfalls.rgb =
+                Some(rate_shortfall(CameraRoleLabel::Rgb, 4, 10, 15));
+
+            let message = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+                5,
+            );
+
+            assert!(message.contains("RGB: 4 shortfalls"), "{message}");
+            assert!(
+                message.contains("worst delivered 10/1 fps; required 15/1 fps"),
+                "{message}"
+            );
+            assert!(
+                message.contains("tolerance 98%; window 30 deltas over 3000000us"),
+                "{message}"
+            );
+            assert!(!message.contains("IR:"), "{message}");
+        }
+
+        #[test]
+        fn rate_shortfall_verdict_names_simultaneous_roles_rgb_first() {
+            let mut report = healthy_concurrent(5, 5);
+            report.concurrent.rate_floor_rounds = 0;
+            report.concurrent.rate_shortfall_failures = 5;
+            report.concurrent.rate_shortfalls = RateShortfallsByRole {
+                rgb: Some(rate_shortfall(CameraRoleLabel::Rgb, 4, 10, 15)),
+                ir: Some(rate_shortfall(CameraRoleLabel::Ir, 2, 20, 30)),
+            };
+
+            let message = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+                5,
+            );
+
+            let rgb = message.find("RGB: 4 shortfalls").expect("RGB facts");
+            let ir = message.find("IR: 2 shortfalls").expect("IR facts");
+            assert!(rgb < ir, "RGB facts must precede IR facts: {message}");
+            assert!(
+                message.contains("worst delivered 20/1 fps; required 30/1 fps"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn rate_shortfall_all_error_verdict_keeps_typed_role_facts() {
+            let mut report = healthy_concurrent(5, 5);
+            report.concurrent = PairSample {
+                failed: 5,
+                rate_shortfall_failures: 5,
+                rate_shortfalls: RateShortfallsByRole {
+                    rgb: Some(rate_shortfall(CameraRoleLabel::Rgb, 5, 10, 15)),
+                    ir: Some(rate_shortfall(CameraRoleLabel::Ir, 3, 20, 30)),
+                },
+                ..Default::default()
+            };
+
+            let message = camera_tune_verdict_message(
+                &report,
+                AttemptOutcome::SequentialRequired(SequentialReason::ConcurrentUnavailable),
+                5,
+            );
+
+            assert!(
+                message.contains("all 5 concurrent attempts errored"),
+                "{message}"
+            );
+            assert!(message.contains("RGB: 5 shortfalls"), "{message}");
+            assert!(message.contains("IR: 3 shortfalls"), "{message}");
+            assert!(
+                message.contains("tolerance 98%; window 30 deltas over 3000000us"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn rate_shortfall_inconclusive_message_reports_one_of_five_partial_facts() {
+            let mut report = healthy_concurrent(5, 5);
+            report.concurrent.rounds = 1;
+            report.concurrent.failed = 4;
+            report.concurrent.rate_shortfall_failures = 4;
+            report.concurrent.rate_shortfalls.rgb =
+                Some(rate_shortfall(CameraRoleLabel::Rgb, 4, 10, 15));
+
+            let message = incomplete_probe_why(&report, 5);
+
+            assert!(
+                message.contains("1 of 5 concurrent rounds completed"),
+                "{message}"
+            );
+            assert!(message.contains("RGB: 4 shortfalls"), "{message}");
+            assert!(
+                message.contains("worst delivered 10/1 fps; required 15/1 fps"),
+                "{message}"
+            );
+            assert!(
+                message.contains("tolerance 98%; window 30 deltas over 3000000us"),
+                "{message}"
+            );
         }
 
         /// #612: an inconclusive probe that leaves a previous authority in
@@ -3376,7 +3508,7 @@ fn run_capture_mode_probe(
                 report.sequential.rgb_mean
             )
         } else {
-            format!("the probe did not complete {rounds} clean rounds in both capture modes")
+            incomplete_probe_why(report, rounds)
         };
         return Ok(inconclusive_probe_message(
             &why,
@@ -3391,6 +3523,47 @@ fn run_capture_mode_probe(
         persisted_outcome,
         rounds,
     ))
+}
+
+/// Exact typed delivered-rate facts in stable role order. The role labels come
+/// from the fixed DTO slots, not from inference or aggregate failure counts.
+fn format_rate_shortfall_facts(
+    shortfalls: &irlume_common::diagnostics::RateShortfallsByRole,
+) -> String {
+    let mut facts = Vec::with_capacity(2);
+    for (label, evidence) in [
+        ("RGB", shortfalls.rgb.as_ref()),
+        ("IR", shortfalls.ir.as_ref()),
+    ] {
+        if let Some(evidence) = evidence {
+            facts.push(format!(
+                "{label}: {} shortfalls; worst delivered {}/{} fps; required {}/{} fps; \
+                 tolerance {}%; window {} deltas over {}us",
+                evidence.failure_count,
+                evidence.delivered_num,
+                evidence.delivered_den,
+                evidence.floor_num,
+                evidence.floor_den,
+                evidence.tolerance_percent,
+                evidence.window_count,
+                evidence.window_span_us,
+            ));
+        }
+    }
+    if facts.is_empty() {
+        String::new()
+    } else {
+        format!("; rate shortfalls: {}", facts.join("; "))
+    }
+}
+
+fn incomplete_probe_why(report: &irlume_auth::ContentionReport, rounds: usize) -> String {
+    let rate_facts = format_rate_shortfall_facts(&report.concurrent.rate_shortfalls);
+    format!(
+        "the probe did not complete {rounds} clean rounds in both capture modes \
+         ({} of {rounds} concurrent rounds completed, {} errored{rate_facts})",
+        report.concurrent.rounds, report.concurrent.failed,
+    )
 }
 
 /// The message for a probe whose attempt was inconclusive, so no NEW verdict
@@ -3473,9 +3646,10 @@ fn camera_tune_verdict_message(
                 .collect();
             format!(" ({})", named.join("; "))
         };
+        let rate_facts = format_rate_shortfall_facts(&report.concurrent.rate_shortfalls);
         return format!(
             "capture mode sequential for this camera: it cannot stream RGB and IR \
-             at once (all {} concurrent attempts errored{detail}; {} sequential \
+             at once (all {} concurrent attempts errored{detail}{rate_facts}; {} sequential \
              round(s) completed, {} errored; a trailing one-at-a-time \
              control confirmed the camera still answers)",
             report.concurrent.failed, report.sequential.rounds, report.sequential.failed,
@@ -3525,11 +3699,16 @@ fn camera_tune_verdict_message(
                         rounds - report.concurrent.continuous_rounds.min(rounds),
                     )
                 }
-                irlume_auth::SequentialReason::DeliveredRateShortfall => format!(
-                    "concurrent rounds failed their delivered-rate floors ({} below floor), \
-                     so the safe one-at-a-time mode is what was measured and persisted",
-                    rounds - report.concurrent.rate_floor_rounds.min(rounds),
-                ),
+                irlume_auth::SequentialReason::DeliveredRateShortfall => {
+                    let rate_facts =
+                        format_rate_shortfall_facts(&report.concurrent.rate_shortfalls);
+                    format!(
+                        "concurrent rounds failed their delivered-rate floors ({} below floor\
+                         {rate_facts}), so the safe one-at-a-time mode is what was measured \
+                         and persisted",
+                        rounds - report.concurrent.rate_floor_rounds.min(rounds),
+                    )
+                }
                 irlume_auth::SequentialReason::SignalLoss => {
                     // #606 (the T14s report): a concurrent arm that classified
                     // ZERO illumination-metadata frames while the sequential

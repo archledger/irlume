@@ -7511,17 +7511,23 @@ fn resolve_capture_qualification_record(
     let latest_attempt_rate_shortfalls = record
         .as_ref()
         .map(|record| record.last_attempt().rate_shortfalls());
-    let authoritative_rate_shortfalls = record.as_ref().and_then(|record| {
-        record
-            .authoritative()
-            .map(capture_qualification::QualificationAttempt::rate_shortfalls)
-    });
-    let resolution = record.map_or(
+    let resolution = record.as_ref().map_or(
         capture_qualification::QualificationResolution::Unqualified(
             capture_qualification::QualificationMismatch::NoAuthority,
         ),
         |record| record.resolve(context),
     );
+    let authoritative_rate_shortfalls = match resolution {
+        capture_qualification::QualificationResolution::ConcurrentQualified
+        | capture_qualification::QualificationResolution::SequentialRequired(_) => {
+            record.as_ref().and_then(|record| {
+                record
+                    .authoritative()
+                    .map(capture_qualification::QualificationAttempt::rate_shortfalls)
+            })
+        }
+        capture_qualification::QualificationResolution::Unqualified(_) => None,
+    };
     StoredCaptureQualificationState {
         resolution,
         runtime_key,
@@ -11845,6 +11851,58 @@ mod tests {
             Some(RateShortfallsByArm {
                 sequential: Some(RateShortfallsByRole::default()),
                 concurrent: Some(latest_shortfalls),
+            })
+        );
+    }
+
+    #[test]
+    fn context_mismatch_hides_authoritative_rate_shortfalls() {
+        use capture_qualification::{
+            AttemptOutcome, CaptureQualificationRecord, QualificationAttempt,
+            QualificationMismatch, QualificationResolution, SequentialReason,
+        };
+        use irlume_common::diagnostics::{
+            CameraRoleLabel, RateShortfallsByArm, RateShortfallsByRole,
+        };
+
+        let authoritative_context = runtime_gate_contract().context().clone();
+        let current_context = runtime_gate_contract_with_interval((1, 15))
+            .context()
+            .clone();
+        let healthy = qualification_arm_with_shortfalls(6, 0, RateShortfallsByRole::default());
+        let shortfalls = RateShortfallsByRole {
+            rgb: Some(qualification_shortfall(CameraRoleLabel::Rgb, 4)),
+            ir: None,
+        };
+        let authoritative = QualificationAttempt::new(
+            1_786_944_000,
+            authoritative_context,
+            healthy.clone(),
+            qualification_arm_with_shortfalls(0, 6, shortfalls.clone()),
+            true,
+            AttemptOutcome::SequentialRequired(SequentialReason::DeliveredRateShortfall),
+            None,
+        )
+        .unwrap();
+        let record =
+            CaptureQualificationRecord::new(1, authoritative.clone(), Some(authoritative)).unwrap();
+
+        let state = resolve_capture_qualification_record(
+            &current_context,
+            "runtime-key".into(),
+            Some(record),
+        );
+
+        assert_eq!(
+            state.resolution,
+            QualificationResolution::Unqualified(QualificationMismatch::ContextChanged)
+        );
+        assert_eq!(state.authoritative_rate_shortfalls, None);
+        assert_eq!(
+            state.latest_attempt_rate_shortfalls,
+            Some(RateShortfallsByArm {
+                sequential: Some(RateShortfallsByRole::default()),
+                concurrent: Some(shortfalls),
             })
         );
     }

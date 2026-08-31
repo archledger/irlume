@@ -1974,6 +1974,45 @@ mod worker_engine {
             );
         }
 
+        #[test]
+        fn rate_shortfall_inconclusive_message_labels_partial_sequential_and_concurrent_arms() {
+            let mut report = healthy_concurrent(5, 5);
+            report.sequential.rounds = 1;
+            report.sequential.failed = 4;
+            report.sequential.rate_shortfall_failures = 4;
+            report.sequential.rate_shortfalls.ir =
+                Some(rate_shortfall(CameraRoleLabel::Ir, 4, 8, 15));
+            report.concurrent.rounds = 1;
+            report.concurrent.failed = 4;
+            report.concurrent.rate_shortfall_failures = 4;
+            report.concurrent.rate_shortfalls.rgb =
+                Some(rate_shortfall(CameraRoleLabel::Rgb, 4, 10, 15));
+
+            let message = incomplete_probe_why(&report, 5);
+
+            assert!(
+                message.contains("1 of 5 concurrent rounds completed, 4 errored"),
+                "{message}"
+            );
+            assert!(
+                message.contains(
+                    "sequential rate shortfalls: IR: 4 shortfalls; worst delivered 8/1 fps; \
+                     required 15/1 fps; tolerance 98%; window 30 deltas over 3000000us"
+                ),
+                "{message}"
+            );
+            assert!(
+                message.contains(
+                    "concurrent rate shortfalls: RGB: 4 shortfalls; worst delivered 10/1 fps; \
+                     required 15/1 fps; tolerance 98%; window 30 deltas over 3000000us"
+                ),
+                "{message}"
+            );
+            let sequential = message.find("sequential rate shortfalls").unwrap();
+            let concurrent = message.find("concurrent rate shortfalls").unwrap();
+            assert!(sequential < concurrent, "{message}");
+        }
+
         /// #612: an inconclusive probe that leaves a previous authority in
         /// force must not tell the operator nothing is stored. The message
         /// names the stored verdict instead of the bare "left unmeasured".
@@ -3557,11 +3596,26 @@ fn format_rate_shortfall_facts(
     }
 }
 
+fn format_arm_rate_shortfall_facts(
+    arm: &str,
+    shortfalls: &irlume_common::diagnostics::RateShortfallsByRole,
+) -> String {
+    format_rate_shortfall_facts(shortfalls)
+        .strip_prefix("; rate shortfalls: ")
+        .map_or_else(String::new, |facts| {
+            format!("; {arm} rate shortfalls: {facts}")
+        })
+}
+
 fn incomplete_probe_why(report: &irlume_auth::ContentionReport, rounds: usize) -> String {
-    let rate_facts = format_rate_shortfall_facts(&report.concurrent.rate_shortfalls);
+    let sequential_rate_facts =
+        format_arm_rate_shortfall_facts("sequential", &report.sequential.rate_shortfalls);
+    let concurrent_rate_facts =
+        format_arm_rate_shortfall_facts("concurrent", &report.concurrent.rate_shortfalls);
     format!(
         "the probe did not complete {rounds} clean rounds in both capture modes \
-         ({} of {rounds} concurrent rounds completed, {} errored{rate_facts})",
+         ({} of {rounds} concurrent rounds completed, {} errored{sequential_rate_facts}\
+          {concurrent_rate_facts})",
         report.concurrent.rounds, report.concurrent.failed,
     )
 }

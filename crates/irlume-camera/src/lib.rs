@@ -6525,6 +6525,8 @@ pub struct PairSample {
     pub capture_failures: usize,
     /// Failed rounds carrying typed delivered-rate-below-floor evidence.
     pub rate_shortfall_failures: usize,
+    /// Per-role details retained from typed delivered-rate-below-floor errors.
+    pub rate_shortfalls: irlume_common::diagnostics::RateShortfallsByRole,
     /// Per-fact counts of the cross-round continuity failures (#586): which
     /// of the four nameable conditions fired, and how often. Arm-local
     /// diagnostic detail; deliberately NOT carried into the persisted
@@ -7546,6 +7548,7 @@ fn qualification_arm(
         count(sample.arm_failures, "arm-failure")?,
         count(sample.capture_failures, "capture-failure")?,
         count(sample.rate_shortfall_failures, "rate-shortfall-failure")?,
+        sample.rate_shortfalls.clone(),
         capture_failure_facts,
         count(sample.ir_camera_classified_frames, "ir-camera-classified")?,
         sample.rgb_mean,
@@ -8076,6 +8079,88 @@ struct PairContinuityState {
 
 impl PairContinuityState {}
 
+fn fraction_is_lower(
+    mut left_num: u128,
+    mut left_den: u128,
+    mut right_num: u128,
+    mut right_den: u128,
+) -> bool {
+    let mut reversed = false;
+    loop {
+        let left_quotient = left_num / left_den;
+        let right_quotient = right_num / right_den;
+        if left_quotient != right_quotient {
+            return if reversed {
+                left_quotient > right_quotient
+            } else {
+                left_quotient < right_quotient
+            };
+        }
+
+        let left_remainder = left_num % left_den;
+        let right_remainder = right_num % right_den;
+        if left_remainder == 0 && right_remainder == 0 {
+            return false;
+        }
+        if left_remainder == 0 || right_remainder == 0 {
+            let lower = left_remainder == 0 && right_remainder != 0;
+            return if reversed { !lower } else { lower };
+        }
+
+        (left_num, left_den) = (left_den, left_remainder);
+        (right_num, right_den) = (right_den, right_remainder);
+        reversed = !reversed;
+    }
+}
+
+fn observe_rate_shortfall(into: &mut PairSample, error: &irlume_common::Error) {
+    let irlume_common::Error::DeliveredRate(rate) = error else {
+        return;
+    };
+    if rate.delivered_den == 0 || rate.floor_num == 0 || rate.floor_den == 0 {
+        return;
+    }
+
+    let (role, slot) = match rate.role.as_str() {
+        "rgb" => (
+            irlume_common::diagnostics::CameraRoleLabel::Rgb,
+            &mut into.rate_shortfalls.rgb,
+        ),
+        "ir" => (
+            irlume_common::diagnostics::CameraRoleLabel::Ir,
+            &mut into.rate_shortfalls.ir,
+        ),
+        _ => return,
+    };
+    let failure_count = slot
+        .as_ref()
+        .map_or(1, |retained| retained.failure_count.saturating_add(1));
+    let candidate = irlume_common::diagnostics::RateShortfallEvidence {
+        role,
+        failure_count,
+        delivered_num: rate.delivered_num,
+        delivered_den: rate.delivered_den,
+        floor_num: rate.floor_num,
+        floor_den: rate.floor_den,
+        tolerance_percent: rate.tolerance_percent,
+        window_count: rate.window_count,
+        window_span_us: rate.window_span_us,
+    };
+    let replace = slot.as_ref().is_none_or(|retained| {
+        fraction_is_lower(
+            u128::from(candidate.delivered_num) * u128::from(candidate.floor_den),
+            u128::from(candidate.delivered_den) * u128::from(candidate.floor_num),
+            u128::from(retained.delivered_num) * u128::from(retained.floor_den),
+            u128::from(retained.delivered_den) * u128::from(retained.floor_num),
+        )
+    });
+    if replace {
+        *slot = Some(candidate);
+    } else if let Some(retained) = slot {
+        retained.failure_count = failure_count;
+    }
+}
+
 /// Fold one probe round into a running mean.
 ///
 /// The IR figure is the burst's `lit_mean`, NOT the returned frame's own mean.
@@ -8099,6 +8184,12 @@ fn accumulate(
 ) {
     let (Ok(rgb), Ok((ir, ir_stats))) = (rgb, ir) else {
         into.failed += 1;
+        if let Err(error) = rgb {
+            observe_rate_shortfall(into, error);
+        }
+        if let Err(error) = ir {
+            observe_rate_shortfall(into, error);
+        }
         if matches!(rgb, Err(irlume_common::Error::DeliveredRate(_)))
             || matches!(ir, Err(irlume_common::Error::DeliveredRate(_)))
         {
@@ -11999,6 +12090,7 @@ mod tests {
                 arm_failures: 0,
                 capture_failures: failed,
                 rate_shortfall_failures: 0,
+                rate_shortfalls: Default::default(),
                 continuity_facts: Default::default(),
                 capture_failure_facts: Default::default(),
                 ir_camera_classified_frames: 0,
@@ -12290,20 +12382,26 @@ mod tests {
         }
     }
 
-    fn below_floor_error(role: &str) -> Error {
+    fn below_floor_error(
+        role: &str,
+        delivered_num: u64,
+        delivered_den: u64,
+        floor_num: u32,
+        floor_den: u32,
+    ) -> Error {
         Error::DeliveredRate(Box::new(irlume_common::CameraStreamRateEvidence {
             role: role.into(),
             requested_num: 1,
             requested_den: 30,
             accepted_num: 1,
             accepted_den: 30,
-            floor_num: 15,
-            floor_den: 1,
+            floor_num,
+            floor_den,
             tolerance_percent: 98,
             window_count: 30,
             window_span_us: 3_000_000,
-            delivered_num: 10,
-            delivered_den: 1,
+            delivered_num,
+            delivered_den,
             meets_floor: false,
             sequence_gap: 0,
             cumulative_drops: 0,
@@ -12322,7 +12420,7 @@ mod tests {
         let rgb = || {
             let call = rgb_calls.fetch_add(1, Ordering::SeqCst);
             if (2..4).contains(&call) {
-                Err(below_floor_error("rgb"))
+                Err(below_floor_error("rgb", 10, 1, 15, 1))
             } else {
                 Ok(frame(&[120; 4]))
             }
@@ -12347,6 +12445,66 @@ mod tests {
             capture_qualification::AttemptOutcome::SequentialRequired(
                 capture_qualification::SequentialReason::DeliveredRateShortfall
             )
+        );
+    }
+
+    #[test]
+    fn rate_shortfall_retains_the_lower_exact_delivered_to_floor_ratio() {
+        let mut sample = PairSample::default();
+        let mut continuity = PairContinuityState::default();
+        let ir = Ok((frame(&[20; 4]), stats(60.0)));
+
+        for rgb in [
+            Err(below_floor_error("rgb", 667, 1_000, 1, 1)),
+            Err(below_floor_error("rgb", 2, 3, 1, 1)),
+        ] {
+            accumulate(
+                &mut sample,
+                &mut continuity,
+                &rgb,
+                &ir,
+                std::time::Duration::ZERO,
+                None,
+            );
+        }
+
+        let rgb = sample.rate_shortfalls.rgb.expect("RGB shortfall");
+        assert_eq!(rgb.failure_count, 2);
+        assert_eq!((rgb.delivered_num, rgb.delivered_den), (2, 3));
+        assert_eq!((rgb.floor_num, rgb.floor_den), (1, 1));
+    }
+
+    #[test]
+    fn rate_shortfall_counts_both_roles_once_in_one_failed_round() {
+        let mut sample = PairSample::default();
+        accumulate(
+            &mut sample,
+            &mut PairContinuityState::default(),
+            &Err(below_floor_error("rgb", 7, 1, 15, 1)),
+            &Err(below_floor_error("ir", 14, 1, 15, 1)),
+            std::time::Duration::ZERO,
+            None,
+        );
+
+        assert_eq!(sample.failed, 1);
+        assert_eq!(sample.rate_shortfall_failures, 1);
+        assert_eq!(
+            sample
+                .rate_shortfalls
+                .rgb
+                .as_ref()
+                .expect("RGB shortfall")
+                .failure_count,
+            1
+        );
+        assert_eq!(
+            sample
+                .rate_shortfalls
+                .ir
+                .as_ref()
+                .expect("IR shortfall")
+                .failure_count,
+            1
         );
     }
 

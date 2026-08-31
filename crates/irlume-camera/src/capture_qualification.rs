@@ -818,6 +818,10 @@ pub struct ArmEvidence {
     /// Failed rounds carrying typed below-floor delivery evidence.
     #[serde(default)]
     rate_shortfall_failures: u32,
+    /// Per-role typed below-floor details. `None` means a legacy producer did
+    /// not record them; `Some(default)` means a fresh arm measured none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByRole>,
     /// Per-fact counts of capture-level round failures (#606), naming HOW an
     /// arm's rounds errored (stream delivery, rate-window establishment).
     /// Additive and defaulted, like `rate_shortfall_failures` before it, so
@@ -858,6 +862,7 @@ impl ArmEvidence {
         arm_failures: u32,
         capture_failures: u32,
         rate_shortfall_failures: u32,
+        rate_shortfalls: irlume_common::diagnostics::RateShortfallsByRole,
         capture_failure_facts: std::collections::BTreeMap<String, u32>,
         ir_camera_classified_frames: u32,
         rgb_mean: f32,
@@ -880,6 +885,7 @@ impl ArmEvidence {
             arm_failures,
             capture_failures,
             rate_shortfall_failures,
+            rate_shortfalls: Some(rate_shortfalls),
             capture_failure_facts,
             ir_camera_classified_frames: Some(ir_camera_classified_frames),
             rgb_mean,
@@ -898,7 +904,30 @@ impl ArmEvidence {
         self.ir_camera_classified_frames
     }
 
+    /// Per-role delivered-rate shortfalls, or `None` for a legacy arm.
+    #[must_use]
+    pub const fn rate_shortfalls(
+        &self,
+    ) -> Option<&irlume_common::diagnostics::RateShortfallsByRole> {
+        self.rate_shortfalls.as_ref()
+    }
+
     fn validate(&self) -> Result<(), QualificationError> {
+        let valid_shortfall =
+            |evidence: &irlume_common::diagnostics::RateShortfallEvidence,
+             role: irlume_common::diagnostics::CameraRoleLabel| {
+                evidence.role == role
+                    && evidence.failure_count != 0
+                    && evidence.delivered_den != 0
+                    && evidence.floor_den != 0
+            };
+        let rate_shortfalls_valid = self.rate_shortfalls.as_ref().is_none_or(|shortfalls| {
+            shortfalls.rgb.as_ref().is_none_or(|evidence| {
+                valid_shortfall(evidence, irlume_common::diagnostics::CameraRoleLabel::Rgb)
+            }) && shortfalls.ir.as_ref().is_none_or(|evidence| {
+                valid_shortfall(evidence, irlume_common::diagnostics::CameraRoleLabel::Ir)
+            })
+        });
         let exceeds_completed = |healthy: u32, failed: u32| {
             healthy
                 .checked_add(failed)
@@ -928,6 +957,7 @@ impl ArmEvidence {
             || !self.ir_mean.is_finite()
             || self.rgb_mean < 0.0
             || self.ir_mean < 0.0
+            || !rate_shortfalls_valid
         {
             return Err(QualificationError::InvalidEvidence);
         }
@@ -1061,6 +1091,15 @@ impl QualificationAttempt {
     #[must_use]
     pub const fn ir_illumination_metadata(&self) -> Option<IlluminationMetadataPresence> {
         self.ir_illumination_metadata
+    }
+
+    /// Per-role delivered-rate shortfalls projected by capture schedule.
+    #[must_use]
+    pub fn rate_shortfalls(&self) -> irlume_common::diagnostics::RateShortfallsByArm {
+        irlume_common::diagnostics::RateShortfallsByArm {
+            sequential: self.sequential.rate_shortfalls.clone(),
+            concurrent: self.concurrent.rate_shortfalls.clone(),
+        }
     }
 
     fn validate(&self) -> Result<(), QualificationError> {
@@ -1660,6 +1699,18 @@ mod tests {
     }
 
     fn arm_with_ir_classified(rounds: u32, ir_camera_classified: u32) -> ArmEvidence {
+        arm_with_rate_shortfalls(
+            rounds,
+            ir_camera_classified,
+            irlume_common::diagnostics::RateShortfallsByRole::default(),
+        )
+    }
+
+    fn arm_with_rate_shortfalls(
+        rounds: u32,
+        ir_camera_classified: u32,
+        rate_shortfalls: irlume_common::diagnostics::RateShortfallsByRole,
+    ) -> ArmEvidence {
         ArmEvidence::new(
             rounds,
             rounds,
@@ -1676,6 +1727,7 @@ mod tests {
             0,
             0,
             0,
+            rate_shortfalls,
             Default::default(),
             ir_camera_classified,
             140.0,
@@ -1683,6 +1735,22 @@ mod tests {
             850,
         )
         .unwrap()
+    }
+
+    fn rate_shortfall(
+        role: irlume_common::diagnostics::CameraRoleLabel,
+    ) -> irlume_common::diagnostics::RateShortfallEvidence {
+        irlume_common::diagnostics::RateShortfallEvidence {
+            role,
+            failure_count: 2,
+            delivered_num: 29,
+            delivered_den: 2,
+            floor_num: 15,
+            floor_den: 1,
+            tolerance_percent: 98,
+            window_count: 30,
+            window_span_us: 2_000_000,
+        }
     }
 
     /// #606: absence means an older producer did not measure the count, while
@@ -1710,6 +1778,92 @@ mod tests {
         );
         let back: ArmEvidence = serde_json::from_value(json).expect("the new record round-trips");
         assert_eq!(back.ir_camera_classified_frames(), Some(47));
+    }
+
+    #[test]
+    fn rate_shortfall_persistence_preserves_unknown_measured_empty_and_roles() {
+        use irlume_common::diagnostics::{CameraRoleLabel, RateShortfallsByRole};
+
+        let fresh = arm(6);
+        assert_eq!(
+            fresh.rate_shortfalls(),
+            Some(&RateShortfallsByRole::default())
+        );
+        assert_eq!(SCHEMA_VERSION, 2);
+
+        let mut legacy = serde_json::to_value(&fresh).unwrap();
+        legacy.as_object_mut().unwrap().remove("rate_shortfalls");
+        let legacy: ArmEvidence = serde_json::from_value(legacy).expect("legacy record parses");
+        assert_eq!(legacy.rate_shortfalls(), None);
+
+        let shortfalls = RateShortfallsByRole {
+            rgb: Some(rate_shortfall(CameraRoleLabel::Rgb)),
+            ir: Some(rate_shortfall(CameraRoleLabel::Ir)),
+        };
+        let populated = arm_with_rate_shortfalls(6, 0, shortfalls.clone());
+        let json = serde_json::to_vec(&populated).unwrap();
+        let decoded: ArmEvidence = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.rate_shortfalls(), Some(&shortfalls));
+    }
+
+    #[test]
+    fn rate_shortfall_populated_slots_validate_role_counts_and_denominators() {
+        use irlume_common::diagnostics::{CameraRoleLabel, RateShortfallsByRole};
+
+        let valid = rate_shortfall(CameraRoleLabel::Rgb);
+        let mut invalid_values = Vec::new();
+
+        let mut wrong_role = valid.clone();
+        wrong_role.role = CameraRoleLabel::Ir;
+        invalid_values.push(wrong_role);
+        let mut zero_count = valid.clone();
+        zero_count.failure_count = 0;
+        invalid_values.push(zero_count);
+        let mut zero_delivered_den = valid.clone();
+        zero_delivered_den.delivered_den = 0;
+        invalid_values.push(zero_delivered_den);
+        let mut zero_floor_den = valid;
+        zero_floor_den.floor_den = 0;
+        invalid_values.push(zero_floor_den);
+
+        for invalid in invalid_values {
+            let mut arm = arm(6);
+            arm.rate_shortfalls = Some(RateShortfallsByRole {
+                rgb: Some(invalid),
+                ir: None,
+            });
+            assert_eq!(arm.validate(), Err(QualificationError::InvalidEvidence));
+        }
+    }
+
+    #[test]
+    fn rate_shortfall_qualification_attempt_projects_both_arms() {
+        use irlume_common::diagnostics::{
+            CameraRoleLabel, RateShortfallsByArm, RateShortfallsByRole,
+        };
+
+        let concurrent = RateShortfallsByRole {
+            rgb: Some(rate_shortfall(CameraRoleLabel::Rgb)),
+            ir: None,
+        };
+        let attempt = QualificationAttempt::new(
+            1_786_944_000,
+            context("/devices/pci0000:00/usb3/3-2"),
+            arm(6),
+            arm_with_rate_shortfalls(6, 0, concurrent.clone()),
+            false,
+            AttemptOutcome::ConcurrentQualified,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            attempt.rate_shortfalls(),
+            RateShortfallsByArm {
+                sequential: Some(RateShortfallsByRole::default()),
+                concurrent: Some(concurrent),
+            }
+        );
     }
 
     fn concurrent_attempt(port: &str) -> QualificationAttempt {
@@ -1892,6 +2046,7 @@ mod tests {
                 3,
                 0,
                 Default::default(),
+                Default::default(),
                 0,
                 80.0,
                 90.0,
@@ -1954,6 +2109,7 @@ mod tests {
                 0,
                 0,
                 Default::default(),
+                Default::default(),
                 0,
                 1.0,
                 1.0,
@@ -1978,6 +2134,7 @@ mod tests {
             0,
             0,
             0,
+            Default::default(),
             Default::default(),
             0,
             1.0,
@@ -2014,6 +2171,7 @@ mod tests {
             0,
             0,
             6,
+            Default::default(),
             Default::default(),
             0,
             0.0,
@@ -2237,6 +2395,7 @@ mod tests {
                 0,
                 2,
                 0,
+                Default::default(),
                 Default::default(),
                 0,
                 80.0,

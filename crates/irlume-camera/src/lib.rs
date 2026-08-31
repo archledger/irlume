@@ -12433,7 +12433,7 @@ mod tests {
             ..PairSample::default()
         };
         let evidence = qualification_arm(&sample, 2).expect("bounded counts");
-        assert_eq!(evidence.ir_camera_classified_frames(), 23);
+        assert_eq!(evidence.ir_camera_classified_frames(), Some(23));
     }
 
     /// #606: a pair that cannot even establish its rate windows names that

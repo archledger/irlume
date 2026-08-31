@@ -826,11 +826,10 @@ pub struct ArmEvidence {
     #[serde(default)]
     capture_failure_facts: std::collections::BTreeMap<String, u32>,
     /// Burst frames the camera's illumination metadata classified as lit or
-    /// dark, summed over the arm's completed rounds (#606). Additive and
-    /// defaulted like `capture_failure_facts`, so schema-2 records written
-    /// before the field still parse and revalidate.
-    #[serde(default)]
-    ir_camera_classified_frames: u32,
+    /// dark, summed over the arm's completed rounds (#606). `None` means the
+    /// schema-2 record predates this measurement; `Some(0)` is a measured zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ir_camera_classified_frames: Option<u32>,
     rgb_mean: f32,
     ir_mean: f32,
     elapsed_ms: u64,
@@ -882,7 +881,7 @@ impl ArmEvidence {
             capture_failures,
             rate_shortfall_failures,
             capture_failure_facts,
-            ir_camera_classified_frames,
+            ir_camera_classified_frames: Some(ir_camera_classified_frames),
             rgb_mean,
             ir_mean,
             elapsed_ms,
@@ -892,9 +891,10 @@ impl ArmEvidence {
     }
 
     /// Burst frames the camera's illumination metadata classified as lit or
-    /// dark across the arm's completed rounds (#606).
+    /// dark across the arm's completed rounds, or `None` when an older producer
+    /// did not record the measurement (#606).
     #[must_use]
-    pub const fn ir_camera_classified_frames(&self) -> u32 {
+    pub const fn ir_camera_classified_frames(&self) -> Option<u32> {
         self.ir_camera_classified_frames
     }
 
@@ -1685,13 +1685,10 @@ mod tests {
         .unwrap()
     }
 
-    /// #606: the illumination-metadata classified-frame count is additive and
-    /// defaulted: schema-2 records written before the field still parse and
-    /// revalidate, and new records round-trip it.
+    /// #606: absence means an older producer did not measure the count, while
+    /// an explicit zero means a current producer measured no classified frames.
     #[test]
-    fn ir_camera_classified_frames_is_additive_and_round_trips() {
-        assert_eq!(arm(6).ir_camera_classified_frames(), 0);
-        // A record serialized before the field existed decodes with zero.
+    fn ir_camera_classified_frames_preserves_unknown_and_measured_values() {
         let json = serde_json::to_value(arm_with_ir_classified(6, 47)).unwrap();
         let mut legacy = json.clone();
         legacy
@@ -1699,10 +1696,20 @@ mod tests {
             .unwrap()
             .remove("ir_camera_classified_frames");
         let decoded: ArmEvidence = serde_json::from_value(legacy).expect("legacy record parses");
-        assert_eq!(decoded.ir_camera_classified_frames(), 0);
-        // And a new record round-trips the value.
+        let legacy_again = serde_json::to_value(decoded).unwrap();
+        assert!(
+            legacy_again.get("ir_camera_classified_frames").is_none(),
+            "an unknown legacy count must not become a measured zero: {legacy_again}"
+        );
+
+        let measured_zero = serde_json::to_value(arm_with_ir_classified(6, 0)).unwrap();
+        assert_eq!(
+            measured_zero.get("ir_camera_classified_frames"),
+            Some(&serde_json::json!(0)),
+            "a measured zero must remain explicit"
+        );
         let back: ArmEvidence = serde_json::from_value(json).expect("the new record round-trips");
-        assert_eq!(back.ir_camera_classified_frames(), 47);
+        assert_eq!(back.ir_camera_classified_frames(), Some(47));
     }
 
     fn concurrent_attempt(port: &str) -> QualificationAttempt {
@@ -2187,7 +2194,29 @@ mod tests {
         let temp = TempStore::new("inconclusive");
         let store = temp.store();
         let conclusive = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
-        store.save_attempt(conclusive.clone(), None).unwrap();
+        let record =
+            CaptureQualificationRecord::new(1, conclusive.clone(), Some(conclusive.clone()))
+                .unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&record.to_json().unwrap()).unwrap();
+        for attempt in ["last_attempt", "authoritative"] {
+            for arm in ["sequential", "concurrent"] {
+                legacy[attempt][arm]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ir_camera_classified_frames");
+            }
+        }
+        store.ensure_dir().unwrap();
+        let path = store.record_path_for_test(conclusive.context());
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let legacy_authority = store
+            .load(conclusive.context())
+            .unwrap()
+            .unwrap()
+            .authoritative()
+            .unwrap()
+            .clone();
         let inconclusive = QualificationAttempt::new(
             1_786_944_001,
             conclusive.context().clone(),
@@ -2224,10 +2253,20 @@ mod tests {
         let updated = store.save_attempt(inconclusive.clone(), Some(1)).unwrap();
         assert_eq!(updated.revision(), 2);
         assert_eq!(updated.last_attempt(), &inconclusive);
-        assert_eq!(updated.authoritative(), Some(&conclusive));
+        assert_eq!(updated.authoritative(), Some(&legacy_authority));
         assert_eq!(
             updated.resolve(conclusive.context()),
             QualificationResolution::ConcurrentQualified
         );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for arm in ["sequential", "concurrent"] {
+            assert!(
+                persisted["authoritative"][arm]
+                    .get("ir_camera_classified_frames")
+                    .is_none(),
+                "preserved authority must not gain a fabricated zero: {persisted}"
+            );
+        }
     }
 }

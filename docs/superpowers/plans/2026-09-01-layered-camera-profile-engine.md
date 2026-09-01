@@ -522,6 +522,7 @@ git commit -s -m "feat: qualify camera conditioning policies"
 ### Task 6: Immutable Attempt Capture Plan And Exact Profile Opens
 
 **Files:**
+- Create: `crates/irlume-camera/src/attempt_contract.rs`
 - Create: `crates/irlume-auth/src/capture_plan.rs`
 - Modify: `crates/irlume-auth/src/lib.rs:3466-3495,3579-3683,3847-4270`
 - Modify: `crates/irlume-camera/src/backend.rs:1-320`
@@ -531,21 +532,24 @@ git commit -s -m "feat: qualify camera conditioning policies"
 - Test: `crates/irlume-camera/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `PairTransportProfile`, `ConditioningSelection`, `ModelContractSet`, camera incarnations, capture qualification context, and exact interval negotiation.
-- Produces: `AttemptCapturePlan`, camera-owned `SceneObservation` minting,
+- Consumes: `PairTransportProfile`, `ConditioningSelection`, `ModelContractSet`, camera incarnations, capture qualification context, canonical evidence manifests, and exact interval negotiation.
+- Produces: camera-owned `CameraAttemptContract`, auth-owned composite
+  `AttemptCapturePlan`, camera-owned `SceneObservation` minting,
   `RgbCamera::open_profile`, `IrCamera::open_profile`, and
   `CapturePlanViolation`.
 
 - [ ] **Step 1: Write failing immutable-plan tests**
 
-Test that one plan binds exact camera generations, both requested/accepted
-tuples, schedule, conditioning ID, preprocessing versions, calibration ID,
-model contracts, and qualification key. Assert any changed field produces a
-specific violation before inference. Test that observation minting rejects any
-camera, connection, RGB tuple, IR tuple, schedule, catalog, or evidence-manifest
-mismatch. Test that the observation freshness instant is the oldest contributing
-capture-window start and that RGB/IR windows beyond the fixed evidence-pair
-bound are rejected rather than allowing fresh evidence to renew older facts.
+Test that `CameraAttemptContract` binds exact camera generations, connection,
+both requested/accepted tuples, schedule, conditioning ID, evidence-window
+rules, qualification key, and policy versions. Test that `AttemptCapturePlan`
+composes it with preprocessing versions, calibration ID, and model contracts.
+Assert any changed field produces a specific violation before inference. Test
+that observation minting rejects any camera, connection, RGB tuple, IR tuple,
+schedule, catalog, or evidence-manifest mismatch. Test that the observation
+freshness instant is the oldest contributing capture-window start and that
+RGB/IR windows beyond the fixed evidence-pair bound are rejected rather than
+allowing fresh evidence to renew older facts.
 
 ```rust
 #[test]
@@ -575,9 +579,10 @@ task. Profile-aware opens are reachable only from diagnostics and tests.
 
 - [ ] **Step 4: Build and validate the immutable plan**
 
-Construct `AttemptCapturePlan` after both cameras are opened and exact
-qualification context is available, but before either session streams. Bind the
-conditioning guard and model contracts before capture. Expose no mutators.
+Construct `CameraAttemptContract` after both cameras are opened and exact
+qualification context is available, but before either session streams. Compose
+it into `AttemptCapturePlan`, then bind the conditioning guard and model
+contracts before capture. Expose no mutators from either layer.
 
 Validate canonical evidence manifests against the plan before detector input is
 constructed. A mismatch returns `CapturePlanViolation` and discards both roles.
@@ -600,7 +605,7 @@ tests pass.
 - [ ] **Step 6: Commit the attempt-plan slice**
 
 ```bash
-git add crates/irlume-auth/src/capture_plan.rs crates/irlume-auth/src/lib.rs crates/irlume-camera/src/backend.rs crates/irlume-camera/src/conditioning.rs crates/irlume-camera/src/lib.rs
+git add crates/irlume-camera/src/attempt_contract.rs crates/irlume-auth/src/capture_plan.rs crates/irlume-auth/src/lib.rs crates/irlume-camera/src/backend.rs crates/irlume-camera/src/conditioning.rs crates/irlume-camera/src/lib.rs
 git commit -s -m "feat: bind immutable camera attempt plans"
 ```
 

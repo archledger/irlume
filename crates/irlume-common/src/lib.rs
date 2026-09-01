@@ -803,6 +803,16 @@ pub struct PositionReport {
     pub guidance: String,
 }
 
+/// Runtime state of one shipped presentation-attack-detection model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PadModelStatus {
+    Loaded,
+    Disabled,
+    Missing,
+    LoadFailed,
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -958,6 +968,12 @@ pub enum Response {
         mesh: bool,
         /// IR domain adapter loaded.
         adapter: bool,
+        /// RGB PAD model state. `None` means the daemon predates this field.
+        #[serde(default)]
+        rgb_pad: Option<PadModelStatus>,
+        /// IR PAD model state. `None` means the daemon predates this field.
+        #[serde(default)]
+        ir_pad: Option<PadModelStatus>,
         /// The daemon's crate version; lets the TUI flag a stale installed
         /// build (daemon predating the CLI it's talking to).
         #[serde(default)]
@@ -1883,6 +1899,37 @@ mod tests {
             Response::Health { version, tier, .. } => {
                 assert_eq!(version, "");
                 assert_eq!(tier, "secure");
+            }
+            other => panic!("expected Health, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn health_pad_status_is_typed_and_defaults_unknown_for_old_daemons() {
+        let old: Response = serde_json::from_str(
+            r#"{"Health":{"tier":"secure","rgb_dev":null,"ir_dev":null,"mesh":true,"adapter":false}}"#,
+        )
+        .unwrap();
+        match old {
+            Response::Health {
+                rgb_pad, ir_pad, ..
+            } => {
+                assert_eq!(rgb_pad, None);
+                assert_eq!(ir_pad, None);
+            }
+            other => panic!("expected Health, got {other:?}"),
+        }
+
+        let current: Response = serde_json::from_str(
+            r#"{"Health":{"tier":"secure","rgb_dev":null,"ir_dev":null,"mesh":true,"adapter":false,"rgb_pad":"loaded","ir_pad":"load-failed"}}"#,
+        )
+        .unwrap();
+        match current {
+            Response::Health {
+                rgb_pad, ir_pad, ..
+            } => {
+                assert_eq!(rgb_pad, Some(PadModelStatus::Loaded));
+                assert_eq!(ir_pad, Some(PadModelStatus::LoadFailed));
             }
             other => panic!("expected Health, got {other:?}"),
         }

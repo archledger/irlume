@@ -441,6 +441,11 @@ print/banner species at login distance. Both ship default-on and verified
 against `models/SHA256SUMS` at daemon startup; kill switches if a cue misfires
 on your hardware: `IRLUME_PAD_IR=0` (service env `pad_ir=0`) and
 `IRLUME_PAD_VIT=0` (`pad_vit=0`), then `sudo systemctl restart irlumed`.
+These switches are password-only controls: the daemon, diagnostics, and
+password fallback remain available, but no face grant that requires the
+disabled cue is permitted. A missing model or inference failure has the same
+fail-closed authentication result. Model availability is reported by the daemon
+health check; a runtime inference failure is reported on the failed attempt.
 
 Third-party / bring-your-own model support was removed (ADR-0015): irlume
 ships and supports exactly the models-v1 set it was validated with, and there
@@ -483,7 +488,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 
 | Variable | Effect | Default |
 |---|---|---|
-| `IRLUME_MODELS_STRICT` | refuse to start when a model file is missing or fails the checksum manifest, instead of warning | warn and continue |
+| `IRLUME_MODELS_STRICT` | refuse to start when a core model file is missing or fails the checksum manifest; a rejected PAD model keeps the daemon available but makes affected face paths password-only | warn and continue |
 | `IRLUME_PRIVILEGED_FACE_CONSENT` | same switch as `privileged_face_consent` in `settings.conf`; the env var wins. `0` waives the literal `yes` on privileged services | on |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |

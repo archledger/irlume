@@ -69,7 +69,7 @@ pub struct Engine {
     /// refine its coarse box into alignment landmarks.
     blaze: Option<Rescue>,
     /// Shipped ViT RGB PAD cue (`liveness_vit.onnx`, ADR-0013, default-on
-    /// with the daemon's kill switch): scores the RGB face chip whenever the
+    /// with the daemon's password-only switch): scores the RGB face chip whenever the
     /// gate verdicted Live and downgrades to Spoof when the rolling median of
     /// the last `VIT_VOTE_N` scores clears `VIT_THRESHOLD`. DENY-ONLY.
     vit_pad: Option<irlume_vision::PadVit>,
@@ -78,7 +78,7 @@ pub struct Engine {
     /// across requests would mix presentations.
     vit_scores: Vec<f32>,
     /// Shipped IR PAD cue (`flir.onnx`, ADR-0013, default-on with the
-    /// daemon's kill switch): the FLIR classifier at its measured 0.9
+    /// daemon's password-only switch): the FLIR classifier at its measured 0.9
     /// threshold, lit-phase IR frames, DENY-ONLY. This is the same weights
     /// and operating point as the opt-in catalog entry; shipping it removes
     /// the enablement step the 2026-07-17 qualification asked operators to run.
@@ -177,6 +177,8 @@ pub struct Assessment {
     /// loaded and an IR face was present. Deny-only: consulted by both the
     /// cross-spectrum verdict (in `assess_full`) and the dark path.
     pub shipped_ir_fake: Option<f32>,
+    rgb_pad: PadEvidence,
+    ir_pad: PadEvidence,
     /// True when the RGB/IR pair this assessment rests on was admitted only
     /// under the sequential pairing budget (`SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW`,
     /// ADR-0014): the frames were captured as two temporally separated one-shot
@@ -1253,6 +1255,60 @@ fn ir_match_in(
         }
     }
     m
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PadEvidence {
+    NotApplicable,
+    Unavailable,
+    InferenceFailed,
+    Score(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PadModality {
+    Rgb,
+    Ir,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PadRequirements {
+    RgbOnly,
+    RgbAndIr,
+    IrOnly,
+}
+
+fn pad_evidence_refusal(modality: PadModality, evidence: PadEvidence) -> Option<Outcome> {
+    let modality = match modality {
+        PadModality::Rgb => "RGB",
+        PadModality::Ir => "IR",
+    };
+    let reason = match evidence {
+        PadEvidence::Unavailable => {
+            format!("{modality} PAD is unavailable; use your password")
+        }
+        PadEvidence::InferenceFailed => {
+            format!("{modality} PAD inference failed; use your password")
+        }
+        PadEvidence::NotApplicable => {
+            format!("{modality} PAD was not evaluated; use your password")
+        }
+        PadEvidence::Score(_) => return None,
+    };
+    Some(Outcome::deny(OutcomeKind::OtherDeny, reason))
+}
+
+fn pad_policy_refusal(
+    requirements: PadRequirements,
+    rgb: PadEvidence,
+    ir: PadEvidence,
+) -> Option<Outcome> {
+    match requirements {
+        PadRequirements::RgbOnly => pad_evidence_refusal(PadModality::Rgb, rgb),
+        PadRequirements::RgbAndIr => pad_evidence_refusal(PadModality::Rgb, rgb)
+            .or_else(|| pad_evidence_refusal(PadModality::Ir, ir)),
+        PadRequirements::IrOnly => pad_evidence_refusal(PadModality::Ir, ir),
+    }
 }
 
 /// Deny-only rule for the opt-in third-party PAD cue: fires (downgrades to
@@ -3289,10 +3345,9 @@ impl Engine {
     }
 
     /// Load the shipped ViT RGB PAD classifier (`liveness_vit.onnx`,
-    /// ADR-0013). No-op if the file is absent, so a partial install or a
-    /// dev tree without weights degrades to no cue (loud startup line +
-    /// `IRLUME_MODELS_STRICT=1` refusal live in the daemon), never to a
-    /// startup failure here.
+    /// ADR-0013). No-op if the file is absent; ADR-0019 makes the resulting
+    /// unavailable evidence a password-fallback denial without turning model
+    /// absence into a daemon startup failure.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_vit_pad(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
@@ -3301,19 +3356,42 @@ impl Engine {
         Ok(self)
     }
 
+    #[must_use]
+    pub fn with_vit_pad_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
+        if std::path::Path::new(path).exists() {
+            match irlume_vision::PadVit::load_from_file(path) {
+                Ok(pad) => self.vit_pad = Some(pad),
+                Err(e) => return (self, Some(e)),
+            }
+        }
+        (self, None)
+    }
+
     pub fn has_vit_pad(&self) -> bool {
         self.vit_pad.is_some()
     }
 
     /// Load the shipped IR PAD classifier (`flir.onnx`, ADR-0013): same
     /// weights/threshold as the opt-in catalog entry, default-on. Absent
-    /// file degrades the same way as the ViT cue.
+    /// files retain unavailable evidence and therefore force password fallback
+    /// on IR-requiring face paths (ADR-0019).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn with_pad_ir(mut self, path: &str) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
             self.pad_ir = Some(irlume_vision::PadIr::load_from_file(path)?);
         }
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_pad_ir_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
+        if std::path::Path::new(path).exists() {
+            match irlume_vision::PadIr::load_from_file(path) {
+                Ok(pad) => self.pad_ir = Some(pad),
+                Err(e) => return (self, Some(e)),
+            }
+        }
+        (self, None)
     }
 
     pub fn has_pad_ir(&self) -> bool {
@@ -3704,21 +3782,20 @@ impl Engine {
         // the one measured defence against the life-size print (the 2026-06-30
         // breach species; IR face-presence does not exist here). Same deny-only
         // 5-median contract as the cross-spectrum path.
-        let vit_score: Option<f32> = match self.vit_pad.as_mut() {
-            Some(pad) if verdict == Verdict::Live => match rgb_top.as_ref() {
-                Some(f) => match pad.p_spoof(&rgb_view, &f.bbox) {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        irlume_common::dlog!("pad-vit: inference failed ({e}); cue skipped");
-                        None
-                    }
-                },
-                None => None,
+        let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
+            (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
+            (Verdict::Live, Some(f), Some(pad)) => match pad.p_spoof(&rgb_view, &f.bbox) {
+                Ok(p) if p.is_finite() => PadEvidence::Score(p),
+                Ok(_) => PadEvidence::InferenceFailed,
+                Err(e) => {
+                    irlume_common::dlog!("pad-vit: inference failed ({e})");
+                    PadEvidence::InferenceFailed
+                }
             },
-            _ => None,
+            _ => PadEvidence::NotApplicable,
         };
-        let (verdict, reason) = match vit_score {
-            Some(p) => {
+        let (verdict, reason) = match rgb_pad {
+            PadEvidence::Score(p) => {
                 irlume_common::dlog!("pad-vit(rgb-only): p_spoof {p:.3}");
                 if self.vit_pad_votes_deny(p) {
                     irlume_common::dlog!(
@@ -3732,7 +3809,7 @@ impl Engine {
                     (verdict, reason)
                 }
             }
-            None => (verdict, reason),
+            _ => (verdict, reason),
         };
         let embedding = match &rgb_top {
             Some(f) => Some(
@@ -3752,6 +3829,8 @@ impl Engine {
             ir_brightness: 0.0,
             ir_ambient_share: None, // RGB-only path: no IR burst to measure
             shipped_ir_fake: None,  // RGB-only path: no IR frame exists
+            rgb_pad,
+            ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false, // RGB-only path: no pair exists
         })
     }
@@ -4393,8 +4472,10 @@ impl Engine {
                     ir_center_edge_ratio: 0.0,
                     ir_brightness: 0.0,
                     ir_ambient_share: None,
-                            shipped_ir_fake: None,
-                            sequential_pair: false, // rejected pair: no pair survives
+                    shipped_ir_fake: None,
+                    rgb_pad: PadEvidence::NotApplicable,
+                    ir_pad: PadEvidence::NotApplicable,
+                    sequential_pair: false, // rejected pair: no pair survives
                 });
             }
         };
@@ -4509,14 +4590,20 @@ impl Engine {
         // Shipped IR PAD cue (ADR-0013, default-on), deny-only on the lit IR
         // frame. Scored even when the gate did not say Live so the dark path
         // can reuse it below.
-        let shipped_ir_fake = match (self.pad_ir.as_mut(), ir_top.as_ref()) {
-            (Some(pad), Some(f)) => match pad.p_fake(&ir_view, &f.bbox) {
-                Ok(p) => Some(p),
+        let ir_pad = match (ir_top.as_ref(), self.pad_ir.as_mut()) {
+            (Some(_), None) => PadEvidence::Unavailable,
+            (Some(f), Some(pad)) => match pad.p_fake(&ir_view, &f.bbox) {
+                Ok(p) if p.is_finite() => PadEvidence::Score(p),
+                Ok(_) => PadEvidence::InferenceFailed,
                 Err(e) => {
-                    irlume_common::dlog!("pad-ir: inference failed ({e}); cue skipped");
-                    None
+                    irlume_common::dlog!("pad-ir: inference failed ({e})");
+                    PadEvidence::InferenceFailed
                 }
             },
+            (None, _) => PadEvidence::NotApplicable,
+        };
+        let shipped_ir_fake = match ir_pad {
+            PadEvidence::Score(p) => Some(p),
             _ => None,
         };
         let (verdict, reason) = if pad_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD) {
@@ -4536,31 +4623,30 @@ impl Engine {
         // deny-only cues never need to run on frames that already deny, and
         // the 268ms N100 inference is not free (the plan: consent-watch-
         // pipelined, Live frames only).
-        let vit_score: Option<f32> = match self.vit_pad.as_mut() {
-            Some(pad) if verdict == Verdict::Live => match rgb_top.as_ref() {
-                Some(f) => {
-                    // Fresh view against the FINAL RGB frame: the self-heal
-                    // above may have recaptured it after the view built for
-                    // detection.
-                    let view = align::RgbView {
-                        data: &rgb.data,
-                        width: rgb.width,
-                        height: rgb.height,
-                    };
-                    match pad.p_spoof(&view, &f.bbox) {
-                        Ok(p) => Some(p),
-                        Err(e) => {
-                            irlume_common::dlog!("pad-vit: inference failed ({e}); cue skipped");
-                            None
-                        }
+        let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
+            (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
+            (Verdict::Live, Some(f), Some(pad)) => {
+                // Fresh view against the FINAL RGB frame: the self-heal
+                // above may have recaptured it after the view built for
+                // detection.
+                let view = align::RgbView {
+                    data: &rgb.data,
+                    width: rgb.width,
+                    height: rgb.height,
+                };
+                match pad.p_spoof(&view, &f.bbox) {
+                    Ok(p) if p.is_finite() => PadEvidence::Score(p),
+                    Ok(_) => PadEvidence::InferenceFailed,
+                    Err(e) => {
+                        irlume_common::dlog!("pad-vit: inference failed ({e})");
+                        PadEvidence::InferenceFailed
                     }
                 }
-                None => None,
-            },
-            _ => None,
+            }
+            _ => PadEvidence::NotApplicable,
         };
-        let (verdict, reason) = match vit_score {
-            Some(p) => {
+        let (verdict, reason) = match rgb_pad {
+            PadEvidence::Score(p) => {
                 irlume_common::dlog!("pad-vit: p_spoof {p:.3}");
                 if self.vit_pad_votes_deny(p) {
                     irlume_common::dlog!(
@@ -4574,7 +4660,7 @@ impl Engine {
                     (verdict, reason)
                 }
             }
-            None => (verdict, reason),
+            _ => (verdict, reason),
         };
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Liveness,
@@ -4628,6 +4714,8 @@ impl Engine {
                 .ambient_observed
                 .then(|| ir_stats.ambient_mean / ir_stats.lit_mean.max(1.0)),
             shipped_ir_fake,
+            rgb_pad,
+            ir_pad,
             // Paired under the schedule-aware budget AND beyond the concurrent
             // ceiling: the bursts ran as separated one-shots (ADR-0014). Such
             // pairs defer the RGB-primary grant (rgb_primary_grant_admissible).
@@ -5643,6 +5731,14 @@ impl Engine {
                     format!("liveness {:?}: {}", a.verdict, a.reason),
                 ));
             }
+            let requirements = if self.ir_available {
+                PadRequirements::RgbAndIr
+            } else {
+                PadRequirements::RgbOnly
+            };
+            if let Some(refusal) = pad_policy_refusal(requirements, a.rgb_pad, a.ir_pad) {
+                return Ok(refusal);
+            }
             // Per-user floor on the IR center/edge brightness ratio
             // (anti-screen/photo, calibrated to how this user's face reads under
             // the emitter): the live frame must clear the enrolled floor. Ratio
@@ -5892,6 +5988,10 @@ impl Engine {
                     kind,
                     format!("dark liveness {verdict:?}: {reason}"),
                 ));
+            }
+            if let Some(refusal) = pad_policy_refusal(PadRequirements::IrOnly, a.rgb_pad, a.ir_pad)
+            {
+                return Ok(refusal);
             }
             // Per-user calibrated center/edge floor, same as the RGB primary path.
             // `evaluate_ir_only` uses the lenient global MIN_CENTER_EDGE_RATIO; the
@@ -10062,9 +10162,116 @@ mod tests {
 
 #[cfg(test)]
 mod pad_cue_tests {
-    use super::pad_downgrades;
+    use super::{
+        pad_downgrades, pad_evidence_refusal, pad_policy_refusal, PadEvidence, PadModality,
+        PadRequirements,
+    };
     use super::{vit_vote_denies, IR_PAD_THRESHOLD, VIT_PAD_VOTE_N};
     use irlume_liveness::Verdict;
+
+    #[test]
+    fn applicable_pad_unavailable_is_terminal_password_fallback_not_abstention() {
+        let refusal = pad_evidence_refusal(PadModality::Rgb, PadEvidence::Unavailable)
+            .expect("required unavailable PAD must refuse face authentication");
+
+        assert_eq!(refusal.kind, super::OutcomeKind::OtherDeny);
+        assert!(!super::presence_retryable(&refusal));
+        assert!(refusal.reason.contains("RGB PAD is unavailable"));
+        assert!(refusal.reason.contains("use your password"));
+    }
+
+    #[test]
+    fn pad_requirements_follow_the_grant_modalities() {
+        assert!(pad_policy_refusal(
+            PadRequirements::RgbOnly,
+            PadEvidence::Score(0.1),
+            PadEvidence::NotApplicable,
+        )
+        .is_none());
+        assert!(pad_policy_refusal(
+            PadRequirements::RgbAndIr,
+            PadEvidence::Score(0.1),
+            PadEvidence::Score(0.1),
+        )
+        .is_none());
+        assert!(pad_policy_refusal(
+            PadRequirements::IrOnly,
+            PadEvidence::NotApplicable,
+            PadEvidence::Score(0.1),
+        )
+        .is_none());
+
+        let paired_ir_missing = pad_policy_refusal(
+            PadRequirements::RgbAndIr,
+            PadEvidence::Score(0.1),
+            PadEvidence::Unavailable,
+        )
+        .expect("paired grants require IR PAD");
+        assert!(paired_ir_missing.reason.contains("IR PAD is unavailable"));
+
+        assert!(pad_policy_refusal(
+            PadRequirements::IrOnly,
+            PadEvidence::Unavailable,
+            PadEvidence::Score(0.1),
+        )
+        .is_none());
+
+        let required_but_not_evaluated = pad_policy_refusal(
+            PadRequirements::RgbOnly,
+            PadEvidence::NotApplicable,
+            PadEvidence::NotApplicable,
+        )
+        .expect("a required modality must produce a PAD score");
+        assert!(required_but_not_evaluated
+            .reason
+            .contains("RGB PAD was not evaluated"));
+    }
+
+    #[test]
+    fn applicable_pad_inference_failure_is_password_fallback() {
+        let refusal = pad_policy_refusal(
+            PadRequirements::IrOnly,
+            PadEvidence::NotApplicable,
+            PadEvidence::InferenceFailed,
+        )
+        .expect("required failed PAD inference must refuse face authentication");
+
+        assert_eq!(refusal.kind, super::OutcomeKind::OtherDeny);
+        assert!(!super::presence_retryable(&refusal));
+        assert!(refusal.reason.contains("IR PAD inference failed"));
+        assert!(refusal.reason.contains("use your password"));
+    }
+
+    #[test]
+    fn every_authentication_grant_path_checks_required_pad_first() {
+        let source = include_str!("lib.rs");
+        let auth = &source[source.find("fn authenticate_once").unwrap()
+            ..source.find("/// 1:N identify").unwrap()];
+        let dark_start = auth.find("// Dark path:").unwrap();
+        let (rgb_path, dark_path) = auth.split_at(dark_start);
+
+        let rgb_check = rgb_path
+            .find("pad_policy_refusal(requirements, a.rgb_pad, a.ir_pad)")
+            .expect("RGB authentication path must enforce applicable PAD");
+        let rgb_grant = rgb_path
+            .find("Outcome::grant")
+            .expect("RGB authentication path must contain a grant arm");
+        assert!(
+            rgb_check < rgb_grant,
+            "RGB PAD must be checked before grants"
+        );
+
+        let dark_check = dark_path
+            .find("pad_policy_refusal(PadRequirements::IrOnly, a.rgb_pad, a.ir_pad)")
+            .expect("dark authentication path must enforce IR PAD");
+        let dark_grant = dark_path
+            .find("Outcome::grant")
+            .expect("dark authentication path must contain a grant arm");
+        assert!(
+            dark_check < dark_grant,
+            "dark IR PAD must be checked before grants"
+        );
+    }
 
     #[test]
     fn fires_only_on_live_plus_confident_fake() {
@@ -10284,6 +10491,25 @@ mod engine_tests {
             );
             assert!(!e.has_mesh(), "the engine must come back mesh-less");
             let _ = std::fs::remove_file(&bogus);
+            let bogus_pad =
+                std::env::temp_dir().join(format!("irlume-bogus-pad-{}.onnx", std::process::id()));
+            std::fs::write(&bogus_pad, b"not an ONNX model").unwrap();
+            let (e, vit_err) = e.with_vit_pad_degraded(&bogus_pad.to_string_lossy());
+            assert!(
+                vit_err.is_some(),
+                "an unloadable RGB PAD must report its error"
+            );
+            assert!(
+                !e.has_vit_pad(),
+                "the engine must come back without RGB PAD"
+            );
+            let (e, ir_err) = e.with_pad_ir_degraded(&bogus_pad.to_string_lossy());
+            assert!(
+                ir_err.is_some(),
+                "an unloadable IR PAD must report its error"
+            );
+            assert!(!e.has_pad_ir(), "the engine must come back without IR PAD");
+            let _ = std::fs::remove_file(&bogus_pad);
             assert_eq!(e.ir_space(), "raw");
             // A present adapter file flips the IR space to its digest name. Any
             // valid ONNX serves; `apply` is never called (BlazeFace here).
@@ -11504,6 +11730,8 @@ mod engine_tests {
             ir_ambient_share: None,
             rgb_frame_mean: 60.0,
             shipped_ir_fake: None,
+            rgb_pad: PadEvidence::NotApplicable,
+            ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false,
         };
         let facts = AttemptFacts::from_assessment(&a);
@@ -11557,6 +11785,8 @@ mod engine_tests {
                 ir_ambient_share: None,
                 rgb_frame_mean: 0.0,
                 shipped_ir_fake: None,
+                rgb_pad: PadEvidence::NotApplicable,
+                ir_pad: PadEvidence::NotApplicable,
                 sequential_pair: false,
             };
             auth_attempt_situation(kind, &AttemptFacts::from_assessment(&assessment))

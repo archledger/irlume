@@ -16,9 +16,9 @@ fn main() {
         match irlume_camera::capture_rgb_denoised(&dev) {
             Ok(f) => println!(
                 "{dev} frame{i}: mean={:.1} ({}x{})",
-                irlume_camera::frame_mean(&f.data),
-                f.width,
-                f.height
+                irlume_camera::frame_mean(f.pixels()),
+                f.width(),
+                f.height()
             ),
             Err(e) => eprintln!("{dev} frame{i}: {e}"),
         }

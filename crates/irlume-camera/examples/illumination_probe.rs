@@ -31,7 +31,8 @@ fn main() {
     let mut frames_total = 0usize;
     for round in 1..=rounds {
         match capture_ir_with_stats(&dev) {
-            Ok((frame, stats)) => {
+            Ok(frame) => {
+                let stats = frame.stats();
                 classified_total += stats.camera_classified_frames;
                 frames_total += stats.burst_frames;
                 let source = if stats.camera_classified_frames == 0 {
@@ -42,8 +43,8 @@ fn main() {
                 println!(
                     "round {round}: {}x{} lit {:.1} / ambient {:.1} (gap {:.1})  \
                      camera classified {}/{} frames  source: {source}",
-                    frame.width,
-                    frame.height,
+                    frame.width(),
+                    frame.height(),
                     stats.lit_mean,
                     stats.ambient_mean,
                     stats.lit_mean - stats.ambient_mean,

@@ -2318,23 +2318,30 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             rgb_top
         );
         // IR. Taken with stats rather than bare, because the exposure gate
-        // needs the negotiated format's ceiling and `capture_ir` is literally
-        // `capture_ir_with_stats(..)?.0`, so the burst already happened and the
-        // plain call was only throwing the answer away (#358 review).
-        let (ir, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
-        let (mn, mx, sum) = ir.data.iter().fold((255u8, 0u8, 0u64), |(mn, mx, s), &p| {
-            (mn.min(p), mx.max(p), s + p as u64)
-        });
-        let mean = sum as f64 / ir.data.len() as f64;
+        // needs the negotiated format's ceiling. The plain capture call uses
+        // the same burst but intentionally discards those statistics (#358 review).
+        let ir = irlume_camera::capture_ir_with_stats(ir_dev)?;
+        let ir_stats = ir.stats();
+        let (mn, mx, sum) = ir
+            .pixels()
+            .iter()
+            .fold((255u8, 0u8, 0u64), |(mn, mx, s), &p| {
+                (mn.min(p), mx.max(p), s + p as u64)
+            });
+        let mean = sum as f64 / ir.pixels().len() as f64;
         println!(
             "[IR ] {}x{}  brightness mean {:.1} min {} max {}",
-            ir.width, ir.height, mean, mn, mx
+            ir.width(),
+            ir.height(),
+            mean,
+            mn,
+            mx
         );
-        let ir_rgb = irlume_camera::grey_to_rgb(&ir.data);
+        let ir_rgb = irlume_camera::grey_to_rgb(ir.pixels());
         let ir_view = irlume_vision::align::RgbView {
             data: &ir_rgb,
-            width: ir.width,
-            height: ir.height,
+            width: ir.width(),
+            height: ir.height(),
         };
         let ir_faces = det.detect(&ir_view)?;
         let ir_top_face = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
@@ -2351,10 +2358,10 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             score: f.score,
         };
         let ir_face_brightness = ir_top_face
-            .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
+            .map(|f| mean_in_bbox(ir.pixels(), ir.width(), ir.height(), &f.bbox))
             .unwrap_or(0.0);
         let ir_center_edge_ratio = ir_top_face
-            .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
+            .map(|f| center_edge_ratio(ir.pixels(), ir.width(), ir.height(), &f.bbox))
             .unwrap_or(0.0);
         // Ceiling-aware, the same call `padcapture` makes. The comment here used
         // to say no white level was known, which was true while this probe
@@ -2368,9 +2375,9 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         // the auth path and the corpus. The tool a developer opens to diagnose a
         // glint problem was the one place still giving the old answer.
         let ir_eye_glint = irlume_auth::eye_glint_of(
-            ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
-            ir.width,
-            ir.height,
+            ir.saturation_pixels(),
+            ir.width(),
+            ir.height(),
             ir_top_face.map(|f| &f.landmarks),
             ir_stats.white_level,
         );
@@ -2378,7 +2385,7 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
         let pose = rgb_top.map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = irlume_liveness::Signals {
             rgb_face: rgb_top.map(|f| to_fbox(f, rgb.width, rgb.height)),
-            ir_face: ir_top_face.map(|f| to_fbox(f, ir.width, ir.height)),
+            ir_face: ir_top_face.map(|f| to_fbox(f, ir.width(), ir.height())),
             ir_face_brightness,
             ir_center_edge_ratio,
             ir_eye_glint,
@@ -2386,7 +2393,7 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // dev gate probe: single frame, no burst stats
             face_frac: ir_top_face
-                .map(|f| irlume_auth::bbox_width_frac(&f.bbox, ir.width))
+                .map(|f| irlume_auth::bbox_width_frac(&f.bbox, ir.width()))
                 .unwrap_or(0.0),
             // Measured the same way the auth path and `padcapture` measure it,
             // off the same burst stats, so this probe judges the frame instead
@@ -2403,9 +2410,9 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             // Raw frame, not the subtracted one: ambient subtraction moves a
             // railed 255 to 254 and hides the clipping this measures.
             ir_saturated_frac: irlume_auth::saturated_frac_of(
-                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
-                ir.width,
-                ir.height,
+                ir.saturation_pixels(),
+                ir.width(),
+                ir.height(),
                 ir_top_face.map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
@@ -2774,21 +2781,22 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             // RGB (median-denoised, matches the auth path) + IR (brightest-of-burst).
             let rgbf = irlume_camera::capture_rgb_denoised(rgb_dev)?;
             let rv = irlume_vision::align::RgbView {
-                data: &rgbf.data,
-                width: rgbf.width,
-                height: rgbf.height,
+                data: rgbf.pixels(),
+                width: rgbf.width(),
+                height: rgbf.height(),
             };
             let rgb_top = det
                 .detect(&rv)?
                 .into_iter()
                 .max_by(|a, b| a.score.total_cmp(&b.score));
 
-            let (irf, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
-            let ir_rgb = irlume_camera::grey_to_rgb(&irf.data);
+            let irf = irlume_camera::capture_ir_with_stats(ir_dev)?;
+            let ir_stats = irf.stats();
+            let ir_rgb = irlume_camera::grey_to_rgb(irf.pixels());
             let iv = irlume_vision::align::RgbView {
                 data: &ir_rgb,
-                width: irf.width,
-                height: irf.height,
+                width: irf.width(),
+                height: irf.height(),
             };
             let ir_top = det
                 .detect(&iv)?
@@ -2809,17 +2817,17 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             // blinding the detector), worth stratifying training data by.
             rec.insert(
                 "rgb_sat_pct".into(),
-                json_f32(sat_pct(&rgbf.data, rgbf.width, rgbf.height, 3)),
+                json_f32(sat_pct(rgbf.pixels(), rgbf.width(), rgbf.height(), 3)),
             );
             rec.insert(
                 "ir_sat_pct".into(),
-                json_f32(sat_pct(&irf.data, irf.width, irf.height, 1)),
+                json_f32(sat_pct(irf.pixels(), irf.width(), irf.height(), 1)),
             );
             // Capture resolution per modality: the driver may deliver a
             // different mode than requested, and detection/sharpness numbers
             // only compare across samples of the same resolution.
-            rec.insert("rgb_res".into(), vec![rgbf.width, rgbf.height].into());
-            rec.insert("ir_res".into(), vec![irf.width, irf.height].into());
+            rec.insert("rgb_res".into(), vec![rgbf.width(), rgbf.height()].into());
+            rec.insert("ir_res".into(), vec![irf.width(), irf.height()].into());
             rec.insert("ts_unix".into(), epoch().into());
             // Per-capture ambient IR from the burst's darkest (emitter-off)
             // frame, and the strobe gap: the ambient-relative gate's inputs,
@@ -2834,7 +2842,7 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             if let Some(t) = &rgb_top {
                 let chip = irlume_vision::align::align_to_arcface(&rv, &t.landmarks)?;
                 let e = emb.embed_tta(&chip)?; // RGB path = TTA flip-average
-                rgb_bri = mean_bbox(&rgbf.data, rgbf.width, rgbf.height, 3, &t.bbox);
+                rgb_bri = mean_bbox(rgbf.pixels(), rgbf.width(), rgbf.height(), 3, &t.bbox);
                 if !rgb_scans.is_empty() {
                     rgb_cos = best(&e, &rgb_scans);
                 }
@@ -2844,9 +2852,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 rec.insert(
                     "rgb_sharpness".into(),
                     json_f32(laplacian_var_bbox(
-                        &rgbf.data,
-                        rgbf.width,
-                        rgbf.height,
+                        rgbf.pixels(),
+                        rgbf.width(),
+                        rgbf.height(),
                         3,
                         &t.bbox,
                     )),
@@ -2854,9 +2862,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 rec.insert(
                     "rgb_contrast".into(),
                     json_f32(contrast_bbox(
-                        &rgbf.data,
-                        rgbf.width,
-                        rgbf.height,
+                        rgbf.pixels(),
+                        rgbf.width(),
+                        rgbf.height(),
                         3,
                         &t.bbox,
                     )),
@@ -2880,11 +2888,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
                 let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
-                ir_bri = mean_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox);
+                ir_bri = mean_bbox(irf.pixels(), irf.width(), irf.height(), 1, &t.bbox);
                 // Ambient-INDEPENDENT liveness cues (the center/edge-floor candidates):
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
-                ir_center_edge_ratio =
-                    irlume_auth::center_edge_ratio(&irf.data, irf.width, irf.height, &t.bbox);
+                ir_center_edge_ratio = irlume_auth::center_edge_ratio(
+                    irf.pixels(),
+                    irf.width(),
+                    irf.height(),
+                    &t.bbox,
+                );
                 // `eye_glint_of` on the RAW frame with the negotiated ceiling, the
                 // same pair the daemon and `pad.rs` already pass. `eye_glint`
                 // returns the window maximum, and a maximum that reached the
@@ -2897,9 +2909,9 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 // railed 255 to 254 and a subtracted frame stops reading as
                 // railed, which would silently disable the refusal (#238 review).
                 ir_glint = irlume_auth::eye_glint_of(
-                    ir_stats.saturation_frame.as_deref().unwrap_or(&irf.data),
-                    irf.width,
-                    irf.height,
+                    irf.saturation_pixels(),
+                    irf.width(),
+                    irf.height(),
                     Some(&t.landmarks),
                     ir_stats.white_level,
                 );
@@ -2915,12 +2927,22 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 rec.insert(
                     "ir_sharpness".into(),
                     json_f32(laplacian_var_bbox(
-                        &irf.data, irf.width, irf.height, 1, &t.bbox,
+                        irf.pixels(),
+                        irf.width(),
+                        irf.height(),
+                        1,
+                        &t.bbox,
                     )),
                 );
                 rec.insert(
                     "ir_contrast".into(),
-                    json_f32(contrast_bbox(&irf.data, irf.width, irf.height, 1, &t.bbox)),
+                    json_f32(contrast_bbox(
+                        irf.pixels(),
+                        irf.width(),
+                        irf.height(),
+                        1,
+                        &t.bbox,
+                    )),
                 );
                 rec.insert(
                     "ir_bbox".into(),

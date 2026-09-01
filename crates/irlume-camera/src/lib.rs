@@ -37,6 +37,7 @@ pub mod census;
 /// Versioned, backend-neutral camera data contracts.
 pub mod contracts;
 pub mod emitter_journal;
+pub mod evidence;
 pub mod frame_interval;
 pub mod frame_provenance;
 mod inventory;
@@ -57,6 +58,8 @@ mod rate_gate;
 // path grows a reader of these files.
 pub mod stream_record;
 pub mod uvc_descriptor;
+
+pub use evidence::{CanonicalIrEvidence, CanonicalRgbEvidence, EvidenceManifest};
 
 /// Serializes unit tests that mutate process-global environment variables, and
 /// the RAII guard that restores them.
@@ -314,8 +317,6 @@ pub enum Spectrum {
 /// strobes, `ambient_mean` is the scene's ambient IR level with the emitter off
 /// and `lit_mean - ambient_mean` is the strobe gap; on a steady emitter the two
 /// converge.
-// Not Copy: `saturation_frame` owns a frame's worth of pixels, and a silent
-// per-use copy of that is not something a caller should get by accident.
 #[derive(Clone, Debug)]
 pub struct IrCaptureStats {
     pub lit_mean: f32,
@@ -391,20 +392,6 @@ pub struct IrCaptureStats {
     /// evidence only, not a grant gate. `None` means the paired measurement
     /// was unavailable or the decoded frame dimensions disagreed.
     pub persistent_saturated_frac: Option<f32>,
-    /// The gate frame's RAW pixels, present only when the returned frame is no
-    /// longer them: ambient subtraction replaces the payload, and a caller
-    /// measuring clipping must not measure the replacement.
-    ///
-    /// Subtraction cannot restore a sample that reached the ceiling, but it
-    /// does move it: a raw 255 minus an ambient 1 is 254, so a face that
-    /// clipped 25% measures 0% afterwards and an exposure guard reading it
-    /// would pass a frame that carries no information (#238 review). The
-    /// camera's own note two screens up already said pixels saturated in the
-    /// lit frame carry no reliable subtracted value; this keeps the evidence
-    /// for the guard that acts on it.
-    ///
-    /// `None` means the returned frame IS the raw gate frame, so measure that.
-    pub saturation_frame: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3536,9 +3523,9 @@ fn diagnose_ir_rate(
 ) -> irlume_common::Result<(irlume_common::CameraStreamRateEvidence, IrCaptureStats)> {
     let camera = IrCamera::open(device)?;
     let mut session = camera.session()?;
-    let (frame, stats) = session.capture_with_stats()?;
-    let evidence = frame.provenance().rate_evidence();
-    Ok((rate_evidence_to_common(&evidence), stats))
+    let frame = session.capture_with_stats()?;
+    let evidence = frame.manifest().rate_evidence();
+    Ok((rate_evidence_to_common(&evidence), frame.stats().clone()))
 }
 
 fn role_diagnostic(
@@ -4280,7 +4267,7 @@ impl<'a> RgbSession<'a> {
     /// The recognition path's denoised frame: a per-pixel temporal median over
     /// the burst, so one blurry or over-exposed frame cannot decide a match.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn denoised(&mut self) -> irlume_common::Result<Frame> {
+    pub fn denoised(&mut self) -> irlume_common::Result<CanonicalRgbEvidence> {
         median_frame(self.burst(RGB_BURST)?)
     }
 }
@@ -4842,7 +4829,7 @@ pub fn capture_rgb(device: &str) -> irlume_common::Result<Frame> {
 /// genuine match below threshold (false reject). Used for auth/enroll; the
 /// framing guide stays single-shot for latency.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<Frame> {
+pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<CanonicalRgbEvidence> {
     capture_rgb_denoised_with_progress(device, &no_progress())
 }
 
@@ -4852,7 +4839,7 @@ pub fn capture_rgb_denoised(device: &str) -> irlume_common::Result<Frame> {
 pub fn capture_rgb_denoised_with_progress(
     device: &str,
     progress: &Progress,
-) -> irlume_common::Result<Frame> {
+) -> irlume_common::Result<CanonicalRgbEvidence> {
     median_frame(capture_rgb_burst_with_progress(
         device, RGB_BURST, progress,
     )?)
@@ -4863,31 +4850,9 @@ pub fn capture_rgb_denoised_with_progress(
 /// for a degenerate burst. Private on purpose: callers must pass at least one
 /// frame (`capture_rgb_burst` clamps to n.max(1)), and keeping it crate-local
 /// keeps that invariant next to the only code that must uphold it.
-fn median_frame(mut frames: Vec<Frame>) -> irlume_common::Result<Frame> {
-    if frames.len() <= 1 {
-        return Ok(frames.pop().expect("median_frame: empty burst"));
-    }
-    let (w, h, spectrum) = (frames[0].width, frames[0].height, frames[0].spectrum);
-    let len = frames.iter().map(|f| f.data.len()).min().unwrap_or(0);
-    let mut out = vec![0u8; len];
-    let mut col = vec![0u8; frames.len()];
-    for (i, o) in out.iter_mut().enumerate() {
-        for (k, f) in frames.iter().enumerate() {
-            col[k] = f.data[i];
-        }
-        col.sort_unstable();
-        *o = col[col.len() / 2];
-    }
-    let contributors = frames
-        .into_iter()
-        .map(Frame::into_single_provenance)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| Error::Hardware(format!("invalid median contributors: {error}")))?;
-    let provenance = checked_aggregate_provenance(
-        contributors,
-        frame_provenance::ContributorSelection::ReducedOverAll,
-    )?;
-    Frame::from_provenance(w, h, spectrum, out, provenance)
+fn median_frame(frames: Vec<Frame>) -> irlume_common::Result<CanonicalRgbEvidence> {
+    CanonicalRgbEvidence::from_temporal_median(frames)
+        .map_err(|error| Error::Hardware(format!("invalid canonical RGB evidence: {error}")))
 }
 
 const IR_W: u32 = 640;
@@ -4933,14 +4898,16 @@ pub const SUBTRACT_MIN_RESULT: f64 = 12.0;
 /// per-camera unit/selector/payload).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir(device: &str) -> irlume_common::Result<Frame> {
-    Ok(capture_ir_with_stats(device)?.0)
+    capture_ir_with_stats(device)?
+        .into_frame()
+        .map_err(|error| Error::Hardware(format!("invalid legacy IR framing evidence: {error}")))
 }
 
 /// [`capture_ir`] plus the burst statistics the plain call discards. The
 /// darkest burst frame's mean is a free per-capture ambient-IR reading (the
 /// input the ambient-relative gates key on), only available at capture time.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<CanonicalIrEvidence> {
     capture_ir_with_stats_and_progress(device, &no_progress())
 }
 
@@ -4950,7 +4917,7 @@ pub fn capture_ir_with_stats(device: &str) -> irlume_common::Result<(Frame, IrCa
 pub fn capture_ir_with_stats_and_progress(
     device: &str,
     progress: &Progress,
-) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+) -> irlume_common::Result<CanonicalIrEvidence> {
     let opened = std::time::Instant::now();
     let cam = IrCamera::open(device)?;
     let open_ms = opened.elapsed().as_millis();
@@ -5257,7 +5224,7 @@ impl IrSession<'_> {
     /// a blown frame both flattens the liveness cues and blinds the PAD model
     /// (#221).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn capture_with_stats(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    pub fn capture_with_stats(&mut self) -> irlume_common::Result<CanonicalIrEvidence> {
         let result = self.capture_with_stats_inner();
         if !self.stream.take_privacy_refusal() {
             return result;
@@ -5281,7 +5248,7 @@ impl IrSession<'_> {
         finish_privacy_teardown(refusal, restore)
     }
 
-    fn capture_with_stats_inner(&mut self) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    fn capture_with_stats_inner(&mut self) -> irlume_common::Result<CanonicalIrEvidence> {
         let device = self.cam.device.as_str();
         let lease = self.cam.lease.clone();
         lease
@@ -5438,7 +5405,6 @@ impl IrSession<'_> {
             ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref()).unwrap_or(0);
         let paired_saturation =
             paired_saturation_evidence(&frames, &means, &flags, best_i, white_level);
-        let mut best = Some(frames[best_i].clone());
 
         // Windows-Hello-style ambient subtraction. EXPERIMENTAL, opt-in. On a
         // strobing emitter the frame adjacent to the brightest is an emitter-OFF
@@ -5467,8 +5433,6 @@ impl IrSession<'_> {
         // Both are moot while the flag is unset (the shipped default).
         let subtract = std::env::var("IRLUME_IR_AMBIENT_SUBTRACT").is_ok_and(|v| v.trim() == "1");
         let debug_ir = std::env::var("IRLUME_DEBUG_IR").is_ok();
-        // Stays None unless the returned pixels stop being the raw gate frame.
-        let mut saturation_frame: Option<Vec<u8>> = None;
         let mut ambient_used = None;
         if subtract {
             // An adjacent frame the camera flagged dark, else the darker
@@ -5494,8 +5458,6 @@ impl IrSession<'_> {
                         // moves every one of them below it. Cloned only on this
                         // branch, the one where the returned pixels stop being
                         // the raw ones.
-                        saturation_frame = white_level.map(|_| frames[best_i].clone());
-                        best = Some(sub);
                         ambient_used = Some(ai);
                         // The result now carries pixels from BOTH frames.
                     }
@@ -5621,14 +5583,17 @@ impl IrSession<'_> {
                 eprintln!("{line}");
             }
         }
-        let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
-        let contributors = dequeue_evidence
+        let contributors = frames
             .into_iter()
+            .zip(dequeue_evidence)
             .zip(flags.iter().copied())
             .map(
-                |((facts, sequence, timestamp, frame_taken, rate_evidence), illumination)| {
+                |(
+                    (data, (facts, sequence, timestamp, frame_taken, rate_evidence)),
+                    illumination,
+                )| {
                     let illumination = illumination_provenance(illumination);
-                    checked_single_evidence(
+                    let provenance = checked_single_provenance(
                         binding.clone(),
                         format.clone(),
                         facts,
@@ -5637,22 +5602,16 @@ impl IrSession<'_> {
                         frame_taken,
                         illumination,
                         rate_evidence,
-                    )
+                    )?;
+                    Frame::from_provenance(w, h, Spectrum::Ir, data, provenance)
                 },
             )
             .collect::<irlume_common::Result<Vec<_>>>()?;
-        let selection = ambient_used.map_or(
-            frame_provenance::ContributorSelection::Selected { index: best_i },
-            |ambient_index| frame_provenance::ContributorSelection::Subtracted {
-                lit_index: best_i,
-                ambient_index,
-            },
-        );
-        let provenance = checked_aggregate_provenance(contributors, selection)?;
-        Ok((
-            Frame::from_provenance(w, h, Spectrum::Ir, grey, provenance)?,
+        CanonicalIrEvidence::from_burst(
+            contributors,
+            best_i,
+            ambient_used,
             IrCaptureStats {
-                saturation_frame,
                 lit_mean: lit_level as f32,
                 ambient_mean: ambient_level as f32,
                 ambient_observed: flags
@@ -5669,7 +5628,8 @@ impl IrSession<'_> {
                 ambient_saturated_frac: paired_saturation.ambient_saturated_frac,
                 persistent_saturated_frac: paired_saturation.persistent_saturated_frac,
             },
-        ))
+        )
+        .map_err(|error| Error::Hardware(format!("invalid canonical IR evidence: {error}")))
     }
 
     /// Recover a broken stream in place, on the fd this session already holds.
@@ -7290,8 +7250,32 @@ impl RuntimePairContract {
         rgb: &Frame,
         ir: &Frame,
     ) -> std::result::Result<(), RuntimePairViolation> {
-        let rgb_provenance = rgb.provenance();
-        let ir_provenance = ir.provenance();
+        self.validate_provenance_pair(rgb.provenance(), ir.provenance())
+    }
+
+    /// Validate canonical model evidence against this exact runtime license.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`RuntimePairViolation`] when the evidence does not
+    /// satisfy the licensed generation, stream contract, delivered-rate,
+    /// continuity, or active-IR provenance requirements.
+    pub fn validate_canonical_pair(
+        &self,
+        rgb: &CanonicalRgbEvidence,
+        ir: &CanonicalIrEvidence,
+    ) -> std::result::Result<(), RuntimePairViolation> {
+        self.validate_provenance_pair(
+            rgb.manifest().runtime_provenance(),
+            ir.manifest().runtime_provenance(),
+        )
+    }
+
+    fn validate_provenance_pair(
+        &self,
+        rgb_provenance: &frame_provenance::RuntimeFrameProvenance,
+        ir_provenance: &frame_provenance::RuntimeFrameProvenance,
+    ) -> std::result::Result<(), RuntimePairViolation> {
         if rgb_provenance.binding() != &self.rgb_binding
             || ir_provenance.binding() != &self.ir_binding
         {
@@ -7331,9 +7315,36 @@ impl RuntimePairContract {
         ir: &Frame,
     ) -> std::result::Result<Vec<irlume_common::diagnostics::TraceEventKind>, RuntimePairViolation>
     {
+        self.validate_pair(rgb, ir)?;
+        Ok(self.diagnostic_trace_events_for(rgb.provenance(), ir.provenance()))
+    }
+
+    /// Trace-only facts for canonical evidence satisfying this runtime license.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`RuntimePairViolation`] when either evidence value
+    /// does not satisfy this runtime license.
+    pub fn diagnostic_canonical_trace_events(
+        &self,
+        rgb: &CanonicalRgbEvidence,
+        ir: &CanonicalIrEvidence,
+    ) -> std::result::Result<Vec<irlume_common::diagnostics::TraceEventKind>, RuntimePairViolation>
+    {
+        self.validate_canonical_pair(rgb, ir)?;
+        Ok(self.diagnostic_trace_events_for(
+            rgb.manifest().runtime_provenance(),
+            ir.manifest().runtime_provenance(),
+        ))
+    }
+
+    fn diagnostic_trace_events_for(
+        &self,
+        rgb: &frame_provenance::RuntimeFrameProvenance,
+        ir: &frame_provenance::RuntimeFrameProvenance,
+    ) -> Vec<irlume_common::diagnostics::TraceEventKind> {
         use irlume_common::diagnostics::{CameraRoleLabel, EmitterTraceOutcome, TraceEventKind};
 
-        self.validate_pair(rgb, ir)?;
         let mut events = Vec::with_capacity(5);
         for (role, contract) in [
             (CameraRoleLabel::Rgb, self.context.rgb_stream()),
@@ -7347,15 +7358,15 @@ impl RuntimePairContract {
                 });
             }
         }
-        for (role, frame, active_ir) in [
+        for (role, provenance, active_ir) in [
             (CameraRoleLabel::Rgb, rgb, None),
             (
                 CameraRoleLabel::Ir,
                 ir,
-                Some(ir.provenance().illumination() == contracts::IlluminationProvenance::ActiveIr),
+                Some(ir.illumination() == contracts::IlluminationProvenance::ActiveIr),
             ),
         ] {
-            if let Some(event) = diagnostic_stream_evidence_for(frame, role, active_ir) {
+            if let Some(event) = diagnostic_stream_evidence_for(provenance, role, active_ir) {
                 events.push(event);
             }
         }
@@ -7366,7 +7377,7 @@ impl RuntimePairContract {
             // emitter guard.
             outcome: EmitterTraceOutcome::AlreadyActive,
         });
-        Ok(events)
+        events
     }
 }
 
@@ -7386,17 +7397,34 @@ pub fn diagnostic_stream_evidence(
     let active_ir = (role == CameraRoleLabel::Ir).then_some(
         frame.provenance().illumination() == contracts::IlluminationProvenance::ActiveIr,
     );
-    diagnostic_stream_evidence_for(frame, role, active_ir)
+    diagnostic_stream_evidence_for(frame.provenance(), role, active_ir)
+}
+
+/// Trace-only delivered-rate and continuity facts for canonical evidence.
+#[must_use]
+pub fn diagnostic_manifest_stream_evidence(
+    manifest: &EvidenceManifest,
+) -> Option<irlume_common::diagnostics::TraceEventKind> {
+    use irlume_common::diagnostics::CameraRoleLabel;
+
+    let provenance = manifest.runtime_provenance();
+    let role = match provenance.binding().stream_role() {
+        contracts::StreamRole::Rgb => CameraRoleLabel::Rgb,
+        contracts::StreamRole::Ir => CameraRoleLabel::Ir,
+    };
+    let active_ir = (role == CameraRoleLabel::Ir)
+        .then_some(provenance.illumination() == contracts::IlluminationProvenance::ActiveIr);
+    diagnostic_stream_evidence_for(provenance, role, active_ir)
 }
 
 fn diagnostic_stream_evidence_for(
-    frame: &Frame,
+    provenance: &frame_provenance::RuntimeFrameProvenance,
     role: irlume_common::diagnostics::CameraRoleLabel,
     active_ir: Option<bool>,
 ) -> Option<irlume_common::diagnostics::TraceEventKind> {
     use irlume_common::diagnostics::{ExactFraction, TraceEventKind};
 
-    let evidence = frame.provenance().rate_evidence();
+    let evidence = provenance.rate_evidence();
     let (delivered_num, delivered_den) = evidence.delivered();
     let (floor_num, floor_den) = evidence.floor();
     let delivered = u32::try_from(delivered_num)
@@ -7807,8 +7835,8 @@ fn measure_contention_impl<R, I, H>(
     context: Option<&capture_qualification::QualificationContext>,
 ) -> irlume_common::Result<ContentionReport>
 where
-    R: Fn() -> irlume_common::Result<Frame>,
-    I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)>,
+    R: Fn() -> irlume_common::Result<CanonicalRgbEvidence>,
+    I: Fn() -> irlume_common::Result<CanonicalIrEvidence>,
     H: FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()>,
 {
     let rounds = rounds.max(1);
@@ -8281,12 +8309,12 @@ fn observe_rate_shortfall(into: &mut PairSample, error: &irlume_common::Error) {
 fn accumulate(
     into: &mut PairSample,
     continuity: &mut PairContinuityState,
-    rgb: &irlume_common::Result<Frame>,
-    ir: &irlume_common::Result<(Frame, IrCaptureStats)>,
+    rgb: &irlume_common::Result<CanonicalRgbEvidence>,
+    ir: &irlume_common::Result<CanonicalIrEvidence>,
     elapsed: std::time::Duration,
     context: Option<&capture_qualification::QualificationContext>,
 ) {
-    let (Ok(rgb), Ok((ir, ir_stats))) = (rgb, ir) else {
+    let (Ok(rgb), Ok(ir)) = (rgb, ir) else {
         into.failed += 1;
         if let Err(error) = rgb {
             observe_rate_shortfall(into, error);
@@ -8314,7 +8342,8 @@ fn accumulate(
     };
     let n = into.rounds as f32;
     let mix = |old: f32, new: f32| (old * n + new) / (n + 1.0);
-    into.rgb_mean = mix(into.rgb_mean, frame_mean(&rgb.data));
+    let ir_stats = ir.stats();
+    into.rgb_mean = mix(into.rgb_mean, frame_mean(rgb.pixels()));
     into.ir_mean = mix(into.ir_mean, ir_stats.lit_mean);
     // #606: fold the camera's own illumination-metadata classification count
     // beside the brightness it gated on, so the arm can name a metadata path
@@ -8326,8 +8355,8 @@ fn accumulate(
     let Some(context) = context else {
         return;
     };
-    let rgb_provenance = rgb.provenance();
-    let ir_provenance = ir.provenance();
+    let rgb_provenance = rgb.manifest().runtime_provenance();
+    let ir_provenance = ir.manifest().runtime_provenance();
     if context.rgb_stream().matches_runtime(rgb_provenance)
         && context.ir_stream().matches_runtime(ir_provenance)
     {
@@ -9343,7 +9372,6 @@ mod tests {
             lit_saturated_frac: None,
             ambient_saturated_frac: None,
             persistent_saturated_frac: None,
-            saturation_frame: None,
         };
         let state = illumination_state(Present, Some(&stats));
         assert_eq!(state.node, irlume_common::CameraIlluminationNode::Present);
@@ -11578,7 +11606,7 @@ mod tests {
             const { std::cell::RefCell::new(frame_provenance::TimestampTracker::new()) };
     }
 
-    fn frame_at(data: &[u8], at: std::time::Instant) -> Frame {
+    fn frame_at_for(data: &[u8], at: std::time::Instant, spectrum: Spectrum) -> Frame {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         let raw = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let micros = i64::from(raw) * 1_000;
@@ -11607,15 +11635,31 @@ mod tests {
                 )
                 .expect("test timestamp observation")
         });
+        let role = match spectrum {
+            Spectrum::Rgb => contracts::StreamRole::Rgb,
+            Spectrum::Ir => contracts::StreamRole::Ir,
+        };
         let binding = frame_provenance::FrameBinding::new(
             contracts::CameraInstanceId::new("22222222222222222222222222222222")
                 .expect("test camera identity"),
             contracts::CameraGeneration::INITIAL,
-            contracts::StreamRole::Rgb,
+            role,
         );
-        let format = frame_provenance::ValidatedFormatIdentity::from_stable_format(
-            &v4l::Format::new(data.len() as u32, 1, v4l::FourCC::new(b"RGB3")),
-        );
+        let width = if spectrum == Spectrum::Rgb {
+            u32::try_from(data.len() / 3).expect("test RGB width")
+        } else {
+            u32::try_from(data.len()).expect("test IR width")
+        };
+        let format =
+            frame_provenance::ValidatedFormatIdentity::from_stable_format(&v4l::Format::new(
+                width,
+                1,
+                v4l::FourCC::new(if spectrum == Spectrum::Rgb {
+                    b"RGB3"
+                } else {
+                    b"GREY"
+                }),
+            ));
         let provenance = checked_single_provenance(
             binding,
             format,
@@ -11623,9 +11667,13 @@ mod tests {
             sequence,
             timestamp,
             at,
-            contracts::IlluminationProvenance::Unknown,
+            if spectrum == Spectrum::Rgb {
+                contracts::IlluminationProvenance::Unknown
+            } else {
+                contracts::IlluminationProvenance::ActiveIr
+            },
             frame_provenance::DeliveredRateEvidence::new(
-                contracts::StreamRole::Rgb,
+                role,
                 (15, 2),
                 (15, 2),
                 (15, 2),
@@ -11639,18 +11687,27 @@ mod tests {
             ),
         )
         .expect("test runtime provenance");
-        Frame::from_provenance(
-            data.len() as u32,
-            1,
-            Spectrum::Rgb,
-            data.to_vec(),
-            provenance,
-        )
-        .expect("test frame")
+        Frame::from_provenance(width, 1, spectrum, data.to_vec(), provenance).expect("test frame")
+    }
+
+    fn frame_at(data: &[u8], at: std::time::Instant) -> Frame {
+        frame_at_for(data, at, Spectrum::Rgb)
     }
 
     fn frame(data: &[u8]) -> Frame {
         frame_at(data, std::time::Instant::now())
+    }
+
+    fn rgb_evidence(data: &[u8]) -> CanonicalRgbEvidence {
+        CanonicalRgbEvidence::try_from(frame(data)).expect("test canonical RGB evidence")
+    }
+
+    fn ir_evidence(data: &[u8], stats: IrCaptureStats) -> CanonicalIrEvidence {
+        CanonicalIrEvidence::try_from((
+            frame_at_for(data, std::time::Instant::now(), Spectrum::Ir),
+            stats,
+        ))
+        .expect("test canonical IR evidence")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11678,7 +11735,7 @@ mod tests {
         }
         let raw = if discontinuous { 3 } else { 1 };
         let micros = i64::from(raw) * 1_000;
-        let data = vec![80_u8; 4];
+        let data = vec![80_u8; if spectrum == Spectrum::Rgb { 12 } else { 4 }];
         let metadata = v4l::buffer::Metadata {
             bytesused: data.len() as u32,
             sequence: raw,
@@ -12186,6 +12243,15 @@ mod tests {
             contract.diagnostic_trace_events(&rgb, &wrong_generation),
             Err(RuntimePairViolation::CameraGeneration)
         );
+
+        let canonical_rgb = CanonicalRgbEvidence::try_from(rgb).unwrap();
+        let canonical_ir = CanonicalIrEvidence::try_from((ir, stats(80.0))).unwrap();
+        assert_eq!(
+            contract
+                .diagnostic_canonical_trace_events(&canonical_rgb, &canonical_ir)
+                .unwrap(),
+            events
+        );
     }
 
     #[test]
@@ -12206,6 +12272,17 @@ mod tests {
 
         assert!(matches!(
             diagnostic_stream_evidence(&rgb),
+            Some(TraceEventKind::StreamEvidence {
+                role: CameraRoleLabel::Rgb,
+                dropped_frames: 0,
+                continuity_epoch: 0,
+                active_ir: None,
+                ..
+            })
+        ));
+        let canonical = CanonicalRgbEvidence::try_from(rgb).unwrap();
+        assert!(matches!(
+            diagnostic_manifest_stream_evidence(canonical.manifest()),
             Some(TraceEventKind::StreamEvidence {
                 role: CameraRoleLabel::Rgb,
                 dropped_frames: 0,
@@ -12620,7 +12697,6 @@ mod tests {
             lit_saturated_frac: None,
             ambient_saturated_frac: None,
             persistent_saturated_frac: None,
-            saturation_frame: None,
         }
     }
 
@@ -12635,8 +12711,8 @@ mod tests {
         ir: &'a I,
     ) -> impl FnOnce(usize, &Progress, &mut PairSample) -> irlume_common::Result<()> + 'a
     where
-        R: Fn() -> irlume_common::Result<Frame>,
-        I: Fn() -> irlume_common::Result<(Frame, IrCaptureStats)>,
+        R: Fn() -> irlume_common::Result<CanonicalRgbEvidence>,
+        I: Fn() -> irlume_common::Result<CanonicalIrEvidence>,
     {
         move |rounds, progress, into| {
             for _ in 0..rounds {
@@ -12697,10 +12773,10 @@ mod tests {
             if (2..4).contains(&call) {
                 Err(below_floor_error("rgb", 10, 1, 15, 1))
             } else {
-                Ok(frame(&[120; 4]))
+                Ok(rgb_evidence(&[120; 3]))
             }
         };
-        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let ir = || Ok(ir_evidence(&[20; 4], stats(60.0)));
         let mut report =
             measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
                 .expect("typed shortfall is a measurement, not a probe abort");
@@ -12727,7 +12803,7 @@ mod tests {
     fn rate_shortfall_retains_the_lower_exact_delivered_to_floor_ratio() {
         let mut sample = PairSample::default();
         let mut continuity = PairContinuityState::default();
-        let ir = Ok((frame(&[20; 4]), stats(60.0)));
+        let ir = Ok(ir_evidence(&[20; 4], stats(60.0)));
 
         for rgb in [
             Err(below_floor_error("rgb", 667, 1_000, 1, 1)),
@@ -12797,10 +12873,10 @@ mod tests {
                     "/dev/video4: the camera never delivered".into(),
                 ))
             } else {
-                Ok(frame(&[120; 4]))
+                Ok(rgb_evidence(&[120; 3]))
             }
         };
-        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let ir = || Ok(ir_evidence(&[20; 4], stats(60.0)));
         let report =
             measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
                 .expect("errored concurrent rounds are a measurement, not a probe abort");
@@ -12834,12 +12910,12 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrows_for_generic_args)]
     fn ir_camera_classified_counts_fold_into_the_arm() {
-        let rgb = || Ok(frame(&[120; 4]));
+        let rgb = || Ok(rgb_evidence(&[120; 3]));
         let ir = || {
             let mut s = stats(60.0);
             s.camera_classified_frames = 7;
             s.camera_lit_frames = 7;
-            Ok((frame(&[20; 4]), s))
+            Ok(ir_evidence(&[20; 4], s))
         };
         let report =
             measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
@@ -12935,12 +13011,12 @@ mod tests {
         // those as failed rounds would persist "this camera cannot stream both
         // nodes" over a software defect (#263 review); the probe must abort.
         let ir_calls = AtomicUsize::new(0);
-        let rgb = || Ok(frame(&[100; 4]));
+        let rgb = || Ok(rgb_evidence(&[100; 3]));
         let ir = || {
             if ir_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
                 panic!("injected defect");
             }
-            Ok((frame(&[10; 4]), stats(50.0)))
+            Ok(ir_evidence(&[10; 4], stats(50.0)))
         };
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {})); // keep the test log clean
@@ -12967,10 +13043,10 @@ mod tests {
                     "EINVAL while the IR sibling streams".into(),
                 ))
             } else {
-                Ok(frame(&[100; 4]))
+                Ok(rgb_evidence(&[100; 3]))
             }
         };
-        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let ir = || Ok(ir_evidence(&[10; 4], stats(50.0)));
         let report =
             measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
                 .expect("an answering camera with an impossible concurrent arm is a verdict");
@@ -12991,8 +13067,8 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrows_for_generic_args)]
     fn a_pair_that_cannot_arm_held_streams_is_a_sequential_verdict() {
-        let rgb = || Ok(frame(&[100; 4]));
-        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let rgb = || Ok(rgb_evidence(&[100; 3]));
+        let ir = || Ok(ir_evidence(&[10; 4], stats(50.0)));
         let arming_fails = |rounds: usize, _p: &Progress, into: &mut PairSample| {
             into.failed += rounds;
             into.arm_failures += rounds;
@@ -13012,8 +13088,8 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrows_for_generic_args)]
     fn failed_concurrent_rate_establishment_reaches_the_sequential_control() {
-        let rgb = || Ok(frame(&[100; 4]));
-        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let rgb = || Ok(rgb_evidence(&[100; 3]));
+        let ir = || Ok(ir_evidence(&[10; 4], stats(50.0)));
         let establishment_fails = |rounds: usize, _p: &Progress, into: &mut PairSample| {
             record_concurrent_establishment_failure(
                 into,
@@ -13045,10 +13121,10 @@ mod tests {
             if rgb_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
                 Err(Error::Hardware("ENODEV".into()))
             } else {
-                Ok(frame(&[100; 4]))
+                Ok(rgb_evidence(&[100; 3]))
             }
         };
-        let ir = || Ok((frame(&[10; 4]), stats(50.0)));
+        let ir = || Ok(ir_evidence(&[10; 4], stats(50.0)));
         let got =
             measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None);
         let err = got.expect_err("a dead camera is a failed probe");
@@ -13276,24 +13352,24 @@ mod tests {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
         let frames = vec![
-            frame_at(&[10, 10], t0),
-            frame_at(&[20, 20], t0 + Duration::from_millis(100)),
-            frame_at(&[30, 30], t0 + Duration::from_millis(200)),
+            frame_at(&[10, 10, 10, 10, 10, 10], t0),
+            frame_at(&[20, 20, 20, 20, 20, 20], t0 + Duration::from_millis(100)),
+            frame_at(&[30, 30, 30, 30, 30, 30], t0 + Duration::from_millis(200)),
         ];
         // A median pixel may come from any frame, so the result cannot claim a
         // single instant: it must cover first-to-last dequeue.
         let m = median_frame(frames).expect("coherent median provenance");
-        assert_eq!(m.captured.start, t0);
-        assert_eq!(m.captured.end, t0 + Duration::from_millis(200));
-        assert_eq!(m.data, vec![20, 20]);
-        match m.provenance() {
+        assert_eq!(m.capture_window().start, t0);
+        assert_eq!(m.capture_window().end, t0 + Duration::from_millis(200));
+        assert_eq!(m.pixels(), &[20; 6]);
+        match m.manifest().runtime_provenance() {
             frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) => {
                 assert_eq!(aggregate.contributors().len(), 3);
                 assert_eq!(
                     aggregate.selection(),
                     frame_provenance::ContributorSelection::ReducedOverAll
                 );
-                assert_eq!(aggregate.capture_window(), m.captured);
+                assert_eq!(aggregate.capture_window(), m.capture_window());
             }
             frame_provenance::RuntimeFrameProvenance::Single(_) => {
                 panic!("a multi-frame median must retain all contributors")
@@ -13313,7 +13389,7 @@ mod tests {
             frame(&[100, 50, 200]),
         ];
         let m = median_frame(frames).expect("coherent median provenance");
-        assert_eq!(m.data, vec![100, 50, 200]);
+        assert_eq!(m.pixels(), &[100, 50, 200]);
     }
 
     #[test]
@@ -13334,9 +13410,9 @@ mod tests {
     #[test]
     fn median_frame_passes_lone_frame_through() {
         let m = median_frame(vec![frame(&[1, 2, 3])]).expect("lone frame passes through");
-        assert_eq!(m.data, vec![1, 2, 3]);
+        assert_eq!(m.pixels(), &[1, 2, 3]);
         assert!(matches!(
-            m.provenance(),
+            m.manifest().runtime_provenance(),
             frame_provenance::RuntimeFrameProvenance::Single(_)
         ));
     }
@@ -13880,15 +13956,24 @@ mod tests {
     #[test]
     fn median_frame_even_burst_takes_upper_middle_and_rejects_mixed_formats() {
         // Even burst: sorted [1,2,3,4] -> index 4/2 = 2 -> 3 (upper middle).
-        let frames = vec![frame(&[1]), frame(&[4]), frame(&[2]), frame(&[3])];
+        let frames = vec![
+            frame(&[1, 1, 1]),
+            frame(&[4, 4, 4]),
+            frame(&[2, 2, 2]),
+            frame(&[3, 3, 3]),
+        ];
         assert_eq!(
             median_frame(frames)
                 .expect("coherent median provenance")
-                .data,
-            vec![3]
+                .pixels(),
+            &[3, 3, 3]
         );
         // A reduction may not silently combine different validated formats.
-        let frames = vec![frame(&[9, 9, 9]), frame(&[5, 5]), frame(&[7, 7, 7])];
+        let frames = vec![
+            frame(&[9, 9, 9]),
+            frame(&[5, 5, 5, 5, 5, 5]),
+            frame(&[7, 7, 7]),
+        ];
         assert!(median_frame(frames).is_err());
     }
 
@@ -15325,17 +15410,17 @@ mod tests {
             "this rig does not drive its emitter, so it cannot discriminate the \
              self-refusal this test exists for; run it on the ASUS/NexiGo hardware"
         );
-        let (frame_before, _) = s.capture_with_stats().expect("capture before recover");
+        let frame_before = s.capture_with_stats().expect("capture before recover");
         s.recover().expect("recover on a healthy device");
         assert!(
             s.lit,
             "the emitter went dark across recover: the fresh enable refused \
              against its predecessor's lock"
         );
-        let (frame_after, _) = s.capture_with_stats().expect("capture after recover");
+        let frame_after = s.capture_with_stats().expect("capture after recover");
         assert_eq!(
-            (frame_before.width, frame_before.height),
-            (frame_after.width, frame_after.height),
+            frame_before.dimensions(),
+            frame_after.dimensions(),
             "the recovered stream must carry the same negotiated geometry"
         );
     }
@@ -15346,23 +15431,23 @@ mod tests {
         let (rgb, _) = loopback_pair();
         let one = capture_rgb(&rgb).expect("single rgb");
         let den = capture_rgb_denoised(&rgb).expect("denoised rgb");
-        for f in [&one, &den] {
-            assert_eq!((f.width, f.height), (RGB_W, RGB_H));
-            assert_eq!(f.data.len(), (RGB_W * RGB_H * 3) as usize);
-        }
+        assert_eq!((one.width, one.height), (RGB_W, RGB_H));
+        assert_eq!(one.data.len(), (RGB_W * RGB_H * 3) as usize);
+        assert_eq!(den.dimensions(), (RGB_W, RGB_H));
+        assert_eq!(den.pixels().len(), (RGB_W * RGB_H * 3) as usize);
     }
 
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_ir_capture_with_stats_and_sequence() {
         let (_, ir) = loopback_pair();
-        let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
-        assert_eq!((frame.width, frame.height), (IR_W, IR_H));
-        assert_eq!(frame.spectrum, Spectrum::Ir);
+        let frame = capture_ir_with_stats(&ir).expect("ir capture");
+        let stats = frame.stats();
+        assert_eq!(frame.dimensions(), (IR_W, IR_H));
         // Drivers may hand back a buffer with trailing slack (v4l2loopback
         // pads by 2 KiB); the contract is at-least-one-byte-per-pixel, and
         // the consumers guard exactly that.
-        assert!(frame.data.len() >= (IR_W * IR_H) as usize);
+        assert_eq!(frame.pixels().len(), (IR_W * IR_H) as usize);
         assert!(stats.burst_frames > 0, "burst must have captured frames");
         assert!(
             (0.0..=255.0).contains(&stats.lit_mean),
@@ -15721,7 +15806,8 @@ mod tests {
         let _lock = env_lock();
         let (_, ir) = loopback_pair();
         let _sub = EnvGuard::unset("IRLUME_IR_AMBIENT_SUBTRACT");
-        let (frame, stats) = capture_ir_with_stats(&ir).expect("ir capture");
+        let frame = capture_ir_with_stats(&ir).expect("ir capture");
+        let stats = frame.stats();
         // Stats contract: per-frame mean extremes over the fixed-size burst,
         // byte-ranged, min <= max. None of it depends on an emitter: a
         // loopback node has no UVC extension unit, so ir_emitter::enable finds
@@ -15740,7 +15826,7 @@ mod tests {
         // recomputed mean equals lit_mean (only f32 rounding apart). A
         // refactor that subtracts by default, or picks any frame other than
         // the max-mean one, breaks this.
-        let mean = ir_probe::mean(&frame.data);
+        let mean = ir_probe::mean(frame.pixels());
         assert!(
             (mean - stats.lit_mean as f64).abs() < 0.01,
             "returned frame mean {mean:.3} != lit_mean {}",
@@ -15763,8 +15849,8 @@ mod tests {
 
         // The single-shot path also accepts static content (this blocks until
         // the feeder's frames actually flow).
-        let (frame, _) = capture_ir_with_stats(&spare).expect("static feed single capture");
-        let mean = ir_probe::mean(&frame.data);
+        let frame = capture_ir_with_stats(&spare).expect("static feed single capture");
+        let mean = ir_probe::mean(frame.pixels());
         assert!(
             (10.0..245.0).contains(&mean),
             "harness: the static gray feed must be usable, got mean {mean:.1}"
@@ -16079,7 +16165,8 @@ mod tests {
             &spare,
             "color=c=black:size=640x400:rate=15,geq=lum='40+160*mod(N,2)'",
         );
-        let (frame, stats) = capture_ir_with_stats(&spare).expect("strobed capture");
+        let frame = capture_ir_with_stats(&spare).expect("strobed capture");
+        let stats = frame.stats();
         // Harness sanity, asserted so a drifting feed fails loudly instead of
         // silently testing the wrong branch: the alternation must present a
         // real strobe gap above the low-ambient floor.
@@ -16097,7 +16184,7 @@ mod tests {
         // frame. The synthetic frames are uniform, so the subtracted mean
         // equals lit_mean - ambient_mean (driver padding bytes are constant
         // and cancel; no pixel clamps because lit > ambient everywhere).
-        let mean = ir_probe::mean(&frame.data);
+        let mean = ir_probe::mean(frame.pixels());
         assert!(
             (mean - (lit - amb)).abs() < 2.0,
             "subtracted frame mean {mean:.1} != lit-ambient {:.1}",

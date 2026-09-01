@@ -50,11 +50,11 @@ fn capture_embed(
         irlume_camera::capture_rgb_denoised(rgb_dev)
     }
     .ok()?;
-    let brightness = mean(&rgb.data);
+    let brightness = mean(rgb.pixels());
     let view = align::RgbView {
-        data: &rgb.data,
-        width: rgb.width,
-        height: rgb.height,
+        data: rgb.pixels(),
+        width: rgb.width(),
+        height: rgb.height(),
     };
     let faces = det.detect(&view).ok()?;
     let top = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score))?;

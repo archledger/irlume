@@ -71,7 +71,7 @@ fn main() {
         let ir = irlume_camera::capture_ir(&ir_dev);
         seq_total.push(t0.elapsed().as_millis() as f32);
         if let Ok(r) = &rgb {
-            seq_rgb_b.push(mean(&r.data));
+            seq_rgb_b.push(mean(r.pixels()));
         }
         if let Ok(i) = &ir {
             seq_ir_b.push(mean(&i.data));
@@ -93,7 +93,7 @@ fn main() {
         });
         con_total.push(t0.elapsed().as_millis() as f32);
         if let Ok(r) = &rgb {
-            con_rgb_b.push(mean(&r.data));
+            con_rgb_b.push(mean(r.pixels()));
         }
         if let Ok(i) = &ir {
             con_ir_b.push(mean(&i.data));

@@ -3700,7 +3700,7 @@ impl Engine {
             &self.rgb_dev,
             &self.capture_progress(),
         )?;
-        if let Some(event) = irlume_camera::diagnostic_stream_evidence(&rgb) {
+        if let Some(event) = irlume_camera::diagnostic_manifest_stream_evidence(rgb.manifest()) {
             diagnostics.emit_trace(event);
         }
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
@@ -3708,9 +3708,9 @@ impl Engine {
             elapsed_us: u64::try_from(capture_started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
         let rgb_view = align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
+            data: rgb.pixels(),
+            width: rgb.width(),
+            height: rgb.height(),
         };
         let detection_started = std::time::Instant::now();
         let rgb_faces = self.det.detect(&rgb_view)?;
@@ -3725,14 +3725,17 @@ impl Engine {
         });
         let (rgb_brightness, rgb_specular) = rgb_top
             .as_ref()
-            .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox))
+            .map(|f| rgb_luma_stats(rgb.pixels(), rgb.width(), rgb.height(), &f.bbox))
             .unwrap_or((0.0, 0.0));
         // 2D-FFT moiré / pixel-grid cue (screen-replay deterrent).
         let rgb_moire = rgb_top
             .as_ref()
             .map(|f| {
                 irlume_vision::moire::moire_score(&irlume_vision::moire::face_gray_n(
-                    &rgb.data, rgb.width, rgb.height, &f.bbox,
+                    rgb.pixels(),
+                    rgb.width(),
+                    rgb.height(),
+                    &f.bbox,
                 ))
             })
             .unwrap_or(0.0);
@@ -3741,8 +3744,8 @@ impl Engine {
             .map(|f| irlume_vision::head_pose(&f.landmarks));
         let signals = Signals {
             rgb_face: rgb_top.as_ref().map(|f| irlume_liveness::FaceBox {
-                cx: (f.bbox[0] + f.bbox[2]) / 2.0 / rgb.width as f32,
-                cy: (f.bbox[1] + f.bbox[3]) / 2.0 / rgb.height as f32,
+                cx: (f.bbox[0] + f.bbox[2]) / 2.0 / rgb.width() as f32,
+                cy: (f.bbox[1] + f.bbox[3]) / 2.0 / rgb.height() as f32,
                 score: f.score,
             }),
             ir_face: None,
@@ -3753,7 +3756,7 @@ impl Engine {
             head_yaw_asym: pose.map(|p| p.yaw_asym).unwrap_or(0.0),
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: 0.0, // RGB-only path: no IR burst to measure
-            face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width),
+            face_frac: face_frac_of(rgb_top.as_ref().map(|f| &f.bbox), rgb.width()),
             // RGB-only path: no IR frame exists to clip.
             ir_saturated_frac: None,
             ir_persistent_saturated_frac: None,
@@ -3822,7 +3825,7 @@ impl Engine {
             verdict,
             reason,
             embedding,
-            rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
+            rgb_frame_mean: irlume_camera::frame_mean(rgb.pixels()),
             ir_embedding: None,
             signals,
             ir_center_edge_ratio: 0.0,
@@ -3941,7 +3944,10 @@ impl Engine {
         // Recovery renegotiates on the fd the session already holds.
         fn held_rgb_capture(
             rgb_s: &mut irlume_camera::RgbSession<'_>,
-        ) -> (irlume_common::Result<irlume_camera::Frame>, bool) {
+        ) -> (
+            irlume_common::Result<irlume_camera::CanonicalRgbEvidence>,
+            bool,
+        ) {
             match rgb_s.denoised() {
                 Ok(f) => (Ok(f), false),
                 Err(e) => {
@@ -3960,7 +3966,7 @@ impl Engine {
         fn held_ir_capture(
             ir_s: &mut irlume_camera::IrSession<'_>,
         ) -> (
-            irlume_common::Result<(irlume_camera::Frame, irlume_camera::IrCaptureStats)>,
+            irlume_common::Result<irlume_camera::CanonicalIrEvidence>,
             bool,
         ) {
             match ir_s.capture_with_stats() {
@@ -4085,8 +4091,8 @@ impl Engine {
         );
         let observed_runtime_violation =
             match (&rgb_res, &ir_res, capture_mode.runtime_contract.as_ref()) {
-                (Ok(rgb), Ok(Some((ir, _))), Some(contract)) => {
-                    match contract.diagnostic_trace_events(rgb, ir) {
+                (Ok(rgb), Ok(Some(ir)), Some(contract)) => {
+                    match contract.diagnostic_canonical_trace_events(rgb, ir) {
                         Ok(events) => {
                             for event in events {
                                 diagnostics.emit_trace(event);
@@ -4221,10 +4227,10 @@ impl Engine {
         // one goes sequential via runtime degradation. Post-capture check,
         // zero streaming overhead.
         if !sequential && !pair_sequential_retried {
-            if let (Ok(rgb), Ok(Some((ir, _)))) = (&rgb_res, &ir_res) {
-                let rgb_gap = rgb.provenance().rate_evidence().sequence_gap() > 0;
-                let ir_gap = ir.provenance().rate_evidence().sequence_gap() > 0;
-                let ts_disc = !rgb.provenance().is_continuous() || !ir.provenance().is_continuous();
+            if let (Ok(rgb), Ok(Some(ir))) = (&rgb_res, &ir_res) {
+                let rgb_gap = rgb.manifest().rate_evidence().sequence_gap() > 0;
+                let ir_gap = ir.manifest().rate_evidence().sequence_gap() > 0;
+                let ts_disc = !rgb.manifest().is_continuous() || !ir.manifest().is_continuous();
                 if successful_capture_shows_degradation_signs(rgb_gap, ir_gap, ts_disc) {
                     if let Some(context_key) = capture_mode.runtime_key.as_deref() {
                         trip_runtime_capture_health(
@@ -4267,9 +4273,9 @@ impl Engine {
         };
         let rgb_detection_started = std::time::Instant::now();
         let mut rgb_faces = self.det.detect(&align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
+            data: rgb.pixels(),
+            width: rgb.width(),
+            height: rgb.height(),
         })?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Detection,
@@ -4279,17 +4285,17 @@ impl Engine {
         let mut rgb_top = top_detection(&rgb_faces).cloned();
         irlume_common::dlog!(
             "assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
-            rgb.width,
-            rgb.height,
+            rgb.width(),
+            rgb.height(),
             rgb_faces.len(),
             rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
         if rgb_top.is_none() {
             rgb_top = self.rescue_detect(
                 &align::RgbView {
-                    data: &rgb.data,
-                    width: rgb.width,
-                    height: rgb.height,
+                    data: rgb.pixels(),
+                    width: rgb.width(),
+                    height: rgb.height(),
                 },
                 "rgb",
             );
@@ -4298,7 +4304,7 @@ impl Engine {
         // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
         // above already returned, so reaching here with `None` is unreachable,
         // but capture alone rather than unwrap to stay panic-free.
-        let (ir, ir_stats) = match ir_res {
+        let ir = match ir_res {
             Ok(Some(f)) => f,
             Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
             Err(e) if !held_sessions && !pair_sequential_retried => {
@@ -4307,11 +4313,12 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
-        let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
+        let ir_stats = ir.stats();
+        let ir_grey_rgb = irlume_camera::grey_to_rgb(ir.pixels());
         let ir_view = align::RgbView {
             data: &ir_grey_rgb,
-            width: ir.width,
-            height: ir.height,
+            width: ir.width(),
+            height: ir.height(),
         };
         let ir_detection_started = std::time::Instant::now();
         let ir_faces = self.det.detect(&ir_view)?;
@@ -4323,8 +4330,8 @@ impl Engine {
         let mut ir_top = top_detection(&ir_faces).cloned();
         irlume_common::dlog!(
             "assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
-            ir.width,
-            ir.height,
+            ir.width(),
+            ir.height(),
             ir_faces.len(),
             ir_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
@@ -4332,9 +4339,9 @@ impl Engine {
             // rescue_detect needs the mesh path over RGB-shaped data; the
             // grey view expands here only on the (rare) rescue path.
             let iv = align::RgbView {
-                data: &irlume_camera::grey_to_rgb(&ir.data),
-                width: ir.width,
-                height: ir.height,
+                data: &irlume_camera::grey_to_rgb(ir.pixels()),
+                width: ir.width(),
+                height: ir.height(),
             };
             ir_top = self.rescue_detect(&iv, "ir");
         }
@@ -4359,15 +4366,15 @@ impl Engine {
             );
             rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?;
             rgb_faces = self.det.detect(&align::RgbView {
-                data: &rgb.data,
-                width: rgb.width,
-                height: rgb.height,
+                data: rgb.pixels(),
+                width: rgb.width(),
+                height: rgb.height(),
             })?;
             rgb_top = top_detection(&rgb_faces).cloned();
             irlume_common::dlog!(
                 "assess: rgb (recaptured) {}x{}, faces={} top-det={:.2}",
-                rgb.width,
-                rgb.height,
+                rgb.width(),
+                rgb.height(),
                 rgb_faces.len(),
                 rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
             );
@@ -4396,17 +4403,17 @@ impl Engine {
         // threads, either side can retry alone, and the dimming self-heal above
         // recaptures RGB after IR is long finished. Measure it, then refuse a
         // pair too stale to compare.
-        let skew = rgb.captured.gap_to(ir.captured);
+        let skew = rgb.capture_window().gap_to(ir.capture_window());
         irlume_common::dlog!(
             "assess: rgb/ir capture skew {}ms (rgb span {}ms, ir span {}ms)",
             skew.as_millis(),
-            rgb.captured
+            rgb.capture_window()
                 .end
-                .duration_since(rgb.captured.start)
+                .duration_since(rgb.capture_window().start)
                 .as_millis(),
-            ir.captured
+            ir.capture_window()
                 .end
-                .duration_since(ir.captured.start)
+                .duration_since(ir.capture_window().start)
                 .as_millis()
         );
         // Move the RGB detection into the eligibility decision. The IR-only
@@ -4460,7 +4467,7 @@ impl Engine {
                 });
                 return Ok(Assessment {
                     verdict: Verdict::Uncertain,
-                    rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
+                    rgb_frame_mean: irlume_camera::frame_mean(rgb.pixels()),
                     reason: format!(
                         "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
                         skew.as_millis(),
@@ -4500,11 +4507,11 @@ impl Engine {
         };
         let ir_brightness = ir_top
             .as_ref()
-            .map(|f| mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
+            .map(|f| mean_in_bbox(ir.pixels(), ir.width(), ir.height(), &f.bbox))
             .unwrap_or(0.0);
         let ir_center_edge_ratio = ir_top
             .as_ref()
-            .map(|f| center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
+            .map(|f| center_edge_ratio(ir.pixels(), ir.width(), ir.height(), &f.bbox))
             .unwrap_or(0.0);
         // Head orientation from the RGB face landmarks (Windows-Hello-style
         // frontality gate). Defaults to frontal when there's no RGB face.
@@ -4520,20 +4527,20 @@ impl Engine {
         // moiré/specular cues stay 0.0 (the IR gate doesn't use them).
         let rgb_brightness = rgb_top
             .as_ref()
-            .map(|f| rgb_luma_stats(&rgb.data, rgb.width, rgb.height, &f.bbox).0)
+            .map(|f| rgb_luma_stats(rgb.pixels(), rgb.width(), rgb.height(), &f.bbox).0)
             .unwrap_or(0.0);
         let signals = Signals {
-            rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width, rgb.height)),
-            ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width, ir.height)),
+            rgb_face: rgb_top.as_ref().map(|f| fbox(f, rgb.width(), rgb.height())),
+            ir_face: ir_top.as_ref().map(|f| fbox(f, ir.width(), ir.height())),
             ir_face_brightness: ir_brightness,
             ir_center_edge_ratio,
             // Same RAW-frame rule as `ir_saturated_frac` below, for the same
             // reason: the ceiling test has to see the samples that actually
             // railed, and subtraction moves a 255 to 254 (#238 review).
             ir_eye_glint: eye_glint_of(
-                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
-                ir.width,
-                ir.height,
+                ir.saturation_pixels(),
+                ir.width(),
+                ir.height(),
                 ir_top.as_ref().map(|f| &f.landmarks),
                 ir_stats.white_level,
             ),
@@ -4541,16 +4548,12 @@ impl Engine {
             head_pitch_frac: pose.map(|p| p.pitch_frac).unwrap_or(0.5),
             ir_ambient: ir_stats.ambient_mean,
             // From the IR frame, because the IR cues are measured there.
-            face_frac: face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
-            // Measured on the RAW gate frame. `ir.data` is the subtracted image
-            // when ambient subtraction is on, and subtraction drops every
-            // ceiling sample below the ceiling, so a 25%-clipped face would
-            // report 0% and the exposure gate would pass a frame carrying
-            // nothing (#238 review).
+            face_frac: face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width()),
+            // Measured on the raw gate frame retained by canonical evidence.
             ir_saturated_frac: saturated_frac_of(
-                ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
-                ir.width,
-                ir.height,
+                ir.saturation_pixels(),
+                ir.width(),
+                ir.height(),
                 ir_top.as_ref().map(|f| &f.bbox),
                 ir_stats.white_level,
             ),
@@ -4630,9 +4633,9 @@ impl Engine {
                 // above may have recaptured it after the view built for
                 // detection.
                 let view = align::RgbView {
-                    data: &rgb.data,
-                    width: rgb.width,
-                    height: rgb.height,
+                    data: rgb.pixels(),
+                    width: rgb.width(),
+                    height: rgb.height(),
                 };
                 match pad.p_spoof(&view, &f.bbox) {
                     Ok(p) if p.is_finite() => PadEvidence::Score(p),
@@ -4673,9 +4676,9 @@ impl Engine {
         // Rebuild the view against the final RGB frame (it may have been
         // recaptured by the cross-spectrum self-heal above).
         let rgb_view = align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
+            data: rgb.pixels(),
+            width: rgb.width(),
+            height: rgb.height(),
         };
         let embedding = match &rgb_top {
             Some(f) => {
@@ -4701,7 +4704,7 @@ impl Engine {
             verdict,
             reason,
             embedding,
-            rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
+            rgb_frame_mean: irlume_camera::frame_mean(rgb.pixels()),
             ir_embedding,
             signals,
             ir_center_edge_ratio,
@@ -6234,9 +6237,9 @@ impl Engine {
             &self.capture_progress(),
         )?;
         let view = align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
+            data: rgb.pixels(),
+            width: rgb.width(),
+            height: rgb.height(),
         };
         let faces = self.det.detect(&view)?;
         let Some(f) = top_detection(&faces) else {
@@ -6654,7 +6657,7 @@ impl Engine {
         let (Ok(rgb), Ok(_)) = (&rgb, &ir) else {
             return false;
         };
-        let concurrent_mean = irlume_camera::frame_mean(&rgb.data);
+        let concurrent_mean = irlume_camera::frame_mean(rgb.pixels());
         irlume_common::dlog!(
             "enroll: A/B/A check: held mean {held_mean:.1}, solo mean {solo_mean:.1}, \
              reopened held mean {concurrent_mean:.1}"
@@ -9918,8 +9921,8 @@ mod tests {
     }
 
     /// Ambient subtraction hides the ceiling it subtracts from, so the exposure
-    /// gate must read the raw gate frame that `IrCaptureStats::saturation_frame`
-    /// preserves. Measuring the returned pixels instead reports a blown face as
+    /// gate must read the raw gate frame that canonical IR evidence preserves.
+    /// Measuring the returned pixels instead reports a blown face as
     /// pristine, which is the fail-open the #238 review found: 255 minus an
     /// ambient 1 is 254, and 254 is not at the ceiling.
     #[test]

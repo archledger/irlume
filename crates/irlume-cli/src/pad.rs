@@ -107,12 +107,13 @@ fn capture_once(
     // fraction that can only be computed from the frame's own ceiling, and a
     // harness that left it None would qualify a corpus against a gate
     // configuration authentication never runs.
-    let (ir, ir_stats) = irlume_camera::capture_ir_with_stats(ir_dev)?;
-    let ir_rgb = irlume_camera::grey_to_rgb(&ir.data);
+    let ir = irlume_camera::capture_ir_with_stats(ir_dev)?;
+    let ir_stats = ir.stats();
+    let ir_rgb = irlume_camera::grey_to_rgb(ir.pixels());
     let iv = irlume_vision::align::RgbView {
         data: &ir_rgb,
-        width: ir.width,
-        height: ir.height,
+        width: ir.width(),
+        height: ir.height(),
     };
     let ir_top = det
         .detect(&iv)?
@@ -121,39 +122,39 @@ fn capture_once(
 
     let ir_face_brightness = ir_top
         .as_ref()
-        .map(|f| crate::mean_in_bbox(&ir.data, ir.width, ir.height, &f.bbox))
+        .map(|f| crate::mean_in_bbox(ir.pixels(), ir.width(), ir.height(), &f.bbox))
         .unwrap_or(0.0);
     let ir_center_edge_ratio = ir_top
         .as_ref()
-        .map(|f| crate::center_edge_ratio(&ir.data, ir.width, ir.height, &f.bbox))
+        .map(|f| crate::center_edge_ratio(ir.pixels(), ir.width(), ir.height(), &f.bbox))
         .unwrap_or(0.0);
     // Ceiling-aware, and on the RAW frame for the same reason the saturation
     // fraction below uses it: a railed peak measured nothing, and subtraction
     // would move it off the ceiling and hide that (#222).
     let ir_eye_glint = irlume_auth::eye_glint_of(
-        ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
-        ir.width,
-        ir.height,
+        ir.saturation_pixels(),
+        ir.width(),
+        ir.height(),
         ir_top.as_ref().map(|f| &f.landmarks),
         ir_stats.white_level,
     );
 
     let signals = Signals {
         rgb_face,
-        ir_face: ir_top.as_ref().map(|f| to_fbox(f, ir.width, ir.height)),
+        ir_face: ir_top.as_ref().map(|f| to_fbox(f, ir.width(), ir.height())),
         ir_face_brightness,
         ir_center_edge_ratio,
         ir_eye_glint,
         head_yaw_asym,
         head_pitch_frac,
         ir_ambient: ir_stats.ambient_mean,
-        face_frac: irlume_auth::face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width),
+        face_frac: irlume_auth::face_frac_of(ir_top.as_ref().map(|f| &f.bbox), ir.width()),
         // The raw gate frame, for the reason the auth path states: subtraction
         // hides the very clipping this measures.
         ir_saturated_frac: irlume_auth::saturated_frac_of(
-            ir_stats.saturation_frame.as_deref().unwrap_or(&ir.data),
-            ir.width,
-            ir.height,
+            ir.saturation_pixels(),
+            ir.width(),
+            ir.height(),
             ir_top.as_ref().map(|f| &f.bbox),
             ir_stats.white_level,
         ),

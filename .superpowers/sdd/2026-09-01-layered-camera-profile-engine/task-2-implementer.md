@@ -90,3 +90,58 @@ The pure source seam covers discrete and range domains, exact lattice intersecti
 
 - None blocking Task 2.
 - This inventory creates candidates only. Later tasks must retain the separate read-only `VIDIOC_TRY_FMT`, exact set/readback, hardware qualification, quality, security, and latency gates before any profile gains authority.
+
+## Fix Round 1
+
+### Findings Fixed
+
+- Made control validation explicitly type-aware. Integer, boolean, menu, and integer-menu controls retain scalar-lattice validation and are the only types eligible for later policy use. Valid integer64, string, compound, and other unsupported standard controls remain available diagnostically without being interpreted as represented scalar controls or gaining policy eligibility.
+- Made menu observation fail closed when no item was enumerated or when sparse enumeration omitted the advertised default index. Sparse non-default holes remain valid when the default is present.
+
+### RED Evidence
+
+After adding the integer64/unsupported-type and incomplete-menu regressions, this focused command failed before production changes:
+
+```text
+cargo test -p irlume-camera --lib capability_inventory::tests
+```
+
+```text
+running 13 tests
+test capability_inventory::tests::unsupported_control_types_remain_diagnostic_and_policy_ineligible ... FAILED
+test capability_inventory::tests::incomplete_menus_fail_closed ... FAILED
+
+called `Result::unwrap()` on an `Err` value: InvalidControl { id: 9963776, reason: "step is not positive" }
+assertion failed: matches!(inventory_from_source(&mut source, StreamRole::Rgb),
+    Err(CapabilityError::InvalidControl { id: actual, .. }) if actual == id)
+
+test result: FAILED. 11 passed; 2 failed; 0 ignored
+```
+
+### GREEN Evidence
+
+- `cargo test -p irlume-camera --lib capability_inventory::tests`: 13 passed, 0 failed.
+- `cargo test -p irlume-camera --lib frame_interval::tests`: 20 passed, 0 failed.
+- `cargo test -p irlume-camera --all-targets --locked`: 621 passed, 0 failed, 26 declared hardware tests ignored.
+- `cargo test --workspace --all-targets --locked`: 1,936 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo clippy -p irlume-camera --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- All seven entries in `models/SHA256SUMS` were verified before the workspace gate. The six temporary ONNX symlinks were removed immediately afterward. The first checksum invocation used the repository root even though the manifest paths are relative to `models/`; it failed without running tests, then passed from the correct working directory.
+
+### Files And Commit
+
+- `crates/irlume-camera/src/capability_inventory.rs`
+- `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-2-implementer.md`
+- Parent: `a12b72316871af181aa680ce745ee98e1ebba19b`.
+- Fix commit: the separate signed+DCO Fix Round 1 commit containing this section.
+
+### Self-Review
+
+- The changes are confined to shared control validation, policy-eligibility derivation, and their pure regressions. The raw ioctl surface and every production capture, qualification, selection, model-input, and MJPG path are unchanged.
+- Unsupported standard control types are retained but cannot become policy inputs. Supported represented types still fail closed on invalid scalar metadata and dangerous flags.
+- Menu default completeness is checked after bounded index validation. Empty menus and missing defaults fail with `CapabilityError::InvalidControl`; sparse non-default holes remain accepted.
+
+### Concerns
+
+- None blocking Task 2.

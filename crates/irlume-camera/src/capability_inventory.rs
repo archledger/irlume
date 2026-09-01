@@ -31,11 +31,15 @@ const V4L2_CTRL_FLAG_READ_ONLY: u32 = 0x0004;
 const V4L2_CTRL_FLAG_WRITE_ONLY: u32 = 0x0040;
 const V4L2_CTRL_FLAG_EXECUTE_ON_WRITE: u32 = 0x0200;
 const V4L2_CTRL_FLAG_NEXT_CTRL: u32 = 0x8000_0000;
-#[cfg(test)]
 const V4L2_CTRL_TYPE_INTEGER: u32 = 1;
+const V4L2_CTRL_TYPE_BOOLEAN: u32 = 2;
 const V4L2_CTRL_TYPE_MENU: u32 = 3;
 const V4L2_CTRL_TYPE_BUTTON: u32 = 4;
+#[cfg(test)]
+const V4L2_CTRL_TYPE_INTEGER64: u32 = 5;
 const V4L2_CTRL_TYPE_CTRL_CLASS: u32 = 6;
+#[cfg(test)]
+const V4L2_CTRL_TYPE_STRING: u32 = 7;
 const V4L2_CTRL_TYPE_INTEGER_MENU: u32 = 9;
 
 /// Version of the finite geometry and interval requirements used for range intersections.
@@ -631,14 +635,18 @@ fn inventory_from_source<S: CapabilitySource>(
     controls.retain(|control| is_standard_control_class(control.id));
     for control in &mut controls {
         validate_control(control)?;
-        control.policy_eligible = control.control_type != V4L2_CTRL_TYPE_BUTTON
-            && control.control_type != V4L2_CTRL_TYPE_CTRL_CLASS
-            && control.flags
-                & (V4L2_CTRL_FLAG_DISABLED
-                    | V4L2_CTRL_FLAG_READ_ONLY
-                    | V4L2_CTRL_FLAG_WRITE_ONLY
-                    | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE)
-                == 0;
+        control.policy_eligible = matches!(
+            control.control_type,
+            V4L2_CTRL_TYPE_INTEGER
+                | V4L2_CTRL_TYPE_BOOLEAN
+                | V4L2_CTRL_TYPE_MENU
+                | V4L2_CTRL_TYPE_INTEGER_MENU
+        ) && control.flags
+            & (V4L2_CTRL_FLAG_DISABLED
+                | V4L2_CTRL_FLAG_READ_ONLY
+                | V4L2_CTRL_FLAG_WRITE_ONLY
+                | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE)
+            == 0;
     }
 
     Ok(CapabilityInventory {
@@ -681,45 +689,53 @@ fn validate_control(control: &StandardControlCapability) -> Result<(), Capabilit
         MAX_MENU_VALUES,
         CapabilityStage::MenuValues,
     )?;
-    let special = matches!(
-        control.control_type,
-        V4L2_CTRL_TYPE_BUTTON | V4L2_CTRL_TYPE_CTRL_CLASS
-    );
-    if special {
-        if (
-            control.minimum,
-            control.maximum,
-            control.step,
-            control.default,
-        ) != (0, 0, 0, 0)
-        {
-            return Err(CapabilityError::InvalidControl {
-                id: control.id,
-                reason: "special control has scalar range",
-            });
+    match control.control_type {
+        V4L2_CTRL_TYPE_BUTTON | V4L2_CTRL_TYPE_CTRL_CLASS => {
+            if (
+                control.minimum,
+                control.maximum,
+                control.step,
+                control.default,
+            ) != (0, 0, 0, 0)
+            {
+                return Err(CapabilityError::InvalidControl {
+                    id: control.id,
+                    reason: "special control has scalar range",
+                });
+            }
         }
-    } else if control.minimum > control.maximum {
-        return Err(CapabilityError::InvalidControl {
-            id: control.id,
-            reason: "minimum exceeds maximum",
-        });
-    } else if control.step <= 0 {
-        return Err(CapabilityError::InvalidControl {
-            id: control.id,
-            reason: "step is not positive",
-        });
-    } else if control.default < control.minimum || control.default > control.maximum {
-        return Err(CapabilityError::InvalidControl {
-            id: control.id,
-            reason: "default is outside range",
-        });
-    } else if (i64::from(control.default) - i64::from(control.minimum)) % i64::from(control.step)
-        != 0
-    {
-        return Err(CapabilityError::InvalidControl {
-            id: control.id,
-            reason: "default is off the control lattice",
-        });
+        V4L2_CTRL_TYPE_INTEGER
+        | V4L2_CTRL_TYPE_BOOLEAN
+        | V4L2_CTRL_TYPE_MENU
+        | V4L2_CTRL_TYPE_INTEGER_MENU => {
+            if control.minimum > control.maximum {
+                return Err(CapabilityError::InvalidControl {
+                    id: control.id,
+                    reason: "minimum exceeds maximum",
+                });
+            }
+            if control.step <= 0 {
+                return Err(CapabilityError::InvalidControl {
+                    id: control.id,
+                    reason: "step is not positive",
+                });
+            }
+            if control.default < control.minimum || control.default > control.maximum {
+                return Err(CapabilityError::InvalidControl {
+                    id: control.id,
+                    reason: "default is outside range",
+                });
+            }
+            if (i64::from(control.default) - i64::from(control.minimum)) % i64::from(control.step)
+                != 0
+            {
+                return Err(CapabilityError::InvalidControl {
+                    id: control.id,
+                    reason: "default is off the control lattice",
+                });
+            }
+        }
+        _ => {}
     }
 
     let is_menu = matches!(
@@ -745,6 +761,12 @@ fn validate_control(control: &StandardControlCapability) -> Result<(), Capabilit
                 reason: "invalid menu index",
             });
         }
+    }
+    if is_menu && !indexes.contains(&(control.default as u32)) {
+        return Err(CapabilityError::InvalidControl {
+            id: control.id,
+            reason: "menu does not contain its default index",
+        });
     }
     Ok(())
 }
@@ -1551,12 +1573,72 @@ mod tests {
     }
 
     #[test]
-    fn bounded_menu_values_are_recorded_exactly() {
+    fn unsupported_control_types_remain_diagnostic_and_policy_ineligible() {
+        let mut source = FakeSource::new(vec![*b"MJPG"]);
+        let mut integer64 = valid_control(V4L2_CTRL_CLASS_USER | 0x900);
+        integer64.control_type = V4L2_CTRL_TYPE_INTEGER64;
+        integer64.minimum = 0;
+        integer64.maximum = 0;
+        integer64.step = 0;
+        integer64.default = 0;
+        let mut string = valid_control(V4L2_CTRL_CLASS_USER | 0x901);
+        string.control_type = V4L2_CTRL_TYPE_STRING;
+        string.minimum = 1;
+        string.maximum = 32;
+        string.default = 0;
+        let mut unknown = valid_control(V4L2_CTRL_CLASS_USER | 0x902);
+        unknown.control_type = 0x100;
+        source.controls = Ok(vec![integer64, string, unknown]);
+
+        let inventory = inventory_from_source(&mut source, StreamRole::Rgb).unwrap();
+        assert_eq!(inventory.controls().len(), 3);
+        assert!(inventory
+            .controls()
+            .iter()
+            .all(|control| !control.policy_eligible()));
+    }
+
+    #[test]
+    fn incomplete_menus_fail_closed() {
+        for (id, values) in [
+            (V4L2_CTRL_CLASS_USER | 0x900, Vec::new()),
+            (
+                V4L2_CTRL_CLASS_USER | 0x901,
+                vec![
+                    MenuValue::Name {
+                        index: 0,
+                        bytes: [0; 32],
+                    },
+                    MenuValue::Name {
+                        index: 2,
+                        bytes: [0; 32],
+                    },
+                ],
+            ),
+        ] {
+            let mut source = FakeSource::new(vec![*b"MJPG"]);
+            let mut menu = valid_control(id);
+            menu.control_type = V4L2_CTRL_TYPE_MENU;
+            menu.minimum = 0;
+            menu.maximum = 2;
+            menu.default = 1;
+            menu.menu_values = values;
+            source.controls = Ok(vec![menu]);
+
+            assert!(matches!(
+                inventory_from_source(&mut source, StreamRole::Rgb),
+                Err(CapabilityError::InvalidControl { id: actual, .. }) if actual == id
+            ));
+        }
+    }
+
+    #[test]
+    fn sparse_menu_with_its_default_is_recorded_exactly() {
         let mut source = FakeSource::new(vec![*b"MJPG"]);
         let mut menu = valid_control(V4L2_CTRL_CLASS_USER | 0x900);
         menu.control_type = V4L2_CTRL_TYPE_MENU;
         menu.minimum = 0;
-        menu.maximum = 2;
+        menu.maximum = 3;
         menu.default = 1;
         menu.menu_values = vec![
             MenuValue::Name {
@@ -1567,11 +1649,15 @@ mod tests {
                 index: 1,
                 bytes: *b"manual\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
             },
+            MenuValue::Name {
+                index: 3,
+                bytes: *b"night\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            },
         ];
         source.controls = Ok(vec![menu]);
 
         let inventory = inventory_from_source(&mut source, StreamRole::Rgb).unwrap();
-        assert_eq!(inventory.controls()[0].menu_values().len(), 2);
+        assert_eq!(inventory.controls()[0].menu_values().len(), 3);
     }
 
     #[test]

@@ -275,6 +275,35 @@ pub enum CameraRoleLabel {
     Ir,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RateShortfallEvidence {
+    pub role: CameraRoleLabel,
+    pub failure_count: u32,
+    pub delivered_num: u64,
+    pub delivered_den: u64,
+    pub floor_num: u32,
+    pub floor_den: u32,
+    pub tolerance_percent: u32,
+    pub window_count: u32,
+    pub window_span_us: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RateShortfallsByRole {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rgb: Option<RateShortfallEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir: Option<RateShortfallEvidence>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RateShortfallsByArm {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequential: Option<RateShortfallsByRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<RateShortfallsByRole>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SanitizedCameraContext {
     pub vid: u16,
@@ -462,6 +491,10 @@ pub struct CaptureStatus {
     pub qualification_context: Option<DigestToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_degradation: Option<RuntimeViolationLabel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_rate_shortfalls: Option<RateShortfallsByArm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_attempt_rate_shortfalls: Option<RateShortfallsByArm>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1081,7 +1114,90 @@ mod tests {
             qualification_reason: Some(QualificationReason::DeliveredRateShortfall),
             qualification_context: Some(DigestToken::from_bytes([0x78; 8])),
             runtime_degradation: Some(RuntimeViolationLabel::DeliveredRateShortfall),
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
         }
+    }
+
+    #[test]
+    fn rate_shortfall_contract_serializes_exact_fixed_slots() {
+        let shortfalls = RateShortfallsByArm {
+            sequential: Some(RateShortfallsByRole::default()),
+            concurrent: Some(RateShortfallsByRole {
+                rgb: Some(RateShortfallEvidence {
+                    role: CameraRoleLabel::Rgb,
+                    failure_count: 4,
+                    delivered_num: 10,
+                    delivered_den: 1,
+                    floor_num: 15,
+                    floor_den: 1,
+                    tolerance_percent: 98,
+                    window_count: 30,
+                    window_span_us: 3_000_000,
+                }),
+                ir: Some(RateShortfallEvidence {
+                    role: CameraRoleLabel::Ir,
+                    failure_count: 1,
+                    delivered_num: 29_761,
+                    delivered_den: 1_000,
+                    floor_num: 30,
+                    floor_den: 1,
+                    tolerance_percent: 98,
+                    window_count: 30,
+                    window_span_us: 1_008_030,
+                }),
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&shortfalls).unwrap(),
+            serde_json::json!({
+                "sequential": {},
+                "concurrent": {
+                    "rgb": {
+                        "role": "rgb",
+                        "failure_count": 4,
+                        "delivered_num": 10,
+                        "delivered_den": 1,
+                        "floor_num": 15,
+                        "floor_den": 1,
+                        "tolerance_percent": 98,
+                        "window_count": 30,
+                        "window_span_us": 3_000_000
+                    },
+                    "ir": {
+                        "role": "ir",
+                        "failure_count": 1,
+                        "delivered_num": 29_761,
+                        "delivered_den": 1_000,
+                        "floor_num": 30,
+                        "floor_den": 1,
+                        "tolerance_percent": 98,
+                        "window_count": 30,
+                        "window_span_us": 1_008_030
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RateShortfallsByArm>(
+                serde_json::to_value(&shortfalls).unwrap()
+            )
+            .unwrap(),
+            shortfalls
+        );
+        assert_eq!(
+            serde_json::to_value(RateShortfallsByArm::default()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn old_capture_status_defaults_rate_shortfall_sections_to_absent() {
+        let old = r#"{"schedule":"sequential","source":"stored_qualification","qualification_state":"measured_sequential"}"#;
+        let status: CaptureStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(status.authoritative_rate_shortfalls, None);
+        assert_eq!(status.latest_attempt_rate_shortfalls, None);
     }
 
     fn event(sequence: u64) -> ShareSafeEvent {

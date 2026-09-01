@@ -1346,6 +1346,8 @@ struct CaptureModeSelection {
     runtime_contract: Option<irlume_camera::RuntimePairContract>,
     qualification_state: irlume_common::diagnostics::QualificationState,
     qualification_reason: Option<irlume_common::diagnostics::QualificationReason>,
+    authoritative_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
+    latest_attempt_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
     operation_demoted: std::cell::Cell<bool>,
 }
 
@@ -1499,6 +1501,8 @@ fn unavailable_capture_mode_selection() -> CaptureModeSelection {
         qualification_reason: Some(
             irlume_common::diagnostics::QualificationReason::StoreUnreadable,
         ),
+        authoritative_rate_shortfalls: None,
+        latest_attempt_rate_shortfalls: None,
         operation_demoted: std::cell::Cell::new(false),
     }
 }
@@ -1517,6 +1521,8 @@ fn rgb_only_enrollment_capture_mode_selection() -> CaptureModeSelection {
         // operation genuinely runs RGB-only, which is what NoIrPair names.
         qualification_state: irlume_common::diagnostics::QualificationState::NoIrPair,
         qualification_reason: None,
+        authoritative_rate_shortfalls: None,
+        latest_attempt_rate_shortfalls: None,
         operation_demoted: std::cell::Cell::new(false),
     }
 }
@@ -1543,14 +1549,20 @@ fn capture_mode_selection_with_diagnostics(
                 return unavailable_capture_mode_selection();
             }
         };
-    let (stored, runtime_key, qualification_state, qualification_reason) =
-        match irlume_camera::stored_capture_qualification_state_from_cameras(rgb_camera, ir_camera)
-        {
-            Ok(state) => {
-                diagnostics.emit_share_safe(diagnostic_qualification_event(&state));
-                let (qualification_state, qualification_reason) =
-                    diagnostic_qualification_state(&state);
-                let stored = match state.resolution {
+    let (
+        stored,
+        runtime_key,
+        qualification_state,
+        qualification_reason,
+        authoritative_rate_shortfalls,
+        latest_attempt_rate_shortfalls,
+    ) = match irlume_camera::stored_capture_qualification_state_from_cameras(rgb_camera, ir_camera)
+    {
+        Ok(state) => {
+            diagnostics.emit_share_safe(diagnostic_qualification_event(&state));
+            let (qualification_state, qualification_reason) =
+                diagnostic_qualification_state(&state);
+            let stored = match state.resolution {
                     irlume_camera::capture_qualification::QualificationResolution::ConcurrentQualified => {
                         Some(irlume_camera::CaptureMode::Concurrent)
                     }
@@ -1561,33 +1573,35 @@ fn capture_mode_selection_with_diagnostics(
                         _,
                     ) => None,
                 };
-                (
-                    stored,
-                    Some(state.runtime_key),
-                    qualification_state,
-                    qualification_reason,
-                )
-            }
-            Err(error) => {
-                diagnostics.emit_share_safe(
-                    irlume_common::diagnostics::ShareSafeEventKind::QualificationChanged {
-                        state: irlume_common::diagnostics::QualificationState::Unreadable,
-                        reason: Some(
-                            irlume_common::diagnostics::QualificationReason::StoreUnreadable,
-                        ),
-                    },
-                );
-                irlume_common::dlog!(
-                    "capture qualification unreadable ({error}); selecting one-at-a-time capture"
-                );
-                (
-                    None,
-                    None,
-                    irlume_common::diagnostics::QualificationState::Unreadable,
-                    Some(irlume_common::diagnostics::QualificationReason::StoreUnreadable),
-                )
-            }
-        };
+            (
+                stored,
+                Some(state.runtime_key),
+                qualification_state,
+                qualification_reason,
+                state.authoritative_rate_shortfalls,
+                state.latest_attempt_rate_shortfalls,
+            )
+        }
+        Err(error) => {
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::QualificationChanged {
+                    state: irlume_common::diagnostics::QualificationState::Unreadable,
+                    reason: Some(irlume_common::diagnostics::QualificationReason::StoreUnreadable),
+                },
+            );
+            irlume_common::dlog!(
+                "capture qualification unreadable ({error}); selecting one-at-a-time capture"
+            );
+            (
+                None,
+                None,
+                irlume_common::diagnostics::QualificationState::Unreadable,
+                Some(irlume_common::diagnostics::QualificationReason::StoreUnreadable),
+                None,
+                None,
+            )
+        }
+    };
     let env = std::env::var("IRLUME_SEQUENTIAL_CAPTURE").ok();
     let selected = capture_mode_decision(env.as_deref(), stored);
     let selected = with_runtime_capture_health(|health| {
@@ -1600,6 +1614,8 @@ fn capture_mode_selection_with_diagnostics(
         runtime_contract: Some(runtime_contract),
         qualification_state,
         qualification_reason,
+        authoritative_rate_shortfalls,
+        latest_attempt_rate_shortfalls,
         operation_demoted: std::cell::Cell::new(false),
     }
 }
@@ -2005,6 +2021,27 @@ fn diagnostic_capture_schedule(
     (schedule, source)
 }
 
+fn diagnostic_capture_status(
+    selection: &CaptureModeSelection,
+    ir_available: bool,
+    runtime_context: Option<irlume_common::diagnostics::DigestToken>,
+    qualification_context: Option<irlume_common::diagnostics::DigestToken>,
+    runtime_degradation: Option<irlume_common::diagnostics::RuntimeViolationLabel>,
+) -> irlume_common::diagnostics::CaptureStatus {
+    let (schedule, source) = diagnostic_capture_schedule(selection, ir_available);
+    irlume_common::diagnostics::CaptureStatus {
+        schedule,
+        source,
+        runtime_context,
+        qualification_state: selection.qualification_state,
+        qualification_reason: selection.qualification_reason,
+        qualification_context,
+        runtime_degradation,
+        authoritative_rate_shortfalls: selection.authoritative_rate_shortfalls.clone(),
+        latest_attempt_rate_shortfalls: selection.latest_attempt_rate_shortfalls.clone(),
+    }
+}
+
 fn diagnostic_qualification_event(
     state: &irlume_camera::StoredCaptureQualificationState,
 ) -> irlume_common::diagnostics::ShareSafeEventKind {
@@ -2064,7 +2101,7 @@ fn emit_capture_context(
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
 ) {
     use irlume_common::diagnostics::{
-        CameraRoleLabel, CaptureStatus, DigestToken, QualificationState, ShareSafeEventKind,
+        CameraRoleLabel, DigestToken, QualificationState, ShareSafeEventKind,
     };
     emit_capture_schedule(selection, ir_available, diagnostics);
     if let Some(contract) = selection.runtime_contract.as_ref() {
@@ -2077,17 +2114,14 @@ fn emit_capture_context(
                 with_runtime_capture_health(|health| health.degradation(key))
                     .map(diagnostic_runtime_violation)
             });
-            let (schedule, source) = diagnostic_capture_schedule(selection, ir_available);
             diagnostics.publish_support_context(
-                CaptureStatus {
-                    schedule,
-                    source,
-                    runtime_context: Some(runtime_context),
-                    qualification_state: selection.qualification_state,
-                    qualification_reason: selection.qualification_reason,
+                diagnostic_capture_status(
+                    selection,
+                    ir_available,
+                    Some(runtime_context),
                     qualification_context,
                     runtime_degradation,
-                },
+                ),
                 cameras.into(),
             );
         }
@@ -2124,6 +2158,8 @@ fn publish_rgb_only_support_context(
             qualification_reason: None,
             qualification_context: None,
             runtime_degradation: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
         },
         vec![camera],
     );
@@ -2521,6 +2557,8 @@ mod capture_mode_switch_tests {
             runtime_contract: None,
             qualification_state: QualificationState::QualifiedConcurrent,
             qualification_reason: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
             operation_demoted: std::cell::Cell::new(false),
         };
 
@@ -2533,6 +2571,62 @@ mod capture_mode_switch_tests {
                 source: CaptureScheduleSource::StoredQualification,
             }]
         );
+    }
+
+    #[test]
+    fn rate_shortfall_support_context_preserves_authoritative_and_latest_attempt() {
+        use irlume_common::diagnostics::{
+            CameraRoleLabel, DigestToken, RateShortfallEvidence, RateShortfallsByArm,
+            RateShortfallsByRole,
+        };
+
+        let evidence = |role, failure_count| RateShortfallEvidence {
+            role,
+            failure_count,
+            delivered_num: 10,
+            delivered_den: 1,
+            floor_num: 15,
+            floor_den: 1,
+            tolerance_percent: 98,
+            window_count: 30,
+            window_span_us: 3_000_000,
+        };
+        let authoritative = RateShortfallsByArm {
+            sequential: Some(RateShortfallsByRole::default()),
+            concurrent: Some(RateShortfallsByRole {
+                rgb: Some(evidence(CameraRoleLabel::Rgb, 4)),
+                ir: None,
+            }),
+        };
+        let latest = RateShortfallsByArm {
+            sequential: Some(RateShortfallsByRole::default()),
+            concurrent: Some(RateShortfallsByRole {
+                rgb: None,
+                ir: Some(evidence(CameraRoleLabel::Ir, 1)),
+            }),
+        };
+        let selection = CaptureModeSelection {
+            sequential: true,
+            source: STORED_CAPTURE_MODE_SOURCE,
+            runtime_key: Some("dock-a".into()),
+            runtime_contract: None,
+            qualification_state: QualificationState::MeasuredSequential,
+            qualification_reason: Some(QualificationReason::DeliveredRateShortfall),
+            authoritative_rate_shortfalls: Some(authoritative.clone()),
+            latest_attempt_rate_shortfalls: Some(latest.clone()),
+            operation_demoted: std::cell::Cell::new(false),
+        };
+
+        let status = diagnostic_capture_status(
+            &selection,
+            true,
+            Some(DigestToken::from_sha256_hex(&"a".repeat(64)).unwrap()),
+            Some(DigestToken::from_sha256_hex(&"b".repeat(64)).unwrap()),
+            None,
+        );
+
+        assert_eq!(status.authoritative_rate_shortfalls, Some(authoritative));
+        assert_eq!(status.latest_attempt_rate_shortfalls, Some(latest));
     }
 
     #[test]
@@ -2557,6 +2651,8 @@ mod capture_mode_switch_tests {
             ),
             runtime_key: "context".into(),
             last_attempt_outcome: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
         };
 
         assert_eq!(
@@ -2672,6 +2768,8 @@ mod capture_mode_switch_tests {
             runtime_contract: None,
             qualification_state: QualificationState::QualifiedConcurrent,
             qualification_reason: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
             operation_demoted: std::cell::Cell::new(false),
         };
         assert!(pair_rate_failure_is_degradation(&qualified));

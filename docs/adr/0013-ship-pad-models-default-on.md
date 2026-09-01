@@ -2,6 +2,8 @@
 
 **Status:** Accepted
 **Date:** 2026-08-22
+**Amended by:** [ADR-0019](0019-fail-closed-pad-availability.md), which makes
+required PAD availability fail closed while keeping the daemon available
 **Implementation:** Complete with this PR. `liveness_vit.onnx` (Adedev-W
 LivenessModels-ONNX, MIT, sha256 `c7f8a6f3…`) and `flir.onnx` (Alibaba DAMO
 ModelScope `cv_manual_face-liveness_flir`, MIT, sha256 `df80cea7…`) are
@@ -84,7 +86,8 @@ records why that is sound and what it costs.
 5. **Kill switches** are first-class: env (`IRLUME_PAD_VIT` /
    `IRLUME_PAD_IR`) and settings.conf (`pad_vit` / `pad_ir`). A
    kill-switched cue skips startup verification entirely and its absence is
-   named in the startup log.
+   named in the startup log. ADR-0019 changes their runtime consequence from
+   an uncovered face path to password-only face authentication.
 
 ## Consequences
 
@@ -106,7 +109,7 @@ records why that is sound and what it costs.
 - **The narrow window (0.04) is a standing risk:** a new camera or print
   landing inside [0.56, 0.604] produces false denials. The kill switch and
   the `pad-vit: p_spoof` journal line exist so an operator can diagnose and
-  disable in one step. Re-qualification is required (and this ADR's
+  switch face authentication to password-only in one step. Re-qualification is required (and this ADR's
   Implementation status must change) if either threshold moves.
 - **The opt-in catalog keeps both entries' provenance records** and remains
   the path for future PAD candidates; `flir` stays listed so existing

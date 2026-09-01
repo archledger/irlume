@@ -162,11 +162,11 @@ here is a claim about those.
 [ms-ess]: https://learn.microsoft.com/windows-hardware/design/device-experiences/windows-hello-enhanced-sign-in-security
 [ms-xu]: https://learn.microsoft.com/windows-hardware/drivers/stream/device-requirements-for-usb-video-class-extension-units
 
-## Liveness: algorithmic gate plus shipped deny-only PAD models
+## Liveness: mandatory, fail-closed PAD evidence
 
 The algorithmic gate uses no trained weights; the default configuration's PAD
 stack additionally runs two shipped deny-only models (ViT RGB + FLIR IR,
-ADR-0013). MediaPipe FaceMesh remains a
+ADR-0013, availability policy amended by ADR-0019). MediaPipe FaceMesh remains a
 dense landmarker for BlazeFace rescue alignment, not a spoof classifier or a
 consent detector; it is Apache-2.0, so the clean-BOM claim holds.
 
@@ -215,7 +215,14 @@ head-shake gestures that replaced it prove intent, not liveness, and do not
 stand between a print and a grant. Measurements:
 [docs/pad-results/](pad-results/).
 
-A user who sets the kill switch (`IRLUME_PAD_IR=0`) carries this gap in full.
+PAD availability is fail closed for face grants. RGB-only grants require a ViT
+RGB score, RGB+IR grants require both ViT RGB and FLIR IR scores, and dark
+IR-only grants require a FLIR IR score. A missing or disabled required model,
+or a failed inference, produces a nonretryable password-fallback denial rather
+than continuing with the algorithmic gate alone. The daemon remains available
+for password fallback, diagnostics, and repair, and its health response reports
+each model as loaded, disabled, missing, or load-failed. Kill switches therefore
+mean password-only face authentication; they do not accept this documented gap.
 Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/2026-06-30-ir-liveness-selftest.md).
 
 ## Storage

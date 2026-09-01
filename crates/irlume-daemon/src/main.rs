@@ -217,26 +217,16 @@ fn load_shipped_recognizer(
 /// refuse to start on a normal install that never had an adapter.
 ///
 /// The shipped PAD cues (ADR-0013) follow the adapter rule, not the core-four
-/// rule: they are verified when present and simply absent otherwise (the
-/// engine degrades to no cue), because a tree without fetched weights (dev,
-/// partial custom installs) must still run. Kill-switched cues skip
+/// rule: they are verified when present and reported unavailable otherwise,
+/// because a tree without fetched weights (dev, partial custom installs) must
+/// still run for password fallback and repair. Face grants fail closed on that
+/// unavailable evidence (ADR-0019). Kill-switched cues skip
 /// verification entirely: an operator who disabled the cue did not ask to
 /// have its weights checked.
-fn models_to_verify<'a>(
-    shipped: [&'a str; 4],
-    adapter: &'a str,
-    vit_pad: &'a str,
-    pad_ir: &'a str,
-) -> Vec<&'a str> {
+fn models_to_verify<'a>(shipped: [&'a str; 4], adapter: &'a str) -> Vec<&'a str> {
     let mut v: Vec<&str> = shipped.to_vec();
     if std::path::Path::new(adapter).exists() {
         v.push(adapter);
-    }
-    if vit_pad_enabled() && std::path::Path::new(vit_pad).exists() {
-        v.push(vit_pad);
-    }
-    if pad_ir_enabled() && std::path::Path::new(pad_ir).exists() {
-        v.push(pad_ir);
     }
     v
 }
@@ -263,6 +253,163 @@ fn pad_ir_enabled() -> bool {
         irlume_common::config::read_kv("settings.conf", "pad_ir").as_deref(),
         Some(v) if irlume_common::config::falsy(v)
     )
+}
+
+fn pad_model_status(
+    enabled: bool,
+    present: bool,
+    loaded: bool,
+    load_failed: bool,
+) -> irlume_common::PadModelStatus {
+    if !enabled {
+        irlume_common::PadModelStatus::Disabled
+    } else if !present {
+        irlume_common::PadModelStatus::Missing
+    } else if loaded {
+        irlume_common::PadModelStatus::Loaded
+    } else {
+        debug_assert!(load_failed);
+        irlume_common::PadModelStatus::LoadFailed
+    }
+}
+
+fn pad_model_load_allowed(path: &str, strict: bool) -> bool {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "irlumed: PAD model {path} cannot be read ({error}); face authentication is password-only"
+            );
+            return false;
+        }
+    };
+    let digest = irlume_common::sha256_hex(&bytes);
+    let known = MODEL_MANIFEST
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|known| known == digest);
+    if known {
+        return true;
+    }
+
+    eprintln!(
+        "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
+    );
+    if strict {
+        eprintln!(
+            "irlumed: IRLUME_MODELS_STRICT=1: refusing this PAD model; daemon remains available and face authentication is password-only"
+        );
+        false
+    } else {
+        eprintln!(
+            "irlumed: continuing with unverified PAD weights; set IRLUME_MODELS_STRICT=1 to refuse them"
+        );
+        true
+    }
+}
+
+fn load_pad_models(
+    engine: irlume_auth::Engine,
+    vit_path: &str,
+    ir_path: &str,
+) -> (
+    irlume_auth::Engine,
+    irlume_common::PadModelStatus,
+    irlume_common::PadModelStatus,
+) {
+    let strict = strict_requested(
+        std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+        std::io::stderr(),
+    );
+    let vit_enabled = vit_pad_enabled();
+    let vit_present = std::path::Path::new(vit_path).exists();
+    let vit_allowed = vit_enabled && vit_present && pad_model_load_allowed(vit_path, strict);
+    let (engine, vit_error) = if vit_allowed {
+        engine.with_vit_pad_degraded(vit_path)
+    } else {
+        (engine, None)
+    };
+    if let Some(error) = &vit_error {
+        eprintln!("irlumed: RGB PAD did not load ({error}); face authentication is password-only");
+    }
+    let rgb_status = pad_model_status(
+        vit_enabled,
+        vit_present,
+        engine.has_vit_pad(),
+        vit_error.is_some() || (vit_enabled && vit_present && !vit_allowed),
+    );
+
+    let ir_enabled = pad_ir_enabled();
+    let ir_present = std::path::Path::new(ir_path).exists();
+    let ir_allowed = ir_enabled && ir_present && pad_model_load_allowed(ir_path, strict);
+    let (engine, ir_error) = if ir_allowed {
+        engine.with_pad_ir_degraded(ir_path)
+    } else {
+        (engine, None)
+    };
+    if let Some(error) = &ir_error {
+        eprintln!(
+            "irlumed: IR PAD did not load ({error}); secure and dark face authentication are password-only"
+        );
+    }
+    let ir_status = pad_model_status(
+        ir_enabled,
+        ir_present,
+        engine.has_pad_ir(),
+        ir_error.is_some() || (ir_enabled && ir_present && !ir_allowed),
+    );
+
+    (engine, rgb_status, ir_status)
+}
+
+struct EngineBuildConfig {
+    det: String,
+    model: String,
+    adapter: String,
+    mesh: String,
+    blaze: String,
+    vit_pad: String,
+    pad_ir: String,
+    rgb_dev: String,
+    ir_dev: String,
+}
+
+fn build_engine_from_config(
+    config: &EngineBuildConfig,
+    recognizer: Option<&irlume_common::HashedModel>,
+) -> irlume_common::Result<(
+    irlume_auth::Engine,
+    irlume_common::PadModelStatus,
+    irlume_common::PadModelStatus,
+)> {
+    load_shipped_recognizer(&config.det, &config.model, recognizer)
+        .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
+        .and_then(|engine| engine.with_ir_adapter(&config.adapter))
+        // FaceMesh load failure disables rescue alignment but not head
+        // consent, which uses detector landmarks. Outside strict mode the
+        // daemon therefore stays available; strict mode retains the explicit
+        // operator-requested refusal.
+        .and_then(|engine| {
+            if strict_requested(
+                std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+                std::io::stderr(),
+            ) {
+                return engine.with_mesh(&config.mesh);
+            }
+            let (engine, error) = engine.with_mesh_degraded(&config.mesh);
+            if let Some(error) = error {
+                eprintln!(
+                    "irlumed: FaceMesh did not load ({error}); continuing WITHOUT \
+                     the mesh: BlazeFace detection-rescue alignment is unavailable; \
+                     head nod approval and head-shake decline still work. Fix the \
+                     TFLite runtime (doctor: tflite-runtime) or \
+                     set IRLUME_MESH_MODEL to the ONNX mesh."
+                );
+            }
+            Ok(engine)
+        })
+        .and_then(|engine| engine.with_blaze_rescue(&config.blaze))
+        .map(|engine| load_pad_models(engine, &config.vit_pad, &config.pad_ir))
 }
 
 fn main() {
@@ -360,7 +507,7 @@ fn main() {
             // engine below (#346), so the 260MB file is read and hashed once per
             // start rather than once here and once again inside the loader.
             let verified_recognizer = verify_models(
-                &models_to_verify([&det, &model, &mesh, &blaze], &adapter, &vit_pad_path, &pad_ir_path),
+                &models_to_verify([&det, &model, &mesh, &blaze], &adapter),
                 Some(&model),
             );
             // Auto-select the camera pair: explicit IRLUME_RGB_DEVICE/IR_DEVICE, else a
@@ -482,65 +629,24 @@ fn main() {
             // (#346); the worker's post-panic rebuild passes None and re-reads
             // the path, which is why the closure takes it as an argument instead
             // of capturing it and holding 260MB for the daemon's life.
+            let engine_config = EngineBuildConfig {
+                det,
+                model,
+                adapter,
+                mesh,
+                blaze,
+                vit_pad: vit_pad_path,
+                pad_ir: pad_ir_path,
+                rgb_dev,
+                ir_dev,
+            };
             let build_engine = move |recognizer: Option<&irlume_common::HashedModel>| {
-                load_shipped_recognizer(&det, &model, recognizer)
-                    .map(|e| e.with_devices(&rgb_dev, &ir_dev))
-                    .and_then(|e| e.with_ir_adapter(&adapter))
-                    // A mesh that fails to LOAD degrades, it does not kill the
-                    // daemon. The mesh became a .tflite on a bundled runtime
-                    // (#295/#315), so every start now dlopens
-                    // libtensorflowlite_c.so, and treating that failure as
-                    // fatal turned "mesh-dependent gates off" into "face auth
-                    // entirely dead" on any host where the bundled runtime
-                    // does not load (a GLIBCXX below the .deb build's 3.4.30
-                    // floor, a failed unpack); 0.9.0 pointed the unit at the
-                    // ONNX mesh and started fine on the same host. Head consent
-                    // needs no mesh; rescue alignment is unavailable, while
-                    // every consent prompt still works. IRLUME_MODELS_STRICT keeps the refusal
-                    // for operators who asked for it. An ABSENT mesh file was
-                    // already a silent no-op inside with_mesh.
-                    .and_then(|e| {
-                        if strict_requested(
-                            std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
-                            std::io::stderr(),
-                        ) {
-                            return e.with_mesh(&mesh);
-                        }
-                        let (e, err) = e.with_mesh_degraded(&mesh);
-                        if let Some(err) = err {
-                            eprintln!(
-                                "irlumed: FaceMesh did not load ({err}); continuing WITHOUT \
-                                 the mesh: BlazeFace detection-rescue alignment is unavailable; \
-                                 head nod approval and head-shake decline still work. Fix the \
-                                 TFLite runtime (doctor: tflite-runtime) or \
-                                 set IRLUME_MESH_MODEL to the ONNX mesh."
-                            );
-                        }
-                        Ok(e)
-                    })
-                    .and_then(|e| e.with_blaze_rescue(&blaze))
-                    // Shipped PAD cues (ADR-0013): default-on, kill-switched.
-                    // The engine builders no-op on an absent file (degrade to
-                    // no cue); the startup lines below name the absence.
-                    .and_then(|e| {
-                        if vit_pad_enabled() {
-                            e.with_vit_pad(&vit_pad_path)
-                        } else {
-                            Ok(e)
-                        }
-                    })
-                    .and_then(|e| {
-                        if pad_ir_enabled() {
-                            e.with_pad_ir(&pad_ir_path)
-                        } else {
-                            Ok(e)
-                        }
-                    })
+                build_engine_from_config(&engine_config, recognizer)
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
             let engine = match build_engine(verified_recognizer.as_ref()) {
-                Ok(e) => {
+                Ok((e, rgb_pad_status, ir_pad_status)) => {
                     eprintln!(
                         "irlumed: IR adapter {}",
                         if e.has_ir_adapter() {
@@ -567,15 +673,15 @@ fn main() {
                     // and does not stop.
                     eprintln!(
                         "irlumed: RGB PAD cue (ViT) {} — catches print/banner species; \
-                         does NOT stop a phone at login distance; disable: IRLUME_PAD_VIT=0",
-                        if e.has_vit_pad() { "loaded" } else if vit_pad_enabled() { "ABSENT (weights not installed)" } else { "disabled" }
+                         does NOT stop a phone at login distance; password-only switch: IRLUME_PAD_VIT=0",
+                        if e.has_vit_pad() { "loaded" } else { "UNAVAILABLE (face authentication is password-only)" }
                     );
                     eprintln!(
                         "irlumed: IR PAD cue (flir) {} — screens/phones present no face \
-                         in IR; print species; disable: IRLUME_PAD_IR=0",
-                        if e.has_pad_ir() { "loaded" } else if pad_ir_enabled() { "ABSENT (weights not installed)" } else { "disabled" }
+                         in IR; print species; password-only switch: IRLUME_PAD_IR=0",
+                        if e.has_pad_ir() { "loaded" } else { "UNAVAILABLE (secure and dark face authentication are password-only)" }
                     );
-                    e
+                    (e, rgb_pad_status, ir_pad_status)
                 }
                 Err(e) => {
                     eprintln!("irlumed: failed to load models: {e}");
@@ -586,7 +692,8 @@ fn main() {
             // this buffer is 260MB of dead memory from here on: release it
             // before the enrollment sweep rather than at the end of startup.
             drop(verified_recognizer);
-            publish_engine_bits(&engine);
+            let (engine, rgb_pad_status, ir_pad_status) = engine;
+            publish_engine_bits(&engine, rgb_pad_status, ir_pad_status);
 
             // One-time inoculation: stamp legacy (untagged) IR scans with the current
             // embedding space while it is still the space they were captured under.
@@ -819,12 +926,16 @@ fn main() {
                                     // systemd kill the daemon MID-REBUILD.
                                     note_worker_progress();
                                     match build_engine(None) {
-                                        Ok(fresh) => {
+                                        Ok((fresh, rgb_pad_status, ir_pad_status)) => {
                                             // Back through `attach`, because a bare
                                             // Engine has no stop signal and assigning
                                             // one here is exactly what #359 was.
                                             engine = WorkerEngine::attach(fresh, &arbiter);
-                                            publish_engine_bits(&engine);
+                                            publish_engine_bits(
+                                                &engine,
+                                                rgb_pad_status,
+                                                ir_pad_status,
+                                            );
                                             eprintln!("irlumed: engine rebuilt after panic");
                                         }
                                         Err(e) => eprintln!(
@@ -2984,6 +3095,8 @@ fn posture(req: &Request) -> RequestPosture<'_> {
 struct EngineBits {
     mesh: bool,
     adapter: bool,
+    rgb_pad: Option<irlume_common::PadModelStatus>,
+    ir_pad: Option<irlume_common::PadModelStatus>,
     /// The camera facts as the ENGINE observed them when it loaded, so
     /// `Health` can answer from memory. Probing them per request opened
     /// video nodes on a connection thread, outside the camera worker's
@@ -3004,7 +3117,11 @@ fn publish_engine_bits_raw(bits: EngineBits) {
     *engine_bits().lock().unwrap_or_else(|e| e.into_inner()) = bits;
 }
 
-fn publish_engine_bits(engine: &irlume_auth::Engine) {
+fn publish_engine_bits(
+    engine: &irlume_auth::Engine,
+    rgb_pad: irlume_common::PadModelStatus,
+    ir_pad: irlume_common::PadModelStatus,
+) {
     // One probe, at load, on the thread that owns the engine. Every later
     // Health answer reads this copy.
     let caps = irlume_auth::capabilities();
@@ -3025,6 +3142,8 @@ fn publish_engine_bits(engine: &irlume_auth::Engine) {
     publish_engine_bits_raw(EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
+        rgb_pad: Some(rgb_pad),
+        ir_pad: Some(ir_pad),
         tier: tier.into(),
         rgb_dev,
         ir_dev,
@@ -3356,6 +3475,8 @@ fn dispatch_status_with_diagnostics(
                 ir_dev: bits.ir_dev.clone(),
                 mesh: bits.mesh,
                 adapter: bits.adapter,
+                rgb_pad: bits.rgb_pad,
+                ir_pad: bits.ir_pad,
                 version: env!("CARGO_PKG_VERSION").into(),
                 apparmor: apparmor_confinement(),
             }
@@ -5682,14 +5803,9 @@ mod tests {
             "/etc/irlume/blaze_face_short_range.onnx",
         ];
         assert_eq!(
-            models_to_verify(
-                shipped,
-                "/nonexistent/irlume-test/ir_adapter.onnx",
-                "/nonexistent/irlume-test/liveness_vit.onnx",
-                "/nonexistent/irlume-test/flir.onnx",
-            ),
+            models_to_verify(shipped, "/nonexistent/irlume-test/ir_adapter.onnx"),
             shipped.to_vec(),
-            "a missing optional adapter/PAD cue must not reach verify_models"
+            "a missing optional adapter must not reach verify_models"
         );
         // An adapter that actually exists is still checked.
         let dir =
@@ -5699,67 +5815,123 @@ mod tests {
         let adapter = dir.join("ir_adapter.onnx");
         std::fs::write(&adapter, b"weights").unwrap();
         let ap = adapter.to_string_lossy().into_owned();
-        let v = models_to_verify(
-            shipped,
-            &ap,
-            "/nonexistent/irlume-test/liveness_vit.onnx",
-            "/nonexistent/irlume-test/flir.onnx",
-        );
+        let v = models_to_verify(shipped, &ap);
         assert_eq!(v.len(), 5);
         assert_eq!(v[4], ap);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ADR-0013: the shipped PAD cues follow the adapter rule (verified when
-    // present, absent otherwise), and a KILL-SWITCHED cue is not verified at
-    // all — the operator disabled it, not its weights.
+    // PAD verification is deliberately separate from the fatal core-model
+    // verifier: strict rejection makes face auth password-only, not the daemon
+    // unavailable (ADR-0019).
     #[test]
-    fn pad_cue_weights_are_optional_and_kill_switches_skip_verification() {
+    fn pad_cues_stay_out_of_the_fatal_model_verification_path() {
         let shipped = [
             "/etc/irlume/det.onnx",
             "/etc/irlume/face.onnx",
             "/etc/irlume/face_landmarks_detector.tflite",
             "/etc/irlume/blaze_face_short_range.onnx",
         ];
-        let dir = std::env::temp_dir().join(format!("irlume-daemon-pad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let vit = dir.join("liveness_vit.onnx");
-        std::fs::write(&vit, b"vit").unwrap();
-        let flir = dir.join("flir.onnx");
-        std::fs::write(&flir, b"flir").unwrap();
-        let (vp, fp) = (
-            vit.to_string_lossy().into_owned(),
-            flir.to_string_lossy().into_owned(),
-        );
-
-        // Present + enabled: both verified, after the core four.
+        // PAD paths are not accepted by the fatal core verifier's interface.
         let _g = env_lock();
         std::env::remove_var("IRLUME_PAD_VIT");
         std::env::remove_var("IRLUME_PAD_IR");
-        let v = models_to_verify(
-            shipped,
-            "/nonexistent/irlume-test/ir_adapter.onnx",
-            &vp,
-            &fp,
-        );
-        assert_eq!(v.len(), 6, "core four + both PAD cues");
-        assert_eq!(v[4], vp);
-        assert_eq!(v[5], fp);
+        let v = models_to_verify(shipped, "/nonexistent/irlume-test/ir_adapter.onnx");
+        assert_eq!(v, shipped);
+        assert!(vit_pad_enabled() && pad_ir_enabled());
 
-        // Kill switch removes the cue from verification entirely.
+        // A kill switch prevents the separate loader/verifier from running.
         std::env::set_var("IRLUME_PAD_VIT", "0");
-        let v = models_to_verify(
-            shipped,
-            "/nonexistent/irlume-test/ir_adapter.onnx",
-            &vp,
-            &fp,
-        );
-        assert_eq!(v.len(), 5, "ViT cue kill-switched out");
-        assert_eq!(v[4], fp);
+        assert!(!vit_pad_enabled());
         std::env::remove_var("IRLUME_PAD_VIT");
+    }
+
+    #[test]
+    fn pad_health_status_distinguishes_password_only_causes() {
+        use irlume_common::PadModelStatus;
+
+        assert_eq!(
+            pad_model_status(false, true, false, false),
+            PadModelStatus::Disabled
+        );
+        assert_eq!(
+            pad_model_status(true, false, false, false),
+            PadModelStatus::Missing
+        );
+        assert_eq!(
+            pad_model_status(true, true, false, true),
+            PadModelStatus::LoadFailed
+        );
+        assert_eq!(
+            pad_model_status(true, true, true, false),
+            PadModelStatus::Loaded
+        );
+    }
+
+    #[test]
+    fn strict_verification_rejects_damaged_pad_without_exiting() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-daemon-bad-pad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pad = dir.join("liveness_vit.onnx");
+        std::fs::write(&pad, b"damaged PAD weights").unwrap();
+
+        assert!(pad_model_load_allowed(&pad.to_string_lossy(), false));
+        assert!(!pad_model_load_allowed(&pad.to_string_lossy(), true));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_damaged_pad_keeps_engine_build_available() {
+        let _guard = env_lock();
+        ort_init();
+        std::env::set_var("IRLUME_MODELS_STRICT", "1");
+        std::env::set_var("IRLUME_FORCE_NO_IR", "1");
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-daemon-strict-pad-build-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let damaged_pad = dir.join("liveness_vit.onnx");
+        std::fs::write(&damaged_pad, b"damaged PAD weights").unwrap();
+        let config = EngineBuildConfig {
+            det: model_path("face_detection_yunet_2023mar.onnx"),
+            model: model_path("glintr100.onnx"),
+            adapter: dir
+                .join("absent-adapter.onnx")
+                .to_string_lossy()
+                .into_owned(),
+            mesh: dir.join("absent-mesh.onnx").to_string_lossy().into_owned(),
+            blaze: dir.join("absent-blaze.onnx").to_string_lossy().into_owned(),
+            vit_pad: damaged_pad.to_string_lossy().into_owned(),
+            pad_ir: dir.join("absent-flir.onnx").to_string_lossy().into_owned(),
+            rgb_dev: "/dev/irlume-test-none-rgb".into(),
+            ir_dev: "/dev/irlume-test-none-ir".into(),
+        };
+
+        let (_, rgb_pad, ir_pad) = build_engine_from_config(&config, None)
+            .expect("damaged PAD must not make the daemon engine unavailable");
+        assert_eq!(rgb_pad, irlume_common::PadModelStatus::LoadFailed);
+        assert_eq!(ir_pad, irlume_common::PadModelStatus::Missing);
+
+        std::env::remove_var("IRLUME_MODELS_STRICT");
+        std::env::remove_var("IRLUME_FORCE_NO_IR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panic_rebuild_republishes_both_pad_statuses() {
+        let source = include_str!("main.rs");
+        let rebuild = &source[source.find("match build_engine(None)").unwrap()
+            ..source.find("Response::Error(\"request failed\"").unwrap()];
+
+        assert!(rebuild.contains("Ok((fresh, rgb_pad_status, ir_pad_status))"));
+        assert!(rebuild.contains("rgb_pad_status,"));
+        assert!(rebuild.contains("ir_pad_status,"));
+        assert!(rebuild.contains("publish_engine_bits"));
     }
 
     // Startup asks for one model and gets back exactly that file's bytes with
@@ -5768,6 +5940,7 @@ mod tests {
     // that keeps something it never verified, fails below.
     #[test]
     fn verify_models_hands_back_the_model_it_was_asked_for_with_its_digest() {
+        let _env = crate::test_support::env_read();
         let dir = std::env::temp_dir().join(format!("irlume-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -7843,6 +8016,8 @@ mod tests {
         publish_engine_bits_raw(EngineBits {
             mesh: true,
             adapter: true,
+            rgb_pad: Some(irlume_common::PadModelStatus::Loaded),
+            ir_pad: Some(irlume_common::PadModelStatus::Disabled),
             tier: "none".into(),
             rgb_dev: None,
             ir_dev: None,
@@ -7854,8 +8029,16 @@ mod tests {
         };
         let resp = dispatch_status(&Request::Health, &peer).expect("status request");
         match resp {
-            Response::Health { mesh, adapter, .. } => {
+            Response::Health {
+                mesh,
+                adapter,
+                rgb_pad,
+                ir_pad,
+                ..
+            } => {
                 assert!(mesh && adapter);
+                assert_eq!(rgb_pad, Some(irlume_common::PadModelStatus::Loaded));
+                assert_eq!(ir_pad, Some(irlume_common::PadModelStatus::Disabled));
             }
             other => panic!("expected Health, got {other:?}"),
         }
@@ -8499,6 +8682,7 @@ mod tests {
 
     #[test]
     fn verify_models_without_strict_warns_but_continues() {
+        let _env = crate::test_support::env_read();
         // No IRLUME_MODELS_STRICT in the test env: an unknown digest and a
         // missing file must both come back (reaching the next line at all is
         // the contract; strict mode would have exited the process).

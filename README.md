@@ -30,7 +30,9 @@ IR camera. Stored as an embedding, never an image. Password always works.
 > **A printed photograph of an enrolled face passes the algorithmic IR gate
 > alone** (accepted in 69 of 70 measured presentations). The shipped PAD pair
 > (ViT RGB + FLIR IR) refuses it, runs default-on, and verifies against signed
-> checksums at startup; kill switches: `IRLUME_PAD_VIT=0`, `IRLUME_PAD_IR=0`.
+> checksums at startup. Missing, disabled, or failed required PAD falls back to
+> password without granting face authentication; kill switches
+> `IRLUME_PAD_VIT=0` and `IRLUME_PAD_IR=0` are password-only controls.
 > Read **[Limits](docs/LIMITATIONS.md)** before wiring this
 > into anything that matters.
 

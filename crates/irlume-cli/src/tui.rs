@@ -434,6 +434,8 @@ struct HealthInfo {
     ir_dev: Option<String>,
     mesh: bool,
     adapter: bool,
+    rgb_pad: Option<irlume_common::PadModelStatus>,
+    ir_pad: Option<irlume_common::PadModelStatus>,
     version: String,
     /// The daemon's real AppArmor confinement label ("irlumed (enforce)",
     /// "unconfined", ...), or None when AppArmor is off or the daemon predates
@@ -876,6 +878,8 @@ impl LightState {
                 ir_dev,
                 mesh,
                 adapter,
+                rgb_pad,
+                ir_pad,
                 version,
                 apparmor,
             }) => Some(HealthInfo {
@@ -884,6 +888,8 @@ impl LightState {
                 ir_dev,
                 mesh,
                 adapter,
+                rgb_pad,
+                ir_pad,
                 version,
                 apparmor,
             }),
@@ -1516,6 +1522,79 @@ impl App {
                     if h.mesh { " + FaceMesh" } else { "" }
                 ),
                 Fix::None,
+            ));
+            let status_name = |status: Option<irlume_common::PadModelStatus>| match status {
+                Some(irlume_common::PadModelStatus::Loaded) => "loaded",
+                Some(irlume_common::PadModelStatus::Disabled) => "disabled",
+                Some(irlume_common::PadModelStatus::Missing) => "missing",
+                Some(irlume_common::PadModelStatus::LoadFailed) => "load failed",
+                None => "unknown",
+            };
+            let rgb_ready = matches!(h.rgb_pad, Some(irlume_common::PadModelStatus::Loaded));
+            let ir_ready = matches!(h.ir_pad, Some(irlume_common::PadModelStatus::Loaded));
+            let (pad_ready, pad_note, pad_fix) = match h.tier.as_str() {
+                "secure" if h.rgb_pad.is_none() || h.ir_pad.is_none() => (
+                    false,
+                    "; PAD availability is unknown",
+                    Fix::Manual(
+                        "upgrade or restart irlumed to obtain PAD health status".into(),
+                    ),
+                ),
+                "secure" => match (rgb_ready, ir_ready) {
+                    (true, true) => (true, "", Fix::None),
+                    (false, true) => (
+                        false,
+                        "; RGB and RGB+IR authentication paths are password-only",
+                        Fix::Manual(
+                            "enable the shipped PAD controls and check their model paths, or reinstall the package"
+                                .into(),
+                        ),
+                    ),
+                    (true, false) => (
+                        false,
+                        "; IR and RGB+IR authentication paths are password-only",
+                        Fix::Manual(
+                            "enable the shipped PAD controls and check their model paths, or reinstall the package"
+                                .into(),
+                        ),
+                    ),
+                    (false, false) => (
+                        false,
+                        "; all face authentication paths are password-only",
+                        Fix::Manual(
+                            "enable the shipped PAD controls and check their model paths, or reinstall the package"
+                                .into(),
+                        ),
+                    ),
+                },
+                "convenience" if h.rgb_pad.is_none() => (
+                    false,
+                    "; PAD availability is unknown",
+                    Fix::Manual(
+                        "upgrade or restart irlumed to obtain PAD health status".into(),
+                    ),
+                ),
+                "convenience" if rgb_ready => (true, "", Fix::None),
+                "convenience" => (
+                    false,
+                    "; RGB authentication paths are password-only",
+                    Fix::Manual(
+                        "enable the shipped PAD controls and check their model paths, or reinstall the package"
+                            .into(),
+                    ),
+                ),
+                _ => (true, "", Fix::None),
+            };
+            let pad_detail = format!(
+                "RGB {} + IR {}{pad_note}",
+                status_name(h.rgb_pad),
+                status_name(h.ir_pad),
+            );
+            v.push(mk(
+                "PAD",
+                if pad_ready { Sev::Ok } else { Sev::Warn },
+                pad_detail,
+                pad_fix,
             ));
             // The mesh ships as a .tflite (#295) and the packaged unit points
             // IRLUME_MESH_MODEL at it, so a running daemon reporting the mesh
@@ -8340,6 +8419,8 @@ mod tests {
             ir_dev: Some("/dev/video2".into()),
             mesh: true,
             adapter: false,
+            rgb_pad: Some(irlume_common::PadModelStatus::Loaded),
+            ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: "test".into(),
             apparmor: None,
         };
@@ -8484,6 +8565,8 @@ mod tests {
             ir_dev: None,
             mesh: true,
             adapter: false,
+            rgb_pad: None,
+            ir_pad: None,
             version: "test".into(),
             apparmor: None,
         });
@@ -10566,6 +10649,8 @@ mod tests {
             ir_dev: None,
             adapter: false,
             mesh: false,
+            rgb_pad: None,
+            ir_pad: None,
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
         });
@@ -10648,6 +10733,8 @@ mod tests {
             ir_dev: None,
             mesh: false,
             adapter: false,
+            rgb_pad: None,
+            ir_pad: None,
             version: "1.0".into(),
             apparmor: None,
         });
@@ -10991,6 +11078,8 @@ mod tests {
             ir_dev: Some("/dev/video2".into()),
             mesh: true,
             adapter: true,
+            rgb_pad: Some(irlume_common::PadModelStatus::Loaded),
+            ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
         });
@@ -11012,6 +11101,9 @@ mod tests {
         let models = find("Models");
         assert!(models.detail.contains("+ IR adapter"));
         assert!(models.detail.contains("+ FaceMesh"));
+        let pad = find("PAD");
+        assert!(pad.sev == Sev::Ok);
+        assert!(pad.detail.contains("RGB loaded + IR loaded"));
         let cams = find("Cameras");
         assert!(cams.sev == Sev::Ok);
         assert!(cams.detail.contains("secure tier"));
@@ -11044,6 +11136,8 @@ mod tests {
             ir_dev: None,
             mesh: false,
             adapter: false,
+            rgb_pad: Some(irlume_common::PadModelStatus::Disabled),
+            ir_pad: None,
             version: "0.0.1-old".into(),
             apparmor: None,
         });
@@ -11061,6 +11155,12 @@ mod tests {
             build.detail.contains("0.0.1-old"),
             "names the stale version"
         );
+        let pad = find("PAD");
+        assert!(pad.sev == Sev::Warn);
+        assert!(pad.detail.contains("RGB disabled"));
+        assert!(pad
+            .detail
+            .contains("RGB authentication paths are password-only"));
         let enroll = find("Enrollment");
         assert!(enroll.sev == Sev::Fail, "unreadable ≠ not enrolled");
         assert!(enroll.detail.contains("bad ciphertext"));
@@ -11079,6 +11179,74 @@ mod tests {
         app.repair_sel = 999;
         app.run_checks();
         assert!(app.repair_sel < app.repair.len());
+    }
+
+    #[test]
+    fn run_checks_reports_only_the_pad_paths_a_missing_model_disables() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: Some("/dev/video0".into()),
+            ir_dev: Some("/dev/video2".into()),
+            mesh: true,
+            adapter: true,
+            rgb_pad: Some(irlume_common::PadModelStatus::LoadFailed),
+            ir_pad: Some(irlume_common::PadModelStatus::Loaded),
+            version: env!("CARGO_PKG_VERSION").into(),
+            apparmor: None,
+        });
+
+        app.run_checks();
+        let pad = app
+            .repair
+            .iter()
+            .find(|check| check.label == "PAD")
+            .expect("PAD check row");
+        assert!(pad.sev == Sev::Warn);
+        assert!(pad.detail.contains("RGB load failed + IR loaded"));
+        assert!(pad
+            .detail
+            .contains("RGB and RGB+IR authentication paths are password-only"));
+        assert!(
+            !pad.detail.contains("face authentication is password-only"),
+            "dark IR-only authentication remains available"
+        );
+    }
+
+    #[test]
+    fn run_checks_treats_legacy_pad_health_as_unknown() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.health = Some(HealthInfo {
+            tier: "secure".into(),
+            rgb_dev: Some("/dev/video0".into()),
+            ir_dev: Some("/dev/video2".into()),
+            mesh: true,
+            adapter: true,
+            rgb_pad: None,
+            ir_pad: None,
+            version: "0.11.3-legacy".into(),
+            apparmor: None,
+        });
+
+        app.run_checks();
+        let pad = app
+            .repair
+            .iter()
+            .find(|check| check.label == "PAD")
+            .expect("PAD check row");
+        assert!(pad.sev == Sev::Warn);
+        assert!(pad.detail.contains("RGB unknown + IR unknown"));
+        assert!(pad.detail.contains("PAD availability is unknown"));
+        assert!(
+            !pad.detail.contains("password-only"),
+            "a legacy daemon did not report enough evidence for this claim"
+        );
+        assert!(matches!(
+            &pad.fix,
+            Fix::Manual(action) if action.contains("upgrade or restart")
+        ));
     }
 
     #[test]

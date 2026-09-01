@@ -115,3 +115,33 @@ No validation removal or security-fix regression was found. The implementation a
 ## Commit
 
 Task 6 is intended for one signed and DCO-compliant commit with subject `feat: bind immutable camera attempt plans`.
+
+## Review Fix Round 1
+
+### Findings Resolved
+
+1. Normal runtime construction incorrectly required requested and driver-accepted tuples to be identical, even though strict diagnostic profile opens alone must reject adjustment. `PairTransportProfile` now retains requested and accepted RGB and IR tuples independently. Existing exact profile construction remains exact by construction, while normal attempt authority preserves legitimate driver adjustment.
+2. Authentication rebuilt model, preprocessing, and calibration authority from the same literals used by the expected plan. `ModelContractSet` now carries actual initialized adapter contracts, model wrappers expose their closed input contract IDs, canonical RGB and GREY producers own their preprocessing identities, and the engine contributes its actual IR calibration space. Expected authority is frozen at attempt start and independently reconstructed at the pre-input boundary.
+3. `CameraAttemptContract::from_runtime` stamped fixed producer and policy versions plus invalidation generation zero without proving stored qualification. It is now crate-private. Public construction requires a conclusive matching `StoredCaptureQualificationState`, and carries its producer version, policy version, schedule resolution, and record revision as invalidation generation.
+4. Selected conditioning was compared as an immutable value but was not bound to successful control application. Selected policy application now requires exact readback, owns restoration, performs explicit reverse-order restoration with readback, and yields a `ConditioningRestoration` proof. Camera orchestration must supply the matching proof before it may mint `SceneObservation`.
+5. Source-text and private-slice checks were replaced with behavioral tests through production authority methods for model, preprocessing, calibration, qualification, tuple, and conditioning drift.
+
+### Additional RED And GREEN Evidence
+
+- Adjusted IR tuple RED failed to compile because `PairTransportProfile` had no independent requested and accepted accessors. GREEN preserves 640x400 requested and 4x1 accepted IR tuples while exact diagnostic opens remain unchanged.
+- Qualification RED failed to compile because no stored-authority constructor existed. GREEN rejects unavailable and mismatched authority and carries revision 7 into the immutable contract.
+- Producer RED failed because `InferenceAuthority` did not exist. GREEN reports field-specific `ModelContract`, `Preprocessing`, and `Calibration` violations from independently observed authority.
+- Conditioning RED failed because `apply_selected_policy` did not exist. GREEN proves exact application, readback, restoration, and refusal to overwrite an external change.
+
+### Final Verification
+
+- `cargo test --workspace --all-targets --locked`: 1,994 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo check --workspace --all-targets --locked`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `sha256sum -c SHA256SUMS`: all seven unchanged model assets passed through temporary links; all six temporary links were removed afterward.
+- `git diff --check`: passed.
+- Added-line U+2014 check: no matches.
+- Supplementary `cargo check -p irlume-vision --no-default-features` still reaches the pre-existing feature-gating error at `model_input.rs`'s call to ONNX-only `mesh_box_valid`; all ten errors initially introduced by the new adapter authority API were removed with an `onnx` feature gate.
+
+No camera, service, enrollment, qualification store, model artifact, system configuration, remote, GitHub, or production profile-selection state changed.

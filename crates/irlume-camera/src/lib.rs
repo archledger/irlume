@@ -3906,6 +3906,21 @@ impl RgbCamera {
         &self,
         progress: &Progress,
     ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress_and_conditioning(progress, None)
+    }
+
+    fn session_with_conditioning(
+        &self,
+        selection: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress_and_conditioning(&no_progress(), Some(selection))
+    }
+
+    fn session_with_progress_and_conditioning(
+        &self,
+        progress: &Progress,
+        selection: Option<conditioning::ConditioningSelection>,
+    ) -> irlume_common::Result<RgbSession<'_>> {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -3926,7 +3941,24 @@ impl RgbCamera {
         // it. Guard rather than session-drop bookkeeping, because a stream
         // open that fails below must restore too, and the first version did
         // not (the Codex round's finding 1 on this PR).
-        let conditioning_restore = apply_default_conditioning(self);
+        let conditioning_restore = if let Some(selection) = selection {
+            let catalog = conditioning::current_catalog();
+            if catalog.version() != selection.catalog_version() {
+                return Err(Error::Hardware(
+                    "selected conditioning catalog is no longer current".into(),
+                ));
+            }
+            Some(
+                conditioning::apply_selected_policy(
+                    self,
+                    selection,
+                    catalog.policy(selection.policy_id()),
+                )
+                .map_err(|error| Error::Hardware(error.to_string()))?,
+            )
+        } else {
+            apply_default_conditioning(self)
+        };
         let stream = SafeStream::open(
             V4l2CameraState::with_interval(
                 &self.device,
@@ -4204,6 +4236,19 @@ pub struct RgbSession<'a> {
 }
 
 impl<'a> RgbSession<'a> {
+    fn finish_conditioning(self) -> irlume_common::Result<conditioning::ConditioningRestoration> {
+        let RgbSession {
+            stream,
+            _conditioning_restore: conditioning_restore,
+            ..
+        } = self;
+        drop(stream);
+        conditioning_restore
+            .ok_or_else(|| Error::Hardware("selected conditioning was not applied".into()))?
+            .restore()
+            .map_err(|error| Error::Hardware(error.to_string()))
+    }
+
     /// Rebuild this session's stream on the SAME open device after a
     /// mid-stream fault.
     ///
@@ -7343,6 +7388,83 @@ pub struct StoredCaptureQualificationState {
     pub last_attempt_outcome: Option<capture_qualification::AttemptOutcome>,
     pub authoritative_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
     pub latest_attempt_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
+    attempt_authority: Option<StoredAttemptQualificationAuthority>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoredAttemptQualificationAuthority {
+    producer_engine_version: u32,
+    policy_version: u32,
+    invalidation_generation: u64,
+    resolution: capture_qualification::QualificationResolution,
+}
+
+impl StoredAttemptQualificationAuthority {
+    pub(crate) const fn producer_engine_version(self) -> u32 {
+        self.producer_engine_version
+    }
+
+    pub(crate) const fn policy_version(self) -> u32 {
+        self.policy_version
+    }
+
+    pub(crate) const fn invalidation_generation(self) -> u64 {
+        self.invalidation_generation
+    }
+
+    pub(crate) const fn resolution(self) -> capture_qualification::QualificationResolution {
+        self.resolution
+    }
+}
+
+impl StoredCaptureQualificationState {
+    #[must_use]
+    pub fn unqualified(
+        runtime_key: impl Into<String>,
+        mismatch: capture_qualification::QualificationMismatch,
+    ) -> Self {
+        Self {
+            resolution: capture_qualification::QualificationResolution::Unqualified(mismatch),
+            runtime_key: runtime_key.into(),
+            last_attempt_outcome: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
+            attempt_authority: None,
+        }
+    }
+
+    pub(crate) const fn attempt_authority(&self) -> Option<StoredAttemptQualificationAuthority> {
+        self.attempt_authority
+    }
+
+    #[cfg(test)]
+    fn qualified_for_test(
+        runtime_key: &str,
+        resolution: capture_qualification::QualificationResolution,
+        invalidation_generation: u64,
+    ) -> Self {
+        Self {
+            resolution,
+            runtime_key: runtime_key.into(),
+            last_attempt_outcome: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
+            attempt_authority: Some(StoredAttemptQualificationAuthority {
+                producer_engine_version: capture_qualification::PRODUCER_ENGINE_VERSION,
+                policy_version: capture_qualification::POLICY_VERSION,
+                invalidation_generation,
+                resolution,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn unqualified_for_test(
+        runtime_key: &str,
+        mismatch: capture_qualification::QualificationMismatch,
+    ) -> Self {
+        Self::unqualified(runtime_key, mismatch)
+    }
 }
 
 /// Exact live contract a concurrent production pair must satisfy before use.
@@ -7794,12 +7916,28 @@ fn resolve_capture_qualification_record(
         }
         capture_qualification::QualificationResolution::Unqualified(_) => None,
     };
+    let attempt_authority = record.as_ref().and_then(|record| {
+        let authoritative = record.authoritative()?;
+        match resolution {
+            capture_qualification::QualificationResolution::ConcurrentQualified
+            | capture_qualification::QualificationResolution::SequentialRequired(_) => {
+                Some(StoredAttemptQualificationAuthority {
+                    producer_engine_version: authoritative.producer_engine_version(),
+                    policy_version: record.policy_version(),
+                    invalidation_generation: record.revision(),
+                    resolution,
+                })
+            }
+            capture_qualification::QualificationResolution::Unqualified(_) => None,
+        }
+    });
     StoredCaptureQualificationState {
         resolution,
         runtime_key,
         last_attempt_outcome,
         authoritative_rate_shortfalls,
         latest_attempt_rate_shortfalls,
+        attempt_authority,
     }
 }
 
@@ -12052,20 +12190,31 @@ mod tests {
         fourcc: &str,
         interval: (u32, u32),
     ) -> capture_qualification::StreamContract {
+        runtime_gate_adjusted_stream(role, fourcc, (4, 1), fourcc, (4, 1), interval)
+    }
+
+    fn runtime_gate_adjusted_stream(
+        role: capture_qualification::QualifiedStreamRole,
+        requested_fourcc: &str,
+        requested_geometry: (u32, u32),
+        accepted_fourcc: &str,
+        accepted_geometry: (u32, u32),
+        interval: (u32, u32),
+    ) -> capture_qualification::StreamContract {
         use capture_qualification::{AcceptedStream, ExactInterval, ExactRate, RequestedStream};
         capture_qualification::StreamContract::new(
             role,
             RequestedStream::new(
-                4,
-                1,
-                fourcc.into(),
+                requested_geometry.0,
+                requested_geometry.1,
+                requested_fourcc.into(),
                 ExactInterval::new(interval.0, interval.1).unwrap(),
             )
             .unwrap(),
             AcceptedStream::new(
-                4,
-                1,
-                fourcc.into(),
+                accepted_geometry.0,
+                accepted_geometry.1,
+                accepted_fourcc.into(),
                 4,
                 4,
                 0,
@@ -12259,6 +12408,7 @@ mod tests {
                 contract.profile(),
                 contract.conditioning_context(),
                 contract.conditioning(),
+                conditioning::ConditioningRestoration::for_test(contract.conditioning()),
                 &rgb,
                 &ir,
                 statistics,
@@ -12279,6 +12429,7 @@ mod tests {
                 narrow.profile(),
                 narrow.conditioning_context(),
                 narrow.conditioning(),
+                conditioning::ConditioningRestoration::for_test(narrow.conditioning()),
                 &rgb,
                 &ir,
                 statistics,
@@ -12289,7 +12440,7 @@ mod tests {
         let current = attempt_contract::CameraAttemptContract::from_runtime(
             contract.runtime().clone(),
             profile::CaptureSchedule::Concurrent,
-            true,
+            attempt_contract::QualificationAuthority::new(1, 1, 1, true).unwrap(),
         )
         .unwrap();
         assert_eq!(current.evidence_windows().rgb_contributors(), RGB_BURST);
@@ -12335,6 +12486,94 @@ mod tests {
         assert_eq!(
             contract.validate_canonical_pair(&rgb, &ir),
             Err(attempt_contract::CapturePlanViolation::IrTuple)
+        );
+    }
+
+    #[test]
+    fn normal_attempt_preserves_driver_adjusted_requested_and_accepted_ir_tuples() {
+        use capture_qualification::QualifiedStreamRole;
+
+        let context = capture_qualification::QualificationContext::new(
+            runtime_gate_endpoint(QualifiedStreamRole::Rgb, 0),
+            runtime_gate_endpoint(QualifiedStreamRole::Ir, 1),
+            runtime_gate_stream(QualifiedStreamRole::Rgb, "YUYV", (2, 15)),
+            runtime_gate_adjusted_stream(
+                QualifiedStreamRole::Ir,
+                "GREY",
+                (640, 400),
+                "GREY",
+                (4, 1),
+                (2, 15),
+            ),
+        )
+        .unwrap();
+        let instance = contracts::CameraInstanceId::new("a".repeat(32)).unwrap();
+        let runtime = RuntimePairContract {
+            context,
+            rgb_binding: frame_provenance::FrameBinding::new(
+                instance.clone(),
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Rgb,
+            ),
+            ir_binding: frame_provenance::FrameBinding::new(
+                instance,
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Ir,
+            ),
+            runtime_key: "adjusted-attempt-runtime-key".into(),
+        };
+
+        let qualification = StoredCaptureQualificationState::qualified_for_test(
+            runtime.runtime_key(),
+            capture_qualification::QualificationResolution::SequentialRequired(
+                capture_qualification::SequentialReason::ConcurrentUnavailable,
+            ),
+            7,
+        );
+        let contract = attempt_contract::CameraAttemptContract::from_qualified_runtime(
+            runtime,
+            &qualification,
+            profile::CaptureSchedule::Sequential,
+        )
+        .expect("normal runtime authority permits a legitimate driver adjustment");
+
+        assert_eq!(contract.profile().requested_ir().width(), 640);
+        assert_eq!(contract.profile().requested_ir().height(), 400);
+        assert_eq!(contract.profile().accepted_ir().width(), 4);
+        assert_eq!(contract.profile().accepted_ir().height(), 1);
+        assert_eq!(contract.qualification().invalidation_generation(), 7);
+    }
+
+    #[test]
+    fn camera_attempt_rejects_unavailable_and_mismatched_qualification_authority() {
+        let runtime = runtime_gate_contract_with_interval((2, 15));
+        let unavailable = StoredCaptureQualificationState::unqualified_for_test(
+            runtime.runtime_key(),
+            capture_qualification::QualificationMismatch::NoAuthority,
+        );
+        assert_eq!(
+            attempt_contract::CameraAttemptContract::from_qualified_runtime(
+                runtime.clone(),
+                &unavailable,
+                profile::CaptureSchedule::Sequential,
+            )
+            .unwrap_err(),
+            attempt_contract::CapturePlanViolation::Qualification
+        );
+
+        let mismatched = StoredCaptureQualificationState::qualified_for_test(
+            "different-runtime-key",
+            capture_qualification::QualificationResolution::ConcurrentQualified,
+            8,
+        );
+        assert_eq!(
+            attempt_contract::CameraAttemptContract::from_qualified_runtime(
+                runtime,
+                &mismatched,
+                profile::CaptureSchedule::Concurrent,
+            )
+            .unwrap_err(),
+            attempt_contract::CapturePlanViolation::Qualification
         );
     }
 

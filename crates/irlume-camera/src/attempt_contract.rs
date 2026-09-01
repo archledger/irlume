@@ -71,23 +71,29 @@ pub fn capture_profile_observation(
                     contract.conditioning(),
                 )
                 .map_err(plan_error)?;
-            let (rgb, ir) = match contract.profile().schedule() {
+            let (rgb, ir, conditioning_restoration) = match contract.profile().schedule() {
                 CaptureSchedule::Sequential => {
-                    let rgb = rgb_camera.session()?.denoised()?;
+                    let mut rgb_session =
+                        rgb_camera.session_with_conditioning(contract.conditioning())?;
+                    let rgb = rgb_session.denoised()?;
                     let ir = ir_camera.session()?.capture_with_stats()?;
-                    (rgb, ir)
+                    let restoration = rgb_session.finish_conditioning()?;
+                    (rgb, ir, restoration)
                 }
                 CaptureSchedule::Concurrent => {
-                    let mut rgb_session = rgb_camera.session()?;
+                    let mut rgb_session =
+                        rgb_camera.session_with_conditioning(contract.conditioning())?;
                     let mut ir_session = ir_camera.session()?;
-                    std::thread::scope(|scope| {
+                    let (rgb, ir) = std::thread::scope(|scope| {
                         let ir_capture = scope.spawn(|| ir_session.capture_with_stats());
                         let rgb = rgb_session.denoised()?;
                         let ir = ir_capture.join().map_err(|_| {
                             irlume_common::Error::Hardware("IR capture thread panicked".into())
                         })??;
                         Ok((rgb, ir))
-                    })?
+                    })?;
+                    let restoration = rgb_session.finish_conditioning()?;
+                    (rgb, ir, restoration)
                 }
             };
             let observation = contract
@@ -96,6 +102,7 @@ pub fn capture_profile_observation(
                     contract.profile(),
                     contract.conditioning_context(),
                     contract.conditioning(),
+                    conditioning_restoration,
                     &rgb,
                     &ir,
                     scene_statistics(&rgb, &ir)?,
@@ -320,34 +327,84 @@ pub struct CameraAttemptContract {
 }
 
 impl CameraAttemptContract {
+    /// Freezes camera authority only from a conclusive stored qualification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapturePlanViolation::Qualification`] when authority is absent,
+    /// stale for another runtime context, or does not authorize the schedule.
+    pub fn from_qualified_runtime(
+        runtime: RuntimePairContract,
+        state: &crate::StoredCaptureQualificationState,
+        schedule: CaptureSchedule,
+    ) -> Result<Self, CapturePlanViolation> {
+        let authority = state
+            .attempt_authority()
+            .ok_or(CapturePlanViolation::Qualification)?;
+        if state.runtime_key != runtime.runtime_key() {
+            return Err(CapturePlanViolation::Qualification);
+        }
+        let sequential_fallback_eligible = match (authority.resolution(), schedule) {
+            (
+                crate::capture_qualification::QualificationResolution::ConcurrentQualified,
+                CaptureSchedule::Concurrent,
+            ) => true,
+            (
+                crate::capture_qualification::QualificationResolution::ConcurrentQualified
+                | crate::capture_qualification::QualificationResolution::SequentialRequired(_),
+                CaptureSchedule::Sequential,
+            ) => false,
+            _ => return Err(CapturePlanViolation::Qualification),
+        };
+        let qualification = QualificationAuthority::new(
+            authority.producer_engine_version(),
+            authority.policy_version(),
+            authority.invalidation_generation(),
+            sequential_fallback_eligible,
+        )?;
+        Self::from_runtime(runtime, schedule, qualification)
+    }
+
     /// Freezes current camera-owned authority from an exact opened pair.
     ///
     /// # Errors
     ///
     /// Returns the specific violation for a non-exact tuple or invalid policy fact.
-    pub fn from_runtime(
+    pub(crate) fn from_runtime(
         runtime: RuntimePairContract,
         schedule: CaptureSchedule,
-        sequential_fallback_eligible: bool,
+        qualification: QualificationAuthority,
     ) -> Result<Self, CapturePlanViolation> {
-        let rgb = runtime
+        let requested_rgb = runtime
             .context()
             .rgb_stream()
-            .exact_tuple()
+            .requested_tuple()
             .ok_or(CapturePlanViolation::RgbTuple)?;
-        let ir = runtime
+        let accepted_rgb = runtime
+            .context()
+            .rgb_stream()
+            .accepted_tuple()
+            .ok_or(CapturePlanViolation::RgbTuple)?;
+        let requested_ir = runtime
             .context()
             .ir_stream()
-            .exact_tuple()
+            .requested_tuple()
+            .ok_or(CapturePlanViolation::IrTuple)?;
+        let accepted_ir = runtime
+            .context()
+            .ir_stream()
+            .accepted_tuple()
             .ok_or(CapturePlanViolation::IrTuple)?;
         let profile_key = format!("{}:{schedule:?}", runtime.runtime_key());
-        let profile = PairTransportProfile::new(
+        let profile = PairTransportProfile::from_negotiated(
             format!(
                 "attempt-{}",
                 irlume_common::sha256_hex(profile_key.as_bytes())
             ),
-            rgb,
-            ir,
+            requested_rgb,
+            accepted_rgb,
+            requested_ir,
+            accepted_ir,
             schedule,
         )
         .map_err(|_| CapturePlanViolation::TransportProfile)?;
@@ -373,12 +430,7 @@ impl CameraAttemptContract {
                 EVIDENCE_PAIR_BOUND_V1,
                 EVIDENCE_WINDOW_RULES_VERSION,
             )?,
-            QualificationAuthority::new(
-                crate::capture_qualification::PRODUCER_ENGINE_VERSION,
-                crate::capture_qualification::POLICY_VERSION,
-                0,
-                sequential_fallback_eligible,
-            )?,
+            qualification,
         )
     }
 
@@ -396,17 +448,16 @@ impl CameraAttemptContract {
         evidence_windows: EvidenceWindowRules,
         qualification: QualificationAuthority,
     ) -> Result<Self, CapturePlanViolation> {
-        if !runtime
-            .context()
-            .rgb_stream()
-            .matches_exact_tuple(profile.rgb())
+        if runtime.context().rgb_stream().requested_tuple().as_ref()
+            != Some(profile.requested_rgb())
+            || runtime.context().rgb_stream().accepted_tuple().as_ref()
+                != Some(profile.accepted_rgb())
         {
             return Err(CapturePlanViolation::RgbTuple);
         }
-        if !runtime
-            .context()
-            .ir_stream()
-            .matches_exact_tuple(profile.ir())
+        if runtime.context().ir_stream().requested_tuple().as_ref() != Some(profile.requested_ir())
+            || runtime.context().ir_stream().accepted_tuple().as_ref()
+                != Some(profile.accepted_ir())
         {
             return Err(CapturePlanViolation::IrTuple);
         }
@@ -505,6 +556,7 @@ impl CameraAttemptContract {
         observed_profile: &PairTransportProfile,
         observed_conditioning_context: &ConditioningContext,
         observed_conditioning: ConditioningSelection,
+        conditioning_restoration: crate::conditioning::ConditioningRestoration,
         rgb: &CanonicalRgbEvidence,
         ir: &CanonicalIrEvidence,
         statistics: SceneStatistics,
@@ -515,6 +567,9 @@ impl CameraAttemptContract {
             observed_conditioning_context,
             observed_conditioning,
         )?;
+        if conditioning_restoration.selection() != self.conditioning {
+            return Err(CapturePlanViolation::Conditioning);
+        }
         self.validate_manifests(rgb, ir)?;
         let rgb_start = rgb.capture_window().start;
         let ir_start = ir.capture_window().start;

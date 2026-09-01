@@ -554,51 +554,40 @@ impl StreamContract {
         self.minimum_rate
     }
 
-    pub(crate) fn matches_exact_tuple(&self, tuple: &crate::profile::StreamTuple) -> bool {
-        let expected_role = match tuple.role() {
-            crate::contracts::StreamRole::Rgb => QualifiedStreamRole::Rgb,
-            crate::contracts::StreamRole::Ir => QualifiedStreamRole::Ir,
-        };
-        let requested_fourcc: Option<[u8; 4]> = self.requested.fourcc.as_bytes().try_into().ok();
-        let accepted_fourcc: Option<[u8; 4]> = self.accepted.fourcc.as_bytes().try_into().ok();
-        let interval = tuple.interval().parts();
-        self.role == expected_role
-            && self.requested.width == tuple.width()
-            && self.requested.height == tuple.height()
-            && requested_fourcc.and_then(crate::profile::DecodedPixelFormat::from_fourcc)
-                == Some(tuple.format())
-            && self.requested.interval.parts() == interval
-            && self.accepted.width == tuple.width()
-            && self.accepted.height == tuple.height()
-            && accepted_fourcc.and_then(crate::profile::DecodedPixelFormat::from_fourcc)
-                == Some(tuple.format())
-            && self.accepted.interval.parts() == interval
+    pub(crate) fn requested_tuple(&self) -> Option<crate::profile::StreamTuple> {
+        self.tuple_from_parts(
+            self.requested.width,
+            self.requested.height,
+            &self.requested.fourcc,
+            self.requested.interval,
+        )
     }
 
-    pub(crate) fn exact_tuple(&self) -> Option<crate::profile::StreamTuple> {
-        if self.requested.width != self.accepted.width
-            || self.requested.height != self.accepted.height
-            || self.requested.fourcc != self.accepted.fourcc
-            || self.requested.interval != self.accepted.interval
-        {
-            return None;
-        }
+    pub(crate) fn accepted_tuple(&self) -> Option<crate::profile::StreamTuple> {
+        self.tuple_from_parts(
+            self.accepted.width,
+            self.accepted.height,
+            &self.accepted.fourcc,
+            self.accepted.interval,
+        )
+    }
+
+    fn tuple_from_parts(
+        &self,
+        width: u32,
+        height: u32,
+        fourcc: &str,
+        interval: ExactInterval,
+    ) -> Option<crate::profile::StreamTuple> {
         let role = match self.role {
             QualifiedStreamRole::Rgb => crate::contracts::StreamRole::Rgb,
             QualifiedStreamRole::Ir => crate::contracts::StreamRole::Ir,
         };
-        let fourcc: [u8; 4] = self.requested.fourcc.as_bytes().try_into().ok()?;
+        let fourcc: [u8; 4] = fourcc.as_bytes().try_into().ok()?;
         let format = crate::profile::DecodedPixelFormat::from_fourcc(fourcc)?;
-        let (numerator, denominator) = self.requested.interval.parts();
+        let (numerator, denominator) = interval.parts();
         let interval = crate::frame_interval::FrameInterval::new(numerator, denominator).ok()?;
-        crate::profile::StreamTuple::new(
-            role,
-            format,
-            self.requested.width,
-            self.requested.height,
-            interval,
-        )
-        .ok()
+        crate::profile::StreamTuple::new(role, format, width, height, interval).ok()
     }
 
     pub(crate) fn diagnostic_contracts(
@@ -1110,6 +1099,11 @@ pub struct QualificationAttempt {
 }
 
 impl QualificationAttempt {
+    #[must_use]
+    pub const fn producer_engine_version(&self) -> u32 {
+        self.producer_engine_version
+    }
+
     /// Construct and validate one complete qualification attempt.
     ///
     /// # Errors
@@ -1269,6 +1263,11 @@ pub struct CaptureQualificationRecord {
 }
 
 impl CaptureQualificationRecord {
+    #[must_use]
+    pub const fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
     /// Construct one complete record at `revision`.
     ///
     /// # Errors

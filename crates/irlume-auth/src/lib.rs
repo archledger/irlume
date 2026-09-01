@@ -1407,7 +1407,8 @@ struct CaptureModeSelection {
     source: &'static str,
     runtime_key: Option<String>,
     runtime_contract: Option<irlume_camera::RuntimePairContract>,
-    attempt_plan: Option<capture_plan::AttemptCapturePlan>,
+    camera_contract: Option<irlume_camera::attempt_contract::CameraAttemptContract>,
+    qualification_authority: Option<irlume_camera::StoredCaptureQualificationState>,
     qualification_state: irlume_common::diagnostics::QualificationState,
     qualification_reason: Option<irlume_common::diagnostics::QualificationReason>,
     authoritative_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
@@ -1561,7 +1562,8 @@ fn unavailable_capture_mode_selection() -> CaptureModeSelection {
         source,
         runtime_key: None,
         runtime_contract: None,
-        attempt_plan: None,
+        camera_contract: None,
+        qualification_authority: None,
         qualification_state: irlume_common::diagnostics::QualificationState::Unreadable,
         qualification_reason: Some(
             irlume_common::diagnostics::QualificationReason::StoreUnreadable,
@@ -1582,7 +1584,8 @@ fn rgb_only_enrollment_capture_mode_selection() -> CaptureModeSelection {
         source: RGB_ONLY_ENROLLMENT_CAPTURE_MODE_SOURCE,
         runtime_key: None,
         runtime_contract: None,
-        attempt_plan: None,
+        camera_contract: None,
+        qualification_authority: None,
         // The share-safe vocabulary has no "IR skipped by request" state; the
         // operation genuinely runs RGB-only, which is what NoIrPair names.
         qualification_state: irlume_common::diagnostics::QualificationState::NoIrPair,
@@ -1622,12 +1625,14 @@ fn capture_mode_selection_with_diagnostics(
         qualification_reason,
         authoritative_rate_shortfalls,
         latest_attempt_rate_shortfalls,
+        qualification_authority,
     ) = match irlume_camera::stored_capture_qualification_state_from_cameras(rgb_camera, ir_camera)
     {
         Ok(state) => {
             diagnostics.emit_share_safe(diagnostic_qualification_event(&state));
             let (qualification_state, qualification_reason) =
                 diagnostic_qualification_state(&state);
+            let qualification_authority = Some(state.clone());
             let stored = match state.resolution {
                     irlume_camera::capture_qualification::QualificationResolution::ConcurrentQualified => {
                         Some(irlume_camera::CaptureMode::Concurrent)
@@ -1646,6 +1651,7 @@ fn capture_mode_selection_with_diagnostics(
                 qualification_reason,
                 state.authoritative_rate_shortfalls,
                 state.latest_attempt_rate_shortfalls,
+                qualification_authority,
             )
         }
         Err(error) => {
@@ -1665,6 +1671,7 @@ fn capture_mode_selection_with_diagnostics(
                 Some(irlume_common::diagnostics::QualificationReason::StoreUnreadable),
                 None,
                 None,
+                None,
             )
         }
     };
@@ -1678,13 +1685,16 @@ fn capture_mode_selection_with_diagnostics(
     } else {
         irlume_camera::profile::CaptureSchedule::Concurrent
     };
-    let attempt_plan = attempt_plan_from_runtime(&runtime_contract, schedule);
+    let camera_contract = qualification_authority.as_ref().and_then(|qualification| {
+        camera_contract_from_runtime(&runtime_contract, qualification, schedule)
+    });
     CaptureModeSelection {
         sequential: selected.0,
         source: selected.1,
         runtime_key,
         runtime_contract: Some(runtime_contract),
-        attempt_plan,
+        camera_contract,
+        qualification_authority,
         qualification_state,
         qualification_reason,
         authoritative_rate_shortfalls,
@@ -1693,26 +1703,28 @@ fn capture_mode_selection_with_diagnostics(
     }
 }
 
-fn attempt_plan_from_runtime(
+fn camera_contract_from_runtime(
     runtime: &irlume_camera::RuntimePairContract,
+    qualification: &irlume_camera::StoredCaptureQualificationState,
     schedule: irlume_camera::profile::CaptureSchedule,
-) -> Option<capture_plan::AttemptCapturePlan> {
-    let camera = irlume_camera::attempt_contract::CameraAttemptContract::from_runtime(
+) -> Option<irlume_camera::attempt_contract::CameraAttemptContract> {
+    irlume_camera::attempt_contract::CameraAttemptContract::from_qualified_runtime(
         runtime.clone(),
+        qualification,
         schedule,
-        true,
     )
-    .ok()?;
-    let versions = capture_plan::AttemptPlanVersions::new(
-        "uncalibrated-cross-spectrum-v1",
-        "canonical-rgb8-v1",
-        "canonical-grey8-v1",
-    )
-    .ok()?;
+    .ok()
+}
+
+fn attempt_plan_from_camera(
+    camera: irlume_camera::attempt_contract::CameraAttemptContract,
+    versions: capture_plan::AttemptPlanVersions,
+    model_contracts: irlume_vision::model_input::ModelContractSet,
+) -> Option<capture_plan::AttemptCapturePlan> {
     Some(capture_plan::AttemptCapturePlan::new(
         camera,
         versions,
-        irlume_vision::model_input::ModelContractSet::production_v1(),
+        model_contracts,
     ))
 }
 
@@ -2651,7 +2663,8 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
-            attempt_plan: None,
+            camera_contract: None,
+            qualification_authority: None,
             qualification_state: QualificationState::QualifiedConcurrent,
             qualification_reason: None,
             authoritative_rate_shortfalls: None,
@@ -2707,7 +2720,8 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
-            attempt_plan: None,
+            camera_contract: None,
+            qualification_authority: None,
             qualification_state: QualificationState::MeasuredSequential,
             qualification_reason: Some(QualificationReason::DeliveredRateShortfall),
             authoritative_rate_shortfalls: Some(authoritative.clone()),
@@ -2743,15 +2757,10 @@ mod capture_mode_switch_tests {
 
     #[test]
     fn qualification_mismatch_event_preserves_context_change() {
-        let stored = irlume_camera::StoredCaptureQualificationState {
-            resolution: QualificationResolution::Unqualified(
-                irlume_camera::capture_qualification::QualificationMismatch::ContextChanged,
-            ),
-            runtime_key: "context".into(),
-            last_attempt_outcome: None,
-            authoritative_rate_shortfalls: None,
-            latest_attempt_rate_shortfalls: None,
-        };
+        let stored = irlume_camera::StoredCaptureQualificationState::unqualified(
+            "context",
+            irlume_camera::capture_qualification::QualificationMismatch::ContextChanged,
+        );
 
         assert_eq!(
             diagnostic_qualification_event(&stored),
@@ -2864,7 +2873,8 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
-            attempt_plan: None,
+            camera_contract: None,
+            qualification_authority: None,
             qualification_state: QualificationState::QualifiedConcurrent,
             qualification_reason: None,
             authoritative_rate_shortfalls: None,
@@ -3072,6 +3082,26 @@ fn cameras_for_held_pair<T>(sequential: bool, cameras: Option<T>) -> Option<T> {
 }
 
 impl Engine {
+    fn active_plan_versions(&self) -> Option<capture_plan::AttemptPlanVersions> {
+        capture_plan::AttemptPlanVersions::new(
+            self.ir_space.clone(),
+            CanonicalRgbView::PREPROCESSING_ID,
+            CanonicalGreyView::PREPROCESSING_ID,
+        )
+        .ok()
+    }
+
+    fn active_model_contracts(&self) -> irlume_vision::model_input::ModelContractSet {
+        irlume_vision::model_input::ModelContractSet::from_initialized_adapters(
+            &self.det,
+            &self.emb,
+            self.vit_pad.as_ref(),
+            self.pad_ir.as_ref(),
+            self.blaze.as_ref().map(|rescue| &rescue.0),
+            self.mesh.as_ref(),
+        )
+    }
+
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
         // Identify the recognizer by its weights, not its path: a file swapped
@@ -3969,7 +3999,13 @@ impl Engine {
             }
         };
         let sequential = capture_mode.is_sequential();
-        let mut attempt_plan = capture_mode.attempt_plan.clone();
+        let mut attempt_plan = capture_mode
+            .camera_contract
+            .clone()
+            .zip(self.active_plan_versions())
+            .and_then(|(camera, versions)| {
+                attempt_plan_from_camera(camera, versions, self.active_model_contracts())
+            });
         let mode_source = capture_mode.active_source();
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
@@ -4212,12 +4248,21 @@ impl Engine {
                 trip_runtime_capture_health(context_key, degradation);
             }
             capture_mode.demote_operation();
-            attempt_plan = capture_mode.runtime_contract.as_ref().and_then(|runtime| {
-                attempt_plan_from_runtime(
-                    runtime,
-                    irlume_camera::profile::CaptureSchedule::Sequential,
-                )
-            });
+            attempt_plan = capture_mode
+                .runtime_contract
+                .as_ref()
+                .zip(capture_mode.qualification_authority.as_ref())
+                .and_then(|(runtime, qualification)| {
+                    camera_contract_from_runtime(
+                        runtime,
+                        qualification,
+                        irlume_camera::profile::CaptureSchedule::Sequential,
+                    )
+                })
+                .zip(self.active_plan_versions())
+                .and_then(|(camera, versions)| {
+                    attempt_plan_from_camera(camera, versions, self.active_model_contracts())
+                });
             irlume_common::dlog!(
                 "assess: concurrent pair failed; discarding both frames and retrying RGB then IR"
             );
@@ -4353,7 +4398,14 @@ impl Engine {
         let observed_plan = capture_mode
             .runtime_contract
             .as_ref()
-            .and_then(|runtime| attempt_plan_from_runtime(runtime, observed_schedule))
+            .zip(capture_mode.qualification_authority.as_ref())
+            .and_then(|(runtime, qualification)| {
+                camera_contract_from_runtime(runtime, qualification, observed_schedule)
+            })
+            .zip(self.active_plan_versions())
+            .and_then(|(camera, versions)| {
+                attempt_plan_from_camera(camera, versions, self.active_model_contracts())
+            })
             .ok_or_else(|| {
                 irlume_common::Error::Hardware(
                     "observed attempt capture plan unavailable; discarding RGB and IR evidence"

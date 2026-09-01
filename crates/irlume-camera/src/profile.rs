@@ -148,8 +148,10 @@ impl StreamTuple {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct PairTransportProfile {
     id: String,
-    rgb: StreamTuple,
-    ir: StreamTuple,
+    requested_rgb: StreamTuple,
+    accepted_rgb: StreamTuple,
+    requested_ir: StreamTuple,
+    accepted_ir: StreamTuple,
     schedule: CaptureSchedule,
 }
 
@@ -166,6 +168,17 @@ impl PairTransportProfile {
         ir: StreamTuple,
         schedule: CaptureSchedule,
     ) -> Result<Self, ProfileError> {
+        Self::from_negotiated(id, rgb.clone(), rgb, ir.clone(), ir, schedule)
+    }
+
+    pub(crate) fn from_negotiated(
+        id: impl Into<String>,
+        requested_rgb: StreamTuple,
+        accepted_rgb: StreamTuple,
+        requested_ir: StreamTuple,
+        accepted_ir: StreamTuple,
+        schedule: CaptureSchedule,
+    ) -> Result<Self, ProfileError> {
         let id = id.into();
         if id.is_empty() {
             return Err(ProfileError::EmptyProfileId);
@@ -173,13 +186,19 @@ impl PairTransportProfile {
         if id.len() > MAX_PROFILE_ID_BYTES || id.chars().any(char::is_control) {
             return Err(ProfileError::InvalidProfileId);
         }
-        if rgb.role != StreamRole::Rgb || ir.role != StreamRole::Ir {
+        if requested_rgb.role != StreamRole::Rgb
+            || accepted_rgb.role != StreamRole::Rgb
+            || requested_ir.role != StreamRole::Ir
+            || accepted_ir.role != StreamRole::Ir
+        {
             return Err(ProfileError::WrongStreamRole);
         }
         Ok(Self {
             id,
-            rgb,
-            ir,
+            requested_rgb,
+            accepted_rgb,
+            requested_ir,
+            accepted_ir,
             schedule,
         })
     }
@@ -193,13 +212,43 @@ impl PairTransportProfile {
     /// Returns the exact RGB stream tuple.
     #[must_use]
     pub const fn rgb(&self) -> &StreamTuple {
-        &self.rgb
+        &self.requested_rgb
     }
 
     /// Returns the exact IR stream tuple.
     #[must_use]
     pub const fn ir(&self) -> &StreamTuple {
-        &self.ir
+        &self.requested_ir
+    }
+
+    /// Returns the exact requested RGB stream tuple.
+    #[must_use]
+    pub const fn requested_rgb(&self) -> &StreamTuple {
+        &self.requested_rgb
+    }
+
+    /// Returns the exact driver-accepted RGB stream tuple.
+    #[must_use]
+    pub const fn accepted_rgb(&self) -> &StreamTuple {
+        &self.accepted_rgb
+    }
+
+    /// Returns the exact requested IR stream tuple.
+    #[must_use]
+    pub const fn requested_ir(&self) -> &StreamTuple {
+        &self.requested_ir
+    }
+
+    /// Returns the exact driver-accepted IR stream tuple.
+    #[must_use]
+    pub const fn accepted_ir(&self) -> &StreamTuple {
+        &self.accepted_ir
+    }
+
+    /// Returns whether neither role was adjusted by the driver.
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        self.requested_rgb == self.accepted_rgb && self.requested_ir == self.accepted_ir
     }
 
     /// Returns the capture schedule.
@@ -211,9 +260,9 @@ impl PairTransportProfile {
     /// Returns the checked sum of both streams' nominal decoded payloads.
     #[must_use]
     pub fn nominal_payload_bytes_per_second(&self) -> Option<u128> {
-        self.rgb
+        self.requested_rgb
             .nominal_payload_bytes_per_second()?
-            .checked_add(self.ir.nominal_payload_bytes_per_second()?)
+            .checked_add(self.requested_ir.nominal_payload_bytes_per_second()?)
     }
 }
 

@@ -6,16 +6,6 @@
 use irlume_camera::attempt_contract::{CameraAttemptContract, CapturePlanViolation};
 use irlume_vision::model_input::ModelContractSet;
 
-fn validate_model_contract_ids(
-    expected: &[irlume_vision::model_input::ModelInputContractId],
-    observed: &[irlume_vision::model_input::ModelInputContractId],
-) -> Result<(), CapturePlanViolation> {
-    if expected != observed {
-        return Err(CapturePlanViolation::ModelContract);
-    }
-    Ok(())
-}
-
 /// Immutable preprocessing and calibration identifiers for one attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptPlanVersions {
@@ -81,6 +71,76 @@ impl AttemptPlanVersions {
     }
 }
 
+/// Frozen producer authority expected by one authentication attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceAuthority {
+    versions: AttemptPlanVersions,
+    model_contracts: ModelContractSet,
+}
+
+/// Independently reconstructed producer authority at the pre-input boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedInferenceAuthority {
+    versions: AttemptPlanVersions,
+    model_contracts: ModelContractSet,
+}
+
+impl InferenceAuthority {
+    #[must_use]
+    pub const fn new(versions: AttemptPlanVersions, model_contracts: ModelContractSet) -> Self {
+        Self {
+            versions,
+            model_contracts,
+        }
+    }
+
+    #[must_use]
+    pub const fn observed(
+        versions: AttemptPlanVersions,
+        model_contracts: ModelContractSet,
+    ) -> ObservedInferenceAuthority {
+        ObservedInferenceAuthority {
+            versions,
+            model_contracts,
+        }
+    }
+
+    /// Refuses independently observed producer drift before typed input construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field-specific authority violation.
+    pub fn validate_observed(
+        &self,
+        observed: &ObservedInferenceAuthority,
+    ) -> Result<(), CapturePlanViolation> {
+        self.versions.validate(&observed.versions)?;
+        if self.model_contracts != observed.model_contracts {
+            return Err(CapturePlanViolation::ModelContract);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn observed_with_versions_for_test(
+        &self,
+        versions: AttemptPlanVersions,
+    ) -> ObservedInferenceAuthority {
+        Self::observed(versions, self.model_contracts)
+    }
+
+    #[cfg(test)]
+    fn observed_with_model_for_test(
+        &self,
+        index: usize,
+        model: Option<irlume_vision::model_input::ModelInputContractId>,
+    ) -> ObservedInferenceAuthority {
+        let mut slots = self.model_contracts.slots();
+        slots[index] = model;
+        Self::observed(self.versions.clone(), ModelContractSet::from_slots(slots))
+    }
+}
+
 /// Authentication-owned composition of camera, preprocessing, and model authority.
 #[derive(Clone, Debug)]
 pub struct AttemptCapturePlan {
@@ -119,6 +179,11 @@ impl AttemptCapturePlan {
         self.model_contracts
     }
 
+    #[must_use]
+    pub fn inference_authority(&self) -> InferenceAuthority {
+        InferenceAuthority::new(self.versions.clone(), self.model_contracts)
+    }
+
     /// Refuses camera, preprocessing, calibration, or model drift.
     ///
     /// # Errors
@@ -126,8 +191,11 @@ impl AttemptCapturePlan {
     /// Returns the first field-specific immutable-plan violation.
     pub fn validate(&self, observed: &Self) -> Result<(), CapturePlanViolation> {
         self.camera.validate_contract(&observed.camera)?;
-        self.versions.validate(&observed.versions)?;
-        validate_model_contract_ids(self.model_contracts.ids(), observed.model_contracts.ids())
+        self.inference_authority()
+            .validate_observed(&InferenceAuthority::observed(
+                observed.versions.clone(),
+                observed.model_contracts,
+            ))
     }
 
     /// Validates both immutable layers and canonical camera manifests.
@@ -148,26 +216,73 @@ impl AttemptCapturePlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttemptCapturePlan, AttemptPlanVersions};
+    use super::{AttemptCapturePlan, AttemptPlanVersions, InferenceAuthority};
+
+    fn authority() -> InferenceAuthority {
+        InferenceAuthority::new(
+            AttemptPlanVersions::new(
+                "uncalibrated-cross-spectrum-v1",
+                "canonical-rgb8-v1",
+                "canonical-grey8-v1",
+            )
+            .unwrap(),
+            irlume_vision::model_input::ModelContractSet::production_v1(),
+        )
+    }
 
     #[test]
-    fn changed_model_contract_invalidates_the_attempt_plan() {
-        let expected = irlume_vision::model_input::ModelContractSet::production_v1().ids();
-        let mut observed = expected.to_vec();
-        observed[3] = irlume_vision::model_input::ModelInputContractId::ArcFace112RgbV1;
-
+    fn independently_observed_model_drift_fails_at_the_pre_input_seam() {
+        let expected = authority();
+        let observed = expected.observed_with_model_for_test(
+            3,
+            Some(irlume_vision::model_input::ModelInputContractId::ArcFace112RgbV1),
+        );
         assert_eq!(
-            super::validate_model_contract_ids(expected, &observed),
+            expected.validate_observed(&observed),
             Err(irlume_camera::attempt_contract::CapturePlanViolation::ModelContract)
         );
     }
 
     #[test]
-    fn authentication_does_not_validate_a_plan_against_itself() {
-        let production = include_str!("lib.rs");
-        let forbidden = ["validate_canonical_pair(", "plan,"].concat();
+    fn independently_observed_preprocessing_and_calibration_drift_fail_at_the_pre_input_seam() {
+        let expected = authority();
+        let calibration = expected.observed_with_versions_for_test(
+            AttemptPlanVersions::new(
+                "different-calibration",
+                "canonical-rgb8-v1",
+                "canonical-grey8-v1",
+            )
+            .unwrap(),
+        );
+        let rgb_preprocessing = expected.observed_with_versions_for_test(
+            AttemptPlanVersions::new(
+                "uncalibrated-cross-spectrum-v1",
+                "different-rgb-preprocessing",
+                "canonical-grey8-v1",
+            )
+            .unwrap(),
+        );
+        let ir_preprocessing = expected.observed_with_versions_for_test(
+            AttemptPlanVersions::new(
+                "uncalibrated-cross-spectrum-v1",
+                "canonical-rgb8-v1",
+                "different-ir-preprocessing",
+            )
+            .unwrap(),
+        );
 
-        assert!(!production.contains(&forbidden));
+        assert_eq!(
+            expected.validate_observed(&calibration),
+            Err(irlume_camera::attempt_contract::CapturePlanViolation::Calibration)
+        );
+        assert_eq!(
+            expected.validate_observed(&rgb_preprocessing),
+            Err(irlume_camera::attempt_contract::CapturePlanViolation::Preprocessing)
+        );
+        assert_eq!(
+            expected.validate_observed(&ir_preprocessing),
+            Err(irlume_camera::attempt_contract::CapturePlanViolation::Preprocessing)
+        );
     }
 
     #[test]

@@ -797,6 +797,25 @@ struct AppliedControl {
 pub struct AppliedConditioningGuard<'a> {
     controls: &'a dyn ControlIo,
     applied: Vec<AppliedControl>,
+    selection: Option<ConditioningSelection>,
+}
+
+/// Proof that one selected policy was exactly applied, read back, and restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConditioningRestoration {
+    selection: ConditioningSelection,
+}
+
+impl ConditioningRestoration {
+    #[must_use]
+    pub const fn selection(self) -> ConditioningSelection {
+        self.selection
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(selection: ConditioningSelection) -> Self {
+        Self { selection }
+    }
 }
 
 impl std::fmt::Debug for AppliedConditioningGuard<'_> {
@@ -813,6 +832,46 @@ impl AppliedConditioningGuard<'_> {
     #[must_use]
     pub fn is_armed(&self) -> bool {
         !self.applied.is_empty()
+    }
+
+    /// Explicitly restores every displaced value and confirms exact readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership changed or restoration cannot be confirmed.
+    pub fn restore(mut self) -> Result<ConditioningRestoration, PolicyError> {
+        while let Some(applied) = self.applied.pop() {
+            match self.controls.read_control(applied.id) {
+                Ok(now) if now == applied.requested => {}
+                Ok(_) => return Err(PolicyError::ReadbackMismatch(applied.id)),
+                Err(error) => {
+                    return Err(PolicyError::ControlRead {
+                        id: applied.id,
+                        errno: error.raw_os_error(),
+                    });
+                }
+            }
+            self.controls
+                .write_control(applied.id, applied.displaced)
+                .map_err(|error| PolicyError::ControlWrite {
+                    id: applied.id,
+                    errno: error.raw_os_error(),
+                })?;
+            match self.controls.read_control(applied.id) {
+                Ok(readback) if readback == applied.displaced => {}
+                Ok(_) => return Err(PolicyError::ReadbackMismatch(applied.id)),
+                Err(error) => {
+                    return Err(PolicyError::ControlRead {
+                        id: applied.id,
+                        errno: error.raw_os_error(),
+                    });
+                }
+            }
+        }
+        self.selection
+            .take()
+            .map(|selection| ConditioningRestoration { selection })
+            .ok_or(PolicyError::InvalidPolicy)
     }
 }
 
@@ -846,6 +905,7 @@ pub(super) fn apply_policy<'a>(
     let mut guard = AppliedConditioningGuard {
         controls,
         applied: Vec::with_capacity(ordered.len()),
+        selection: None,
     };
 
     for setting in ordered {
@@ -884,6 +944,19 @@ pub(super) fn apply_policy<'a>(
             }
         }
     }
+    Ok(guard)
+}
+
+pub(super) fn apply_selected_policy<'a>(
+    controls: &'a dyn ControlIo,
+    selection: ConditioningSelection,
+    policy: &ConditioningPolicy,
+) -> Result<AppliedConditioningGuard<'a>, PolicyError> {
+    if selection.catalog_version == 0 || selection.policy_id != policy.id {
+        return Err(PolicyError::InvalidPolicy);
+    }
+    let mut guard = apply_policy(controls, policy)?;
+    guard.selection = Some(selection);
     Ok(guard)
 }
 
@@ -1531,6 +1604,41 @@ mod tests {
             .expect("already requested is harmless");
         controls.external_write(GAIN, 6);
         drop(guard);
+        assert_eq!(controls.value(GAIN), 6);
+    }
+
+    #[test]
+    fn selected_policy_requires_apply_readback_and_explicit_restoration_proof() {
+        let controls = FakeControls::with_values(&[(GAIN, 3)]);
+        let selected = ConditioningSelection {
+            scene: SceneClass::Lit,
+            policy_id: ConditioningPolicyId::LitAuto,
+            catalog_version: CATALOG_VERSION,
+        };
+        let requested = policy(vec![ControlSetting::integer(GAIN, 8)]);
+
+        let applied = apply_selected_policy(&controls, selected, &requested).unwrap();
+        assert_eq!(controls.value(GAIN), 8, "exact readback gates application");
+
+        let proof = applied.restore().unwrap();
+        assert_eq!(proof.selection(), selected);
+        assert_eq!(controls.value(GAIN), 3, "proof follows exact restoration");
+    }
+
+    #[test]
+    fn external_change_prevents_restoration_proof() {
+        let controls = FakeControls::with_values(&[(GAIN, 3)]);
+        let selected = ConditioningSelection {
+            scene: SceneClass::Lit,
+            policy_id: ConditioningPolicyId::LitAuto,
+            catalog_version: CATALOG_VERSION,
+        };
+        let requested = policy(vec![ControlSetting::integer(GAIN, 8)]);
+        let applied = apply_selected_policy(&controls, selected, &requested).unwrap();
+
+        controls.external_write(GAIN, 6);
+
+        assert!(applied.restore().is_err());
         assert_eq!(controls.value(GAIN), 6);
     }
 }

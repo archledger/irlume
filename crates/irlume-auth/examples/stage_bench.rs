@@ -10,7 +10,10 @@
 //! Usage: cargo run --release -p irlume-auth --example stage_bench -- \
 //!   [models_dir]
 
-use irlume_vision::align::{FrameView, Grey8View, RgbView};
+use irlume_vision::model_input::{
+    ArcFaceInput, CanonicalGreyView, CanonicalRgbView, DetectorInput, FlirIrPadInput,
+    VitRgbPadInput,
+};
 use irlume_vision::{Detector, Embedder, FaceMesh, PadIr, PadVit};
 use std::time::Instant;
 
@@ -48,40 +51,33 @@ fn main() {
     let mut vit = PadVit::load_from_file(&p("liveness_vit.onnx")).expect("vit");
     let mut flir = PadIr::load_from_file(&p("flir.onnx")).expect("flir");
 
-    let rgb_view = RgbView {
-        data: &rgb,
-        width: w,
-        height: h,
-    };
+    let rgb_view = CanonicalRgbView::try_from_parts(&rgb, w, h).expect("rgb input");
+    let grey_view = CanonicalGreyView::try_from_parts(&grey, w, h).expect("grey input");
+    let vit_input = VitRgbPadInput::new(rgb_view, bbox);
+    let flir_input = FlirIrPadInput::new(grey_view, bbox);
+    let mesh_input = mesh.prepare_input(rgb_view, bbox).expect("mesh input");
+    let embed_input = ArcFaceInput::try_from_aligned_rgb(chip).expect("embed input");
 
     // Warm-up one ViT call so its 343 MB of weights are paged in before any
     // timing (the E3 experiment measures the un-warmed spike separately).
-    let _ = vit.p_spoof(&rgb_view, &bbox);
+    let _ = vit.p_spoof(&vit_input);
 
     bench("detect grey 640x480 (YuNet)", 10, 100, || {
-        let _ = det.detect_any(&FrameView::Grey(Grey8View {
-            data: &grey,
-            width: w,
-            height: h,
-        }));
+        let _ = det.detect(&DetectorInput::from_grey(grey_view));
     });
     bench("detect rgb 640x480 (YuNet)", 10, 100, || {
-        let _ = det.detect_any(&FrameView::Rgb(RgbView {
-            data: &rgb,
-            width: w,
-            height: h,
-        }));
+        let _ = det.detect(&DetectorInput::from_rgb(rgb_view));
     });
     bench("landmarks (face_landmark)", 10, 200, || {
-        let _ = mesh.landmarks(&rgb_view, &bbox, 0.25);
+        let _ = mesh.landmarks(&mesh_input);
     });
     bench("embed 112x112 (glintr100)", 10, 200, || {
-        let _ = embed.embed(&chip);
+        let _ = embed.embed(&embed_input);
     });
     bench("PAD ViT 224 (liveness_vit)", 3, 30, || {
-        let _ = vit.p_spoof(&rgb_view, &bbox);
+        let _ = vit.p_spoof(&vit_input);
     });
     bench("PAD FLIR 112 (flir)", 10, 200, || {
-        let _ = flir.p_fake(&rgb_view, &bbox);
+        let _ = flir.p_fake(&flir_input);
     });
 }

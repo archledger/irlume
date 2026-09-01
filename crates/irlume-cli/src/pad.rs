@@ -90,7 +90,8 @@ fn capture_once(
             width: rgb.width,
             height: rgb.height,
         };
-        let faces = det.detect(&rv)?;
+        let view = irlume_vision::model_input::CanonicalRgbView::try_from_align(&rv)?;
+        let faces = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(view))?;
         let top = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         let pose = top.map(|f| irlume_vision::head_pose(&f.landmarks));
         (
@@ -109,14 +110,13 @@ fn capture_once(
     // configuration authentication never runs.
     let ir = irlume_camera::capture_ir_with_stats(ir_dev)?;
     let ir_stats = ir.stats();
-    let ir_rgb = irlume_camera::grey_to_rgb(ir.pixels());
-    let iv = irlume_vision::align::RgbView {
-        data: &ir_rgb,
-        width: ir.width(),
-        height: ir.height(),
-    };
+    let iv = irlume_vision::model_input::CanonicalGreyView::try_from_parts(
+        ir.pixels(),
+        ir.width(),
+        ir.height(),
+    )?;
     let ir_top = det
-        .detect(&iv)?
+        .detect(&irlume_vision::model_input::DetectorInput::from_grey(iv))?
         .into_iter()
         .max_by(|a, b| a.score.total_cmp(&b.score));
 

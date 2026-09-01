@@ -15,6 +15,7 @@
 //!   <det.onnx> <model.onnx> <rgb_dev> <ir_dev> [captures_per_mode]
 //! Look at the camera throughout.
 
+use irlume_vision::model_input::{ArcFaceInput, CanonicalRgbView, DetectorInput};
 use irlume_vision::{align, Detector, Embedder};
 
 fn mean(d: &[u8]) -> f32 {
@@ -56,11 +57,13 @@ fn capture_embed(
         width: rgb.width(),
         height: rgb.height(),
     };
-    let faces = det.detect(&view).ok()?;
+    let model_view = CanonicalRgbView::try_from_align(&view).ok()?;
+    let faces = det.detect(&DetectorInput::from_rgb(model_view)).ok()?;
     let top = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score))?;
     // Same alignment + TTA embedding the production match path uses.
     let chip = align::align_to_arcface(&view, &top.landmarks).ok()?;
-    let e = emb.embed_tta(&chip).ok()?;
+    let input = ArcFaceInput::try_from_aligned_rgb(chip).ok()?;
+    let e = emb.embed_tta(&input).ok()?;
     Some((brightness, e.to_vec()))
 }
 

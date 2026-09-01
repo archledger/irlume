@@ -23,6 +23,7 @@
 //! Look at the camera.
 
 use irlume_camera::ir_probe;
+use irlume_vision::model_input::{CanonicalGreyView, CanonicalRgbView, DetectorInput};
 use irlume_vision::{align, Detector, FaceMesh};
 use std::io::Write;
 
@@ -74,14 +75,18 @@ fn main() {
             width: f.width,
             height: f.height,
         };
+        let grey_view = CanonicalGreyView::try_from_parts(&f.data, f.width, f.height)
+            .expect("valid grey frame");
         let top = det
-            .detect(&view)
+            .detect(&DetectorInput::from_grey(grey_view))
             .expect("detect")
             .into_iter()
             .max_by(|a, b| a.score.total_cmp(&b.score));
         match top {
             Some(t) => {
-                let lm = mesh.landmarks(&view, &t.bbox, 0.25).expect("mesh");
+                let mesh_view = CanonicalRgbView::try_from_align(&view).expect("valid mesh frame");
+                let mesh_input = mesh.prepare_input(mesh_view, t.bbox).expect("mesh input");
+                let lm = mesh.landmarks(&mesh_input).expect("mesh");
                 let mut csv = std::fs::File::create(format!("{out}/frame{i:02}.landmarks.csv"))
                     .expect("csv file");
                 writeln!(csv, "idx,x,y,brightness").unwrap();

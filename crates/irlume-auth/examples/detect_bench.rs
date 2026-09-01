@@ -16,6 +16,7 @@
 //!   <det.onnx> <blaze.onnx> <mesh.onnx> <corpus_root> > out.csv
 
 use irlume_vision::align::RgbView;
+use irlume_vision::model_input::{BlazeFaceInput, CanonicalRgbView, DetectorInput};
 use irlume_vision::{BlazeRescue, Detector, FaceMesh};
 use std::path::Path;
 
@@ -171,13 +172,18 @@ fn main() {
             // runtime failure masquerade as "the model saw no face" (#294
             // review). Detector execution errors abort the run; a mesh error
             // is an intended measurement (refusal) and is logged instead.
+            let model_view = CanonicalRgbView::try_from_align(&view)
+                .unwrap_or_else(|e| panic!("{seg_name}/{name}: invalid input: {e}"));
             let dets = det
-                .detect(&view)
+                .detect(&DetectorInput::from_rgb(model_view))
                 .unwrap_or_else(|e| panic!("{seg_name}/{name}: YuNet inference failed: {e}"));
             let top = dets.iter().max_by(|a, b| a.score.total_cmp(&b.score));
             let (mut mesh_ok, mut span_x, mut span_y) = (false, None, None);
             if let Some(t) = top {
-                match mesh.landmarks(&view, &t.bbox, 0.25) {
+                let mesh_input = mesh
+                    .prepare_input(model_view, t.bbox)
+                    .unwrap_or_else(|e| panic!("{seg_name}/{name}: invalid mesh input: {e}"));
+                match mesh.landmarks(&mesh_input) {
                     Ok(lm) => {
                         mesh_ok = true;
                         span_x = Some(central_span(lm.iter().map(|&(x, _)| x).collect()));
@@ -186,8 +192,9 @@ fn main() {
                     Err(e) => eprintln!("{seg_name}/{name}: mesh refused or failed: {e}"),
                 }
             }
+            let blaze_input = BlazeFaceInput::new(model_view);
             let bl = blaze
-                .detect_top(&view)
+                .detect_top(&blaze_input)
                 .unwrap_or_else(|e| panic!("{seg_name}/{name}: BlazeFace inference failed: {e}"));
             let kind = if name.starts_with("rgb") { "rgb" } else { "ir" };
             println!(

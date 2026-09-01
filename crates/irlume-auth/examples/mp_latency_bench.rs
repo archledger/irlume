@@ -16,10 +16,13 @@
 
 use irlume_vision::align::RgbView;
 use irlume_vision::blaze_full::FullRangeBlaze;
+use irlume_vision::model_input::{
+    BlazeFaceInput, CanonicalRgbView, DetectorInput, FullRangeBlazeFaceInput,
+};
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{
-    blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output, BlazeRescue, Detector,
-    FaceMesh, BLAZE_SCORE_THRESHOLD, MESH_N_IRIS,
+    decode_short_range_best, map_checked_mesh_output, BlazeRescue, Detector, FaceMesh,
+    BLAZE_SCORE_THRESHOLD, MESH_N_IRIS,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -177,7 +180,11 @@ fn main() {
 
     // The frame must actually carry a face: a mesh timed on a non-face crop
     // or a detector timed into its miss path measures a different code path.
-    let faces = yunet.detect(&view).expect("detect");
+    let model_view = CanonicalRgbView::try_from_align(&view).expect("valid input");
+    let detector_input = DetectorInput::from_rgb(model_view);
+    let blaze_input = BlazeFaceInput::new(model_view);
+    let full_blaze_input = FullRangeBlazeFaceInput::new(model_view);
+    let faces = yunet.detect(&detector_input).expect("detect");
     let top = faces
         .iter()
         .max_by(|a, b| a.score.total_cmp(&b.score))
@@ -185,7 +192,7 @@ fn main() {
         .expect("bench frame must contain a face");
     assert!(
         blaze_onnx
-            .detect_top(&view)
+            .detect_top(&blaze_input)
             .expect("onnx blaze detect")
             .is_some(),
         "bench frame must clear the short-range threshold"
@@ -194,11 +201,11 @@ fn main() {
 
     println!("stage,model,runtime,threads,mean_ms,p50_ms,p95_ms");
     bench("detection", "yunet", "ort", 0, || {
-        let f = yunet.detect(&view).expect("detect");
+        let f = yunet.detect(&detector_input).expect("detect");
         assert!(!f.is_empty());
     });
     bench("detection-rescue", "blaze_short", "ort", 0, || {
-        let r = blaze_onnx.detect_top(&view).expect("onnx blaze");
+        let r = blaze_onnx.detect_top(&blaze_input).expect("onnx blaze");
         assert!(r.is_some());
     });
     for threads in [1i32, 2, 4] {
@@ -211,8 +218,7 @@ fn main() {
             "tflite",
             threads as usize,
             || {
-                let input = blaze_letterbox_input(&view);
-                let outputs = s.run_f32(&input).expect("native blaze");
+                let outputs = s.run_f32(blaze_input.tensor()).expect("native blaze");
                 let (mut reg, mut cls): (Option<&Vec<f32>>, Option<&Vec<f32>>) = (None, None);
                 for (_, raw) in &outputs {
                     match raw.len() {
@@ -232,13 +238,14 @@ fn main() {
         );
     }
     bench("detection-rescue", "blaze_full_range", "tflite", 2, || {
-        let r = full.detect_top(&view).expect("fullrange");
+        let r = full.detect_top(&full_blaze_input).expect("fullrange");
         assert!(r.is_some());
     });
     bench("landmarks", "face_landmark_468", "ort", 0, || {
-        let lm = mesh_onnx
-            .landmarks(&view, &top.bbox, MESH_MARGIN)
-            .expect("onnx mesh");
+        let mesh_input = mesh_onnx
+            .prepare_input(model_view, top.bbox)
+            .expect("mesh input");
+        let lm = mesh_onnx.landmarks(&mesh_input).expect("onnx mesh");
         assert!(!lm.is_empty());
     });
     for threads in [1i32, 2, 4] {

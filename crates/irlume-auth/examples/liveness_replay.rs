@@ -27,7 +27,7 @@
 //! The directory is walked recursively, so pointing it at a corpus root emits
 //! one CSV covering every segment, with the relative path as the label.
 
-use irlume_vision::align;
+use irlume_vision::model_input::{CanonicalGreyView, DetectorInput};
 use std::io::Write;
 
 /// Parse a binary 8-bit PGM (`P5`). Copied deliberately from
@@ -179,14 +179,11 @@ fn main() {
                 continue;
             }
         };
-        // The detector wants three channels; the corpus is single-plane grey.
-        let rgb = irlume_camera::grey_to_rgb(&grey);
-        let view = align::RgbView {
-            data: &rgb,
-            width: w,
-            height: h,
+        let Ok(view) = CanonicalGreyView::try_from_parts(&grey, w, h) else {
+            skipped += 1;
+            continue;
         };
-        let faces = match det.detect(&view) {
+        let faces = match det.detect(&DetectorInput::from_grey(view)) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("skip {}: detect: {e}", path.display());

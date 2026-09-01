@@ -18,6 +18,7 @@
 //!   <det.onnx> <embed.onnx> <frames-root> [max_per_scene]
 
 use irlume_vision::align::RgbView;
+use irlume_vision::model_input::{ArcFaceMeasurementInput, CanonicalRgbView, DetectorInput};
 use irlume_vision::{align, Detector, Embedder};
 use std::path::{Path, PathBuf};
 
@@ -164,7 +165,10 @@ fn main() {
                 width: w,
                 height: h,
             };
-            let dets = match det.detect(&view) {
+            let Ok(model_view) = CanonicalRgbView::try_from_align(&view) else {
+                continue;
+            };
+            let dets = match det.detect(&DetectorInput::from_rgb(model_view)) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
@@ -181,8 +185,10 @@ fn main() {
             // Match the production IR path: plain embed, no TTA.
             let t128 = align::preprocess_arcface(&chip);
             let t1275 = preprocess_div(&chip, 127.5);
-            let e128 = emb.embed_preprocessed(&t128).expect("embed /128");
-            let e1275 = emb.embed_preprocessed(&t1275).expect("embed /127.5");
+            let t128 = ArcFaceMeasurementInput::try_from_tensor(t128).expect("/128 input");
+            let t1275 = ArcFaceMeasurementInput::try_from_tensor(t1275).expect("/127.5 input");
+            let e128 = emb.embed_measurement(&t128).expect("embed /128");
+            let e1275 = emb.embed_measurement(&t1275).expect("embed /127.5");
             embs.push((e128, e1275));
         }
         if embs.len() >= 2 {

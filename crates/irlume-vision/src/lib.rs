@@ -21,6 +21,7 @@ pub mod align;
 pub mod blaze_full;
 pub mod detect;
 pub mod light;
+pub mod model_input;
 pub mod moire;
 #[cfg(feature = "tflite")]
 pub mod tflite;
@@ -592,8 +593,11 @@ mod onnx {
         /// coherent with /128.0; do NOT "correct" the constant without
         /// re-baselining thresholds and re-enrolling.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-        pub fn embed(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
-            Ok(self.embed_with_norm(chip_rgb)?.0)
+        pub fn embed(
+            &mut self,
+            input: &crate::model_input::ArcFaceInput,
+        ) -> irlume_common::Result<Embedding> {
+            Ok(self.embed_with_norm(input)?.0)
         }
 
         /// Test-time augmentation: embed the chip + its horizontal mirror, average,
@@ -602,9 +606,12 @@ mod onnx {
         /// ONLY: on NIR it over-smooths the low-texture embedding (no EER gain,
         /// slightly worse at low FAR), so the IR path keeps plain `embed`.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-        pub fn embed_tta(&mut self, chip_rgb: &[u8]) -> irlume_common::Result<Embedding> {
-            let a = self.embed(chip_rgb)?;
-            let b = self.embed(&crate::align::flip_h(chip_rgb))?;
+        pub fn embed_tta(
+            &mut self,
+            input: &crate::model_input::ArcFaceInput,
+        ) -> irlume_common::Result<Embedding> {
+            let a = self.embed(input)?;
+            let b = self.embed(&input.flipped())?;
             let mut out = [0.0f32; EMBED_DIM];
             for k in 0..EMBED_DIM {
                 out[k] = a[k] + b[k];
@@ -622,10 +629,12 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn embed_with_norm(
             &mut self,
-            chip_rgb: &[u8],
+            input: &crate::model_input::ArcFaceInput,
         ) -> irlume_common::Result<(Embedding, f32)> {
-            let data = align::preprocess_arcface(chip_rgb);
-            self.embed_preprocessed_with_norm(&data)
+            input
+                .require(crate::model_input::ModelInputContractId::ArcFace112RgbV1)
+                .map_err(|error| err(error.to_string()))?;
+            self.embed_preprocessed_with_norm(input.tensor())
         }
 
         /// Embed an ALREADY-preprocessed NCHW f32 tensor (the shape produced by
@@ -633,8 +642,11 @@ mod onnx {
         /// preprocessing constants deliberately; production paths always go
         /// through [`Self::embed`]/[`Self::embed_tta`].
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-        pub fn embed_preprocessed(&mut self, data: &[f32]) -> irlume_common::Result<Embedding> {
-            Ok(self.embed_preprocessed_with_norm(data)?.0)
+        pub fn embed_measurement(
+            &mut self,
+            input: &crate::model_input::ArcFaceMeasurementInput,
+        ) -> irlume_common::Result<Embedding> {
+            Ok(self.embed_preprocessed_with_norm(input.tensor())?.0)
         }
 
         fn embed_preprocessed_with_norm(
@@ -738,9 +750,7 @@ mod onnx {
 
     pub struct FaceMesh {
         backend: MeshBackend,
-        /// Square input side, read from the model: 192 for the legacy
-        /// face_landmark, 256 for the face_landmarker-generation mesh.
-        input: u32,
+        input_contract: crate::model_input::ModelInputContractId,
     }
 
     /// Legacy FaceMesh square input side (fallback when the model does not
@@ -771,9 +781,14 @@ mod onnx {
                         "tflite mesh: unexpected input shape {shape:?}"
                     )));
                 }
+                if shape != [1, 256, 256, 3] {
+                    return Err(err(format!(
+                        "tflite mesh: input shape {shape:?} does not match FaceMesh256RgbV1"
+                    )));
+                }
                 return Ok(Self {
                     backend: MeshBackend::Tflite(session),
-                    input: shape[1] as u32,
+                    input_contract: crate::model_input::ModelInputContractId::FaceMesh256RgbV1,
                 });
             }
             let session = build(model)?;
@@ -789,9 +804,14 @@ mod onnx {
                 })
                 .map(|d| d as u32)
                 .unwrap_or(MESH_INPUT);
+            let input_contract = match input {
+                192 => crate::model_input::ModelInputContractId::FaceMesh192RgbV1,
+                256 => crate::model_input::ModelInputContractId::FaceMesh256RgbV1,
+                _ => return Err(err(format!("onnx mesh: unsupported input side {input}"))),
+            };
             Ok(Self {
                 backend: MeshBackend::Onnx(session),
-                input,
+                input_contract,
             })
         }
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -800,8 +820,19 @@ mod onnx {
             Self::load_from_memory(&bytes)
         }
 
-        /// Run FaceMesh on the face at `bbox` (frame pixel coords) with `margin`
-        /// (fraction of the box size added on each side; MediaPipe uses ~0.25).
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        /// Prepare the fixed-quarter-margin crop required by this loaded mesh
+        /// generation's closed 192-side or 256-side contract.
+        pub fn prepare_input(
+            &self,
+            view: crate::model_input::CanonicalRgbView<'_>,
+            bbox: [f32; 4],
+        ) -> Result<crate::model_input::FaceMeshInput, crate::model_input::ModelInputError>
+        {
+            crate::model_input::FaceMeshInput::new_for_contract(view, bbox, self.input_contract)
+        }
+
+        /// Run FaceMesh on a matching typed input.
         /// Returns the model's landmarks as `(x, y)` in ORIGINAL FRAME pixel
         /// coords: [`MESH_N`] of them from a legacy mesh, [`MESH_N_IRIS`] from
         /// the shipped face_landmarker one, so a caller must read the length
@@ -815,39 +846,22 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn landmarks(
             &mut self,
-            frame: &align::RgbView,
-            bbox: &[f32; 4],
-            margin: f32,
+            input: &crate::model_input::FaceMeshInput,
         ) -> irlume_common::Result<Vec<(f32, f32)>> {
-            mesh_box_valid(bbox, frame.width, frame.height)
-                .map_err(|why| err(format!("mesh refused detector box {bbox:?}: {why}")))?;
-            // Square crop centered on the box, expanded by `margin` on each side.
-            let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
-            let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * margin);
-            let (x0, y0) = (cx - half, cy - half);
-            let side = 2.0 * half;
-            let n = self.input as usize;
-            // NHWC, normalized to [0,1] (MediaPipe face_landmark expects [0,1]; flip
-            // to (px/127.5−1) if landmarks come out garbage; the first thing to try).
-            let mut data = vec![0.0f32; n * n * 3];
-            for oy in 0..n {
-                for ox in 0..n {
-                    let sx = x0 + (ox as f32 + 0.5) / n as f32 * side;
-                    let sy = y0 + (oy as f32 + 0.5) / n as f32 * side;
-                    let p = frame.sample_bilinear(sx, sy);
-                    let i = (oy * n + ox) * 3;
-                    data[i] = p[0] / 255.0;
-                    data[i + 1] = p[1] / 255.0;
-                    data[i + 2] = p[2] / 255.0;
-                }
-            }
+            input
+                .require(self.input_contract)
+                .map_err(|error| err(error.to_string()))?;
+            let (x0, y0, side) = input.crop();
+            let data = input.tensor();
+            let input_side = input.input_side();
             // Find the landmark tensor by length (order-agnostic): 468x3
             // legacy or 478x3 iris-generation. Same rule on both backends.
             let is_lm = |d: &[f32]| d.len() == MESH_N * 3 || d.len() == MESH_N_IRIS * 3;
             let raw = match &mut self.backend {
                 MeshBackend::Onnx(session) => {
-                    let s = self.input as i64;
-                    let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
+                    let s = input_side as i64;
+                    let tensor =
+                        Tensor::from_array(([1i64, s, s, 3], data.to_vec())).map_err(err)?;
                     let outputs = session.run(ort::inputs![tensor]).map_err(err)?;
                     let mut lm_raw: Option<Vec<f32>> = None;
                     for i in 0..outputs.len() {
@@ -859,14 +873,14 @@ mod onnx {
                     lm_raw
                 }
                 MeshBackend::Tflite(session) => session
-                    .run_f32(&data)?
+                    .run_f32(data)?
                     .into_iter()
                     .map(|(_, d)| d)
                     .find(|d| is_lm(d)),
             };
             let raw =
                 raw.ok_or_else(|| err(format!("no {MESH_N}/{MESH_N_IRIS}-landmark output")))?;
-            map_checked_mesh_output(&raw, self.input as f32, x0, y0, side)
+            map_checked_mesh_output(&raw, input_side as f32, x0, y0, side)
                 .map_err(|why| err(format!("mesh output refused: {why}")))
         }
     }
@@ -1018,37 +1032,26 @@ mod onnx {
             Self::load_from_memory(&bytes)
         }
 
-        /// Detect faces in an RGB frame. Letterboxes to YuNet's square input,
+        /// Detect faces in a validated RGB8 or GREY8 view. Letterboxes to YuNet's square input,
         /// runs the net, groups outputs by tensor shape (cls/obj=1ch, bbox=4ch,
         /// kps=10ch) per stride, decodes, NMS, and maps coords back to the frame.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-        pub fn detect(&mut self, frame: &align::RgbView) -> irlume_common::Result<Vec<Detection>> {
-            self.detect_any(&align::FrameView::Rgb(align::RgbView {
-                data: frame.data,
-                width: frame.width,
-                height: frame.height,
-            }))
-        }
-
-        /// [`Self::detect`] over either frame layout; a grey (IR) frame skips
-        /// the `grey_to_rgb` full-frame expansion and samples luma directly.
-        /// The letterbox tensor reuses a scratch buffer across calls and the
-        /// SSD heads are decoded from borrowed output slices (no per-tensor
-        /// copies).
-        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-        pub fn detect_any(
+        pub fn detect(
             &mut self,
-            frame: &align::FrameView<'_>,
+            input: &crate::model_input::DetectorInput<'_>,
         ) -> irlume_common::Result<Vec<Detection>> {
             use crate::detect::{
                 decode_stride, letterbox_scale, nms, unletterbox, INPUT_SIZE, NMS_IOU,
                 SCORE_THRESHOLD, STRIDES,
             };
-            let scale = letterbox_scale(frame.width(), frame.height());
+            input
+                .require(crate::model_input::ModelInputContractId::YuNetLetterbox640V1)
+                .map_err(|error| err(error.to_string()))?;
+            let scale = letterbox_scale(input.width(), input.height());
             let n = INPUT_SIZE;
             self.input_scratch.clear();
             self.input_scratch.resize(3 * n * n, 0.0);
-            letterbox_bgr_into(frame, scale, n, &mut self.input_scratch);
+            letterbox_bgr_into(input, scale, n, &mut self.input_scratch);
             let ni = n as i64;
             // Borrow the scratch: the tensor views our buffer, the session
             // reads it, and the buffer stays owned here for the next call.
@@ -1174,9 +1177,9 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn detect_top(
             &mut self,
-            frame: &align::RgbView,
+            input: &crate::model_input::BlazeFaceInput,
         ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
-            self.detect_top_at(frame, BLAZE_SCORE_THRESHOLD)
+            self.detect_top_at(input, BLAZE_SCORE_THRESHOLD)
         }
 
         /// Same decode at an explicit floor, for measurement harnesses that
@@ -1185,13 +1188,16 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn detect_top_at(
             &mut self,
-            frame: &align::RgbView,
+            input: &crate::model_input::BlazeFaceInput,
             floor: f32,
         ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
-            let side = frame.width.max(frame.height) as f32;
-            let data = blaze_letterbox_input(frame);
+            input
+                .require(crate::model_input::ModelInputContractId::BlazeFaceLetterbox128V1)
+                .map_err(|error| err(error.to_string()))?;
+            let side = input.frame_side();
+            let data = input.tensor();
             let s = BLAZE_INPUT as i64;
-            let tensor = Tensor::from_array(([1i64, s, s, 3], data)).map_err(err)?;
+            let tensor = Tensor::from_array(([1i64, s, s, 3], data.to_vec())).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             // Identify the two heads by length (order-agnostic).
             let (mut reg, mut cls): (Option<Vec<f32>>, Option<Vec<f32>>) = (None, None);
@@ -1220,33 +1226,6 @@ mod onnx {
                 score,
             )))
         }
-    }
-
-    /// Resize+letterbox an RGB frame into the BlazeFace 128x128x3 RGB NHWC
-    /// `[-1,1]` input tensor (zero-padded square). Pure and shared with the
-    /// native-runtime parity harness so both runtimes eat the IDENTICAL
-    /// tensor: any disagreement left is the weights', not the preprocessing's.
-    pub fn blaze_letterbox_input(frame: &align::RgbView) -> Vec<f32> {
-        let side = frame.width.max(frame.height) as f32;
-        let n = BLAZE_INPUT;
-        let mut data = vec![0.0f32; n * n * 3];
-        for oy in 0..n {
-            for ox in 0..n {
-                let sx = (ox as f32 + 0.5) / n as f32 * side;
-                let sy = (oy as f32 + 0.5) / n as f32 * side;
-                // Zero-pad outside the frame (letterbox), matching the
-                // parity reference exactly.
-                if sx >= frame.width as f32 || sy >= frame.height as f32 {
-                    continue;
-                }
-                let p = frame.sample_bilinear(sx, sy);
-                let i = (oy * n + ox) * 3;
-                data[i] = (p[0] - 127.5) / 127.5;
-                data[i + 1] = (p[1] - 127.5) / 127.5;
-                data[i + 2] = (p[2] - 127.5) / 127.5;
-            }
-        }
-        data
     }
 
     /// Best short-range SSD anchor above `floor`, decoded to a unit-letterbox
@@ -1296,15 +1275,20 @@ mod onnx {
     /// YuNet (top-left aligned; remainder zero-padded).
     /// Write the letterboxed BGR-planar f32 tensor for `frame` into `t`
     /// (caller-owned scratch, `3*size*size`, pre-zeroed for the bars).
-    fn letterbox_bgr_into(t_view: &align::FrameView<'_>, scale: f32, size: usize, t: &mut [f32]) {
+    fn letterbox_bgr_into(
+        input: &crate::model_input::DetectorInput<'_>,
+        scale: f32,
+        size: usize,
+        t: &mut [f32],
+    ) {
         let plane = size * size;
         let (sw, sh) = (
-            (t_view.width() as f32 * scale) as usize,
-            (t_view.height() as f32 * scale) as usize,
+            (input.width() as f32 * scale) as usize,
+            (input.height() as f32 * scale) as usize,
         );
         for y in 0..sh.min(size) {
             for x in 0..sw.min(size) {
-                let p = t_view.sample_bilinear(x as f32 / scale, y as f32 / scale);
+                let p = input.sample_bilinear(x as f32 / scale, y as f32 / scale);
                 let o = y * size + x;
                 t[o] = p[2]; // B
                 t[plane + o] = p[1]; // G
@@ -1340,15 +1324,17 @@ mod onnx {
             Self::load_from_memory(&bytes)
         }
 
-        /// P(spoof) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
+        /// P(spoof) for a matching typed RGB PAD input.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn p_spoof(
             &mut self,
-            frame: &align::RgbView,
-            bbox: &[f32; 4],
+            input: &crate::model_input::VitRgbPadInput,
         ) -> irlume_common::Result<f32> {
-            let t = pad_vit_input(frame, bbox, 224);
-            let tensor = Tensor::from_array(([1i64, 3, 224, 224], t)).map_err(err)?;
+            input
+                .require(crate::model_input::ModelInputContractId::VitRgbPadM96V1)
+                .map_err(|error| err(error.to_string()))?;
+            let tensor =
+                Tensor::from_array(([1i64, 3, 224, 224], input.tensor().to_vec())).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
             if raw.len() < 2 {
@@ -1362,45 +1348,7 @@ mod onnx {
         }
     }
 
-    /// Build the ViT PAD input tensor: m96 bbox expansion (clamped, no fill),
-    /// bilinear resize to `size`, RGB, `(px/255 - 0.5)/0.5`, CHW. Pure and
-    /// separate so the preprocessing arithmetic is testable without weights.
-    fn pad_vit_input(frame: &align::RgbView, bbox: &[f32; 4], size: usize) -> Vec<f32> {
-        const MARGIN: f32 = 96.0 / 112.0;
-        let (fw, fh) = (frame.width as f32, frame.height as f32);
-        // Degenerate 0-dimension frame (misbehaving V4L2 driver): f32::clamp
-        // asserts min<=max, so 0 would panic BEFORE sample_bilinear's own
-        // degenerate guard runs. Return zeros (an all--1.0 tensor after
-        // normalization is impossible to hit here, but a uniform input is the
-        // fail-safe: the cue reads no signal and denies nothing).
-        if fw <= 0.0 || fh <= 0.0 {
-            return vec![0.0; 3 * size * size];
-        }
-        let (bw, bh) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
-        let x1 = (bbox[0] - bw * MARGIN).max(0.0);
-        let y1 = (bbox[1] - bh * MARGIN).max(0.0);
-        let x2 = (bbox[2] + bw * MARGIN).min(fw - 1.0);
-        let y2 = (bbox[3] + bh * MARGIN).min(fh - 1.0);
-        let (cw, ch) = ((x2 - x1).max(1.0), (y2 - y1).max(1.0));
-        let mut t = vec![0.0f32; 3 * size * size];
-        let plane = size * size;
-        for oy in 0..size {
-            for ox in 0..size {
-                // dst center -> source coord (bilinear, cv2 INTER_LINEAR
-                // convention); pixel() clamps sampling at the frame edge.
-                let fx = x1 + (ox as f32 + 0.5) * cw / size as f32 - 0.5;
-                let fy = y1 + (oy as f32 + 0.5) * ch / size as f32 - 0.5;
-                let p = frame.sample_bilinear(fx.clamp(0.0, fw - 1.0), fy.clamp(0.0, fh - 1.0));
-                let o = oy * size + ox;
-                t[o] = (p[0] / 255.0 - 0.5) / 0.5;
-                t[plane + o] = (p[1] / 255.0 - 0.5) / 0.5;
-                t[2 * plane + o] = (p[2] / 255.0 - 0.5) / 0.5;
-            }
-        }
-        t
-    }
-
-    /// Preprocessing arithmetic tests for [`pad_vit_input`]: the m96
+    /// Preprocessing arithmetic tests for [`crate::model_input::VitRgbPadInput`]: the m96
     /// expansion, edge clamping, RGB order, and `(px/255 - 0.5)/0.5`
     /// normalization. The crop margin IS part of the measured operating
     /// point (docs/research/2026-08-21-vit-liveness-pad-evaluation.md:
@@ -1408,8 +1356,8 @@ mod onnx {
     /// is a threshold drift and these pin it.
     #[cfg(test)]
     mod pad_vit_input_tests {
-        use super::pad_vit_input;
         use crate::align::RgbView;
+        use crate::model_input::{CanonicalRgbView, VitRgbPadInput};
 
         struct Frame {
             data: Vec<u8>,
@@ -1440,6 +1388,11 @@ mod onnx {
                     height: self.height,
                 }
             }
+
+            fn input(&self, bbox: [f32; 4]) -> VitRgbPadInput {
+                let view = CanonicalRgbView::try_from_align(&self.view()).expect("valid frame");
+                VitRgbPadInput::new(view, bbox)
+            }
         }
 
         const S: usize = 224;
@@ -1450,7 +1403,8 @@ mod onnx {
             // px=128 -> (128/255 - 0.5)/0.5 ≈ +0.004; the m96 crop of a
             // uniform frame is uniform, so EVERY element sits there.
             let f = Frame::new(64, 48, |_, _| [128, 128, 128]);
-            let t = pad_vit_input(&f.view(), &[16.0, 8.0, 48.0, 40.0], S);
+            let input = f.input([16.0, 8.0, 48.0, 40.0]);
+            let t = input.tensor();
             let want = (128.0 / 255.0 - 0.5) / 0.5;
             assert!(t.iter().all(|&v| (v - want).abs() < 1e-6));
         }
@@ -1460,7 +1414,8 @@ mod onnx {
             // R=255 everywhere: plane 0 ≈ +0.996, planes 1/2 = −1.0. A BGR
             // swap fails this.
             let f = Frame::new(16, 16, |_, _| [255, 0, 0]);
-            let t = pad_vit_input(&f.view(), &[2.0, 2.0, 12.0, 12.0], S);
+            let input = f.input([2.0, 2.0, 12.0, 12.0]);
+            let t = input.tensor();
             let hi = (255.0 / 255.0 - 0.5) / 0.5;
             let lo = (0.0 / 255.0 - 0.5) / 0.5;
             assert!(t[..PLANE].iter().all(|&v| (v - hi).abs() < 1e-6));
@@ -1476,7 +1431,8 @@ mod onnx {
             // fill value). A 127-fill variant (the FLIR convention) would
             // read ~0.0 there instead of the frame's own pixels.
             let f = Frame::new(32, 32, |x, y| [(x * 8) as u8, (y * 8) as u8, 0]);
-            let t = pad_vit_input(&f.view(), &[0.0, 0.0, 32.0, 32.0], S);
+            let input = f.input([0.0, 0.0, 32.0, 32.0]);
+            let t = input.tensor();
             let want00 = (0.0 / 255.0 - 0.5) / 0.5;
             assert!((t[0] - want00).abs() < 1e-6, "R(0,0)={}", t[0]);
             // x1 clamps to 0, x2 to 31; the last dst column samples
@@ -1494,7 +1450,8 @@ mod onnx {
             // R=x*4 gradient frame makes dst (0,0) a linear readout of the
             // sampled fx, pinning the margin arithmetic end to end.
             let f = Frame::new(256, 64, |x, _| [(x * 4) as u8, 0, 0]);
-            let t = pad_vit_input(&f.view(), &[100.0, 8.0, 148.0, 56.0], S);
+            let input = f.input([100.0, 8.0, 148.0, 56.0]);
+            let t = input.tensor();
             let x1 = 100.0 - 48.0 * 96.0 / 112.0;
             let cw = (148.0 + 48.0 * 96.0 / 112.0) - x1;
             let fx = x1 + 0.5 * cw / S as f32 - 0.5;
@@ -1530,74 +1487,17 @@ mod onnx {
             Self::load_from_memory(&bytes)
         }
 
-        /// P(fake) for the face at `bbox` (frame pixel coords, `[x1,y1,x2,y2]`).
+        /// P(fake) for a matching typed GREY8 PAD input.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn p_fake(
             &mut self,
-            frame: &align::RgbView,
-            bbox: &[f32; 4],
+            input: &crate::model_input::FlirIrPadInput,
         ) -> irlume_common::Result<f32> {
-            const PAD: i64 = 16;
-            let (fw, fh) = (frame.width as i64, frame.height as i64);
-            let mut b = [
-                bbox[0] as i64,
-                bbox[1] as i64,
-                bbox[2] as i64,
-                bbox[3] as i64,
-            ];
-            let px = (b[2] - b[0] + 1) * PAD / 112;
-            let py = (b[3] - b[1] + 1) * PAD / 112;
-            b = [
-                (b[0] - px).max(0),
-                (b[1] - py).max(0),
-                (b[2] + px).min(fw - 1),
-                (b[3] + py).min(fh - 1),
-            ];
-            let (ph, pw) = (b[3] - b[1] + 1, b[2] - b[0] + 1);
-            let dst_size = if pw > ph {
-                let off = (pw - ph) / 2;
-                b[1] = (b[1] - off).max(0);
-                b[3] = (b[1] + pw - 1).min(fh - 1);
-                pw
-            } else {
-                let off = (ph - pw) / 2;
-                b[0] = (b[0] - off).max(0);
-                b[2] = (b[0] + ph - 1).min(fw - 1);
-                ph
-            } as f32;
-            // Crop offsets center the (possibly clamped) region in the square.
-            let xo = (dst_size as i64 - (b[2] - b[0] + 1)) / 2;
-            let yo = (dst_size as i64 - (b[3] - b[1] + 1)) / 2;
-            // Sample the 112 center of the virtual 128 square directly:
-            // dst pixel (ox,oy) in 0..112 maps to square coord via the cv2
-            // INTER_LINEAR convention, offset by the 8px center-crop margin.
-            let scale = dst_size / 128.0;
-            let mut t = vec![0.0f32; 3 * 112 * 112];
-            let plane = 112 * 112;
-            for oy in 0..112usize {
-                for ox in 0..112usize {
-                    let sqx = ((ox + 8) as f32 + 0.5) * scale - 0.5;
-                    let sqy = ((oy + 8) as f32 + 0.5) * scale - 0.5;
-                    // Square coords -> frame coords (127 gray outside the crop).
-                    let fx = sqx - xo as f32 + b[0] as f32;
-                    let fy = sqy - yo as f32 + b[1] as f32;
-                    let p = if fx < b[0] as f32 - 0.5
-                        || fy < b[1] as f32 - 0.5
-                        || fx > b[2] as f32 + 0.5
-                        || fy > b[3] as f32 + 0.5
-                    {
-                        [127.0, 127.0, 127.0]
-                    } else {
-                        frame.sample_bilinear(fx, fy)
-                    };
-                    let o = oy * 112 + ox;
-                    // Grayscale IR: channels are equal, order irrelevant.
-                    t[o] = (p[0] - 127.5) * 0.007_812_5;
-                    t[plane + o] = (p[1] - 127.5) * 0.007_812_5;
-                    t[2 * plane + o] = (p[2] - 127.5) * 0.007_812_5;
-                }
-            }
-            let tensor = Tensor::from_array(([1i64, 3, 112, 112], t)).map_err(err)?;
+            input
+                .require(crate::model_input::ModelInputContractId::FlirIrPad112V1)
+                .map_err(|error| err(error.to_string()))?;
+            let tensor =
+                Tensor::from_array(([1i64, 3, 112, 112], input.tensor().to_vec())).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
             if raw.len() < 2 {
@@ -1621,11 +1521,15 @@ mod onnx {
         for (i, px) in chip.iter_mut().enumerate() {
             *px = ((i * 37 + 11) % 256) as u8; // deterministic pseudo-texture
         }
-        let a = match embedder.embed(&chip) {
+        let input = match crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip) {
+            Ok(input) => input,
+            Err(error) => return (false, format!("input failed: {error}")),
+        };
+        let a = match embedder.embed(&input) {
             Ok(e) => e,
             Err(e) => return (false, format!("embed failed: {e}")),
         };
-        let b = match embedder.embed(&chip) {
+        let b = match embedder.embed(&input) {
             Ok(e) => e,
             Err(e) => return (false, format!("embed failed: {e}")),
         };
@@ -1855,10 +1759,10 @@ mod onnx {
 
 #[cfg(feature = "onnx")]
 pub use onnx::{
-    blaze_anchors, blaze_letterbox_input, decode_short_range_best, map_checked_mesh_output,
-    mesh_box_valid, mesh_output_plausible, runtime_resolution, selftest_alignment_identity,
-    Adapter, BlazeRescue, Detector, Embedder, FaceMesh, PadIr, PadVit, BLAZE_INPUT,
-    BLAZE_SCORE_THRESHOLD, MESH_INPUT, MESH_N, MESH_N_IRIS,
+    blaze_anchors, decode_short_range_best, map_checked_mesh_output, mesh_box_valid,
+    mesh_output_plausible, runtime_resolution, selftest_alignment_identity, Adapter, BlazeRescue,
+    Detector, Embedder, FaceMesh, PadIr, PadVit, BLAZE_INPUT, BLAZE_SCORE_THRESHOLD, MESH_INPUT,
+    MESH_N, MESH_N_IRIS,
 };
 
 /// Pure decode tests for the short-range head: the reject half (floor, NaN)
@@ -1973,13 +1877,13 @@ mod mesh_backend_tests {
         let mut mesh = FaceMesh::load_from_file(&model_path).expect("load pinned TFLite mesh");
         let (w, h) = (320u32, 240u32);
         let data: Vec<u8> = (0..(w * h * 3)).map(|i| (i * 37 % 251) as u8).collect();
-        let view = super::align::RgbView {
-            data: &data,
-            width: w,
-            height: h,
-        };
+        let view = super::model_input::CanonicalRgbView::try_from_parts(&data, w, h)
+            .expect("valid RGB fixture");
+        let input = mesh
+            .prepare_input(view, [80.0, 40.0, 240.0, 200.0])
+            .expect("valid mesh input");
         let lm = mesh
-            .landmarks(&view, &[80.0, 40.0, 240.0, 200.0], 0.25)
+            .landmarks(&input)
             .expect("the production backend must return a usable landmark set");
         assert_eq!(lm.len(), super::MESH_N_IRIS);
         assert!(lm.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
@@ -2091,14 +1995,12 @@ mod model_tests {
     fn pad_vit_deterministic_and_uniform_frame_is_low_spoof() {
         let mut pad = pad_vit();
         let data = vec![140u8; 160 * 120 * 3];
-        let view = align::RgbView {
-            data: &data,
-            width: 160,
-            height: 120,
-        };
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&data, 160, 120)
+            .expect("valid RGB fixture");
         let bbox = [40.0, 30.0, 120.0, 90.0];
-        let a = pad.p_spoof(&view, &bbox).expect("score");
-        let b = pad.p_spoof(&view, &bbox).expect("score");
+        let input = crate::model_input::VitRgbPadInput::new(view, bbox);
+        let a = pad.p_spoof(&input).expect("score");
+        let b = pad.p_spoof(&input).expect("score");
         assert!((a - b).abs() < 1e-6, "nondeterministic: {a} vs {b}");
         assert!(
             a < 0.7,
@@ -2135,7 +2037,8 @@ mod model_tests {
     #[test]
     fn embed_is_512d_unit_norm_and_deterministic() {
         let mut e = embedder();
-        let c = chip(1);
+        let c =
+            crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip(1)).expect("valid chip");
         let a = e.embed(&c).expect("embed");
         let b = e.embed(&c).expect("embed again");
         // Contract: 512-D (by type), L2-normalized, bitwise-stable inference.
@@ -2145,7 +2048,9 @@ mod model_tests {
             "non-deterministic embedding"
         );
         // A different input must land somewhere else on the hypersphere.
-        let other = e.embed(&chip(2)).expect("embed other");
+        let other_input = crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip(2))
+            .expect("valid other chip");
+        let other = e.embed(&other_input).expect("embed other");
         assert!(
             align::cosine(&a, &other) < 0.999,
             "distinct chips collapsed to one embedding: {}",
@@ -2156,21 +2061,24 @@ mod model_tests {
     #[test]
     fn embed_with_norm_returns_positive_quality_norm() {
         let mut e = embedder();
-        let (emb, norm) = e.embed_with_norm(&chip(3)).expect("embed_with_norm");
+        let input =
+            crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip(3)).expect("valid chip");
+        let (emb, norm) = e.embed_with_norm(&input).expect("embed_with_norm");
         assert!(
             norm > 0.0,
             "pre-normalization norm must be positive: {norm}"
         );
         assert!((l2(&emb) - 1.0).abs() < 1e-4);
         // The returned embedding is the plain embed() of the same chip.
-        let plain = e.embed(&chip(3)).expect("embed");
+        let plain = e.embed(&input).expect("embed");
         assert!(align::cosine(&emb, &plain) > 0.9999);
     }
 
     #[test]
     fn embed_tta_is_normalized_deterministic_and_near_plain() {
         let mut e = embedder();
-        let c = chip(4);
+        let c =
+            crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip(4)).expect("valid chip");
         let t1 = e.embed_tta(&c).expect("tta");
         let t2 = e.embed_tta(&c).expect("tta again");
         assert!((l2(&t1) - 1.0).abs() < 1e-4);
@@ -2194,27 +2102,25 @@ mod model_tests {
         let mut d = detector();
         let (w, h) = (640u32, 480u32);
         let grad = gradient_frame(w, h);
-        let view = align::RgbView {
-            data: &grad,
-            width: w,
-            height: h,
-        };
-        let dets = d.detect(&view).expect("detect");
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&grad, w, h)
+            .expect("valid RGB fixture");
+        let input = crate::model_input::DetectorInput::from_rgb(view);
+        let dets = d.detect(&input).expect("detect");
         assert!(
             dets.is_empty(),
             "a faceless gradient must yield no detections, got {}",
             dets.len()
         );
         // Full pipeline determinism (letterbox -> session -> decode -> NMS).
-        assert_eq!(d.detect(&view).expect("detect again").len(), 0);
+        assert_eq!(d.detect(&input).expect("detect again").len(), 0);
         // Flat mid-grey behaves the same.
         let flat = vec![128u8; (w * h * 3) as usize];
-        let view = align::RgbView {
-            data: &flat,
-            width: w,
-            height: h,
-        };
-        assert!(d.detect(&view).expect("detect flat").is_empty());
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&flat, w, h)
+            .expect("valid flat fixture");
+        assert!(d
+            .detect(&crate::model_input::DetectorInput::from_rgb(view))
+            .expect("detect flat")
+            .is_empty());
     }
 
     #[test]
@@ -2222,13 +2128,11 @@ mod model_tests {
         let mut m = facemesh();
         let (w, h) = (256u32, 256u32);
         let frame = gradient_frame(w, h);
-        let view = align::RgbView {
-            data: &frame,
-            width: w,
-            height: h,
-        };
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&frame, w, h)
+            .expect("valid RGB fixture");
         let bbox = [64.0, 64.0, 192.0, 192.0];
-        let lm = m.landmarks(&view, &bbox, 0.25).expect("landmarks");
+        let input = m.prepare_input(view, bbox).expect("mesh input");
+        let lm = m.landmarks(&input).expect("landmarks");
         // Either mesh generation is acceptable; both carry the private eye-ring
         // indices used to derive alignment points for BlazeFace rescue boxes.
         assert!(
@@ -2245,7 +2149,7 @@ mod model_tests {
             assert!((-256.0..512.0).contains(&y), "y out of range: {y}");
         }
         // Determinism: same crop, same points.
-        let again = m.landmarks(&view, &bbox, 0.25).expect("landmarks again");
+        let again = m.landmarks(&input).expect("landmarks again");
         assert_eq!(lm, again);
         // Headroom over the collapse gate's 2px central-span floor: even on a
         // faceless gradient the real mesh spreads its central 80% far above
@@ -2258,31 +2162,20 @@ mod model_tests {
 
     #[test]
     fn facemesh_refuses_garbage_detector_boxes_through_the_real_model() {
-        // The pure gates have their own unit tests; this pins the BOX-gate
-        // WIRING, so a refactor that drops that call from `landmarks()`
-        // fails here even though the gate functions still pass alone. (The
-        // OUTPUT gate's wiring is not pinned by a model test: the real mesh
-        // never emits implausible output. It is structural instead: the
-        // check lives inside `map_checked_mesh_output`, the only mapping
-        // implementation, so skipping it means reimplementing the mapping.)
-        let mut m = facemesh();
+        // Invalid detector geometry cannot cross the typed mesh boundary.
         let (w, h) = (256u32, 256u32);
         let frame = gradient_frame(w, h);
-        let view = align::RgbView {
-            data: &frame,
-            width: w,
-            height: h,
-        };
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&frame, w, h)
+            .expect("valid RGB fixture");
         for bbox in [
             [f32::NAN; 4],
             [128.0, 128.0, 128.0, 128.0],
             [-900.0, -900.0, -700.0, -700.0],
         ] {
-            let e = m
-                .landmarks(&view, &bbox, 0.25)
+            let e = crate::model_input::FaceMeshInput::new(view, bbox)
                 .expect_err("garbage box must be refused");
             assert!(
-                e.to_string().contains("mesh refused detector box"),
+                e.to_string().contains("face geometry is invalid"),
                 "wrong refusal for {bbox:?}: {e}"
             );
         }
@@ -2293,13 +2186,11 @@ mod model_tests {
         let mut b = blaze();
         let (w, h) = (640u32, 400u32);
         let frame = gradient_frame(w, h);
-        let view = align::RgbView {
-            data: &frame,
-            width: w,
-            height: h,
-        };
-        let r1 = b.detect_top(&view).expect("blaze");
-        let r2 = b.detect_top(&view).expect("blaze again");
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&frame, w, h)
+            .expect("valid RGB fixture");
+        let input = crate::model_input::BlazeFaceInput::new(view);
+        let r1 = b.detect_top(&input).expect("blaze");
+        let r2 = b.detect_top(&input).expect("blaze again");
         // Determinism of the full decode (letterbox, sigmoid, anchor mapping).
         match (&r1, &r2) {
             (None, None) => {}
@@ -2316,12 +2207,12 @@ mod model_tests {
         );
         // Flat grey likewise.
         let flat = vec![127u8; (w * h * 3) as usize];
-        let view = align::RgbView {
-            data: &flat,
-            width: w,
-            height: h,
-        };
-        assert!(b.detect_top(&view).expect("blaze flat").is_none());
+        let view = crate::model_input::CanonicalRgbView::try_from_parts(&flat, w, h)
+            .expect("valid flat fixture");
+        assert!(b
+            .detect_top(&crate::model_input::BlazeFaceInput::new(view))
+            .expect("blaze flat")
+            .is_none());
     }
 
     /// The recognizer's output for one fixed input, pinned so a runtime bump
@@ -2519,9 +2410,11 @@ mod model_tests {
     #[test]
     fn the_recognizer_embedding_of_a_fixed_input_has_not_moved() {
         let mut e = embedder();
-        let got = e
-            .embed(&chip(PINNED_EMBEDDING_INPUT_SEED))
-            .expect("embed the pinned chip");
+        let input = crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip(
+            PINNED_EMBEDDING_INPUT_SEED,
+        ))
+        .expect("valid pinned chip");
+        let got = e.embed(&input).expect("embed the pinned chip");
 
         // Accumulated in f64 on purpose. `align::cosine` returns f32, whose
         // spacing near 1.0 is about 6e-8, so it cannot resolve a drift of 1e-6

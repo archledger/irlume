@@ -22,6 +22,7 @@
 
 use irlume_vision::align::RgbView;
 use irlume_vision::blaze_full::FullRangeBlaze;
+use irlume_vision::model_input::{CanonicalRgbView, FullRangeBlazeFaceInput};
 use std::path::Path;
 
 fn read_pnm(p: &Path) -> Option<(Vec<u8>, u32, u32)> {
@@ -112,8 +113,11 @@ fn main() {
                         width: w,
                         height: h,
                     };
+                    let model_view = CanonicalRgbView::try_from_align(&view)
+                        .unwrap_or_else(|e| panic!("{}: input: {e}", f.display()));
+                    let input = FullRangeBlazeFaceInput::new(model_view);
                     let top = det
-                        .detect_top_at(&view, floor)
+                        .detect_top_at(&input, floor)
                         .unwrap_or_else(|e| panic!("{}: inference: {e}", f.display()));
                     let name = format!("{sub}/{}", f.file_name().unwrap().to_string_lossy());
                     emitted += 1;

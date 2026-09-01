@@ -121,17 +121,27 @@ fn main() {
     // (expand to RGB) vs new (grey view), same frame.
     if let Some(det_path) = std::env::args().nth(3) {
         let mut det = irlume_vision::Detector::load_from_file(&det_path).expect("detector");
+        let rgb = grey_via_rgb.as_rgb().expect("rgb");
+        let rgb =
+            irlume_vision::model_input::CanonicalRgbView::try_from_align(rgb).expect("RGB input");
+        let grey = match &grey_native {
+            FrameView::Grey(view) => {
+                irlume_vision::model_input::CanonicalGreyView::try_from_align(view)
+                    .expect("grey input")
+            }
+            FrameView::Rgb(_) => unreachable!(),
+        };
         for _ in 0..3 {
-            let _ = det.detect(grey_via_rgb.as_rgb().expect("rgb"));
+            let _ = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(rgb));
         }
         let t = Instant::now();
         for _ in 0..ITERS {
-            let _ = det.detect(grey_via_rgb.as_rgb().expect("rgb"));
+            let _ = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(rgb));
         }
         let old_ms = t.elapsed().as_secs_f64() / ITERS as f64 * 1e3;
         let t = Instant::now();
         for _ in 0..ITERS {
-            let _ = det.detect_any(&grey_native);
+            let _ = det.detect(&irlume_vision::model_input::DetectorInput::from_grey(grey));
         }
         let new_ms = t.elapsed().as_secs_f64() / ITERS as f64 * 1e3;
         println!("  e2e detect via RGB expansion     : {old_ms:.3} ms");

@@ -319,14 +319,27 @@ git commit -s -m "refactor: type canonical camera evidence"
 **Files:**
 - Create: `crates/irlume-vision/src/model_input.rs`
 - Modify: `crates/irlume-vision/src/lib.rs:1-40,560-660,1010-1060,1316-1611`
+- Modify: `crates/irlume-vision/src/blaze_full.rs`
 - Modify: `crates/irlume-vision/src/align.rs:294-369`
 - Modify: `crates/irlume-auth/src/lib.rs:3694-3835,4268-4600`
+- Modify: inference consumers under `crates/irlume-auth/examples/` and
+  `crates/irlume-cli/src/`
 - Test: `crates/irlume-vision/src/model_input.rs`
 - Test: `crates/irlume-auth/src/lib.rs`
 
 **Interfaces:**
 - Consumes: validated read-only RGB8/GREY8 pixel views exposed by canonical camera evidence at the auth boundary, detector landmarks, and existing measured preprocessing functions. `irlume-vision` must not depend on `irlume-camera`.
-- Produces: `DetectorInput`, `ArcFaceInput`, `VitRgbPadInput`, `FlirIrPadInput`, `ModelInputContractId`, and `ModelContractSet`.
+- Produces: `DetectorInput`, `ArcFaceInput`, `VitRgbPadInput`, `FlirIrPadInput`,
+  `BlazeFaceInput`, `FullRangeBlazeFaceInput`, `FaceMeshInput`,
+  `ModelInputContractId`, and `ModelContractSet`.
+
+**Scope correction:** The initial plan omitted BlazeFace and FaceMesh even
+though authentication uses both for rescue alignment. It also omitted the
+full-range BlazeFace measurement wrapper and downstream CLI, example, test,
+and benchmark consumers of the public raw signatures. A partial migration
+would leave an alternate untyped inference path, so Task 4 covers all model
+wrappers and all their consumers. Direct TFLite parity sessions stay
+measurement-only, but consume tensors produced by typed inputs.
 
 - [ ] **Step 1: Write failing model-contract and preprocessing tests**
 
@@ -363,6 +376,10 @@ pub enum ModelInputContractId {
     ArcFace112RgbV1,
     VitRgbPadM96V1,
     FlirIrPad112V1,
+    BlazeFaceLetterbox128V1,
+    BlazeFaceFullRangeLetterbox192V1,
+    FaceMesh192RgbV1,
+    FaceMesh256RgbV1,
 }
 
 pub struct CanonicalRgbView<'a> {
@@ -387,15 +404,18 @@ Provide validating `CanonicalRgbView::try_from_parts` and
 and exact payload length. Authentication may call them only after validating the
 camera evidence manifest against the attempt plan. Keep existing preprocessing
 arithmetic unchanged and move its public entry through the typed constructors.
-Change detector, embedder, `PadVit`, and `PadIr` inference entry points to accept
-only their matching typed input.
+Change detector, embedder, `PadVit`, `PadIr`, short-range BlazeFace, full-range
+BlazeFace, and FaceMesh inference entry points to accept only their matching
+typed input. Preserve both supported FaceMesh generations with distinct closed
+192 and 256 contracts.
 
 - [ ] **Step 4: Migrate authentication to the typed gateway**
 
 Construct detector inputs from canonical RGB and IR evidence, derive landmarks,
-then construct ArcFace, ViT RGB PAD, and FLIR IR PAD inputs. Ensure no
-authentication call passes `Frame`, `RgbView`, or an arbitrary byte slice
-directly to an inference method.
+then construct ArcFace, ViT RGB PAD, FLIR IR PAD, BlazeFace, and FaceMesh
+inputs. Migrate auth, CLI, test, example, and benchmark consumers. Ensure no
+consumer passes `Frame`, `RgbView`, or an arbitrary byte slice directly to an
+inference method.
 
 Add a source-level ratchet test that scans non-test `irlume-auth` source and
 rejects calls to the removed raw inference signatures.
@@ -410,7 +430,7 @@ unchanged model outputs and verdict fixtures.
 - [ ] **Step 6: Commit the typed model boundary**
 
 ```bash
-git add crates/irlume-vision/src/model_input.rs crates/irlume-vision/src/lib.rs crates/irlume-vision/src/align.rs crates/irlume-auth/src/lib.rs
+git add <all Task 4 typed-boundary and migrated-consumer files>
 git commit -s -m "refactor: type model input contracts"
 ```
 

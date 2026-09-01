@@ -28,6 +28,7 @@
 use irlume_auth::eye_glint;
 use irlume_liveness::{detect_head_gesture, PoseSample};
 use irlume_vision::align::{align_to_arcface, RgbView};
+use irlume_vision::model_input::CanonicalRgbView;
 use irlume_vision::{head_pose, FaceMesh, Landmarks5};
 
 const W: u32 = 400;
@@ -191,8 +192,13 @@ fn main() {
         ("nan", [f32::NAN; 4]),
         ("huge", [-1e6, -1e6, 1e6, 1e6]),
     ];
+    let model_view = CanonicalRgbView::try_from_align(&view).expect("valid probe frame");
     for (name, bbox) in &boxes {
-        match mesh.landmarks(&view, bbox, 0.25) {
+        let result = mesh
+            .prepare_input(model_view, *bbox)
+            .map_err(|e| e.to_string())
+            .and_then(|input| mesh.landmarks(&input).map_err(|e| e.to_string()));
+        match result {
             Ok(lm) => {
                 let finite = lm
                     .iter()

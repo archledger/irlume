@@ -15,7 +15,7 @@
 //! prints candidate thresholds derived from the run.
 
 use crate::{center_edge_ratio, mean_in_bbox};
-use irlume_camera::{grey_to_rgb, ir_probe};
+use irlume_camera::ir_probe;
 use std::process::ExitCode;
 
 /// Read a binary P5 (greyscale) PGM: `P5\n<w> <h>\n255\n<w*h bytes>`.
@@ -80,13 +80,10 @@ fn face_center_edge(
     w: u32,
     h: u32,
 ) -> Option<(f32, f32)> {
-    let rgb = grey_to_rgb(grey);
-    let view = irlume_vision::align::RgbView {
-        data: &rgb,
-        width: w,
-        height: h,
-    };
-    let faces = det.detect(&view).ok()?;
+    let view = irlume_vision::model_input::CanonicalGreyView::try_from_parts(grey, w, h).ok()?;
+    let faces = det
+        .detect(&irlume_vision::model_input::DetectorInput::from_grey(view))
+        .ok()?;
     let top = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score))?;
     let bri = mean_in_bbox(grey, w, h, &top.bbox);
     let ratio = center_edge_ratio(grey, w, h, &top.bbox);

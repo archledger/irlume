@@ -33,6 +33,7 @@
 //!   (IRLUME_TFLITE_LIB overrides the packaged libtensorflowlite_c.so)
 
 use irlume_vision::align::RgbView;
+use irlume_vision::model_input::{CanonicalRgbView, DetectorInput};
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{map_checked_mesh_output, Detector, FaceMesh, MESH_N, MESH_N_IRIS};
 use std::collections::BTreeMap;
@@ -314,8 +315,10 @@ fn main() {
                     };
                     let name = format!("{sub}/{fname}");
                     emitted += 1;
+                    let model_view = CanonicalRgbView::try_from_align(&view)
+                        .unwrap_or_else(|e| panic!("{}: input: {e}", f.display()));
                     let faces = det
-                        .detect(&view)
+                        .detect(&DetectorInput::from_rgb(model_view))
                         .unwrap_or_else(|e| panic!("{}: detect: {e}", f.display()));
                     let top = faces
                         .iter()
@@ -325,7 +328,10 @@ fn main() {
                         println!("{cam},{seg_name},{kind},{name},,,");
                         continue;
                     };
-                    let a = onnx_mesh.landmarks(&view, &top.bbox, MESH_MARGIN);
+                    let mesh_input = onnx_mesh
+                        .prepare_input(model_view, top.bbox)
+                        .unwrap_or_else(|e| panic!("{}: mesh input: {e}", f.display()));
+                    let a = onnx_mesh.landmarks(&mesh_input);
                     let b = native_landmarks(
                         &mut native,
                         native_side,

@@ -18,6 +18,7 @@
 //!   <yunet.onnx> <corpus_root> [out.csv]
 
 use irlume_vision::align::RgbView;
+use irlume_vision::model_input::{CanonicalRgbView, DetectorInput};
 use irlume_vision::moire::{face_gray_n, moire_score};
 use irlume_vision::Detector;
 use std::io::Write as _;
@@ -132,7 +133,10 @@ fn main() -> Result<(), String> {
             width: w,
             height: h,
         };
-        let faces = det.detect(&view).map_err(|e| e.to_string())?;
+        let model_view = CanonicalRgbView::try_from_align(&view).map_err(|e| e.to_string())?;
+        let faces = det
+            .detect(&DetectorInput::from_rgb(model_view))
+            .map_err(|e| e.to_string())?;
         let top = faces.iter().max_by(|a, b| {
             let sa = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
             let sb = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);

@@ -10,7 +10,7 @@
 //! native runtime (#294 compared irlume's decode against the official
 //! MediaPipe PYTHON runtime, a different question with a cross-runtime
 //! preprocessing gap in it). Here both models run in ONE process on the
-//! IDENTICAL input tensor (`blaze_letterbox_input`, the production
+//! IDENTICAL input tensor (`BlazeFaceInput`, the production
 //! preprocessing) through the IDENTICAL decode (`decode_short_range_best`,
 //! the production decode), so any difference left is the weights', not the
 //! harness's.
@@ -27,8 +27,9 @@
 //!   (IRLUME_TFLITE_LIB overrides the packaged libtensorflowlite_c.so)
 
 use irlume_vision::align::RgbView;
+use irlume_vision::model_input::{BlazeFaceInput, CanonicalRgbView};
 use irlume_vision::tflite::TfliteSession;
-use irlume_vision::{blaze_letterbox_input, decode_short_range_best, BlazeRescue, BLAZE_INPUT};
+use irlume_vision::{decode_short_range_best, BlazeRescue, BLAZE_INPUT};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -321,13 +322,15 @@ fn main() {
                     let name = format!("{sub}/{fname}");
                     emitted += 1;
                     let side = w.max(h) as f32;
-                    let input = blaze_letterbox_input(&view);
+                    let model_view = CanonicalRgbView::try_from_align(&view)
+                        .unwrap_or_else(|e| panic!("{}: input: {e}", f.display()));
+                    let input = BlazeFaceInput::new(model_view);
                     let native_input = match skew {
-                        Some(k) => shift_columns(&input, k),
-                        None => input.clone(),
+                        Some(k) => shift_columns(input.tensor(), k),
+                        None => input.tensor().to_vec(),
                     };
                     let a = onnx
-                        .detect_top_at(&view, FLOOR)
+                        .detect_top_at(&input, FLOOR)
                         .unwrap_or_else(|e| panic!("{}: onnx detect: {e}", f.display()));
                     let b = native_detect(&mut native, &anchors, &native_input, side)
                         .unwrap_or_else(|e| panic!("{}: native detect: {e}", f.display()));

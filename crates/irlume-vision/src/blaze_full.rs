@@ -20,7 +20,7 @@
 //! runtime at 0.94 IoU; the same parity bar applies to this decoder before
 //! any catalog entry cites it.
 
-use crate::align;
+use crate::model_input::{FullRangeBlazeFaceInput, ModelInputContractId};
 use crate::tflite::TfliteSession;
 
 /// Pin of `blaze_face_full_range.tflite` from the versioned
@@ -122,7 +122,7 @@ impl FullRangeBlaze {
         })
     }
 
-    /// Best face in `frame`, as `(bbox in frame pixels, score)`, or `None`.
+    /// Best face in `input`, as `(bbox in frame pixels, score)`, or `None`.
     ///
     /// Preprocessing matches the short-range rescue: square zero-pad
     /// letterbox to the larger frame side, center-of-pixel bilinear
@@ -130,9 +130,9 @@ impl FullRangeBlaze {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn detect_top(
         &mut self,
-        frame: &align::RgbView,
+        input: &FullRangeBlazeFaceInput,
     ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
-        self.detect_top_at(frame, FULL_RANGE_SCORE_THRESHOLD)
+        self.detect_top_at(input, FULL_RANGE_SCORE_THRESHOLD)
     }
 
     /// [`Self::detect_top`] at an explicit floor. Exists for MEASUREMENT:
@@ -142,27 +142,14 @@ impl FullRangeBlaze {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn detect_top_at(
         &mut self,
-        frame: &align::RgbView,
+        input: &FullRangeBlazeFaceInput,
         floor: f32,
     ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
-        let side = frame.width.max(frame.height) as f32;
-        let n = FULL_RANGE_INPUT;
-        let mut data = vec![0.0f32; n * n * 3];
-        for oy in 0..n {
-            for ox in 0..n {
-                let sx = (ox as f32 + 0.5) / n as f32 * side;
-                let sy = (oy as f32 + 0.5) / n as f32 * side;
-                if sx >= frame.width as f32 || sy >= frame.height as f32 {
-                    continue;
-                }
-                let p = frame.sample_bilinear(sx, sy);
-                let i = (oy * n + ox) * 3;
-                data[i] = (p[0] - 127.5) / 127.5;
-                data[i + 1] = (p[1] - 127.5) / 127.5;
-                data[i + 2] = (p[2] - 127.5) / 127.5;
-            }
-        }
-        let outputs = self.session.run_f32(&data)?;
+        input
+            .require(ModelInputContractId::BlazeFaceFullRangeLetterbox192V1)
+            .map_err(irlume_common::Error::from)?;
+        let side = input.frame_side();
+        let outputs = self.session.run_f32(input.tensor())?;
         // Identify the two heads by element count, order-agnostic, same as
         // the short-range path.
         let (mut reg, mut cls): (Option<&[f32]>, Option<&[f32]>) = (None, None);

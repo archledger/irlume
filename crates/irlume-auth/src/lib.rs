@@ -10,6 +10,10 @@
 
 use irlume_common::config::HeadConsentPolicy;
 use irlume_liveness::{LivenessGate, Signals, Verdict};
+use irlume_vision::model_input::{
+    ArcFaceInput, BlazeFaceInput, CanonicalGreyView, CanonicalRgbView, DetectorInput,
+    FlirIrPadInput, VitRgbPadInput,
+};
 use irlume_vision::{align, Adapter, Detection, Embedder, Landmarks5, EMBED_DIM};
 
 pub use irlume_camera::capture_qualification::{
@@ -131,10 +135,14 @@ struct Rescue(irlume_vision::BlazeRescue);
 impl Rescue {
     fn detect_top(
         &mut self,
-        view: &align::RgbView<'_>,
+        input: &BlazeFaceInput,
     ) -> irlume_common::Result<Option<([f32; 4], f32)>> {
-        self.0.detect_top(view)
+        self.0.detect_top(input)
     }
+}
+
+fn model_input_error(error: irlume_vision::model_input::ModelInputError) -> irlume_common::Error {
+    irlume_common::Error::Protocol(error.to_string())
 }
 
 /// Assurance tier of this engine, derived from the available camera hardware.
@@ -549,12 +557,9 @@ pub fn apply_known_ir_emitter_subject_region(
     det: &mut irlume_vision::Detector,
 ) -> irlume_common::Result<bool> {
     let frame = irlume_camera::capture_ir(device)?;
-    let grey_rgb = irlume_camera::grey_to_rgb(&frame.data);
-    let faces = det.detect(&align::RgbView {
-        data: &grey_rgb,
-        width: frame.width,
-        height: frame.height,
-    })?;
+    let view = CanonicalGreyView::try_from_parts(&frame.data, frame.width, frame.height)
+        .map_err(model_input_error)?;
+    let faces = det.detect(&DetectorInput::from_grey(view))?;
     let face_mean = top_detection(&faces)
         .map(|top| grey_mean_in_bbox(&frame.data, frame.width, frame.height, &top.bbox));
     let verdict = ir_preflight_subject_lit(face_mean)?;
@@ -3417,13 +3422,17 @@ impl Engine {
     /// 0.087 NME vs YuNet's 0.053; never align from its own keypoints).
     /// Returns a Detection shaped exactly like YuNet's, or None when either
     /// optional model is absent or no face clears the threshold.
-    fn rescue_detect(&mut self, view: &align::RgbView<'_>, tag: &str) -> Option<Detection> {
+    fn rescue_detect(&mut self, view: CanonicalRgbView<'_>, tag: &str) -> Option<Detection> {
         let blaze = self.blaze.as_mut()?;
         let mesh = self.mesh.as_mut()?;
-        let (bbox, score) = blaze.detect_top(view).ok().flatten()?;
+        let (bbox, score) = blaze
+            .detect_top(&BlazeFaceInput::new(view))
+            .ok()
+            .flatten()?;
         // (both rescue variants return the same coarse-box contract; the
         // mesh refine below is what turns either into alignment landmarks)
-        let lm = mesh.landmarks(view, &bbox, 0.25).ok()?;
+        let input = mesh.prepare_input(view, bbox).ok()?;
+        let lm = mesh.landmarks(&input).ok()?;
         if lm.len() < irlume_vision::MESH_N {
             return None;
         }
@@ -3707,13 +3716,10 @@ impl Engine {
             stage: irlume_common::diagnostics::TraceStage::RgbCapture,
             elapsed_us: u64::try_from(capture_started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
-        let rgb_view = align::RgbView {
-            data: rgb.pixels(),
-            width: rgb.width(),
-            height: rgb.height(),
-        };
+        let rgb_view = CanonicalRgbView::try_from_parts(rgb.pixels(), rgb.width(), rgb.height())
+            .map_err(model_input_error)?;
         let detection_started = std::time::Instant::now();
-        let rgb_faces = self.det.detect(&rgb_view)?;
+        let rgb_faces = self.det.detect(&DetectorInput::from_rgb(rgb_view))?;
         let rgb_top = top_detection(&rgb_faces).cloned();
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Detection,
@@ -3787,14 +3793,16 @@ impl Engine {
         // 5-median contract as the cross-spectrum path.
         let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
             (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
-            (Verdict::Live, Some(f), Some(pad)) => match pad.p_spoof(&rgb_view, &f.bbox) {
-                Ok(p) if p.is_finite() => PadEvidence::Score(p),
-                Ok(_) => PadEvidence::InferenceFailed,
-                Err(e) => {
-                    irlume_common::dlog!("pad-vit: inference failed ({e})");
-                    PadEvidence::InferenceFailed
+            (Verdict::Live, Some(f), Some(pad)) => {
+                match pad.p_spoof(&VitRgbPadInput::new(rgb_view, f.bbox)) {
+                    Ok(p) if p.is_finite() => PadEvidence::Score(p),
+                    Ok(_) => PadEvidence::InferenceFailed,
+                    Err(e) => {
+                        irlume_common::dlog!("pad-vit: inference failed ({e})");
+                        PadEvidence::InferenceFailed
+                    }
                 }
-            },
+            }
             _ => PadEvidence::NotApplicable,
         };
         let (verdict, reason) = match rgb_pad {
@@ -3815,10 +3823,9 @@ impl Engine {
             _ => (verdict, reason),
         };
         let embedding = match &rgb_top {
-            Some(f) => Some(
-                self.emb
-                    .embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?,
-            ),
+            Some(f) => Some(self.emb.embed_tta(
+                &ArcFaceInput::from_rgb(rgb_view, &f.landmarks).map_err(model_input_error)?,
+            )?),
             None => None,
         };
         Ok(Assessment {
@@ -4272,11 +4279,10 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let rgb_detection_started = std::time::Instant::now();
-        let mut rgb_faces = self.det.detect(&align::RgbView {
-            data: rgb.pixels(),
-            width: rgb.width(),
-            height: rgb.height(),
-        })?;
+        let mut rgb_view =
+            CanonicalRgbView::try_from_parts(rgb.pixels(), rgb.width(), rgb.height())
+                .map_err(model_input_error)?;
+        let mut rgb_faces = self.det.detect(&DetectorInput::from_rgb(rgb_view))?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Detection,
             elapsed_us: u64::try_from(rgb_detection_started.elapsed().as_micros())
@@ -4291,14 +4297,7 @@ impl Engine {
             rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
         if rgb_top.is_none() {
-            rgb_top = self.rescue_detect(
-                &align::RgbView {
-                    data: rgb.pixels(),
-                    width: rgb.width(),
-                    height: rgb.height(),
-                },
-                "rgb",
-            );
+            rgb_top = self.rescue_detect(rgb_view, "rgb");
         }
 
         // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
@@ -4314,14 +4313,10 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let ir_stats = ir.stats();
-        let ir_grey_rgb = irlume_camera::grey_to_rgb(ir.pixels());
-        let ir_view = align::RgbView {
-            data: &ir_grey_rgb,
-            width: ir.width(),
-            height: ir.height(),
-        };
+        let ir_view = CanonicalGreyView::try_from_parts(ir.pixels(), ir.width(), ir.height())
+            .map_err(model_input_error)?;
         let ir_detection_started = std::time::Instant::now();
-        let ir_faces = self.det.detect(&ir_view)?;
+        let ir_faces = self.det.detect(&DetectorInput::from_grey(ir_view))?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Detection,
             elapsed_us: u64::try_from(ir_detection_started.elapsed().as_micros())
@@ -4338,12 +4333,10 @@ impl Engine {
         if ir_top.is_none() {
             // rescue_detect needs the mesh path over RGB-shaped data; the
             // grey view expands here only on the (rare) rescue path.
-            let iv = align::RgbView {
-                data: &irlume_camera::grey_to_rgb(ir.pixels()),
-                width: ir.width(),
-                height: ir.height(),
-            };
-            ir_top = self.rescue_detect(&iv, "ir");
+            let expanded = irlume_camera::grey_to_rgb(ir.pixels());
+            let iv = CanonicalRgbView::try_from_parts(&expanded, ir.width(), ir.height())
+                .map_err(model_input_error)?;
+            ir_top = self.rescue_detect(iv, "ir");
         }
 
         // Cross-spectrum self-heal for overlapped-capture RGB dimming. Some
@@ -4365,11 +4358,9 @@ impl Engine {
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
             rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?;
-            rgb_faces = self.det.detect(&align::RgbView {
-                data: rgb.pixels(),
-                width: rgb.width(),
-                height: rgb.height(),
-            })?;
+            rgb_view = CanonicalRgbView::try_from_parts(rgb.pixels(), rgb.width(), rgb.height())
+                .map_err(model_input_error)?;
+            rgb_faces = self.det.detect(&DetectorInput::from_rgb(rgb_view))?;
             rgb_top = top_detection(&rgb_faces).cloned();
             irlume_common::dlog!(
                 "assess: rgb (recaptured) {}x{}, faces={} top-det={:.2}",
@@ -4595,7 +4586,7 @@ impl Engine {
         // can reuse it below.
         let ir_pad = match (ir_top.as_ref(), self.pad_ir.as_mut()) {
             (Some(_), None) => PadEvidence::Unavailable,
-            (Some(f), Some(pad)) => match pad.p_fake(&ir_view, &f.bbox) {
+            (Some(f), Some(pad)) => match pad.p_fake(&FlirIrPadInput::new(ir_view, f.bbox)) {
                 Ok(p) if p.is_finite() => PadEvidence::Score(p),
                 Ok(_) => PadEvidence::InferenceFailed,
                 Err(e) => {
@@ -4629,15 +4620,7 @@ impl Engine {
         let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
             (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
             (Verdict::Live, Some(f), Some(pad)) => {
-                // Fresh view against the FINAL RGB frame: the self-heal
-                // above may have recaptured it after the view built for
-                // detection.
-                let view = align::RgbView {
-                    data: rgb.pixels(),
-                    width: rgb.width(),
-                    height: rgb.height(),
-                };
-                match pad.p_spoof(&view, &f.bbox) {
+                match pad.p_spoof(&VitRgbPadInput::new(rgb_view, f.bbox)) {
                     Ok(p) if p.is_finite() => PadEvidence::Score(p),
                     Ok(_) => PadEvidence::InferenceFailed,
                     Err(e) => {
@@ -4673,17 +4656,11 @@ impl Engine {
             verdict, &signals,
         ));
 
-        // Rebuild the view against the final RGB frame (it may have been
-        // recaptured by the cross-spectrum self-heal above).
-        let rgb_view = align::RgbView {
-            data: rgb.pixels(),
-            width: rgb.width(),
-            height: rgb.height(),
-        };
         let embedding = match &rgb_top {
             Some(f) => {
-                let chip = align::align_to_arcface(&rgb_view, &f.landmarks)?;
-                Some(self.emb.embed_tta(&chip)?) // TTA flip-average (RGB only; cuts FRR)
+                let input =
+                    ArcFaceInput::from_rgb(rgb_view, &f.landmarks).map_err(model_input_error)?;
+                Some(self.emb.embed_tta(&input)?) // TTA flip-average (RGB only; cuts FRR)
             }
             None => None,
         };
@@ -4691,8 +4668,9 @@ impl Engine {
         // then apply the domain-adaptation adapter if loaded.
         let ir_embedding = match &ir_top {
             Some(f) => {
-                let chip = align::align_to_arcface(&ir_view, &f.landmarks)?;
-                let raw = self.emb.embed(&chip)?;
+                let input =
+                    ArcFaceInput::from_grey(ir_view, &f.landmarks).map_err(model_input_error)?;
+                let raw = self.emb.embed(&input)?;
                 Some(match &mut self.ir_adapter {
                     Some(a) => a.apply(&raw)?,
                     None => raw.to_vec(),
@@ -4740,13 +4718,10 @@ impl Engine {
         let mut out = Vec::with_capacity(frames.len());
         for (i, f) in frames.iter().enumerate() {
             let bri = f.data.iter().map(|&p| p as f32).sum::<f32>() / f.data.len().max(1) as f32;
-            let view = align::Grey8View {
-                data: &f.data,
-                width: f.width,
-                height: f.height,
-            };
+            let view = CanonicalGreyView::try_from_parts(&f.data, f.width, f.height)
+                .map_err(model_input_error)?;
             let (mut pitch_frac, mut yaw_signed) = (None, None);
-            let faces = self.det.detect_any(&align::FrameView::Grey(view))?;
+            let faces = self.det.detect(&DetectorInput::from_grey(view))?;
             if let Some(t) = top_detection(&faces) {
                 let pose = irlume_vision::head_pose(&t.landmarks);
                 pitch_frac = Some(pose.pitch_frac);
@@ -4771,13 +4746,10 @@ impl Engine {
     ) -> irlume_common::Result<irlume_liveness::PoseSample> {
         let bri =
             frame.data.iter().map(|&p| p as f32).sum::<f32>() / frame.data.len().max(1) as f32;
-        let view = align::Grey8View {
-            data: &frame.data,
-            width: frame.width,
-            height: frame.height,
-        };
+        let view = CanonicalGreyView::try_from_parts(&frame.data, frame.width, frame.height)
+            .map_err(model_input_error)?;
         let (mut pitch_frac, mut yaw_signed) = (None, None);
-        let faces = self.det.detect_any(&align::FrameView::Grey(view))?;
+        let faces = self.det.detect(&DetectorInput::from_grey(view))?;
         if let Some(t) = top_detection(&faces) {
             let pose = irlume_vision::head_pose(&t.landmarks);
             pitch_frac = Some(pose.pitch_frac);
@@ -6236,21 +6208,18 @@ impl Engine {
             &self.rgb_dev,
             &self.capture_progress(),
         )?;
-        let view = align::RgbView {
-            data: rgb.pixels(),
-            width: rgb.width(),
-            height: rgb.height(),
-        };
-        let faces = self.det.detect(&view)?;
+        let view = CanonicalRgbView::try_from_parts(rgb.pixels(), rgb.width(), rgb.height())
+            .map_err(model_input_error)?;
+        let faces = self.det.detect(&DetectorInput::from_rgb(view))?;
         let Some(f) = top_detection(&faces) else {
             return Ok((
                 false,
                 "no RGB face detected; face the camera and retry".into(),
             ));
         };
-        let chip = align::align_to_arcface(&view, &f.landmarks)?;
-        let emb_first = self.emb.embed(&chip)?;
-        let emb_second = self.emb.embed(&chip)?;
+        let input = ArcFaceInput::from_rgb(view, &f.landmarks).map_err(model_input_error)?;
+        let emb_first = self.emb.embed(&input)?;
+        let emb_second = self.emb.embed(&input)?;
         let cos = align::cosine(&emb_first, &emb_second);
         Ok((
             cos > 0.999,
@@ -6560,15 +6529,11 @@ impl Engine {
         let held_mean = shape.rgb_mean_sum / shape.attempts as f32;
         let frame = irlume_camera::capture_rgb(&self.rgb_dev).ok()?;
         let solo_mean = irlume_camera::frame_mean(&frame.data);
-        let view = align::RgbView {
-            data: &frame.data,
-            width: frame.width,
-            height: frame.height,
-        };
+        let view = CanonicalRgbView::try_from_parts(&frame.data, frame.width, frame.height).ok()?;
         // A detector ERROR is not an observation that no face was there, and
         // collapsing the two would let a broken detector read as a refutation.
         // Nothing is confirmed without a detection that actually ran.
-        let found = match self.det.detect(&view) {
+        let found = match self.det.detect(&DetectorInput::from_rgb(view)) {
             Ok(faces) => faces.iter().any(irlume_vision::detection_is_finite),
             Err(e) => {
                 irlume_common::dlog!("enroll: solo RGB probe: detector failed ({e}); no verdict");
@@ -7206,12 +7171,9 @@ impl Engine {
         )?
         .pop()
         .ok_or_else(|| irlume_common::Error::Hardware("no frames captured".into()))?;
-        let view = align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
-        };
-        let faces = self.det.detect(&view)?;
+        let view = CanonicalRgbView::try_from_parts(&rgb.data, rgb.width, rgb.height)
+            .map_err(model_input_error)?;
+        let faces = self.det.detect(&DetectorInput::from_rgb(view))?;
         let top = top_detection(&faces);
         // NB: the framing guide is RGB-only so it stays fast enough to poll (the
         // IR burst would make each sample multi-second). IR readiness is checked
@@ -10277,6 +10239,31 @@ mod pad_cue_tests {
     }
 
     #[test]
+    fn authentication_source_has_no_raw_model_input_view_types() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module boundary")
+            .0;
+        let raw_types = [
+            ["align::", "RgbView"].concat(),
+            ["align::", "Grey8View"].concat(),
+            ["Frame", "View"].concat(),
+        ];
+        for raw_type in raw_types {
+            assert!(
+                !production.contains(&raw_type),
+                "authentication production source must construct typed model inputs, not use {raw_type}"
+            );
+        }
+        assert!(production.contains("DetectorInput::from_rgb"));
+        assert!(production.contains("DetectorInput::from_grey"));
+        assert!(production.contains("ArcFaceInput::"));
+        assert!(production.contains("VitRgbPadInput::new"));
+        assert!(production.contains("FlirIrPadInput::new"));
+    }
+
+    #[test]
     fn fires_only_on_live_plus_confident_fake() {
         assert!(pad_downgrades(Verdict::Live, Some(0.9), 0.5));
         assert!(pad_downgrades(Verdict::Live, Some(0.5), 0.5)); // at threshold
@@ -12096,21 +12083,17 @@ mod engine_tests {
         let mut s = shared();
         let (w, h) = (64u32, 64u32);
         let flat = vec![127u8; (w * h * 3) as usize];
-        let view = align::RgbView {
-            data: &flat,
-            width: w,
-            height: h,
-        };
+        let view = CanonicalRgbView::try_from_parts(&flat, w, h).expect("valid fixture");
         // Both rescue models loaded, but no face in the frame.
         assert!(s.engine.has_blaze_rescue() && s.engine.has_mesh());
-        assert!(s.engine.rescue_detect(&view, "test").is_none());
+        assert!(s.engine.rescue_detect(view, "test").is_none());
         // With BlazeFace missing the cascade stage is simply absent.
         let blaze = s.engine.blaze.take();
-        assert!(s.engine.rescue_detect(&view, "test").is_none());
+        assert!(s.engine.rescue_detect(view, "test").is_none());
         s.engine.blaze = blaze;
         // Same when only the mesh refiner is missing.
         let mesh = s.engine.mesh.take();
-        assert!(s.engine.rescue_detect(&view, "test").is_none());
+        assert!(s.engine.rescue_detect(view, "test").is_none());
         s.engine.mesh = mesh;
     }
 

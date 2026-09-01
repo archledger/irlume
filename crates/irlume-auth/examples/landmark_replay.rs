@@ -20,6 +20,7 @@
 //!   <det.onnx> <mesh.onnx> <pgm_dir> [out_dir]
 //! With no out_dir the CSVs are written beside the PGMs.
 
+use irlume_vision::model_input::{CanonicalGreyView, CanonicalRgbView, DetectorInput};
 use irlume_vision::{align, Detector, FaceMesh};
 use std::io::Write;
 
@@ -256,8 +257,10 @@ fn run(
             width: *w,
             height: *h,
         };
+        let grey_view = CanonicalGreyView::try_from_parts(data, *w, *h)
+            .map_err(|e| format!("input frame {n}: {e}"))?;
         let top = det
-            .detect(&view)
+            .detect(&DetectorInput::from_grey(grey_view))
             .map_err(|e| format!("detect frame {n}: {e}"))?
             .into_iter()
             .max_by(|a, b| a.score.total_cmp(&b.score));
@@ -265,8 +268,13 @@ fn run(
         // would otherwise re-label every later frame.
         match top {
             Some(t) => {
+                let mesh_view = CanonicalRgbView::try_from_align(&view)
+                    .map_err(|e| format!("mesh input frame {n}: {e}"))?;
+                let mesh_input = mesh
+                    .prepare_input(mesh_view, t.bbox)
+                    .map_err(|e| format!("mesh input frame {n}: {e}"))?;
                 let lm = mesh
-                    .landmarks(&view, &t.bbox, 0.25)
+                    .landmarks(&mesh_input)
                     .map_err(|e| format!("mesh frame {n}: {e}"))?;
                 let csv_path = out.join(format!("frame{n:02}.landmarks.csv"));
                 let mut csv = std::fs::File::create(&csv_path)

@@ -237,15 +237,28 @@ qualified conditioning policy enables it.
 Each model adapter owns its exact tensor contract. Existing measured contracts
 remain unchanged, including ArcFace 112x112 alignment and normalization, ViT
 RGB PAD m96 crop and 224x224 normalization, and FLIR IR PAD padding, resize,
-center crop, and normalization. A model whose shape, preprocessing version,
-color convention, or calibration does not match the attempt plan is
-unavailable, preserving ADR-0019 fail-closed behavior.
+center crop, and normalization. YuNet 640 letterboxing, short-range BlazeFace
+128 letterboxing, full-range BlazeFace 192 letterboxing, and the legacy 192 and
+current 256 FaceMesh crop contracts are frozen by the same boundary. A model
+whose shape, preprocessing version, color convention, or calibration does not
+match the attempt plan is unavailable, preserving ADR-0019 fail-closed
+behavior.
 
 ### ModelGateway
 
 `ModelGateway` accepts only typed canonical evidence or typed tensors produced
 by a matching model adapter. It cannot accept `irlume_camera::Frame`, arbitrary
 byte slices, or camera fourcc values directly.
+
+Task 4 scope correction: the initial design and plan named only YuNet, ArcFace,
+ViT RGB PAD, and FLIR IR PAD even though authentication also invokes
+short-range BlazeFace and FaceMesh during rescue alignment, and measurement
+tools invoke full-range BlazeFace. Leaving those APIs raw would have preserved
+an alternate camera-buffer-to-inference path and made the typed boundary
+incomplete. Task 4 therefore covers every inference wrapper and every auth,
+CLI, test, example, and benchmark consumer. Direct TFLite sessions remain
+measurement-only runtime parity tools, but their inputs are obtained from the
+matching typed contract rather than a duplicated public preprocessor.
 
 Detector output carries the landmarks and transform provenance used to derive
 recognition and PAD inputs. RGB and IR geometry mapping is profile and
@@ -323,7 +336,8 @@ report and diagnostic trace privacy contracts continue to govern projection.
 - Mocked ioctl tests for driver adjustment, exact negotiation, readback
   mismatch, unsupported controls, and restoration ordering.
 - Golden tests for RGB decode and temporal median, IR decode and burst
-  selection, ArcFace preprocessing, ViT RGB PAD input, and FLIR IR PAD input.
+  selection, YuNet, ArcFace, ViT RGB PAD, FLIR IR PAD, BlazeFace, and FaceMesh
+  preprocessing.
 - Contract tests proving inference entry points cannot consume camera buffers or
   untyped frames.
 - Hardware qualification in bright, backlit, low-light, and dark-IR scenes.

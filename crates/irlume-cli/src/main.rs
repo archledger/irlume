@@ -1806,7 +1806,14 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
                 width: w,
                 height: h,
             };
-            let Ok(faces) = det.detect(&view) else {
+            let Ok(model_view) =
+                irlume_vision::model_input::CanonicalRgbView::try_from_align(&view)
+            else {
+                continue;
+            };
+            let Ok(faces) = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+                model_view,
+            )) else {
                 continue;
             };
             let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
@@ -1828,25 +1835,17 @@ fn irbench(args: &[String]) -> std::process::ExitCode {
                     ),
                     _ => {}
                 }
-                if tta {
-                    if let (Ok(a), Ok(b)) = (
-                        emb.embed(&chip),
-                        emb.embed(&irlume_vision::align::flip_h(&chip)),
-                    ) {
-                        let mut v = [0f32; irlume_vision::EMBED_DIM];
-                        let mut norm = 0f32;
-                        for k in 0..irlume_vision::EMBED_DIM {
-                            v[k] = a[k] + b[k];
-                            norm += v[k] * v[k];
-                        }
-                        let norm = norm.sqrt().max(1e-12);
-                        for vk in v.iter_mut() {
-                            *vk /= norm;
-                        }
-                        embs.push((pi, v));
+                if let Ok(input) =
+                    irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)
+                {
+                    let embedded = if tta {
+                        emb.embed_tta(&input)
+                    } else {
+                        emb.embed(&input)
+                    };
+                    if let Ok(e) = embedded {
+                        embs.push((pi, e));
                     }
-                } else if let Ok(e) = emb.embed(&chip) {
-                    embs.push((pi, e));
                 }
             }
         }
@@ -2015,7 +2014,13 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
             width: w,
             height: h,
         };
-        let Ok(faces) = det.detect(&view) else {
+        let Ok(model_view) = irlume_vision::model_input::CanonicalRgbView::try_from_align(&view)
+        else {
+            continue;
+        };
+        let Ok(faces) = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+            model_view,
+        )) else {
             continue;
         };
         let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
@@ -2023,7 +2028,9 @@ fn farbench(dir: &str, det_path: &str, model: &str, args: &[String]) -> std::pro
             continue;
         };
         if let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) {
-            if let Ok(e) = emb.embed(&chip) {
+            if let Ok(input) = irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)
+            {
+                let Ok(e) = emb.embed(&input) else { continue };
                 embs.push(e);
             }
         }
@@ -2206,7 +2213,13 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
             width: w,
             height: h,
         };
-        let Ok(faces) = det.detect(&view) else {
+        let Ok(model_view) = irlume_vision::model_input::CanonicalRgbView::try_from_align(&view)
+        else {
+            continue;
+        };
+        let Ok(faces) = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+            model_view,
+        )) else {
             continue;
         };
         let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
@@ -2215,10 +2228,19 @@ fn normprobe(args: &[String]) -> std::process::ExitCode {
         let Ok(chip) = irlume_vision::align::align_to_arcface(&view, &top.landmarks) else {
             continue;
         };
+        let (Ok(base), Ok(dark), Ok(blur)) = (
+            irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb_slice(&chip),
+            irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(darken_chip(
+                &chip, 0.35,
+            )),
+            irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(blur_chip(&chip)),
+        ) else {
+            continue;
+        };
         let (Ok((_, nf)), Ok((_, nd)), Ok((_, nb))) = (
-            emb.embed_with_norm(&chip),
-            emb.embed_with_norm(&darken_chip(&chip, 0.35)),
-            emb.embed_with_norm(&blur_chip(&chip)),
+            emb.embed_with_norm(&base),
+            emb.embed_with_norm(&dark),
+            emb.embed_with_norm(&blur),
         ) else {
             continue;
         };
@@ -2308,7 +2330,10 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             width: rgb.width,
             height: rgb.height,
         };
-        let rgb_faces = det.detect(&rgb_view)?;
+        let rgb_input = irlume_vision::model_input::CanonicalRgbView::try_from_align(&rgb_view)?;
+        let rgb_faces = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+            rgb_input,
+        ))?;
         let rgb_top = rgb_faces.iter().map(|f| f.score).fold(0.0f32, f32::max);
         println!(
             "[RGB] {}x{}  faces {}  top score {:.3}",
@@ -2337,13 +2362,14 @@ fn liveness_probe(args: &[String]) -> std::process::ExitCode {
             mn,
             mx
         );
-        let ir_rgb = irlume_camera::grey_to_rgb(ir.pixels());
-        let ir_view = irlume_vision::align::RgbView {
-            data: &ir_rgb,
-            width: ir.width(),
-            height: ir.height(),
-        };
-        let ir_faces = det.detect(&ir_view)?;
+        let ir_view = irlume_vision::model_input::CanonicalGreyView::try_from_parts(
+            ir.pixels(),
+            ir.width(),
+            ir.height(),
+        )?;
+        let ir_faces = det.detect(&irlume_vision::model_input::DetectorInput::from_grey(
+            ir_view,
+        ))?;
         let ir_top_face = ir_faces.iter().max_by(|a, b| a.score.total_cmp(&b.score));
         println!(
             "[IR ] faces {}  top score {:.3}",
@@ -2477,11 +2503,16 @@ fn genuine(args: &[String]) -> std::process::ExitCode {
                 width: f.width,
                 height: f.height,
             };
-            let faces = det.detect(&view)?;
+            let model_view = irlume_vision::model_input::CanonicalRgbView::try_from_align(&view)?;
+            let faces = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+                model_view,
+            ))?;
             match faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
                 Some(top) => {
                     let chip = irlume_vision::align::align_to_arcface(&view, &top.landmarks)?;
-                    embs.push(emb.embed(&chip)?);
+                    let input =
+                        irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)?;
+                    embs.push(emb.embed(&input)?);
                     println!("  frame {}: face score {:.3}", k + 1, top.score);
                 }
                 None => println!("  frame {}: no face", k + 1),
@@ -2785,8 +2816,11 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 width: rgbf.width(),
                 height: rgbf.height(),
             };
+            let rgb_view = irlume_vision::model_input::CanonicalRgbView::try_from_align(&rv)?;
             let rgb_top = det
-                .detect(&rv)?
+                .detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+                    rgb_view,
+                ))?
                 .into_iter()
                 .max_by(|a, b| a.score.total_cmp(&b.score));
 
@@ -2798,8 +2832,15 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
                 width: irf.width(),
                 height: irf.height(),
             };
+            let ir_view = irlume_vision::model_input::CanonicalGreyView::try_from_parts(
+                irf.pixels(),
+                irf.width(),
+                irf.height(),
+            )?;
             let ir_top = det
-                .detect(&iv)?
+                .detect(&irlume_vision::model_input::DetectorInput::from_grey(
+                    ir_view,
+                ))?
                 .into_iter()
                 .max_by(|a, b| a.score.total_cmp(&b.score));
 
@@ -2841,7 +2882,8 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             let (mut rgb_cos, mut rgb_bri) = (f32::NAN, 0.0f32);
             if let Some(t) = &rgb_top {
                 let chip = irlume_vision::align::align_to_arcface(&rv, &t.landmarks)?;
-                let e = emb.embed_tta(&chip)?; // RGB path = TTA flip-average
+                let input = irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)?;
+                let e = emb.embed_tta(&input)?; // RGB path = TTA flip-average
                 rgb_bri = mean_bbox(rgbf.pixels(), rgbf.width(), rgbf.height(), 3, &t.bbox);
                 if !rgb_scans.is_empty() {
                     rgb_cos = best(&e, &rgb_scans);
@@ -2887,7 +2929,8 @@ fn calcapture(args: &[String]) -> std::process::ExitCode {
             let mut ir_glint: Option<f32> = None;
             if let Some(t) = &ir_top {
                 let chip = irlume_vision::align::align_to_arcface(&iv, &t.landmarks)?;
-                let raw = emb.embed(&chip)?; // IR = plain embed (no TTA), RAW 512-D
+                let input = irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)?;
+                let raw = emb.embed(&input)?; // IR = plain embed (no TTA), RAW 512-D
                 ir_bri = mean_bbox(irf.pixels(), irf.width(), irf.height(), 1, &t.bbox);
                 // Ambient-INDEPENDENT liveness cues (the center/edge-floor candidates):
                 // center/edge IR ratio (3D face structure) and corneal glint peak.
@@ -3063,7 +3106,10 @@ fn eval(args: &[String]) -> std::process::ExitCode {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
         let mut emb = irlume_vision::Embedder::load_from_file(model)?;
         let grey = args.iter().any(|a| a == "--grey");
-        let faces = det.detect(&view)?;
+        let model_view = irlume_vision::model_input::CanonicalRgbView::try_from_align(&view)?;
+        let faces = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+            model_view,
+        ))?;
         println!(
             "[eval] {} faces; embedding each{}…",
             faces.len(),
@@ -3083,7 +3129,8 @@ fn eval(args: &[String]) -> std::process::ExitCode {
                     px[2] = y;
                 }
             }
-            embs.push(emb.embed(&chip)?);
+            let input = irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)?;
+            embs.push(emb.embed(&input)?);
         }
         // All pairwise cosines = impostor scores (distinct people).
         let mut scores = Vec::new();
@@ -4442,7 +4489,10 @@ fn capture(args: &[String]) -> std::process::ExitCode {
 
     let run = || -> irlume_common::Result<()> {
         let mut det = irlume_vision::Detector::load_from_file(det_path)?;
-        let faces = det.detect(&view)?;
+        let model_view = irlume_vision::model_input::CanonicalRgbView::try_from_align(&view)?;
+        let faces = det.detect(&irlume_vision::model_input::DetectorInput::from_rgb(
+            model_view,
+        ))?;
         println!("[detect] {} face(s)", faces.len());
         let Some(top) = faces.iter().max_by(|a, b| a.score.total_cmp(&b.score)) else {
             println!("  no face in frame; sit in view and re-run.");
@@ -4454,7 +4504,8 @@ fn capture(args: &[String]) -> std::process::ExitCode {
         );
         let chip = irlume_vision::align::align_to_arcface(&view, &top.landmarks)?;
         let mut emb = irlume_vision::Embedder::load_from_file(model)?;
-        let e = emb.embed(&chip)?;
+        let input = irlume_vision::model_input::ArcFaceInput::try_from_aligned_rgb(chip)?;
+        let e = emb.embed(&input)?;
         let norm = e.iter().map(|x| x * x).sum::<f32>().sqrt();
         println!(
             "[embed]  512-D, L2 norm {norm:.4}, head [{:.3}, {:.3}, {:.3}, {:.3}]",

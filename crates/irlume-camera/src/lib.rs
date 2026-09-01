@@ -3916,6 +3916,16 @@ impl RgbCamera {
         self.session_with_progress_and_conditioning(&no_progress(), Some(selection))
     }
 
+    /// Opens a session with one immutable plan-selected conditioning policy.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn session_with_selected_conditioning(
+        &self,
+        progress: &Progress,
+        selection: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress_and_conditioning(progress, Some(selection))
+    }
+
     fn session_with_progress_and_conditioning(
         &self,
         progress: &Progress,
@@ -4236,6 +4246,53 @@ pub struct RgbSession<'a> {
 }
 
 impl<'a> RgbSession<'a> {
+    /// Applies the selected policy around the next held-session evidence window.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn ensure_conditioning(
+        &mut self,
+        expected: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<()> {
+        if let Some(guard) = self._conditioning_restore.as_ref() {
+            if guard.selection() == Some(expected) {
+                return Ok(());
+            }
+            return Err(Error::Hardware("selected conditioning changed".into()));
+        }
+        let catalog = conditioning::current_catalog();
+        if catalog.version() != expected.catalog_version() {
+            return Err(Error::Hardware(
+                "selected conditioning catalog is no longer current".into(),
+            ));
+        }
+        self._conditioning_restore = Some(
+            conditioning::apply_selected_policy(
+                self.cam,
+                expected,
+                catalog.policy(expected.policy_id()),
+            )
+            .map_err(|error| Error::Hardware(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Restores exact displaced values after one conditioned evidence window.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn restore_conditioning(
+        &mut self,
+        expected: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<conditioning::ConditioningRestoration> {
+        let guard = self
+            ._conditioning_restore
+            .take()
+            .ok_or_else(|| Error::Hardware("selected conditioning was not applied".into()))?;
+        if guard.selection() != Some(expected) {
+            return Err(Error::Hardware("selected conditioning changed".into()));
+        }
+        guard
+            .restore()
+            .map_err(|error| Error::Hardware(error.to_string()))
+    }
+
     fn finish_conditioning(self) -> irlume_common::Result<conditioning::ConditioningRestoration> {
         let RgbSession {
             stream,
@@ -4980,6 +5037,30 @@ pub fn capture_rgb_denoised_with_progress(
     median_frame(capture_rgb_burst_with_progress(
         device, RGB_BURST, progress,
     )?)
+}
+
+/// Captures canonical RGB evidence under one immutable conditioning selection.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn capture_rgb_denoised_with_progress_and_conditioning(
+    device: &str,
+    progress: &Progress,
+    selection: conditioning::ConditioningSelection,
+) -> irlume_common::Result<(CanonicalRgbEvidence, conditioning::ConditioningRestoration)> {
+    let opened = std::time::Instant::now();
+    let cam = RgbCamera::open(device)?;
+    let open_ms = opened.elapsed().as_millis();
+    let armed = std::time::Instant::now();
+    let mut session = cam.session_with_selected_conditioning(progress, selection)?;
+    let arm_ms = armed.elapsed().as_millis();
+    let captured = std::time::Instant::now();
+    let evidence = session.denoised()?;
+    let proof = session.finish_conditioning()?;
+    let capture_ms = captured.elapsed().as_millis();
+    irlume_common::dlog!(
+        "{}",
+        capture_stage_summary("rgb", device, open_ms, arm_ms, capture_ms)
+    );
+    Ok((evidence, proof))
 }
 
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
@@ -12574,6 +12655,25 @@ mod tests {
             )
             .unwrap_err(),
             attempt_contract::CapturePlanViolation::Qualification
+        );
+    }
+
+    #[test]
+    fn camera_attempt_requires_matching_conditioning_restoration_before_inference() {
+        let contract = camera_attempt_fixture(
+            profile::CaptureSchedule::Concurrent,
+            attempt_contract::EVIDENCE_PAIR_BOUND_V1,
+        );
+        let matching = conditioning::ConditioningRestoration::for_test(contract.conditioning());
+        assert_eq!(contract.validate_conditioning_restoration(matching), Ok(()));
+
+        let changed = conditioning::ConditioningRestoration::with_policy_for_test(
+            contract.conditioning(),
+            conditioning::ConditioningPolicyId::BacklitAuto,
+        );
+        assert_eq!(
+            contract.validate_conditioning_restoration(changed),
+            Err(attempt_contract::CapturePlanViolation::Conditioning)
         );
     }
 

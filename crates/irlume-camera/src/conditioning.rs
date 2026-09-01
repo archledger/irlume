@@ -797,6 +797,7 @@ struct AppliedControl {
 pub struct AppliedConditioningGuard<'a> {
     controls: &'a dyn ControlIo,
     applied: Vec<AppliedControl>,
+    required: Vec<ControlSetting>,
     selection: Option<ConditioningSelection>,
 }
 
@@ -814,6 +815,15 @@ impl ConditioningRestoration {
 
     #[cfg(test)]
     pub(crate) const fn for_test(selection: ConditioningSelection) -> Self {
+        Self { selection }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_policy_for_test(
+        mut selection: ConditioningSelection,
+        policy_id: ConditioningPolicyId,
+    ) -> Self {
+        selection.policy_id = policy_id;
         Self { selection }
     }
 }
@@ -834,12 +844,29 @@ impl AppliedConditioningGuard<'_> {
         !self.applied.is_empty()
     }
 
+    #[must_use]
+    pub const fn selection(&self) -> Option<ConditioningSelection> {
+        self.selection
+    }
+
     /// Explicitly restores every displaced value and confirms exact readback.
     ///
     /// # Errors
     ///
     /// Returns an error if ownership changed or restoration cannot be confirmed.
     pub fn restore(mut self) -> Result<ConditioningRestoration, PolicyError> {
+        for setting in &self.required {
+            match self.controls.read_control(setting.id) {
+                Ok(value) if value == setting.value => {}
+                Ok(_) => return Err(PolicyError::ReadbackMismatch(setting.id)),
+                Err(error) => {
+                    return Err(PolicyError::ControlRead {
+                        id: setting.id,
+                        errno: error.raw_os_error(),
+                    });
+                }
+            }
+        }
         while let Some(applied) = self.applied.pop() {
             match self.controls.read_control(applied.id) {
                 Ok(now) if now == applied.requested => {}
@@ -905,6 +932,7 @@ pub(super) fn apply_policy<'a>(
     let mut guard = AppliedConditioningGuard {
         controls,
         applied: Vec::with_capacity(ordered.len()),
+        required: ordered.clone(),
         selection: None,
     };
 
@@ -955,9 +983,71 @@ pub(super) fn apply_selected_policy<'a>(
     if selection.catalog_version == 0 || selection.policy_id != policy.id {
         return Err(PolicyError::InvalidPolicy);
     }
-    let mut guard = apply_policy(controls, policy)?;
+    let optional_blc = match policy.controls.as_slice() {
+        [setting] if setting.id == V4L2_CID_BACKLIGHT_COMPENSATION => Some(*setting),
+        _ => None,
+    };
+    let mut guard = if let Some(setting) = optional_blc {
+        apply_optional_control(controls, setting)?
+    } else {
+        apply_policy(controls, policy)?
+    };
     guard.selection = Some(selection);
     Ok(guard)
+}
+
+fn apply_optional_control<'a>(
+    controls: &'a dyn ControlIo,
+    setting: ControlSetting,
+) -> Result<AppliedConditioningGuard<'a>, PolicyError> {
+    let empty = || AppliedConditioningGuard {
+        controls,
+        applied: Vec::new(),
+        required: Vec::new(),
+        selection: None,
+    };
+    let displaced = match controls.read_control(setting.id) {
+        Ok(value) => value,
+        Err(_) => return Ok(empty()),
+    };
+    if displaced == setting.value {
+        return Ok(AppliedConditioningGuard {
+            controls,
+            applied: Vec::new(),
+            required: vec![setting],
+            selection: None,
+        });
+    }
+    if controls.write_control(setting.id, setting.value).is_err() {
+        return Ok(empty());
+    }
+    if matches!(controls.read_control(setting.id), Ok(value) if value == setting.value) {
+        return Ok(AppliedConditioningGuard {
+            controls,
+            applied: vec![AppliedControl {
+                id: setting.id,
+                requested: setting.value,
+                displaced,
+            }],
+            required: vec![setting],
+            selection: None,
+        });
+    }
+
+    controls
+        .write_control(setting.id, displaced)
+        .map_err(|error| PolicyError::ControlWrite {
+            id: setting.id,
+            errno: error.raw_os_error(),
+        })?;
+    match controls.read_control(setting.id) {
+        Ok(value) if value == displaced => Ok(empty()),
+        Ok(_) => Err(PolicyError::ReadbackMismatch(setting.id)),
+        Err(error) => Err(PolicyError::ControlRead {
+            id: setting.id,
+            errno: error.raw_os_error(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1640,5 +1730,23 @@ mod tests {
 
         assert!(applied.restore().is_err());
         assert_eq!(controls.value(GAIN), 6);
+    }
+
+    #[test]
+    fn selected_policy_omits_unavailable_optional_blc_and_still_proves_restoration() {
+        let controls = FakeControls::with_values(&[]);
+        let selected = ConditioningSelection {
+            scene: SceneClass::Lit,
+            policy_id: ConditioningPolicyId::LitAuto,
+            catalog_version: CATALOG_VERSION,
+        };
+        let requested = policy(vec![ControlSetting::integer(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            2,
+        )]);
+
+        let applied = apply_selected_policy(&controls, selected, &requested).unwrap();
+        assert!(!applied.is_armed());
+        assert_eq!(applied.restore().unwrap().selection(), selected);
     }
 }

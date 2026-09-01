@@ -206,10 +206,13 @@ impl AttemptCapturePlan {
     pub fn validate_canonical_pair(
         &self,
         observed: &Self,
+        conditioning: irlume_camera::conditioning::ConditioningRestoration,
         rgb: &irlume_camera::CanonicalRgbEvidence,
         ir: &irlume_camera::CanonicalIrEvidence,
     ) -> Result<(), CapturePlanViolation> {
         self.validate(observed)?;
+        self.camera
+            .validate_conditioning_restoration(conditioning)?;
         self.camera.validate_canonical_pair(rgb, ir)
     }
 }

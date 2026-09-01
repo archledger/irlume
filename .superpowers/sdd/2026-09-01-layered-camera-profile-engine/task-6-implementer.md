@@ -145,3 +145,30 @@ Task 6 is intended for one signed and DCO-compliant commit with subject `feat: b
 - Supplementary `cargo check -p irlume-vision --no-default-features` still reaches the pre-existing feature-gating error at `model_input.rs`'s call to ONNX-only `mesh_box_valid`; all ten errors initially introduced by the new adapter authority API were removed with an `onnx` feature gate.
 
 No camera, service, enrollment, qualification store, model artifact, system configuration, remote, GitHub, or production profile-selection state changed.
+
+## Controller Review Fix Round 2
+
+### Remaining Finding Resolved
+
+Direct controller re-review found that Review Fix Round 1 proved selected-policy restoration only in the diagnostic profile path. Production authentication still captured through the legacy default-conditioning entrypoints and could validate canonical evidence without proving that the plan-selected controls were applied and restored. The strict selected path also treated unavailable optional BLC as a fatal control error.
+
+Production attempt authority is now frozen before capture. One-shot, held-session, sequential-fallback, and RGB self-heal captures all apply the exact plan selection. Each evidence window must return an opaque, matching `ConditioningRestoration` after exact readback and exact displaced-value restoration before `AttemptCapturePlan::validate_canonical_pair` can succeed or any detector input can be constructed. Held streams remain open, but conditioning is reapplied and restored around each complete evidence window. Missing or write-refused optional BLC remains an allowed no-op; any uncertain post-write state or failed restoration fails closed.
+
+### RED And GREEN Evidence
+
+- RED: `selected_policy_omits_unavailable_optional_blc_and_still_proves_restoration` failed to compile because selected guards exposed no proof seam. GREEN confirms optional omission and matching restoration authority.
+- GREEN: `camera_attempt_requires_matching_conditioning_restoration_before_inference` accepts only a proof for the frozen selection and rejects policy drift.
+- GREEN: production capture constructs the immutable plan before opening a stream, requires selected conditioning on held and one-shot paths, refreshes authority for sequential fallback, and requires fresh proof after RGB self-heal.
+
+### Verification
+
+- `cargo test -p irlume-camera --lib`: 651 passed, 0 failed, 26 declared hardware tests ignored.
+- `cargo test -p irlume-auth --lib`: 145 passed, 0 failed, 3 declared environment tests ignored.
+- `cargo test --workspace --all-targets --locked`: 1,996 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo check --workspace --all-targets --locked`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- `sha256sum -c SHA256SUMS`: all seven unchanged model assets passed through temporary links; all six links were removed afterward.
+
+No hardware, service, enrollment, qualification store, model artifact, system configuration, remote, GitHub, or production profile-selection state changed.

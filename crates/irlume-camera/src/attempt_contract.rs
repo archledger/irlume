@@ -524,6 +524,21 @@ impl CameraAttemptContract {
         self.validate_manifests(rgb, ir)
     }
 
+    /// Refuses evidence captured under a different or unconfirmed policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapturePlanViolation::Conditioning`] for selection drift.
+    pub fn validate_conditioning_restoration(
+        &self,
+        restoration: crate::conditioning::ConditioningRestoration,
+    ) -> Result<(), CapturePlanViolation> {
+        if restoration.selection() != self.conditioning {
+            return Err(CapturePlanViolation::Conditioning);
+        }
+        Ok(())
+    }
+
     /// Validates every immutable camera-owned field against another attempt.
     ///
     /// # Errors

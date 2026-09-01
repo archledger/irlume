@@ -4005,7 +4005,13 @@ impl Engine {
             .zip(self.active_plan_versions())
             .and_then(|(camera, versions)| {
                 attempt_plan_from_camera(camera, versions, self.active_model_contracts())
-            });
+            })
+            .ok_or_else(|| {
+                irlume_common::Error::Hardware(
+                    "immutable attempt capture plan unavailable; refusing capture".into(),
+                )
+            })?;
+        let mut conditioning_selection = attempt_plan.camera().conditioning();
         let mode_source = capture_mode.active_source();
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
@@ -4031,12 +4037,19 @@ impl Engine {
         // Recovery renegotiates on the fd the session already holds.
         fn held_rgb_capture(
             rgb_s: &mut irlume_camera::RgbSession<'_>,
+            conditioning: irlume_camera::conditioning::ConditioningSelection,
         ) -> (
-            irlume_common::Result<irlume_camera::CanonicalRgbEvidence>,
+            irlume_common::Result<(
+                irlume_camera::CanonicalRgbEvidence,
+                irlume_camera::conditioning::ConditioningRestoration,
+            )>,
             bool,
         ) {
-            match rgb_s.denoised() {
-                Ok(f) => (Ok(f), false),
+            if let Err(error) = rgb_s.ensure_conditioning(conditioning) {
+                return (Err(error), false);
+            }
+            let (capture, recovered) = match rgb_s.denoised() {
+                Ok(frame) => (Ok(frame), false),
                 Err(e) => {
                     irlume_common::dlog!(
                         "assess: held rgb stream broke ({e}); recovering it in place"
@@ -4044,7 +4057,13 @@ impl Engine {
                     let recovered = rgb_s.recover().and_then(|()| rgb_s.denoised());
                     (recovered, true)
                 }
-            }
+            };
+            let restoration = rgb_s.restore_conditioning(conditioning);
+            let result = match (capture, restoration) {
+                (Ok(frame), Ok(proof)) => Ok((frame, proof)),
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            };
+            (result, recovered)
         }
         // One IR capture from a HELD session, recovering the stream in place
         // on a mid-stream fault. Mirrors held_rgb_capture; the same EBUSY
@@ -4075,7 +4094,7 @@ impl Engine {
             if let Some((rgb_s, ir_s)) = held {
                 if sequential {
                     let t = std::time::Instant::now();
-                    let (rgb, rgb_recovered) = held_rgb_capture(rgb_s);
+                    let (rgb, rgb_recovered) = held_rgb_capture(rgb_s, conditioning_selection);
                     let rgb_ms = t.elapsed().as_millis();
                     if rgb.is_err() {
                         (rgb, rgb_ms, Ok(None), 0, rgb_recovered)
@@ -4101,7 +4120,7 @@ impl Engine {
                             (captured, t.elapsed().as_millis())
                         });
                         let t = std::time::Instant::now();
-                        let (rgb, rgb_recovered) = held_rgb_capture(rgb_s);
+                        let (rgb, rgb_recovered) = held_rgb_capture(rgb_s, conditioning_selection);
                         let rgb_ms = t.elapsed().as_millis();
                         let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                             (
@@ -4126,8 +4145,11 @@ impl Engine {
                 }
             } else if sequential {
                 let t = std::time::Instant::now();
-                let rgb =
-                    irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress);
+                let rgb = irlume_camera::capture_rgb_denoised_with_progress_and_conditioning(
+                    &self.rgb_dev,
+                    &progress,
+                    conditioning_selection,
+                );
                 let rgb_ms = t.elapsed().as_millis();
                 // Match the old short-circuit: don't fire the IR emitter after an
                 // RGB fault (privacy switch, missing node); the shared retry below
@@ -4152,8 +4174,11 @@ impl Engine {
                         (captured, t.elapsed().as_millis())
                     });
                     let t = std::time::Instant::now();
-                    let rgb =
-                        irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress);
+                    let rgb = irlume_camera::capture_rgb_denoised_with_progress_and_conditioning(
+                        &self.rgb_dev,
+                        &progress,
+                        conditioning_selection,
+                    );
                     let rgb_ms = t.elapsed().as_millis();
                     let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                         (
@@ -4178,7 +4203,7 @@ impl Engine {
         );
         let observed_runtime_violation =
             match (&rgb_res, &ir_res, capture_mode.runtime_contract.as_ref()) {
-                (Ok(rgb), Ok(Some(ir)), Some(contract)) => {
+                (Ok((rgb, _)), Ok(Some(ir)), Some(contract)) => {
                     match contract.diagnostic_canonical_trace_events(rgb, ir) {
                         Ok(events) => {
                             for event in events {
@@ -4262,16 +4287,24 @@ impl Engine {
                 .zip(self.active_plan_versions())
                 .and_then(|(camera, versions)| {
                     attempt_plan_from_camera(camera, versions, self.active_model_contracts())
-                });
+                })
+                .ok_or_else(|| {
+                    irlume_common::Error::Hardware(
+                        "sequential retry attempt plan unavailable; discarding prior evidence"
+                            .into(),
+                    )
+                })?;
+            conditioning_selection = attempt_plan.camera().conditioning();
             irlume_common::dlog!(
                 "assess: concurrent pair failed; discarding both frames and retrying RGB then IR"
             );
             let (fresh_rgb, fresh_ir) = capture_pair_sequentially(
                 || {
                     let started = std::time::Instant::now();
-                    let frame = irlume_camera::capture_rgb_denoised_with_progress(
+                    let frame = irlume_camera::capture_rgb_denoised_with_progress_and_conditioning(
                         &self.rgb_dev,
                         &progress,
+                        conditioning_selection,
                     )?;
                     Ok((frame, started.elapsed().as_millis()))
                 },
@@ -4330,9 +4363,9 @@ impl Engine {
         // zero streaming overhead.
         if !sequential && !pair_sequential_retried {
             if let (Ok(rgb), Ok(Some(ir))) = (&rgb_res, &ir_res) {
-                let rgb_gap = rgb.manifest().rate_evidence().sequence_gap() > 0;
+                let rgb_gap = rgb.0.manifest().rate_evidence().sequence_gap() > 0;
                 let ir_gap = ir.manifest().rate_evidence().sequence_gap() > 0;
-                let ts_disc = !rgb.manifest().is_continuous() || !ir.manifest().is_continuous();
+                let ts_disc = !rgb.0.manifest().is_continuous() || !ir.manifest().is_continuous();
                 if successful_capture_shows_degradation_signs(rgb_gap, ir_gap, ts_disc) {
                     if let Some(context_key) = capture_mode.runtime_key.as_deref() {
                         trip_runtime_capture_health(
@@ -4353,8 +4386,8 @@ impl Engine {
         // switch, missing node) fails again with the same error. Logged so a
         // silent retry can't make the timing lines below lie about a slow login.
         let mut rgb_hard_retried = pair_sequential_retried;
-        let mut rgb = match rgb_res {
-            Ok(f) => f,
+        let (mut rgb, mut conditioning_application) = match rgb_res {
+            Ok(pair) => pair,
             // Standalone reopen is only safe when THIS call opened one-shot:
             // with held sessions the device queue belongs to the caller's
             // stream, the in-place recovery above already had its attempt,
@@ -4369,7 +4402,11 @@ impl Engine {
                     }
                 );
                 rgb_hard_retried = true;
-                irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?
+                irlume_camera::capture_rgb_denoised_with_progress_and_conditioning(
+                    &self.rgb_dev,
+                    &progress,
+                    conditioning_selection,
+                )?
             }
             Err(e) => return Err(e.into()),
         };
@@ -4385,11 +4422,7 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
-        let plan = attempt_plan.as_ref().ok_or_else(|| {
-            irlume_common::Error::Hardware(
-                "immutable attempt capture plan unavailable; discarding RGB and IR evidence".into(),
-            )
-        })?;
+        let plan = &attempt_plan;
         let observed_schedule = if sequential || pair_sequential_retried {
             irlume_camera::profile::CaptureSchedule::Sequential
         } else {
@@ -4412,7 +4445,7 @@ impl Engine {
                         .into(),
                 )
             })?;
-        plan.validate_canonical_pair(&observed_plan, &rgb, &ir)
+        plan.validate_canonical_pair(&observed_plan, conditioning_application, &rgb, &ir)
             .map_err(|violation| {
                 irlume_common::Error::Hardware(format!(
                     "attempt capture plan violation ({violation:?}); discarding RGB and IR evidence"
@@ -4484,8 +4517,19 @@ impl Engine {
             irlume_common::dlog!(
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
-            rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?;
-            plan.validate_canonical_pair(&observed_plan, &rgb, &ir)
+            let recaptured = irlume_camera::capture_rgb_denoised_with_progress_and_conditioning(
+                &self.rgb_dev,
+                &progress,
+                conditioning_selection,
+            )?;
+            rgb = recaptured.0;
+            conditioning_application = recaptured.1;
+            plan.validate_canonical_pair(
+                &observed_plan,
+                conditioning_application,
+                &rgb,
+                &ir,
+            )
                 .map_err(|violation| {
                     irlume_common::Error::Hardware(format!(
                         "recaptured evidence violates attempt plan ({violation:?}); discarding RGB and IR evidence"
@@ -5442,15 +5486,23 @@ impl Engine {
             );
         }
         let sequential = capture_mode.is_sequential();
-        let held_cams = cameras_for_held_pair(sequential, resolved_cams);
+        let held_cams = cameras_for_held_pair(
+            sequential || capture_mode.camera_contract.is_none(),
+            resolved_cams,
+        );
         let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
         let mut held_ir: Option<irlume_camera::IrSession<'_>> = None;
-        if let (Some((cam_r, cam_i)), true) = (&held_cams, !sequential && self.ir_available) {
+        if let (Some((cam_r, cam_i)), true, Some(camera_contract)) = (
+            &held_cams,
+            !sequential && self.ir_available,
+            capture_mode.camera_contract.as_ref(),
+        ) {
             let progress = self.capture_progress();
+            let conditioning = camera_contract.conditioning();
             // The camera pair is declared before the sessions so it outlives them.
             let arm_started = std::time::Instant::now();
             let armed = arm_pair_transactionally(
-                || cam_r.session_with_progress(&progress),
+                || cam_r.session_with_selected_conditioning(&progress, conditioning),
                 || cam_i.session_with_progress(&progress),
             );
             diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
@@ -6457,10 +6509,13 @@ impl Engine {
                 "enroll: sequential capture mode (from {mode_source}); not holding \
                  both streams, capturing per-frame"
             );
-        } else if let Some((r, i)) = &cams {
+        } else if let (Some((r, i)), Some(camera_contract)) =
+            (&cams, capture_mode.camera_contract.as_ref())
+        {
             let progress = self.capture_progress();
+            let conditioning = camera_contract.conditioning();
             match arm_pair_transactionally(
-                || r.session_with_progress(&progress),
+                || r.session_with_selected_conditioning(&progress, conditioning),
                 || i.session_with_progress(&progress),
             ) {
                 Ok((mut rs, mut is)) => {

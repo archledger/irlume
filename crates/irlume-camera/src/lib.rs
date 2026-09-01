@@ -14464,6 +14464,71 @@ mod tests {
         assert!(!policy.ambient_subtraction_enabled());
     }
 
+    #[test]
+    fn scene_observation_is_derived_from_canonical_camera_evidence() {
+        let mut pixels = Vec::new();
+        for value in [0; 2].into_iter().chain([100; 15]).chain([255; 3]) {
+            pixels.extend_from_slice(&[value, value, value]);
+        }
+        let rgb = rgb_evidence(&pixels);
+        let connection = capture_qualification::ConnectionContext::new(
+            "/devices/controller".into(),
+            480_000,
+            "uvcvideo".into(),
+            "v4l2".into(),
+        )
+        .unwrap();
+        let transport_profile = profile::PairTransportProfile::new(
+            "evidence-profile",
+            profile::StreamTuple::new(
+                contracts::StreamRole::Rgb,
+                profile::DecodedPixelFormat::Yuyv,
+                20,
+                1,
+                frame_interval::FrameInterval::new(1, 15).unwrap(),
+            )
+            .unwrap(),
+            profile::StreamTuple::new(
+                contracts::StreamRole::Ir,
+                profile::DecodedPixelFormat::Grey8,
+                1,
+                1,
+                frame_interval::FrameInterval::new(1, 15).unwrap(),
+            )
+            .unwrap(),
+            profile::CaptureSchedule::Sequential,
+        )
+        .unwrap();
+        let context = conditioning::ConditioningContext::new(
+            contracts::CameraInstanceId::new("2".repeat(32)).unwrap(),
+            contracts::CameraGeneration::INITIAL,
+            connection.clone(),
+            transport_profile.clone(),
+        );
+        let catalog = conditioning::current_catalog();
+        let wrong_context = conditioning::ConditioningContext::new(
+            contracts::CameraInstanceId::new("3".repeat(32)).unwrap(),
+            contracts::CameraGeneration::INITIAL,
+            connection,
+            transport_profile,
+        );
+        assert!(catalog.observe(wrong_context, &rgb, None).is_err());
+        let observation = catalog
+            .observe(context.clone(), &rgb, None)
+            .expect("canonical evidence matches the context");
+
+        assert_eq!(
+            catalog
+                .select(
+                    &context,
+                    rgb.capture_window().end,
+                    conditioning::ConditioningAttempt::Later(&observation),
+                )
+                .policy_id(),
+            conditioning::ConditioningPolicyId::BacklitAuto,
+        );
+    }
+
     /// Only the errnos the V4L2 specification assigns to "this control does
     /// not exist" (EINVAL for an unsupported id, ENOTTY for a device without
     /// the ioctl) read as absence; an IO failure or a vanished device must not.

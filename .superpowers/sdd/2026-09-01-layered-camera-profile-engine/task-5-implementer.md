@@ -92,3 +92,51 @@ The review covered the complete Task 5 change against base `03f90eab4e2402af185e
 ## Commit
 
 Task 5 is committed separately with signed+DCO subject `feat: qualify camera conditioning policies`.
+
+## Fix Round 1
+
+### Findings Addressed
+
+1. The selector previously represented attempt phase as `Option<&SceneObservation>`. A caller could therefore attach an observation without structurally proving that selection was for a later attempt. Selection now takes the closed `ConditioningAttempt` enum: `First` carries no observation authority, while `Later` carries exactly one preceding `SceneObservation`.
+2. `SceneObservation::new` was public, so arbitrary caller-authored statistics could become policy-selection authority. The constructor is removed. Observations are opaque externally and are minted only by a crate-private catalog factory from canonical RGB evidence and optional canonical IR evidence whose camera instance and generation match the exact conditioning context.
+3. The fixed catalog previously required BLC 2 on every represented inventory. BLC is now optional catalog content and is included only when the exact eligible integer request for value 2 passes the represented control domain. Manual policies still reject absent, ineligible, wrong-type, out-of-range, and off-lattice requests.
+
+### RED Evidence
+
+- `cargo test -p irlume-camera --lib conditioning::tests` failed to compile because `ConditioningAttempt` and the inventory-domain fixed-catalog test seam did not exist.
+- `cargo test -p irlume-camera --doc conditioning` failed because the external `SceneObservation::new` construction marked `compile_fail` still compiled successfully.
+- `cargo test -p irlume-camera --lib scene_observation_is_derived_from_canonical_camera_evidence` failed to compile because the canonical-evidence observation factory and catalog seam did not exist.
+
+### GREEN Evidence
+
+- `cargo test -p irlume-camera --lib conditioning::tests`: 17 passed, 0 failed.
+- `cargo test -p irlume-camera --doc conditioning`: 1 compile-fail test passed.
+- `cargo test -p irlume-camera --lib scene_observation_is_derived_from_canonical_camera_evidence`: 1 passed, 0 failed.
+- `cargo test -p irlume-camera --lib ir_emitter::tests`: 129 passed, 0 failed.
+- `cargo test -p irlume-camera --all-targets`: 652 passed, 0 failed, 26 declared hardware tests ignored.
+- `cargo test --workspace --all-targets --locked`: 1,977 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo check --workspace --all-targets --locked`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- Added-line U+2014 check: no matches.
+- All seven model assets passed `models/SHA256SUMS`; six temporary ONNX links were removed after verification.
+
+### Behavior And Authority Review
+
+- Current production still calls only `current_safe_default`; later-attempt selection and observation derivation remain a Task 6 seam.
+- First-attempt selection cannot carry an observation. Later-attempt selection retains exact context, catalog version, monotonic future-time rejection, and the fixed 30-second TTL.
+- The observation factory accepts canonical camera evidence only and rejects an RGB or IR camera incarnation mismatch before deriving bounded brightness, clipping, contrast, and illumination facts.
+- Fixed-catalog BLC inclusion reuses the same exact domain validation as manually authored policies. No vendor extension control or emitter ownership changed.
+- Every catalog policy still has identical non-BLC safe settings, so the fix changes neither capture schedule, model input, threshold, authentication policy, nor password fallback.
+- Final differential review found no remaining Critical, Important, or Minor issue in the fix scope.
+
+### Fix Files
+
+- `crates/irlume-camera/src/conditioning.rs`
+- `crates/irlume-camera/src/lib.rs`
+- `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-5-implementer.md`
+
+### Fix Commit
+
+Fix Round 1 is committed separately with signed+DCO subject `fix: close conditioning authority gaps`.

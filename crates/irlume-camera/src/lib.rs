@@ -31,6 +31,7 @@
 //! panic on some drivers. Probe, don't assume.
 
 mod backend;
+pub mod capability_inventory;
 pub mod capture_qualification;
 pub mod census;
 /// Versioned, backend-neutral camera data contracts.

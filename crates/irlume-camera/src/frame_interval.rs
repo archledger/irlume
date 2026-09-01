@@ -208,6 +208,29 @@ impl FrameIntervalDomain {
             Self::Continuous(_) | Self::Stepwise(_) => None,
         }
     }
+
+    /// Materializes a bounded exact candidate set without expanding a range.
+    ///
+    /// Discrete domains retain every advertised value. Range domains retain
+    /// their endpoints and only supplied requirements that are exact members.
+    pub(crate) fn candidate_values(&self, requirements: &[FrameInterval]) -> Vec<FrameInterval> {
+        let mut values = match self {
+            Self::Discrete(discrete) => discrete.values.clone(),
+            Self::Continuous(continuous) => vec![continuous.min, continuous.max],
+            Self::Stepwise(stepwise) => vec![stepwise.min, stepwise.max],
+        };
+        if !matches!(self, Self::Discrete(_)) {
+            values.extend(
+                requirements
+                    .iter()
+                    .copied()
+                    .filter(|value| self.contains(*value)),
+            );
+        }
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
 }
 
 /// Exact V4L2 frame-interval query identity.

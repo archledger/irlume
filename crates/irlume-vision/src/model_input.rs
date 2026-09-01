@@ -703,6 +703,78 @@ pub struct FaceMeshInput {
     contract: ModelInputContractId,
 }
 
+/// FaceMesh input for direct measurement runtimes.
+///
+/// This preserves the selected production contract and preprocessing while
+/// allowing parity tooling to inject an explicit bounded horizontal crop skew.
+pub struct FaceMeshMeasurementInput {
+    input: FaceMeshInput,
+    horizontal_skew: f32,
+}
+
+impl FaceMeshMeasurementInput {
+    /// Construct an unskewed measurement input through the production adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported contract or invalid face geometry.
+    pub fn new(
+        view: CanonicalRgbView<'_>,
+        bbox: [f32; 4],
+        contract: ModelInputContractId,
+    ) -> Result<Self, ModelInputError> {
+        Self::with_horizontal_skew(view, bbox, contract, 0.0)
+    }
+
+    /// Construct a measurement input with an explicit horizontal crop skew.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the skew is finite and no larger than one
+    /// quarter of the selected FaceMesh crop.
+    pub fn with_horizontal_skew(
+        view: CanonicalRgbView<'_>,
+        bbox: [f32; 4],
+        contract: ModelInputContractId,
+        horizontal_skew: f32,
+    ) -> Result<Self, ModelInputError> {
+        Ok(Self {
+            input: FaceMeshInput::new_for_contract_with_skew(
+                view,
+                bbox,
+                contract,
+                horizontal_skew,
+            )?,
+            horizontal_skew,
+        })
+    }
+
+    #[must_use]
+    pub fn tensor(&self) -> &[f32] {
+        self.input.tensor()
+    }
+
+    #[must_use]
+    pub const fn input_side(&self) -> usize {
+        self.input.input_side
+    }
+
+    #[must_use]
+    pub const fn crop(&self) -> (f32, f32, f32) {
+        (self.input.crop_x, self.input.crop_y, self.input.crop_side)
+    }
+
+    #[must_use]
+    pub const fn contract(&self) -> ModelInputContractId {
+        self.input.contract
+    }
+
+    #[must_use]
+    pub const fn horizontal_skew(&self) -> f32 {
+        self.horizontal_skew
+    }
+}
+
 impl FaceMeshInput {
     /// Construct the current 256-side FaceMesh input contract.
     ///
@@ -723,6 +795,15 @@ impl FaceMeshInput {
         bbox: [f32; 4],
         contract: ModelInputContractId,
     ) -> Result<Self, ModelInputError> {
+        Self::new_for_contract_with_skew(view, bbox, contract, 0.0)
+    }
+
+    fn new_for_contract_with_skew(
+        view: CanonicalRgbView<'_>,
+        bbox: [f32; 4],
+        contract: ModelInputContractId,
+        horizontal_skew: f32,
+    ) -> Result<Self, ModelInputError> {
         let input_side = match contract {
             ModelInputContractId::FaceMesh192RgbV1 => 192,
             ModelInputContractId::FaceMesh256RgbV1 => 256,
@@ -733,8 +814,13 @@ impl FaceMeshInput {
         const MARGIN: f32 = 0.25;
         let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
         let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * MARGIN);
-        let (crop_x, crop_y) = (cx - half, cy - half);
         let crop_side = 2.0 * half;
+        if !horizontal_skew.is_finite() || horizontal_skew.abs() > crop_side * 0.25 {
+            return Err(ModelInputError::Preprocessing(
+                "FaceMesh measurement skew must be finite and within one quarter crop".into(),
+            ));
+        }
+        let (crop_x, crop_y) = (cx - half + horizontal_skew, cy - half);
         let mut tensor_nhwc = vec![0.0f32; input_side * input_side * 3];
         let sampler = view.as_align();
         for oy in 0..input_side {
@@ -1112,5 +1198,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input.tensor().len(), 192 * 192 * 3);
+    }
+
+    #[test]
+    fn facemesh_measurement_standard_uses_the_production_contract_and_preprocessing() {
+        let pixels: Vec<u8> = (0..12 * 10 * 3).map(|i| (i % 251) as u8).collect();
+        let rgb = CanonicalRgbView::try_from_parts(&pixels, 12, 10).unwrap();
+        let bbox = [2.0, 1.0, 9.0, 8.0];
+        let production =
+            FaceMeshInput::new_for_contract(rgb, bbox, ModelInputContractId::FaceMesh192RgbV1)
+                .unwrap();
+        let measurement =
+            FaceMeshMeasurementInput::new(rgb, bbox, ModelInputContractId::FaceMesh192RgbV1)
+                .unwrap();
+
+        assert_eq!(
+            measurement.contract(),
+            ModelInputContractId::FaceMesh192RgbV1
+        );
+        assert_eq!(measurement.horizontal_skew(), 0.0);
+        assert_eq!(measurement.tensor(), production.tensor());
+    }
+
+    #[test]
+    fn facemesh_measurement_skew_is_explicit_finite_and_crop_bounded() {
+        let pixels: Vec<u8> = (0..100 * 100 * 3).map(|i| (i % 251) as u8).collect();
+        let rgb = CanonicalRgbView::try_from_parts(&pixels, 100, 100).unwrap();
+        let bbox = [20.0, 20.0, 60.0, 60.0];
+        let standard =
+            FaceMeshMeasurementInput::new(rgb, bbox, ModelInputContractId::FaceMesh256RgbV1)
+                .unwrap();
+        let skewed = FaceMeshMeasurementInput::with_horizontal_skew(
+            rgb,
+            bbox,
+            ModelInputContractId::FaceMesh256RgbV1,
+            1.5,
+        )
+        .unwrap();
+
+        assert_eq!(skewed.contract(), standard.contract());
+        assert_eq!(skewed.horizontal_skew(), 1.5);
+        assert_eq!(skewed.crop().0 - standard.crop().0, 1.5);
+        assert_eq!(skewed.crop().1, standard.crop().1);
+        assert_eq!(skewed.crop().2, standard.crop().2);
+        assert_ne!(skewed.tensor(), standard.tensor());
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 15.01] {
+            assert!(FaceMeshMeasurementInput::with_horizontal_skew(
+                rgb,
+                bbox,
+                ModelInputContractId::FaceMesh256RgbV1,
+                invalid,
+            )
+            .is_err());
+        }
+        assert!(FaceMeshMeasurementInput::with_horizontal_skew(
+            rgb,
+            bbox,
+            ModelInputContractId::FaceMesh256RgbV1,
+            15.0,
+        )
+        .is_ok());
     }
 }

@@ -245,7 +245,7 @@ mod onnx {
     use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
     use ort::session::{builder::GraphOptimizationLevel, Session};
-    use ort::value::Tensor;
+    use ort::value::{Tensor, TensorElementType};
 
     /// Intra-op threads per ONNX session. 2 matches the measured TFLite
     /// XNNPACK knee for these small single-image models, and the ONNX
@@ -753,8 +753,7 @@ mod onnx {
         input_contract: crate::model_input::ModelInputContractId,
     }
 
-    /// Legacy FaceMesh square input side (fallback when the model does not
-    /// declare static input dims).
+    /// Legacy FaceMesh square input side.
     pub const MESH_INPUT: u32 = 192;
     /// Number of dense landmarks in the legacy topology. The newer mesh emits
     /// 478 (the same 468 plus 10 iris points); both are accepted and the
@@ -762,6 +761,41 @@ mod onnx {
     pub const MESH_N: usize = 468;
     /// Landmark count of the face_landmarker-generation mesh.
     pub const MESH_N_IRIS: usize = 478;
+
+    fn facemesh_contract_for_onnx_tensor(
+        input: Option<(TensorElementType, &[i64])>,
+    ) -> irlume_common::Result<crate::model_input::ModelInputContractId> {
+        let Some((element_type, shape)) = input else {
+            return Err(err("onnx mesh: input is not a tensor"));
+        };
+        if element_type != TensorElementType::Float32 {
+            return Err(err(format!(
+                "onnx mesh: input element type {element_type:?} is not Float32"
+            )));
+        }
+        let [batch, height, width, channels] = shape else {
+            return Err(err(format!(
+                "onnx mesh: input shape {shape:?} must have rank 4"
+            )));
+        };
+        if !matches!(*batch, -1 | 1) {
+            return Err(err(format!(
+                "onnx mesh: batch {batch} must be dynamic or static 1"
+            )));
+        }
+        if *channels != 3 {
+            return Err(err(format!(
+                "onnx mesh: channel dimension {channels} must be static 3"
+            )));
+        }
+        match (*height, *width) {
+            (192, 192) => Ok(crate::model_input::ModelInputContractId::FaceMesh192RgbV1),
+            (256, 256) => Ok(crate::model_input::ModelInputContractId::FaceMesh256RgbV1),
+            _ => Err(err(format!(
+                "onnx mesh: spatial dimensions [{height},{width}] must be static 192x192 or 256x256"
+            ))),
+        }
+    }
 
     impl FaceMesh {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -792,23 +826,16 @@ mod onnx {
                 });
             }
             let session = build(model)?;
-            // NHWC [1, side, side, 3]: take the declared H when static.
-            let input = session
-                .inputs()
-                .first()
-                .and_then(|i| match i.dtype() {
-                    ort::value::ValueType::Tensor { shape, .. } => {
-                        shape.get(1).copied().filter(|&d| d > 0)
+            // The pinned 256 graph declares a dynamic batch. The declaration
+            // may therefore be unknown or static 1, but the selected contract
+            // and every tensor produced by FaceMeshInput remain [1,H,W,3].
+            let input_contract =
+                facemesh_contract_for_onnx_tensor(session.inputs().first().and_then(|i| {
+                    match i.dtype() {
+                        ort::value::ValueType::Tensor { ty, shape, .. } => Some((*ty, &shape[..])),
+                        _ => None,
                     }
-                    _ => None,
-                })
-                .map(|d| d as u32)
-                .unwrap_or(MESH_INPUT);
-            let input_contract = match input {
-                192 => crate::model_input::ModelInputContractId::FaceMesh192RgbV1,
-                256 => crate::model_input::ModelInputContractId::FaceMesh256RgbV1,
-                _ => return Err(err(format!("onnx mesh: unsupported input side {input}"))),
-            };
+                }))?;
             Ok(Self {
                 backend: MeshBackend::Onnx(session),
                 input_contract,
@@ -1753,6 +1780,68 @@ mod onnx {
                 err.contains("OrtGetApiBase returned null"),
                 "expected the null-base refusal, got: {err}"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod facemesh_input_shape_tests {
+        use super::facemesh_contract_for_onnx_tensor;
+        use crate::model_input::ModelInputContractId;
+        use ort::value::TensorElementType;
+
+        #[test]
+        fn dynamic_or_static_one_batch_f32_nhwc_selects_the_matching_contract() {
+            assert_eq!(
+                facemesh_contract_for_onnx_tensor(Some((
+                    TensorElementType::Float32,
+                    &[1, 192, 192, 3],
+                )))
+                .unwrap(),
+                ModelInputContractId::FaceMesh192RgbV1
+            );
+            assert_eq!(
+                facemesh_contract_for_onnx_tensor(Some((
+                    TensorElementType::Float32,
+                    &[1, 256, 256, 3],
+                )))
+                .unwrap(),
+                ModelInputContractId::FaceMesh256RgbV1
+            );
+            assert_eq!(
+                facemesh_contract_for_onnx_tensor(Some((
+                    TensorElementType::Float32,
+                    &[-1, 256, 256, 3],
+                )))
+                .unwrap(),
+                ModelInputContractId::FaceMesh256RgbV1
+            );
+        }
+
+        #[test]
+        fn missing_dynamic_malformed_and_non_f32_inputs_are_rejected() {
+            assert!(facemesh_contract_for_onnx_tensor(None).is_err());
+            for shape in [
+                &[1, 256, 256][..],
+                &[2, 256, 256, 3],
+                &[1, 192, 256, 3],
+                &[1, 256, 256, 1],
+                &[1, 3, 256, 256],
+                &[1, -1, 256, 3],
+                &[1, 256, -1, 3],
+                &[1, 256, 256, -1],
+                &[1, 224, 224, 3],
+            ] {
+                assert!(facemesh_contract_for_onnx_tensor(Some((
+                    TensorElementType::Float32,
+                    shape,
+                )))
+                .is_err());
+            }
+            assert!(facemesh_contract_for_onnx_tensor(Some((
+                TensorElementType::Uint8,
+                &[1, 256, 256, 3],
+            )))
+            .is_err());
         }
     }
 }

@@ -14,10 +14,10 @@
 //!   <blaze_face_short_range.tflite> <blaze_face_full_range.tflite> \
 //!   <face_landmarks_detector.tflite> <frame.ppm>
 
-use irlume_vision::align::RgbView;
 use irlume_vision::blaze_full::FullRangeBlaze;
 use irlume_vision::model_input::{
-    BlazeFaceInput, CanonicalRgbView, DetectorInput, FullRangeBlazeFaceInput,
+    BlazeFaceInput, CanonicalRgbView, DetectorInput, FaceMeshMeasurementInput,
+    FullRangeBlazeFaceInput, ModelInputContractId,
 };
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{
@@ -37,7 +37,6 @@ const NATIVE_BLAZE_SHA256: &str =
     "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f";
 const LANDMARKER_MESH_SHA256: &str =
     "c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5";
-const MESH_MARGIN: f32 = 0.25;
 const WARMUP: usize = 10;
 const ITERS: usize = 100;
 
@@ -111,36 +110,15 @@ fn bench(stage: &str, model: &str, runtime: &str, threads: usize, mut f: impl Fn
     );
 }
 
-fn native_mesh_run(
-    mesh: &mut TfliteSession,
-    input_side: usize,
-    frame: &RgbView,
-    bbox: &[f32; 4],
-) -> Vec<(f32, f32)> {
-    let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
-    let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * MESH_MARGIN);
-    let (x0, y0) = (cx - half, cy - half);
-    let side = 2.0 * half;
-    let n = input_side;
-    let mut data = vec![0.0f32; n * n * 3];
-    for oy in 0..n {
-        for ox in 0..n {
-            let sx = x0 + (ox as f32 + 0.5) / n as f32 * side;
-            let sy = y0 + (oy as f32 + 0.5) / n as f32 * side;
-            let p = frame.sample_bilinear(sx, sy);
-            let i = (oy * n + ox) * 3;
-            data[i] = p[0] / 255.0;
-            data[i + 1] = p[1] / 255.0;
-            data[i + 2] = p[2] / 255.0;
-        }
-    }
-    let outputs = mesh.run_f32(&data).expect("native mesh run");
+fn native_mesh_run(mesh: &mut TfliteSession, input: &FaceMeshMeasurementInput) -> Vec<(f32, f32)> {
+    let outputs = mesh.run_f32(input.tensor()).expect("native mesh run");
     let raw = outputs
         .iter()
         .map(|(_, d)| d)
         .find(|d| d.len() == MESH_N_IRIS * 3)
         .expect("478-landmark output");
-    map_checked_mesh_output(raw, input_side as f32, x0, y0, side).expect("plausible mesh")
+    let (x0, y0, side) = input.crop();
+    map_checked_mesh_output(raw, input.input_side() as f32, x0, y0, side).expect("plausible mesh")
 }
 
 fn main() {
@@ -156,11 +134,6 @@ fn main() {
     };
 
     let (data, w, h) = read_pnm(Path::new(frame_path)).expect("read frame");
-    let view = RgbView {
-        data: &data,
-        width: w,
-        height: h,
-    };
     let side = w.max(h) as f32;
 
     let yunet_bytes = read_pinned(yunet_path, SHIPPED_DETECTOR_SHA256, "detector");
@@ -180,7 +153,7 @@ fn main() {
 
     // The frame must actually carry a face: a mesh timed on a non-face crop
     // or a detector timed into its miss path measures a different code path.
-    let model_view = CanonicalRgbView::try_from_align(&view).expect("valid input");
+    let model_view = CanonicalRgbView::try_from_parts(&data, w, h).expect("valid input");
     let detector_input = DetectorInput::from_rgb(model_view);
     let blaze_input = BlazeFaceInput::new(model_view);
     let full_blaze_input = FullRangeBlazeFaceInput::new(model_view);
@@ -253,14 +226,20 @@ fn main() {
             TfliteSession::from_pinned_bytes(&mesh_tfl_bytes, LANDMARKER_MESH_SHA256, threads)
                 .expect("load native mesh");
         let shape = s.input_shape().expect("mesh shape");
-        let mesh_side = shape[1];
+        let mesh_contract = match shape.as_slice() {
+            [1, 192, 192, 3] => ModelInputContractId::FaceMesh192RgbV1,
+            [1, 256, 256, 3] => ModelInputContractId::FaceMesh256RgbV1,
+            _ => panic!("unsupported native FaceMesh input shape {shape:?}"),
+        };
         bench(
             "landmarks",
             "face_landmarks_478",
             "tflite",
             threads as usize,
             || {
-                let lm = native_mesh_run(&mut s, mesh_side, &view, &top.bbox);
+                let input = FaceMeshMeasurementInput::new(model_view, top.bbox, mesh_contract)
+                    .expect("native mesh input");
+                let lm = native_mesh_run(&mut s, &input);
                 assert!(lm.len() >= MESH_N_IRIS);
             },
         );

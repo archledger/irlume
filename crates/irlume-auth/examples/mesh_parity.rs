@@ -32,8 +32,9 @@
 //!   <corpus_root>... > mesh-parity.csv
 //!   (IRLUME_TFLITE_LIB overrides the packaged libtensorflowlite_c.so)
 
-use irlume_vision::align::RgbView;
-use irlume_vision::model_input::{CanonicalRgbView, DetectorInput};
+use irlume_vision::model_input::{
+    CanonicalRgbView, DetectorInput, FaceMeshMeasurementInput, ModelInputContractId,
+};
 use irlume_vision::tflite::TfliteSession;
 use irlume_vision::{map_checked_mesh_output, Detector, FaceMesh, MESH_N, MESH_N_IRIS};
 use std::collections::BTreeMap;
@@ -44,9 +45,6 @@ use std::path::Path;
 /// silently different file must fail, not measure.
 const LANDMARKER_MESH_SHA256: &str =
     "c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5";
-
-/// Same margin the authentication path passes to `FaceMesh::landmarks`.
-const MESH_MARGIN: f32 = 0.25;
 
 /// Outer eye corners in the MediaPipe face mesh topology, the standard NME
 /// normalizer for it.
@@ -137,41 +135,20 @@ fn read_pnm(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
-/// The native mesh over the SAME crop `FaceMesh::landmarks` uses: identical
-/// x0/y0/side arithmetic, identical bilinear sampling, identical [0,1]
-/// normalization, and the shared `map_checked_mesh_output` on the way back,
-/// so the two runs differ in nothing but the weights.
+/// Run the native mesh from a typed measurement input produced by the same
+/// adapter as `FaceMesh::landmarks`.
 fn native_landmarks(
     mesh: &mut TfliteSession,
-    input_side: usize,
-    frame: &RgbView,
-    bbox: &[f32; 4],
-    skew: f32,
+    input: &FaceMeshMeasurementInput,
 ) -> Result<Vec<(f32, f32)>, String> {
-    let (cx, cy) = ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5);
-    let half = 0.5 * (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]) * (1.0 + 2.0 * MESH_MARGIN);
-    let (x0, y0) = (cx - half + skew, cy - half);
-    let side = 2.0 * half;
-    let n = input_side;
-    let mut data = vec![0.0f32; n * n * 3];
-    for oy in 0..n {
-        for ox in 0..n {
-            let sx = x0 + (ox as f32 + 0.5) / n as f32 * side;
-            let sy = y0 + (oy as f32 + 0.5) / n as f32 * side;
-            let p = frame.sample_bilinear(sx, sy);
-            let i = (oy * n + ox) * 3;
-            data[i] = p[0] / 255.0;
-            data[i + 1] = p[1] / 255.0;
-            data[i + 2] = p[2] / 255.0;
-        }
-    }
-    let outputs = mesh.run_f32(&data).map_err(|e| e.to_string())?;
+    let outputs = mesh.run_f32(input.tensor()).map_err(|e| e.to_string())?;
     let raw = outputs
         .iter()
         .map(|(_, d)| d)
         .find(|d| d.len() == MESH_N * 3 || d.len() == MESH_N_IRIS * 3)
         .ok_or_else(|| format!("no {MESH_N}/{MESH_N_IRIS}-landmark output"))?;
-    map_checked_mesh_output(raw, input_side as f32, x0, y0, side)
+    let (x0, y0, side) = input.crop();
+    map_checked_mesh_output(raw, input.input_side() as f32, x0, y0, side)
 }
 
 /// Instrument self-test: a nonzero skew shifts ONLY the native crop, and the
@@ -259,6 +236,11 @@ fn main() {
         shape.len() == 4 && shape[1] == shape[2] && shape[3] == 3,
         "unexpected native input shape {shape:?}"
     );
+    let native_contract = match shape.as_slice() {
+        [1, 192, 192, 3] => ModelInputContractId::FaceMesh192RgbV1,
+        [1, 256, 256, 3] => ModelInputContractId::FaceMesh256RgbV1,
+        _ => panic!("unsupported native FaceMesh input shape {shape:?}"),
+    };
     let native_side = shape[1];
     eprintln!("native mesh input {native_side}x{native_side}");
 
@@ -308,14 +290,9 @@ fn main() {
                     );
                     let (data, w, h) =
                         read_pnm(&bytes).unwrap_or_else(|| panic!("{}: invalid PNM", f.display()));
-                    let view = RgbView {
-                        data: &data,
-                        width: w,
-                        height: h,
-                    };
                     let name = format!("{sub}/{fname}");
                     emitted += 1;
-                    let model_view = CanonicalRgbView::try_from_align(&view)
+                    let model_view = CanonicalRgbView::try_from_parts(&data, w, h)
                         .unwrap_or_else(|e| panic!("{}: input: {e}", f.display()));
                     let faces = det
                         .detect(&DetectorInput::from_rgb(model_view))
@@ -332,13 +309,19 @@ fn main() {
                         .prepare_input(model_view, top.bbox)
                         .unwrap_or_else(|e| panic!("{}: mesh input: {e}", f.display()));
                     let a = onnx_mesh.landmarks(&mesh_input);
-                    let b = native_landmarks(
-                        &mut native,
-                        native_side,
-                        &view,
-                        &top.bbox,
-                        skew.unwrap_or(0.0),
-                    );
+                    let native_input = match skew {
+                        Some(skew) => FaceMeshMeasurementInput::with_horizontal_skew(
+                            model_view,
+                            top.bbox,
+                            native_contract,
+                            skew,
+                        ),
+                        None => {
+                            FaceMeshMeasurementInput::new(model_view, top.bbox, native_contract)
+                        }
+                    }
+                    .unwrap_or_else(|e| panic!("{}: native mesh input: {e}", f.display()));
+                    let b = native_landmarks(&mut native, &native_input);
                     let (Ok(a), Ok(b)) = (a, b) else {
                         // One side declining is a finding, not a crash: the
                         // row stays, the metrics are empty, the bound script

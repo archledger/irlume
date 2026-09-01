@@ -110,3 +110,59 @@ The review covered the complete change against base `37d4df8fd885390100377335938
 
 - Physical camera, v4l2loopback, TPM, PAM wrapper, and packaged TFLite runtime tests remain declared ignored in this environment. The unchanged preprocessing arithmetic, real ONNX model tests, parity-tool compilation, and full workspace suite cover the software boundary, but equipped-host gates may still run before production integration.
 - No system, hardware, service, enrollment, remote, or production authority state changed.
+
+## Fix Round 1
+
+### Findings Fixed
+
+1. `mesh_parity::native_landmarks` and `mp_latency_bench::native_mesh_run` independently rebuilt FaceMesh crop, sampling, NHWC, and normalization arithmetic before submitting arbitrary tensors directly to TFLite. Both paths now submit only tensors produced by `FaceMeshMeasurementInput`, which delegates to the same private preprocessing implementation as production `FaceMeshInput`.
+2. The ONNX FaceMesh loader previously read only dimension 1 and defaulted missing or dynamic geometry to 192. It now validates an f32 tensor of rank 4, accepts only declared batch `1` or unknown `-1`, requires static square 192 or 256 spatial dimensions and static channel 3, then assigns the matching existing closed contract.
+
+The pinned 256 graph declares `tensor(float) ['unk__2008',256,256,3]`; the legacy 192 graph declares `tensor(float) [1,192,192,3]`. The compatibility decision therefore permits only dynamic or static-one declared batch while every typed adapter still produces an actual batch-one tensor matching contract metadata `[1,H,W,3]`. No model artifact, checksum, pin, or contract changed.
+
+### RED Evidence
+
+- `cargo test -p irlume-vision --lib facemesh` failed compilation because `FaceMeshMeasurementInput` and `facemesh_contract_for_onnx_tensor` did not exist.
+- After the first exact static-only selector, focused tests passed but the real vision plus auth library run failed 20 authentication setup tests because the pinned 256 model declared `[-1,256,256,3]`. Independent ONNX Runtime inspection confirmed input `input_12`, type `tensor(float)`, shape `['unk__2008',256,256,3]`.
+- After the compatibility decision, `cargo test -p irlume-vision --lib facemesh_input_shape_tests` passed the malformed-input test and failed only the new dynamic-batch acceptance assertion, returning `input shape [-1, 256, 256, 3] must be [1,192,192,3] or [1,256,256,3]`.
+
+### GREEN Evidence
+
+- `cargo test -p irlume-vision --lib model_input::tests`: 9 passed, 0 failed.
+- `cargo test -p irlume-vision --lib facemesh_input_shape_tests`: 2 passed, 0 failed.
+- `cargo check -p irlume-auth --examples`: passed.
+- `cargo test -p irlume-vision -p irlume-auth --lib`: 222 passed, 0 failed, 4 declared environment tests ignored.
+- `cargo test --workspace --all-targets --locked`: 1,959 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo check --workspace --all-targets --locked`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- Added-line U+2014 check: no matches.
+- Focused source scan found no sampling loop, raw FaceMesh tensor allocation, or `run_f32(&data)` in either affected example. Their only FaceMesh TFLite submissions are `run_f32(input.tensor())`.
+- All seven model assets passed `models/SHA256SUMS`; six temporary ONNX links were removed after verification.
+
+### Files Changed
+
+- `crates/irlume-vision/src/model_input.rs`
+- `crates/irlume-vision/src/lib.rs`
+- `crates/irlume-auth/examples/mesh_parity.rs`
+- `crates/irlume-auth/examples/mp_latency_bench.rs`
+- `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-4-implementer.md`
+
+### Commit
+
+Fix Round 1 is the separate signed+DCO commit with subject `fix: close typed FaceMesh authority gaps`; this report is committed with that fix.
+
+### Self-Review
+
+- Critical: 0 remaining.
+- Important: 0 remaining; both independently verified findings are closed.
+- Minor: 0 remaining.
+- The measurement adapter adds no contract. Standard measurement tensors are byte-for-byte equal to production adapter tensors for the same view, box, and contract.
+- Horizontal skew is explicit, finite, and limited to one quarter of the selected crop. It changes only crop X and uses the shared sampler and normalization implementation.
+- The loader rejects missing or non-tensor input, non-f32 type, wrong rank, static batch other than 1, dynamic or unsupported spatial dimensions, nonsquare dimensions, wrong layout dimensions, and dynamic or non-3 channels before contract assignment.
+
+### Concerns
+
+- The packaged TFLite runtime end-to-end test, physical camera, v4l2loopback, TPM, and PAM wrapper tests remain declared ignored in this environment. Both TFLite examples compile and their tensor authority is covered by focused adapter tests and source inspection.
+- No model artifact, checksum, inference threshold, crop policy, normalization arithmetic, production verdict, system state, or external authority changed.

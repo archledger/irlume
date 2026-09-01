@@ -257,20 +257,29 @@ pub struct QualifiedProfileMetrics {
 }
 
 impl QualifiedProfileMetrics {
-    /// Binds qualification metrics and a hard-gate verdict to an exact profile.
-    #[must_use]
-    pub const fn new(
+    /// Binds latency and a hard-gate verdict to an exact profile.
+    ///
+    /// Nominal payload is derived from the profile and cannot be supplied by a
+    /// caller independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the profile's checked nominal payload is not
+    /// representable.
+    pub fn new(
         profile: PairTransportProfile,
-        nominal_payload_bytes_per_second: u128,
         p95_latency_ms: u64,
         verdict: CandidateVerdict,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProfileError> {
+        let nominal_payload_bytes_per_second = profile
+            .nominal_payload_bytes_per_second()
+            .ok_or(ProfileError::NominalPayloadOverflow)?;
+        Ok(Self {
             profile,
             nominal_payload_bytes_per_second,
             p95_latency_ms,
             verdict,
-        }
+        })
     }
 
     /// Returns the stable profile identifier.
@@ -363,7 +372,7 @@ pub fn rank_balanced(
 ) -> Option<&QualifiedProfileMetrics> {
     pareto_frontier(candidates)
         .into_iter()
-        .filter_map(|candidate| normalized_cost(candidate, budget).map(|cost| (candidate, cost)))
+        .map(|candidate| (candidate, normalized_cost(candidate, budget)))
         .min_by(|(left, left_cost), (right, right_cost)| {
             left_cost
                 .cmp(right_cost)
@@ -386,15 +395,19 @@ fn dominates(left: &QualifiedProfileMetrics, right: &QualifiedProfileMetrics) ->
     payload_no_worse && latency_no_worse && improves_one
 }
 
-fn normalized_cost(candidate: &QualifiedProfileMetrics, budget: RankingBudget) -> Option<u128> {
+fn normalized_cost(candidate: &QualifiedProfileMetrics, budget: RankingBudget) -> u128 {
     let payload = candidate
         .nominal_payload_bytes_per_second
-        .checked_mul(FIXED_POINT_MILLION)?
-        .checked_div(budget.payload_bytes_per_second.get())?;
+        .checked_mul(FIXED_POINT_MILLION)
+        .expect("derived profile payload fits fixed-point normalization")
+        / budget.payload_bytes_per_second.get();
     let latency = u128::from(candidate.p95_latency_ms)
-        .checked_mul(FIXED_POINT_MILLION)?
-        .checked_div(u128::from(budget.p95_latency_ms.get()))?;
-    payload.checked_add(latency)
+        .checked_mul(FIXED_POINT_MILLION)
+        .expect("u64 latency fits fixed-point normalization")
+        / u128::from(budget.p95_latency_ms.get());
+    payload
+        .checked_add(latency)
+        .expect("valid profile and latency costs fit their fixed-point sum")
 }
 
 fn checked_ceil_div(numerator: u128, denominator: u128) -> Option<u128> {
@@ -419,6 +432,8 @@ pub enum ProfileError {
     WrongStreamRole,
     /// Ranking version or a normalization denominator was zero.
     InvalidRankingBudget,
+    /// The exact profile's nominal payload was not representable.
+    NominalPayloadOverflow,
 }
 
 impl std::fmt::Display for ProfileError {
@@ -430,6 +445,7 @@ impl std::fmt::Display for ProfileError {
             Self::InvalidProfileId => "transport profile identifier is invalid",
             Self::WrongStreamRole => "transport profile stream role is invalid",
             Self::InvalidRankingBudget => "ranking budget contains zero",
+            Self::NominalPayloadOverflow => "transport profile nominal payload overflowed",
         })
     }
 }
@@ -465,18 +481,35 @@ mod tests {
         .unwrap()
     }
 
+    fn profile_with_payload(id: &str, payload_bytes_per_second: u32) -> PairTransportProfile {
+        assert!(payload_bytes_per_second >= 2);
+        PairTransportProfile::new(
+            id,
+            stream(
+                StreamRole::Rgb,
+                DecodedPixelFormat::Grey8,
+                1,
+                payload_bytes_per_second - 1,
+                1,
+            ),
+            stream(StreamRole::Ir, DecodedPixelFormat::Grey8, 1, 1, 1),
+            CaptureSchedule::Sequential,
+        )
+        .unwrap()
+    }
+
     fn candidate(
         id: &str,
-        payload_bytes_per_second: u128,
+        payload_bytes_per_second: u32,
         p95_latency_ms: u64,
         verdict: CandidateVerdict,
     ) -> QualifiedProfileMetrics {
         QualifiedProfileMetrics::new(
-            profile(id),
-            payload_bytes_per_second,
+            profile_with_payload(id, payload_bytes_per_second),
             p95_latency_ms,
             verdict,
         )
+        .unwrap()
     }
 
     fn budget() -> RankingBudget {
@@ -599,6 +632,54 @@ mod tests {
         assert_eq!(
             profile("asus-15-15").nominal_payload_bytes_per_second(),
             Some(13_056_000)
+        );
+    }
+
+    #[test]
+    fn qualified_metrics_derive_payload_from_the_bound_profile() {
+        let metrics = QualifiedProfileMetrics::new(
+            profile("derived-payload"),
+            6_400,
+            CandidateVerdict::Passed,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.nominal_payload_bytes_per_second(), 13_056_000);
+    }
+
+    #[test]
+    fn maximum_valid_profile_remains_rankable_with_minimum_budgets() {
+        let maximum_stream = |role| {
+            StreamTuple::new(
+                role,
+                DecodedPixelFormat::Yuyv,
+                u32::MAX,
+                u32::MAX,
+                interval(1, u32::MAX),
+            )
+            .unwrap()
+        };
+        let maximum = PairTransportProfile::new(
+            "maximum",
+            maximum_stream(StreamRole::Rgb),
+            maximum_stream(StreamRole::Ir),
+            CaptureSchedule::Concurrent,
+        )
+        .unwrap();
+        let candidate =
+            QualifiedProfileMetrics::new(maximum, u64::MAX, CandidateVerdict::Passed).unwrap();
+
+        assert_eq!(
+            candidate.nominal_payload_bytes_per_second(),
+            316_912_649_835_696_421_541_200_789_500
+        );
+        assert_eq!(
+            rank_balanced(
+                std::slice::from_ref(&candidate),
+                RankingBudget::new(1, 1, 1).unwrap(),
+            )
+            .map(QualifiedProfileMetrics::id),
+            Some("maximum")
         );
     }
 

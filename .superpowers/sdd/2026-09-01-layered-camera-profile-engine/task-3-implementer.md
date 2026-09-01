@@ -95,3 +95,52 @@ The review covered the complete change against base `50572617382149f0562571b700a
 
 - None blocking Task 3.
 - Physical camera and v4l2loopback tests remain declared ignored in this environment. Existing hardware behavior is preserved by pure fixture equivalence and the unchanged capture selection policy, but the controller may run those gates on equipped hosts before production integration.
+
+## Fix Round 1
+
+### Defects Fixed
+
+- Removed the public `TryFrom<Frame>` and `TryFrom<(Frame, IrCaptureStats)>` implementations. External callers can no longer turn a publicly mutable `Frame` into canonical evidence.
+- Bound every internal canonical frame to the width and height retained by its validated runtime format provenance, in addition to the existing role and payload checks.
+- Added `EvidenceError::InvalidStatistics` and made IR burst construction recompute contributor-dependent facts from retained contributor pixels and illumination provenance.
+- Validated burst, camera-classified, and camera-lit counts; ambient observation and mean; lit mean; selected gate index; subtraction partner; and all three saturation fractions.
+- Preserved `white_level` as capture-owned evidence because decoded pixels and provenance cannot reconstruct the negotiated sensor ceiling.
+- Kept a test-only crate-private IR constructor for existing unit fixtures that intentionally exercise downstream behavior with synthetic statistics. It does not exist in production builds and exposes no external authority.
+
+### RED Evidence
+
+- The first focused run failed to compile because the required `InvalidStatistics` error contract did not exist.
+- After adding only that error variant, `cargo test -p irlume-camera --lib evidence::tests` ran 11 tests: 7 passed and the 4 new authority regressions failed because malformed geometry, counts, ambient facts, and selected/subtracted contributor claims were accepted.
+- `cargo test -p irlume-camera --doc` failed both new compile-fail tests because both public conversions still compiled.
+
+### GREEN Evidence
+
+- `cargo test -p irlume-camera --lib evidence::tests`: 11 passed, 0 failed.
+- `cargo test -p irlume-camera --doc`: 2 compile-fail tests passed, 0 failed.
+- `cargo test -p irlume-camera --lib`: 619 passed, 0 failed, 26 declared hardware tests ignored.
+- `cargo test -p irlume-camera --all-targets --locked`: passed 619 library tests, 12 contract tests, 1 qualification contract, and 2 example tests; 26 declared hardware tests ignored.
+- `cargo check --workspace --all-targets`: passed.
+- `cargo test --workspace --all-targets --locked`: 1,947 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+The linked worktree still lacks six ignored ONNX assets. Six temporary symlinks to the parent checkout were created after all seven files passed `models/SHA256SUMS`; the full workspace suite passed, and every temporary link was removed.
+
+### Files Changed
+
+- `crates/irlume-camera/src/evidence.rs`
+- `crates/irlume-camera/src/lib.rs`
+- `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-3-implementer.md`
+
+### Self-Review
+
+- Public single-frame `Frame` APIs remain unchanged; only the unintended public canonical conversions were removed.
+- Production capture still computes the same means, metadata counts, clipping fractions, gate-frame index, ambient partner, and output pixels before canonical construction. Validation independently recomputes those facts and rejects disagreement without changing thresholds, selection policy, model inputs, or capture scheduling.
+- Geometry is checked against provenance before payload acceptance, closing the mutable-field relabeling path for both RGB and IR evidence.
+- Compile-fail doctests prove both external minting routes remain unavailable.
+- All changed production methods remain crate-private, canonical pixel fields remain owned and private, and the synthetic constructor is compiled only under `cfg(test)`.
+
+### Concerns
+
+- Physical camera and v4l2loopback tests remain declared ignored in this environment. The unchanged production calculations and fixture equivalence cover the authority correction, but equipped-host gates may still be run before production integration.

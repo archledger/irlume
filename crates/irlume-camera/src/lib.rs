@@ -11699,14 +11699,15 @@ mod tests {
     }
 
     fn rgb_evidence(data: &[u8]) -> CanonicalRgbEvidence {
-        CanonicalRgbEvidence::try_from(frame(data)).expect("test canonical RGB evidence")
+        CanonicalRgbEvidence::from_temporal_median(vec![frame(data)])
+            .expect("test canonical RGB evidence")
     }
 
     fn ir_evidence(data: &[u8], stats: IrCaptureStats) -> CanonicalIrEvidence {
-        CanonicalIrEvidence::try_from((
+        CanonicalIrEvidence::from_test_frame(
             frame_at_for(data, std::time::Instant::now(), Spectrum::Ir),
             stats,
-        ))
+        )
         .expect("test canonical IR evidence")
     }
 
@@ -12244,8 +12245,8 @@ mod tests {
             Err(RuntimePairViolation::CameraGeneration)
         );
 
-        let canonical_rgb = CanonicalRgbEvidence::try_from(rgb).unwrap();
-        let canonical_ir = CanonicalIrEvidence::try_from((ir, stats(80.0))).unwrap();
+        let canonical_rgb = CanonicalRgbEvidence::from_temporal_median(vec![rgb]).unwrap();
+        let canonical_ir = CanonicalIrEvidence::from_test_frame(ir, stats(80.0)).unwrap();
         assert_eq!(
             contract
                 .diagnostic_canonical_trace_events(&canonical_rgb, &canonical_ir)
@@ -12280,7 +12281,7 @@ mod tests {
                 ..
             })
         ));
-        let canonical = CanonicalRgbEvidence::try_from(rgb).unwrap();
+        let canonical = CanonicalRgbEvidence::from_temporal_median(vec![rgb]).unwrap();
         assert!(matches!(
             diagnostic_manifest_stream_evidence(canonical.manifest()),
             Some(TraceEventKind::StreamEvidence {

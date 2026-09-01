@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU32;
 
-use crate::contracts::StreamRole;
+use crate::contracts::{IlluminationProvenance, StreamRole};
 use crate::frame_provenance::{
     AggregateFrameProvenance, ContributorSelection, DeliveredRateEvidence, RuntimeFrameProvenance,
     RuntimeProvenanceError,
@@ -24,6 +24,7 @@ pub enum EvidenceError {
     TooFewContributors,
     TooManyContributors,
     InvalidSelection,
+    InvalidStatistics,
     InvalidProvenance,
 }
 
@@ -36,6 +37,7 @@ impl std::fmt::Display for EvidenceError {
             Self::TooFewContributors => "canonical evidence has no contributors",
             Self::TooManyContributors => "canonical evidence exceeds 64 contributors",
             Self::InvalidSelection => "canonical evidence selection is out of bounds",
+            Self::InvalidStatistics => "canonical IR statistics disagree with contributors",
             Self::InvalidProvenance => "canonical evidence contributors have invalid provenance",
         })
     }
@@ -149,6 +151,16 @@ impl std::fmt::Debug for EvidenceManifest {
 }
 
 /// Owned, validated RGB8 scene evidence before model-specific preprocessing.
+///
+/// Canonical evidence can only be produced by capture-owned reduction paths.
+///
+/// ```compile_fail
+/// use irlume_camera::{CanonicalRgbEvidence, Frame};
+///
+/// fn mint_from_mutable_frame(frame: Frame) {
+///     let _ = CanonicalRgbEvidence::try_from(frame);
+/// }
+/// ```
 pub struct CanonicalRgbEvidence {
     width: NonZeroU32,
     height: NonZeroU32,
@@ -168,7 +180,8 @@ impl CanonicalRgbEvidence {
             validate_frame(frame, Spectrum::Rgb, 3)?;
         }
         if frames.len() == 1 {
-            return Self::try_from(frames.pop().expect("one validated contributor"));
+            let frame = frames.pop().expect("one validated contributor");
+            return Self::from_parts(frame.width, frame.height, frame.data, frame.provenance);
         }
 
         let width = frames[0].width;
@@ -252,15 +265,6 @@ impl CanonicalRgbEvidence {
     }
 }
 
-impl TryFrom<Frame> for CanonicalRgbEvidence {
-    type Error = EvidenceError;
-
-    fn try_from(frame: Frame) -> Result<Self, Self::Error> {
-        validate_frame(&frame, Spectrum::Rgb, 3)?;
-        Self::from_parts(frame.width, frame.height, frame.data, frame.provenance)
-    }
-}
-
 impl std::fmt::Debug for CanonicalRgbEvidence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CanonicalRgbEvidence")
@@ -273,6 +277,16 @@ impl std::fmt::Debug for CanonicalRgbEvidence {
 }
 
 /// Owned, validated GREY8 scene evidence before model-specific preprocessing.
+///
+/// Canonical evidence can only be produced by capture-owned reduction paths.
+///
+/// ```compile_fail
+/// use irlume_camera::{CanonicalIrEvidence, Frame, IrCaptureStats};
+///
+/// fn mint_from_mutable_frame(input: (Frame, IrCaptureStats)) {
+///     let _ = CanonicalIrEvidence::try_from(input);
+/// }
+/// ```
 pub struct CanonicalIrEvidence {
     width: NonZeroU32,
     height: NonZeroU32,
@@ -309,6 +323,7 @@ impl CanonicalIrEvidence {
         {
             return Err(EvidenceError::InvalidProvenance);
         }
+        validate_ir_statistics(&frames, selected_index, ambient_index, &stats)?;
         let (grey8, saturation_source, selection) = match ambient_index {
             Some(ambient_index) if ambient_index != selected_index => {
                 let ambient = frames
@@ -424,12 +439,12 @@ impl CanonicalIrEvidence {
         )
         .map_err(|_| EvidenceError::InvalidProvenance)
     }
-}
 
-impl TryFrom<(Frame, IrCaptureStats)> for CanonicalIrEvidence {
-    type Error = EvidenceError;
-
-    fn try_from((frame, stats): (Frame, IrCaptureStats)) -> Result<Self, Self::Error> {
+    #[cfg(test)]
+    pub(crate) fn from_test_frame(
+        frame: Frame,
+        stats: IrCaptureStats,
+    ) -> Result<Self, EvidenceError> {
         validate_frame(&frame, Spectrum::Ir, 1)?;
         Self::from_parts(
             frame.width,
@@ -469,6 +484,10 @@ fn validate_frame(
     if frame.spectrum != expected_spectrum || frame.provenance.stream_role() != expected_role {
         return Err(EvidenceError::WrongRole);
     }
+    let format = frame.provenance.format();
+    if frame.width != format.width() || frame.height != format.height() {
+        return Err(EvidenceError::InvalidProvenance);
+    }
     let width = NonZeroU32::new(frame.width).ok_or(EvidenceError::InvalidGeometry)?;
     let height = NonZeroU32::new(frame.height).ok_or(EvidenceError::InvalidGeometry)?;
     validate_payload(width, height, bytes_per_pixel, frame.data.len())
@@ -493,6 +512,137 @@ fn validate_payload(
         return Err(EvidenceError::PayloadLength);
     }
     Ok(())
+}
+
+fn validate_ir_statistics(
+    frames: &[Frame],
+    selected_index: usize,
+    ambient_index: Option<usize>,
+    stats: &IrCaptureStats,
+) -> Result<(), EvidenceError> {
+    let means: Vec<f64> = frames
+        .iter()
+        .map(|frame| {
+            frame
+                .data
+                .iter()
+                .map(|&pixel| f64::from(pixel))
+                .sum::<f64>()
+                / frame.data.len() as f64
+        })
+        .collect();
+    let flags: Vec<Option<crate::ir_metadata::Illumination>> = frames
+        .iter()
+        .map(|frame| match frame.provenance.illumination() {
+            IlluminationProvenance::ActiveIr => Some(crate::ir_metadata::Illumination::Lit),
+            IlluminationProvenance::Ambient => Some(crate::ir_metadata::Illumination::Dark),
+            IlluminationProvenance::Unknown => None,
+        })
+        .collect();
+    let camera_classified_frames = flags.iter().filter(|flag| flag.is_some()).count();
+    let camera_lit_frames = flags
+        .iter()
+        .filter(|flag| matches!(flag, Some(crate::ir_metadata::Illumination::Lit)))
+        .count();
+    let ambient_observed = camera_lit_frames > 0
+        && flags
+            .iter()
+            .any(|flag| matches!(flag, Some(crate::ir_metadata::Illumination::Dark)));
+    let clipped_fracs: Option<Vec<f64>> = stats.white_level.map(|white| {
+        frames
+            .iter()
+            .map(|frame| crate::ir_probe::saturated_fraction(&frame.data, white))
+            .collect()
+    });
+    let expected_selected =
+        crate::ir_metadata::best_gate_frame(&means, &flags, clipped_fracs.as_deref())
+            .ok_or(EvidenceError::InvalidStatistics)?;
+    if selected_index != expected_selected {
+        return Err(EvidenceError::InvalidStatistics);
+    }
+    if let Some(ambient_index) = ambient_index {
+        if crate::ir_metadata::ambient_partner(selected_index, &means, &flags)
+            != Some(ambient_index)
+        {
+            return Err(EvidenceError::InvalidStatistics);
+        }
+    }
+
+    let burst_min = means.iter().copied().fold(f64::INFINITY, f64::min);
+    let burst_max = means.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (lit_mean, ambient_mean) = if camera_classified_frames == 0 {
+        (burst_max, burst_min)
+    } else {
+        let dark_min = means
+            .iter()
+            .zip(&flags)
+            .filter(|(_, flag)| matches!(flag, Some(crate::ir_metadata::Illumination::Dark)))
+            .map(|(mean, _)| *mean)
+            .fold(f64::INFINITY, f64::min);
+        (
+            means[selected_index],
+            if dark_min.is_finite() {
+                dark_min
+            } else {
+                burst_min
+            },
+        )
+    };
+    let (lit_saturated_frac, ambient_saturated_frac, persistent_saturated_frac) =
+        expected_saturation_statistics(frames, &means, &flags, selected_index, stats.white_level);
+    if stats.burst_frames != frames.len()
+        || stats.camera_classified_frames != camera_classified_frames
+        || stats.camera_lit_frames != camera_lit_frames
+        || stats.ambient_observed != ambient_observed
+        || stats.lit_mean != lit_mean as f32
+        || stats.ambient_mean != ambient_mean as f32
+        || stats.lit_saturated_frac != lit_saturated_frac
+        || stats.ambient_saturated_frac != ambient_saturated_frac
+        || stats.persistent_saturated_frac != persistent_saturated_frac
+    {
+        return Err(EvidenceError::InvalidStatistics);
+    }
+    Ok(())
+}
+
+fn expected_saturation_statistics(
+    frames: &[Frame],
+    means: &[f64],
+    flags: &[Option<crate::ir_metadata::Illumination>],
+    selected_index: usize,
+    white_level: Option<u8>,
+) -> (Option<f32>, Option<f32>, Option<f32>) {
+    let Some(white) = white_level else {
+        return (None, None, None);
+    };
+    if !matches!(
+        flags.get(selected_index),
+        Some(Some(crate::ir_metadata::Illumination::Lit))
+    ) {
+        return (None, None, None);
+    }
+    let lit = &frames[selected_index].data;
+    let lit_saturated = Some(crate::ir_probe::saturated_fraction(lit, white) as f32);
+    let Some(ambient_index) = crate::ir_metadata::ambient_partner(selected_index, means, flags)
+    else {
+        return (lit_saturated, None, None);
+    };
+    if !matches!(
+        flags.get(ambient_index),
+        Some(Some(crate::ir_metadata::Illumination::Dark))
+    ) {
+        return (lit_saturated, None, None);
+    }
+    let ambient = &frames[ambient_index].data;
+    let ambient_saturated = Some(crate::ir_probe::saturated_fraction(ambient, white) as f32);
+    let persistent_saturated = Some(
+        lit.iter()
+            .zip(ambient)
+            .filter(|(lit, ambient)| **lit >= white && **ambient >= white)
+            .count() as f32
+            / lit.len() as f32,
+    );
+    (lit_saturated, ambient_saturated, persistent_saturated)
 }
 
 #[cfg(test)]
@@ -618,28 +768,53 @@ mod tests {
         }
     }
 
+    fn coherent_ir_stats(
+        lit_mean: f32,
+        ambient_mean: f32,
+        burst_frames: usize,
+        white_level: Option<u8>,
+        lit_saturated_frac: Option<f32>,
+    ) -> IrCaptureStats {
+        IrCaptureStats {
+            lit_mean,
+            ambient_mean,
+            ambient_observed: true,
+            burst_frames,
+            camera_classified_frames: burst_frames,
+            camera_lit_frames: 1,
+            white_level,
+            lit_saturated_frac,
+            ambient_saturated_frac: white_level.map(|_| 0.0),
+            persistent_saturated_frac: white_level.map(|_| 0.0),
+        }
+    }
+
     #[test]
     fn canonical_rgb_rejects_short_zero_geometry_and_wrong_role_frames() {
         let mut short = FixtureStream::new(Spectrum::Rgb, 4, 4);
         assert_eq!(
-            CanonicalRgbEvidence::try_from(
+            CanonicalRgbEvidence::from_temporal_median(vec![
                 short.frame(vec![0; 47], IlluminationProvenance::Unknown)
-            )
+            ])
             .unwrap_err(),
             EvidenceError::PayloadLength
         );
 
         let mut zero = FixtureStream::new(Spectrum::Rgb, 0, 4);
         assert_eq!(
-            CanonicalRgbEvidence::try_from(zero.frame(vec![], IlluminationProvenance::Unknown))
-                .unwrap_err(),
+            CanonicalRgbEvidence::from_temporal_median(vec![
+                zero.frame(vec![], IlluminationProvenance::Unknown)
+            ])
+            .unwrap_err(),
             EvidenceError::InvalidGeometry
         );
 
         let mut ir = FixtureStream::new(Spectrum::Ir, 4, 4);
         assert_eq!(
-            CanonicalRgbEvidence::try_from(ir.frame(vec![0; 16], IlluminationProvenance::ActiveIr))
-                .unwrap_err(),
+            CanonicalRgbEvidence::from_temporal_median(vec![
+                ir.frame(vec![0; 16], IlluminationProvenance::ActiveIr)
+            ])
+            .unwrap_err(),
             EvidenceError::WrongRole
         );
     }
@@ -648,30 +823,45 @@ mod tests {
     fn canonical_ir_rejects_short_zero_geometry_and_wrong_role_frames() {
         let mut short = FixtureStream::new(Spectrum::Ir, 4, 4);
         assert_eq!(
-            CanonicalIrEvidence::try_from((
-                short.frame(vec![0; 15], IlluminationProvenance::ActiveIr),
+            CanonicalIrEvidence::from_burst(
+                vec![
+                    short.frame(vec![0; 15], IlluminationProvenance::ActiveIr),
+                    short.frame(vec![0; 16], IlluminationProvenance::Ambient),
+                ],
+                0,
+                None,
                 ir_stats(Some(255)),
-            ))
+            )
             .unwrap_err(),
             EvidenceError::PayloadLength
         );
 
         let mut zero = FixtureStream::new(Spectrum::Ir, 4, 0);
         assert_eq!(
-            CanonicalIrEvidence::try_from((
-                zero.frame(vec![], IlluminationProvenance::ActiveIr),
+            CanonicalIrEvidence::from_burst(
+                vec![
+                    zero.frame(vec![], IlluminationProvenance::ActiveIr),
+                    zero.frame(vec![], IlluminationProvenance::Ambient),
+                ],
+                0,
+                None,
                 ir_stats(Some(255)),
-            ))
+            )
             .unwrap_err(),
             EvidenceError::InvalidGeometry
         );
 
         let mut rgb = FixtureStream::new(Spectrum::Rgb, 2, 2);
         assert_eq!(
-            CanonicalIrEvidence::try_from((
-                rgb.frame(vec![0; 12], IlluminationProvenance::Unknown),
+            CanonicalIrEvidence::from_burst(
+                vec![
+                    rgb.frame(vec![0; 12], IlluminationProvenance::Unknown),
+                    rgb.frame(vec![0; 12], IlluminationProvenance::Unknown),
+                ],
+                0,
+                None,
                 ir_stats(Some(255)),
-            ))
+            )
             .unwrap_err(),
             EvidenceError::WrongRole
         );
@@ -718,6 +908,128 @@ mod tests {
     }
 
     #[test]
+    fn canonical_reduction_rejects_geometry_that_disagrees_with_provenance() {
+        let mut stream = FixtureStream::new(Spectrum::Rgb, 2, 1);
+        let mut frame = stream.frame(vec![1, 2, 3, 4, 5, 6], IlluminationProvenance::Unknown);
+        frame.width = 1;
+        frame.data.truncate(3);
+
+        assert_eq!(
+            CanonicalRgbEvidence::from_temporal_median(vec![frame]).unwrap_err(),
+            EvidenceError::InvalidProvenance
+        );
+
+        let mut stream = FixtureStream::new(Spectrum::Ir, 2, 1);
+        let mut lit = stream.frame(vec![100, 110], IlluminationProvenance::ActiveIr);
+        lit.width = 1;
+        lit.data.truncate(1);
+        let ambient = stream.frame(vec![10, 20], IlluminationProvenance::Ambient);
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(vec![lit, ambient], 0, None, ir_stats(None),)
+                .unwrap_err(),
+            EvidenceError::InvalidProvenance
+        );
+    }
+
+    #[test]
+    fn ir_burst_rejects_contributor_count_statistics_mismatch() {
+        let burst = || {
+            let mut stream = FixtureStream::new(Spectrum::Ir, 1, 1);
+            vec![
+                stream.frame(vec![10], IlluminationProvenance::Ambient),
+                stream.frame(vec![100], IlluminationProvenance::ActiveIr),
+            ]
+        };
+        let mut stats = coherent_ir_stats(100.0, 10.0, 2, None, None);
+        stats.burst_frames = 3;
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(burst(), 1, None, stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+
+        let mut stats = coherent_ir_stats(100.0, 10.0, 2, None, None);
+        stats.camera_classified_frames = 1;
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(burst(), 1, None, stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+
+        let mut stats = coherent_ir_stats(100.0, 10.0, 2, None, None);
+        stats.camera_lit_frames = 2;
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(burst(), 1, None, stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+    }
+
+    #[test]
+    fn ir_burst_rejects_ambient_statistics_mismatch() {
+        let burst = || {
+            let mut stream = FixtureStream::new(Spectrum::Ir, 1, 1);
+            vec![
+                stream.frame(vec![10], IlluminationProvenance::Ambient),
+                stream.frame(vec![100], IlluminationProvenance::ActiveIr),
+            ]
+        };
+        let mut stats = coherent_ir_stats(100.0, 10.0, 2, None, None);
+        stats.ambient_observed = false;
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(burst(), 1, None, stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+
+        let mut stats = coherent_ir_stats(100.0, 10.0, 2, None, None);
+        stats.ambient_mean = 11.0;
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(burst(), 1, None, stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+    }
+
+    #[test]
+    fn ir_burst_rejects_selected_and_subtracted_contributor_mismatch() {
+        let mut selected_stream = FixtureStream::new(Spectrum::Ir, 1, 1);
+        let selected_frames = vec![
+            selected_stream.frame(vec![10], IlluminationProvenance::Ambient),
+            selected_stream.frame(vec![100], IlluminationProvenance::ActiveIr),
+        ];
+        let stats = coherent_ir_stats(100.0, 10.0, 2, None, None);
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(selected_frames, 0, None, stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+
+        let mut subtracted_stream = FixtureStream::new(Spectrum::Ir, 1, 1);
+        let subtracted_frames = vec![
+            subtracted_stream.frame(vec![10], IlluminationProvenance::Ambient),
+            subtracted_stream.frame(vec![100], IlluminationProvenance::ActiveIr),
+            subtracted_stream.frame(vec![20], IlluminationProvenance::Ambient),
+            subtracted_stream.frame(vec![5], IlluminationProvenance::Ambient),
+        ];
+        let stats = coherent_ir_stats(100.0, 5.0, 4, None, None);
+        assert_eq!(
+            CanonicalIrEvidence::from_burst(subtracted_frames, 1, Some(3), stats).unwrap_err(),
+            EvidenceError::InvalidStatistics
+        );
+    }
+
+    #[test]
+    fn ir_burst_accepts_statistics_derived_from_its_contributors() {
+        let mut stream = FixtureStream::new(Spectrum::Ir, 1, 1);
+        let frames = vec![
+            stream.frame(vec![10], IlluminationProvenance::Ambient),
+            stream.frame(vec![255], IlluminationProvenance::ActiveIr),
+        ];
+        let stats = coherent_ir_stats(255.0, 10.0, 2, Some(255), Some(1.0));
+
+        let evidence = CanonicalIrEvidence::from_burst(frames, 1, None, stats)
+            .expect("coherent burst statistics");
+
+        assert_eq!(evidence.pixels(), &[255]);
+        assert_eq!(evidence.stats().burst_frames, 2);
+    }
+
+    #[test]
     fn ir_default_selection_preserves_raw_pixels_and_clipping_source() {
         let mut stream = FixtureStream::new(Spectrum::Ir, 2, 2);
         let frames = vec![
@@ -725,13 +1037,14 @@ mod tests {
             stream.frame(vec![100, 255, 120, 130], IlluminationProvenance::ActiveIr),
         ];
 
-        let evidence = CanonicalIrEvidence::from_burst(frames, 1, None, ir_stats(Some(255)))
+        let stats = coherent_ir_stats(151.25, 4.5, 2, Some(255), Some(0.25));
+        let evidence = CanonicalIrEvidence::from_burst(frames, 1, None, stats)
             .expect("valid selected IR frame");
 
         assert_eq!(evidence.pixels(), &[100, 255, 120, 130]);
         assert_eq!(evidence.saturation_pixels(), &[100, 255, 120, 130]);
         assert_eq!(evidence.dimensions(), (2, 2));
-        assert_eq!(evidence.stats().lit_mean, 100.0);
+        assert_eq!(evidence.stats().lit_mean, 151.25);
         assert_eq!(
             evidence.manifest().selection(),
             EvidenceSelection::Selected { index: 1 }
@@ -747,7 +1060,8 @@ mod tests {
             stream.frame(vec![3, 40, 20, 1], IlluminationProvenance::Ambient),
         ];
 
-        let evidence = CanonicalIrEvidence::from_burst(frames, 0, Some(1), ir_stats(Some(255)))
+        let stats = coherent_ir_stats(98.75, 16.0, 2, Some(255), Some(0.25));
+        let evidence = CanonicalIrEvidence::from_burst(frames, 0, Some(1), stats)
             .expect("valid subtracted IR evidence");
 
         assert_eq!(evidence.pixels(), &[7, 0, 80, 254]);

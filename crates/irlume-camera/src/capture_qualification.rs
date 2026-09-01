@@ -328,6 +328,11 @@ impl CameraEndpoint {
     fn clear_serial_for_test(&mut self) {
         self.serial = None;
     }
+
+    #[must_use]
+    pub const fn connection(&self) -> &ConnectionContext {
+        &self.connection
+    }
 }
 
 /// The stream irlume requested before the driver adjusted it.
@@ -547,6 +552,53 @@ impl StreamContract {
     #[must_use]
     pub const fn minimum_rate(&self) -> ExactRate {
         self.minimum_rate
+    }
+
+    pub(crate) fn matches_exact_tuple(&self, tuple: &crate::profile::StreamTuple) -> bool {
+        let expected_role = match tuple.role() {
+            crate::contracts::StreamRole::Rgb => QualifiedStreamRole::Rgb,
+            crate::contracts::StreamRole::Ir => QualifiedStreamRole::Ir,
+        };
+        let requested_fourcc: Option<[u8; 4]> = self.requested.fourcc.as_bytes().try_into().ok();
+        let accepted_fourcc: Option<[u8; 4]> = self.accepted.fourcc.as_bytes().try_into().ok();
+        let interval = tuple.interval().parts();
+        self.role == expected_role
+            && self.requested.width == tuple.width()
+            && self.requested.height == tuple.height()
+            && requested_fourcc.and_then(crate::profile::DecodedPixelFormat::from_fourcc)
+                == Some(tuple.format())
+            && self.requested.interval.parts() == interval
+            && self.accepted.width == tuple.width()
+            && self.accepted.height == tuple.height()
+            && accepted_fourcc.and_then(crate::profile::DecodedPixelFormat::from_fourcc)
+                == Some(tuple.format())
+            && self.accepted.interval.parts() == interval
+    }
+
+    pub(crate) fn exact_tuple(&self) -> Option<crate::profile::StreamTuple> {
+        if self.requested.width != self.accepted.width
+            || self.requested.height != self.accepted.height
+            || self.requested.fourcc != self.accepted.fourcc
+            || self.requested.interval != self.accepted.interval
+        {
+            return None;
+        }
+        let role = match self.role {
+            QualifiedStreamRole::Rgb => crate::contracts::StreamRole::Rgb,
+            QualifiedStreamRole::Ir => crate::contracts::StreamRole::Ir,
+        };
+        let fourcc: [u8; 4] = self.requested.fourcc.as_bytes().try_into().ok()?;
+        let format = crate::profile::DecodedPixelFormat::from_fourcc(fourcc)?;
+        let (numerator, denominator) = self.requested.interval.parts();
+        let interval = crate::frame_interval::FrameInterval::new(numerator, denominator).ok()?;
+        crate::profile::StreamTuple::new(
+            role,
+            format,
+            self.requested.width,
+            self.requested.height,
+            interval,
+        )
+        .ok()
     }
 
     pub(crate) fn diagnostic_contracts(

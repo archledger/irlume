@@ -8,6 +8,8 @@
 //! and run the liveness gate on the cross-spectrum signals → on Live, match the
 //! embedding against the user's enrolled templates at the fixed threshold.
 
+pub mod capture_plan;
+
 use irlume_common::config::HeadConsentPolicy;
 use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::model_input::{
@@ -1399,12 +1401,13 @@ fn top_detection(faces: &[Detection]) -> Option<&Detection> {
 /// disagreed, "sequential" ordered the reads of two streams that were both
 /// live anyway, which on a bandwidth-starved camera is indistinguishable
 /// from concurrent (#187).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct CaptureModeSelection {
     sequential: bool,
     source: &'static str,
     runtime_key: Option<String>,
     runtime_contract: Option<irlume_camera::RuntimePairContract>,
+    attempt_plan: Option<capture_plan::AttemptCapturePlan>,
     qualification_state: irlume_common::diagnostics::QualificationState,
     qualification_reason: Option<irlume_common::diagnostics::QualificationReason>,
     authoritative_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
@@ -1558,6 +1561,7 @@ fn unavailable_capture_mode_selection() -> CaptureModeSelection {
         source,
         runtime_key: None,
         runtime_contract: None,
+        attempt_plan: None,
         qualification_state: irlume_common::diagnostics::QualificationState::Unreadable,
         qualification_reason: Some(
             irlume_common::diagnostics::QualificationReason::StoreUnreadable,
@@ -1578,6 +1582,7 @@ fn rgb_only_enrollment_capture_mode_selection() -> CaptureModeSelection {
         source: RGB_ONLY_ENROLLMENT_CAPTURE_MODE_SOURCE,
         runtime_key: None,
         runtime_contract: None,
+        attempt_plan: None,
         // The share-safe vocabulary has no "IR skipped by request" state; the
         // operation genuinely runs RGB-only, which is what NoIrPair names.
         qualification_state: irlume_common::diagnostics::QualificationState::NoIrPair,
@@ -1668,17 +1673,47 @@ fn capture_mode_selection_with_diagnostics(
     let selected = with_runtime_capture_health(|health| {
         apply_runtime_capture_health(selected, runtime_key.as_deref(), health)
     });
+    let schedule = if selected.0 {
+        irlume_camera::profile::CaptureSchedule::Sequential
+    } else {
+        irlume_camera::profile::CaptureSchedule::Concurrent
+    };
+    let attempt_plan = attempt_plan_from_runtime(&runtime_contract, schedule);
     CaptureModeSelection {
         sequential: selected.0,
         source: selected.1,
         runtime_key,
         runtime_contract: Some(runtime_contract),
+        attempt_plan,
         qualification_state,
         qualification_reason,
         authoritative_rate_shortfalls,
         latest_attempt_rate_shortfalls,
         operation_demoted: std::cell::Cell::new(false),
     }
+}
+
+fn attempt_plan_from_runtime(
+    runtime: &irlume_camera::RuntimePairContract,
+    schedule: irlume_camera::profile::CaptureSchedule,
+) -> Option<capture_plan::AttemptCapturePlan> {
+    let camera = irlume_camera::attempt_contract::CameraAttemptContract::from_runtime(
+        runtime.clone(),
+        schedule,
+        true,
+    )
+    .ok()?;
+    let versions = capture_plan::AttemptPlanVersions::new(
+        "uncalibrated-cross-spectrum-v1",
+        "canonical-rgb8-v1",
+        "canonical-grey8-v1",
+    )
+    .ok()?;
+    Some(capture_plan::AttemptCapturePlan::new(
+        camera,
+        versions,
+        irlume_vision::model_input::ModelContractSet::production_v1(),
+    ))
 }
 
 fn standalone_capture_mode_selection(rgb_dev: &str, ir_dev: &str) -> CaptureModeSelection {
@@ -2616,6 +2651,7 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
+            attempt_plan: None,
             qualification_state: QualificationState::QualifiedConcurrent,
             qualification_reason: None,
             authoritative_rate_shortfalls: None,
@@ -2671,6 +2707,7 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
+            attempt_plan: None,
             qualification_state: QualificationState::MeasuredSequential,
             qualification_reason: Some(QualificationReason::DeliveredRateShortfall),
             authoritative_rate_shortfalls: Some(authoritative.clone()),
@@ -2827,6 +2864,7 @@ mod capture_mode_switch_tests {
             source: STORED_CAPTURE_MODE_SOURCE,
             runtime_key: Some("dock-a".into()),
             runtime_contract: None,
+            attempt_plan: None,
             qualification_state: QualificationState::QualifiedConcurrent,
             qualification_reason: None,
             authoritative_rate_shortfalls: None,
@@ -3858,7 +3896,12 @@ impl Engine {
         &mut self,
         operation: &irlume_camera::lease::CameraOperationSession,
     ) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None, None, operation, &())
+        let rgb = operation.open_rgb(&self.rgb_dev)?;
+        let ir = operation.open_ir(&self.ir_dev)?;
+        let selection = capture_mode_selection(&rgb, &ir);
+        drop(rgb);
+        drop(ir);
+        self.assess_full_with(None, Some(&selection), operation, &())
             .map_err(CapturePathError::into_inner)
     }
 
@@ -3926,6 +3969,7 @@ impl Engine {
             }
         };
         let sequential = capture_mode.is_sequential();
+        let mut attempt_plan = capture_mode.attempt_plan.clone();
         let mode_source = capture_mode.active_source();
         // Name the mode AND where it came from. Without this the only way to
         // tell which path ran is to infer it from timings, which is exactly the
@@ -4168,6 +4212,12 @@ impl Engine {
                 trip_runtime_capture_health(context_key, degradation);
             }
             capture_mode.demote_operation();
+            attempt_plan = capture_mode.runtime_contract.as_ref().and_then(|runtime| {
+                attempt_plan_from_runtime(
+                    runtime,
+                    irlume_camera::profile::CaptureSchedule::Sequential,
+                )
+            });
             irlume_common::dlog!(
                 "assess: concurrent pair failed; discarding both frames and retrying RGB then IR"
             );
@@ -4278,6 +4328,44 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
+        // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
+        // above already returned, so reaching here with `None` is unreachable,
+        // but capture alone rather than unwrap to stay panic-free.
+        let ir = match ir_res {
+            Ok(Some(f)) => f,
+            Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
+            Err(e) if !held_sessions && !pair_sequential_retried => {
+                irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
+                irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let plan = attempt_plan.as_ref().ok_or_else(|| {
+            irlume_common::Error::Hardware(
+                "immutable attempt capture plan unavailable; discarding RGB and IR evidence".into(),
+            )
+        })?;
+        let observed_schedule = if sequential || pair_sequential_retried {
+            irlume_camera::profile::CaptureSchedule::Sequential
+        } else {
+            irlume_camera::profile::CaptureSchedule::Concurrent
+        };
+        let observed_plan = capture_mode
+            .runtime_contract
+            .as_ref()
+            .and_then(|runtime| attempt_plan_from_runtime(runtime, observed_schedule))
+            .ok_or_else(|| {
+                irlume_common::Error::Hardware(
+                    "observed attempt capture plan unavailable; discarding RGB and IR evidence"
+                        .into(),
+                )
+            })?;
+        plan.validate_canonical_pair(&observed_plan, &rgb, &ir)
+            .map_err(|violation| {
+                irlume_common::Error::Hardware(format!(
+                    "attempt capture plan violation ({violation:?}); discarding RGB and IR evidence"
+                ))
+            })?;
         let rgb_detection_started = std::time::Instant::now();
         let mut rgb_view =
             CanonicalRgbView::try_from_parts(rgb.pixels(), rgb.width(), rgb.height())
@@ -4299,19 +4387,6 @@ impl Engine {
         if rgb_top.is_none() {
             rgb_top = self.rescue_detect(rgb_view, "rgb");
         }
-
-        // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
-        // above already returned, so reaching here with `None` is unreachable,
-        // but capture alone rather than unwrap to stay panic-free.
-        let ir = match ir_res {
-            Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
-            Err(e) if !held_sessions && !pair_sequential_retried => {
-                irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?
-            }
-            Err(e) => return Err(e.into()),
-        };
         let ir_stats = ir.stats();
         let ir_view = CanonicalGreyView::try_from_parts(ir.pixels(), ir.width(), ir.height())
             .map_err(model_input_error)?;
@@ -4358,6 +4433,12 @@ impl Engine {
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
             rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?;
+            plan.validate_canonical_pair(&observed_plan, &rgb, &ir)
+                .map_err(|violation| {
+                    irlume_common::Error::Hardware(format!(
+                        "recaptured evidence violates attempt plan ({violation:?}); discarding RGB and IR evidence"
+                    ))
+                })?;
             rgb_view = CanonicalRgbView::try_from_parts(rgb.pixels(), rgb.width(), rgb.height())
                 .map_err(model_input_error)?;
             rgb_faces = self.det.detect(&DetectorInput::from_rgb(rgb_view))?;

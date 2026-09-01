@@ -421,6 +421,26 @@ impl ConditioningContext {
             transport_profile,
         }
     }
+
+    #[must_use]
+    pub const fn camera_instance_id(&self) -> &CameraInstanceId {
+        &self.camera_instance_id
+    }
+
+    #[must_use]
+    pub const fn camera_generation(&self) -> CameraGeneration {
+        self.camera_generation
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &ConnectionContext {
+        &self.connection
+    }
+
+    #[must_use]
+    pub const fn transport_profile(&self) -> &PairTransportProfile {
+        &self.transport_profile
+    }
 }
 
 /// Ordered visible-light brightness percentiles from one preceding evidence window.
@@ -517,6 +537,28 @@ pub struct SceneObservation {
     catalog_version: u32,
     observed_at: Instant,
     statistics: SceneStatistics,
+}
+
+impl SceneObservation {
+    pub(crate) const fn from_validated_attempt(
+        context: ConditioningContext,
+        catalog_version: u32,
+        observed_at: Instant,
+        statistics: SceneStatistics,
+    ) -> Self {
+        Self {
+            context,
+            catalog_version,
+            observed_at,
+            statistics,
+        }
+    }
+
+    /// Oldest contributing capture-window start used for freshness checks.
+    #[must_use]
+    pub const fn freshness_start(&self) -> Instant {
+        self.observed_at
+    }
 }
 
 /// Closed attempt phase for policy selection.
@@ -1037,14 +1079,15 @@ mod tests {
     }
 
     #[test]
-    fn production_code_has_no_scene_observation_minting_path() {
+    fn production_observation_minting_is_crate_private_and_attempt_validated() {
         let production = include_str!("conditioning.rs")
             .split_once("#[cfg(test)]\nmod tests")
             .expect("test module marker remains present")
             .0;
 
         assert!(!production.contains("fn observe("));
-        assert_eq!(production.matches("SceneObservation {").count(), 1);
+        assert!(production.contains("pub(crate) const fn from_validated_attempt("));
+        assert!(!production.contains("pub const fn from_validated_attempt("));
     }
 
     #[test]

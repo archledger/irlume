@@ -491,7 +491,11 @@ illumination facts from a preceding evidence window. Expire observations after
 the fixed catalog TTL and invalidate them on camera incarnation, connection,
 transport profile, or catalog-version change. The selector's signature cannot
 accept model scores, detections, authentication verdicts, or identity data. Do
-not open a separate preflight stream for classification.
+not open a separate preflight stream for classification. Task 5 exposes no
+production `SceneObservation` constructor or factory; selector context, TTL, and
+catalog-version behavior use observations constructed only inside `#[cfg(test)]`
+tests. Task 6 owns the first production minting path after complete authority is
+available.
 
 - [ ] **Step 4: Generalize the existing control restore guard**
 
@@ -521,20 +525,27 @@ git commit -s -m "feat: qualify camera conditioning policies"
 - Create: `crates/irlume-auth/src/capture_plan.rs`
 - Modify: `crates/irlume-auth/src/lib.rs:3466-3495,3579-3683,3847-4270`
 - Modify: `crates/irlume-camera/src/backend.rs:1-320`
+- Modify: `crates/irlume-camera/src/conditioning.rs`
 - Modify: `crates/irlume-camera/src/lib.rs:3769-4023,5051-5322,7125-7217`
 - Test: `crates/irlume-auth/src/capture_plan.rs`
 - Test: `crates/irlume-camera/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `PairTransportProfile`, `ConditioningSelection`, `ModelContractSet`, camera incarnations, capture qualification context, and exact interval negotiation.
-- Produces: `AttemptCapturePlan`, `RgbCamera::open_profile`, `IrCamera::open_profile`, and `CapturePlanViolation`.
+- Produces: `AttemptCapturePlan`, camera-owned `SceneObservation` minting,
+  `RgbCamera::open_profile`, `IrCamera::open_profile`, and
+  `CapturePlanViolation`.
 
 - [ ] **Step 1: Write failing immutable-plan tests**
 
 Test that one plan binds exact camera generations, both requested/accepted
 tuples, schedule, conditioning ID, preprocessing versions, calibration ID,
 model contracts, and qualification key. Assert any changed field produces a
-specific violation before inference.
+specific violation before inference. Test that observation minting rejects any
+camera, connection, RGB tuple, IR tuple, schedule, catalog, or evidence-manifest
+mismatch. Test that the observation freshness instant is the oldest contributing
+capture-window start and that RGB/IR windows beyond the fixed evidence-pair
+bound are rejected rather than allowing fresh evidence to renew older facts.
 
 ```rust
 #[test]
@@ -570,6 +581,14 @@ conditioning guard and model contracts before capture. Expose no mutators.
 
 Validate canonical evidence manifests against the plan before detector input is
 constructed. A mismatch returns `CapturePlanViolation` and discards both roles.
+Only camera capture orchestration may then mint a `SceneObservation`, and only
+after the exact opened camera incarnation, connection, full transport profile
+including requested and accepted RGB and IR tuples and capture schedule,
+catalog version, and both evidence manifests match the immutable plan. Derive
+its freshness instant from the oldest contributing capture-window start. Reject
+construction when RGB and IR windows are separated beyond one fixed, versioned
+evidence-pair bound. Authentication and other callers receive no observation
+constructor.
 
 - [ ] **Step 5: Run camera and auth tests and verify GREEN**
 
@@ -581,7 +600,7 @@ tests pass.
 - [ ] **Step 6: Commit the attempt-plan slice**
 
 ```bash
-git add crates/irlume-auth/src/capture_plan.rs crates/irlume-auth/src/lib.rs crates/irlume-camera/src/backend.rs crates/irlume-camera/src/lib.rs
+git add crates/irlume-auth/src/capture_plan.rs crates/irlume-auth/src/lib.rs crates/irlume-camera/src/backend.rs crates/irlume-camera/src/conditioning.rs crates/irlume-camera/src/lib.rs
 git commit -s -m "feat: bind immutable camera attempt plans"
 ```
 

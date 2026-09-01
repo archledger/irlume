@@ -210,6 +210,17 @@ an authentication result. The selected conditioning policy is frozen for the
 attempt. Irlume does not open a hidden preflight stream solely to classify the
 scene.
 
+Task 5 provides no production constructor or factory for a scene observation.
+Camera-owned capture orchestration may mint one only after exact profile opens
+and immutable attempt-plan validation prove the camera incarnation, connection,
+full transport profile including requested and accepted RGB and IR tuples and
+capture schedule actually used, and after both canonical evidence manifests
+validate against that same plan. The observation binds that exact validated
+context rather than accepting context facts from its caller. Its freshness
+instant is the oldest contributing capture window start. Construction rejects
+RGB and IR windows separated beyond one fixed, versioned evidence-pair bound,
+so fresh evidence from one role can never renew older facts from the other.
+
 ### CanonicalPreprocessor
 
 The capture boundary owns V4L2 buffers and device-specific payload layouts.

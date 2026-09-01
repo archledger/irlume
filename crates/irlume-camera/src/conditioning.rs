@@ -13,7 +13,6 @@ use crate::{
     capability_inventory::{CapabilityInventory, MenuValue, StandardControlCapability},
     capture_qualification::ConnectionContext,
     contracts::{CameraGeneration, CameraInstanceId},
-    evidence::{CanonicalIrEvidence, CanonicalRgbEvidence, EvidenceManifest},
     profile::PairTransportProfile,
     V4L2_CID_BACKLIGHT_COMPENSATION,
 };
@@ -371,29 +370,6 @@ impl ConditioningCatalog {
         }
     }
 
-    #[allow(dead_code, reason = "Task 6 consumes preceding camera observations")]
-    pub(crate) fn observe(
-        &self,
-        context: ConditioningContext,
-        rgb: &CanonicalRgbEvidence,
-        ir: Option<&CanonicalIrEvidence>,
-    ) -> Result<SceneObservation, PolicyError> {
-        if !evidence_matches_context(rgb.manifest(), &context)
-            || ir.is_some_and(|evidence| !evidence_matches_context(evidence.manifest(), &context))
-        {
-            return Err(PolicyError::ObservationContextMismatch);
-        }
-        let observed_at = ir.map_or(rgb.capture_window().end, |evidence| {
-            rgb.capture_window().end.max(evidence.capture_window().end)
-        });
-        Ok(SceneObservation {
-            context,
-            catalog_version: self.version,
-            observed_at,
-            statistics: statistics_from_evidence(rgb, ir),
-        })
-    }
-
     #[cfg(test)]
     fn with_version_for_test(version: u32) -> Self {
         Self::definition(version, true)
@@ -522,8 +498,8 @@ impl SceneStatistics {
 
 /// One process-local observation retained only for a later attempt.
 ///
-/// Observations are minted only from canonical camera evidence inside this
-/// crate. External callers cannot fabricate one from arbitrary statistics.
+/// Task 5 exposes no production construction path. External callers cannot
+/// fabricate an observation from arbitrary context, time, or statistics.
 ///
 /// ```compile_fail
 /// use std::time::Instant;
@@ -550,51 +526,6 @@ pub enum ConditioningAttempt<'a> {
     First,
     /// Later attempt with one preceding camera-authorized observation.
     Later(&'a SceneObservation),
-}
-
-#[allow(dead_code, reason = "used by the Task 6 observation seam")]
-fn evidence_matches_context(manifest: &EvidenceManifest, context: &ConditioningContext) -> bool {
-    let binding = manifest.runtime_provenance().binding();
-    binding.camera_instance_id() == &context.camera_instance_id
-        && binding.generation() == context.camera_generation
-}
-
-#[allow(dead_code, reason = "used by the Task 6 observation seam")]
-fn statistics_from_evidence(
-    rgb: &CanonicalRgbEvidence,
-    ir: Option<&CanonicalIrEvidence>,
-) -> SceneStatistics {
-    let mut brightness: Vec<u8> = rgb
-        .pixels()
-        .chunks_exact(3)
-        .map(|pixel| {
-            let weighted =
-                u16::from(pixel[0]) * 77 + u16::from(pixel[1]) * 150 + u16::from(pixel[2]) * 29;
-            u8::try_from((weighted + 128) >> 8).expect("weighted RGB luma is eight-bit")
-        })
-        .collect();
-    brightness.sort_unstable();
-    let percentile = |percent: usize| brightness[(brightness.len() - 1) * percent / 100];
-    let p10 = percentile(10);
-    let median = percentile(50);
-    let p90 = percentile(90);
-    let clipped = brightness.iter().filter(|value| **value == u8::MAX).count();
-    let clipped_high_basis_points =
-        u16::try_from((clipped as u128 * 10_000) / brightness.len() as u128)
-            .expect("clipped fraction is at most 10000 basis points");
-    let illumination = ir.map_or(IlluminationFacts::new(false, false), |evidence| {
-        let stats = evidence.stats();
-        IlluminationFacts::new(
-            stats.ambient_observed && stats.ambient_mean <= f32::from(LOW_LIGHT_MEDIAN_MAX),
-            stats.camera_lit_frames > 0,
-        )
-    });
-    SceneStatistics {
-        brightness: BrightnessDistribution { p10, median, p90 },
-        clipped_high_basis_points,
-        contrast: p90 - p10,
-        illumination,
-    }
 }
 
 /// Immutable catalog choice for one attempt.
@@ -751,8 +682,6 @@ pub enum PolicyError {
     InvalidStatistics,
     /// A policy has an empty evidence window or another invalid fixed field.
     InvalidPolicy,
-    /// Canonical evidence belongs to another camera incarnation.
-    ObservationContextMismatch,
     /// A policy names one control more than once.
     DuplicateControl,
     /// The inventory did not advertise the named standard control.
@@ -780,9 +709,6 @@ impl std::fmt::Display for PolicyError {
         match self {
             Self::InvalidStatistics => formatter.write_str("invalid conditioning statistics"),
             Self::InvalidPolicy => formatter.write_str("invalid conditioning policy"),
-            Self::ObservationContextMismatch => {
-                formatter.write_str("conditioning evidence context mismatch")
-            }
             Self::DuplicateControl => formatter.write_str("duplicate conditioning control"),
             Self::UnsupportedControl(id) => write!(formatter, "unsupported control {id:#x}"),
             Self::IneligibleControl(id) => write!(formatter, "ineligible control {id:#x}"),
@@ -1108,6 +1034,17 @@ mod tests {
 
     fn integer(id: u32, minimum: i32, maximum: i32, step: i32) -> ControlDomain {
         ControlDomain::for_test(id, ControlKind::Integer, minimum, maximum, step, &[], true)
+    }
+
+    #[test]
+    fn production_code_has_no_scene_observation_minting_path() {
+        let production = include_str!("conditioning.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module marker remains present")
+            .0;
+
+        assert!(!production.contains("fn observe("));
+        assert_eq!(production.matches("SceneObservation {").count(), 1);
     }
 
     #[test]

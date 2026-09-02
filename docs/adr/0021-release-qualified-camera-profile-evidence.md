@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-01
 **Amends:** [ADR-0020](0020-layered-camera-profile-and-evidence-engine.md)
+**Amended by:** [ADR-0022](0022-sealed-maintainer-qualification-campaign.md)
 **Design:** [Camera Profile Release Qualification](../superpowers/specs/2026-09-01-camera-profile-release-qualification-design.md)
 
 ## Context

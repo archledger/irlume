@@ -4,6 +4,7 @@
 resolver = "2"
 members = [
     "crates/irlume-common",
+    "crates/irlume-qualification",
     "crates/irlume-camera",
     "crates/irlume-vision",
     "crates/irlume-liveness",
@@ -55,6 +56,7 @@ undocumented_unsafe_blocks = "warn"
 # that used to sit here described stubs that no longer exist.
 [workspace.dependencies]
 irlume-common   = { path = "crates/irlume-common" }
+irlume-qualification = { path = "crates/irlume-qualification" }
 irlume-camera   = { path = "crates/irlume-camera" }
 irlume-vision   = { path = "crates/irlume-vision" }
 irlume-liveness = { path = "crates/irlume-liveness" }

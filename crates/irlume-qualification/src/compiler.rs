@@ -529,6 +529,10 @@ mod tests {
             Err(CampaignError::ArtifactCompileFailed)
         );
         assert_eq!(
+            bounded_expiry(200, 100, 0),
+            Err(CampaignError::ArtifactCompileFailed)
+        );
+        assert_eq!(
             bounded_expiry(200, 100, 200),
             Err(CampaignError::ArtifactCompileFailed)
         );

@@ -936,8 +936,11 @@ mod tests {
                     ]))
                     .unwrap(),
                 );
-                (0..99).map(
-                    move |instance_position| qualification::EvaluatedPairedCase {
+                let planned_count =
+                    u32::try_from(pair[0]["planned_count"].as_u64().unwrap()).unwrap();
+                assert_eq!(pair[1]["planned_count"], pair[0]["planned_count"]);
+                (0..planned_count).map(move |instance_position| {
+                    qualification::EvaluatedPairedCase {
                         case_id: qualification::Identifier::new(
                             pair[0]["logical_case_id"].as_str().unwrap(),
                         )
@@ -952,8 +955,8 @@ mod tests {
                         baseline: passing_case_outcome(expected_accept),
                         candidate: passing_case_outcome(expected_accept),
                         attempt_history_sha256: history.clone(),
-                    },
-                )
+                    }
+                })
             })
             .collect();
         let evaluator = qualification::SignerFingerprint::new(EVALUATOR).unwrap();
@@ -1123,21 +1126,79 @@ mod tests {
         assert_eq!(artifact.campaign_result_sha256(), expected_result.as_str());
         assert_eq!(wire["qualified_at_unix"], json!(1789000002u64));
         assert_eq!(wire["expires_at_unix"], json!(1790899200u64));
+        assert_eq!(
+            wire["hardware_scope"],
+            json!({
+                "interface_layout_sha256": "a".repeat(64),
+                "ir": {
+                    "backend": "v4l2-uvc",
+                    "descriptor_sha256": "b".repeat(64),
+                    "driver": "uvcvideo",
+                    "interface_number": 2,
+                    "pid": 0x5678,
+                    "speed_millimbps": 5_000_000u64,
+                    "vid": 0x0bda
+                },
+                "match_policy_version": 1,
+                "rgb": {
+                    "backend": "v4l2-uvc",
+                    "descriptor_sha256": "c".repeat(64),
+                    "driver": "uvcvideo",
+                    "interface_number": 0,
+                    "pid": 0x5678,
+                    "speed_millimbps": 5_000_000u64,
+                    "vid": 0x0bda
+                }
+            })
+        );
+        for (profile, profile_id, rgb_denominator) in [
+            ("baseline", "baseline-30fps", 30),
+            ("candidate", "candidate-15fps", 15),
+        ] {
+            assert_eq!(
+                wire[profile],
+                json!({
+                    "accepted_ir": {
+                        "format": "grey8",
+                        "height": 400,
+                        "interval_denominator": 15,
+                        "interval_numerator": 1,
+                        "width": 640
+                    },
+                    "accepted_rgb": {
+                        "format": "yuyv",
+                        "height": 480,
+                        "interval_denominator": rgb_denominator,
+                        "interval_numerator": 1,
+                        "width": 640
+                    },
+                    "profile_id": profile_id,
+                    "requested_ir": {
+                        "format": "grey8",
+                        "height": 400,
+                        "interval_denominator": 15,
+                        "interval_numerator": 1,
+                        "width": 640
+                    },
+                    "requested_rgb": {
+                        "format": "yuyv",
+                        "height": 480,
+                        "interval_denominator": rgb_denominator,
+                        "interval_numerator": 1,
+                        "width": 640
+                    },
+                    "schedule": "concurrent"
+                }),
+                "compiler changed {profile} projection"
+            );
+        }
         assert_eq!(artifact.baseline_profile().id(), "baseline-30fps");
         assert_eq!(artifact.candidate_profile().id(), "candidate-15fps");
-        let baseline = artifact.baseline_profile().to_profile().unwrap();
-        let candidate = artifact.candidate_profile().to_profile().unwrap();
-        assert_eq!(baseline.requested_rgb().interval().parts(), (1, 30));
-        assert_eq!(candidate.requested_rgb().interval().parts(), (1, 15));
-        assert_eq!(baseline.requested_ir().interval().parts(), (1, 15));
-        assert_eq!(candidate.requested_ir().interval().parts(), (1, 15));
         assert_eq!(artifact.hardware_scope().match_policy_version, 1);
         assert_eq!(
             artifact.hardware_scope().interface_layout_sha256,
             "a".repeat(64)
         );
-        assert_eq!(artifact.hardware_scope().rgb.interface_number, 0);
-        assert_eq!(artifact.hardware_scope().ir.interface_number, 2);
         assert_eq!(artifact.conditioning_catalog_sha256(), "1".repeat(64));
         assert_eq!(artifact.selected_policy_sha256(), "5".repeat(64));
         assert_eq!(artifact.preprocessing_contract_sha256(), "3".repeat(64));

@@ -15,7 +15,7 @@ use crate::{
     },
     profile::{
         rank_balanced, CandidateVerdict, CaptureSchedule, PairTransportProfile, ProfileGate,
-        QualifiedProfileMetrics, RankingBudget,
+        QualificationScene, QualifiedProfileMetrics, RankingBudget,
     },
 };
 
@@ -73,16 +73,6 @@ impl ProfileAuthGateEvidence {
             ir_pad,
         }
     }
-}
-
-/// Fixed scene slots supported by the conditioning policy catalog.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QualificationScene {
-    Lit,
-    Backlit,
-    LowLight,
-    DarkIr,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

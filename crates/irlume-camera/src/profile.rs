@@ -291,6 +291,16 @@ pub enum ProfileGate {
     Latency,
 }
 
+/// Fixed scene slots supported by profile qualification and evaluation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationScene {
+    Lit,
+    Backlit,
+    LowLight,
+    DarkIr,
+}
+
 /// Final hard-gate disposition for one candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateVerdict {

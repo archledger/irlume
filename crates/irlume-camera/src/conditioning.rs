@@ -303,6 +303,35 @@ impl ConditioningCatalog {
         self.version
     }
 
+    /// Returns a canonical digest over every policy fact that affects capture.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut material = format!("conditioning-catalog-v1|version:{}", self.version);
+        for policy in &self.policies {
+            let _ = write!(
+                material,
+                "|policy:{}|ae:{}|warmup:{}|median:{}|ambient:{}|controls:{}",
+                policy.id.as_str(),
+                u8::from(policy.auto_exposure_enabled),
+                policy.rgb_warmup_frames,
+                policy.rgb_median_frames,
+                u8::from(policy.ambient_subtraction_enabled),
+                policy.controls.len(),
+            );
+            for control in &policy.controls {
+                let kind = match control.kind {
+                    ControlSettingKind::Integer => "integer",
+                    ControlSettingKind::Boolean => "boolean",
+                    ControlSettingKind::Menu => "menu",
+                };
+                let _ = write!(material, "|control:{}:{kind}:{}", control.id, control.value);
+            }
+        }
+        irlume_common::sha256_hex(material.as_bytes())
+    }
+
     /// Returns all four IDs in deterministic catalog order.
     #[must_use]
     pub const fn policy_ids(&self) -> [ConditioningPolicyId; 4] {
@@ -383,6 +412,12 @@ impl ConditioningCatalog {
 
 pub(super) fn current_catalog() -> ConditioningCatalog {
     ConditioningCatalog::definition(CATALOG_VERSION, true)
+}
+
+/// Digest of the fixed catalog used by production attempt selection.
+#[must_use]
+pub fn current_catalog_digest() -> String {
+    current_catalog().digest()
 }
 
 pub(super) fn current_safe_default() -> ConditioningPolicy {
@@ -1385,6 +1420,18 @@ mod tests {
         assert_eq!(default.rgb_warmup_frames(), 6);
         assert_eq!(default.rgb_median_frames(), 5);
         assert!(!default.ambient_subtraction_enabled());
+    }
+
+    #[test]
+    fn catalog_digest_binds_version_controls_and_reduction_policy() {
+        let with_blc = ConditioningCatalog::definition(1, true);
+        let without_blc = ConditioningCatalog::definition(1, false);
+        let newer = ConditioningCatalog::definition(2, true);
+
+        assert_eq!(with_blc.digest().len(), 64);
+        assert_ne!(with_blc.digest(), without_blc.digest());
+        assert_ne!(with_blc.digest(), newer.digest());
+        assert_eq!(with_blc.digest(), with_blc.digest());
     }
 
     #[test]

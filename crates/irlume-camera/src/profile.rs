@@ -8,6 +8,8 @@ use std::{
     num::{NonZeroU128, NonZeroU32, NonZeroU64},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{contracts::StreamRole, frame_interval::FrameInterval};
 
 const MAX_PROFILE_ID_BYTES: usize = 256;
@@ -50,7 +52,8 @@ impl DecodedPixelFormat {
 }
 
 /// Ordering used to acquire the RGB and IR streams in one transport profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureSchedule {
     /// Capture one stream after the other.
     Sequential,
@@ -267,7 +270,8 @@ impl PairTransportProfile {
 }
 
 /// One fail-closed qualification gate for a transport profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileGate {
     /// Exact negotiation and readback.
     Negotiation,

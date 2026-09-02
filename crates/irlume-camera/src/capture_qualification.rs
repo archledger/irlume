@@ -286,7 +286,7 @@ impl CameraEndpoint {
         )
     }
 
-    fn validate(&self) -> Result<(), QualificationError> {
+    pub(crate) fn validate(&self) -> Result<(), QualificationError> {
         if self.descriptor_sha256.len() != 64
             || !self
                 .descriptor_sha256
@@ -332,6 +332,11 @@ impl CameraEndpoint {
     #[must_use]
     pub const fn connection(&self) -> &ConnectionContext {
         &self.connection
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> QualifiedStreamRole {
+        self.role
     }
 }
 
@@ -695,7 +700,7 @@ impl QualificationContext {
         Ok(value)
     }
 
-    fn validate(&self) -> Result<(), QualificationError> {
+    pub(crate) fn validate(&self) -> Result<(), QualificationError> {
         if self.rgb_endpoint.role != QualifiedStreamRole::Rgb
             || self.rgb_stream.role != QualifiedStreamRole::Rgb
             || self.ir_endpoint.role != QualifiedStreamRole::Ir

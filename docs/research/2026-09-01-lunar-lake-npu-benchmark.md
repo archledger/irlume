@@ -372,6 +372,41 @@ standard installed permissions/confinement, cache upgrade/corruption behavior,
 performance qualification, or same-domain energy savings. It does not
 authorize production accelerator discovery or change any threshold.
 
+### PR exact-tip regression and hardware revalidation
+
+PR #647 exposed a first-run camera regression in the hosted v4l2loopback lane:
+the new immutable attempt plan required stored capture qualification before the
+legacy fixed sequential profile could capture. The repair represents that path
+as typed `LegacyUnqualified` authority, restricts it to the baseline 640x480
+RGB plus 640x400 IR requests and sequential schedule, and preserves every
+generation, tuple, delivered-rate, continuity, and evidence-window check.
+Unconfirmed emitter metadata is deferred only on that compatibility path to
+the existing face, liveness, and PAD gates; it neither becomes `ActiveIr`
+evidence nor creates stored capture qualification. Exact-path virtual topology
+remains a root-controlled test-only exception. Stored-qualified attempts retain
+the strict active-emitter requirement.
+
+Hosted CI run `33609156562` passed at signed+DCO commit
+`789fcb2c79dd69915114b10cec30eaabb22fd667`, including MSRV and stable Rust,
+warnings-denied Clippy and rustdoc, Nix, fuzzing, packaging, PAM, and the full
+v4l2loopback camera/authentication lane. The exact-head trusted runner then
+verified all seven model hashes, executed all six ONNX graphs on exact `NPU`
+with positive per-model busy movement, kept and inferred all six in one
+process, and measured 388,586 us of NPU busy movement over the 30-round primary
+pipeline. The Rust adapter, assignment-mismatch rejection, and clean/warm/
+corrupt cache gates all passed. The retained bounded artifact is
+`/tmp/opencode/m1-012-trusted-789fcb2.json`, 2,217 bytes, mode 0600.
+
+One isolated exact-head authentication used a cold private cache and cloned
+state, resolved the complete ONNX engine to exact OpenVINO `NPU`, and left
+TFLite FaceMesh outside that assignment. It granted with liveness and increased
+NPU busy time by 40,554 us. Production enrollment, template-key, and settings
+hashes were unchanged, `irlumed.service` remained active and enabled, and only
+`/usr/bin/irlumed` remained as the production daemon. Cleanup removed cloned
+state, cache, socket, raw log, and intermediate files. The retained bounded
+artifact is `/tmp/opencode/m1-012-live-auth-789fcb2/evidence.json`, 314 bytes,
+mode 0600.
+
 - Clean baseline before the spike: 1,973 tests passed, 0 failed, 100 ignored.
 - Exact installed model hashes: all seven passed.
 - Production release stage benchmark: completed successfully.

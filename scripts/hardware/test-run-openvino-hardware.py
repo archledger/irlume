@@ -13,6 +13,7 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RUNNER = pathlib.Path(__file__).with_name("run-openvino-hardware.sh")
 WORKFLOW = ROOT / ".github/workflows/openvino-hardware.yml"
+ACTIONLINT_CONFIG = ROOT / ".github/actionlint.yaml"
 
 
 class WorkflowTrustTests(unittest.TestCase):
@@ -52,6 +53,17 @@ class WorkflowTrustTests(unittest.TestCase):
         self.assertEqual(
             run_step["run"].strip(),
             'bash scripts/hardware/run-openvino-hardware.sh "$(git rev-parse HEAD)" "$RUNNER_TEMP/openvino-evidence.json"',
+        )
+
+    def test_custom_runner_labels_are_declared_for_actionlint(self) -> None:
+        config = yaml.safe_load(ACTIONLINT_CONFIG.read_text(encoding="utf-8"))
+        self.assertEqual(
+            config,
+            {
+                "self-hosted-runner": {
+                    "labels": ["arch", "ir-camera", "tpm", "ci", "cachyos", "n100", "lunar-lake", "npu"]
+                }
+            },
         )
 
 

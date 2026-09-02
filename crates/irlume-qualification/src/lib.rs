@@ -2,6 +2,26 @@
 // Copyright the irlume contributors.
 
 //! Maintainer-only camera profile qualification contracts.
+//!
+//! External code cannot fabricate reviewed or verified campaign authority:
+//!
+//! ```compile_fail
+//! use irlume_qualification::ReviewedAggregate;
+//! let _reviewed = ReviewedAggregate::new_for_test();
+//! ```
+//!
+//! ```compile_fail
+//! use irlume_qualification::{CampaignPolicy, Verified};
+//! let document: CampaignPolicy = todo!();
+//! let _verified = Verified::new_for_test(document);
+//! ```
+//!
+//! Unsigned release artifacts can be produced only from reviewed authority:
+//!
+//! ```compile_fail
+//! use irlume_qualification::UnsignedReleaseArtifact;
+//! let _bytes = UnsignedReleaseArtifact::from_unreviewed_result(b"{}");
+//! ```
 
 mod canonical;
 mod compiler;

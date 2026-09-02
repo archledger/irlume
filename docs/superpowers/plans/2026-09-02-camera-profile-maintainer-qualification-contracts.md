@@ -1414,6 +1414,8 @@ git commit -S -s -m "feat: compile reviewed qualification artifacts"
 
 **Files:**
 - Modify: `crates/irlume-qualification/src/lib.rs`
+- Modify: `crates/irlume-qualification/src/lifecycle.rs`
+- Modify: `crates/irlume-qualification/src/reducer.rs`
 - Modify: `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/progress.md`
 - Create: `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-8-maintainer-campaign-contracts-implementer.md`
 - Test: complete qualification crate, camera compatibility, workspace checks
@@ -1449,14 +1451,20 @@ Run: `cargo test -p irlume-qualification --doc`
 
 Expected: PASS because prohibited construction fails to compile.
 
-- [ ] **Step 3: Add exhaustive synthetic category and monotonicity matrices**
+- [ ] **Step 3: Complete exhaustive synthetic category and monotonicity matrices**
 
-One table test must trigger each of the 14 `CampaignDiagnostic` variants through
-its real interface. Enumerate all paired 2 by 2 tables through denominator 24,
-all single-gate intersection failures, every consent status at each phase, every
-role collision, and every target digest mismatch. For each valid passing fixture,
-remove one case, fail one stage, corrupt one digest, or advance one expiry and
-assert the verdict cannot improve.
+Retain the existing table that triggers each of the 14 `CampaignDiagnostic`
+variants through `CampaignError::diagnostic`, the exhaustive paired 2 by 2 table
+enumeration through denominator 24, every role collision, and every target
+digest mismatch. Add the two missing real-interface matrices in their owning
+modules: every inactive consent status at collection, evaluation, and
+publication in `lifecycle.rs`, and every individual model gate failure in
+`reducer.rs`. For each valid passing fixture, remove one case, fail one stage,
+corrupt one digest, or advance one expiry and assert the verdict cannot improve.
+
+This owning-module placement is an approved Task 8 scope correction. It avoids
+duplicating the full signed protocol and lifecycle fixture in `lib.rs` merely to
+reach private validated authority.
 
 - [ ] **Step 4: Run the complete focused software suite**
 
@@ -1507,7 +1515,7 @@ Inspect `git status`, `git diff`, and `git log --oneline -10`, then stage only
 tracked closure changes:
 
 ```bash
-git add crates/irlume-qualification/src/lib.rs
+git add docs/superpowers/plans/2026-09-02-camera-profile-maintainer-qualification-contracts.md crates/irlume-qualification/src/lib.rs crates/irlume-qualification/src/lifecycle.rs crates/irlume-qualification/src/reducer.rs
 git commit -S -s -m "test: prove campaign qualification authority"
 ```
 

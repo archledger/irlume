@@ -1315,6 +1315,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn eligibility_statuses_fail_closed_at_every_phase() {
+        let (protocol, bundle, evaluation) = reduction_inputs();
+        for status in ["active", "expired", "withdrawn"] {
+            let mut collection_value = snapshot_value(protocol.protocol_sha256());
+            collection_value["statuses"][0]["status"] = json!(status);
+            let collection = validate_collection_eligibility(
+                &protocol,
+                verified_snapshot(&collection_value).unwrap(),
+                1788500000,
+            )
+            .map(|_| ());
+
+            let mut evaluation_value = snapshot_value(protocol.protocol_sha256());
+            evaluation_value["phase"] = json!("evaluation");
+            evaluation_value["registry_revision"] = json!(2);
+            evaluation_value["predecessor_sha256"] =
+                json!(bundle.collection_snapshot_sha256.as_str());
+            evaluation_value["statuses"][0]["status"] = json!(status);
+            let evaluation_result = validate_evaluation_eligibility(
+                &bundle,
+                verified_snapshot(&evaluation_value).unwrap(),
+                1789000000,
+            )
+            .map(|_| ());
+
+            let mut publication_value = snapshot_value(protocol.protocol_sha256());
+            publication_value["phase"] = json!("publication");
+            publication_value["registry_revision"] = json!(3);
+            publication_value["predecessor_sha256"] = json!(evaluation.snapshot_sha256().as_str());
+            publication_value["aggregate_publication_acknowledged"] = json!(true);
+            publication_value["publication_boundary_acknowledged"] = json!(true);
+            publication_value["statuses"][0]["status"] = json!(status);
+            let publication = validate_publication_eligibility(
+                &evaluation,
+                verified_snapshot(&publication_value).unwrap(),
+                1789000001,
+            )
+            .map(|_| ());
+
+            let actual = [collection, evaluation_result, publication]
+                .map(|result| result.err().map(|error| error.diagnostic()));
+            let expected = if status == "active" {
+                [None; 3]
+            } else {
+                [Some(crate::CampaignDiagnostic::ConsentIneligible); 3]
+            };
+            assert_eq!(actual, expected, "status {status}");
+        }
+    }
+
+    #[test]
     fn eligibility_rejects_purpose_class_window_and_retention_drift() {
         let protocol = validate(&protocol_value()).unwrap();
         for (field, value) in [

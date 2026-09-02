@@ -747,15 +747,33 @@ pub(crate) mod tests {
             Err(CampaignError::SecurityGateFailed)
         );
 
-        let mut inferior = complete.clone();
-        inferior
-            .iter_mut()
-            .filter(|case| case.presentation == crate::PresentationClass::BonaFide)
-            .for_each(|case| case.candidate.detection = StageOutcome::Incorrect);
-        assert_eq!(
-            reduce_campaign(context, inferior),
-            Err(CampaignError::NoninferiorityFailed)
-        );
+        for gate in [
+            crate::BinaryGate::Detection,
+            crate::BinaryGate::Recognition,
+            crate::BinaryGate::Liveness,
+            crate::BinaryGate::RgbPad,
+            crate::BinaryGate::IrPad,
+        ] {
+            let mut inferior = complete.clone();
+            for case in inferior
+                .iter_mut()
+                .filter(|case| case.presentation == crate::PresentationClass::BonaFide)
+            {
+                let stage = match gate {
+                    crate::BinaryGate::Detection => &mut case.candidate.detection,
+                    crate::BinaryGate::Recognition => &mut case.candidate.recognition,
+                    crate::BinaryGate::Liveness => &mut case.candidate.liveness,
+                    crate::BinaryGate::RgbPad => &mut case.candidate.rgb_pad,
+                    crate::BinaryGate::IrPad => &mut case.candidate.ir_pad,
+                };
+                *stage = StageOutcome::Incorrect;
+            }
+            assert_eq!(
+                reduce_campaign(context, inferior),
+                Err(CampaignError::NoninferiorityFailed),
+                "accepted failed {gate:?} intersection"
+            );
+        }
 
         let mut slow = complete;
         slow.iter_mut()

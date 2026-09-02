@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     io::Read as _,
     path::{Path, PathBuf},
 };
@@ -20,14 +21,20 @@ use crate::{
         CameraEndpoint, QualificationContext, QualificationError, QualifiedStreamRole,
     },
     profile::{
-        rank_balanced, CandidateVerdict, CaptureSchedule, PairTransportProfile, ProfileGate,
-        QualificationScene, QualifiedProfileMetrics, RankingBudget,
+        rank_balanced, CandidateVerdict, CaptureSchedule, PairTransportProfile,
+        QualifiedProfileMetrics, RankingBudget,
     },
+    profile_commissioning::ValidatedLocalCommissioning,
+    release_qualification::{
+        HARDWARE_SCOPE_MATCH_POLICY_VERSION, RELEASE_QUALIFICATION_POLICY_VERSION,
+        RELEASE_QUALIFICATION_PRODUCER_VERSION,
+    },
+    release_qualification_signature::VerifiedReleaseQualification,
 };
 
 /// Profile-selection record shape understood by this build.
 pub const PROFILE_SELECTION_SCHEMA_VERSION: u32 = 1;
-/// Full-quality gate policy understood by this build.
+/// Profile-selection policy understood by this build.
 pub const PROFILE_SELECTION_POLICY_VERSION: u32 = 1;
 /// Version of the profile qualification producer.
 pub const PROFILE_QUALIFICATION_PRODUCER_VERSION: u32 = 1;
@@ -38,260 +45,9 @@ pub const MAX_PROFILE_SELECTION_RECORD_BYTES: usize = 256 * 1024;
 
 const MAX_PROFILE_ID_BYTES: usize = 256;
 
-/// Aggregate result for one gate. Scores and biometric outputs are deliberately absent.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GateStatus {
-    Passed,
-    Failed,
-    NotApplicable,
-}
-
-/// Aggregate model-gate output. It cannot carry identities, scores, or authority writes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProfileAuthGateEvidence {
-    detection: GateStatus,
-    recognition: GateStatus,
-    liveness: GateStatus,
-    rgb_pad: GateStatus,
-    ir_pad: GateStatus,
-}
-
-impl ProfileAuthGateEvidence {
-    /// Constructs one aggregate model assessment without biometric values.
-    #[must_use]
-    #[expect(
-        dead_code,
-        reason = "reserved for a future authorizing qualification runner"
-    )]
-    pub(crate) const fn new(
-        detection: GateStatus,
-        recognition: GateStatus,
-        liveness: GateStatus,
-        rgb_pad: GateStatus,
-        ir_pad: GateStatus,
-    ) -> Self {
-        Self {
-            detection,
-            recognition,
-            liveness,
-            rgb_pad,
-            ir_pad,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-struct SceneGateEvidence {
-    required: bool,
-    status: Option<GateStatus>,
-}
-
-/// Bounded aggregate evidence for every full-quality hard gate.
-///
-/// Aggregate model evidence is not constructible outside camera qualification.
-///
-/// ```compile_fail
-/// use irlume_camera::profile_qualification::ProfileAuthGateEvidence;
-/// let _ = ProfileAuthGateEvidence::new(
-///     irlume_camera::profile_qualification::GateStatus::Passed,
-///     irlume_camera::profile_qualification::GateStatus::Passed,
-///     irlume_camera::profile_qualification::GateStatus::Passed,
-///     irlume_camera::profile_qualification::GateStatus::Passed,
-///     irlume_camera::profile_qualification::GateStatus::Passed,
-/// );
-/// ```
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProfileGateEvidence {
-    negotiation: Option<GateStatus>,
-    transport: Option<GateStatus>,
-    lit: SceneGateEvidence,
-    backlit: SceneGateEvidence,
-    low_light: SceneGateEvidence,
-    dark_ir: SceneGateEvidence,
-    detection: Option<GateStatus>,
-    recognition: Option<GateStatus>,
-    liveness: Option<GateStatus>,
-    rgb_pad: Option<GateStatus>,
-    ir_pad: Option<GateStatus>,
-    p50_latency_ms: Option<u64>,
-    p95_latency_ms: Option<u64>,
-    latency_budget_ms: Option<u64>,
-}
-
-impl ProfileGateEvidence {
-    /// Starts an incomplete diagnostic attempt. It grants no authority until complete.
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            negotiation: None,
-            transport: None,
-            lit: SceneGateEvidence {
-                required: false,
-                status: None,
-            },
-            backlit: SceneGateEvidence {
-                required: false,
-                status: None,
-            },
-            low_light: SceneGateEvidence {
-                required: false,
-                status: None,
-            },
-            dark_ir: SceneGateEvidence {
-                required: false,
-                status: None,
-            },
-            detection: None,
-            recognition: None,
-            liveness: None,
-            rgb_pad: None,
-            ir_pad: None,
-            p50_latency_ms: None,
-            p95_latency_ms: None,
-            latency_budget_ms: None,
-        }
-    }
-
-    /// Records one non-scene gate without exposing model scores.
-    #[must_use]
-    pub fn with_gate(mut self, gate: ProfileGate, status: GateStatus) -> Self {
-        match gate {
-            ProfileGate::Negotiation => self.negotiation = Some(status),
-            ProfileGate::Transport => self.transport = Some(status),
-            ProfileGate::Detection => self.detection = Some(status),
-            ProfileGate::Recognition => self.recognition = Some(status),
-            ProfileGate::Liveness => self.liveness = Some(status),
-            ProfileGate::Signal | ProfileGate::Pad | ProfileGate::Latency => {}
-        }
-        self
-    }
-
-    /// Records whether one fixed scene is applicable and its aggregate result.
-    #[must_use]
-    pub fn with_scene(
-        mut self,
-        scene: QualificationScene,
-        required: bool,
-        status: GateStatus,
-    ) -> Self {
-        *self.scene_mut(scene) = SceneGateEvidence {
-            required,
-            status: Some(status),
-        };
-        self
-    }
-
-    /// Records aggregate RGB and IR PAD dispositions independently.
-    #[must_use]
-    pub const fn with_pad(mut self, rgb: GateStatus, ir: GateStatus) -> Self {
-        self.rgb_pad = Some(rgb);
-        self.ir_pad = Some(ir);
-        self
-    }
-
-    /// Records bounded wall-time percentiles and the fixed policy ceiling.
-    #[must_use]
-    pub const fn with_latency(mut self, p50_ms: u64, p95_ms: u64, budget_ms: u64) -> Self {
-        self.p50_latency_ms = Some(p50_ms);
-        self.p95_latency_ms = Some(p95_ms);
-        self.latency_budget_ms = Some(budget_ms);
-        self
-    }
-
-    #[cfg(test)]
-    fn without_gate(mut self, gate: ProfileGate) -> Self {
-        match gate {
-            ProfileGate::Negotiation => self.negotiation = None,
-            ProfileGate::Transport => self.transport = None,
-            ProfileGate::Detection => self.detection = None,
-            ProfileGate::Recognition => self.recognition = None,
-            ProfileGate::Liveness => self.liveness = None,
-            ProfileGate::Pad => {
-                self.rgb_pad = None;
-                self.ir_pad = None;
-            }
-            ProfileGate::Latency => {
-                self.p50_latency_ms = None;
-                self.p95_latency_ms = None;
-                self.latency_budget_ms = None;
-            }
-            ProfileGate::Signal => {
-                self.lit.status = None;
-            }
-        }
-        self
-    }
-
-    fn scene_mut(&mut self, scene: QualificationScene) -> &mut SceneGateEvidence {
-        match scene {
-            QualificationScene::Lit => &mut self.lit,
-            QualificationScene::Backlit => &mut self.backlit,
-            QualificationScene::LowLight => &mut self.low_light,
-            QualificationScene::DarkIr => &mut self.dark_ir,
-        }
-    }
-
-    fn validate(&self) -> Result<(), ProfileQualificationError> {
-        require_gate(ProfileGate::Negotiation, self.negotiation)?;
-        require_gate(ProfileGate::Transport, self.transport)?;
-        for scene in [self.lit, self.backlit, self.low_light, self.dark_ir] {
-            match (scene.required, scene.status) {
-                (true, None) | (false, None) => {
-                    return Err(ProfileQualificationError::MissingGate(ProfileGate::Signal));
-                }
-                (true, Some(GateStatus::Passed)) | (false, Some(GateStatus::NotApplicable)) => {}
-                (true, Some(GateStatus::Failed)) => {
-                    return Err(ProfileQualificationError::RejectedGate(ProfileGate::Signal));
-                }
-                _ => return Err(ProfileQualificationError::InvalidEvidence),
-            }
-        }
-        require_gate(ProfileGate::Detection, self.detection)?;
-        require_gate(ProfileGate::Recognition, self.recognition)?;
-        require_gate(ProfileGate::Liveness, self.liveness)?;
-        let (Some(rgb_pad), Some(ir_pad)) = (self.rgb_pad, self.ir_pad) else {
-            return Err(ProfileQualificationError::MissingGate(ProfileGate::Pad));
-        };
-        if matches!(rgb_pad, GateStatus::Failed) || matches!(ir_pad, GateStatus::Failed) {
-            return Err(ProfileQualificationError::RejectedGate(ProfileGate::Pad));
-        }
-        if !matches!(rgb_pad, GateStatus::Passed) && !matches!(ir_pad, GateStatus::Passed) {
-            return Err(ProfileQualificationError::InvalidEvidence);
-        }
-        let (Some(p50), Some(p95), Some(budget)) = (
-            self.p50_latency_ms,
-            self.p95_latency_ms,
-            self.latency_budget_ms,
-        ) else {
-            return Err(ProfileQualificationError::MissingGate(ProfileGate::Latency));
-        };
-        if p50 == 0 || p95 == 0 || budget == 0 || p50 > p95 {
-            return Err(ProfileQualificationError::InvalidEvidence);
-        }
-        if p95 > budget {
-            return Err(ProfileQualificationError::RejectedGate(
-                ProfileGate::Latency,
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn require_gate(
-    gate: ProfileGate,
-    status: Option<GateStatus>,
-) -> Result<(), ProfileQualificationError> {
-    match status {
-        None => Err(ProfileQualificationError::MissingGate(gate)),
-        Some(GateStatus::Passed) => Ok(()),
-        Some(GateStatus::Failed) => Err(ProfileQualificationError::RejectedGate(gate)),
-        Some(GateStatus::NotApplicable) => Err(ProfileQualificationError::InvalidEvidence),
-    }
-}
-
 /// Camera-pair identity and connection facts collected before format selection.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileScope {
     rgb_endpoint: CameraEndpoint,
     ir_endpoint: CameraEndpoint,
@@ -342,184 +98,134 @@ impl ProfileScope {
     }
 }
 
-/// Current model and conditioning authority against which attempts are checked.
+/// Current installed contracts against which opaque evidence is checked.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QualificationAuthorityContext {
-    model_contract_digest: String,
-    conditioning_catalog_digest: String,
+pub(crate) struct QualificationAuthorityContext {
+    model_contract_sha256: String,
+    preprocessing_contract_sha256: String,
+    conditioning_catalog_sha256: String,
+    selected_policy_sha256: String,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reserved for reviewed profile-selection integration"
+    )
+)]
 impl QualificationAuthorityContext {
-    #[must_use]
-    pub const fn new(model_contract_digest: String, conditioning_catalog_digest: String) -> Self {
-        Self {
-            model_contract_digest,
-            conditioning_catalog_digest,
-        }
-    }
-
-    fn validate(&self) -> Result<(), ProfileQualificationError> {
-        validate_digest(&self.model_contract_digest)?;
-        validate_digest(&self.conditioning_catalog_digest)
-    }
-}
-
-/// One candidate attempt. Incomplete evidence remains diagnostic-only.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProfileQualificationAttempt {
-    producer_version: u32,
-    measured_at_unix: u64,
-    profile_id: String,
-    context: QualificationContext,
-    schedule: CaptureSchedule,
-    gates: ProfileGateEvidence,
-    model_contract_digest: String,
-    conditioning_catalog_digest: String,
-    evaluation_manifest_digest: String,
-    pre_scope: ProfileScope,
-    post_scope: ProfileScope,
-}
-
-impl ProfileQualificationAttempt {
-    /// Constructs a bounded attempt without treating incomplete gates as authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid profile, context, version, or digest facts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        measured_at_unix: u64,
-        profile_id: String,
-        context: QualificationContext,
-        schedule: CaptureSchedule,
-        gates: ProfileGateEvidence,
-        model_contract_digest: String,
-        conditioning_catalog_digest: String,
-        evaluation_manifest_digest: String,
-        post_scope: ProfileScope,
+    pub(crate) fn new(
+        model_contract_sha256: String,
+        preprocessing_contract_sha256: String,
+        conditioning_catalog_sha256: String,
+        selected_policy_sha256: String,
     ) -> Result<Self, ProfileQualificationError> {
-        let pre_scope = ProfileScope::from_context(&context)?;
         let value = Self {
-            producer_version: PROFILE_QUALIFICATION_PRODUCER_VERSION,
-            measured_at_unix,
-            profile_id,
-            context,
-            schedule,
-            gates,
-            model_contract_digest,
-            conditioning_catalog_digest,
-            evaluation_manifest_digest,
-            pre_scope,
-            post_scope,
+            model_contract_sha256,
+            preprocessing_contract_sha256,
+            conditioning_catalog_sha256,
+            selected_policy_sha256,
         };
-        value.validate_structure()?;
+        value.validate()?;
         Ok(value)
     }
 
-    fn validate_structure(&self) -> Result<(), ProfileQualificationError> {
-        if self.producer_version != PROFILE_QUALIFICATION_PRODUCER_VERSION
-            || self.measured_at_unix == 0
-        {
-            return Err(ProfileQualificationError::InvalidEvidence);
+    fn validate(&self) -> Result<(), ProfileQualificationError> {
+        validate_digest(&self.model_contract_sha256)?;
+        validate_digest(&self.preprocessing_contract_sha256)?;
+        validate_digest(&self.conditioning_catalog_sha256)?;
+        validate_digest(&self.selected_policy_sha256)
+    }
+}
+
+/// One candidate backed by separate verified release and local evidence.
+#[derive(Debug)]
+pub(crate) struct QualifiedCandidateEvidence {
+    release: VerifiedReleaseQualification,
+    local: ValidatedLocalCommissioning,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reserved for reviewed profile-selection integration"
+    )
+)]
+impl QualifiedCandidateEvidence {
+    pub(crate) fn new(
+        release: VerifiedReleaseQualification,
+        local: ValidatedLocalCommissioning,
+        authority: &QualificationAuthorityContext,
+    ) -> Result<Self, ProfileQualificationError> {
+        let value = Self { release, local };
+        value.validate_for(authority)?;
+        Ok(value)
+    }
+
+    fn validate_for(
+        &self,
+        authority: &QualificationAuthorityContext,
+    ) -> Result<(), ProfileQualificationError> {
+        authority.validate()?;
+        let artifact = self.release.artifact();
+        let release_profile = artifact
+            .candidate_profile()
+            .to_profile()
+            .map_err(|_| ProfileQualificationError::InvalidEvidence)?;
+        if release_profile != *self.local.profile() {
+            return Err(ProfileQualificationError::ProfileMismatch);
         }
-        validate_profile_id(&self.profile_id)?;
-        self.pre_scope.validate()?;
-        self.post_scope.validate()?;
-        validate_digest(&self.model_contract_digest)?;
-        validate_digest(&self.conditioning_catalog_digest)?;
-        validate_digest(&self.evaluation_manifest_digest)?;
-        self.profile()?;
+        if !artifact
+            .hardware_scope()
+            .matches_context(self.local.context(), self.local.interface_layout_sha256())
+        {
+            return Err(ProfileQualificationError::HardwareScopeMismatch);
+        }
+        if artifact.model_contract_sha256() != authority.model_contract_sha256 {
+            return Err(ProfileQualificationError::ModelContractChanged);
+        }
+        if artifact.preprocessing_contract_sha256() != authority.preprocessing_contract_sha256 {
+            return Err(ProfileQualificationError::PreprocessingContractChanged);
+        }
+        if artifact.conditioning_catalog_sha256() != authority.conditioning_catalog_sha256
+            || self.local.conditioning_catalog_sha256() != authority.conditioning_catalog_sha256
+        {
+            return Err(ProfileQualificationError::ConditioningCatalogChanged);
+        }
+        if artifact.selected_policy_sha256() != authority.selected_policy_sha256
+            || self.local.selected_policy_sha256() != authority.selected_policy_sha256
+        {
+            return Err(ProfileQualificationError::SelectedPolicyChanged);
+        }
         Ok(())
     }
 
-    /// Resolves this attempt against the authority it recorded.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first missing, failed, stale, or inconsistent qualification gate.
-    pub fn qualified(&self) -> Result<QualifiedProfileRecord, ProfileQualificationError> {
-        self.qualified_for(&QualificationAuthorityContext::new(
-            self.model_contract_digest.clone(),
-            self.conditioning_catalog_digest.clone(),
-        ))
-    }
-
-    /// Resolves this attempt only if current model and catalog authority still match.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first missing, failed, stale, or inconsistent qualification gate.
-    pub fn qualified_for(
-        &self,
-        authority: &QualificationAuthorityContext,
-    ) -> Result<QualifiedProfileRecord, ProfileQualificationError> {
-        self.validate_structure()?;
-        authority.validate()?;
-        if self.model_contract_digest != authority.model_contract_digest {
-            return Err(ProfileQualificationError::ModelContractChanged);
+    fn to_record(&self) -> QualifiedProfileRecord {
+        QualifiedProfileRecord {
+            profile_id: self.local.profile_id().to_owned(),
+            context: self.local.context().clone(),
+            schedule: self.local.profile().schedule(),
+            p50_latency_ms: self.local.p50_latency_ms(),
+            p95_latency_ms: self.local.p95_latency_ms(),
+            release_qualification_sha256: self.release.artifact_sha256().to_owned(),
+            local_commissioning_sha256: self.local.record_sha256().to_owned(),
         }
-        if self.conditioning_catalog_digest != authority.conditioning_catalog_digest {
-            return Err(ProfileQualificationError::ConditioningCatalogChanged);
-        }
-        if self.pre_scope != self.post_scope {
-            return Err(ProfileQualificationError::ContextChanged);
-        }
-        self.gates.validate()?;
-        let p50_latency_ms = self
-            .gates
-            .p50_latency_ms
-            .ok_or(ProfileQualificationError::MissingGate(ProfileGate::Latency))?;
-        let p95_latency_ms = self
-            .gates
-            .p95_latency_ms
-            .ok_or(ProfileQualificationError::MissingGate(ProfileGate::Latency))?;
-        Ok(QualifiedProfileRecord {
-            profile_id: self.profile_id.clone(),
-            context: self.context.clone(),
-            schedule: self.schedule,
-            p50_latency_ms,
-            p95_latency_ms,
-            evaluation_manifest_digest: self.evaluation_manifest_digest.clone(),
-        })
-    }
-
-    fn profile(&self) -> Result<PairTransportProfile, ProfileQualificationError> {
-        self.context
-            .validate()
-            .map_err(ProfileQualificationError::Context)?;
-        PairTransportProfile::from_negotiated(
-            self.profile_id.clone(),
-            self.context
-                .rgb_stream()
-                .requested_tuple()
-                .ok_or(ProfileQualificationError::InvalidEvidence)?,
-            self.context
-                .rgb_stream()
-                .accepted_tuple()
-                .ok_or(ProfileQualificationError::InvalidEvidence)?,
-            self.context
-                .ir_stream()
-                .requested_tuple()
-                .ok_or(ProfileQualificationError::InvalidEvidence)?,
-            self.context
-                .ir_stream()
-                .accepted_tuple()
-                .ok_or(ProfileQualificationError::InvalidEvidence)?,
-            self.schedule,
-        )
-        .map_err(|_| ProfileQualificationError::InvalidEvidence)
     }
 }
 
 /// One exact profile whose full-quality gates passed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualifiedProfileRecord {
     profile_id: String,
     context: QualificationContext,
     schedule: CaptureSchedule,
     p50_latency_ms: u64,
     p95_latency_ms: u64,
-    evaluation_manifest_digest: String,
+    release_qualification_sha256: String,
+    local_commissioning_sha256: String,
 }
 
 impl QualifiedProfileRecord {
@@ -533,9 +239,26 @@ impl QualifiedProfileRecord {
         self.schedule
     }
 
+    #[must_use]
+    pub fn release_qualification_sha256(&self) -> &str {
+        &self.release_qualification_sha256
+    }
+
+    #[must_use]
+    pub fn local_commissioning_sha256(&self) -> &str {
+        &self.local_commissioning_sha256
+    }
+
     fn profile(&self) -> Result<PairTransportProfile, ProfileQualificationError> {
         validate_profile_id(&self.profile_id)?;
-        validate_digest(&self.evaluation_manifest_digest)?;
+        validate_digest(&self.release_qualification_sha256)?;
+        validate_digest(&self.local_commissioning_sha256)?;
+        if self.p50_latency_ms == 0
+            || self.p95_latency_ms == 0
+            || self.p50_latency_ms > self.p95_latency_ms
+        {
+            return Err(ProfileQualificationError::InvalidEvidence);
+        }
         self.context
             .validate()
             .map_err(ProfileQualificationError::Context)?;
@@ -574,15 +297,24 @@ impl QualifiedProfileRecord {
 
 /// Separate, versioned profile-selection authority for one physical pair scope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileSelectionRecord {
     schema_version: u32,
     policy_version: u32,
     producer_version: u32,
     measured_at_unix: u64,
     scope: ProfileScope,
-    model_contract_digest: String,
-    conditioning_catalog_digest: String,
-    evaluation_manifest_digest: String,
+    release_policy_version: u32,
+    release_producer_version: u32,
+    hardware_match_policy_version: u32,
+    campaign_id: String,
+    campaign_protocol_sha256: String,
+    campaign_result_sha256: String,
+    baseline_profile_sha256: String,
+    model_contract_sha256: String,
+    preprocessing_contract_sha256: String,
+    conditioning_catalog_sha256: String,
+    selected_policy_sha256: String,
     selected: QualifiedProfileRecord,
     sequential_fallback: Option<QualifiedProfileRecord>,
 }
@@ -595,8 +327,7 @@ impl ProfileSelectionRecord {
     /// Returns an error when authority is invalid or JSON serialization fails.
     pub fn to_json(&self) -> Result<String, ProfileQualificationError> {
         self.validate()?;
-        serde_json::to_string_pretty(self)
-            .map_err(|error| ProfileQualificationError::Json(error.to_string()))
+        serde_json::to_string_pretty(self).map_err(|_| ProfileQualificationError::Json)
     }
 
     /// Parse bounded untrusted bytes and revalidate all nested authority.
@@ -608,8 +339,8 @@ impl ProfileSelectionRecord {
         if bytes.len() > MAX_PROFILE_SELECTION_RECORD_BYTES {
             return Err(ProfileQualificationError::RecordTooLarge);
         }
-        let value: Self = serde_json::from_slice(bytes)
-            .map_err(|error| ProfileQualificationError::Json(error.to_string()))?;
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| ProfileQualificationError::Json)?;
         value.validate()?;
         Ok(value)
     }
@@ -630,8 +361,8 @@ impl ProfileSelectionRecord {
     }
 
     #[must_use]
-    pub fn model_contract_digest(&self) -> &str {
-        &self.model_contract_digest
+    pub fn model_contract_sha256(&self) -> &str {
+        &self.model_contract_sha256
     }
 
     fn validate(&self) -> Result<(), ProfileQualificationError> {
@@ -647,24 +378,32 @@ impl ProfileSelectionRecord {
         }
         if self.producer_version != PROFILE_QUALIFICATION_PRODUCER_VERSION
             || self.measured_at_unix == 0
+            || self.release_policy_version != RELEASE_QUALIFICATION_POLICY_VERSION
+            || self.release_producer_version != RELEASE_QUALIFICATION_PRODUCER_VERSION
+            || self.hardware_match_policy_version != HARDWARE_SCOPE_MATCH_POLICY_VERSION
         {
             return Err(ProfileQualificationError::InvalidEvidence);
         }
         self.scope.validate()?;
-        validate_digest(&self.model_contract_digest)?;
-        validate_digest(&self.conditioning_catalog_digest)?;
-        validate_digest(&self.evaluation_manifest_digest)?;
+        validate_profile_id(&self.campaign_id)?;
+        for digest in [
+            &self.campaign_protocol_sha256,
+            &self.campaign_result_sha256,
+            &self.baseline_profile_sha256,
+            &self.model_contract_sha256,
+            &self.preprocessing_contract_sha256,
+            &self.conditioning_catalog_sha256,
+            &self.selected_policy_sha256,
+        ] {
+            validate_digest(digest)?;
+        }
         self.selected.profile()?;
         if ProfileScope::from_context(&self.selected.context)? != self.scope {
             return Err(ProfileQualificationError::ContextChanged);
         }
-        if self.selected.evaluation_manifest_digest != self.evaluation_manifest_digest {
-            return Err(ProfileQualificationError::InvalidEvidence);
-        }
         if let Some(fallback) = &self.sequential_fallback {
             fallback.profile()?;
             if fallback.schedule != CaptureSchedule::Sequential
-                || fallback.evaluation_manifest_digest != self.evaluation_manifest_digest
                 || ProfileScope::from_context(&fallback.context)? != self.scope
             {
                 return Err(ProfileQualificationError::InvalidEvidence);
@@ -741,7 +480,7 @@ impl ProfileSelectionStore {
         Self::at(irlume_common::state_dir().join("profile-selections"))
     }
 
-    fn at(dir: PathBuf) -> Self {
+    pub(crate) fn at(dir: PathBuf) -> Self {
         Self { dir }
     }
 
@@ -763,7 +502,8 @@ impl ProfileSelectionStore {
     /// # Errors
     ///
     /// Returns an error for invalid authority, stale revision, or publication failure.
-    pub fn save(
+    #[cfg(test)]
+    pub(crate) fn save(
         &self,
         record: ProfileSelectionRecord,
         expected_revision: Option<u64>,
@@ -786,8 +526,8 @@ impl ProfileSelectionStore {
             .ok_or(ProfileSelectionStoreError::RevisionExhausted)?;
         let stored = StoredProfileSelection { revision, record };
         stored.validate()?;
-        let mut body = serde_json::to_vec_pretty(&stored)
-            .map_err(|error| ProfileQualificationError::Json(error.to_string()))?;
+        let mut body =
+            serde_json::to_vec_pretty(&stored).map_err(|_| ProfileQualificationError::Json)?;
         body.push(b'\n');
         if body.len() > MAX_PROFILE_SELECTION_RECORD_BYTES {
             return Err(ProfileQualificationError::RecordTooLarge.into());
@@ -805,6 +545,7 @@ impl ProfileSelectionStore {
         }
     }
 
+    #[cfg(test)]
     fn ensure_dir(&self) -> Result<(), ProfileSelectionStoreError> {
         let existed = self.dir.exists();
         std::fs::create_dir_all(&self.dir)
@@ -865,16 +606,18 @@ fn read_stored_selection(
     if body.len() > MAX_PROFILE_SELECTION_RECORD_BYTES {
         return Err(ProfileQualificationError::RecordTooLarge.into());
     }
-    let stored: StoredProfileSelection = serde_json::from_slice(&body)
-        .map_err(|error| ProfileQualificationError::Json(error.to_string()))?;
+    let stored: StoredProfileSelection =
+        serde_json::from_slice(&body).map_err(|_| ProfileQualificationError::Json)?;
     stored.validate()?;
     Ok(Some(stored))
 }
 
+#[cfg(test)]
 struct ProfileStoreLock {
     _file: std::fs::File,
 }
 
+#[cfg(test)]
 impl ProfileStoreLock {
     fn acquire(path: &Path) -> Result<Self, ProfileSelectionStoreError> {
         #[cfg(unix)]
@@ -923,36 +666,72 @@ fn profile_store_io(
 ///
 /// # Errors
 ///
-/// Returns an error when no complete candidate passes or shared authority is inconsistent.
-pub fn select_profiles(
-    attempts: Vec<ProfileQualificationAttempt>,
+/// Returns an error when candidate evidence or shared authority is inconsistent.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reserved for reviewed profile-selection integration"
+    )
+)]
+pub(crate) fn select_profiles(
+    candidates: Vec<QualifiedCandidateEvidence>,
     authority: QualificationAuthorityContext,
     budget: RankingBudget,
 ) -> Result<ProfileSelectionRecord, ProfileQualificationError> {
-    if attempts.is_empty() || attempts.len() > MAX_PROFILE_CANDIDATES {
+    if candidates.is_empty() || candidates.len() > MAX_PROFILE_CANDIDATES {
         return Err(ProfileQualificationError::CandidateCount);
     }
     authority.validate()?;
-    let measured_at_unix = attempts
+    let first = &candidates[0];
+    first.validate_for(&authority)?;
+    let first_artifact = first.release.artifact();
+    let scope = ProfileScope::from_context(first.local.context())?;
+    let release_policy_version = first_artifact.policy_version();
+    let release_producer_version = first_artifact.producer_version();
+    let hardware_match_policy_version = first_artifact.hardware_scope().match_policy_version();
+    let campaign_id = first_artifact.campaign_id().to_owned();
+    let campaign_protocol_sha256 = first_artifact.campaign_protocol_sha256().to_owned();
+    let campaign_result_sha256 = first_artifact.campaign_result_sha256().to_owned();
+    let baseline_profile_sha256 = first_artifact
+        .baseline_profile_sha256()
+        .map_err(|_| ProfileQualificationError::InvalidEvidence)?;
+    let measured_at_unix = candidates
         .iter()
-        .map(|attempt| attempt.measured_at_unix)
+        .map(|candidate| candidate.local.measured_at_unix())
         .max()
         .ok_or(ProfileQualificationError::CandidateCount)?;
-    let scope = attempts[0].pre_scope.clone();
-    let manifest = attempts[0].evaluation_manifest_digest.clone();
-    let mut qualified = Vec::with_capacity(attempts.len());
-    for attempt in attempts {
-        if attempt.pre_scope != scope || attempt.evaluation_manifest_digest != manifest {
+    let mut unique_candidates = HashSet::with_capacity(candidates.len());
+    let mut qualified = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        candidate.validate_for(&authority)?;
+        let artifact = candidate.release.artifact();
+        if !unique_candidates.insert((
+            candidate.local.profile_id().to_owned(),
+            candidate.local.profile().schedule(),
+        )) {
+            return Err(ProfileQualificationError::DuplicateCandidate);
+        }
+        if ProfileScope::from_context(candidate.local.context())? != scope {
             return Err(ProfileQualificationError::ContextChanged);
         }
-        match attempt.qualified_for(&authority) {
-            Ok(candidate) => qualified.push(candidate),
-            Err(
-                ProfileQualificationError::MissingGate(_)
-                | ProfileQualificationError::RejectedGate(_),
-            ) => {}
-            Err(error) => return Err(error),
+        if artifact
+            .baseline_profile_sha256()
+            .map_err(|_| ProfileQualificationError::InvalidEvidence)?
+            != baseline_profile_sha256
+        {
+            return Err(ProfileQualificationError::BaselineProfileMismatch);
         }
+        if artifact.policy_version() != release_policy_version
+            || artifact.producer_version() != release_producer_version
+            || artifact.hardware_scope().match_policy_version() != hardware_match_policy_version
+            || artifact.campaign_id() != campaign_id
+            || artifact.campaign_protocol_sha256() != campaign_protocol_sha256
+            || artifact.campaign_result_sha256() != campaign_result_sha256
+        {
+            return Err(ProfileQualificationError::ContextChanged);
+        }
+        qualified.push(candidate.to_record());
     }
     let concurrent: Vec<_> = qualified
         .iter()
@@ -969,7 +748,7 @@ pub fn select_profiles(
     } else {
         rank_balanced(&concurrent, budget)
     }
-    .ok_or(ProfileQualificationError::NoPassingProfile)?;
+    .ok_or(ProfileQualificationError::InvalidEvidence)?;
     let selected = qualified
         .iter()
         .find(|candidate| {
@@ -993,9 +772,17 @@ pub fn select_profiles(
         producer_version: PROFILE_QUALIFICATION_PRODUCER_VERSION,
         measured_at_unix,
         scope,
-        model_contract_digest: authority.model_contract_digest,
-        conditioning_catalog_digest: authority.conditioning_catalog_digest,
-        evaluation_manifest_digest: manifest,
+        release_policy_version,
+        release_producer_version,
+        hardware_match_policy_version,
+        campaign_id,
+        campaign_protocol_sha256,
+        campaign_result_sha256,
+        baseline_profile_sha256,
+        model_contract_sha256: authority.model_contract_sha256,
+        preprocessing_contract_sha256: authority.preprocessing_contract_sha256,
+        conditioning_catalog_sha256: authority.conditioning_catalog_sha256,
+        selected_policy_sha256: authority.selected_policy_sha256,
         selected,
         sequential_fallback,
     };
@@ -1022,30 +809,53 @@ fn validate_digest(value: &str) -> Result<(), ProfileQualificationError> {
     Ok(())
 }
 
-/// Why incomplete or stale full-quality evidence cannot grant selection authority.
+/// Why dual profile evidence cannot grant selection authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ProfileQualificationError {
-    MissingGate(ProfileGate),
-    RejectedGate(ProfileGate),
+    ProfileMismatch,
+    HardwareScopeMismatch,
+    BaselineProfileMismatch,
     ModelContractChanged,
+    PreprocessingContractChanged,
     ConditioningCatalogChanged,
+    SelectedPolicyChanged,
     ContextChanged,
+    DuplicateCandidate,
     InvalidEvidence,
     InvalidProfileId,
     InvalidDigest,
     CandidateCount,
-    NoPassingProfile,
     UnsupportedSchema(u32),
     UnsupportedPolicy(u32),
     RecordTooLarge,
-    Json(String),
+    Json,
     Context(QualificationError),
 }
 
 impl std::fmt::Display for ProfileQualificationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "profile qualification failed: {self:?}")
+        let category = match self {
+            Self::ProfileMismatch => "profile_mismatch",
+            Self::HardwareScopeMismatch => "hardware_scope_mismatch",
+            Self::BaselineProfileMismatch => "baseline_profile_mismatch",
+            Self::ModelContractChanged => "model_contract_changed",
+            Self::PreprocessingContractChanged => "preprocessing_contract_changed",
+            Self::ConditioningCatalogChanged => "conditioning_catalog_changed",
+            Self::SelectedPolicyChanged => "selected_policy_changed",
+            Self::ContextChanged => "camera_context_changed",
+            Self::DuplicateCandidate => "duplicate_candidate",
+            Self::InvalidEvidence => "profile_evidence_invalid",
+            Self::InvalidProfileId => "profile_identifier_invalid",
+            Self::InvalidDigest => "profile_digest_invalid",
+            Self::CandidateCount => "profile_candidate_count_invalid",
+            Self::UnsupportedSchema(_) => "profile_selection_schema_unsupported",
+            Self::UnsupportedPolicy(_) => "profile_selection_policy_unsupported",
+            Self::RecordTooLarge => "profile_selection_too_large",
+            Self::Json => "profile_selection_json_invalid",
+            Self::Context(_) => "profile_context_invalid",
+        };
+        formatter.write_str(category)
     }
 }
 
@@ -1055,259 +865,422 @@ impl std::error::Error for ProfileQualificationError {}
 mod tests {
     use super::*;
     use crate::{
-        capture_qualification::{
-            AcceptedStream, CameraEndpoint, ConnectionContext, ExactInterval, ExactRate,
-            QualificationContext, QualifiedStreamRole, RequestedStream, StreamContract,
+        profile::{CaptureSchedule, RankingBudget},
+        profile_commissioning::{
+            validated_commissioning_fixture, validated_commissioning_fixture_with_bindings,
+            validated_commissioning_fixture_with_serial,
         },
-        profile::{CaptureSchedule, ProfileGate, RankingBudget},
+        release_qualification_signature::{
+            verified_release_fixture, verified_release_fixture_with_descriptor,
+        },
     };
 
-    fn endpoint(role: QualifiedStreamRole) -> CameraEndpoint {
-        CameraEndpoint::new(
-            "ab".repeat(32),
-            0x0bda,
-            0x5678,
-            Some("fixture-serial".into()),
-            match role {
-                QualifiedStreamRole::Rgb => 0,
-                QualifiedStreamRole::Ir => 2,
-            },
-            "/devices/pci0000:00/0000:00:14.0/usb4/4-2".into(),
-            role,
-            ConnectionContext::new(
-                "/devices/pci0000:00/0000:00:14.0".into(),
-                5_000_000,
-                "uvcvideo".into(),
-                "v4l2-uvc".into(),
-            )
-            .unwrap(),
+    const FIXED_NOW: u64 = 1_788_192_050;
+
+    fn authority_fixture() -> QualificationAuthorityContext {
+        QualificationAuthorityContext::new(
+            "77".repeat(32),
+            "66".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
         )
         .unwrap()
     }
 
-    fn stream(role: QualifiedStreamRole, height: u32, fps: u32) -> StreamContract {
-        let fourcc = match role {
-            QualifiedStreamRole::Rgb => "YUYV",
-            QualifiedStreamRole::Ir => "GREY",
-        };
-        StreamContract::new(
-            role,
-            RequestedStream::new(
-                640,
-                height,
-                fourcc.into(),
-                ExactInterval::new(1, fps).unwrap(),
-            )
-            .unwrap(),
-            AcceptedStream::new(
-                640,
-                height,
-                fourcc.into(),
-                1_280,
-                640 * height * 2,
-                0,
-                8,
-                1,
-                1,
-                0,
-                ExactInterval::new(1, fps).unwrap(),
-            )
-            .unwrap(),
-            ExactRate::new(15, 2).unwrap(),
-        )
-        .unwrap()
-    }
-
-    fn context(fps: u32) -> QualificationContext {
-        QualificationContext::new(
-            endpoint(QualifiedStreamRole::Rgb),
-            endpoint(QualifiedStreamRole::Ir),
-            stream(QualifiedStreamRole::Rgb, 480, fps),
-            stream(QualifiedStreamRole::Ir, 400, fps),
-        )
-        .unwrap()
-    }
-
-    fn complete_gates() -> ProfileGateEvidence {
-        ProfileGateEvidence::empty()
-            .with_gate(ProfileGate::Negotiation, GateStatus::Passed)
-            .with_gate(ProfileGate::Transport, GateStatus::Passed)
-            .with_scene(QualificationScene::Lit, true, GateStatus::Passed)
-            .with_scene(QualificationScene::Backlit, true, GateStatus::Passed)
-            .with_scene(QualificationScene::LowLight, true, GateStatus::Passed)
-            .with_scene(QualificationScene::DarkIr, true, GateStatus::Passed)
-            .with_gate(ProfileGate::Detection, GateStatus::Passed)
-            .with_gate(ProfileGate::Recognition, GateStatus::Passed)
-            .with_gate(ProfileGate::Liveness, GateStatus::Passed)
-            .with_pad(GateStatus::Passed, GateStatus::Passed)
-            .with_latency(4_000, 6_000, 8_000)
-    }
-
-    fn attempt(
+    fn candidate_fixture(
         id: &str,
-        fps: u32,
+        rgb_fps: u32,
+        ir_fps: u32,
         schedule: CaptureSchedule,
-        gates: ProfileGateEvidence,
-    ) -> ProfileQualificationAttempt {
-        let context = context(fps);
-        let post_scope = ProfileScope::from_context(&context).unwrap();
-        ProfileQualificationAttempt::new(
-            1_788_192_000,
-            id.into(),
-            context,
+    ) -> QualifiedCandidateEvidence {
+        candidate_fixture_with_release("baseline-30-15", id, rgb_fps, ir_fps, schedule, 0x44)
+    }
+
+    fn candidate_fixture_with_release(
+        baseline_id: &str,
+        id: &str,
+        rgb_fps: u32,
+        ir_fps: u32,
+        schedule: CaptureSchedule,
+        campaign_byte: u8,
+    ) -> QualifiedCandidateEvidence {
+        let release = verified_release_fixture(
+            baseline_id,
+            id,
+            rgb_fps,
+            ir_fps,
             schedule,
-            gates,
-            "11".repeat(32),
-            "22".repeat(32),
-            "33".repeat(32),
-            post_scope,
+            campaign_byte,
+            FIXED_NOW,
+        );
+        let local = validated_commissioning_fixture(id, rgb_fps, ir_fps, schedule, FIXED_NOW);
+        QualifiedCandidateEvidence::new(release, local, &authority_fixture()).unwrap()
+    }
+
+    fn candidate_with_profile_mismatch(
+    ) -> Result<QualifiedCandidateEvidence, ProfileQualificationError> {
+        let release = verified_release_fixture(
+            "baseline-30-15",
+            "release-candidate",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            0x44,
+            FIXED_NOW,
+        );
+        let local = validated_commissioning_fixture(
+            "local-candidate",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            FIXED_NOW,
+        );
+        QualifiedCandidateEvidence::new(release, local, &authority_fixture())
+    }
+
+    fn candidate_with_scope_mismatch(
+    ) -> Result<QualifiedCandidateEvidence, ProfileQualificationError> {
+        let release = verified_release_fixture_with_descriptor(
+            "baseline-30-15",
+            "candidate-15-15",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            0x44,
+            FIXED_NOW,
+            &"cd".repeat(32),
+        );
+        let local = validated_commissioning_fixture(
+            "candidate-15-15",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            FIXED_NOW,
+        );
+        QualifiedCandidateEvidence::new(release, local, &authority_fixture())
+    }
+
+    fn candidate_with_model_drift() -> Result<QualifiedCandidateEvidence, ProfileQualificationError>
+    {
+        let release = verified_release_fixture(
+            "baseline-30-15",
+            "candidate-15-15",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            0x44,
+            FIXED_NOW,
+        );
+        let local = validated_commissioning_fixture(
+            "candidate-15-15",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            FIXED_NOW,
+        );
+        let authority = QualificationAuthorityContext::new(
+            "78".repeat(32),
+            "66".repeat(32),
+            "44".repeat(32),
+            "55".repeat(32),
         )
-        .unwrap()
+        .unwrap();
+        QualifiedCandidateEvidence::new(release, local, &authority)
     }
 
     #[test]
-    fn transport_only_attempt_cannot_select_a_profile() {
-        let gates = ProfileGateEvidence::empty()
-            .with_gate(ProfileGate::Negotiation, GateStatus::Passed)
-            .with_gate(ProfileGate::Transport, GateStatus::Passed)
-            .with_scene(QualificationScene::Lit, true, GateStatus::Passed)
-            .with_scene(
-                QualificationScene::Backlit,
-                false,
-                GateStatus::NotApplicable,
-            )
-            .with_scene(
-                QualificationScene::LowLight,
-                false,
-                GateStatus::NotApplicable,
-            )
-            .with_scene(QualificationScene::DarkIr, false, GateStatus::NotApplicable);
-        let attempt = attempt("transport-only", 15, CaptureSchedule::Concurrent, gates);
+    fn release_and_local_pass_select_balanced_candidate_and_sequential_fallback() {
+        let candidates = vec![
+            candidate_fixture("concurrent-30-15", 30, 15, CaptureSchedule::Concurrent),
+            candidate_fixture("concurrent-15-15", 15, 15, CaptureSchedule::Concurrent),
+            candidate_fixture("sequential-15-15", 15, 15, CaptureSchedule::Sequential),
+        ];
+        let record = select_profiles(
+            candidates,
+            authority_fixture(),
+            RankingBudget::new(1, 20_000_000, 10_000).unwrap(),
+        )
+        .unwrap();
 
+        assert_eq!(record.selected().profile_id(), "concurrent-15-15");
         assert_eq!(
-            attempt.qualified().unwrap_err(),
-            ProfileQualificationError::MissingGate(ProfileGate::Detection)
+            record.sequential_fallback().unwrap().profile_id(),
+            "sequential-15-15"
+        );
+        assert_ne!(
+            record.selected().release_qualification_sha256(),
+            record.selected().local_commissioning_sha256(),
+        );
+        assert_eq!(record.model_contract_sha256(), "77".repeat(32));
+    }
+
+    #[test]
+    fn mismatched_evidence_never_enters_ranking() {
+        assert_eq!(
+            candidate_with_profile_mismatch().unwrap_err(),
+            ProfileQualificationError::ProfileMismatch,
+        );
+        assert_eq!(
+            candidate_with_scope_mismatch().unwrap_err(),
+            ProfileQualificationError::HardwareScopeMismatch,
+        );
+        assert_eq!(
+            candidate_with_model_drift().unwrap_err(),
+            ProfileQualificationError::ModelContractChanged,
         );
     }
 
     #[test]
-    fn every_model_quality_and_latency_gate_is_mandatory() {
-        let cases = [
+    fn every_current_contract_binding_is_mandatory() {
+        let authority_cases = [
             (
-                ProfileGate::Detection,
-                complete_gates().without_gate(ProfileGate::Detection),
+                QualificationAuthorityContext::new(
+                    "77".repeat(32),
+                    "67".repeat(32),
+                    "44".repeat(32),
+                    "55".repeat(32),
+                )
+                .unwrap(),
+                ProfileQualificationError::PreprocessingContractChanged,
             ),
             (
-                ProfileGate::Recognition,
-                complete_gates().without_gate(ProfileGate::Recognition),
+                QualificationAuthorityContext::new(
+                    "77".repeat(32),
+                    "66".repeat(32),
+                    "45".repeat(32),
+                    "55".repeat(32),
+                )
+                .unwrap(),
+                ProfileQualificationError::ConditioningCatalogChanged,
             ),
             (
-                ProfileGate::Liveness,
-                complete_gates().without_gate(ProfileGate::Liveness),
-            ),
-            (
-                ProfileGate::Pad,
-                complete_gates().without_gate(ProfileGate::Pad),
-            ),
-            (
-                ProfileGate::Latency,
-                complete_gates().without_gate(ProfileGate::Latency),
+                QualificationAuthorityContext::new(
+                    "77".repeat(32),
+                    "66".repeat(32),
+                    "44".repeat(32),
+                    "56".repeat(32),
+                )
+                .unwrap(),
+                ProfileQualificationError::SelectedPolicyChanged,
             ),
         ];
-        for (missing, gates) in cases {
-            let attempt = attempt("missing-gate", 15, CaptureSchedule::Concurrent, gates);
+        for (authority, expected) in authority_cases {
+            let release = verified_release_fixture(
+                "baseline-30-15",
+                "candidate-15-15",
+                15,
+                15,
+                CaptureSchedule::Concurrent,
+                0x44,
+                FIXED_NOW,
+            );
+            let local = validated_commissioning_fixture(
+                "candidate-15-15",
+                15,
+                15,
+                CaptureSchedule::Concurrent,
+                FIXED_NOW,
+            );
             assert_eq!(
-                attempt.qualified().unwrap_err(),
-                ProfileQualificationError::MissingGate(missing)
+                QualifiedCandidateEvidence::new(release, local, &authority).unwrap_err(),
+                expected,
+            );
+        }
+
+        for (catalog_byte, policy_byte, expected) in [
+            (
+                0x45,
+                0x55,
+                ProfileQualificationError::ConditioningCatalogChanged,
+            ),
+            (0x44, 0x56, ProfileQualificationError::SelectedPolicyChanged),
+        ] {
+            let release = verified_release_fixture(
+                "baseline-30-15",
+                "candidate-15-15",
+                15,
+                15,
+                CaptureSchedule::Concurrent,
+                0x44,
+                FIXED_NOW,
+            );
+            let local = validated_commissioning_fixture_with_bindings(
+                "candidate-15-15",
+                15,
+                15,
+                CaptureSchedule::Concurrent,
+                FIXED_NOW,
+                catalog_byte,
+                policy_byte,
+            );
+            assert_eq!(
+                QualifiedCandidateEvidence::new(release, local, &authority_fixture()).unwrap_err(),
+                expected,
             );
         }
     }
 
     #[test]
-    fn digest_or_endpoint_context_drift_authorizes_nothing() {
-        let mut digest_drift = attempt(
-            "digest-drift",
-            15,
-            CaptureSchedule::Concurrent,
-            complete_gates(),
-        );
-        digest_drift.model_contract_digest = "44".repeat(32);
+    fn mixed_baselines_campaigns_scopes_and_duplicate_pairs_fail_closed() {
+        let budget = RankingBudget::new(1, 20_000_000, 10_000).unwrap();
         assert_eq!(
-            digest_drift
-                .qualified_for(&QualificationAuthorityContext::new(
-                    "11".repeat(32),
-                    "22".repeat(32),
-                ))
-                .unwrap_err(),
-            ProfileQualificationError::ModelContractChanged
+            select_profiles(
+                vec![
+                    candidate_fixture_with_release(
+                        "baseline-30-15",
+                        "candidate-a",
+                        15,
+                        15,
+                        CaptureSchedule::Concurrent,
+                        0x44,
+                    ),
+                    candidate_fixture_with_release(
+                        "other-baseline",
+                        "candidate-b",
+                        15,
+                        15,
+                        CaptureSchedule::Concurrent,
+                        0x44,
+                    ),
+                ],
+                authority_fixture(),
+                budget,
+            )
+            .unwrap_err(),
+            ProfileQualificationError::BaselineProfileMismatch,
+        );
+        assert_eq!(
+            select_profiles(
+                vec![
+                    candidate_fixture_with_release(
+                        "baseline-30-15",
+                        "candidate-a",
+                        15,
+                        15,
+                        CaptureSchedule::Concurrent,
+                        0x44,
+                    ),
+                    candidate_fixture_with_release(
+                        "baseline-30-15",
+                        "candidate-b",
+                        15,
+                        15,
+                        CaptureSchedule::Concurrent,
+                        0x45,
+                    ),
+                ],
+                authority_fixture(),
+                budget,
+            )
+            .unwrap_err(),
+            ProfileQualificationError::ContextChanged,
         );
 
-        let mut context_drift = attempt(
-            "context-drift",
+        let changed_context_release = verified_release_fixture(
+            "baseline-30-15",
+            "candidate-b",
+            15,
             15,
             CaptureSchedule::Concurrent,
-            complete_gates(),
+            0x44,
+            FIXED_NOW,
         );
-        context_drift.post_scope = ProfileScope::from_context(&context(30)).unwrap();
-        context_drift.post_scope.rgb_endpoint = CameraEndpoint::new(
-            "cd".repeat(32),
-            0x0bda,
-            0x5678,
-            Some("replacement".into()),
-            0,
-            "/devices/pci0000:00/0000:00:14.0/usb4/4-3".into(),
-            QualifiedStreamRole::Rgb,
-            ConnectionContext::new(
-                "/devices/pci0000:00/0000:00:14.0".into(),
-                5_000_000,
-                "uvcvideo".into(),
-                "v4l2-uvc".into(),
-            )
-            .unwrap(),
+        let changed_context_local = validated_commissioning_fixture_with_serial(
+            "candidate-b",
+            15,
+            15,
+            CaptureSchedule::Concurrent,
+            FIXED_NOW,
+            "other-device",
+        );
+        let changed_context = QualifiedCandidateEvidence::new(
+            changed_context_release,
+            changed_context_local,
+            &authority_fixture(),
         )
         .unwrap();
         assert_eq!(
-            context_drift.qualified().unwrap_err(),
-            ProfileQualificationError::ContextChanged
+            select_profiles(
+                vec![
+                    candidate_fixture("candidate-a", 15, 15, CaptureSchedule::Concurrent),
+                    changed_context,
+                ],
+                authority_fixture(),
+                budget,
+            )
+            .unwrap_err(),
+            ProfileQualificationError::ContextChanged,
+        );
+
+        assert_eq!(
+            select_profiles(
+                vec![
+                    candidate_fixture("duplicate", 15, 15, CaptureSchedule::Concurrent),
+                    candidate_fixture("duplicate", 15, 15, CaptureSchedule::Concurrent),
+                ],
+                authority_fixture(),
+                budget,
+            )
+            .unwrap_err(),
+            ProfileQualificationError::DuplicateCandidate,
         );
     }
 
     #[test]
-    fn complete_record_selects_balanced_winner_and_sequential_fallback() {
-        let attempts = vec![
-            attempt(
-                "concurrent-30",
-                30,
-                CaptureSchedule::Concurrent,
-                complete_gates(),
-            ),
-            attempt(
-                "concurrent-15",
-                15,
-                CaptureSchedule::Concurrent,
-                complete_gates(),
-            ),
-            attempt(
-                "sequential-15",
-                15,
-                CaptureSchedule::Sequential,
-                complete_gates(),
-            ),
-        ];
-        let authority = QualificationAuthorityContext::new("11".repeat(32), "22".repeat(32));
+    fn sequential_only_candidates_rank_without_fabricating_a_concurrent_profile() {
         let record = select_profiles(
-            attempts,
-            authority,
+            vec![
+                candidate_fixture("sequential-30-15", 30, 15, CaptureSchedule::Sequential),
+                candidate_fixture("sequential-15-15", 15, 15, CaptureSchedule::Sequential),
+            ],
+            authority_fixture(),
             RankingBudget::new(1, 20_000_000, 10_000).unwrap(),
         )
         .unwrap();
-
-        assert_eq!(record.selected().profile_id(), "concurrent-15");
+        assert_eq!(record.selected().profile_id(), "sequential-15-15");
+        assert_eq!(record.selected().schedule(), CaptureSchedule::Sequential);
         assert_eq!(
             record.sequential_fallback().unwrap().profile_id(),
-            "sequential-15"
+            "sequential-15-15",
         );
-        assert_eq!(record.model_contract_digest(), "11".repeat(32));
+
+        let same_id = select_profiles(
+            vec![
+                candidate_fixture("same-id", 15, 15, CaptureSchedule::Concurrent),
+                candidate_fixture("same-id", 15, 15, CaptureSchedule::Sequential),
+            ],
+            authority_fixture(),
+            RankingBudget::new(1, 20_000_000, 10_000).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(same_id.selected().schedule(), CaptureSchedule::Concurrent);
+        assert_eq!(
+            same_id.sequential_fallback().unwrap().schedule(),
+            CaptureSchedule::Sequential,
+        );
+    }
+
+    #[test]
+    fn candidate_count_is_bounded_before_ranking() {
+        let budget = RankingBudget::new(1, 20_000_000, 10_000).unwrap();
+        assert_eq!(
+            select_profiles(Vec::new(), authority_fixture(), budget).unwrap_err(),
+            ProfileQualificationError::CandidateCount,
+        );
+        let candidates = (0..33)
+            .map(|index| {
+                candidate_fixture(
+                    &format!("candidate-{index:02}"),
+                    15,
+                    15,
+                    CaptureSchedule::Concurrent,
+                )
+            })
+            .collect();
+        assert_eq!(
+            select_profiles(candidates, authority_fixture(), budget).unwrap_err(),
+            ProfileQualificationError::CandidateCount,
+        );
     }
 
     struct TempStore {
@@ -1340,20 +1313,10 @@ mod tests {
     fn selection_record() -> ProfileSelectionRecord {
         select_profiles(
             vec![
-                attempt(
-                    "concurrent-15",
-                    15,
-                    CaptureSchedule::Concurrent,
-                    complete_gates(),
-                ),
-                attempt(
-                    "sequential-15",
-                    15,
-                    CaptureSchedule::Sequential,
-                    complete_gates(),
-                ),
+                candidate_fixture("concurrent-15-15", 15, 15, CaptureSchedule::Concurrent),
+                candidate_fixture("sequential-15-15", 15, 15, CaptureSchedule::Sequential),
             ],
-            QualificationAuthorityContext::new("11".repeat(32), "22".repeat(32)),
+            authority_fixture(),
             RankingBudget::new(1, 20_000_000, 10_000).unwrap(),
         )
         .unwrap()
@@ -1368,11 +1331,43 @@ mod tests {
             record
         );
 
+        let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert_eq!(
+            ProfileSelectionRecord::from_json(value.to_string().as_bytes()).unwrap_err(),
+            ProfileQualificationError::Json,
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        value["selected"]["unknown"] = serde_json::json!(true);
+        assert_eq!(
+            ProfileSelectionRecord::from_json(value.to_string().as_bytes()).unwrap_err(),
+            ProfileQualificationError::Json,
+        );
+
         let mut unsupported: serde_json::Value = serde_json::from_str(&body).unwrap();
         unsupported["schema_version"] = serde_json::json!(99);
         assert_eq!(
             ProfileSelectionRecord::from_json(unsupported.to_string().as_bytes()).unwrap_err(),
             ProfileQualificationError::UnsupportedSchema(99)
+        );
+
+        for field in ["release_qualification_sha256", "local_commissioning_sha256"] {
+            let mut malformed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            malformed["selected"][field] = serde_json::json!("not-a-digest");
+            assert_eq!(
+                ProfileSelectionRecord::from_json(malformed.to_string().as_bytes()).unwrap_err(),
+                ProfileQualificationError::InvalidDigest,
+                "{field}",
+            );
+        }
+
+        let mut changed_scope: serde_json::Value = serde_json::from_str(&body).unwrap();
+        changed_scope["selected"]["context"]["rgb_endpoint"]["serial"] =
+            serde_json::json!("different-device");
+        assert_eq!(
+            ProfileSelectionRecord::from_json(changed_scope.to_string().as_bytes()).unwrap_err(),
+            ProfileQualificationError::ContextChanged,
         );
         assert_eq!(
             ProfileSelectionRecord::from_json(&vec![b' '; MAX_PROFILE_SELECTION_RECORD_BYTES + 1])

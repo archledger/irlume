@@ -207,6 +207,10 @@ impl ReleaseHardwareScope {
             && self.rgb.matches_endpoint(context.rgb_endpoint())
             && self.ir.matches_endpoint(context.ir_endpoint())
     }
+
+    pub(crate) const fn match_policy_version(&self) -> u32 {
+        self.match_policy_version
+    }
 }
 
 impl ReleaseEndpointScope {
@@ -375,6 +379,42 @@ impl ReleaseQualificationArtifact {
 
     pub(crate) const fn signature(&self) -> &ReleaseSignatureMetadata {
         &self.signature
+    }
+
+    pub(crate) const fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
+    pub(crate) const fn producer_version(&self) -> u32 {
+        self.producer_version
+    }
+
+    pub(crate) fn campaign_id(&self) -> &str {
+        &self.campaign_id
+    }
+
+    pub(crate) fn campaign_protocol_sha256(&self) -> &str {
+        &self.campaign_protocol_sha256
+    }
+
+    pub(crate) fn campaign_result_sha256(&self) -> &str {
+        &self.campaign_result_sha256
+    }
+
+    pub(crate) fn conditioning_catalog_sha256(&self) -> &str {
+        &self.conditioning_catalog_sha256
+    }
+
+    pub(crate) fn selected_policy_sha256(&self) -> &str {
+        &self.selected_policy_sha256
+    }
+
+    pub(crate) fn preprocessing_contract_sha256(&self) -> &str {
+        &self.preprocessing_contract_sha256
+    }
+
+    pub(crate) fn model_contract_sha256(&self) -> &str {
+        &self.model_contract_sha256
     }
 }
 

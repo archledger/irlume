@@ -254,6 +254,54 @@ pub(crate) fn verified_release_fixture(
     campaign_byte: u8,
     now_unix: u64,
 ) -> VerifiedReleaseQualification {
+    verified_release_fixture_with_optional_descriptor(
+        baseline_id,
+        candidate_id,
+        candidate_rgb_fps,
+        candidate_ir_fps,
+        candidate_schedule,
+        campaign_byte,
+        now_unix,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verified_release_fixture_with_descriptor(
+    baseline_id: &str,
+    candidate_id: &str,
+    candidate_rgb_fps: u32,
+    candidate_ir_fps: u32,
+    candidate_schedule: crate::profile::CaptureSchedule,
+    campaign_byte: u8,
+    now_unix: u64,
+    rgb_descriptor_sha256: &str,
+) -> VerifiedReleaseQualification {
+    verified_release_fixture_with_optional_descriptor(
+        baseline_id,
+        candidate_id,
+        candidate_rgb_fps,
+        candidate_ir_fps,
+        candidate_schedule,
+        campaign_byte,
+        now_unix,
+        Some(rgb_descriptor_sha256),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn verified_release_fixture_with_optional_descriptor(
+    baseline_id: &str,
+    candidate_id: &str,
+    candidate_rgb_fps: u32,
+    candidate_ir_fps: u32,
+    candidate_schedule: crate::profile::CaptureSchedule,
+    campaign_byte: u8,
+    now_unix: u64,
+    rgb_descriptor_sha256: Option<&str>,
+) -> VerifiedReleaseQualification {
     assert!(now_unix > 1 && now_unix < u64::MAX - 604_800);
     let mut value = crate::release_qualification::fixture_artifact_value(baseline_id, candidate_id);
     for stream in ["requested_rgb", "accepted_rgb"] {
@@ -264,6 +312,9 @@ pub(crate) fn verified_release_fixture(
     }
     value["candidate"]["schedule"] = serde_json::to_value(candidate_schedule).unwrap();
     value["campaign_result_sha256"] = serde_json::json!(format!("{campaign_byte:02x}").repeat(32));
+    if let Some(descriptor) = rgb_descriptor_sha256 {
+        value["hardware_scope"]["rgb"]["descriptor_sha256"] = serde_json::json!(descriptor);
+    }
     value["qualified_at_unix"] = serde_json::json!(now_unix - 1);
     value["expires_at_unix"] = serde_json::json!(now_unix + 604_800);
     let artifact: ReleaseQualificationArtifact = serde_json::from_value(value).unwrap();

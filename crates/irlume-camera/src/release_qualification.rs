@@ -13,6 +13,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    capture_qualification::{CameraEndpoint, QualificationContext},
     contracts::StreamRole,
     frame_interval::FrameInterval,
     profile::{CaptureSchedule, DecodedPixelFormat, PairTransportProfile, StreamTuple},
@@ -195,6 +196,33 @@ impl ReleaseHardwareScope {
         self.ir.validate()?;
         Ok(())
     }
+
+    pub(crate) fn matches_context(
+        &self,
+        context: &QualificationContext,
+        interface_layout_sha256: &str,
+    ) -> bool {
+        self.match_policy_version == HARDWARE_SCOPE_MATCH_POLICY_VERSION
+            && self.interface_layout_sha256 == interface_layout_sha256
+            && self.rgb.matches_endpoint(context.rgb_endpoint())
+            && self.ir.matches_endpoint(context.ir_endpoint())
+    }
+
+    pub(crate) const fn match_policy_version(&self) -> u32 {
+        self.match_policy_version
+    }
+}
+
+impl ReleaseEndpointScope {
+    fn matches_endpoint(&self, endpoint: &CameraEndpoint) -> bool {
+        self.descriptor_sha256 == endpoint.descriptor_sha256()
+            && self.vid == endpoint.vid()
+            && self.pid == endpoint.pid()
+            && self.interface_number == endpoint.interface_number()
+            && self.driver == endpoint.connection().driver()
+            && self.backend == endpoint.connection().backend()
+            && self.speed_millimbps == endpoint.connection().speed_millimbps()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -351,6 +379,42 @@ impl ReleaseQualificationArtifact {
 
     pub(crate) const fn signature(&self) -> &ReleaseSignatureMetadata {
         &self.signature
+    }
+
+    pub(crate) const fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
+    pub(crate) const fn producer_version(&self) -> u32 {
+        self.producer_version
+    }
+
+    pub(crate) fn campaign_id(&self) -> &str {
+        &self.campaign_id
+    }
+
+    pub(crate) fn campaign_protocol_sha256(&self) -> &str {
+        &self.campaign_protocol_sha256
+    }
+
+    pub(crate) fn campaign_result_sha256(&self) -> &str {
+        &self.campaign_result_sha256
+    }
+
+    pub(crate) fn conditioning_catalog_sha256(&self) -> &str {
+        &self.conditioning_catalog_sha256
+    }
+
+    pub(crate) fn selected_policy_sha256(&self) -> &str {
+        &self.selected_policy_sha256
+    }
+
+    pub(crate) fn preprocessing_contract_sha256(&self) -> &str {
+        &self.preprocessing_contract_sha256
+    }
+
+    pub(crate) fn model_contract_sha256(&self) -> &str {
+        &self.model_contract_sha256
     }
 }
 

@@ -1,6 +1,7 @@
 # Camera Profile Release Qualification: Design
 
-Status: approved design, pending implementation plan
+Status: software-only authority design implemented and independently approved;
+campaign and production integration remain separate
 Date: 2026-09-01
 Agent: opencode
 Scope: Task 7 release qualification authority, local non-biometric commissioning,
@@ -21,6 +22,10 @@ Amends:
 Decision record:
 
 - `docs/adr/0021-release-qualified-camera-profile-evidence.md`
+
+Campaign design:
+
+- `docs/superpowers/specs/2026-09-02-camera-profile-maintainer-qualification-campaign-design.md`
 
 ## Goal
 

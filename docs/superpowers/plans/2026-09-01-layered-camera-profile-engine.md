@@ -611,6 +611,12 @@ git commit -s -m "feat: bind immutable camera attempt plans"
 
 ### Task 7: Offline Full-Quality Profile Qualification
 
+> **Superseded:** Do not execute this Task 7 procedure. The approved architecture
+> is `docs/superpowers/specs/2026-09-01-camera-profile-release-qualification-design.md`.
+> A replacement implementation plan is pending review. Task 8 remains blocked
+> until that replacement plan produces reviewed release and local evidence
+> authority.
+
 **Files:**
 - Create: `crates/irlume-camera/src/profile_qualification.rs`
 - Create: `crates/irlume-camera/examples/profile_qualification_probe.rs`

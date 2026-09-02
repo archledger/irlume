@@ -1,12 +1,14 @@
 # Camera Profile Evaluation Corpus: Design
 
-Status: approved design, pending implementation plan
+Status: superseded by `2026-09-01-camera-profile-release-qualification-design.md`
 Date: 2026-09-01
 Agent: opencode
 Scope: Task 7 corpus protocol, private capture evidence, consent governance,
 offline evaluation, and no-write reporting. No biometric collection, corpus
 copy, hardware run, qualification write, or production selection is authorized
 by this document.
+
+This owner-local design is retained for history only. Do not implement it.
 
 ## Goal
 

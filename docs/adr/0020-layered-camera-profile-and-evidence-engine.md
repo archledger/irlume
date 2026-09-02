@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-01
 **Amends:** [ADR-0007](0007-context-bound-capture-qualification.md)
+**Amended by:** [ADR-0021](0021-release-qualified-camera-profile-evidence.md)
 **Design:** [Layered Camera Profile And Evidence Engine](../superpowers/specs/2026-09-01-layered-camera-profile-engine-design.md)
 
 ## Context

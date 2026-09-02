@@ -1,5 +1,8 @@
 # Camera Profile Evaluation Corpus Software Implementation Plan
 
+> **Superseded:** Do not execute this plan. The approved replacement is
+> `docs/superpowers/specs/2026-09-01-camera-profile-release-qualification-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. The user prohibits subagents for this project, so execute inline with review checkpoints.
 
 **Goal:** Replace the provisional combined evaluation manifest with bounded signed protocol, capture, and consent contracts plus a synthetic-only, identity-free owner-pilot reducer that cannot create profile-selection authority.

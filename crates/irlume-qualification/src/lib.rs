@@ -4,6 +4,7 @@
 //! Maintainer-only camera profile qualification contracts.
 
 mod canonical;
+mod compiler;
 mod lifecycle;
 mod policy;
 mod protocol;
@@ -16,6 +17,7 @@ pub use canonical::{
     CampaignDiagnostic, CampaignError, CanonicalDocument, Identifier, RatePpb, Sha256Digest,
     SignedRateDifferencePpb, SignerFingerprint, MAX_CAMPAIGN_DOCUMENT_BYTES, RATE_SCALE_PPB,
 };
+pub use compiler::{compile_unsigned_release_artifact, UnsignedReleaseArtifact};
 pub use lifecycle::{
     resolve_deletion, validate_collection_eligibility, validate_evaluation_eligibility,
     validate_frozen_bundle, validate_publication_eligibility, AssetDescriptor, AttemptRecord,
@@ -32,10 +34,11 @@ pub use policy::{
     OVERALL_MARGIN_PPB, REQUIRED_POWER_PPB, STRATUM_MARGIN_PPB,
 };
 pub use protocol::{
-    CampaignProtocol, CaptureSchedule, CasePlan, EquipmentInvalidation, HardwareScope,
-    LockedSampleSize, OperatingPoint, PilotDiscordance, PixelFormat, ProfileContract,
-    PublicRegressionEvidence, RuntimeContractDigests, StratumPlan, StreamContract, StreamRole,
-    ValidatedProtocol, CAMPAIGN_PROTOCOL_SCHEMA_VERSION, HARDWARE_SCOPE_MATCH_POLICY_VERSION,
+    CampaignProtocol, CaptureSchedule, CasePlan, EquipmentInvalidation, HardwareEndpointScope,
+    HardwareScope, LockedSampleSize, OperatingPoint, PilotDiscordance, PixelFormat,
+    ProfileContract, PublicRegressionEvidence, RuntimeContractDigests, StratumPlan, StreamContract,
+    StreamRole, ValidatedProtocol, CAMPAIGN_PROTOCOL_SCHEMA_VERSION,
+    HARDWARE_SCOPE_MATCH_POLICY_VERSION,
 };
 pub use reducer::{
     reduce_campaign, EvaluatedPairedCase, ProfileCaseOutcome, ReductionContext, StageOutcome,

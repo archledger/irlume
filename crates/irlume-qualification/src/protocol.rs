@@ -76,6 +76,22 @@ impl StreamContract {
         }
         Ok(())
     }
+
+    pub(crate) const fn format(&self) -> PixelFormat {
+        self.format
+    }
+    pub(crate) const fn width(&self) -> u32 {
+        self.width
+    }
+    pub(crate) const fn height(&self) -> u32 {
+        self.height
+    }
+    pub(crate) const fn interval_numerator(&self) -> u32 {
+        self.interval_numerator
+    }
+    pub(crate) const fn interval_denominator(&self) -> u32 {
+        self.interval_denominator
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -158,6 +174,65 @@ impl ProfileContract {
     pub(crate) const fn selected_policy_sha256(&self) -> &Sha256Digest {
         &self.contracts.selected_policy_sha256
     }
+
+    pub(crate) const fn requested_rgb(&self) -> &StreamContract {
+        &self.requested_rgb
+    }
+    pub(crate) const fn accepted_rgb(&self) -> &StreamContract {
+        &self.accepted_rgb
+    }
+    pub(crate) const fn requested_ir(&self) -> &StreamContract {
+        &self.requested_ir
+    }
+    pub(crate) const fn accepted_ir(&self) -> &StreamContract {
+        &self.accepted_ir
+    }
+    pub(crate) const fn schedule(&self) -> CaptureSchedule {
+        self.schedule
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareEndpointScope {
+    backend: Identifier,
+    descriptor_sha256: Sha256Digest,
+    driver: Identifier,
+    interface_number: u8,
+    pid: u16,
+    speed_millimbps: u64,
+    vid: u16,
+}
+
+impl HardwareEndpointScope {
+    fn validate(&self) -> Result<(), CampaignError> {
+        if self.speed_millimbps == 0 {
+            return Err(CampaignError::ProtocolInvalid);
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn backend(&self) -> &Identifier {
+        &self.backend
+    }
+    pub(crate) const fn descriptor_sha256(&self) -> &Sha256Digest {
+        &self.descriptor_sha256
+    }
+    pub(crate) const fn driver(&self) -> &Identifier {
+        &self.driver
+    }
+    pub(crate) const fn interface_number(&self) -> u8 {
+        self.interface_number
+    }
+    pub(crate) const fn pid(&self) -> u16 {
+        self.pid
+    }
+    pub(crate) const fn speed_millimbps(&self) -> u64 {
+        self.speed_millimbps
+    }
+    pub(crate) const fn vid(&self) -> u16 {
+        self.vid
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -165,24 +240,39 @@ impl ProfileContract {
 pub struct HardwareScope {
     hardware_class: Identifier,
     interface_layout_sha256: Sha256Digest,
-    ir_descriptor_sha256: Sha256Digest,
+    ir: HardwareEndpointScope,
     match_policy_version: u32,
-    rgb_descriptor_sha256: Sha256Digest,
+    rgb: HardwareEndpointScope,
 }
 
 impl HardwareScope {
     fn validate(&self) -> Result<(), CampaignError> {
         if self.match_policy_version != HARDWARE_SCOPE_MATCH_POLICY_VERSION
-            || self.rgb_descriptor_sha256 == self.ir_descriptor_sha256
+            || self.rgb.descriptor_sha256 == self.ir.descriptor_sha256
         {
             return Err(CampaignError::ProtocolInvalid);
         }
+        self.rgb.validate()?;
+        self.ir.validate()?;
         Ok(())
     }
 
     #[must_use]
     pub fn hardware_class(&self) -> &Identifier {
         &self.hardware_class
+    }
+
+    pub(crate) const fn interface_layout_sha256(&self) -> &Sha256Digest {
+        &self.interface_layout_sha256
+    }
+    pub(crate) const fn match_policy_version(&self) -> u32 {
+        self.match_policy_version
+    }
+    pub(crate) const fn rgb(&self) -> &HardwareEndpointScope {
+        &self.rgb
+    }
+    pub(crate) const fn ir(&self) -> &HardwareEndpointScope {
+        &self.ir
     }
 
     pub(crate) fn lifecycle_sha256(&self) -> Result<Sha256Digest, CampaignError> {
@@ -1041,9 +1131,25 @@ pub(crate) mod tests {
             "hardware_scope": {
                 "hardware_class": "usb-rgb-ir-v1",
                 "interface_layout_sha256": digest("a"),
-                "ir_descriptor_sha256": digest("b"),
+                "ir": {
+                    "backend": "v4l2-uvc",
+                    "descriptor_sha256": digest("b"),
+                    "driver": "uvcvideo",
+                    "interface_number": 2,
+                    "pid": 0x5678,
+                    "speed_millimbps": 5_000_000u64,
+                    "vid": 0x0bda
+                },
                 "match_policy_version": 1,
-                "rgb_descriptor_sha256": digest("c")
+                "rgb": {
+                    "backend": "v4l2-uvc",
+                    "descriptor_sha256": digest("c"),
+                    "driver": "uvcvideo",
+                    "interface_number": 0,
+                    "pid": 0x5678,
+                    "speed_millimbps": 5_000_000u64,
+                    "vid": 0x0bda
+                }
             },
             "locked_sample_sizes": locked_sample_sizes,
             "latency_budget_us": 1000000,
@@ -1157,6 +1263,74 @@ pub(crate) mod tests {
                 validate(&drift),
                 Err(CampaignError::ProtocolInvalid),
                 "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_binds_exact_identity_free_release_endpoint_scope() {
+        let original = validate(&protocol_value()).unwrap();
+        let original_digest = original.protocol_sha256().clone();
+        for (endpoint, field, replacement) in [
+            ("rgb", "backend", json!("v4l2-rgb")),
+            ("rgb", "descriptor_sha256", digest("e")),
+            ("rgb", "driver", json!("uvcvideo-rgb")),
+            ("rgb", "interface_number", json!(1)),
+            ("rgb", "pid", json!(0x5679)),
+            ("rgb", "speed_millimbps", json!(4_800_000u64)),
+            ("rgb", "vid", json!(0x0bdb)),
+            ("ir", "backend", json!("v4l2-ir")),
+            ("ir", "descriptor_sha256", digest("f")),
+            ("ir", "driver", json!("uvcvideo-ir")),
+            ("ir", "interface_number", json!(3)),
+            ("ir", "pid", json!(0x5680)),
+            ("ir", "speed_millimbps", json!(4_900_000u64)),
+            ("ir", "vid", json!(0x0bdc)),
+        ] {
+            let mut changed = protocol_value();
+            changed["hardware_scope"][endpoint][field] = replacement;
+            let changed = validate(&changed).unwrap();
+            assert_ne!(
+                changed.protocol_sha256(),
+                &original_digest,
+                "protocol digest ignored {endpoint}.{field}"
+            );
+        }
+
+        for (endpoint, field, replacement) in [
+            ("rgb", "speed_millimbps", json!(0)),
+            ("ir", "speed_millimbps", json!(0)),
+            ("rgb", "driver", json!("")),
+            ("ir", "driver", json!("")),
+            ("rgb", "backend", json!("")),
+            ("ir", "backend", json!("")),
+        ] {
+            let mut invalid = protocol_value();
+            invalid["hardware_scope"][endpoint][field] = replacement;
+            assert!(matches!(
+                validate(&invalid),
+                Err(CampaignError::ProtocolInvalid | CampaignError::CanonicalInvalid)
+            ));
+        }
+
+        let mut equal_descriptors = protocol_value();
+        equal_descriptors["hardware_scope"]["ir"]["descriptor_sha256"] =
+            equal_descriptors["hardware_scope"]["rgb"]["descriptor_sha256"].clone();
+        assert_eq!(
+            validate(&equal_descriptors),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut unknown = protocol_value();
+        unknown["hardware_scope"]["rgb"]["serial"] = json!("forbidden");
+        assert_eq!(validate(&unknown), Err(CampaignError::CanonicalInvalid));
+
+        let bytes = serde_json::to_vec(&protocol_value()).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for forbidden in ["serial", "devpath", "device_path", "relative_path"] {
+            assert!(
+                !text.contains(&format!("\"{forbidden}\":")),
+                "protocol serialized forbidden field {forbidden}"
             );
         }
     }

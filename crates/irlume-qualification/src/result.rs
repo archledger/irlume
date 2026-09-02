@@ -467,6 +467,11 @@ impl ReviewedAggregateEnvelope {
     pub const fn campaign_id(&self) -> &Identifier {
         &self.campaign_id
     }
+
+    #[must_use]
+    pub const fn protocol_sha256(&self) -> &Sha256Digest {
+        &self.protocol_sha256
+    }
 }
 
 /// Opaque authority proving that a passing aggregate completed independent review.
@@ -478,6 +483,7 @@ impl ReviewedAggregateEnvelope {
 /// let _forged = ReviewedAggregate {
 ///     envelope: todo!(),
 ///     envelope_sha256: todo!(),
+///     protocol: todo!(),
 ///     public_result: todo!(),
 ///     review: todo!(),
 /// };
@@ -497,6 +503,7 @@ impl ReviewedAggregateEnvelope {
 pub struct ReviewedAggregate {
     envelope: ReviewedAggregateEnvelope,
     envelope_sha256: Sha256Digest,
+    protocol: ValidatedProtocol,
     public_result: Verified<PublicAggregateResult>,
     review: Verified<ReviewAttestation>,
 }
@@ -510,6 +517,10 @@ impl ReviewedAggregate {
     #[must_use]
     pub const fn envelope_sha256(&self) -> &Sha256Digest {
         &self.envelope_sha256
+    }
+
+    pub(crate) const fn protocol(&self) -> &ValidatedProtocol {
+        &self.protocol
     }
 
     #[must_use]
@@ -605,13 +616,14 @@ pub fn assemble_reviewed_aggregate(
     Ok(ReviewedAggregate {
         envelope,
         envelope_sha256,
+        protocol: context.protocol.clone(),
         public_result,
         review,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         lifecycle::tests::review_inputs, reducer::tests::passing_output, verify_document,
@@ -739,6 +751,23 @@ mod tests {
         )
     }
 
+    pub(crate) fn passing_reviewed_aggregate() -> ReviewedAggregate {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        assemble_review_value(
+            &review_value(
+                &protocol,
+                &bundle,
+                &publication,
+                &transcript,
+                &public_result,
+            ),
+            &reviewer,
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn result_documents_round_trip_only_in_canonical_evaluator_form() {
         let output = passing_output();
@@ -795,36 +824,19 @@ mod tests {
 
     #[test]
     fn review_passes_only_with_verified_independent_authority() {
-        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
-        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
-        let review_bytes = serde_json::to_vec(&review_value(
-            &protocol,
-            &bundle,
-            &publication,
-            &transcript,
-            &public_result,
-        ))
-        .unwrap();
-        let review = verify_document::<ReviewAttestation>(
-            &review_bytes,
-            b"review-signature",
-            SignerRole::Reviewer,
-            &reviewer,
-            &AcceptSigner(reviewer.clone()),
-        )
-        .unwrap();
-        let reproduced = public_result.digest().clone();
-        let context = ReviewContext {
-            protocol: &protocol,
-            bundle: &bundle,
-            publication: &publication,
-            transcript: &transcript,
-            reproduced_public_result_sha256: &reproduced,
-        };
-        let reviewed = assemble_reviewed_aggregate(context, public_result, Some(review)).unwrap();
+        let reviewed = passing_reviewed_aggregate();
         assert_eq!(
             reviewed.envelope_sha256(),
             &reviewed.envelope().digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn reviewed_aggregate_retains_only_its_exact_validated_protocol() {
+        let reviewed = passing_reviewed_aggregate();
+        assert_eq!(
+            reviewed.protocol().protocol_sha256(),
+            reviewed.envelope().protocol_sha256()
         );
     }
 

@@ -583,9 +583,464 @@ pub(crate) fn fixture_release_scope() -> ReleaseHardwareScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irlume_qualification as qualification;
+    use qualification::{CanonicalDocument, DetachedSignatureVerifier};
+    use serde_json::{json, Value};
 
     const FIXED_NOW: u64 = 1_788_192_050;
     type AuthorityMutation = (&'static str, fn(&mut serde_json::Value));
+
+    const POLICY_AUTHOR: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const OPERATOR: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const EVALUATOR: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    const REVIEWER: &str = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+    const RELEASE_SIGNER: &str = "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+
+    struct FakeVerifier(&'static str);
+
+    impl DetachedSignatureVerifier for FakeVerifier {
+        fn verify(
+            &self,
+            _canonical_payload: &[u8],
+            _detached_signature: &[u8],
+        ) -> Result<qualification::SignerFingerprint, qualification::CampaignError> {
+            qualification::SignerFingerprint::new(self.0)
+        }
+    }
+
+    fn qdigest(byte: &str) -> Value {
+        json!(byte.repeat(64))
+    }
+
+    fn verify_q<T: CanonicalDocument>(
+        value: &Value,
+        role: qualification::SignerRole,
+        signer: &'static str,
+    ) -> qualification::Verified<T> {
+        let expected = signer;
+        let signer = qualification::SignerFingerprint::new(expected).unwrap();
+        qualification::verify_document(
+            &serde_json::to_vec(value).unwrap(),
+            b"synthetic-signature",
+            role,
+            &signer,
+            &FakeVerifier(expected),
+        )
+        .unwrap()
+    }
+
+    fn verify_q_document<T: CanonicalDocument>(
+        document: &T,
+        role: qualification::SignerRole,
+        expected: &'static str,
+    ) -> qualification::Verified<T> {
+        let signer = qualification::SignerFingerprint::new(expected).unwrap();
+        qualification::verify_document(
+            &document.to_canonical_json().unwrap(),
+            b"synthetic-signature",
+            role,
+            &signer,
+            &FakeVerifier(expected),
+        )
+        .unwrap()
+    }
+
+    fn campaign_policy_value() -> Value {
+        json!({
+            "allowed_equipment_repeats": 2,
+            "binary_gates": ["detection", "ir_pad", "liveness", "recognition", "rgb_pad"],
+            "demographic_axes": [
+                {"axis": "age", "categories": ["adult", "older_adult"], "minimum_cases": 40},
+                {"axis": "gender", "categories": ["female", "male", "nonbinary"], "minimum_cases": 40},
+                {"axis": "skin_tone", "categories": ["dark", "light", "medium"], "minimum_cases": 40}
+            ],
+            "excluded_pai_species": ["active_ir", "three_dimensional_mask"],
+            "expiry_rules": {"artifact_seconds": 31536000, "bundle_seconds": 2592000, "protocol_seconds": 2592000, "result_seconds": 2592000, "review_seconds": 604800},
+            "latency_bootstrap_resamples": 10000,
+            "latency_budget_fraction_ppb": 50000000,
+            "latency_method": "cluster_bootstrap_latency_v1",
+            "minimum_public_cell_size": 20,
+            "missingness_rule": "count_as_incorrect",
+            "noninferiority_method": "paired_mover_wilson_v1",
+            "one_sided_alpha_ppb": 50000000,
+            "operational_axes": [
+                {"axis": "eyewear", "categories": ["absent", "present"], "minimum_cases": 40},
+                {"axis": "lighting", "categories": ["dim", "ordinary"], "minimum_cases": 40},
+                {"axis": "range", "categories": ["near", "ordinary"], "minimum_cases": 40}
+            ],
+            "overall_margin_ppb": -20000000,
+            "paired_crossover": true,
+            "permitted_hardware_classes": ["usb-rgb-ir-v1"],
+            "policy_id": "maintainer-camera-profile-v1",
+            "policy_version": 1,
+            "power_method": "paired_power_normal_v1",
+            "presentation_classes": ["bona_fide", "display_replay", "no_face", "non_mated_live_cross_identity", "print"],
+            "private_asset_retention_seconds": 31536000,
+            "required_pai_species": ["display_replay", "print"],
+            "required_power_ppb": 800000000,
+            "role_separation_required": true,
+            "schema_version": 1,
+            "security_bound_method": "clopper_pearson_upper_v1",
+            "signature": {"algorithm": "open_pgp", "role": "policy_author", "signer_fingerprint": POLICY_AUTHOR},
+            "stopping_rule": "locked_sample_no_optional_stopping",
+            "stratum_margin_ppb": -50000000,
+            "target_population": "consenting-adults-in-declared-operating-range",
+            "withdrawal_rule": "invalidate_before_publication_delete_after_publication"
+        })
+    }
+
+    fn qstream(role: &str, format: &str, denominator: u32) -> Value {
+        json!({"format": format, "height": if role == "rgb" { 480 } else { 400 }, "interval_denominator": denominator, "interval_numerator": 1, "role": role, "width": 640})
+    }
+
+    fn qcontracts() -> Value {
+        json!({
+            "conditioning_catalog_sha256": qdigest("1"), "model_contract_sha256": qdigest("2"),
+            "preprocessing_contract_sha256": qdigest("3"), "producer_contract_sha256": qdigest("4"),
+            "selected_policy_sha256": qdigest("5"), "software_contract_sha256": qdigest("6"),
+            "threshold_contract_sha256": qdigest("7")
+        })
+    }
+
+    fn qprofile(id: &str, denominator: u32) -> Value {
+        json!({
+            "accepted_ir": qstream("ir", "grey8", 15), "accepted_rgb": qstream("rgb", "yuyv", denominator),
+            "contracts": qcontracts(), "profile_id": id, "requested_ir": qstream("ir", "grey8", 15),
+            "requested_rgb": qstream("rgb", "yuyv", denominator), "schedule": "concurrent"
+        })
+    }
+
+    fn campaign_protocol_value(policy_bytes: &[u8]) -> Value {
+        let policy = campaign_policy_value();
+        let mut strata = Vec::new();
+        for field in ["demographic_axes", "operational_axes"] {
+            for axis in policy[field].as_array().unwrap() {
+                for category in axis["categories"].as_array().unwrap() {
+                    let axis_name = axis["axis"].as_str().unwrap();
+                    let category_name = category.as_str().unwrap();
+                    strata.push(json!({"axis": axis_name, "category": category_name, "minimum_cases": axis["minimum_cases"], "stratum_id": format!("{axis_name}-{category_name}")}));
+                }
+            }
+        }
+        strata.sort_by(|a, b| a["stratum_id"].as_str().cmp(&b["stratum_id"].as_str()));
+        let mut cells: Vec<_> = strata
+            .iter()
+            .map(|s| (s, "bona_fide", None, "accept"))
+            .collect();
+        cells.extend([
+            (
+                &strata[0],
+                "display_replay",
+                Some("display_replay"),
+                "reject",
+            ),
+            (&strata[1], "no_face", None, "reject"),
+            (&strata[2], "non_mated_live_cross_identity", None, "reject"),
+            (&strata[3], "print", Some("print"), "reject"),
+        ]);
+        let mut cases = Vec::new();
+        for (index, (stratum, presentation, pai, expected)) in cells.into_iter().enumerate() {
+            let relation = match presentation {
+                "bona_fide" => "mated",
+                "non_mated_live_cross_identity" => "non_mated",
+                "no_face" => "no_reference",
+                _ => "pai_instrument",
+            };
+            let logical = format!("logical-{index:02}");
+            for (side, position) in if index % 2 == 0 {
+                [("baseline", "first"), ("candidate", "second")]
+            } else {
+                [("baseline", "second"), ("candidate", "first")]
+            } {
+                cases.push(json!({
+                    "case_id": format!("{logical}-{side}"), "collection_block": format!("block-{index:02}"), "expected_outcome": expected,
+                    "logical_case_id": logical, "order_position": position, "pai_instrument_id": pai.map(|_| format!("instrument-{index:02}")),
+                    "pai_production_method": pai.map(|_| "protocol-declared-2d-production"), "pai_species": pai, "planned_count": 99,
+                    "presentation_class": presentation, "profile_side": side, "reference_relation": relation, "scene_id": "ordinary-frontal", "stratum_id": stratum["stratum_id"]
+                }));
+            }
+        }
+        cases.sort_by(|a, b| a["case_id"].as_str().cmp(&b["case_id"].as_str()));
+        let mut pilot = Vec::new();
+        let mut samples = Vec::new();
+        for gate in ["detection", "ir_pad", "liveness", "recognition", "rgb_pad"] {
+            pilot.push(json!({"baseline_only_success_ppb": 20000000, "candidate_only_success_ppb": 20000000, "gate": gate, "stratum_id": null}));
+            samples.push(json!({"gate": gate, "margin_ppb": -20000000, "planned_power_ppb": 800000000, "required_cases": 619, "stopping_rule": "locked_sample_no_optional_stopping", "stratum_id": null}));
+            for stratum in &strata {
+                pilot.push(json!({"baseline_only_success_ppb": 20000000, "candidate_only_success_ppb": 20000000, "gate": gate, "stratum_id": stratum["stratum_id"]}));
+                samples.push(json!({"gate": gate, "margin_ppb": -50000000, "planned_power_ppb": 800000000, "required_cases": 99, "stopping_rule": "locked_sample_no_optional_stopping", "stratum_id": stratum["stratum_id"]}));
+            }
+        }
+        json!({
+            "balanced_order_seed": qdigest("8"), "baseline": qprofile("baseline-30fps", 30), "campaign_id": "campaign-2026-09-02-a",
+            "candidate": qprofile("candidate-15fps", 15), "cases": cases, "collection_not_after_unix": 1788998400u64,
+            "collection_not_before_unix": 1788393600u64, "contracts": qcontracts(), "created_at_unix": 1788307200u64,
+            "equipment_invalidations": [{"code": "device_disconnect", "detection_phase": "pre_outcome", "maximum_repeats": 2}],
+            "evaluation_not_after_unix": 1789603200u64, "evaluator_build_sha256": qdigest("9"), "expires_at_unix": 1790899200u64,
+            "hardware_scope": {"hardware_class": "usb-rgb-ir-v1", "interface_layout_sha256": qdigest("a"),
+                "ir": {"backend": "v4l2-uvc", "descriptor_sha256": qdigest("b"), "driver": "uvcvideo", "interface_number": 2, "pid": 0x5678, "speed_millimbps": 5000000u64, "vid": 0x0bda},
+                "match_policy_version": 1,
+                "rgb": {"backend": "v4l2-uvc", "descriptor_sha256": qdigest("c"), "driver": "uvcvideo", "interface_number": 0, "pid": 0x5678, "speed_millimbps": 5000000u64, "vid": 0x0bda}},
+            "locked_sample_sizes": samples, "latency_budget_us": 1000000,
+            "operating_points": [
+                {"gate": "detection", "operating_point_id": "detection-v1", "threshold_ppb": 500000000}, {"gate": "ir_pad", "operating_point_id": "ir-pad-v1", "threshold_ppb": 500000000},
+                {"gate": "liveness", "operating_point_id": "liveness-v1", "threshold_ppb": 500000000}, {"gate": "recognition", "operating_point_id": "recognition-v1", "threshold_ppb": 500000000},
+                {"gate": "rgb_pad", "operating_point_id": "rgb-pad-v1", "threshold_ppb": 500000000}],
+            "operator_fingerprint": OPERATOR, "pilot_discordance": pilot, "policy_id": "maintainer-camera-profile-v1",
+            "policy_sha256": qualification::Sha256Digest::of(policy_bytes).as_str(), "public_regression_evidence": [], "review_not_after_unix": 1790208000u64,
+            "schema_version": 1, "signature": {"algorithm": "open_pgp", "role": "protocol_author", "signer_fingerprint": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"},
+            "source_revision": qdigest("d"), "strata": strata
+        })
+    }
+
+    fn snapshot_value(protocol_digest: &qualification::Sha256Digest) -> Value {
+        let tokens = json!([qdigest("0"), qdigest("e")]);
+        json!({
+            "aggregate_publication_acknowledged": false,
+            "allowed_presentations": ["bona_fide", "display_replay", "no_face", "non_mated_live_cross_identity", "print"],
+            "collection_closes_unix": 1788998400u64, "collection_opens_unix": 1788393600u64,
+            "phase": "collection", "predecessor_sha256": null, "protocol_sha256": protocol_digest.as_str(),
+            "publication_boundary_acknowledged": false, "purpose": "camera-profile-release-qualification", "registry_revision": 1,
+            "retention_expires_unix": 1790899200u64, "schema_version": 1,
+            "signature": {"algorithm": "open_pgp", "role": "operator", "signer_fingerprint": OPERATOR},
+            "statuses": [{"status": "active", "token_sha256": qdigest("0")}, {"status": "active", "token_sha256": qdigest("e")}],
+            "token_set_sha256": qualification::Sha256Digest::of(&serde_json::to_vec(&tokens).unwrap()).as_str()
+        })
+    }
+
+    fn capture_shard_value(
+        protocol: &Value,
+        protocol_digest: &qualification::Sha256Digest,
+    ) -> Value {
+        let hardware_digest = qualification::Sha256Digest::of(
+            &serde_json::to_vec(&protocol["hardware_scope"]).unwrap(),
+        );
+        let pairs: Vec<_> = protocol["cases"].as_array().unwrap().chunks_exact(2).enumerate().map(|(position, pair)| {
+            let side = |case: &Value, name: &str| {
+                let profile = &protocol[name];
+                let profile_digest = qualification::Sha256Digest::of(&serde_json::to_vec(profile).unwrap());
+                json!({
+                    "assets": [
+                        {"content_sha256": qualification::Sha256Digest::of(format!("{position}-{name}-rgb").as_bytes()).as_str(), "height": 1, "path": format!("pair-{position}/{name}-rgb.bin"), "position": 0, "role": "rgb", "size_bytes": 1, "width": 1},
+                        {"content_sha256": qualification::Sha256Digest::of(format!("{position}-{name}-ir").as_bytes()).as_str(), "height": 1, "path": format!("pair-{position}/{name}-ir.bin"), "position": 0, "role": "ir", "size_bytes": 1, "width": 1}
+                    ],
+                    "attempts": [{"attempt_position": 0, "conditioning_applied_sha256": profile["contracts"]["selected_policy_sha256"], "conditioning_before_sha256": qdigest("b"), "conditioning_restored_sha256": qdigest("b"), "invalidated_pre_outcome": false, "invalidation_code": null, "outcome_recorded": true}],
+                    "capture_ended_unix": 1788500001u64, "capture_provenance_sha256": qualification::Sha256Digest::of(format!("provenance-{position}-{name}").as_bytes()).as_str(),
+                    "capture_started_unix": 1788500000u64, "captured_count": case["planned_count"], "case_id": case["case_id"], "expected_outcome": case["expected_outcome"],
+                    "hardware_scope_sha256": hardware_digest.as_str(), "order_position": case["order_position"], "presentation_class": case["presentation_class"],
+                    "profile_id": profile["profile_id"], "profile_sha256": profile_digest.as_str(), "scene_id": case["scene_id"], "source_revision": protocol["source_revision"],
+                    "stratum_id": case["stratum_id"], "token_sha256": if position % 2 == 0 { qdigest("0") } else { qdigest("e") }
+                })
+            };
+            json!({"baseline": side(&pair[0], "baseline"), "candidate": side(&pair[1], "candidate"), "logical_case_id": pair[0]["logical_case_id"]})
+        }).collect();
+        json!({"cases": pairs, "protocol_sha256": protocol_digest.as_str(), "schema_version": 1, "shard_position": 0, "signature": {"algorithm": "open_pgp", "role": "operator", "signer_fingerprint": OPERATOR}})
+    }
+
+    fn passing_case_outcome(accept: bool) -> qualification::ProfileCaseOutcome {
+        qualification::ProfileCaseOutcome {
+            detection: qualification::StageOutcome::Success,
+            recognition: qualification::StageOutcome::Success,
+            liveness: qualification::StageOutcome::Success,
+            rgb_pad: qualification::StageOutcome::Success,
+            ir_pad: qualification::StageOutcome::Success,
+            authentication_accept: accept,
+            latency_us: 100,
+            decision_value_ppb: None,
+        }
+    }
+
+    fn compiled_campaign_artifact() -> (
+        qualification::UnsignedReleaseArtifact,
+        qualification::Sha256Digest,
+        qualification::Sha256Digest,
+    ) {
+        let policy_value = campaign_policy_value();
+        let policy_bytes = serde_json::to_vec(&policy_value).unwrap();
+        let policy = verify_q::<qualification::CampaignPolicy>(
+            &policy_value,
+            qualification::SignerRole::PolicyAuthor,
+            POLICY_AUTHOR,
+        );
+        let protocol_value = campaign_protocol_value(&policy_bytes);
+        let verified_protocol = verify_q::<qualification::CampaignProtocol>(
+            &protocol_value,
+            qualification::SignerRole::ProtocolAuthor,
+            EVALUATOR,
+        );
+        let protocol = qualification::ValidatedProtocol::new(&policy, verified_protocol).unwrap();
+
+        let collection_value = snapshot_value(protocol.protocol_sha256());
+        let collection_snapshot = verify_q::<qualification::EligibilitySnapshot>(
+            &collection_value,
+            qualification::SignerRole::Operator,
+            OPERATOR,
+        );
+        let collection = qualification::validate_collection_eligibility(
+            &protocol,
+            collection_snapshot,
+            1788500000,
+        )
+        .unwrap();
+        let shard_value = capture_shard_value(&protocol_value, protocol.protocol_sha256());
+        let shard = verify_q::<qualification::CaptureShard>(
+            &shard_value,
+            qualification::SignerRole::Operator,
+            OPERATOR,
+        );
+        let index_value = json!({
+            "collection_eligibility_sha256": collection.snapshot_sha256().as_str(), "ordered_shard_sha256": [shard.digest().as_str()],
+            "protocol_sha256": protocol.protocol_sha256().as_str(), "schema_version": 1,
+            "signature": {"algorithm": "open_pgp", "role": "operator", "signer_fingerprint": OPERATOR}
+        });
+        let index = verify_q::<qualification::BundleIndex>(
+            &index_value,
+            qualification::SignerRole::Operator,
+            OPERATOR,
+        );
+        let bundle =
+            qualification::validate_frozen_bundle(&protocol, &collection, index, vec![shard])
+                .unwrap();
+
+        let mut evaluation_value = snapshot_value(protocol.protocol_sha256());
+        evaluation_value["phase"] = json!("evaluation");
+        evaluation_value["registry_revision"] = json!(2);
+        evaluation_value["predecessor_sha256"] = json!(collection.snapshot_sha256().as_str());
+        let evaluation_snapshot = verify_q::<qualification::EligibilitySnapshot>(
+            &evaluation_value,
+            qualification::SignerRole::Operator,
+            OPERATOR,
+        );
+        let evaluation = qualification::validate_evaluation_eligibility(
+            &bundle,
+            evaluation_snapshot,
+            1789000000,
+        )
+        .unwrap();
+
+        let outcomes: Vec<_> = protocol_value["cases"]
+            .as_array()
+            .unwrap()
+            .chunks_exact(2)
+            .zip(shard_value["cases"].as_array().unwrap())
+            .flat_map(|(pair, captured)| {
+                let expected_accept = pair[0]["expected_outcome"] == "accept";
+                let presentation: qualification::PresentationClass =
+                    serde_json::from_value(pair[0]["presentation_class"].clone()).unwrap();
+                let expected: qualification::ExpectedOutcome =
+                    serde_json::from_value(pair[0]["expected_outcome"].clone()).unwrap();
+                let history = qualification::Sha256Digest::of(
+                    &serde_json::to_vec(&json!([
+                        captured["baseline"]["attempts"],
+                        captured["candidate"]["attempts"]
+                    ]))
+                    .unwrap(),
+                );
+                (0..99).map(
+                    move |instance_position| qualification::EvaluatedPairedCase {
+                        case_id: qualification::Identifier::new(
+                            pair[0]["logical_case_id"].as_str().unwrap(),
+                        )
+                        .unwrap(),
+                        instance_position,
+                        stratum_ids: vec![qualification::Identifier::new(
+                            pair[0]["stratum_id"].as_str().unwrap(),
+                        )
+                        .unwrap()],
+                        presentation,
+                        expected,
+                        baseline: passing_case_outcome(expected_accept),
+                        candidate: passing_case_outcome(expected_accept),
+                        attempt_history_sha256: history.clone(),
+                    },
+                )
+            })
+            .collect();
+        let evaluator = qualification::SignerFingerprint::new(EVALUATOR).unwrap();
+        let evaluator_provenance = qualification::Sha256Digest::of(b"evaluator-v1");
+        let evaluator_signature: qualification::SignatureMetadata = serde_json::from_value(
+            json!({"algorithm": "open_pgp", "role": "evaluator", "signer_fingerprint": EVALUATOR}),
+        )
+        .unwrap();
+        let output = qualification::reduce_campaign(
+            qualification::ReductionContext {
+                protocol: &protocol,
+                bundle: &bundle,
+                evaluation: &evaluation,
+                evaluator_fingerprint: &evaluator,
+                evaluator_provenance_sha256: &evaluator_provenance,
+                evaluated_at_unix: 1789000001,
+                signature: &evaluator_signature,
+            },
+            outcomes,
+        )
+        .unwrap();
+
+        let transcript = verify_q_document(
+            &output.private_transcript_index,
+            qualification::SignerRole::Evaluator,
+            EVALUATOR,
+        );
+        let public_result = verify_q_document(
+            &output.public_result,
+            qualification::SignerRole::Evaluator,
+            EVALUATOR,
+        );
+        let mut publication_value = snapshot_value(protocol.protocol_sha256());
+        publication_value["phase"] = json!("publication");
+        publication_value["registry_revision"] = json!(3);
+        publication_value["predecessor_sha256"] = json!(evaluation.snapshot_sha256().as_str());
+        publication_value["aggregate_publication_acknowledged"] = json!(true);
+        publication_value["publication_boundary_acknowledged"] = json!(true);
+        let publication_snapshot = verify_q::<qualification::EligibilitySnapshot>(
+            &publication_value,
+            qualification::SignerRole::Operator,
+            OPERATOR,
+        );
+        let publication = qualification::validate_publication_eligibility(
+            &evaluation,
+            publication_snapshot,
+            1789000001,
+        )
+        .unwrap();
+        let review_value = json!({
+            "bundle_sha256": bundle.bundle_index_sha256().as_str(),
+            "checks": {"attacks": true, "cases": true, "cohort": true, "completeness": true, "consent": true, "expiry": true, "ordering": true, "provenance": true, "public_projection": true, "statistics": true},
+            "collection_eligibility_sha256": publication.snapshot_sha256()[0].as_str(), "decision": "passed",
+            "evaluation_eligibility_sha256": publication.snapshot_sha256()[1].as_str(), "evaluator_build_sha256": "9".repeat(64),
+            "operator_fingerprint": OPERATOR, "policy_sha256": protocol.policy_sha256().as_str(), "protocol_sha256": protocol.protocol_sha256().as_str(),
+            "public_result_sha256": public_result.digest().as_str(), "publication_eligibility_sha256": publication.snapshot_sha256()[2].as_str(),
+            "reproduced_public_result_sha256": public_result.digest().as_str(), "reviewed_at_unix": 1789000002u64, "reviewer_fingerprint": REVIEWER,
+            "schema_version": 1, "signature": {"algorithm": "open_pgp", "role": "reviewer", "signer_fingerprint": REVIEWER},
+            "source_revision": "d".repeat(64), "transcript_sha256": transcript.digest().as_str()
+        });
+        let review = verify_q::<qualification::ReviewAttestation>(
+            &review_value,
+            qualification::SignerRole::Reviewer,
+            REVIEWER,
+        );
+        let reproduced = public_result.digest().clone();
+        let reviewed = qualification::assemble_reviewed_aggregate(
+            qualification::ReviewContext {
+                protocol: &protocol,
+                bundle: &bundle,
+                publication: &publication,
+                transcript: &transcript,
+                reproduced_public_result_sha256: &reproduced,
+            },
+            public_result,
+            Some(review),
+        )
+        .unwrap();
+        let expected_protocol = protocol.protocol_sha256().clone();
+        let expected_result = reviewed.envelope_sha256().clone();
+        let compiled = qualification::compile_unsigned_release_artifact(
+            &reviewed,
+            &qualification::SignerFingerprint::new(RELEASE_SIGNER).unwrap(),
+        )
+        .unwrap();
+        (compiled, expected_protocol, expected_result)
+    }
 
     fn parse_mutated(
         field: &str,
@@ -652,6 +1107,46 @@ mod tests {
         assert_eq!(candidate.accepted_ir().interval().parts(), (1, 15));
         assert_eq!(baseline.schedule(), CaptureSchedule::Concurrent);
         assert_eq!(candidate.schedule(), CaptureSchedule::Concurrent);
+    }
+
+    #[test]
+    fn qualification_compiler_bytes_match_private_camera_schema() {
+        let (compiled, expected_protocol, expected_result) = compiled_campaign_artifact();
+        let artifact =
+            ReleaseQualificationArtifact::from_canonical_json(compiled.canonical_bytes()).unwrap();
+        let wire: Value = serde_json::from_slice(compiled.canonical_bytes()).unwrap();
+        assert_eq!(artifact.campaign_id(), "campaign-2026-09-02-a");
+        assert_eq!(
+            artifact.campaign_protocol_sha256(),
+            expected_protocol.as_str()
+        );
+        assert_eq!(artifact.campaign_result_sha256(), expected_result.as_str());
+        assert_eq!(wire["qualified_at_unix"], json!(1789000002u64));
+        assert_eq!(wire["expires_at_unix"], json!(1790899200u64));
+        assert_eq!(artifact.baseline_profile().id(), "baseline-30fps");
+        assert_eq!(artifact.candidate_profile().id(), "candidate-15fps");
+        let baseline = artifact.baseline_profile().to_profile().unwrap();
+        let candidate = artifact.candidate_profile().to_profile().unwrap();
+        assert_eq!(baseline.requested_rgb().interval().parts(), (1, 30));
+        assert_eq!(candidate.requested_rgb().interval().parts(), (1, 15));
+        assert_eq!(baseline.requested_ir().interval().parts(), (1, 15));
+        assert_eq!(candidate.requested_ir().interval().parts(), (1, 15));
+        assert_eq!(artifact.hardware_scope().match_policy_version, 1);
+        assert_eq!(
+            artifact.hardware_scope().interface_layout_sha256,
+            "a".repeat(64)
+        );
+        assert_eq!(artifact.hardware_scope().rgb.interface_number, 0);
+        assert_eq!(artifact.hardware_scope().ir.interface_number, 2);
+        assert_eq!(artifact.conditioning_catalog_sha256(), "1".repeat(64));
+        assert_eq!(artifact.selected_policy_sha256(), "5".repeat(64));
+        assert_eq!(artifact.preprocessing_contract_sha256(), "3".repeat(64));
+        assert_eq!(artifact.model_contract_sha256(), "2".repeat(64));
+        assert_eq!(artifact.signature().signer_fingerprint(), RELEASE_SIGNER);
+        assert_eq!(
+            compiled.artifact_sha256().as_str(),
+            irlume_common::sha256_hex(compiled.canonical_bytes())
+        );
     }
 
     #[test]

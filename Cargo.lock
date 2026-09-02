@@ -1015,6 +1015,7 @@ name = "irlume-camera"
 version = "0.11.3"
 dependencies = [
  "irlume-common",
+ "irlume-qualification",
  "libc",
  "rand 0.10.2",
  "serde",

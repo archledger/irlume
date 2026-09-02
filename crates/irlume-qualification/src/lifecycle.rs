@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonical::private,
     policy::{parse_canonical, to_canonical},
-    CampaignError, CanonicalDocument, Identifier, PresentationClass, Sha256Digest,
-    SignatureMetadata, SignerRole, StreamRole, ValidatedProtocol, Verified,
+    CampaignError, CanonicalDocument, ExpectedOutcome, Identifier, PaiSpecies, PresentationClass,
+    Sha256Digest, SignatureMetadata, SignerRole, StreamRole, ValidatedProtocol, Verified,
     MAX_ASSETS_PER_ROLE_PER_CASE, MAX_ASSET_BYTES, MAX_CAPTURE_SHARD_CASES,
     MAX_PRIVATE_RETENTION_SECONDS,
 };
@@ -417,6 +417,22 @@ impl CanonicalDocument for BundleIndex {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedEvaluationCell {
+    pub(crate) attempt_history_sha256: Sha256Digest,
+    pub(crate) baseline_case_id: Identifier,
+    pub(crate) candidate_case_id: Identifier,
+    pub(crate) expected_outcome: ExpectedOutcome,
+    pub(crate) logical_case_id: Identifier,
+    pub(crate) pai_instrument_id: Option<Identifier>,
+    pub(crate) pai_production_method: Option<Identifier>,
+    pub(crate) pai_species: Option<PaiSpecies>,
+    pub(crate) planned_count: u32,
+    pub(crate) presentation_class: PresentationClass,
+    pub(crate) stratum_id: Identifier,
+    pub(crate) token_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedFrozenBundle {
     allowed_presentations: Vec<PresentationClass>,
     bundle_index_sha256: Sha256Digest,
@@ -430,6 +446,7 @@ pub struct ValidatedFrozenBundle {
     review_not_after_unix: u64,
     operator_fingerprint: crate::SignerFingerprint,
     asset_sha256: Vec<Sha256Digest>,
+    evaluation_cells: Vec<ValidatedEvaluationCell>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -456,6 +473,16 @@ impl ValidatedEvaluationEligibility {
     #[must_use]
     pub const fn token_set_sha256(&self) -> &Sha256Digest {
         &self.token_set_sha256
+    }
+    pub(crate) fn authorizes_reduction_of(&self, bundle: &ValidatedFrozenBundle) -> bool {
+        self.bundle_index_sha256 == bundle.bundle_index_sha256
+            && self.collection_snapshot_sha256 == bundle.collection_snapshot_sha256
+            && self.protocol_sha256 == bundle.protocol_sha256
+            && self.token_set_sha256 == bundle.token_set_sha256
+            && self.operator_fingerprint == bundle.operator_fingerprint
+    }
+    pub(crate) const fn validated_at_unix(&self) -> u64 {
+        self.validated_at_unix
     }
 }
 
@@ -582,6 +609,12 @@ impl ValidatedFrozenBundle {
     #[must_use]
     pub const fn token_set_sha256(&self) -> &Sha256Digest {
         &self.token_set_sha256
+    }
+    pub(crate) fn evaluation_cells(&self) -> &[ValidatedEvaluationCell] {
+        &self.evaluation_cells
+    }
+    pub(crate) const fn operator_fingerprint(&self) -> &crate::SignerFingerprint {
+        &self.operator_fingerprint
     }
 }
 
@@ -724,6 +757,35 @@ pub fn validate_frozen_bundle(
         asset_sha256.push(asset.content_sha256.clone());
     }
     asset_sha256.sort();
+    let evaluation_cells = shards
+        .iter()
+        .flat_map(|shard| &shard.document().cases)
+        .zip(protocol.protocol().cases().chunks_exact(2))
+        .map(|(pair, planned_pair)| {
+            let planned = planned_pair
+                .iter()
+                .find(|case| case.is_baseline())
+                .ok_or(CampaignError::ProtocolInvalid)?;
+            let attempt_history_sha256 = Sha256Digest::of(&to_canonical(&(
+                &pair.baseline.attempts,
+                &pair.candidate.attempts,
+            ))?);
+            Ok(ValidatedEvaluationCell {
+                attempt_history_sha256,
+                baseline_case_id: pair.baseline.case_id.clone(),
+                candidate_case_id: pair.candidate.case_id.clone(),
+                expected_outcome: pair.baseline.expected_outcome,
+                logical_case_id: pair.logical_case_id.clone(),
+                pai_instrument_id: planned.pai_instrument_id().cloned(),
+                pai_production_method: planned.pai_production_method().cloned(),
+                pai_species: planned.pai_species(),
+                planned_count: pair.baseline.captured_count,
+                presentation_class: pair.baseline.presentation_class,
+                stratum_id: pair.baseline.stratum_id.clone(),
+                token_sha256: pair.baseline.token_sha256.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, CampaignError>>()?;
     Ok(ValidatedFrozenBundle {
         allowed_presentations: collection.allowed_presentations.clone(),
         bundle_index_sha256: index.digest().clone(),
@@ -737,6 +799,7 @@ pub fn validate_frozen_bundle(
         review_not_after_unix: protocol.protocol().review_not_after_unix(),
         operator_fingerprint: collection.operator_fingerprint.clone(),
         asset_sha256,
+        evaluation_cells,
     })
 }
 
@@ -842,7 +905,7 @@ pub fn resolve_deletion(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::{json, Value};
 
     use super::*;
@@ -884,11 +947,11 @@ mod tests {
 
     fn snapshot_value(protocol_sha256: &Sha256Digest) -> Value {
         let statuses = json!([
-            {"status": "active", "token_sha256": digest("1")},
-            {"status": "active", "token_sha256": digest("2")}
+            {"status": "active", "token_sha256": digest("0")},
+            {"status": "active", "token_sha256": digest("e")}
         ]);
         let token_set_sha256 =
-            Sha256Digest::of(&serde_json::to_vec(&json!([digest("1"), digest("2")])).unwrap());
+            Sha256Digest::of(&serde_json::to_vec(&json!([digest("0"), digest("e")])).unwrap());
         json!({
             "aggregate_publication_acknowledged": false,
             "allowed_presentations": ["bona_fide", "display_replay", "no_face", "non_mated_live_cross_identity", "print"],
@@ -1022,7 +1085,7 @@ mod tests {
                         "scene_id": case["scene_id"],
                         "source_revision": protocol["source_revision"],
                         "stratum_id": case["stratum_id"],
-                        "token_sha256": if pair_position % 2 == 0 { digest("1") } else { digest("2") }
+                        "token_sha256": if pair_position % 2 == 0 { digest("0") } else { digest("e") }
                     })
                 };
                 json!({
@@ -1069,6 +1132,22 @@ mod tests {
         (protocol, collection, shard)
     }
 
+    pub(crate) fn reduction_inputs() -> (
+        ValidatedProtocol,
+        ValidatedFrozenBundle,
+        ValidatedEvaluationEligibility,
+    ) {
+        let (protocol, collection, shard) = bundle_inputs();
+        let bundle = freeze_bundle(&protocol, &collection, &shard).unwrap();
+        let mut value = snapshot_value(protocol.protocol_sha256());
+        value["phase"] = json!("evaluation");
+        value["registry_revision"] = json!(2);
+        value["predecessor_sha256"] = json!(collection.snapshot_sha256().as_str());
+        let snapshot = verified_snapshot(&value).unwrap();
+        let evaluation = validate_evaluation_eligibility(&bundle, snapshot, 1789000000).unwrap();
+        (protocol, bundle, evaluation)
+    }
+
     fn publication_inputs() -> (
         ValidatedEvaluationEligibility,
         crate::Verified<EligibilitySnapshot>,
@@ -1092,6 +1171,7 @@ mod tests {
             review_not_after_unix: 1790208000,
             operator_fingerprint: collection.operator_fingerprint.clone(),
             asset_sha256: Vec::new(),
+            evaluation_cells: Vec::new(),
         };
         let mut evaluation_value = snapshot_value(protocol.protocol_sha256());
         evaluation_value["phase"] = json!("evaluation");
@@ -1184,7 +1264,7 @@ mod tests {
             .unwrap()
             .push(duplicate_status);
         duplicate["token_set_sha256"] = json!(Sha256Digest::of(
-            &serde_json::to_vec(&json!([digest("1"), digest("2"), digest("1")])).unwrap()
+            &serde_json::to_vec(&json!([digest("0"), digest("e"), digest("0")])).unwrap()
         )
         .as_str());
         assert_eq!(
@@ -1358,6 +1438,19 @@ mod tests {
         let shard = shard_value(&protocol_value, protocol.protocol_sha256());
 
         assert!(freeze_bundle(&protocol, &collection, &shard).is_ok());
+    }
+
+    #[test]
+    fn bundle_exposes_exact_validated_evaluation_cells() {
+        let (protocol, collection, shard) = bundle_inputs();
+        let bundle = freeze_bundle(&protocol, &collection, &shard).unwrap();
+        let cells = bundle.evaluation_cells();
+        assert_eq!(cells.len(), 18);
+        assert!(cells.iter().all(|cell| cell.planned_count == 99));
+        assert!(cells.iter().all(|cell| {
+            cell.baseline_case_id != cell.candidate_case_id
+                && cell.attempt_history_sha256.as_str().len() == 64
+        }));
     }
 
     #[test]
@@ -1671,6 +1764,7 @@ mod tests {
             review_not_after_unix: 1790208000,
             operator_fingerprint: collection.operator_fingerprint.clone(),
             asset_sha256: Vec::new(),
+            evaluation_cells: Vec::new(),
         };
         let mut value = snapshot_value(protocol.protocol_sha256());
         value["phase"] = json!("evaluation");
@@ -1705,6 +1799,7 @@ mod tests {
             review_not_after_unix: 1790208000,
             operator_fingerprint: collection.operator_fingerprint.clone(),
             asset_sha256: Vec::new(),
+            evaluation_cells: Vec::new(),
         };
         let mut value = snapshot_value(protocol.protocol_sha256());
         value["phase"] = json!("evaluation");
@@ -1775,7 +1870,7 @@ mod tests {
         let mut changed_tokens = publication_value();
         changed_tokens["statuses"][1]["token_sha256"] = digest("f");
         changed_tokens["token_set_sha256"] = json!(Sha256Digest::of(
-            &serde_json::to_vec(&json!([digest("1"), digest("f")])).unwrap()
+            &serde_json::to_vec(&json!([digest("0"), digest("f")])).unwrap()
         )
         .as_str());
         assert_eq!(

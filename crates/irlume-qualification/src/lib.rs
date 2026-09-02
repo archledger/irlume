@@ -7,6 +7,8 @@ mod canonical;
 mod lifecycle;
 mod policy;
 mod protocol;
+mod reducer;
+mod result;
 mod signature;
 mod statistics;
 
@@ -34,6 +36,15 @@ pub use protocol::{
     LockedSampleSize, OperatingPoint, PilotDiscordance, PixelFormat, ProfileContract,
     PublicRegressionEvidence, RuntimeContractDigests, StratumPlan, StreamContract, StreamRole,
     ValidatedProtocol, CAMPAIGN_PROTOCOL_SCHEMA_VERSION, HARDWARE_SCOPE_MATCH_POLICY_VERSION,
+};
+pub use reducer::{
+    reduce_campaign, EvaluatedPairedCase, ProfileCaseOutcome, ReductionContext, StageOutcome,
+};
+pub use result::{
+    PrivateTranscriptCase, PrivateTranscriptIndex, PrivateTranscriptShard, PublicAggregateResult,
+    PublicCategoryCount, PublicGateResult, PublicLatencyResult, PublicPairedTable,
+    PublicPresentationCategory, PublicSecurityResult, ReductionOutput, ResultDisposition,
+    RESULT_SCHEMA_VERSION,
 };
 pub use signature::{
     verify_document, DetachedSignatureVerifier, GpgDetachedSignatureVerifier, SignatureAlgorithm,

@@ -90,6 +90,30 @@ pub struct RuntimeContractDigests {
     threshold_contract_sha256: Sha256Digest,
 }
 
+impl RuntimeContractDigests {
+    pub(crate) const fn conditioning_catalog_sha256(&self) -> &Sha256Digest {
+        &self.conditioning_catalog_sha256
+    }
+    pub(crate) const fn model_contract_sha256(&self) -> &Sha256Digest {
+        &self.model_contract_sha256
+    }
+    pub(crate) const fn preprocessing_contract_sha256(&self) -> &Sha256Digest {
+        &self.preprocessing_contract_sha256
+    }
+    pub(crate) const fn producer_contract_sha256(&self) -> &Sha256Digest {
+        &self.producer_contract_sha256
+    }
+    pub(crate) const fn selected_policy_sha256(&self) -> &Sha256Digest {
+        &self.selected_policy_sha256
+    }
+    pub(crate) const fn software_contract_sha256(&self) -> &Sha256Digest {
+        &self.software_contract_sha256
+    }
+    pub(crate) const fn threshold_contract_sha256(&self) -> &Sha256Digest {
+        &self.threshold_contract_sha256
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileContract {
@@ -302,6 +326,15 @@ impl CasePlan {
     pub(crate) const fn planned_count(&self) -> u32 {
         self.planned_count
     }
+    pub(crate) const fn pai_instrument_id(&self) -> Option<&Identifier> {
+        self.pai_instrument_id.as_ref()
+    }
+    pub(crate) const fn pai_production_method(&self) -> Option<&Identifier> {
+        self.pai_production_method.as_ref()
+    }
+    pub(crate) const fn pai_species(&self) -> Option<PaiSpecies> {
+        self.pai_species
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -385,6 +418,7 @@ pub struct CampaignProtocol {
     evaluator_build_sha256: Sha256Digest,
     expires_at_unix: u64,
     hardware_scope: HardwareScope,
+    latency_budget_us: u64,
     locked_sample_sizes: Vec<LockedSampleSize>,
     operating_points: Vec<OperatingPoint>,
     operator_fingerprint: SignerFingerprint,
@@ -407,6 +441,7 @@ impl CampaignProtocol {
             || self.baseline == self.candidate
             || self.baseline.profile_id == self.candidate.profile_id
             || self.baseline.same_transport_as(&self.candidate)
+            || self.latency_budget_us == 0
             || !(self.created_at_unix < self.collection_not_before_unix
                 && self.collection_not_before_unix <= self.collection_not_after_unix
                 && self.collection_not_after_unix <= self.evaluation_not_after_unix
@@ -466,6 +501,10 @@ impl CampaignProtocol {
         &self.candidate
     }
 
+    pub(crate) const fn runtime_contracts(&self) -> &RuntimeContractDigests {
+        &self.contracts
+    }
+
     pub(crate) const fn collection_not_before_unix(&self) -> u64 {
         self.collection_not_before_unix
     }
@@ -488,6 +527,10 @@ impl CampaignProtocol {
 
     pub(crate) const fn expires_at_unix(&self) -> u64 {
         self.expires_at_unix
+    }
+
+    pub(crate) const fn latency_budget_us(&self) -> u64 {
+        self.latency_budget_us
     }
 
     pub(crate) fn cases(&self) -> &[CasePlan] {
@@ -613,17 +656,15 @@ fn validate_strata_order(strata: &[StratumPlan]) -> Result<(), CampaignError> {
 }
 
 fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), CampaignError> {
-    if cases.len()
-        != strata
-            .len()
-            .checked_mul(2)
-            .ok_or(CampaignError::ProtocolInvalid)?
+    if cases.is_empty()
+        || !cases.len().is_multiple_of(2)
         || !strictly_sorted_by(cases, |left, right| left.case_id.cmp(&right.case_id))
     {
         return Err(CampaignError::ProtocolInvalid);
     }
     let mut baseline_first = 0usize;
     let mut candidate_first = 0usize;
+    let mut logical_case_ids = std::collections::BTreeSet::new();
     for pair in cases.chunks_exact(2) {
         let left = &pair[0];
         let right = &pair[1];
@@ -639,6 +680,9 @@ fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), Camp
         {
             return Err(CampaignError::ProtocolInvalid);
         }
+        if !logical_case_ids.insert(&left.logical_case_id) {
+            return Err(CampaignError::ProtocolInvalid);
+        }
         if left.order_position == OrderPosition::First {
             baseline_first += 1;
         } else {
@@ -647,9 +691,10 @@ fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), Camp
     }
     if baseline_first != candidate_first
         || strata.iter().any(|stratum| {
-            !cases
-                .iter()
-                .any(|case| case.stratum_id == stratum.stratum_id)
+            !cases.iter().any(|case| {
+                case.stratum_id == stratum.stratum_id
+                    && case.presentation_class == PresentationClass::BonaFide
+            })
         })
     {
         return Err(CampaignError::ProtocolInvalid);
@@ -873,16 +918,24 @@ pub(crate) mod tests {
     }
 
     fn cases(strata: &[Value]) -> Vec<Value> {
-        let presentations = [
-            ("bona_fide", None, "accept"),
-            ("display_replay", Some("display_replay"), "reject"),
-            ("no_face", None, "reject"),
-            ("non_mated_live_cross_identity", None, "reject"),
-            ("print", Some("print"), "reject"),
-        ];
+        let mut cells: Vec<_> = strata
+            .iter()
+            .map(|stratum| (stratum, "bona_fide", None, "accept"))
+            .collect();
+        cells.extend([
+            (
+                &strata[0],
+                "display_replay",
+                Some("display_replay"),
+                "reject",
+            ),
+            (&strata[1], "no_face", None, "reject"),
+            (&strata[2], "non_mated_live_cross_identity", None, "reject"),
+            (&strata[3], "print", Some("print"), "reject"),
+        ]);
         let mut cases = Vec::new();
-        for (index, stratum) in strata.iter().enumerate() {
-            let (presentation, pai_species, expected) = presentations[index % presentations.len()];
+        for (index, (stratum, presentation, pai_species, expected)) in cells.into_iter().enumerate()
+        {
             let reference_relation = match presentation {
                 "bona_fide" => "mated",
                 "non_mated_live_cross_identity" => "non_mated",
@@ -989,6 +1042,7 @@ pub(crate) mod tests {
                 "rgb_descriptor_sha256": digest("c")
             },
             "locked_sample_sizes": locked_sample_sizes,
+            "latency_budget_us": 1000000,
             "operating_points": [
                 {"gate": "detection", "operating_point_id": "detection-v1", "threshold_ppb": 500000000},
                 {"gate": "ir_pad", "operating_point_id": "ir-pad-v1", "threshold_ppb": 500000000},
@@ -1125,6 +1179,32 @@ pub(crate) mod tests {
         let mut missing_side = protocol_value();
         missing_side["cases"].as_array_mut().unwrap().remove(0);
         assert_eq!(validate(&missing_side), Err(CampaignError::ProtocolInvalid));
+
+        let mut missing_stratum_bona_fide = protocol_value();
+        let stratum_id = missing_stratum_bona_fide["strata"][0]["stratum_id"].clone();
+        missing_stratum_bona_fide["cases"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|case| {
+                case["stratum_id"] != stratum_id || case["presentation_class"] != "bona_fide"
+            });
+        assert_eq!(
+            validate(&missing_stratum_bona_fide),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut duplicate_logical_id = protocol_value();
+        let first_logical_id = duplicate_logical_id["cases"][0]["logical_case_id"].clone();
+        let second_logical_id = duplicate_logical_id["cases"][2]["logical_case_id"].clone();
+        for case in duplicate_logical_id["cases"].as_array_mut().unwrap() {
+            if case["logical_case_id"] == second_logical_id {
+                case["logical_case_id"] = first_logical_id.clone();
+            }
+        }
+        assert_eq!(
+            validate(&duplicate_logical_id),
+            Err(CampaignError::ProtocolInvalid)
+        );
 
         let mut duplicate = protocol_value();
         let first = duplicate["cases"][0].clone();
@@ -1342,5 +1422,12 @@ pub(crate) mod tests {
             validate(&with_public_evidence),
             Err(CampaignError::ProtocolInvalid)
         );
+    }
+
+    #[test]
+    fn protocol_requires_positive_signed_latency_budget() {
+        let mut zero_budget = protocol_value();
+        zero_budget["latency_budget_us"] = json!(0);
+        assert_eq!(validate(&zero_budget), Err(CampaignError::ProtocolInvalid));
     }
 }

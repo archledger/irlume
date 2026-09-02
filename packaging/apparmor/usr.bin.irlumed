@@ -61,6 +61,12 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /opt/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
   /opt/onnxruntime-*/lib/libonnxruntime*.so* mr,
   /usr/share/irlume/onnxruntime/lib/libonnxruntime*.so* mr,
+  # Experimental direct OpenVINO support remains package-default-off. These
+  # narrow families cover distro and Debian multiarch installs without granting
+  # arbitrary executable mappings under /usr.
+  /usr/lib{,64,/*-linux-gnu}/libopenvino*.so* mr,
+  /usr/lib{,64,/*-linux-gnu}/libze_loader*.so* mr,
+  /usr/lib{,64,/*-linux-gnu}/libze_intel_npu*.so* mr,
   # TFLite C runtime bundled by every FHS packaging lane (#295): dlopen needs
   # read + executable-map, and a missing rule silently kills native .tflite
   # detection on every AppArmor-enforcing install (#297 review).
@@ -88,6 +94,10 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /var/ r,
   /var/lib/ r,
   /dev/video[0-9]* rw,
+  /dev/accel/ r,
+  /dev/accel/accel[0-9]* rw,
+  /dev/dri/ r,
+  /dev/dri/renderD[0-9]* rw,
   # Media-controller nodes: camera classification's no-open path (#428) reads
   # the media graph to decide a video node's role WITHOUT opening it (a video
   # open powers the camera up pre-6.16 = privacy-LED blink per scan, and the
@@ -169,6 +179,9 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   /home/*/.local/share/irlume/** rw,
   /var/lib/irlume/ rw,
   /var/lib/irlume/** rw,
+  /var/cache/irlume/ rw,
+  /var/cache/irlume/openvino/ rw,
+  /var/cache/irlume/openvino/** rw,
 
   # Camera-busy diagnostics name the process holding the device (readdir /proc,
   # readlink each fd to find who holds the camera node, read its comm).

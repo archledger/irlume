@@ -28,6 +28,12 @@ LANES=(
 
 fail=0
 
+echo "== experimental OpenVINO matrix and package-boundary contracts =="
+python3 scripts/test-check-openvino-matrix.py
+python3 scripts/check-openvino-matrix.py
+python3 scripts/test-openvino-packaging.py
+echo
+
 echo "== pamsm consumed from the maintained fork only =="
 # pamsm comes from the archledger/pam_sm_rust fork at an exact commit. The
 # in-tree vendored copy is gone; a source-complete build means Cargo can fetch
@@ -180,8 +186,11 @@ for model in $models; do
   # that was downloaded and then never copied into the derivation output.
   ext="${model##*.}"
   # shellcheck disable=SC2016  # `$out` is literal text in the derivation
-  if uncommented nix/package.nix | grep -F -- "$model" | grep -qF -- '$out' \
-    && uncommented nix/package.nix | grep -qF -- "*.$ext"; then
+  # Do not use grep -q at the end of this pipefail pipeline: an early match can
+  # close the pipe while the first grep is still writing and misreport its
+  # SIGPIPE as a missing model.
+  if uncommented nix/package.nix | grep -F -- "$model" | grep -F -- '$out' >/dev/null \
+    && uncommented nix/package.nix | grep -F -- "*.$ext" >/dev/null; then
     printf '  ok    %-34s %s\n' "$model" nix/package.nix
   else
     printf '  MISS  %-34s %s (named but not installed)\n' "$model" nix/package.nix

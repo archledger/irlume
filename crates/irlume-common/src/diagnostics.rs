@@ -7,6 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::num::NonZeroU32;
 
+use crate::InferenceResolutionReport;
+
 pub const SUPPORT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SHARE_SAFE_EVENTS: usize = 256;
 pub const MAX_SANITIZED_CAMERAS: usize = 8;
@@ -546,6 +548,23 @@ pub struct SupportSnapshot {
     pub cameras: Vec<SanitizedCameraContext>,
     pub events: Vec<ShareSafeEvent>,
     pub unavailable: Vec<SupportUnavailable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<InferenceResolutionReport>,
+}
+
+#[must_use]
+pub fn bounded_inference_report(report: InferenceResolutionReport) -> InferenceResolutionReport {
+    InferenceResolutionReport::new(
+        report.requested_policy,
+        report.policy_source,
+        report.resolved_device,
+        report.backend,
+    )
+    .with_runtime_versions(report.ort_version, report.openvino_version)
+    .with_available_openvino_devices(report.available_openvino_devices)
+    .with_rejected_candidates(report.rejected_candidates)
+    .with_cache(report.cache)
+    .with_tflite_facemesh_loaded(report.tflite_facemesh_loaded)
 }
 
 impl SupportSnapshot {
@@ -557,6 +576,7 @@ impl SupportSnapshot {
         mut cameras: Vec<SanitizedCameraContext>,
         mut events: Vec<ShareSafeEvent>,
         mut unavailable: Vec<SupportUnavailable>,
+        inference: Option<InferenceResolutionReport>,
     ) -> Self {
         cameras.truncate(MAX_SANITIZED_CAMERAS);
         if events.len() > MAX_SHARE_SAFE_EVENTS {
@@ -571,6 +591,7 @@ impl SupportSnapshot {
             cameras,
             events,
             unavailable,
+            inference: inference.map(bounded_inference_report),
         }
     }
 
@@ -610,6 +631,8 @@ impl<'de> Deserialize<'de> for SupportSnapshot {
             events: Vec<ShareSafeEvent>,
             #[serde(default)]
             unavailable: Vec<SupportUnavailable>,
+            #[serde(default)]
+            inference: Option<InferenceResolutionReport>,
         }
         let wire = Wire::deserialize(deserializer)?;
         if wire.support_schema != SUPPORT_SCHEMA_VERSION
@@ -634,6 +657,7 @@ impl<'de> Deserialize<'de> for SupportSnapshot {
             cameras: wire.cameras,
             events: wire.events,
             unavailable: wire.unavailable,
+            inference: wire.inference.map(bounded_inference_report),
         })
     }
 }
@@ -1224,6 +1248,7 @@ mod tests {
                 section: SupportSection::RecentEvents,
                 reason: UnavailableReason::DaemonRestarted,
             }],
+            inference: None,
         }
     }
 
@@ -1341,12 +1366,113 @@ mod tests {
                     reason: UnavailableReason::DaemonRestarted,
                 })
                 .collect(),
+            None,
         );
         assert_eq!(snapshot.cameras.len(), MAX_SANITIZED_CAMERAS);
         assert_eq!(snapshot.events.len(), MAX_SHARE_SAFE_EVENTS);
         assert_eq!(snapshot.events.first().unwrap().sequence, 2);
         assert_eq!(snapshot.unavailable.len(), MAX_UNAVAILABLE_SECTIONS);
         assert_eq!(snapshot.retained_history_ms, MAX_HISTORY_MS);
+    }
+
+    #[test]
+    fn inference_projection_rebounds_every_free_text_and_vector() {
+        let report = crate::InferenceResolutionReport {
+            requested_policy: crate::ExecutionDevicePolicy::Auto,
+            policy_source: crate::ExecutionDevicePolicySource::Environment,
+            resolved_device: crate::ResolvedExecutionDevice::Cpu,
+            backend: crate::InferenceBackend::OnnxRuntime,
+            ort_version: Some("o".repeat(crate::MAX_INFERENCE_VERSION_BYTES + 10)),
+            openvino_version: Some("v".repeat(crate::MAX_INFERENCE_VERSION_BYTES + 10)),
+            available_openvino_devices: (0..crate::MAX_AVAILABLE_INFERENCE_DEVICES + 3)
+                .map(|_| "device".repeat(crate::MAX_INFERENCE_DEVICE_BYTES))
+                .collect(),
+            rejected_candidates: (0..crate::MAX_REJECTED_INFERENCE_CANDIDATES + 3)
+                .map(|_| crate::RejectedInferenceCandidate {
+                    device: crate::ResolvedExecutionDevice::Npu,
+                    reason: "embedding credential score ".repeat(30),
+                })
+                .collect(),
+            cache: Some(crate::InferenceCacheStatus {
+                root: "r".repeat(crate::MAX_INFERENCE_DEVICE_BYTES + 10),
+                state: crate::InferenceCacheState::Unavailable,
+                runtime_version: Some("c".repeat(crate::MAX_INFERENCE_VERSION_BYTES + 10)),
+            }),
+            tflite_facemesh_loaded: Some(false),
+        };
+
+        let bounded = bounded_inference_report(report);
+        assert_eq!(
+            bounded.available_openvino_devices.len(),
+            crate::MAX_AVAILABLE_INFERENCE_DEVICES
+        );
+        assert!(bounded
+            .available_openvino_devices
+            .iter()
+            .all(|device| device.len() <= crate::MAX_INFERENCE_DEVICE_BYTES));
+        assert_eq!(
+            bounded.rejected_candidates.len(),
+            crate::MAX_REJECTED_INFERENCE_CANDIDATES
+        );
+        assert!(bounded
+            .rejected_candidates
+            .iter()
+            .all(|candidate| candidate.reason.len() <= crate::MAX_INFERENCE_REASON_BYTES));
+        assert_eq!(
+            bounded.ort_version.as_ref().unwrap().len(),
+            crate::MAX_INFERENCE_VERSION_BYTES
+        );
+        assert_eq!(
+            bounded.cache.as_ref().unwrap().root.len(),
+            crate::MAX_INFERENCE_DEVICE_BYTES
+        );
+    }
+
+    #[test]
+    fn support_snapshot_accepts_old_json_and_round_trips_bounded_inference() {
+        let mut old_value = serde_json::to_value(snapshot()).unwrap();
+        old_value.as_object_mut().unwrap().remove("inference");
+        let old: SupportSnapshot = serde_json::from_value(old_value.clone()).unwrap();
+        assert_eq!(old.inference, None);
+        assert_eq!(serde_json::to_value(old).unwrap(), old_value);
+
+        let report = crate::InferenceResolutionReport::new(
+            crate::ExecutionDevicePolicy::Auto,
+            crate::ExecutionDevicePolicySource::Settings,
+            crate::ResolvedExecutionDevice::Gpu,
+            crate::InferenceBackend::OpenVino,
+        );
+        let current = SupportSnapshot::bounded(
+            1,
+            MAX_HISTORY_MS,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(report.clone()),
+        );
+        assert_eq!(current.inference, Some(report));
+        let value = serde_json::to_value(&current).unwrap();
+        assert_eq!(value["inference"]["requested_policy"], "auto");
+        assert_eq!(value["inference"]["resolved_device"], "gpu");
+        assert_eq!(
+            serde_json::from_value::<SupportSnapshot>(value).unwrap(),
+            current
+        );
+
+        let mut keys = BTreeSet::new();
+        collect_keys(&serde_json::to_value(current).unwrap(), &mut keys);
+        for forbidden in [
+            "frame",
+            "crop",
+            "tensor",
+            "embedding",
+            "identity",
+            "score",
+            "credential",
+        ] {
+            assert!(!keys.contains(forbidden), "forbidden field: {forbidden}");
+        }
     }
 
     #[test]

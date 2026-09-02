@@ -398,6 +398,11 @@ pub fn status(args: &[String]) -> ExitCode {
         _ => json!({ "known": false }),
     };
 
+    let inference = match crate::daemon_request(&Request::Health) {
+        Ok(Response::Health { inference, .. }) => inference_status(inference),
+        _ => None,
+    };
+
     let (templates, recovery) = match crate::daemon_request(&Request::RecoveryStatus { user }) {
         Ok(Response::RecoveryStatus {
             encrypted,
@@ -437,28 +442,26 @@ pub fn status(args: &[String]) -> ExitCode {
         "ir": caps.ir_pair && std::path::Path::new(&ir).exists(),
     });
 
-    emit(
-        &success(
-            COMMAND,
-            json!({
-                "daemon": daemon,
-                "auth_method": format!("{method:?}").to_lowercase(),
-                "face_disabled": method.face_disabled(),
-                "enrollment": enrollment,
-                "templates": templates,
-                "keyring": keyring,
-                "recovery": recovery,
-                "camera": camera,
-                // "Whether a fingerprint reader was found", as the schema puts
-                // it: fprintd present AND a reader present, the same predicate
-                // doctor's line and its `fingerprint-reader` check use. Naming
-                // the device is a narrower question and disagreed with both.
-                "fingerprint": irlume_fingerprint::available(),
-            }),
-            contract,
-        ),
-        ExitCode::SUCCESS,
-    )
+    let mut data = json!({
+        "daemon": daemon,
+        "auth_method": format!("{method:?}").to_lowercase(),
+        "face_disabled": method.face_disabled(),
+        "enrollment": enrollment,
+        "templates": templates,
+        "keyring": keyring,
+        "recovery": recovery,
+        "camera": camera,
+        // "Whether a fingerprint reader was found", as the schema puts
+        // it: fprintd present AND a reader present, the same predicate
+        // doctor's line and its `fingerprint-reader` check use. Naming
+        // the device is a narrower question and disagreed with both.
+        "fingerprint": irlume_fingerprint::available(),
+    });
+    if let Some(inference) = inference {
+        data["inference"] = inference;
+    }
+
+    emit(&success(COMMAND, data, contract), ExitCode::SUCCESS)
 }
 
 fn valid_status_args(args: &[String]) -> bool {
@@ -488,6 +491,12 @@ fn valid_status_args(args: &[String]) -> bool {
         }
     }
     saw_json
+}
+
+fn inference_status(
+    report: Option<irlume_common::InferenceResolutionReport>,
+) -> Option<serde_json::Value> {
+    report.and_then(|report| serde_json::to_value(report).ok())
 }
 
 /// `irlume doctor --json`: every readiness check as an identified result.
@@ -2356,6 +2365,23 @@ mod tests {
         assert_eq!(auth_refusal(false, false, true, true), Some("policy"));
     }
     use super::*;
+
+    #[test]
+    fn inference_status_is_additive_and_absent_for_an_old_daemon() {
+        assert_eq!(inference_status(None), None);
+
+        let report = irlume_common::InferenceResolutionReport::new(
+            irlume_common::config::ExecutionDevicePolicy::Auto,
+            irlume_common::config::ExecutionDevicePolicySource::Settings,
+            irlume_common::ResolvedExecutionDevice::Npu,
+            irlume_common::InferenceBackend::OpenVino,
+        );
+        let value = inference_status(Some(report)).expect("new daemon report");
+        assert_eq!(value["requested_policy"], "auto");
+        assert_eq!(value["policy_source"], "settings");
+        assert_eq!(value["resolved_device"], "npu");
+        assert_eq!(value["backend"], "open-vino");
+    }
 
     #[test]
     fn an_absent_contract_flag_always_means_the_first_contract() {

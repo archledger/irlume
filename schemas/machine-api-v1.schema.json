@@ -447,7 +447,66 @@
         "fingerprint": {
           "description": "Whether a fingerprint reader was found.",
           "type": "boolean"
+        },
+        "inference": {
+          "description": "The daemon-proven global ONNX inference resolution. Absent when the daemon is unreachable or predates this additive contract-1 field.",
+          "$ref": "#/$defs/inferenceResolution"
         }
+      }
+    },
+    "inferenceResolution": {
+      "type": "object",
+      "required": [
+        "requested_policy",
+        "policy_source",
+        "resolved_device",
+        "backend",
+        "ort_version",
+        "openvino_version",
+        "available_openvino_devices",
+        "rejected_candidates",
+        "cache",
+        "tflite_facemesh_loaded"
+      ],
+      "properties": {
+        "requested_policy": { "enum": ["auto", "cpu", "npu"] },
+        "policy_source": { "enum": ["default", "settings", "environment"] },
+        "resolved_device": { "enum": ["cpu", "gpu", "npu"] },
+        "backend": { "enum": ["onnx-runtime", "open-vino"] },
+        "ort_version": { "type": ["string", "null"], "maxLength": 128 },
+        "openvino_version": { "type": ["string", "null"], "maxLength": 128 },
+        "available_openvino_devices": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "type": "string", "maxLength": 96 }
+        },
+        "rejected_candidates": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "required": ["device", "reason"],
+            "properties": {
+              "device": { "enum": ["cpu", "gpu", "npu"] },
+              "reason": { "type": "string", "maxLength": 256 }
+            }
+          }
+        },
+        "cache": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["root", "state", "runtime_version"],
+              "properties": {
+                "root": { "type": "string", "maxLength": 96 },
+                "state": { "enum": ["disabled", "cold", "warm", "rebuilt", "unavailable"] },
+                "runtime_version": { "type": ["string", "null"], "maxLength": 128 }
+              }
+            }
+          ]
+        },
+        "tflite_facemesh_loaded": { "type": ["boolean", "null"] }
       }
     },
     "doctorData": {

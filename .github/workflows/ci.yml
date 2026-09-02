@@ -146,22 +146,50 @@ jobs:
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets -- -D warnings
 
-      # Optional ONNX Runtime execution providers are compile-time APIs. The
-      # default CPU build cannot catch an upstream rename in one of these paths
-      # (issue #454), so compile every supported provider independently and in
-      # combination whenever dependencies are updated.
-      - name: optional ONNX execution providers compile
+      # Direct OpenVINO is runtime-linked and default-off while qualification is
+      # incomplete. Compile it in CI without activating it in released builds.
+      - name: experimental direct OpenVINO compiles
         run: |
-          for feature in cuda openvino coreml tensorrt; do
-            cargo check -p irlume-vision --features "$feature" --locked
-          done
+          cargo check -p irlume-vision --features experimental-openvino --locked
           cargo check -p irlume-vision --all-features --locked
+          cargo build -p irlume-daemon --features experimental-openvino --locked
+          dynamic=$(readelf -d target/debug/irlumed)
+          if grep -Eiq 'NEEDED.*(openvino|ze_loader|ze_intel_npu)' <<<"$dynamic"; then
+            echo 'experimental runtime-linked binary gained an accelerator ELF dependency' >&2
+            exit 1
+          fi
+
+      # Runtime linking must turn an absent OpenVINO installation into a normal
+      # rejected accelerator candidate, not a loader crash or base-package
+      # dependency. The resolver test then proves experimental auto continues
+      # to the next complete-engine candidate.
+      - name: experimental OpenVINO absence is recoverable
+        run: |
+          if ldconfig -p | grep -q 'libopenvino'; then
+            echo 'hosted absence gate unexpectedly has OpenVINO installed' >&2
+            exit 1
+          fi
+          ./scripts/run-tests-guarded.sh --min 1 -- \
+            cargo test -p irlume-vision --features experimental-openvino \
+              hosted_runtime_absence_is_a_recoverable_candidate_error --locked -- --ignored
+          ./scripts/run-tests-guarded.sh --min 1 -- \
+            cargo test -p irlume-daemon --features experimental-openvino \
+              resolve_engine_experimental_auto_records_rejections_and_reaches_cpu --locked
+          ./scripts/run-tests-guarded.sh --min 1 -- \
+            cargo test -p irlume-daemon --features experimental-openvino \
+              resolve_engine_explicit_npu_never_invokes_another_candidate --locked
 
       - name: doc (broken intra-doc links are errors)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
       - name: build
-        run: cargo build --release --locked
+        run: |
+          cargo build --release --locked
+          dynamic=$(readelf -d target/release/irlumed)
+          if grep -Eiq 'NEEDED.*(openvino|ze_loader|ze_intel_npu)' <<<"$dynamic"; then
+            echo 'released base binary gained an accelerator ELF dependency' >&2
+            exit 1
+          fi
 
       # Guarded because `cargo test` exits 0 even when it discovers no tests at
       # all. The floor sits well below the real count (707 at 0.7.0), so it

@@ -24,6 +24,189 @@ pub mod secureboot;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+pub use config::{
+    EffectiveExecutionDevicePolicy, ExecutionDevicePolicy, ExecutionDevicePolicyError,
+    ExecutionDevicePolicySource,
+};
+
+/// Maximum rejected accelerator candidates retained in one resolution report.
+pub const MAX_REJECTED_INFERENCE_CANDIDATES: usize = 2;
+/// Maximum UTF-8 byte length of one sanitized candidate-rejection reason.
+pub const MAX_INFERENCE_REASON_BYTES: usize = 256;
+/// Maximum discovered OpenVINO devices retained in one resolution report.
+pub const MAX_AVAILABLE_INFERENCE_DEVICES: usize = 8;
+/// Maximum UTF-8 byte length of one device name or internal cache root.
+pub const MAX_INFERENCE_DEVICE_BYTES: usize = 96;
+/// Maximum UTF-8 byte length of one inference-runtime version.
+pub const MAX_INFERENCE_VERSION_BYTES: usize = 128;
+
+/// Physical device considered during global ONNX engine resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CandidateDevice {
+    Cpu,
+    Gpu,
+    Npu,
+}
+
+/// Physical device accepted for the complete configured ONNX model set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolvedExecutionDevice {
+    Cpu,
+    Gpu,
+    Npu,
+}
+
+/// Runtime adapter backing the accepted ONNX engine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InferenceBackend {
+    OnnxRuntime,
+    OpenVino,
+}
+
+/// State of the direct OpenVINO compilation cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InferenceCacheState {
+    Disabled,
+    Cold,
+    Warm,
+    Rebuilt,
+    Unavailable,
+}
+
+/// One globally rejected accelerator candidate and its sanitized reason.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RejectedInferenceCandidate {
+    pub device: ResolvedExecutionDevice,
+    pub reason: String,
+}
+
+impl RejectedInferenceCandidate {
+    pub fn new(device: ResolvedExecutionDevice, reason: impl Into<String>) -> Self {
+        Self {
+            device,
+            reason: truncate_utf8(reason.into(), MAX_INFERENCE_REASON_BYTES),
+        }
+    }
+}
+
+/// OpenVINO cache facts safe to carry over the daemon wire protocol.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InferenceCacheStatus {
+    pub root: String,
+    pub state: InferenceCacheState,
+    pub runtime_version: Option<String>,
+}
+
+impl InferenceCacheStatus {
+    pub fn new(
+        root: impl Into<String>,
+        state: InferenceCacheState,
+        runtime_version: Option<String>,
+    ) -> Self {
+        Self {
+            root: truncate_utf8(root.into(), MAX_INFERENCE_DEVICE_BYTES),
+            state,
+            runtime_version: runtime_version
+                .map(|version| truncate_utf8(version, MAX_INFERENCE_VERSION_BYTES)),
+        }
+    }
+}
+
+/// Bounded, non-biometric result of one global ONNX device resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InferenceResolutionReport {
+    pub requested_policy: ExecutionDevicePolicy,
+    pub policy_source: ExecutionDevicePolicySource,
+    pub resolved_device: ResolvedExecutionDevice,
+    pub backend: InferenceBackend,
+    pub ort_version: Option<String>,
+    pub openvino_version: Option<String>,
+    pub available_openvino_devices: Vec<String>,
+    pub rejected_candidates: Vec<RejectedInferenceCandidate>,
+    pub cache: Option<InferenceCacheStatus>,
+    pub tflite_facemesh_loaded: Option<bool>,
+}
+
+impl InferenceResolutionReport {
+    pub fn new(
+        requested_policy: ExecutionDevicePolicy,
+        policy_source: ExecutionDevicePolicySource,
+        resolved_device: ResolvedExecutionDevice,
+        backend: InferenceBackend,
+    ) -> Self {
+        Self {
+            requested_policy,
+            policy_source,
+            resolved_device,
+            backend,
+            ort_version: None,
+            openvino_version: None,
+            available_openvino_devices: Vec::new(),
+            rejected_candidates: Vec::new(),
+            cache: None,
+            tflite_facemesh_loaded: None,
+        }
+    }
+
+    pub fn with_runtime_versions(
+        mut self,
+        ort_version: Option<String>,
+        openvino_version: Option<String>,
+    ) -> Self {
+        self.ort_version =
+            ort_version.map(|version| truncate_utf8(version, MAX_INFERENCE_VERSION_BYTES));
+        self.openvino_version =
+            openvino_version.map(|version| truncate_utf8(version, MAX_INFERENCE_VERSION_BYTES));
+        self
+    }
+
+    pub fn with_available_openvino_devices(mut self, devices: Vec<String>) -> Self {
+        self.available_openvino_devices = devices
+            .into_iter()
+            .take(MAX_AVAILABLE_INFERENCE_DEVICES)
+            .map(|device| truncate_utf8(device, MAX_INFERENCE_DEVICE_BYTES))
+            .collect();
+        self
+    }
+
+    pub fn with_rejected_candidates(mut self, candidates: Vec<RejectedInferenceCandidate>) -> Self {
+        self.rejected_candidates = candidates
+            .into_iter()
+            .take(MAX_REJECTED_INFERENCE_CANDIDATES)
+            .map(|candidate| RejectedInferenceCandidate::new(candidate.device, candidate.reason))
+            .collect();
+        self
+    }
+
+    pub fn with_cache(mut self, cache: Option<InferenceCacheStatus>) -> Self {
+        self.cache = cache.map(|status| {
+            InferenceCacheStatus::new(status.root, status.state, status.runtime_version)
+        });
+        self
+    }
+
+    pub fn with_tflite_facemesh_loaded(mut self, loaded: Option<bool>) -> Self {
+        self.tflite_facemesh_loaded = loaded;
+        self
+    }
+}
+
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
+}
+
 /// Unix domain socket the daemon listens on. Root-owned, mode 0666: every local
 /// uid may connect, and `SO_PEERCRED` authorizes each request.
 pub const SOCKET_PATH: &str = "/run/irlume.sock";
@@ -987,6 +1170,9 @@ pub enum Response {
         /// failed to load it and the daemon is actually unconfined.
         #[serde(default)]
         apparmor: Option<String>,
+        /// Complete-engine inference resolution. `None` means an older daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inference: Option<InferenceResolutionReport>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
@@ -1251,6 +1437,90 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn inference_resolution_report_constructor_bounds_wire_fields() {
+        use super::*;
+
+        let oversized_utf8 = "é".repeat(MAX_INFERENCE_REASON_BYTES);
+        let rejected = vec![
+            RejectedInferenceCandidate::new(ResolvedExecutionDevice::Npu, &oversized_utf8),
+            RejectedInferenceCandidate::new(ResolvedExecutionDevice::Gpu, "compiler unavailable"),
+            RejectedInferenceCandidate::new(ResolvedExecutionDevice::Cpu, "must be discarded"),
+        ];
+        let devices = (0..MAX_AVAILABLE_INFERENCE_DEVICES + 2)
+            .map(|index| format!("NPU.{index}.{}", "x".repeat(MAX_INFERENCE_DEVICE_BYTES)))
+            .collect();
+        let cache = InferenceCacheStatus::new(
+            format!(
+                "/var/cache/irlume/{}",
+                "x".repeat(MAX_INFERENCE_DEVICE_BYTES)
+            ),
+            InferenceCacheState::Warm,
+            Some("v".repeat(MAX_INFERENCE_VERSION_BYTES + 1)),
+        );
+
+        let report = InferenceResolutionReport::new(
+            ExecutionDevicePolicy::Auto,
+            ExecutionDevicePolicySource::Environment,
+            ResolvedExecutionDevice::Cpu,
+            InferenceBackend::OnnxRuntime,
+        )
+        .with_runtime_versions(
+            Some("o".repeat(MAX_INFERENCE_VERSION_BYTES + 1)),
+            Some("v".repeat(MAX_INFERENCE_VERSION_BYTES + 1)),
+        )
+        .with_available_openvino_devices(devices)
+        .with_rejected_candidates(rejected)
+        .with_cache(Some(cache))
+        .with_tflite_facemesh_loaded(Some(true));
+
+        assert_eq!(
+            report.rejected_candidates.len(),
+            MAX_REJECTED_INFERENCE_CANDIDATES
+        );
+        assert!(report
+            .rejected_candidates
+            .iter()
+            .all(|candidate| candidate.reason.len() <= MAX_INFERENCE_REASON_BYTES));
+        assert_eq!(
+            report.available_openvino_devices.len(),
+            MAX_AVAILABLE_INFERENCE_DEVICES
+        );
+        assert!(report
+            .available_openvino_devices
+            .iter()
+            .all(|device| device.len() <= MAX_INFERENCE_DEVICE_BYTES));
+        assert!(report
+            .ort_version
+            .as_ref()
+            .is_some_and(|version| version.len() <= MAX_INFERENCE_VERSION_BYTES));
+        assert!(report
+            .openvino_version
+            .as_ref()
+            .is_some_and(|version| version.len() <= MAX_INFERENCE_VERSION_BYTES));
+        assert!(report.cache.as_ref().is_some_and(|status| {
+            status.root.len() <= MAX_INFERENCE_DEVICE_BYTES
+                && status
+                    .runtime_version
+                    .as_ref()
+                    .is_some_and(|version| version.len() <= MAX_INFERENCE_VERSION_BYTES)
+        }));
+        assert_eq!(report.tflite_facemesh_loaded, Some(true));
+
+        assert_eq!(
+            serde_json::to_value(ExecutionDevicePolicy::Npu).unwrap(),
+            serde_json::json!("npu")
+        );
+        assert_eq!(
+            serde_json::to_value(InferenceBackend::OnnxRuntime).unwrap(),
+            serde_json::json!("onnx-runtime")
+        );
+        assert_eq!(
+            serde_json::to_value(InferenceCacheState::Unavailable).unwrap(),
+            serde_json::json!("unavailable")
+        );
+    }
 
     /// `AuthResult.situation` (#616 step 3) is `#[serde(default)]` so an
     /// OLDER daemon's reply, which predates the field, still decodes: the
@@ -1933,6 +2203,67 @@ mod tests {
             }
             other => panic!("expected Health, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn health_inference_is_optional_for_old_daemons_and_round_trips_when_present() {
+        let old_json = r#"{"Health":{"tier":"secure","rgb_dev":null,"ir_dev":null,"mesh":true,"adapter":false}}"#;
+        let old: Response = serde_json::from_str(old_json).unwrap();
+        assert!(matches!(
+            old,
+            Response::Health {
+                inference: None,
+                ..
+            }
+        ));
+
+        let inference = InferenceResolutionReport::new(
+            ExecutionDevicePolicy::Auto,
+            ExecutionDevicePolicySource::Default,
+            ResolvedExecutionDevice::Npu,
+            InferenceBackend::OpenVino,
+        )
+        .with_tflite_facemesh_loaded(Some(true));
+        let current = Response::Health {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            rgb_pad: Some(PadModelStatus::Loaded),
+            ir_pad: Some(PadModelStatus::Loaded),
+            version: "0.11.3".into(),
+            apparmor: None,
+            inference: Some(inference.clone()),
+        };
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["Health"]["inference"]["requested_policy"], "auto");
+        assert_eq!(json["Health"]["inference"]["resolved_device"], "npu");
+        match serde_json::from_value::<Response>(json).unwrap() {
+            Response::Health {
+                inference: Some(decoded),
+                ..
+            } => assert_eq!(decoded, inference),
+            other => panic!("expected Health inference report, got {other:?}"),
+        }
+
+        let without_inference = Response::Health {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            rgb_pad: None,
+            ir_pad: None,
+            version: String::new(),
+            apparmor: None,
+            inference: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&without_inference).unwrap(),
+            r#"{"Health":{"tier":"secure","rgb_dev":null,"ir_dev":null,"mesh":true,"adapter":false,"rgb_pad":null,"ir_pad":null,"version":"","apparmor":null}}"#,
+            "an absent additive field must preserve the old daemon wire shape"
+        );
     }
 
     /// `Authenticate` crosses a live-upgrade boundary in both directions: an

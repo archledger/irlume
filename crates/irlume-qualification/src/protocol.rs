@@ -547,6 +547,10 @@ impl CampaignProtocol {
     pub(crate) const fn source_revision(&self) -> &Sha256Digest {
         &self.source_revision
     }
+
+    pub(crate) const fn evaluator_build_sha256(&self) -> &Sha256Digest {
+        &self.evaluator_build_sha256
+    }
 }
 
 impl private::Sealed for CampaignProtocol {}

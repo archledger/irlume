@@ -8,7 +8,9 @@ use crate::{
     policy::{parse_canonical, to_canonical},
     BinaryGate, CampaignError, CanonicalDocument, ExpectedOutcome, Identifier,
     IntersectionDecision, PaiSpecies, PresentationClass, ProfileCaseOutcome, RatePpb, Sha256Digest,
-    SignatureMetadata, SignedRateDifferencePpb, SignerRole, MAX_CAPTURE_SHARD_CASES,
+    SignatureMetadata, SignedRateDifferencePpb, SignerFingerprint, SignerRole,
+    ValidatedFrozenBundle, ValidatedProtocol, ValidatedPublicationEligibility, Verified,
+    MAX_CAPTURE_SHARD_CASES,
 };
 
 pub const RESULT_SCHEMA_VERSION: u32 = 1;
@@ -347,10 +349,395 @@ pub struct ReductionOutput {
     pub public_result: PublicAggregateResult,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewChecks {
+    attacks: bool,
+    cases: bool,
+    cohort: bool,
+    completeness: bool,
+    consent: bool,
+    expiry: bool,
+    ordering: bool,
+    provenance: bool,
+    public_projection: bool,
+    statistics: bool,
+}
+
+impl ReviewChecks {
+    fn all_passed(&self) -> bool {
+        self.attacks
+            && self.cases
+            && self.cohort
+            && self.completeness
+            && self.consent
+            && self.expiry
+            && self.ordering
+            && self.provenance
+            && self.public_projection
+            && self.statistics
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecision {
+    Passed,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAttestation {
+    bundle_sha256: Sha256Digest,
+    checks: ReviewChecks,
+    collection_eligibility_sha256: Sha256Digest,
+    decision: ReviewDecision,
+    evaluation_eligibility_sha256: Sha256Digest,
+    evaluator_build_sha256: Sha256Digest,
+    operator_fingerprint: SignerFingerprint,
+    policy_sha256: Sha256Digest,
+    protocol_sha256: Sha256Digest,
+    public_result_sha256: Sha256Digest,
+    publication_eligibility_sha256: Sha256Digest,
+    reproduced_public_result_sha256: Sha256Digest,
+    reviewed_at_unix: u64,
+    reviewer_fingerprint: SignerFingerprint,
+    schema_version: u32,
+    signature: SignatureMetadata,
+    source_revision: Sha256Digest,
+    transcript_sha256: Sha256Digest,
+}
+
+impl ReviewAttestation {
+    fn validate(&self) -> Result<(), CampaignError> {
+        if self.schema_version != RESULT_SCHEMA_VERSION
+            || self.reviewed_at_unix == 0
+            || self.signature.role() != SignerRole::Reviewer
+            || self.signature.signer_fingerprint() != &self.reviewer_fingerprint
+        {
+            return Err(CampaignError::ReviewRejected);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn reviewed_at_unix(&self) -> u64 {
+        self.reviewed_at_unix
+    }
+}
+
+impl private::Sealed for ReviewAttestation {}
+impl CanonicalDocument for ReviewAttestation {
+    fn from_canonical_json(bytes: &[u8]) -> Result<Self, CampaignError> {
+        let value: Self = parse_canonical(bytes)?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn to_canonical_json(&self) -> Result<Vec<u8>, CampaignError> {
+        self.validate()?;
+        to_canonical(self)
+    }
+
+    fn signature_metadata(&self) -> &SignatureMetadata {
+        &self.signature
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReviewedAggregateEnvelope {
+    campaign_id: Identifier,
+    evaluator_fingerprint: SignerFingerprint,
+    policy_sha256: Sha256Digest,
+    protocol_sha256: Sha256Digest,
+    public_result_sha256: Sha256Digest,
+    review_attestation_sha256: Sha256Digest,
+    reviewed_at_unix: u64,
+    reviewer_fingerprint: SignerFingerprint,
+    schema_version: u32,
+}
+
+impl ReviewedAggregateEnvelope {
+    fn digest(&self) -> Result<Sha256Digest, CampaignError> {
+        Ok(Sha256Digest::of(&to_canonical(self)?))
+    }
+
+    #[must_use]
+    pub const fn campaign_id(&self) -> &Identifier {
+        &self.campaign_id
+    }
+}
+
+/// Opaque authority proving that a passing aggregate completed independent review.
+///
+/// External code cannot forge this authority from fields:
+///
+/// ```compile_fail
+/// use irlume_qualification::ReviewedAggregate;
+/// let _forged = ReviewedAggregate {
+///     envelope: todo!(),
+///     envelope_sha256: todo!(),
+///     public_result: todo!(),
+///     review: todo!(),
+/// };
+/// ```
+///
+/// Nor can external code forge the verified inputs it consumes:
+///
+/// ```compile_fail
+/// use irlume_qualification::Verified;
+/// let _forged: Verified<()> = Verified {
+///     document: (),
+///     digest: todo!(),
+///     signer: todo!(),
+/// };
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewedAggregate {
+    envelope: ReviewedAggregateEnvelope,
+    envelope_sha256: Sha256Digest,
+    public_result: Verified<PublicAggregateResult>,
+    review: Verified<ReviewAttestation>,
+}
+
+impl ReviewedAggregate {
+    #[must_use]
+    pub const fn envelope(&self) -> &ReviewedAggregateEnvelope {
+        &self.envelope
+    }
+
+    #[must_use]
+    pub const fn envelope_sha256(&self) -> &Sha256Digest {
+        &self.envelope_sha256
+    }
+
+    #[must_use]
+    pub const fn public_result(&self) -> &Verified<PublicAggregateResult> {
+        &self.public_result
+    }
+
+    #[must_use]
+    pub const fn review(&self) -> &Verified<ReviewAttestation> {
+        &self.review
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ReviewContext<'a> {
+    pub protocol: &'a ValidatedProtocol,
+    pub bundle: &'a ValidatedFrozenBundle,
+    pub publication: &'a ValidatedPublicationEligibility,
+    pub transcript: &'a Verified<PrivateTranscriptIndex>,
+    pub reproduced_public_result_sha256: &'a Sha256Digest,
+}
+
+/// Binds a verified passing result to its exact independent review authority.
+///
+/// # Errors
+///
+/// Returns `ReviewMissing` when no verified review is supplied and
+/// `ReviewRejected` for every rejected, stale, non-independent, or mismatched review.
+pub fn assemble_reviewed_aggregate(
+    context: ReviewContext<'_>,
+    public_result: Verified<PublicAggregateResult>,
+    review: Option<Verified<ReviewAttestation>>,
+) -> Result<ReviewedAggregate, CampaignError> {
+    let review = review.ok_or(CampaignError::ReviewMissing)?;
+    let public = public_result.document();
+    let transcript = context.transcript.document();
+    let attestation = review.document();
+    let protocol = context.protocol.protocol();
+    let snapshots = context.publication.snapshot_sha256();
+
+    if attestation.decision != ReviewDecision::Passed
+        || !attestation.checks.all_passed()
+        || review.signer() != &attestation.reviewer_fingerprint
+        || public_result.signer() != context.transcript.signer()
+        || public_result.signer() == context.bundle.operator_fingerprint()
+        || review.signer() == context.bundle.operator_fingerprint()
+        || review.signer() == public_result.signer()
+        || context.publication.protocol_sha256() != context.protocol.protocol_sha256()
+        || context.publication.bundle_index_sha256() != context.bundle.bundle_index_sha256()
+        || context.publication.operator_fingerprint() != context.bundle.operator_fingerprint()
+        || public.policy_sha256 != *context.protocol.policy_sha256()
+        || public.protocol_sha256 != *context.protocol.protocol_sha256()
+        || public.bundle_index_sha256 != *context.bundle.bundle_index_sha256()
+        || public.evaluation_eligibility_sha256 != snapshots[1]
+        || public.transcript_index_sha256 != *context.transcript.digest()
+        || public.evaluator_provenance_sha256 != transcript.evaluator_provenance_sha256
+        || public.source_revision != *protocol.source_revision()
+        || transcript.bundle_index_sha256 != *context.bundle.bundle_index_sha256()
+        || transcript.evaluation_eligibility_sha256 != snapshots[1]
+        || transcript.protocol_sha256 != *context.protocol.protocol_sha256()
+        || attestation.policy_sha256 != *context.protocol.policy_sha256()
+        || attestation.protocol_sha256 != *context.protocol.protocol_sha256()
+        || attestation.collection_eligibility_sha256 != snapshots[0]
+        || attestation.evaluation_eligibility_sha256 != snapshots[1]
+        || attestation.publication_eligibility_sha256 != snapshots[2]
+        || attestation.bundle_sha256 != *context.bundle.bundle_index_sha256()
+        || attestation.evaluator_build_sha256 != *protocol.evaluator_build_sha256()
+        || attestation.transcript_sha256 != *context.transcript.digest()
+        || attestation.public_result_sha256 != *public_result.digest()
+        || attestation.source_revision != *protocol.source_revision()
+        || attestation.reproduced_public_result_sha256 != *public_result.digest()
+        || context.reproduced_public_result_sha256 != public_result.digest()
+        || attestation.operator_fingerprint != *context.bundle.operator_fingerprint()
+        || attestation.reviewed_at_unix < context.publication.validated_at_unix()
+        || attestation.reviewed_at_unix > protocol.review_not_after_unix()
+        || attestation.reviewed_at_unix > protocol.expires_at_unix()
+    {
+        return Err(CampaignError::ReviewRejected);
+    }
+
+    let envelope = ReviewedAggregateEnvelope {
+        campaign_id: protocol.campaign_id().clone(),
+        evaluator_fingerprint: public_result.signer().clone(),
+        policy_sha256: context.protocol.policy_sha256().clone(),
+        protocol_sha256: context.protocol.protocol_sha256().clone(),
+        public_result_sha256: public_result.digest().clone(),
+        review_attestation_sha256: review.digest().clone(),
+        reviewed_at_unix: attestation.reviewed_at_unix,
+        reviewer_fingerprint: review.signer().clone(),
+        schema_version: RESULT_SCHEMA_VERSION,
+    };
+    let envelope_sha256 = envelope.digest()?;
+    Ok(ReviewedAggregate {
+        envelope,
+        envelope_sha256,
+        public_result,
+        review,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reducer::tests::passing_output;
+    use crate::{
+        lifecycle::tests::review_inputs, reducer::tests::passing_output, verify_document,
+        DetachedSignatureVerifier, ReviewContext, SignerFingerprint, Verified,
+    };
+
+    const EVALUATOR: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    const REVIEWER: &str = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+    struct AcceptSigner(SignerFingerprint);
+
+    impl DetachedSignatureVerifier for AcceptSigner {
+        fn verify(
+            &self,
+            _canonical_payload: &[u8],
+            _detached_signature: &[u8],
+        ) -> Result<SignerFingerprint, CampaignError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn verified<T: CanonicalDocument>(
+        document: &T,
+        role: SignerRole,
+        signer: &SignerFingerprint,
+    ) -> Verified<T> {
+        verify_document(
+            &document.to_canonical_json().unwrap(),
+            b"detached-signature",
+            role,
+            signer,
+            &AcceptSigner(signer.clone()),
+        )
+        .unwrap()
+    }
+
+    fn review_value(
+        protocol: &crate::ValidatedProtocol,
+        bundle: &crate::ValidatedFrozenBundle,
+        publication: &crate::ValidatedPublicationEligibility,
+        transcript: &Verified<PrivateTranscriptIndex>,
+        public_result: &Verified<PublicAggregateResult>,
+    ) -> serde_json::Value {
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        serde_json::json!({
+            "bundle_sha256": bundle.bundle_index_sha256().as_str(),
+            "checks": {
+                "attacks": true,
+                "cases": true,
+                "cohort": true,
+                "completeness": true,
+                "consent": true,
+                "expiry": true,
+                "ordering": true,
+                "provenance": true,
+                "public_projection": true,
+                "statistics": true
+            },
+            "collection_eligibility_sha256": publication.snapshot_sha256()[0].as_str(),
+            "decision": "passed",
+            "evaluation_eligibility_sha256": publication.snapshot_sha256()[1].as_str(),
+            "evaluator_build_sha256": protocol.protocol().evaluator_build_sha256().as_str(),
+            "operator_fingerprint": bundle.operator_fingerprint().as_str(),
+            "policy_sha256": protocol.policy_sha256().as_str(),
+            "protocol_sha256": protocol.protocol_sha256().as_str(),
+            "public_result_sha256": public_result.digest().as_str(),
+            "publication_eligibility_sha256": publication.snapshot_sha256()[2].as_str(),
+            "reproduced_public_result_sha256": public_result.digest().as_str(),
+            "reviewed_at_unix": 1789000002u64,
+            "reviewer_fingerprint": reviewer.as_str(),
+            "schema_version": 1,
+            "signature": {
+                "algorithm": "open_pgp",
+                "role": "reviewer",
+                "signer_fingerprint": reviewer.as_str()
+            },
+            "source_revision": protocol.protocol().source_revision().as_str(),
+            "transcript_sha256": transcript.digest().as_str()
+        })
+    }
+
+    fn verified_review_inputs() -> (
+        crate::ValidatedProtocol,
+        crate::ValidatedFrozenBundle,
+        crate::ValidatedPublicationEligibility,
+        Verified<PrivateTranscriptIndex>,
+        Verified<PublicAggregateResult>,
+    ) {
+        let (protocol, bundle, publication) = review_inputs();
+        let output = passing_output();
+        let evaluator = SignerFingerprint::new(EVALUATOR).unwrap();
+        let transcript = verified(
+            &output.private_transcript_index,
+            SignerRole::Evaluator,
+            &evaluator,
+        );
+        let public_result = verified(&output.public_result, SignerRole::Evaluator, &evaluator);
+        (protocol, bundle, publication, transcript, public_result)
+    }
+
+    fn assemble_review_value(
+        value: &serde_json::Value,
+        expected_reviewer: &SignerFingerprint,
+        reproduced: Option<Sha256Digest>,
+    ) -> Result<ReviewedAggregate, CampaignError> {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let review = verify_document::<ReviewAttestation>(
+            &serde_json::to_vec(value).unwrap(),
+            b"review-signature",
+            SignerRole::Reviewer,
+            expected_reviewer,
+            &AcceptSigner(expected_reviewer.clone()),
+        )?;
+        let reproduced = reproduced.unwrap_or_else(|| public_result.digest().clone());
+        assemble_reviewed_aggregate(
+            ReviewContext {
+                protocol: &protocol,
+                bundle: &bundle,
+                publication: &publication,
+                transcript: &transcript,
+                reproduced_public_result_sha256: &reproduced,
+            },
+            public_result,
+            Some(review),
+        )
+    }
 
     #[test]
     fn result_documents_round_trip_only_in_canonical_evaluator_form() {
@@ -387,5 +774,293 @@ mod tests {
             wrong_role.to_canonical_json(),
             Err(CampaignError::EvaluatorDrift)
         );
+    }
+
+    #[test]
+    fn review_missing_is_a_fixed_failure() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let reproduced = public_result.digest().clone();
+        let context = ReviewContext {
+            protocol: &protocol,
+            bundle: &bundle,
+            publication: &publication,
+            transcript: &transcript,
+            reproduced_public_result_sha256: &reproduced,
+        };
+        assert_eq!(
+            assemble_reviewed_aggregate(context, public_result, None),
+            Err(CampaignError::ReviewMissing)
+        );
+    }
+
+    #[test]
+    fn review_passes_only_with_verified_independent_authority() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        let review_bytes = serde_json::to_vec(&review_value(
+            &protocol,
+            &bundle,
+            &publication,
+            &transcript,
+            &public_result,
+        ))
+        .unwrap();
+        let review = verify_document::<ReviewAttestation>(
+            &review_bytes,
+            b"review-signature",
+            SignerRole::Reviewer,
+            &reviewer,
+            &AcceptSigner(reviewer.clone()),
+        )
+        .unwrap();
+        let reproduced = public_result.digest().clone();
+        let context = ReviewContext {
+            protocol: &protocol,
+            bundle: &bundle,
+            publication: &publication,
+            transcript: &transcript,
+            reproduced_public_result_sha256: &reproduced,
+        };
+        let reviewed = assemble_reviewed_aggregate(context, public_result, Some(review)).unwrap();
+        assert_eq!(
+            reviewed.envelope_sha256(),
+            &reviewed.envelope().digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn review_rejects_every_attestation_authority_mismatch() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let value = review_value(
+            &protocol,
+            &bundle,
+            &publication,
+            &transcript,
+            &public_result,
+        );
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        let digest_fields = [
+            "bundle_sha256",
+            "collection_eligibility_sha256",
+            "evaluation_eligibility_sha256",
+            "evaluator_build_sha256",
+            "policy_sha256",
+            "protocol_sha256",
+            "public_result_sha256",
+            "publication_eligibility_sha256",
+            "reproduced_public_result_sha256",
+            "source_revision",
+            "transcript_sha256",
+        ];
+        for field in digest_fields {
+            let mut changed = value.clone();
+            changed[field] = serde_json::json!("a".repeat(64));
+            assert_eq!(
+                assemble_review_value(&changed, &reviewer, None),
+                Err(CampaignError::ReviewRejected),
+                "accepted mismatched {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_rejects_false_checks_decision_and_stale_times() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let value = review_value(
+            &protocol,
+            &bundle,
+            &publication,
+            &transcript,
+            &public_result,
+        );
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        let checks = [
+            "attacks",
+            "cases",
+            "cohort",
+            "completeness",
+            "consent",
+            "expiry",
+            "ordering",
+            "provenance",
+            "public_projection",
+            "statistics",
+        ];
+        for check in checks {
+            let mut changed = value.clone();
+            changed["checks"][check] = serde_json::json!(false);
+            assert_eq!(
+                assemble_review_value(&changed, &reviewer, None),
+                Err(CampaignError::ReviewRejected),
+                "accepted false {check} check"
+            );
+        }
+        for (field, replacement) in [
+            ("decision", serde_json::json!("rejected")),
+            ("reviewed_at_unix", serde_json::json!(1789000000u64)),
+            ("reviewed_at_unix", serde_json::json!(1790208001u64)),
+        ] {
+            let mut changed = value.clone();
+            changed[field] = replacement;
+            assert_eq!(
+                assemble_review_value(&changed, &reviewer, None),
+                Err(CampaignError::ReviewRejected)
+            );
+        }
+    }
+
+    #[test]
+    fn review_requires_three_separate_roles_and_independent_reproduction() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let value = review_value(
+            &protocol,
+            &bundle,
+            &publication,
+            &transcript,
+            &public_result,
+        );
+        for signer in [
+            bundle.operator_fingerprint().clone(),
+            public_result.signer().clone(),
+        ] {
+            let mut changed = value.clone();
+            changed["reviewer_fingerprint"] = serde_json::json!(signer.as_str());
+            changed["signature"]["signer_fingerprint"] = serde_json::json!(signer.as_str());
+            assert_eq!(
+                assemble_review_value(&changed, &signer, None),
+                Err(CampaignError::ReviewRejected)
+            );
+        }
+
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        assert_eq!(
+            assemble_review_value(
+                &value,
+                &reviewer,
+                Some(Sha256Digest::new(&"a".repeat(64)).unwrap())
+            ),
+            Err(CampaignError::ReviewRejected)
+        );
+
+        let mut wrong_role = value;
+        wrong_role["signature"]["role"] = serde_json::json!("operator");
+        assert!(assemble_review_value(&wrong_role, &reviewer, None).is_err());
+    }
+
+    #[test]
+    fn review_rejects_tampered_public_or_private_evaluator_output() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        let review = verified(
+            &ReviewAttestation::from_canonical_json(
+                &serde_json::to_vec(&review_value(
+                    &protocol,
+                    &bundle,
+                    &publication,
+                    &transcript,
+                    &public_result,
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            SignerRole::Reviewer,
+            &reviewer,
+        );
+        let reproduced = public_result.digest().clone();
+
+        let mut public_value: serde_json::Value =
+            serde_json::from_slice(&public_result.document().to_canonical_json().unwrap()).unwrap();
+        public_value["bundle_index_sha256"] = serde_json::json!("a".repeat(64));
+        let tampered_public: PublicAggregateResult = serde_json::from_value(public_value).unwrap();
+        let evaluator = public_result.signer().clone();
+        let tampered_public = verified(&tampered_public, SignerRole::Evaluator, &evaluator);
+        assert_eq!(
+            assemble_reviewed_aggregate(
+                ReviewContext {
+                    protocol: &protocol,
+                    bundle: &bundle,
+                    publication: &publication,
+                    transcript: &transcript,
+                    reproduced_public_result_sha256: &reproduced,
+                },
+                tampered_public,
+                Some(review.clone()),
+            ),
+            Err(CampaignError::ReviewRejected)
+        );
+
+        let mut transcript_value: serde_json::Value =
+            serde_json::from_slice(&transcript.document().to_canonical_json().unwrap()).unwrap();
+        transcript_value["bundle_index_sha256"] = serde_json::json!("a".repeat(64));
+        let tampered_transcript: PrivateTranscriptIndex =
+            serde_json::from_value(transcript_value).unwrap();
+        let tampered_transcript = verified(&tampered_transcript, SignerRole::Evaluator, &evaluator);
+        assert_eq!(
+            assemble_reviewed_aggregate(
+                ReviewContext {
+                    protocol: &protocol,
+                    bundle: &bundle,
+                    publication: &publication,
+                    transcript: &tampered_transcript,
+                    reproduced_public_result_sha256: &reproduced,
+                },
+                public_result,
+                Some(review),
+            ),
+            Err(CampaignError::ReviewRejected)
+        );
+    }
+
+    #[test]
+    fn every_reviewed_envelope_authority_field_changes_its_digest() {
+        let (protocol, bundle, publication, transcript, public_result) = verified_review_inputs();
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        let reviewed = assemble_review_value(
+            &review_value(
+                &protocol,
+                &bundle,
+                &publication,
+                &transcript,
+                &public_result,
+            ),
+            &reviewer,
+            None,
+        )
+        .unwrap();
+        let original = reviewed.envelope().digest().unwrap();
+        let mut variants = Vec::new();
+        let mut changed = reviewed.envelope().clone();
+        changed.schema_version += 1;
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.campaign_id = Identifier::new("other-campaign").unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.policy_sha256 = Sha256Digest::new(&"a".repeat(64)).unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.protocol_sha256 = Sha256Digest::new(&"a".repeat(64)).unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.public_result_sha256 = Sha256Digest::new(&"a".repeat(64)).unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.review_attestation_sha256 = Sha256Digest::new(&"a".repeat(64)).unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.evaluator_fingerprint =
+            SignerFingerprint::new("EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE").unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.reviewer_fingerprint =
+            SignerFingerprint::new("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF").unwrap();
+        variants.push(changed);
+        let mut changed = reviewed.envelope().clone();
+        changed.reviewed_at_unix += 1;
+        variants.push(changed);
+
+        assert!(variants
+            .into_iter()
+            .all(|envelope| envelope.digest().unwrap() != original));
     }
 }

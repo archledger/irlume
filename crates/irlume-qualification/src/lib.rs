@@ -41,10 +41,11 @@ pub use reducer::{
     reduce_campaign, EvaluatedPairedCase, ProfileCaseOutcome, ReductionContext, StageOutcome,
 };
 pub use result::{
-    PrivateTranscriptCase, PrivateTranscriptIndex, PrivateTranscriptShard, PublicAggregateResult,
-    PublicCategoryCount, PublicGateResult, PublicLatencyResult, PublicPairedTable,
-    PublicPresentationCategory, PublicSecurityResult, ReductionOutput, ResultDisposition,
-    RESULT_SCHEMA_VERSION,
+    assemble_reviewed_aggregate, PrivateTranscriptCase, PrivateTranscriptIndex,
+    PrivateTranscriptShard, PublicAggregateResult, PublicCategoryCount, PublicGateResult,
+    PublicLatencyResult, PublicPairedTable, PublicPresentationCategory, PublicSecurityResult,
+    ReductionOutput, ResultDisposition, ReviewAttestation, ReviewChecks, ReviewContext,
+    ReviewDecision, ReviewedAggregate, ReviewedAggregateEnvelope, RESULT_SCHEMA_VERSION,
 };
 pub use signature::{
     verify_document, DetachedSignatureVerifier, GpgDetachedSignatureVerifier, SignatureAlgorithm,

@@ -505,6 +505,22 @@ impl ValidatedPublicationEligibility {
     pub const fn token_set_sha256(&self) -> &Sha256Digest {
         &self.token_set_sha256
     }
+
+    pub(crate) const fn bundle_index_sha256(&self) -> &Sha256Digest {
+        &self.bundle_index_sha256
+    }
+
+    pub(crate) const fn operator_fingerprint(&self) -> &crate::SignerFingerprint {
+        &self.operator_fingerprint
+    }
+
+    pub(crate) const fn protocol_sha256(&self) -> &Sha256Digest {
+        &self.protocol_sha256
+    }
+
+    pub(crate) const fn validated_at_unix(&self) -> u64 {
+        self.validated_at_unix
+    }
 }
 
 /// Validates the evaluation successor of a frozen collection bundle.
@@ -1146,6 +1162,24 @@ pub(crate) mod tests {
         let snapshot = verified_snapshot(&value).unwrap();
         let evaluation = validate_evaluation_eligibility(&bundle, snapshot, 1789000000).unwrap();
         (protocol, bundle, evaluation)
+    }
+
+    pub(crate) fn review_inputs() -> (
+        ValidatedProtocol,
+        ValidatedFrozenBundle,
+        ValidatedPublicationEligibility,
+    ) {
+        let (protocol, bundle, evaluation) = reduction_inputs();
+        let mut value = snapshot_value(protocol.protocol_sha256());
+        value["phase"] = json!("publication");
+        value["registry_revision"] = json!(3);
+        value["predecessor_sha256"] = json!(evaluation.snapshot_sha256().as_str());
+        value["aggregate_publication_acknowledged"] = json!(true);
+        value["publication_boundary_acknowledged"] = json!(true);
+        let snapshot = verified_snapshot(&value).unwrap();
+        let publication =
+            validate_publication_eligibility(&evaluation, snapshot, 1789000001).unwrap();
+        (protocol, bundle, publication)
     }
 
     fn publication_inputs() -> (

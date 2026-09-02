@@ -209,6 +209,7 @@ impl LocalCommissioningRecord {
             context: self.context.clone(),
             conditioning_catalog_sha256: self.conditioning_catalog_sha256.clone(),
             selected_policy_sha256: self.selected_policy_sha256.clone(),
+            interface_layout_sha256: self.interface_layout_sha256.clone(),
             measured_at_unix: self.measured_at_unix,
             p50_latency_ms: self.gates.p50_latency_ms,
             p95_latency_ms: self.gates.p95_latency_ms,
@@ -279,6 +280,7 @@ pub(crate) struct ValidatedLocalCommissioning {
     context: QualificationContext,
     conditioning_catalog_sha256: String,
     selected_policy_sha256: String,
+    interface_layout_sha256: String,
     measured_at_unix: u64,
     p50_latency_ms: u64,
     p95_latency_ms: u64,
@@ -286,6 +288,10 @@ pub(crate) struct ValidatedLocalCommissioning {
 }
 
 impl ValidatedLocalCommissioning {
+    pub(crate) const fn profile(&self) -> &PairTransportProfile {
+        &self.profile
+    }
+
     pub(crate) fn profile_id(&self) -> &str {
         self.profile.id()
     }
@@ -296,6 +302,30 @@ impl ValidatedLocalCommissioning {
 
     pub(crate) const fn p95_latency_ms(&self) -> u64 {
         self.p95_latency_ms
+    }
+
+    pub(crate) const fn p50_latency_ms(&self) -> u64 {
+        self.p50_latency_ms
+    }
+
+    pub(crate) fn conditioning_catalog_sha256(&self) -> &str {
+        &self.conditioning_catalog_sha256
+    }
+
+    pub(crate) fn selected_policy_sha256(&self) -> &str {
+        &self.selected_policy_sha256
+    }
+
+    pub(crate) const fn measured_at_unix(&self) -> u64 {
+        self.measured_at_unix
+    }
+
+    pub(crate) fn record_sha256(&self) -> &str {
+        &self.record_sha256
+    }
+
+    pub(crate) fn interface_layout_sha256(&self) -> &str {
+        &self.interface_layout_sha256
     }
 }
 
@@ -522,6 +552,83 @@ pub(crate) fn validated_commissioning_fixture(
     candidate_schedule: CaptureSchedule,
     now_unix: u64,
 ) -> ValidatedLocalCommissioning {
+    validated_commissioning_fixture_with(
+        candidate_id,
+        candidate_rgb_fps,
+        candidate_ir_fps,
+        candidate_schedule,
+        now_unix,
+        fixture_current_context(candidate_rgb_fps, candidate_ir_fps),
+        FIXTURE_CONDITIONING_CATALOG_SHA256.to_owned(),
+        FIXTURE_SELECTED_POLICY_SHA256.to_owned(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validated_commissioning_fixture_with_bindings(
+    candidate_id: &str,
+    candidate_rgb_fps: u32,
+    candidate_ir_fps: u32,
+    candidate_schedule: CaptureSchedule,
+    now_unix: u64,
+    conditioning_catalog_byte: u8,
+    selected_policy_byte: u8,
+) -> ValidatedLocalCommissioning {
+    validated_commissioning_fixture_with(
+        candidate_id,
+        candidate_rgb_fps,
+        candidate_ir_fps,
+        candidate_schedule,
+        now_unix,
+        fixture_current_context(candidate_rgb_fps, candidate_ir_fps),
+        format!("{conditioning_catalog_byte:02x}").repeat(32),
+        format!("{selected_policy_byte:02x}").repeat(32),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validated_commissioning_fixture_with_serial(
+    candidate_id: &str,
+    candidate_rgb_fps: u32,
+    candidate_ir_fps: u32,
+    candidate_schedule: CaptureSchedule,
+    now_unix: u64,
+    serial: &str,
+) -> ValidatedLocalCommissioning {
+    let context = fixture_context_with(
+        candidate_rgb_fps,
+        candidate_ir_fps,
+        &ContextOverrides {
+            rgb_serial: Some(serial.to_owned()),
+            ..ContextOverrides::default()
+        },
+    );
+    validated_commissioning_fixture_with(
+        candidate_id,
+        candidate_rgb_fps,
+        candidate_ir_fps,
+        candidate_schedule,
+        now_unix,
+        context,
+        FIXTURE_CONDITIONING_CATALOG_SHA256.to_owned(),
+        FIXTURE_SELECTED_POLICY_SHA256.to_owned(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn validated_commissioning_fixture_with(
+    candidate_id: &str,
+    candidate_rgb_fps: u32,
+    candidate_ir_fps: u32,
+    candidate_schedule: CaptureSchedule,
+    now_unix: u64,
+    context: QualificationContext,
+    conditioning_catalog_sha256: String,
+    selected_policy_sha256: String,
+) -> ValidatedLocalCommissioning {
     let mut value = fixture_commissioning_value(
         candidate_id,
         candidate_rgb_fps,
@@ -530,6 +637,9 @@ pub(crate) fn validated_commissioning_fixture(
     );
     value["measured_at_unix"] = serde_json::json!(now_unix.checked_sub(50).unwrap());
     value["expires_at_unix"] = serde_json::json!(now_unix.checked_add(86_400).unwrap());
+    value["context"] = serde_json::to_value(&context).unwrap();
+    value["conditioning_catalog_sha256"] = serde_json::json!(conditioning_catalog_sha256.clone());
+    value["selected_policy_sha256"] = serde_json::json!(selected_policy_sha256.clone());
     let wire: LocalCommissioningRecord = serde_json::from_value(value).unwrap();
     let canonical = serde_json::to_vec(&wire).unwrap();
     LocalCommissioningRecord::from_canonical_json(&canonical)
@@ -542,9 +652,9 @@ pub(crate) fn validated_commissioning_fixture(
                 candidate_ir_fps,
                 candidate_schedule,
             ),
-            &fixture_current_context(candidate_rgb_fps, candidate_ir_fps),
-            FIXTURE_CONDITIONING_CATALOG_SHA256,
-            FIXTURE_SELECTED_POLICY_SHA256,
+            &context,
+            &conditioning_catalog_sha256,
+            &selected_policy_sha256,
             now_unix,
         )
         .unwrap()

@@ -125,6 +125,14 @@ impl ProfileContract {
             && self.requested_rgb == other.requested_rgb
             && self.schedule == other.schedule
     }
+
+    pub(crate) fn lifecycle_sha256(&self) -> Result<Sha256Digest, CampaignError> {
+        to_canonical(self).map(|bytes| Sha256Digest::of(&bytes))
+    }
+
+    pub(crate) const fn selected_policy_sha256(&self) -> &Sha256Digest {
+        &self.contracts.selected_policy_sha256
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,6 +158,10 @@ impl HardwareScope {
     #[must_use]
     pub fn hardware_class(&self) -> &Identifier {
         &self.hardware_class
+    }
+
+    pub(crate) fn lifecycle_sha256(&self) -> Result<Sha256Digest, CampaignError> {
+        to_canonical(self).map(|bytes| Sha256Digest::of(&bytes))
     }
 }
 
@@ -260,6 +272,34 @@ impl CasePlan {
             && self.reference_relation == other.reference_relation
             && self.scene_id == other.scene_id
             && self.stratum_id == other.stratum_id
+    }
+
+    pub(crate) const fn case_id(&self) -> &Identifier {
+        &self.case_id
+    }
+    pub(crate) const fn logical_case_id(&self) -> &Identifier {
+        &self.logical_case_id
+    }
+    pub(crate) const fn expected_outcome(&self) -> ExpectedOutcome {
+        self.expected_outcome
+    }
+    pub(crate) const fn is_baseline(&self) -> bool {
+        matches!(self.profile_side, ProfileSide::Baseline)
+    }
+    pub(crate) const fn is_first(&self) -> bool {
+        matches!(self.order_position, OrderPosition::First)
+    }
+    pub(crate) const fn presentation_class(&self) -> PresentationClass {
+        self.presentation_class
+    }
+    pub(crate) const fn scene_id(&self) -> &Identifier {
+        &self.scene_id
+    }
+    pub(crate) const fn stratum_id(&self) -> &Identifier {
+        &self.stratum_id
+    }
+    pub(crate) const fn planned_count(&self) -> u32 {
+        self.planned_count
     }
 }
 
@@ -423,6 +463,45 @@ impl CampaignProtocol {
     #[must_use]
     pub fn candidate(&self) -> &ProfileContract {
         &self.candidate
+    }
+
+    pub(crate) const fn collection_not_before_unix(&self) -> u64 {
+        self.collection_not_before_unix
+    }
+
+    pub(crate) const fn collection_not_after_unix(&self) -> u64 {
+        self.collection_not_after_unix
+    }
+
+    pub(crate) const fn evaluation_not_after_unix(&self) -> u64 {
+        self.evaluation_not_after_unix
+    }
+
+    pub(crate) const fn review_not_after_unix(&self) -> u64 {
+        self.review_not_after_unix
+    }
+
+    pub(crate) const fn operator_fingerprint(&self) -> &SignerFingerprint {
+        &self.operator_fingerprint
+    }
+
+    pub(crate) const fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
+    }
+
+    pub(crate) fn cases(&self) -> &[CasePlan] {
+        &self.cases
+    }
+
+    pub(crate) fn maximum_repeats(&self, code: &Identifier) -> Option<u32> {
+        self.equipment_invalidations
+            .iter()
+            .find(|rule| &rule.code == code)
+            .map(|rule| rule.maximum_repeats)
+    }
+
+    pub(crate) const fn source_revision(&self) -> &Sha256Digest {
+        &self.source_revision
     }
 }
 
@@ -689,7 +768,7 @@ const fn gcd(mut left: u32, mut right: u32) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::{json, Value};
 
     use super::*;
@@ -866,7 +945,7 @@ mod tests {
         serde_json::to_vec(&policy_value()).unwrap()
     }
 
-    fn protocol_value() -> Value {
+    pub(crate) fn protocol_value() -> Value {
         let policy = policy_bytes();
         let strata = strata();
         let cases = cases(&strata);
@@ -946,7 +1025,7 @@ mod tests {
         )
     }
 
-    fn validate(value: &Value) -> Result<ValidatedProtocol, CampaignError> {
+    pub(crate) fn validate(value: &Value) -> Result<ValidatedProtocol, CampaignError> {
         ValidatedProtocol::new(&verified_policy(), verified_protocol(value)?)
     }
 

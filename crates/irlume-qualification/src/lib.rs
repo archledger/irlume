@@ -4,6 +4,7 @@
 //! Maintainer-only camera profile qualification contracts.
 
 mod canonical;
+mod lifecycle;
 mod policy;
 mod protocol;
 mod signature;
@@ -11,6 +12,14 @@ mod signature;
 pub use canonical::{
     CampaignDiagnostic, CampaignError, CanonicalDocument, Identifier, RatePpb, Sha256Digest,
     SignedRateDifferencePpb, SignerFingerprint, MAX_CAMPAIGN_DOCUMENT_BYTES, RATE_SCALE_PPB,
+};
+pub use lifecycle::{
+    resolve_deletion, validate_collection_eligibility, validate_evaluation_eligibility,
+    validate_frozen_bundle, validate_publication_eligibility, AssetDescriptor, AttemptRecord,
+    BundleIndex, CaptureOrderPosition, CaptureShard, CaseSideCapture, DeletionDisposition,
+    DeletionReason, DeletionRecord, DeletionStatus, EligibilityPhase, EligibilitySnapshot,
+    EligibilityStatus, PairedCaseCapture, TokenEligibility, ValidatedCollectionEligibility,
+    ValidatedEvaluationEligibility, ValidatedFrozenBundle, ValidatedPublicationEligibility,
 };
 pub use policy::{
     BinaryGate, CampaignPolicy, ExpectedOutcome, MissingnessRule, PaiSpecies, PresentationClass,

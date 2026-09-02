@@ -8,6 +8,29 @@
 //! ```compile_fail
 //! use irlume_camera::profile_evaluation::ProfileEvaluationProtocolManifest;
 //! ```
+//!
+//! Release evidence cannot be fabricated outside camera verification.
+//!
+//! ```compile_fail
+//! use irlume_camera::release_qualification_signature::VerifiedReleaseQualification;
+//! let _ = VerifiedReleaseQualification::new_for_test();
+//! ```
+//!
+//! Local commissioning evidence cannot be fabricated from release data.
+//!
+//! ```compile_fail
+//! use irlume_camera::profile_commissioning::ValidatedLocalCommissioning;
+//! let _ = ValidatedLocalCommissioning::new_for_test();
+//! ```
+//!
+//! Profile-selection publication is not an external API.
+//!
+//! ```compile_fail
+//! let store = irlume_camera::profile_qualification::ProfileSelectionStore::system();
+//! let record = irlume_camera::profile_qualification::ProfileSelectionRecord::from_json(b"{}")
+//!     .unwrap();
+//! store.save(record, None).unwrap();
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,12 +47,12 @@ use crate::{
         rank_balanced, CandidateVerdict, CaptureSchedule, PairTransportProfile,
         QualifiedProfileMetrics, RankingBudget,
     },
-    profile_commissioning::ValidatedLocalCommissioning,
+    profile_commissioning::{ProfileCommissioningError, ValidatedLocalCommissioning},
     release_qualification::{
-        HARDWARE_SCOPE_MATCH_POLICY_VERSION, RELEASE_QUALIFICATION_POLICY_VERSION,
-        RELEASE_QUALIFICATION_PRODUCER_VERSION,
+        ReleaseQualificationError, HARDWARE_SCOPE_MATCH_POLICY_VERSION,
+        RELEASE_QUALIFICATION_POLICY_VERSION, RELEASE_QUALIFICATION_PRODUCER_VERSION,
     },
-    release_qualification_signature::VerifiedReleaseQualification,
+    release_qualification_signature::{ReleaseSignatureError, VerifiedReleaseQualification},
 };
 
 /// Profile-selection record shape understood by this build.
@@ -861,6 +884,191 @@ impl std::fmt::Display for ProfileQualificationError {
 
 impl std::error::Error for ProfileQualificationError {}
 
+/// Share-safe reason that profile qualification authority is unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileQualificationDiagnostic {
+    /// No signed release artifact is available.
+    ArtifactMissing,
+    /// The signed release artifact exceeds its bound.
+    ArtifactTooLarge,
+    /// The release artifact schema or policy is unsupported or malformed.
+    ArtifactSchemaUnsupported,
+    /// The detached release signature is absent.
+    SignatureMissing,
+    /// The detached release signature cannot be verified.
+    SignatureInvalid,
+    /// The release signer is not trusted.
+    SignerUntrusted,
+    /// The release artifact is outside its validity interval.
+    ArtifactExpired,
+    /// Release hardware scope does not match the local camera pair.
+    HardwareScopeMismatch,
+    /// Candidates do not share one exact release baseline.
+    BaselineProfileMismatch,
+    /// Release and local profile tuples or schedules differ.
+    ProfileTupleMismatch,
+    /// Local camera identity or connection context differs.
+    CameraContextMismatch,
+    /// The installed model contract differs from release evidence.
+    ModelDigestChanged,
+    /// The installed preprocessing contract differs from release evidence.
+    PreprocessingDigestChanged,
+    /// Conditioning catalog or selected policy evidence differs.
+    ConditioningDigestChanged,
+    /// No valid local commissioning authority is available.
+    CommissioningMissing,
+    /// Local commissioning evidence is outside its validity interval.
+    CommissioningStale,
+    /// At least one release qualification gate failed.
+    ReleaseGateFailed,
+    /// At least one local commissioning gate failed.
+    LocalGateFailed,
+}
+
+impl std::fmt::Display for ProfileQualificationDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ArtifactMissing => "artifact_missing",
+            Self::ArtifactTooLarge => "artifact_too_large",
+            Self::ArtifactSchemaUnsupported => "artifact_schema_unsupported",
+            Self::SignatureMissing => "signature_missing",
+            Self::SignatureInvalid => "signature_invalid",
+            Self::SignerUntrusted => "signer_untrusted",
+            Self::ArtifactExpired => "artifact_expired",
+            Self::HardwareScopeMismatch => "hardware_scope_mismatch",
+            Self::BaselineProfileMismatch => "baseline_profile_mismatch",
+            Self::ProfileTupleMismatch => "profile_tuple_mismatch",
+            Self::CameraContextMismatch => "camera_context_mismatch",
+            Self::ModelDigestChanged => "model_digest_changed",
+            Self::PreprocessingDigestChanged => "preprocessing_digest_changed",
+            Self::ConditioningDigestChanged => "conditioning_digest_changed",
+            Self::CommissioningMissing => "commissioning_missing",
+            Self::CommissioningStale => "commissioning_stale",
+            Self::ReleaseGateFailed => "release_gate_failed",
+            Self::LocalGateFailed => "local_gate_failed",
+        })
+    }
+}
+
+impl std::error::Error for ProfileQualificationDiagnostic {}
+
+impl From<ReleaseQualificationError> for ProfileQualificationDiagnostic {
+    fn from(error: ReleaseQualificationError) -> Self {
+        match error {
+            ReleaseQualificationError::DocumentTooLarge => Self::ArtifactTooLarge,
+            ReleaseQualificationError::UnsupportedHardwareMatchPolicy(_) => {
+                Self::HardwareScopeMismatch
+            }
+            ReleaseQualificationError::InvalidSignerFingerprint => Self::SignerUntrusted,
+            ReleaseQualificationError::InvalidProfile
+            | ReleaseQualificationError::IdenticalProfiles => Self::ProfileTupleMismatch,
+            ReleaseQualificationError::InvalidTime
+            | ReleaseQualificationError::ArtifactNotYetValid
+            | ReleaseQualificationError::ArtifactExpired => Self::ArtifactExpired,
+            ReleaseQualificationError::ReleaseGateFailed => Self::ReleaseGateFailed,
+            ReleaseQualificationError::Json
+            | ReleaseQualificationError::UnsupportedSchema(_)
+            | ReleaseQualificationError::UnsupportedPolicy(_)
+            | ReleaseQualificationError::UnsupportedProducer(_)
+            | ReleaseQualificationError::InvalidIdentifier
+            | ReleaseQualificationError::InvalidDigest => Self::ArtifactSchemaUnsupported,
+        }
+    }
+}
+
+impl From<ReleaseSignatureError> for ProfileQualificationDiagnostic {
+    fn from(error: ReleaseSignatureError) -> Self {
+        match error {
+            ReleaseSignatureError::Artifact(error) => error.into(),
+            ReleaseSignatureError::ArtifactMissing | ReleaseSignatureError::FileMissing => {
+                Self::ArtifactMissing
+            }
+            ReleaseSignatureError::ArtifactTooLarge | ReleaseSignatureError::FileTooLarge => {
+                Self::ArtifactTooLarge
+            }
+            ReleaseSignatureError::SignatureMissing => Self::SignatureMissing,
+            ReleaseSignatureError::SignerUntrusted
+            | ReleaseSignatureError::MetadataSignerMismatch => Self::SignerUntrusted,
+            ReleaseSignatureError::SignatureTooLarge
+            | ReleaseSignatureError::InvalidSignature
+            | ReleaseSignatureError::InvalidConfiguration
+            | ReleaseSignatureError::TrustedKeyMissing
+            | ReleaseSignatureError::TrustedKeyTooLarge
+            | ReleaseSignatureError::Io
+            | ReleaseSignatureError::ProcessFailed
+            | ReleaseSignatureError::Timeout
+            | ReleaseSignatureError::StatusTooLarge
+            | ReleaseSignatureError::InvalidStatus
+            | ReleaseSignatureError::InvalidArtifactName
+            | ReleaseSignatureError::UnsafeFile => Self::SignatureInvalid,
+        }
+    }
+}
+
+impl From<ProfileCommissioningError> for ProfileQualificationDiagnostic {
+    fn from(error: ProfileCommissioningError) -> Self {
+        match error {
+            ProfileCommissioningError::InvalidTime
+            | ProfileCommissioningError::NotYetValid
+            | ProfileCommissioningError::Stale => Self::CommissioningStale,
+            ProfileCommissioningError::InvalidContext
+            | ProfileCommissioningError::ContextMismatch => Self::CameraContextMismatch,
+            ProfileCommissioningError::InvalidLatency
+            | ProfileCommissioningError::LocalGateFailed => Self::LocalGateFailed,
+            ProfileCommissioningError::HardwareScopeMismatch => Self::HardwareScopeMismatch,
+            ProfileCommissioningError::ProfileMismatch => Self::ProfileTupleMismatch,
+            ProfileCommissioningError::ConditioningMismatch => Self::ConditioningDigestChanged,
+            ProfileCommissioningError::UnsupportedSchema(_)
+            | ProfileCommissioningError::UnsupportedPolicy(_)
+            | ProfileCommissioningError::UnsupportedProducer(_)
+            | ProfileCommissioningError::InvalidIdentifier
+            | ProfileCommissioningError::InvalidDigest
+            | ProfileCommissioningError::DocumentTooLarge
+            | ProfileCommissioningError::Json => Self::CommissioningMissing,
+        }
+    }
+}
+
+impl From<ProfileQualificationError> for ProfileQualificationDiagnostic {
+    fn from(error: ProfileQualificationError) -> Self {
+        match error {
+            ProfileQualificationError::ProfileMismatch
+            | ProfileQualificationError::InvalidProfileId => Self::ProfileTupleMismatch,
+            ProfileQualificationError::HardwareScopeMismatch => Self::HardwareScopeMismatch,
+            ProfileQualificationError::BaselineProfileMismatch => Self::BaselineProfileMismatch,
+            ProfileQualificationError::ModelContractChanged => Self::ModelDigestChanged,
+            ProfileQualificationError::PreprocessingContractChanged => {
+                Self::PreprocessingDigestChanged
+            }
+            ProfileQualificationError::ConditioningCatalogChanged
+            | ProfileQualificationError::SelectedPolicyChanged => Self::ConditioningDigestChanged,
+            ProfileQualificationError::ContextChanged | ProfileQualificationError::Context(_) => {
+                Self::CameraContextMismatch
+            }
+            ProfileQualificationError::DuplicateCandidate
+            | ProfileQualificationError::InvalidEvidence
+            | ProfileQualificationError::InvalidDigest
+            | ProfileQualificationError::CandidateCount
+            | ProfileQualificationError::UnsupportedSchema(_)
+            | ProfileQualificationError::UnsupportedPolicy(_)
+            | ProfileQualificationError::RecordTooLarge
+            | ProfileQualificationError::Json => Self::CommissioningMissing,
+        }
+    }
+}
+
+impl From<ProfileSelectionStoreError> for ProfileQualificationDiagnostic {
+    fn from(error: ProfileSelectionStoreError) -> Self {
+        match error {
+            ProfileSelectionStoreError::InvalidRecord(error) => error.into(),
+            ProfileSelectionStoreError::Io(_)
+            | ProfileSelectionStoreError::StaleRevision { .. }
+            | ProfileSelectionStoreError::RevisionExhausted
+            | ProfileSelectionStoreError::VisibleNotDurable(_) => Self::CommissioningMissing,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,10 +1076,12 @@ mod tests {
         profile::{CaptureSchedule, RankingBudget},
         profile_commissioning::{
             validated_commissioning_fixture, validated_commissioning_fixture_with_bindings,
-            validated_commissioning_fixture_with_serial,
+            validated_commissioning_fixture_with_serial, ProfileCommissioningError,
         },
+        release_qualification::ReleaseQualificationError,
         release_qualification_signature::{
             verified_release_fixture, verified_release_fixture_with_descriptor,
+            ReleaseSignatureError,
         },
     };
 
@@ -1281,6 +1491,198 @@ mod tests {
             select_profiles(candidates, authority_fixture(), budget).unwrap_err(),
             ProfileQualificationError::CandidateCount,
         );
+    }
+
+    #[test]
+    fn internal_failures_project_to_the_fixed_diagnostic_vocabulary() {
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseSignatureError::ArtifactMissing),
+            ProfileQualificationDiagnostic::ArtifactMissing,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseQualificationError::DocumentTooLarge),
+            ProfileQualificationDiagnostic::ArtifactTooLarge,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseQualificationError::UnsupportedSchema(2)),
+            ProfileQualificationDiagnostic::ArtifactSchemaUnsupported,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseSignatureError::SignatureMissing),
+            ProfileQualificationDiagnostic::SignatureMissing,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseSignatureError::InvalidSignature),
+            ProfileQualificationDiagnostic::SignatureInvalid,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseSignatureError::SignerUntrusted),
+            ProfileQualificationDiagnostic::SignerUntrusted,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseQualificationError::ArtifactExpired),
+            ProfileQualificationDiagnostic::ArtifactExpired,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileQualificationError::HardwareScopeMismatch,),
+            ProfileQualificationDiagnostic::HardwareScopeMismatch,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(
+                ProfileQualificationError::BaselineProfileMismatch,
+            ),
+            ProfileQualificationDiagnostic::BaselineProfileMismatch,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileQualificationError::ProfileMismatch),
+            ProfileQualificationDiagnostic::ProfileTupleMismatch,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileQualificationError::ContextChanged),
+            ProfileQualificationDiagnostic::CameraContextMismatch,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileQualificationError::ModelContractChanged,),
+            ProfileQualificationDiagnostic::ModelDigestChanged,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(
+                ProfileQualificationError::PreprocessingContractChanged,
+            ),
+            ProfileQualificationDiagnostic::PreprocessingDigestChanged,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(
+                ProfileQualificationError::ConditioningCatalogChanged,
+            ),
+            ProfileQualificationDiagnostic::ConditioningDigestChanged,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileCommissioningError::Json),
+            ProfileQualificationDiagnostic::CommissioningMissing,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileCommissioningError::Stale),
+            ProfileQualificationDiagnostic::CommissioningStale,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ReleaseQualificationError::ReleaseGateFailed,),
+            ProfileQualificationDiagnostic::ReleaseGateFailed,
+        );
+        assert_eq!(
+            ProfileQualificationDiagnostic::from(ProfileCommissioningError::LocalGateFailed),
+            ProfileQualificationDiagnostic::LocalGateFailed,
+        );
+    }
+
+    #[test]
+    fn diagnostic_display_is_exact_and_never_leaks_internal_text() {
+        let cases = [
+            (
+                ProfileQualificationDiagnostic::ArtifactMissing,
+                "artifact_missing",
+            ),
+            (
+                ProfileQualificationDiagnostic::ArtifactTooLarge,
+                "artifact_too_large",
+            ),
+            (
+                ProfileQualificationDiagnostic::ArtifactSchemaUnsupported,
+                "artifact_schema_unsupported",
+            ),
+            (
+                ProfileQualificationDiagnostic::SignatureMissing,
+                "signature_missing",
+            ),
+            (
+                ProfileQualificationDiagnostic::SignatureInvalid,
+                "signature_invalid",
+            ),
+            (
+                ProfileQualificationDiagnostic::SignerUntrusted,
+                "signer_untrusted",
+            ),
+            (
+                ProfileQualificationDiagnostic::ArtifactExpired,
+                "artifact_expired",
+            ),
+            (
+                ProfileQualificationDiagnostic::HardwareScopeMismatch,
+                "hardware_scope_mismatch",
+            ),
+            (
+                ProfileQualificationDiagnostic::BaselineProfileMismatch,
+                "baseline_profile_mismatch",
+            ),
+            (
+                ProfileQualificationDiagnostic::ProfileTupleMismatch,
+                "profile_tuple_mismatch",
+            ),
+            (
+                ProfileQualificationDiagnostic::CameraContextMismatch,
+                "camera_context_mismatch",
+            ),
+            (
+                ProfileQualificationDiagnostic::ModelDigestChanged,
+                "model_digest_changed",
+            ),
+            (
+                ProfileQualificationDiagnostic::PreprocessingDigestChanged,
+                "preprocessing_digest_changed",
+            ),
+            (
+                ProfileQualificationDiagnostic::ConditioningDigestChanged,
+                "conditioning_digest_changed",
+            ),
+            (
+                ProfileQualificationDiagnostic::CommissioningMissing,
+                "commissioning_missing",
+            ),
+            (
+                ProfileQualificationDiagnostic::CommissioningStale,
+                "commissioning_stale",
+            ),
+            (
+                ProfileQualificationDiagnostic::ReleaseGateFailed,
+                "release_gate_failed",
+            ),
+            (
+                ProfileQualificationDiagnostic::LocalGateFailed,
+                "local_gate_failed",
+            ),
+        ];
+        for (diagnostic, expected) in cases {
+            assert_eq!(diagnostic.to_string(), expected);
+        }
+
+        let unsafe_text = "gpg: /tmp/private/campaign serial score fixture-id";
+        for diagnostic in [
+            ProfileQualificationDiagnostic::from(ProfileQualificationError::Context(
+                QualificationError::System(unsafe_text.to_owned()),
+            )),
+            ProfileQualificationDiagnostic::from(ProfileSelectionStoreError::Io(
+                unsafe_text.to_owned(),
+            )),
+            ProfileQualificationDiagnostic::from(ProfileSelectionStoreError::VisibleNotDurable(
+                unsafe_text.to_owned(),
+            )),
+        ] {
+            let rendered = diagnostic.to_string();
+            for forbidden in [
+                "/",
+                "\\",
+                "gpg:",
+                "campaign",
+                "serial",
+                "score",
+                "fixture-id",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "{rendered} leaked {forbidden}"
+                );
+            }
+        }
     }
 
     struct TempStore {

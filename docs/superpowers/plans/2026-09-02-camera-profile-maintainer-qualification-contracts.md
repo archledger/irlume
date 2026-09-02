@@ -28,7 +28,8 @@ enumeration/doctests, Clippy, rustfmt, Git signed commits, and DCO.
 
 - Work only in `/home/wisbfime/irlume/.worktrees/feat-layered-camera-profile-engine`
   on `feat/layered-camera-profile-engine`; do not reconcile, rebase, merge, push,
-  or alter remote `2540d369` without separate authorization.
+  or alter fetched remote `77fe8e7a4098dc50fcaa0d7764cd22848f704136`
+  without separate authorization.
 - Execute inline. Do not dispatch subagents.
 - Use strict TDD. Observe the named RED failure before writing each behavior.
 - This plan implements Delivery Phases 2 and 3 only. Synthetic vault,
@@ -46,9 +47,9 @@ enumeration/doctests, Clippy, rustfmt, Git signed commits, and DCO.
   unknown-field rejecting, versioned, and content-addressed with lowercase
   SHA-256. Capture shards contain at most 128 paired cases, 32 assets per role
   per case, and 64 MiB per asset.
-- One protocol binds one campaign ID, one policy digest, one exact hardware
-  class, and one exact baseline/candidate profile pair. Candidate output never
-  supplies labels, exclusions, strata, or expected outcomes.
+- One protocol binds one campaign ID, one policy digest, one exact identity-free
+  hardware scope, and one exact baseline/candidate profile pair. Candidate
+  output never supplies labels, exclusions, strata, or expected outcomes.
 - Freeze confidence at one-sided 95 percent, alpha `0.05`, planned power at
   least 80 percent, overall non-inferiority margin `-0.02`, per-stratum margin
   `-0.05`, latency increase at 5 percent of the fixed budget, and 10,000
@@ -1119,6 +1120,8 @@ git commit -S -s -m "feat: require independent campaign review"
 ### Task 7: Compile Canonical Unsigned Schema-1 Artifact Bytes
 
 **Files:**
+- Modify: `crates/irlume-qualification/src/protocol.rs`
+- Modify: `crates/irlume-qualification/src/result.rs`
 - Create: `crates/irlume-qualification/src/compiler.rs`
 - Modify: `crates/irlume-qualification/src/lib.rs`
 - Modify: `crates/irlume-camera/Cargo.toml`
@@ -1126,12 +1129,127 @@ git commit -S -s -m "feat: require independent campaign review"
 - Test: compiler module and camera private parser compatibility
 
 **Interfaces:**
-- Consumes: `ReviewedAggregate`, exact target contracts copied from its passing
-  public result, and intended allowlisted release signer fingerprint.
+- Consumes: `ReviewedAggregate` retaining the exact validated signed protocol,
+  its matching passing public result/review, and the intended allowlisted
+  release signer fingerprint. No caller supplies target contracts.
 - Produces: `UnsignedReleaseArtifact { canonical_bytes, artifact_sha256 }` only.
   It does not produce a detached signature or verified release evidence.
 
-- [ ] **Step 1: Write failing compiler projection tests**
+- [ ] **Step 1: Write failing upstream-authority correction tests**
+
+In `protocol.rs`, change the synthetic protocol fixture's hardware scope to:
+
+```rust
+"hardware_scope": {
+    "hardware_class": "usb-rgb-ir-v1",
+    "interface_layout_sha256": digest("a"),
+    "ir": {
+        "backend": "v4l2-uvc",
+        "descriptor_sha256": digest("b"),
+        "driver": "uvcvideo",
+        "interface_number": 2,
+        "pid": 0x5678,
+        "speed_millimbps": 5_000_000u64,
+        "vid": 0x0bda
+    },
+    "match_policy_version": 1,
+    "rgb": {
+        "backend": "v4l2-uvc",
+        "descriptor_sha256": digest("c"),
+        "driver": "uvcvideo",
+        "interface_number": 0,
+        "pid": 0x5678,
+        "speed_millimbps": 5_000_000u64,
+        "vid": 0x0bda
+    }
+}
+```
+
+Add `protocol_binds_exact_identity_free_release_endpoint_scope`. Parse the
+fixture successfully, then mutate each nested descriptor, VID, PID, interface,
+driver, backend, and speed independently and assert the canonical protocol
+digest changes. Also assert zero speed, equal RGB/IR descriptor digests, empty
+driver/backend, and unknown endpoint fields return `ProtocolInvalid` or
+`CanonicalInvalid` as appropriate. Assert serialized protocol bytes contain no
+`serial`, `devpath`, `device_path`, or `relative_path` field.
+
+In `result.rs`, update the compile-fail `ReviewedAggregate` literal with its
+private `protocol` field. Add `reviewed_aggregate_retains_only_its_exact_validated_protocol`:
+
+```rust
+let reviewed = passing_reviewed_aggregate();
+assert_eq!(
+    reviewed.protocol().protocol_sha256(),
+    reviewed.envelope().protocol_sha256()
+);
+```
+
+Expose `protocol_sha256()` read-only on `ReviewedAggregateEnvelope`; keep
+`ReviewedAggregate::protocol()` crate-private so no public API can substitute
+protocol authority. Refactor the existing passing review setup into
+`pub(crate) fn passing_reviewed_aggregate() -> ReviewedAggregate`, and make the
+`#[cfg(test)]` result test module `pub(crate)` so compiler unit tests can reuse
+only this fully validated test authority. This helper remains absent from normal
+library builds.
+
+- [ ] **Step 2: Run upstream-authority tests and verify RED**
+
+Run: `cargo test -p irlume-qualification protocol::tests::protocol_binds_exact_identity_free_release_endpoint_scope`
+
+Expected: FAIL because `HardwareEndpointScope` and nested endpoint parsing do
+not exist.
+
+Run: `cargo test -p irlume-qualification result::tests::reviewed_aggregate_retains_only_its_exact_validated_protocol`
+
+Expected: FAIL because `ReviewedAggregate` does not retain `ValidatedProtocol`.
+
+- [ ] **Step 3: Implement the minimal signed endpoint and retained-protocol authority**
+
+Replace descriptor-only hardware fields with:
+
+```rust
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareEndpointScope {
+    backend: Identifier,
+    descriptor_sha256: Sha256Digest,
+    driver: Identifier,
+    interface_number: u8,
+    pid: u16,
+    speed_millimbps: u64,
+    vid: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareScope {
+    hardware_class: Identifier,
+    interface_layout_sha256: Sha256Digest,
+    ir: HardwareEndpointScope,
+    match_policy_version: u32,
+    rgb: HardwareEndpointScope,
+}
+```
+
+`HardwareEndpointScope::validate` rejects zero speed. `HardwareScope::validate`
+retains schema-1 match-policy equality and rejects equal RGB/IR descriptor
+digests. Add crate-private read-only accessors for compiler projection: endpoint
+backend, descriptor digest, driver, interface, PID, speed, VID; hardware
+interface-layout digest, match-policy version, RGB, and IR; profile requested and
+accepted tuples, schedule, runtime contracts; and stream format, dimensions,
+interval, and role. Do not add camera imports or serial/path fields.
+
+Clone `context.protocol` into `ReviewedAggregate.protocol` only in the successful
+assembly branch, then add the crate-private getter. Keep envelope bytes and
+envelope digest unchanged by this retained internal authority.
+
+Run: `cargo test -p irlume-qualification protocol::tests`
+
+Run: `cargo test -p irlume-qualification result::tests`
+
+Expected: PASS.
+
+- [ ] **Step 4: Write failing compiler projection tests**
 
 Use this only public compiler interface:
 
@@ -1147,6 +1265,9 @@ pub struct UnsignedReleaseArtifact {
 }
 ```
 
+Provide read-only `canonical_bytes() -> &[u8]` and
+`artifact_sha256() -> &Sha256Digest`; provide no constructor or mutable bytes.
+
 Test exact projection of campaign ID, protocol digest, reviewed envelope digest,
 hardware scope, baseline/candidate requested and accepted RGB/IR tuples,
 schedules, conditioning catalog/selected policy, preprocessing/model contracts,
@@ -1155,13 +1276,13 @@ and OpenPGP release signer metadata. Assert
 `campaign_result_sha256 == reviewed.envelope_sha256()` and
 `qualified_at_unix == review.reviewed_at_unix()`.
 
-- [ ] **Step 2: Run compiler tests and verify RED**
+- [ ] **Step 5: Run compiler tests and verify RED**
 
 Run: `cargo test -p irlume-qualification compiler::tests`
 
 Expected: compilation FAIL because compiler types do not exist.
 
-- [ ] **Step 3: Implement a private schema-1 wire mirror and pure compiler**
+- [ ] **Step 6: Implement a private schema-1 wire mirror and pure compiler**
 
 Mirror the existing `irlume-camera` wire field order exactly:
 
@@ -1176,11 +1297,66 @@ preprocessing_contract_sha256, model_contract_sha256, gates, signature
 All six gate fields serialize as `passed`; failed/rejected reviewed input is
 unconstructible. Expiry is the minimum of protocol expiry and collection end
 plus 31,536,000 checked seconds. Reject zero/reversed/overflowing time and any
-target field mismatch between protocol and public result. Serialize compactly,
-bound to 256 KiB, parse back through the compiler's closed wire type, require
-byte equality, then hash.
+target field mismatch between retained protocol and public result. Before
+projection, recompute the canonical protocol hardware, baseline profile, and
+candidate profile digests and compare them with `hardware_scope_sha256`,
+`baseline_profile_sha256`, and `candidate_profile_sha256`. Also compare policy,
+protocol, collection bounds, conditioning catalog, selected policy,
+preprocessing, model, producer, software, threshold, and source-revision facts.
+Any mismatch, arithmetic overflow, invalid time, serialization, size, or
+canonical round-trip failure maps to `ArtifactCompileFailed`. The release signer
+is already a validated `SignerFingerprint`; the compiler does not reparse or
+weaken that boundary.
 
-- [ ] **Step 4: Add camera parser compatibility as a dev-only seam**
+Map qualification `PixelFormat` and `CaptureSchedule` exhaustively into private
+wire enums. The endpoint wire declaration order is exactly
+`descriptor_sha256, vid, pid, interface_number, driver, backend,
+speed_millimbps`; profile order is exactly `profile_id, requested_rgb,
+accepted_rgb, requested_ir, accepted_ir, schedule`. Serialize compactly, bound
+to 256 KiB, parse back through the compiler's closed wire type, require byte
+equality, then hash.
+
+- [ ] **Step 7: Add target-mismatch, privacy, and opaque-output tests**
+
+Extract a private `validate_target_bindings(&ValidatedProtocol,
+&PublicAggregateResult)` so compiler unit tests can supply canonical synthetic
+protocol/public documents without forging `ReviewedAggregate`. Independently
+mutate every artifact target source listed in Step 6 and assert
+`ArtifactCompileFailed`. Test review time zero, collection-end addition overflow,
+and expiry at or before review time. Test the private closed wire parser directly
+with bytes over 256 KiB, unknown fields, and noncanonical bytes.
+
+Serialize compiler bytes and assert absence of the exact lifecycle token fixture
+`"0".repeat(64)` and these forbidden field fragments:
+
+```rust
+[
+    "identity", "participant", "token", "consent", "relative_path",
+    "device_path", "devpath", "serial", "image", "crop", "tensor",
+    "template", "embedding", "score", "third_party", "error_text",
+]
+```
+
+Add compile-fail rustdoc proving external field construction and authority
+promotion do not exist:
+
+```rust
+/// ```compile_fail
+/// use irlume_qualification::UnsignedReleaseArtifact;
+/// let _ = UnsignedReleaseArtifact {
+///     canonical_bytes: b"{}".to_vec(),
+///     artifact_sha256: todo!(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use irlume_qualification::UnsignedReleaseArtifact;
+/// let unsigned: UnsignedReleaseArtifact = todo!();
+/// let _verified = unsigned.into_verified_release_qualification();
+/// ```
+```
+
+- [ ] **Step 8: Add camera parser compatibility as a dev-only seam**
 
 Add to `crates/irlume-camera/Cargo.toml`:
 
@@ -1195,23 +1371,29 @@ qualification crate's public interfaces using a camera-test-local
 `FakeVerifier`, compile the resulting passing reviewed aggregate, then call private
 `ReleaseQualificationArtifact::from_canonical_json(bytes)`. Assert campaign ID,
 protocol digest, reviewed-envelope digest, review timestamp, expiry, profile IDs,
-all target digests, and release signer fingerprint. Add mismatch tests for every
-nested target contract. Do not change production module visibility, constructors,
-or dependencies.
+all target digests, and release signer fingerprint. Retain the camera parser's
+existing nested profile/hardware mutation coverage; protocol/public target
+mismatches belong to Step 7 before bytes exist. Do not change production module
+visibility, constructors, or dependencies.
 
-- [ ] **Step 5: Prove compiler privacy and authority separation**
+Keep all campaign fixture assembly in the camera test module. Do not add a
+qualification test-fixture feature, public fixture constructor, checked-in
+artifact bytes, or production dependency. Generate the 1,782 categorical
+outcomes from the signed protocol's locked case counts, use only generated
+non-biometric values, and mint each opaque authority through
+`verify_document`, lifecycle validators, `reduce_campaign`, and
+`assemble_reviewed_aggregate` before compilation.
 
-Serialize compiler bytes and assert absence of token fixture values and the
-forbidden field-name list from Task 5. Add rustdoc compile-fail proofs that
-`UnsignedReleaseArtifact` fields cannot be constructed and that it cannot become
-`VerifiedReleaseQualification`. Search production dependencies and confirm
-`irlume-camera` has no normal dependency on `irlume-qualification`.
+Search Cargo manifests and metadata and confirm `irlume-camera` has no normal
+dependency on `irlume-qualification`; only `[dev-dependencies]` may contain it.
 
-- [ ] **Step 6: Run GREEN, quality gates, and commit**
+- [ ] **Step 9: Run GREEN, quality gates, and commit**
 
 Run: `cargo test -p irlume-qualification compiler::tests`
 
 Run: `cargo test -p irlume-camera --lib release_qualification::tests`
+
+Run: `cargo test -p irlume-qualification --doc`
 
 Run: `cargo clippy -p irlume-qualification -p irlume-camera --all-targets -- -D warnings`
 
@@ -1222,7 +1404,7 @@ Run: `git diff --check`
 Expected: PASS.
 
 ```bash
-git add Cargo.lock crates/irlume-qualification/src/lib.rs crates/irlume-qualification/src/compiler.rs crates/irlume-camera/Cargo.toml crates/irlume-camera/src/release_qualification.rs
+git add Cargo.lock crates/irlume-qualification/src/lib.rs crates/irlume-qualification/src/protocol.rs crates/irlume-qualification/src/result.rs crates/irlume-qualification/src/compiler.rs crates/irlume-camera/Cargo.toml crates/irlume-camera/src/release_qualification.rs
 git commit -S -s -m "feat: compile reviewed qualification artifacts"
 ```
 

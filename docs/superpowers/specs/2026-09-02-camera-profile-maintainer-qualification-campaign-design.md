@@ -1,6 +1,6 @@
 # Camera Profile Maintainer Qualification Campaign: Design
 
-Status: approved design; artifact-authority correction drafted for review;
+Status: approved design; artifact-authority correction approved;
 Delivery Phases 2 and 3 planned in
 `docs/superpowers/plans/2026-09-02-camera-profile-maintainer-qualification-contracts.md`
 Date: 2026-09-02

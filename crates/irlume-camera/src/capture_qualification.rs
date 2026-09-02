@@ -205,6 +205,18 @@ impl ConnectionContext {
         validate_text(&self.driver)?;
         validate_text(&self.backend)
     }
+
+    pub(crate) const fn speed_millimbps(&self) -> u64 {
+        self.speed_millimbps
+    }
+
+    pub(crate) fn driver(&self) -> &str {
+        &self.driver
+    }
+
+    pub(crate) fn backend(&self) -> &str {
+        &self.backend
+    }
 }
 
 /// Persistent identity of one endpoint, collected from its opened fd.
@@ -380,6 +392,22 @@ impl CameraEndpoint {
     #[must_use]
     pub const fn role(&self) -> QualifiedStreamRole {
         self.role
+    }
+
+    pub(crate) fn descriptor_sha256(&self) -> &str {
+        &self.descriptor_sha256
+    }
+
+    pub(crate) const fn vid(&self) -> u16 {
+        self.vid
+    }
+
+    pub(crate) const fn pid(&self) -> u16 {
+        self.pid
+    }
+
+    pub(crate) const fn interface_number(&self) -> u8 {
+        self.interface_number
     }
 }
 

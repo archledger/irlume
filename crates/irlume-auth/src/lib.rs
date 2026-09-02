@@ -12865,6 +12865,29 @@ mod engine_tests {
 
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_legacy_unqualified_attempt_contract_is_available() {
+        let (rgb, ir) = loopback_pair();
+        let _g = env_guard();
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &[rgb.as_str(), ir.as_str()],
+            irlume_camera::lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire one RGB+IR operation");
+        let rgb_camera = operation.open_rgb(&rgb).expect("open the RGB node");
+        let ir_camera = operation.open_ir(&ir).expect("open the IR node");
+        let runtime = irlume_camera::runtime_pair_contract_from_cameras(&rgb_camera, &ir_camera)
+            .expect("bind the loopback runtime pair");
+
+        irlume_camera::attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+            runtime,
+            irlume_camera::profile::CaptureSchedule::Sequential,
+        )
+        .expect("the production loopback tuple must retain the legacy sequential path");
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_authenticate_denies_without_a_face() {
         let (rgb, ir) = loopback_pair();
         let _g = env_guard();

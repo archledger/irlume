@@ -54,7 +54,6 @@ pub mod lease;
 mod lifecycle;
 mod media_graph;
 pub mod profile;
-pub mod profile_evaluation;
 pub mod profile_qualification;
 mod rate_gate;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of

@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! Full-quality, no-authority qualification of exact camera profiles.
+//! Offline release and local evidence composition for exact camera profiles.
+//!
+//! The superseded owner-local protocol is not a public product surface.
+//!
+//! ```compile_fail
+//! use irlume_camera::profile_evaluation::ProfileEvaluationProtocolManifest;
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::{

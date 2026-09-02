@@ -4,11 +4,26 @@
 //! Maintainer-only camera profile qualification contracts.
 
 mod canonical;
+mod policy;
+mod protocol;
 mod signature;
 
 pub use canonical::{
     CampaignDiagnostic, CampaignError, CanonicalDocument, Identifier, RatePpb, Sha256Digest,
     SignedRateDifferencePpb, SignerFingerprint, MAX_CAMPAIGN_DOCUMENT_BYTES, RATE_SCALE_PPB,
+};
+pub use policy::{
+    BinaryGate, CampaignPolicy, ExpectedOutcome, MissingnessRule, PaiSpecies, PresentationClass,
+    StratificationAxis, WithdrawalRule, CAMPAIGN_POLICY_SCHEMA_VERSION, CAMPAIGN_POLICY_VERSION,
+    LATENCY_BOOTSTRAP_RESAMPLES, LATENCY_BUDGET_FRACTION_PPB, MAX_ASSETS_PER_ROLE_PER_CASE,
+    MAX_ASSET_BYTES, MAX_CAPTURE_SHARD_CASES, MAX_PRIVATE_RETENTION_SECONDS, ONE_SIDED_ALPHA_PPB,
+    OVERALL_MARGIN_PPB, REQUIRED_POWER_PPB, STRATUM_MARGIN_PPB,
+};
+pub use protocol::{
+    CampaignProtocol, CaptureSchedule, CasePlan, EquipmentInvalidation, HardwareScope,
+    LockedSampleSize, OperatingPoint, PilotDiscordance, PixelFormat, ProfileContract,
+    PublicRegressionEvidence, RuntimeContractDigests, StratumPlan, StreamContract, StreamRole,
+    ValidatedProtocol, CAMPAIGN_PROTOCOL_SCHEMA_VERSION, HARDWARE_SCOPE_MATCH_POLICY_VERSION,
 };
 pub use signature::{
     verify_document, DetachedSignatureVerifier, GpgDetachedSignatureVerifier, SignatureAlgorithm,

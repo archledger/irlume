@@ -297,6 +297,29 @@ primary YuNet, FaceMesh, AuraFace, ViT, and FLIR sequence completed 30 rounds
 with mean 16.908 ms, p50 16.608 ms, p95 19.533 ms, 13.57% of one CPU core, and
 429,492 us of NPU busy time.
 
+### Clean commit-bound trusted runner
+
+After the complete software gate and inline differential review passed, the
+55-path M1-012 implementation was committed as signed+DCO
+`503f8200dd9f8725b1bc41851887ad8093a809e4`. The repository was clean, and the
+trusted runner accepted that exact OID. It rebuilt the direct Rust adapter in
+private scratch, verified all seven model hashes, reran exact assignment and
+both cache contracts, executed both manifest-derived benchmarks, and published
+only the validated bounded artifact.
+
+The retained result is `/tmp/opencode/m1-012-trusted-503f820.json`, 2,214 bytes,
+mode 0600. It binds the exact commit and pinned experimental matrix, records all
+six ONNX graphs on exact `NPU` with positive per-model busy deltas, records all
+six resident and inferred in one process, and records 408,704 us total NPU busy
+movement over the 30-round primary pipeline. The Rust adapter,
+assignment-mismatch rejection, and clean/warm/corrupt cache gates are all true.
+
+This is trusted local commit-bound hardware evidence, not a run of the
+scheduled `main` workflow. The branch was created on the earlier typed camera
+and model-contract stack rather than directly on `origin/main`; the workflow
+continues to check out `refs/heads/main` and therefore remains pending until the
+reviewed change is integrated there.
+
 Two fail-closed attempts found integration defects before evidence publication:
 
 - The Python wheel exposes only versioned `libopenvino_c.so.2620`, while

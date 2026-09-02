@@ -1,6 +1,7 @@
 # Camera Profile Maintainer Qualification Campaign: Design
 
-Status: approved design, pending implementation plan
+Status: approved design; Delivery Phases 2 and 3 planned in
+`docs/superpowers/plans/2026-09-02-camera-profile-maintainer-qualification-contracts.md`
 Date: 2026-09-02
 Agent: opencode
 Scope: generic maintainer campaign contracts, governance, paired statistical

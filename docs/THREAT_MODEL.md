@@ -71,6 +71,14 @@ logged. It weakens nothing in production: the daemon's environment comes from
 its root-owned systemd unit, so setting it requires the same root the pin does
 not defend against, and tests pin the escape to exact-path matches.
 
+The fixed legacy unqualified sequential path also preserves the pre-profile
+behavior for cameras that cannot prove active-emitter state in frame metadata:
+unconfirmed illumination may reach the existing face, liveness, and PAD gates,
+but it does not become `ActiveIr` evidence or stored capture qualification.
+Stored-qualified attempts continue to require active-emitter provenance, and
+all generation, tuple, delivered-rate, continuity, and evidence-window checks
+remain mandatory on both paths.
+
 ## The Windows camera contract (#169)
 
 These Hello modules are designed and certified against Windows, so the Windows

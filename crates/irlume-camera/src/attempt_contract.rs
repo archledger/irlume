@@ -710,9 +710,13 @@ impl CameraAttemptContract {
         {
             return Err(CapturePlanViolation::IrTuple);
         }
-        self.runtime
-            .validate_canonical_pair(rgb, ir)
-            .map_err(map_runtime_violation)?;
+        if let Err(violation) = self.runtime.validate_canonical_pair(rgb, ir) {
+            if let Some(violation) =
+                map_runtime_violation_for_qualification(self.qualification, violation)
+            {
+                return Err(violation);
+            }
+        }
         let rgb_start = rgb.capture_window().start;
         let ir_start = ir.capture_window().start;
         let start_separation = if rgb_start <= ir_start {
@@ -782,11 +786,52 @@ const fn map_runtime_violation(violation: RuntimePairViolation) -> CapturePlanVi
     }
 }
 
+const fn map_runtime_violation_for_qualification(
+    qualification: AttemptQualification,
+    violation: RuntimePairViolation,
+) -> Option<CapturePlanViolation> {
+    if matches!(qualification, AttemptQualification::LegacyUnqualified)
+        && matches!(violation, RuntimePairViolation::ActiveIr)
+    {
+        return None;
+    }
+    Some(map_runtime_violation(violation))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{CapturePlanViolation, EvidenceWindowRules, QualificationAuthority};
+    use super::{
+        map_runtime_violation_for_qualification, AttemptQualification, CapturePlanViolation,
+        EvidenceWindowRules, QualificationAuthority,
+    };
+    use crate::RuntimePairViolation;
+
+    #[test]
+    fn legacy_unqualified_evidence_defers_only_unconfirmed_active_ir() {
+        assert_eq!(
+            map_runtime_violation_for_qualification(
+                AttemptQualification::LegacyUnqualified,
+                RuntimePairViolation::ActiveIr,
+            ),
+            None
+        );
+        assert_eq!(
+            map_runtime_violation_for_qualification(
+                AttemptQualification::Stored(QualificationAuthority::new(1, 1, 0, false).unwrap()),
+                RuntimePairViolation::ActiveIr,
+            ),
+            Some(CapturePlanViolation::ActiveIr)
+        );
+        assert_eq!(
+            map_runtime_violation_for_qualification(
+                AttemptQualification::LegacyUnqualified,
+                RuntimePairViolation::Continuity,
+            ),
+            Some(CapturePlanViolation::Continuity)
+        );
+    }
 
     #[test]
     fn external_callers_cannot_forge_camera_attempt_authority() {

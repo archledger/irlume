@@ -1928,9 +1928,11 @@ fn capture_mode_selection_with_diagnostics(
     } else {
         irlume_camera::profile::CaptureSchedule::Concurrent
     };
-    let camera_contract = qualification_authority.as_ref().and_then(|qualification| {
-        camera_contract_from_runtime(&runtime_contract, qualification, schedule)
-    });
+    let camera_contract = camera_contract_from_runtime(
+        &runtime_contract,
+        qualification_authority.as_ref(),
+        schedule,
+    );
     CaptureModeSelection {
         sequential: selected.0,
         source: selected.1,
@@ -1948,15 +1950,33 @@ fn capture_mode_selection_with_diagnostics(
 
 fn camera_contract_from_runtime(
     runtime: &irlume_camera::RuntimePairContract,
-    qualification: &irlume_camera::StoredCaptureQualificationState,
+    qualification: Option<&irlume_camera::StoredCaptureQualificationState>,
     schedule: irlume_camera::profile::CaptureSchedule,
 ) -> Option<irlume_camera::attempt_contract::CameraAttemptContract> {
-    irlume_camera::attempt_contract::CameraAttemptContract::from_qualified_runtime(
-        runtime.clone(),
-        qualification,
-        schedule,
-    )
-    .ok()
+    qualification
+        .and_then(|state| {
+            irlume_camera::attempt_contract::CameraAttemptContract::from_qualified_runtime(
+                runtime.clone(),
+                state,
+                schedule,
+            )
+            .ok()
+        })
+        .or_else(|| {
+            irlume_camera::attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+                runtime.clone(),
+                schedule,
+            )
+            .ok()
+        })
+}
+
+fn ir_fallback_rgb_context(score: f32, threshold: f32, sequential_pair: bool) -> String {
+    if sequential_pair && score >= threshold {
+        format!("sequential pair required IR verification; rgb {score:.2}>={threshold:.2}")
+    } else {
+        format!("dim light; rgb {score:.2}<{threshold:.2}")
+    }
 }
 
 fn attempt_plan_from_camera(
@@ -4716,11 +4736,10 @@ impl Engine {
             attempt_plan = capture_mode
                 .runtime_contract
                 .as_ref()
-                .zip(capture_mode.qualification_authority.as_ref())
-                .and_then(|(runtime, qualification)| {
+                .and_then(|runtime| {
                     camera_contract_from_runtime(
                         runtime,
-                        qualification,
+                        capture_mode.qualification_authority.as_ref(),
                         irlume_camera::profile::CaptureSchedule::Sequential,
                     )
                 })
@@ -4871,9 +4890,12 @@ impl Engine {
         let observed_plan = capture_mode
             .runtime_contract
             .as_ref()
-            .zip(capture_mode.qualification_authority.as_ref())
-            .and_then(|(runtime, qualification)| {
-                camera_contract_from_runtime(runtime, qualification, observed_schedule)
+            .and_then(|runtime| {
+                camera_contract_from_runtime(
+                    runtime,
+                    capture_mode.qualification_authority.as_ref(),
+                    observed_schedule,
+                )
             })
             .zip(self.active_plan_versions())
             .and_then(|(camera, versions)| {
@@ -6471,11 +6493,15 @@ impl Engine {
                     );
                     if ir_score >= ir_thr {
                         release_held(held_rgb, held_ir);
+                        let rgb_context = ir_fallback_rgb_context(score, thr, a.sequential_pair);
                         return self.challenge_if_required(
-                    purpose,
-                    service,
-                    Outcome::grant(ir_score,
-                            format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
+                            purpose,
+                            service,
+                            Outcome::grant(
+                                ir_score,
+                                format!("match: {ir_who} (ir-fallback, {rgb_context})"),
+                            ),
+                        );
                     }
                     // (c) calibrated-centroid fallback (ADR-0004): the mean-
                     // template score carries no best-of-N FAR inflation, so it
@@ -6493,11 +6519,16 @@ impl Engine {
                         );
                         if *cs >= cthr {
                             release_held(held_rgb, held_ir);
+                            let rgb_context =
+                                ir_fallback_rgb_context(score, thr, a.sequential_pair);
                             return self.challenge_if_required(
-                    purpose,
-                    service,
-                    Outcome::grant(*cs,
-                                format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
+                                purpose,
+                                service,
+                                Outcome::grant(
+                                    *cs,
+                                    format!("match: {cwho} (calibrated centroid, {rgb_context})"),
+                                ),
+                            );
                         }
                     }
                 }
@@ -13086,6 +13117,18 @@ mod engine_tests {
             })
             .collect();
         assert!(!completed_consent_take_hit(false, true, &poses));
+    }
+
+    #[test]
+    fn ir_fallback_context_distinguishes_rgb_miss_from_sequential_deferral() {
+        assert_eq!(
+            ir_fallback_rgb_context(0.58, 0.61, false),
+            "dim light; rgb 0.58<0.61",
+        );
+        assert_eq!(
+            ir_fallback_rgb_context(0.76, 0.61, true),
+            "sequential pair required IR verification; rgb 0.76>=0.61",
+        );
     }
 
     #[test]

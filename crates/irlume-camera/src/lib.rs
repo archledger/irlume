@@ -56,6 +56,7 @@ mod media_graph;
 pub mod profile;
 pub mod profile_qualification;
 mod rate_gate;
+mod release_qualification;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.

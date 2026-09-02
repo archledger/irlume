@@ -579,6 +579,10 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
         "pcrlock",
         "camera-nodes",
         "models",
+        "execution-device-policy",
+        "inference-resolution",
+        "openvino-runtime",
+        "inference-cache",
         "templates",
         "recovery-passphrase",
         "credential-release-challenge",
@@ -590,6 +594,21 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
         assert!(
             checks.iter().any(|c| c["id"] == required),
             "check `{required}` is missing from the array"
+        );
+    }
+    for inference_id in [
+        "execution-device-policy",
+        "inference-resolution",
+        "openvino-runtime",
+        "inference-cache",
+    ] {
+        let check = checks
+            .iter()
+            .find(|check| check["id"] == inference_id)
+            .unwrap();
+        assert_eq!(
+            check["state"], "unknown",
+            "an unreachable or old daemon must not be reported as CPU: {check}"
         );
     }
 

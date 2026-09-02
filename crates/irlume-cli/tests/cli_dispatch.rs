@@ -311,6 +311,96 @@ fn status_empty_legacy_enrollment_keeps_the_targeted_cleanup() {
     );
 }
 
+#[test]
+fn inference_device_validates_before_writing_and_reports_policy_separately_from_resolution() {
+    let sb = Sandbox::new("inference-device");
+    let cfg = sb.path("cfg/settings.conf");
+    std::fs::write(&cfg, "unrelated=keep\nexecution_device=cpu\n").unwrap();
+
+    let (code, _, err) = run(
+        &mut sb.cmd(&["inference-device", "gpu"]),
+        "inference-device-gpu",
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("auto|cpu|npu|status"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        "unrelated=keep\nexecution_device=cpu\n",
+        "invalid syntax must not write"
+    );
+
+    if is_root() {
+        let (code, out, err) = run(
+            &mut sb.cmd(&["inference-device", "auto"]),
+            "inference-device-auto",
+        );
+        assert_eq!(code, 0, "{out}{err}");
+        let written = std::fs::read_to_string(&cfg).unwrap();
+        assert!(written.contains("unrelated=keep\n"), "{written}");
+        assert!(written.contains("execution_device=auto\n"), "{written}");
+        assert!(out.contains("restart irlumed"), "{out}");
+    } else {
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        let (code, _, err) = run(
+            &mut sb.cmd(&["inference-device", "npu"]),
+            "inference-device-npu",
+        );
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("sudo irlume inference-device npu"), "{err}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+    }
+
+    std::fs::write(&cfg, "unrelated=keep\nexecution_device=cpu\n").unwrap();
+    let report = irlume_common::InferenceResolutionReport::new(
+        irlume_common::ExecutionDevicePolicy::Auto,
+        irlume_common::ExecutionDevicePolicySource::Settings,
+        irlume_common::ResolvedExecutionDevice::Gpu,
+        irlume_common::InferenceBackend::OpenVino,
+    )
+    .with_rejected_candidates(vec![irlume_common::RejectedInferenceCandidate::new(
+        irlume_common::ResolvedExecutionDevice::Npu,
+        "hardware candidate unavailable",
+    )])
+    .with_tflite_facemesh_loaded(Some(true));
+    serve(&sb.sock(), move |request| match request {
+        Request::Health => Response::Health {
+            tier: "secure".into(),
+            rgb_dev: None,
+            ir_dev: None,
+            mesh: true,
+            adapter: false,
+            rgb_pad: Some(irlume_common::PadModelStatus::Loaded),
+            ir_pad: Some(irlume_common::PadModelStatus::Loaded),
+            version: env!("CARGO_PKG_VERSION").into(),
+            apparmor: None,
+            inference: Some(report.clone()),
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let mut status = sb.cmd(&["inference-device", "status"]);
+    status.env("IRLUME_EXECUTION_DEVICE", "npu");
+    let (code, out, err) = run(&mut status, "inference-device-status");
+    assert_eq!(code, 0, "{out}{err}");
+    for expected in [
+        "persisted policy: cpu",
+        "environment override: npu",
+        "effective policy: npu",
+        "policy source: environment",
+        "daemon requested policy: auto",
+        "resolved device: gpu",
+        "backend: openvino",
+        "rejected npu: hardware candidate unavailable",
+        "TFLite FaceMesh: loaded",
+    ] {
+        assert!(out.contains(expected), "missing '{expected}' in:\n{out}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        "unrelated=keep\nexecution_device=cpu\n",
+        "status must never write"
+    );
+}
+
 // The credential-release challenge command: DEFAULT-OFF reporting, the root gate,
 // and the global toggle. Off is the default (a greeter cold login and logout
 // release the keyring with no nod), so neither direction confirms or warns; the
@@ -905,6 +995,7 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: one_profile(),
@@ -943,6 +1034,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),
@@ -983,6 +1075,7 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),

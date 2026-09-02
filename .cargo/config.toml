@@ -1,13 +1,12 @@
 # Build tuning for irlume.
 #
-# Hardware acceleration has two layers:
+# Inference acceleration has two layers:
 #
-#   1. ONNX Runtime execution provider: the big win (this is what howrs does).
-#      Pick at build time via cargo features on irlume-vision:
-#          cargo build -p irlume-daemon --features irlume-vision/cuda
-#          ... or openvino | coreml | tensorrt
-#      Default is CPU (ONNX Runtime's own SIMD + thread pool). Most of the
-#      compute lives here, not in our Rust code.
+#   1. The default is provider-free ONNX Runtime CPU. Experimental direct
+#      OpenVINO NPU/GPU support is default-off and runtime-linked:
+#          cargo build -p irlume-daemon \
+#              --features irlume-vision/experimental-openvino
+#      Released base packages omit that feature until qualification completes.
 #
 #   2. Our glue loops (alignment warp, cosine fold): let LLVM vectorize them.
 #      Uncomment ONE block below for the machine you build for. Leave commented

@@ -8,7 +8,7 @@ use std::{num::NonZeroUsize, time::Duration};
 use crate::{
     conditioning::{ConditioningContext, ConditioningSelection, SceneObservation, SceneStatistics},
     evidence::{CanonicalIrEvidence, CanonicalRgbEvidence},
-    profile::{CaptureSchedule, PairTransportProfile},
+    profile::{CaptureSchedule, DecodedPixelFormat, PairTransportProfile},
     RuntimePairContract, RuntimePairViolation,
 };
 
@@ -323,10 +323,63 @@ pub struct CameraAttemptContract {
     conditioning_context: ConditioningContext,
     conditioning: ConditioningSelection,
     evidence_windows: EvidenceWindowRules,
-    qualification: QualificationAuthority,
+    qualification: AttemptQualification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptQualification {
+    LegacyUnqualified,
+    Stored(QualificationAuthority),
 }
 
 impl CameraAttemptContract {
+    /// Freezes the fixed legacy camera path when no stored qualification exists.
+    ///
+    /// Only the established 640x480 RGB plus 640x400 IR request and the safe
+    /// sequential schedule are eligible. This preserves first-run capture
+    /// without manufacturing stored qualification provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapturePlanViolation::Qualification`] for a concurrent or
+    /// non-baseline request.
+    pub fn from_legacy_unqualified_runtime(
+        runtime: RuntimePairContract,
+        schedule: CaptureSchedule,
+    ) -> Result<Self, CapturePlanViolation> {
+        let rgb = runtime
+            .context()
+            .rgb_stream()
+            .requested_tuple()
+            .ok_or(CapturePlanViolation::RgbTuple)?;
+        let ir = runtime
+            .context()
+            .ir_stream()
+            .requested_tuple()
+            .ok_or(CapturePlanViolation::IrTuple)?;
+        if schedule != CaptureSchedule::Sequential
+            || !matches!(
+                rgb.format(),
+                DecodedPixelFormat::Yuyv | DecodedPixelFormat::Nv12
+            )
+            || rgb.width() != 640
+            || rgb.height() != 480
+            || !matches!(
+                ir.format(),
+                DecodedPixelFormat::Grey8 | DecodedPixelFormat::Grey16
+            )
+            || ir.width() != 640
+            || ir.height() != 400
+        {
+            return Err(CapturePlanViolation::Qualification);
+        }
+        Self::from_runtime_with_qualification(
+            runtime,
+            schedule,
+            AttemptQualification::LegacyUnqualified,
+        )
+    }
+
     /// Freezes camera authority only from a conclusive stored qualification.
     ///
     /// # Errors
@@ -375,6 +428,18 @@ impl CameraAttemptContract {
         schedule: CaptureSchedule,
         qualification: QualificationAuthority,
     ) -> Result<Self, CapturePlanViolation> {
+        Self::from_runtime_with_qualification(
+            runtime,
+            schedule,
+            AttemptQualification::Stored(qualification),
+        )
+    }
+
+    fn from_runtime_with_qualification(
+        runtime: RuntimePairContract,
+        schedule: CaptureSchedule,
+        qualification: AttemptQualification,
+    ) -> Result<Self, CapturePlanViolation> {
         let requested_rgb = runtime
             .context()
             .rgb_stream()
@@ -419,7 +484,7 @@ impl CameraAttemptContract {
             std::time::Instant::now(),
             crate::conditioning::ConditioningAttempt::First,
         );
-        Self::new(
+        Self::new_with_qualification(
             runtime,
             profile,
             conditioning_context,
@@ -440,6 +505,7 @@ impl CameraAttemptContract {
     ///
     /// Returns the specific violation when nested camera authority is inconsistent.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn new(
         runtime: RuntimePairContract,
         profile: PairTransportProfile,
@@ -447,6 +513,24 @@ impl CameraAttemptContract {
         conditioning: ConditioningSelection,
         evidence_windows: EvidenceWindowRules,
         qualification: QualificationAuthority,
+    ) -> Result<Self, CapturePlanViolation> {
+        Self::new_with_qualification(
+            runtime,
+            profile,
+            conditioning_context,
+            conditioning,
+            evidence_windows,
+            AttemptQualification::Stored(qualification),
+        )
+    }
+
+    fn new_with_qualification(
+        runtime: RuntimePairContract,
+        profile: PairTransportProfile,
+        conditioning_context: ConditioningContext,
+        conditioning: ConditioningSelection,
+        evidence_windows: EvidenceWindowRules,
+        qualification: AttemptQualification,
     ) -> Result<Self, CapturePlanViolation> {
         if runtime.context().rgb_stream().requested_tuple().as_ref()
             != Some(profile.requested_rgb())
@@ -507,8 +591,11 @@ impl CameraAttemptContract {
     }
 
     #[must_use]
-    pub const fn qualification(&self) -> QualificationAuthority {
-        self.qualification
+    pub const fn qualification(&self) -> Option<QualificationAuthority> {
+        match self.qualification {
+            AttemptQualification::LegacyUnqualified => None,
+            AttemptQualification::Stored(authority) => Some(authority),
+        }
     }
 
     /// Validates canonical manifests before authentication constructs model inputs.
@@ -623,9 +710,13 @@ impl CameraAttemptContract {
         {
             return Err(CapturePlanViolation::IrTuple);
         }
-        self.runtime
-            .validate_canonical_pair(rgb, ir)
-            .map_err(map_runtime_violation)?;
+        if let Err(violation) = self.runtime.validate_canonical_pair(rgb, ir) {
+            if let Some(violation) =
+                map_runtime_violation_for_qualification(self.qualification, violation)
+            {
+                return Err(violation);
+            }
+        }
         let rgb_start = rgb.capture_window().start;
         let ir_start = ir.capture_window().start;
         let start_separation = if rgb_start <= ir_start {
@@ -695,11 +786,52 @@ const fn map_runtime_violation(violation: RuntimePairViolation) -> CapturePlanVi
     }
 }
 
+const fn map_runtime_violation_for_qualification(
+    qualification: AttemptQualification,
+    violation: RuntimePairViolation,
+) -> Option<CapturePlanViolation> {
+    if matches!(qualification, AttemptQualification::LegacyUnqualified)
+        && matches!(violation, RuntimePairViolation::ActiveIr)
+    {
+        return None;
+    }
+    Some(map_runtime_violation(violation))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{CapturePlanViolation, EvidenceWindowRules, QualificationAuthority};
+    use super::{
+        map_runtime_violation_for_qualification, AttemptQualification, CapturePlanViolation,
+        EvidenceWindowRules, QualificationAuthority,
+    };
+    use crate::RuntimePairViolation;
+
+    #[test]
+    fn legacy_unqualified_evidence_defers_only_unconfirmed_active_ir() {
+        assert_eq!(
+            map_runtime_violation_for_qualification(
+                AttemptQualification::LegacyUnqualified,
+                RuntimePairViolation::ActiveIr,
+            ),
+            None
+        );
+        assert_eq!(
+            map_runtime_violation_for_qualification(
+                AttemptQualification::Stored(QualificationAuthority::new(1, 1, 0, false).unwrap()),
+                RuntimePairViolation::ActiveIr,
+            ),
+            Some(CapturePlanViolation::ActiveIr)
+        );
+        assert_eq!(
+            map_runtime_violation_for_qualification(
+                AttemptQualification::LegacyUnqualified,
+                RuntimePairViolation::Continuity,
+            ),
+            Some(CapturePlanViolation::Continuity)
+        );
+    }
 
     #[test]
     fn external_callers_cannot_forge_camera_attempt_authority() {

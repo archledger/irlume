@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
+
+status = "experimental"
+openvino = "2026.2.0-21903-52ddc073857-releases/2026/2"
+level_zero_tag = "v1.28.2"
+level_zero_commit = "6369d8d642e9c7625e67f38664267f171b8e42dc"
+npu_userspace = "1.35.0.20260722-29947505341"
+gpu_status = "disabled-unqualified"

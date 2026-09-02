@@ -143,6 +143,249 @@ impl Rescue {
     }
 }
 
+#[cfg(test)]
+mod inference_runtime_tests {
+    use super::Engine;
+    use irlume_vision::inference::{
+        DimensionContract, InferenceSession, ModelCompiler, OwnedTensor, SessionContract,
+        SessionMetadata, TensorMetadata,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "irlume-inference-runtime-{}-{}",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("test")
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn model(&self, name: &str, bytes: &[u8]) -> String {
+            let path = self.0.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct SessionDrop(Arc<AtomicUsize>);
+
+    impl Drop for SessionDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct RecordingCompiler {
+        models: Arc<Mutex<Vec<&'static str>>>,
+        dropped: Arc<AtomicUsize>,
+        fail_on_call: Option<usize>,
+    }
+
+    impl RecordingCompiler {
+        fn new() -> Self {
+            Self {
+                models: Arc::new(Mutex::new(Vec::new())),
+                dropped: Arc::new(AtomicUsize::new(0)),
+                fail_on_call: None,
+            }
+        }
+    }
+
+    impl ModelCompiler for RecordingCompiler {
+        fn compile(
+            &mut self,
+            _model: &[u8],
+            contract: &'static SessionContract,
+        ) -> irlume_common::Result<InferenceSession> {
+            let call = self.models.lock().unwrap().len() + 1;
+            self.models.lock().unwrap().push(contract.model);
+            if self.fail_on_call == Some(call) {
+                return Err(irlume_common::Error::Hardware(
+                    "candidate compile failed".into(),
+                ));
+            }
+            let dimensions = |dimensions: &[DimensionContract]| {
+                dimensions
+                    .iter()
+                    .map(|dimension| match dimension {
+                        DimensionContract::Fixed(value) => Some(*value),
+                        DimensionContract::FixedOneOf(values) => values.last().copied(),
+                        DimensionContract::BatchOneOrDynamic => Some(1),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let metadata = SessionMetadata {
+                input: TensorMetadata::f32(
+                    contract.input.name,
+                    dimensions(contract.input.dimensions),
+                ),
+                outputs: contract
+                    .outputs
+                    .iter()
+                    .map(|output| TensorMetadata::f32(output.name, dimensions(output.dimensions)))
+                    .collect(),
+            };
+            let dropped = SessionDrop(Arc::clone(&self.dropped));
+            InferenceSession::new(contract, metadata, move |_| {
+                let _keep_drop_guard = &dropped;
+                Ok(contract
+                    .outputs
+                    .iter()
+                    .map(|output| {
+                        let shape: Vec<usize> = output
+                            .dimensions
+                            .iter()
+                            .map(|dimension| match dimension {
+                                DimensionContract::Fixed(value) => *value,
+                                DimensionContract::FixedOneOf(values) => *values.last().unwrap(),
+                                DimensionContract::BatchOneOrDynamic => 1,
+                            })
+                            .collect();
+                        OwnedTensor {
+                            name: output.name.into(),
+                            values: vec![0.0; shape.iter().product()],
+                            shape,
+                        }
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    #[test]
+    fn inference_runtime_one_compiler_reaches_every_configured_onnx_model() {
+        let dir = TestDir::new();
+        let det = dir.model("det.onnx", b"det");
+        let adapter = dir.model("adapter.onnx", b"adapter");
+        let mesh = dir.model("mesh.onnx", b"mesh");
+        let blaze = dir.model("blaze.onnx", b"blaze");
+        let vit = dir.model("vit.onnx", b"vit");
+        let flir = dir.model("flir.onnx", b"flir");
+        let recognizer = irlume_common::HashedModel::new(b"recognizer".to_vec());
+        let mut runtime = RecordingCompiler::new();
+
+        let engine =
+            Engine::load_with_recognizer_weights_and_runtime(&mut runtime, &det, &recognizer)
+                .unwrap()
+                .with_ir_adapter_with_runtime(&mut runtime, &adapter)
+                .unwrap()
+                .with_mesh_with_runtime(&mut runtime, &mesh)
+                .unwrap()
+                .with_blaze_rescue_with_runtime(&mut runtime, &blaze)
+                .unwrap()
+                .with_vit_pad_with_runtime(&mut runtime, &vit)
+                .unwrap()
+                .with_pad_ir_with_runtime(&mut runtime, &flir)
+                .unwrap();
+
+        assert!(engine.has_ir_adapter());
+        assert_eq!(
+            engine.ir_space(),
+            format!("adapter:{}", &irlume_common::sha256_hex(b"adapter")[..12])
+        );
+        assert!(engine.has_blaze_rescue());
+        assert!(engine.has_vit_pad());
+        assert!(engine.has_pad_ir());
+        assert_eq!(
+            *runtime.models.lock().unwrap(),
+            [
+                "yunet",
+                "auraface",
+                "ir-adapter",
+                "facemesh",
+                "blazeface",
+                "vit-pad",
+                "flir-pad"
+            ]
+        );
+    }
+
+    #[test]
+    fn inference_runtime_absence_and_tflite_never_compile_as_onnx() {
+        let dir = TestDir::new();
+        let det = dir.model("det.onnx", b"det");
+        let tflite = dir.model("mesh.tflite", &[0, 0, 0, 0, b'T', b'F', b'L', b'3']);
+        let recognizer = irlume_common::HashedModel::new(b"recognizer".to_vec());
+        let mut runtime = RecordingCompiler::new();
+        let engine =
+            Engine::load_with_recognizer_weights_and_runtime(&mut runtime, &det, &recognizer)
+                .unwrap();
+        let missing = dir.0.join("absent.onnx").to_string_lossy().into_owned();
+        let engine = engine
+            .with_ir_adapter_with_runtime(&mut runtime, &missing)
+            .unwrap()
+            .with_blaze_rescue_with_runtime(&mut runtime, &missing)
+            .unwrap()
+            .with_vit_pad_with_runtime(&mut runtime, &missing)
+            .unwrap()
+            .with_pad_ir_with_runtime(&mut runtime, &missing)
+            .unwrap();
+        assert_eq!(*runtime.models.lock().unwrap(), ["yunet", "auraface"]);
+
+        assert!(engine
+            .with_mesh_with_runtime(&mut runtime, &tflite)
+            .is_err());
+        assert_eq!(*runtime.models.lock().unwrap(), ["yunet", "auraface"]);
+    }
+
+    #[test]
+    fn inference_runtime_failed_partial_build_drops_every_prior_session() {
+        let dir = TestDir::new();
+        let det = dir.model("det.onnx", b"det");
+        let mesh = dir.model("mesh.onnx", b"mesh");
+        let recognizer = irlume_common::HashedModel::new(b"recognizer".to_vec());
+        let mut runtime = RecordingCompiler::new();
+        runtime.fail_on_call = Some(3);
+        let engine =
+            Engine::load_with_recognizer_weights_and_runtime(&mut runtime, &det, &recognizer)
+                .unwrap();
+
+        assert!(engine.with_mesh_with_runtime(&mut runtime, &mesh).is_err());
+        assert_eq!(runtime.dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn inference_runtime_degraded_blaze_failure_keeps_the_same_engine() {
+        let dir = TestDir::new();
+        let det = dir.model("det.onnx", b"det");
+        let blaze = dir.model("blaze.onnx", b"blaze");
+        let recognizer = irlume_common::HashedModel::new(b"recognizer".to_vec());
+        let mut runtime = RecordingCompiler::new();
+        runtime.fail_on_call = Some(3);
+        let engine =
+            Engine::load_with_recognizer_weights_and_runtime(&mut runtime, &det, &recognizer)
+                .unwrap();
+
+        let (engine, error) = engine.with_blaze_rescue_degraded_with_runtime(&mut runtime, &blaze);
+
+        assert!(error.is_some());
+        assert!(!engine.has_blaze_rescue());
+        assert_eq!(
+            *runtime.models.lock().unwrap(),
+            ["yunet", "auraface", "blazeface"]
+        );
+    }
+}
+
+fn read_model(path: &str) -> irlume_common::Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| irlume_common::Error::Io(format!("{path}: {error}")))
+}
+
 fn model_input_error(error: irlume_vision::model_input::ModelInputError) -> irlume_common::Error {
     irlume_common::Error::Protocol(error.to_string())
 }
@@ -1685,9 +1928,11 @@ fn capture_mode_selection_with_diagnostics(
     } else {
         irlume_camera::profile::CaptureSchedule::Concurrent
     };
-    let camera_contract = qualification_authority.as_ref().and_then(|qualification| {
-        camera_contract_from_runtime(&runtime_contract, qualification, schedule)
-    });
+    let camera_contract = camera_contract_from_runtime(
+        &runtime_contract,
+        qualification_authority.as_ref(),
+        schedule,
+    );
     CaptureModeSelection {
         sequential: selected.0,
         source: selected.1,
@@ -1705,15 +1950,33 @@ fn capture_mode_selection_with_diagnostics(
 
 fn camera_contract_from_runtime(
     runtime: &irlume_camera::RuntimePairContract,
-    qualification: &irlume_camera::StoredCaptureQualificationState,
+    qualification: Option<&irlume_camera::StoredCaptureQualificationState>,
     schedule: irlume_camera::profile::CaptureSchedule,
 ) -> Option<irlume_camera::attempt_contract::CameraAttemptContract> {
-    irlume_camera::attempt_contract::CameraAttemptContract::from_qualified_runtime(
-        runtime.clone(),
-        qualification,
-        schedule,
-    )
-    .ok()
+    qualification
+        .and_then(|state| {
+            irlume_camera::attempt_contract::CameraAttemptContract::from_qualified_runtime(
+                runtime.clone(),
+                state,
+                schedule,
+            )
+            .ok()
+        })
+        .or_else(|| {
+            irlume_camera::attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+                runtime.clone(),
+                schedule,
+            )
+            .ok()
+        })
+}
+
+fn ir_fallback_rgb_context(score: f32, threshold: f32, sequential_pair: bool) -> String {
+    if sequential_pair && score >= threshold {
+        format!("sequential pair required IR verification; rgb {score:.2}>={threshold:.2}")
+    } else {
+        format!("dim light; rgb {score:.2}<{threshold:.2}")
+    }
 }
 
 fn attempt_plan_from_camera(
@@ -2349,6 +2612,7 @@ fn support_probe_result(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
         ),
         schedule,
         source,
@@ -3104,13 +3368,28 @@ impl Engine {
 
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(det_path: &str, model_path: &str) -> irlume_common::Result<Self> {
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        Self::load_with_runtime(&mut runtime, det_path, model_path)
+    }
+
+    /// [`Self::load`], with all required ONNX sessions compiled by one runtime.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn load_with_runtime(
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        det_path: &str,
+        model_path: &str,
+    ) -> irlume_common::Result<Self> {
         // Identify the recognizer by its weights, not its path: a file swapped
         // in place under the same name is a different embedding space and must
         // not silently score against templates from the old one. Read the file
         // ONCE and hand those bytes to the weights loader below.
         let model_bytes = std::fs::read(model_path)
             .map_err(|e| irlume_common::Error::Io(format!("{model_path}: {e}")))?;
-        Self::load_with_recognizer_weights(det_path, &irlume_common::HashedModel::new(model_bytes))
+        Self::load_with_recognizer_weights_and_runtime(
+            runtime,
+            det_path,
+            &irlume_common::HashedModel::new(model_bytes),
+        )
     }
 
     /// [`Self::load`], from recognizer weights the CALLER already holds.
@@ -3129,12 +3408,24 @@ impl Engine {
         det_path: &str,
         model: &irlume_common::HashedModel,
     ) -> irlume_common::Result<Self> {
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        Self::load_with_recognizer_weights_and_runtime(&mut runtime, det_path, model)
+    }
+
+    /// Build every required ONNX session with one candidate runtime.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn load_with_recognizer_weights_and_runtime(
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        det_path: &str,
+        model: &irlume_common::HashedModel,
+    ) -> irlume_common::Result<Self> {
         // Full digest: the tag resists an adversarial model, and truncation
         // halves its strength per dropped character.
         let embed_space = format!("embed:{}", model.sha256());
+        let det_bytes = read_model(det_path)?;
         Ok(Self {
-            det: Detector::load_from_file(det_path)?,
-            emb: Embedder::load_from_memory(model.bytes())?,
+            det: Detector::load_from_memory_with_runtime(runtime, &det_bytes)?,
+            emb: Embedder::load_from_memory_with_runtime(runtime, model.bytes())?,
             ir_adapter: None,
             ir_space: "raw".into(),
             embed_space,
@@ -3272,16 +3563,28 @@ impl Engine {
     /// Load the IR domain-adaptation adapter (improves dark recognition). If the
     /// file is absent this is a no-op (raw IR embeddings are used).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_ir_adapter(mut self, path: &str) -> irlume_common::Result<Self> {
+    pub fn with_ir_adapter(self, path: &str) -> irlume_common::Result<Self> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(self);
+        }
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        self.with_ir_adapter_with_runtime(&mut runtime, path)
+    }
+
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_ir_adapter_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
             // One read feeds both the digest and the session, so the tag always
             // describes the weights that are running (same reasoning as the
             // recognizer in `load`). The 12-hex prefix is the format existing
             // enrollments carry in `ir_space`; changing it would orphan them.
-            let bytes = std::fs::read(path)
-                .map_err(|e| irlume_common::Error::Io(format!("{path}: {e}")))?;
+            let bytes = read_model(path)?;
             let digest = irlume_common::sha256_hex(&bytes);
-            self.ir_adapter = Some(Adapter::load_from_memory(&bytes)?);
+            self.ir_adapter = Some(Adapter::load_from_memory_with_runtime(runtime, &bytes)?);
             self.ir_space = format!("adapter:{}", &digest[..12]);
         }
         Ok(self)
@@ -3323,7 +3626,15 @@ impl Engine {
     /// the stored IR embeddings are adapter-space, and the calibration stays
     /// `None` (matching then behaves exactly as before the feature).
     fn refit_profile_calib(&self, prof: &mut irlume_core::storage::FaceProfile) {
-        if self.ir_adapter.is_some() {
+        self.refit_profile_calib_for_adapter_state(self.ir_adapter.is_some(), prof);
+    }
+
+    fn refit_profile_calib_for_adapter_state(
+        &self,
+        adapter_loaded: bool,
+        prof: &mut irlume_core::storage::FaceProfile,
+    ) {
+        if adapter_loaded {
             return;
         }
         let dim = self.ir_dim();
@@ -3379,9 +3690,36 @@ impl Engine {
     /// not use this model. If the file is absent this is a no-op; the
     /// mesh-dependent rescue path is skipped, so face auth keeps working.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_mesh(mut self, path: &str) -> irlume_common::Result<Self> {
+    pub fn with_mesh(self, path: &str) -> irlume_common::Result<Self> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(self);
+        }
+        let bytes = read_model(path)?;
+        if bytes.len() >= 8 && &bytes[4..8] == b"TFL3" {
+            let mut engine = self;
+            engine.mesh = Some(irlume_vision::FaceMesh::load_from_memory(&bytes)?);
+            return Ok(engine);
+        }
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        let mut engine = self;
+        engine.mesh = Some(irlume_vision::FaceMesh::load_from_memory_with_runtime(
+            &mut runtime,
+            &bytes,
+        )?);
+        Ok(engine)
+    }
+
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_mesh_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
-            self.mesh = Some(irlume_vision::FaceMesh::load_from_file(path)?);
+            self.mesh = Some(irlume_vision::FaceMesh::load_from_memory_with_runtime(
+                runtime,
+                &read_model(path)?,
+            )?);
         }
         Ok(self)
     }
@@ -3392,9 +3730,27 @@ impl Engine {
     /// mode: head consent needs no mesh, and killing the daemon over an optional
     /// rescue model would turn "rescue off" into "face auth dead").
     #[must_use]
-    pub fn with_mesh_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
+    pub fn with_mesh_degraded(self, path: &str) -> (Self, Option<irlume_common::Error>) {
+        if !std::path::Path::new(path).exists() {
+            return (self, None);
+        }
+        match irlume_vision::inference::CandidateRuntime::ort_cpu() {
+            Ok(mut runtime) => self.with_mesh_degraded_with_runtime(&mut runtime, path),
+            Err(error) => (self, Some(error)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_mesh_degraded_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> (Self, Option<irlume_common::Error>) {
         if std::path::Path::new(path).exists() {
-            match irlume_vision::FaceMesh::load_from_file(path) {
+            let loaded = read_model(path).and_then(|bytes| {
+                irlume_vision::FaceMesh::load_from_memory_with_runtime(runtime, &bytes)
+            });
+            match loaded {
                 Ok(m) => self.mesh = Some(m),
                 Err(e) => return (self, Some(e)),
             }
@@ -3405,12 +3761,48 @@ impl Engine {
     /// Load the BlazeFace short-range rescue detector (improves detection on
     /// saturated outdoor frames). No-op if the file is absent.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_blaze_rescue(mut self, path: &str) -> irlume_common::Result<Self> {
+    pub fn with_blaze_rescue(self, path: &str) -> irlume_common::Result<Self> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(self);
+        }
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        self.with_blaze_rescue_with_runtime(&mut runtime, path)
+    }
+
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_blaze_rescue_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> irlume_common::Result<Self> {
         // Shipped short-range rescue (ONNX).
         if std::path::Path::new(path).exists() {
-            self.blaze = Some(Rescue(irlume_vision::BlazeRescue::load_from_file(path)?));
+            self.blaze = Some(Rescue(
+                irlume_vision::BlazeRescue::load_from_memory_with_runtime(
+                    runtime,
+                    &read_model(path)?,
+                )?,
+            ));
         }
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_blaze_rescue_degraded_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> (Self, Option<irlume_common::Error>) {
+        if std::path::Path::new(path).exists() {
+            let loaded = read_model(path).and_then(|bytes| {
+                irlume_vision::BlazeRescue::load_from_memory_with_runtime(runtime, &bytes)
+            });
+            match loaded {
+                Ok(blaze) => self.blaze = Some(Rescue(blaze)),
+                Err(error) => return (self, Some(error)),
+            }
+        }
+        (self, None)
     }
 
     pub fn has_blaze_rescue(&self) -> bool {
@@ -3422,17 +3814,51 @@ impl Engine {
     /// unavailable evidence a password-fallback denial without turning model
     /// absence into a daemon startup failure.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_vit_pad(mut self, path: &str) -> irlume_common::Result<Self> {
+    pub fn with_vit_pad(self, path: &str) -> irlume_common::Result<Self> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(self);
+        }
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        self.with_vit_pad_with_runtime(&mut runtime, path)
+    }
+
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_vit_pad_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
-            self.vit_pad = Some(irlume_vision::PadVit::load_from_file(path)?);
+            self.vit_pad = Some(irlume_vision::PadVit::load_from_memory_with_runtime(
+                runtime,
+                &read_model(path)?,
+            )?);
         }
         Ok(self)
     }
 
     #[must_use]
-    pub fn with_vit_pad_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
+    pub fn with_vit_pad_degraded(self, path: &str) -> (Self, Option<irlume_common::Error>) {
+        if !std::path::Path::new(path).exists() {
+            return (self, None);
+        }
+        match irlume_vision::inference::CandidateRuntime::ort_cpu() {
+            Ok(mut runtime) => self.with_vit_pad_degraded_with_runtime(&mut runtime, path),
+            Err(error) => (self, Some(error)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_vit_pad_degraded_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> (Self, Option<irlume_common::Error>) {
         if std::path::Path::new(path).exists() {
-            match irlume_vision::PadVit::load_from_file(path) {
+            let loaded = read_model(path).and_then(|bytes| {
+                irlume_vision::PadVit::load_from_memory_with_runtime(runtime, &bytes)
+            });
+            match loaded {
                 Ok(pad) => self.vit_pad = Some(pad),
                 Err(e) => return (self, Some(e)),
             }
@@ -3449,17 +3875,51 @@ impl Engine {
     /// files retain unavailable evidence and therefore force password fallback
     /// on IR-requiring face paths (ADR-0019).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-    pub fn with_pad_ir(mut self, path: &str) -> irlume_common::Result<Self> {
+    pub fn with_pad_ir(self, path: &str) -> irlume_common::Result<Self> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(self);
+        }
+        let mut runtime = irlume_vision::inference::CandidateRuntime::ort_cpu()?;
+        self.with_pad_ir_with_runtime(&mut runtime, path)
+    }
+
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn with_pad_ir_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> irlume_common::Result<Self> {
         if std::path::Path::new(path).exists() {
-            self.pad_ir = Some(irlume_vision::PadIr::load_from_file(path)?);
+            self.pad_ir = Some(irlume_vision::PadIr::load_from_memory_with_runtime(
+                runtime,
+                &read_model(path)?,
+            )?);
         }
         Ok(self)
     }
 
     #[must_use]
-    pub fn with_pad_ir_degraded(mut self, path: &str) -> (Self, Option<irlume_common::Error>) {
+    pub fn with_pad_ir_degraded(self, path: &str) -> (Self, Option<irlume_common::Error>) {
+        if !std::path::Path::new(path).exists() {
+            return (self, None);
+        }
+        match irlume_vision::inference::CandidateRuntime::ort_cpu() {
+            Ok(mut runtime) => self.with_pad_ir_degraded_with_runtime(&mut runtime, path),
+            Err(error) => (self, Some(error)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_pad_ir_degraded_with_runtime(
+        mut self,
+        runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+        path: &str,
+    ) -> (Self, Option<irlume_common::Error>) {
         if std::path::Path::new(path).exists() {
-            match irlume_vision::PadIr::load_from_file(path) {
+            let loaded = read_model(path).and_then(|bytes| {
+                irlume_vision::PadIr::load_from_memory_with_runtime(runtime, &bytes)
+            });
+            match loaded {
                 Ok(pad) => self.pad_ir = Some(pad),
                 Err(e) => return (self, Some(e)),
             }
@@ -4276,11 +4736,10 @@ impl Engine {
             attempt_plan = capture_mode
                 .runtime_contract
                 .as_ref()
-                .zip(capture_mode.qualification_authority.as_ref())
-                .and_then(|(runtime, qualification)| {
+                .and_then(|runtime| {
                     camera_contract_from_runtime(
                         runtime,
-                        qualification,
+                        capture_mode.qualification_authority.as_ref(),
                         irlume_camera::profile::CaptureSchedule::Sequential,
                     )
                 })
@@ -4431,9 +4890,12 @@ impl Engine {
         let observed_plan = capture_mode
             .runtime_contract
             .as_ref()
-            .zip(capture_mode.qualification_authority.as_ref())
-            .and_then(|(runtime, qualification)| {
-                camera_contract_from_runtime(runtime, qualification, observed_schedule)
+            .and_then(|runtime| {
+                camera_contract_from_runtime(
+                    runtime,
+                    capture_mode.qualification_authority.as_ref(),
+                    observed_schedule,
+                )
             })
             .zip(self.active_plan_versions())
             .and_then(|(camera, versions)| {
@@ -6031,11 +6493,15 @@ impl Engine {
                     );
                     if ir_score >= ir_thr {
                         release_held(held_rgb, held_ir);
+                        let rgb_context = ir_fallback_rgb_context(score, thr, a.sequential_pair);
                         return self.challenge_if_required(
-                    purpose,
-                    service,
-                    Outcome::grant(ir_score,
-                            format!("match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})")));
+                            purpose,
+                            service,
+                            Outcome::grant(
+                                ir_score,
+                                format!("match: {ir_who} (ir-fallback, {rgb_context})"),
+                            ),
+                        );
                     }
                     // (c) calibrated-centroid fallback (ADR-0004): the mean-
                     // template score carries no best-of-N FAR inflation, so it
@@ -6053,11 +6519,16 @@ impl Engine {
                         );
                         if *cs >= cthr {
                             release_held(held_rgb, held_ir);
+                            let rgb_context =
+                                ir_fallback_rgb_context(score, thr, a.sequential_pair);
                             return self.challenge_if_required(
-                    purpose,
-                    service,
-                    Outcome::grant(*cs,
-                                format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
+                                purpose,
+                                service,
+                                Outcome::grant(
+                                    *cs,
+                                    format!("match: {cwho} (calibrated centroid, {rgb_context})"),
+                                ),
+                            );
                         }
                     }
                 }
@@ -10689,23 +11160,21 @@ mod engine_tests {
             assert!(!e.has_pad_ir(), "the engine must come back without IR PAD");
             let _ = std::fs::remove_file(&bogus_pad);
             assert_eq!(e.ir_space(), "raw");
-            // A present adapter file flips the IR space to its digest name. Any
-            // valid ONNX serves; `apply` is never called (BlazeFace here).
+            // Adapter digest naming is covered by the contract-aware recording
+            // runtime test. A graph for another model must not masquerade as an
+            // adapter now that model ports are validated.
             let blaze = model_path("blaze_face_short_range.onnx");
-            let e = e.with_ir_adapter(&blaze).unwrap();
-            assert!(e.has_ir_adapter());
-            let adapter_space = e.ir_space().to_string();
-            let mut e = e
+            let adapter_space = format!(
+                "adapter:{}",
+                &irlume_common::sha256_hex(&std::fs::read(&blaze).unwrap())[..12]
+            );
+            let e = e
                 .with_mesh(&model_path("face_landmark.onnx"))
                 .unwrap()
                 .with_blaze_rescue(&blaze)
                 .unwrap()
-                .with_pad_ir(&blaze)
+                .with_pad_ir(&model_path("flir.onnx"))
                 .unwrap();
-            // Shared baseline is the raw (no-adapter) space; tests needing an
-            // adapter set one temporarily and restore.
-            e.ir_adapter = None;
-            e.ir_space = "raw".into();
             Mutex::new(Shared {
                 engine: e,
                 adapter_space,
@@ -10922,10 +11391,9 @@ mod engine_tests {
         assert!(foreign_rec.ir_calib.is_none());
         // With a global adapter loaded, refit is a no-op: an existing
         // calibration is left untouched and none is fitted.
-        let adapter = Adapter::load_from_file(&model_path("blaze_face_short_range.onnx")).unwrap();
-        s.engine.ir_adapter = Some(adapter);
         let before = prof.ir_calib.clone().unwrap();
-        s.engine.refit_profile_calib(&mut prof);
+        s.engine
+            .refit_profile_calib_for_adapter_state(true, &mut prof);
         assert_eq!(
             prof.ir_calib.as_ref().map(|c| c.fitted_pairs),
             Some(before.fitted_pairs),
@@ -10937,7 +11405,8 @@ mod engine_tests {
             ir_calibs: Default::default(),
             scans: (0..5).map(|i| scan512(i, true, Some("raw"))).collect(),
         };
-        s.engine.refit_profile_calib(&mut fresh);
+        s.engine
+            .refit_profile_calib_for_adapter_state(true, &mut fresh);
         assert!(fresh.ir_calib.is_none(), "adapter mode must not fit anew");
         s.engine.ir_adapter = None; // restore the shared baseline
     }
@@ -12396,6 +12865,29 @@ mod engine_tests {
 
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
+    fn loopback_legacy_unqualified_attempt_contract_is_available() {
+        let (rgb, ir) = loopback_pair();
+        let _g = env_guard();
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &[rgb.as_str(), ir.as_str()],
+            irlume_camera::lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire one RGB+IR operation");
+        let rgb_camera = operation.open_rgb(&rgb).expect("open the RGB node");
+        let ir_camera = operation.open_ir(&ir).expect("open the IR node");
+        let runtime = irlume_camera::runtime_pair_contract_from_cameras(&rgb_camera, &ir_camera)
+            .expect("bind the loopback runtime pair");
+
+        irlume_camera::attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+            runtime,
+            irlume_camera::profile::CaptureSchedule::Sequential,
+        )
+        .expect("the production loopback tuple must retain the legacy sequential path");
+    }
+
+    #[test]
+    #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_authenticate_denies_without_a_face() {
         let (rgb, ir) = loopback_pair();
         let _g = env_guard();
@@ -12648,6 +13140,18 @@ mod engine_tests {
             })
             .collect();
         assert!(!completed_consent_take_hit(false, true, &poses));
+    }
+
+    #[test]
+    fn ir_fallback_context_distinguishes_rgb_miss_from_sequential_deferral() {
+        assert_eq!(
+            ir_fallback_rgb_context(0.58, 0.61, false),
+            "dim light; rgb 0.58<0.61",
+        );
+        assert_eq!(
+            ir_fallback_rgb_context(0.76, 0.61, true),
+            "sequential pair required IR verification; rgb 0.76>=0.61",
+        );
     }
 
     #[test]

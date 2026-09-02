@@ -271,6 +271,8 @@ in
         # by hand with packaging/systemd/irlumed.service, which nothing in CI
         # enforces.
         ConfigurationDirectory = "irlume";
+        CacheDirectory = "irlume";
+        CacheDirectoryMode = "0700";
         PrivateTmp = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;

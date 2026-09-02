@@ -1480,6 +1480,7 @@ fn status_takes_the_camera_pair_from_the_daemon_not_a_local_probe() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -1868,6 +1869,7 @@ fn setup_walks_every_step_noninteractively() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),

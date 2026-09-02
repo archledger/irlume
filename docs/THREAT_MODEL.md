@@ -65,10 +65,19 @@ and removability pinning per host; the settings key `forbid_external_cameras=1`
 (env `IRLUME_FORBID_EXTERNAL_CAMERAS`) drives the same fixed-camera requirement
 from settings.conf, live-read per request. One deliberate exception exists for the CI
 test harness: `IRLUME_TEST_ALLOW_VIRTUAL_CAMERA` names exact device paths
-(v4l2loopback nodes) that may skip the physical-bus check, and every use is
+(v4l2loopback nodes) that may skip the physical-bus check and receive synthetic
+virtual topology for an unqualified sequential attempt contract; every use is
 logged. It weakens nothing in production: the daemon's environment comes from
 its root-owned systemd unit, so setting it requires the same root the pin does
-not defend against, and a unit test pins the escape to exact-path matches.
+not defend against, and tests pin the escape to exact-path matches.
+
+The fixed legacy unqualified sequential path also preserves the pre-profile
+behavior for cameras that cannot prove active-emitter state in frame metadata:
+unconfirmed illumination may reach the existing face, liveness, and PAD gates,
+but it does not become `ActiveIr` evidence or stored capture qualification.
+Stored-qualified attempts continue to require active-emitter provenance, and
+all generation, tuple, delivered-rate, continuity, and evidence-window checks
+remain mandatory on both paths.
 
 ## The Windows camera contract (#169)
 

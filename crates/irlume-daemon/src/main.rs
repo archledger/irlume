@@ -198,6 +198,7 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
 /// always has. Keeping the 260MB buffer alive for the daemon's whole life to
 /// save that one re-read would cost more resident memory than the entire rest
 /// of the process, so startup drops it as soon as the session owns its copy.
+#[cfg(test)]
 fn load_shipped_recognizer(
     det_path: &str,
     model_path: &str,
@@ -308,60 +309,6 @@ fn pad_model_load_allowed(path: &str, strict: bool) -> bool {
     }
 }
 
-fn load_pad_models(
-    engine: irlume_auth::Engine,
-    vit_path: &str,
-    ir_path: &str,
-) -> (
-    irlume_auth::Engine,
-    irlume_common::PadModelStatus,
-    irlume_common::PadModelStatus,
-) {
-    let strict = strict_requested(
-        std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
-        std::io::stderr(),
-    );
-    let vit_enabled = vit_pad_enabled();
-    let vit_present = std::path::Path::new(vit_path).exists();
-    let vit_allowed = vit_enabled && vit_present && pad_model_load_allowed(vit_path, strict);
-    let (engine, vit_error) = if vit_allowed {
-        engine.with_vit_pad_degraded(vit_path)
-    } else {
-        (engine, None)
-    };
-    if let Some(error) = &vit_error {
-        eprintln!("irlumed: RGB PAD did not load ({error}); face authentication is password-only");
-    }
-    let rgb_status = pad_model_status(
-        vit_enabled,
-        vit_present,
-        engine.has_vit_pad(),
-        vit_error.is_some() || (vit_enabled && vit_present && !vit_allowed),
-    );
-
-    let ir_enabled = pad_ir_enabled();
-    let ir_present = std::path::Path::new(ir_path).exists();
-    let ir_allowed = ir_enabled && ir_present && pad_model_load_allowed(ir_path, strict);
-    let (engine, ir_error) = if ir_allowed {
-        engine.with_pad_ir_degraded(ir_path)
-    } else {
-        (engine, None)
-    };
-    if let Some(error) = &ir_error {
-        eprintln!(
-            "irlumed: IR PAD did not load ({error}); secure and dark face authentication are password-only"
-        );
-    }
-    let ir_status = pad_model_status(
-        ir_enabled,
-        ir_present,
-        engine.has_pad_ir(),
-        ir_error.is_some() || (ir_enabled && ir_present && !ir_allowed),
-    );
-
-    (engine, rgb_status, ir_status)
-}
-
 struct EngineBuildConfig {
     det: String,
     model: String,
@@ -372,8 +319,394 @@ struct EngineBuildConfig {
     pad_ir: String,
     rgb_dev: String,
     ir_dev: String,
+    execution_device: irlume_common::config::EffectiveExecutionDevicePolicy,
+    accelerator_support: AcceleratorSupport,
+    openvino_cache_root: std::path::PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceleratorSupport {
+    Disabled,
+    #[cfg(any(test, feature = "experimental-openvino"))]
+    Experimental,
+}
+
+const CPU_CANDIDATE: &[irlume_common::CandidateDevice] = &[irlume_common::CandidateDevice::Cpu];
+#[cfg(any(test, feature = "experimental-openvino"))]
+const ACCELERATOR_CANDIDATES: &[irlume_common::CandidateDevice] = &[
+    irlume_common::CandidateDevice::Npu,
+    irlume_common::CandidateDevice::Gpu,
+    irlume_common::CandidateDevice::Cpu,
+];
+#[cfg(any(test, feature = "experimental-openvino"))]
+const NPU_CANDIDATE: &[irlume_common::CandidateDevice] = &[irlume_common::CandidateDevice::Npu];
+
+fn candidate_order(
+    policy: irlume_common::config::ExecutionDevicePolicy,
+    support: AcceleratorSupport,
+) -> irlume_common::Result<&'static [irlume_common::CandidateDevice]> {
+    use irlume_common::config::ExecutionDevicePolicy::{Auto, Cpu, Npu};
+
+    match (policy, support) {
+        (Cpu | Auto, AcceleratorSupport::Disabled) => Ok(CPU_CANDIDATE),
+        (Npu, AcceleratorSupport::Disabled) => Err(irlume_common::Error::Hardware(
+            "NPU requires an experimental accelerator-enabled build".into(),
+        )),
+        #[cfg(any(test, feature = "experimental-openvino"))]
+        (Auto, AcceleratorSupport::Experimental) => Ok(ACCELERATOR_CANDIDATES),
+        #[cfg(any(test, feature = "experimental-openvino"))]
+        (Cpu, AcceleratorSupport::Experimental) => Ok(CPU_CANDIDATE),
+        #[cfg(any(test, feature = "experimental-openvino"))]
+        (Npu, AcceleratorSupport::Experimental) => Ok(NPU_CANDIDATE),
+    }
+}
+
+struct ResolvedCandidate<T> {
+    value: T,
+    rejected: Vec<irlume_common::RejectedInferenceCandidate>,
+}
+
+const fn sanitized_candidate_rejection(error: &irlume_common::Error) -> &'static str {
+    match error {
+        irlume_common::Error::Io(_) => "candidate I/O failure",
+        irlume_common::Error::Protocol(_) => "candidate protocol failure",
+        irlume_common::Error::NotAuthorized(_) => "candidate access denied",
+        irlume_common::Error::Hardware(_) => "hardware candidate unavailable",
+        irlume_common::Error::Tpm(_) => "candidate dependency unavailable",
+        irlume_common::Error::Policy(_) => "candidate rejected by policy",
+        irlume_common::Error::DeliveredRate(_) => "candidate unavailable",
+        irlume_common::Error::Preempted(_) => "candidate build interrupted",
+    }
+}
+
+fn resolve_engine_candidates_with<T>(
+    policy: irlume_common::config::ExecutionDevicePolicy,
+    support: AcceleratorSupport,
+    mut build: impl FnMut(irlume_common::CandidateDevice) -> irlume_common::Result<T>,
+) -> irlume_common::Result<ResolvedCandidate<T>> {
+    let candidates = candidate_order(policy, support)?;
+    let mut rejected = Vec::new();
+    for (index, candidate) in candidates.iter().copied().enumerate() {
+        match build(candidate) {
+            Ok(value) => return Ok(ResolvedCandidate { value, rejected }),
+            Err(error) if index + 1 < candidates.len() => {
+                let device = match candidate {
+                    irlume_common::CandidateDevice::Cpu => {
+                        irlume_common::ResolvedExecutionDevice::Cpu
+                    }
+                    irlume_common::CandidateDevice::Gpu => {
+                        irlume_common::ResolvedExecutionDevice::Gpu
+                    }
+                    irlume_common::CandidateDevice::Npu => {
+                        irlume_common::ResolvedExecutionDevice::Npu
+                    }
+                };
+                rejected.push(irlume_common::RejectedInferenceCandidate::new(
+                    device,
+                    sanitized_candidate_rejection(&error),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("candidate_order always returns at least one candidate")
+}
+
+#[cfg(test)]
+fn replace_built_engine_on_success<T, E>(
+    current: &mut T,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<(), E> {
+    let fresh = build()?;
+    *current = fresh;
+    Ok(())
+}
+
+const fn accelerator_support() -> AcceleratorSupport {
+    #[cfg(feature = "experimental-openvino")]
+    {
+        AcceleratorSupport::Experimental
+    }
+    #[cfg(not(feature = "experimental-openvino"))]
+    {
+        AcceleratorSupport::Disabled
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupModelFailureAction {
+    KeepDaemonAvailable,
+    Exit,
+}
+
+const fn startup_model_failure_action(
+    policy: irlume_common::config::ExecutionDevicePolicy,
+) -> StartupModelFailureAction {
+    match policy {
+        irlume_common::config::ExecutionDevicePolicy::Npu => {
+            StartupModelFailureAction::KeepDaemonAvailable
+        }
+        irlume_common::config::ExecutionDevicePolicy::Auto
+        | irlume_common::config::ExecutionDevicePolicy::Cpu => StartupModelFailureAction::Exit,
+    }
+}
+
+struct BuiltEngine {
+    engine: irlume_auth::Engine,
+    rgb_pad_status: irlume_common::PadModelStatus,
+    ir_pad_status: irlume_common::PadModelStatus,
+    inference: irlume_common::InferenceResolutionReport,
+}
+
+fn resolve_engine_with(
+    policy: irlume_common::config::EffectiveExecutionDevicePolicy,
+    build: impl FnMut(irlume_common::CandidateDevice) -> irlume_common::Result<BuiltEngine>,
+) -> irlume_common::Result<BuiltEngine> {
+    let resolved = resolve_engine_candidates_with(policy.policy, accelerator_support(), build)?;
+    let mut built = resolved.value;
+    built.inference = built.inference.with_rejected_candidates(resolved.rejected);
+    Ok(built)
+}
+
+fn configured_mesh_is_tflite(path: &str) -> bool {
+    if std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "tflite")
+    {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 8];
+    std::io::Read::read_exact(&mut file, &mut header).is_ok() && &header[4..8] == b"TFL3"
+}
+
+const fn mesh_failure_rejects_candidate(
+    policy: irlume_common::config::ExecutionDevicePolicy,
+    candidate: irlume_common::CandidateDevice,
+    tflite: bool,
+) -> bool {
+    !tflite
+        && matches!(policy, irlume_common::config::ExecutionDevicePolicy::Auto)
+        && !matches!(candidate, irlume_common::CandidateDevice::Cpu)
+}
+
+fn prepare_openvino_cache_root(path: &std::path::Path) -> irlume_common::Result<()> {
+    if !path.is_absolute() {
+        return Err(irlume_common::Error::Hardware(
+            "OpenVINO cache root must be absolute".into(),
+        ));
+    }
+    std::fs::create_dir_all(path).map_err(|error| {
+        irlume_common::Error::Io(format!(
+            "cannot create OpenVINO cache root {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn build_resolved_engine(
+    config: &EngineBuildConfig,
+    recognizer: Option<&irlume_common::HashedModel>,
+) -> irlume_common::Result<BuiltEngine> {
+    let mut built = resolve_engine_with(config.execution_device, |candidate| {
+        build_engine_for_candidate(config, recognizer, candidate)
+    })?;
+    if configured_mesh_is_tflite(&config.mesh) {
+        if strict_requested(
+            std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+            std::io::stderr(),
+        ) {
+            built.engine = built.engine.with_mesh(&config.mesh)?;
+        } else {
+            let (engine, error) = built.engine.with_mesh_degraded(&config.mesh);
+            built.engine = engine;
+            if let Some(error) = error {
+                eprintln!(
+                    "irlumed: TFLite FaceMesh did not load ({error}); continuing without mesh rescue"
+                );
+            }
+        }
+        built.inference = built
+            .inference
+            .with_tflite_facemesh_loaded(Some(built.engine.has_mesh()));
+    }
+    Ok(built)
+}
+
+fn build_engine_for_candidate(
+    config: &EngineBuildConfig,
+    recognizer: Option<&irlume_common::HashedModel>,
+    candidate: irlume_common::CandidateDevice,
+) -> irlume_common::Result<BuiltEngine> {
+    if candidate != irlume_common::CandidateDevice::Cpu
+        && config.accelerator_support == AcceleratorSupport::Disabled
+    {
+        return Err(irlume_common::Error::Hardware(
+            "experimental accelerator support is unavailable".into(),
+        ));
+    }
+    if candidate != irlume_common::CandidateDevice::Cpu {
+        prepare_openvino_cache_root(&config.openvino_cache_root)?;
+    }
+    let mut runtime = match candidate {
+        irlume_common::CandidateDevice::Cpu => {
+            irlume_vision::inference::CandidateRuntime::ort_cpu()?
+        }
+        #[cfg(feature = "experimental-openvino")]
+        candidate @ (irlume_common::CandidateDevice::Npu | irlume_common::CandidateDevice::Gpu) => {
+            irlume_vision::inference::CandidateRuntime::openvino(
+                candidate,
+                &config.openvino_cache_root,
+            )?
+        }
+        #[cfg(not(feature = "experimental-openvino"))]
+        irlume_common::CandidateDevice::Npu | irlume_common::CandidateDevice::Gpu => {
+            return Err(irlume_common::Error::Hardware(
+                "experimental accelerator support is unavailable".into(),
+            ));
+        }
+    };
+    let engine = match recognizer {
+        Some(weights) => irlume_auth::Engine::load_with_recognizer_weights_and_runtime(
+            &mut runtime,
+            &config.det,
+            weights,
+        )?,
+        None => irlume_auth::Engine::load_with_runtime(&mut runtime, &config.det, &config.model)?,
+    }
+    .with_devices(&config.rgb_dev, &config.ir_dev)
+    .with_ir_adapter_with_runtime(&mut runtime, &config.adapter)?;
+
+    let mesh_is_tflite = configured_mesh_is_tflite(&config.mesh);
+    let reject_optional_failure = config.execution_device.policy
+        == irlume_common::config::ExecutionDevicePolicy::Auto
+        && candidate != irlume_common::CandidateDevice::Cpu;
+    let explicit_npu =
+        config.execution_device.policy == irlume_common::config::ExecutionDevicePolicy::Npu;
+    let models_strict = strict_requested(
+        std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+        std::io::stderr(),
+    );
+    let engine = if mesh_is_tflite {
+        engine
+    } else if mesh_failure_rejects_candidate(config.execution_device.policy, candidate, false)
+        || (candidate == irlume_common::CandidateDevice::Cpu && models_strict)
+    {
+        engine.with_mesh_with_runtime(&mut runtime, &config.mesh)?
+    } else {
+        let (engine, error) = engine.with_mesh_degraded_with_runtime(&mut runtime, &config.mesh);
+        if let Some(error) = error {
+            eprintln!("irlumed: FaceMesh did not load ({error}); continuing without mesh rescue");
+        }
+        engine
+    };
+    let engine = if explicit_npu {
+        let (engine, error) =
+            engine.with_blaze_rescue_degraded_with_runtime(&mut runtime, &config.blaze);
+        if let Some(error) = error {
+            eprintln!(
+                "irlumed: BlazeFace rescue did not load ({error}); continuing without rescue"
+            );
+        }
+        engine
+    } else {
+        engine.with_blaze_rescue_with_runtime(&mut runtime, &config.blaze)?
+    };
+    let (engine, rgb_pad_status, ir_pad_status) = load_pad_models_with_runtime(
+        engine,
+        &mut runtime,
+        &config.vit_pad,
+        &config.pad_ir,
+        reject_optional_failure,
+    )?;
+    let (resolved_device, backend) = match candidate {
+        irlume_common::CandidateDevice::Cpu => (
+            irlume_common::ResolvedExecutionDevice::Cpu,
+            irlume_common::InferenceBackend::OnnxRuntime,
+        ),
+        irlume_common::CandidateDevice::Gpu => (
+            irlume_common::ResolvedExecutionDevice::Gpu,
+            irlume_common::InferenceBackend::OpenVino,
+        ),
+        irlume_common::CandidateDevice::Npu => (
+            irlume_common::ResolvedExecutionDevice::Npu,
+            irlume_common::InferenceBackend::OpenVino,
+        ),
+    };
+    let runtime_diagnostics = runtime.diagnostics();
+    Ok(BuiltEngine {
+        engine,
+        rgb_pad_status,
+        ir_pad_status,
+        inference: irlume_common::InferenceResolutionReport::new(
+            config.execution_device.policy,
+            config.execution_device.source,
+            resolved_device,
+            backend,
+        )
+        .with_runtime_versions(
+            runtime_diagnostics.ort_version,
+            runtime_diagnostics.openvino_version,
+        )
+        .with_available_openvino_devices(runtime_diagnostics.available_openvino_devices)
+        .with_cache(runtime_diagnostics.cache),
+    })
+}
+
+fn load_pad_models_with_runtime(
+    engine: irlume_auth::Engine,
+    runtime: &mut dyn irlume_vision::inference::ModelCompiler,
+    vit_path: &str,
+    ir_path: &str,
+    reject_load_failure: bool,
+) -> irlume_common::Result<(
+    irlume_auth::Engine,
+    irlume_common::PadModelStatus,
+    irlume_common::PadModelStatus,
+)> {
+    let strict = strict_requested(
+        std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
+        std::io::stderr(),
+    );
+    let vit_enabled = vit_pad_enabled();
+    let vit_present = std::path::Path::new(vit_path).exists();
+    let vit_allowed = vit_enabled && vit_present && pad_model_load_allowed(vit_path, strict);
+    let (engine, vit_error) = if vit_allowed && reject_load_failure {
+        (engine.with_vit_pad_with_runtime(runtime, vit_path)?, None)
+    } else if vit_allowed {
+        engine.with_vit_pad_degraded_with_runtime(runtime, vit_path)
+    } else {
+        (engine, None)
+    };
+    let rgb_status = pad_model_status(
+        vit_enabled,
+        vit_present,
+        engine.has_vit_pad(),
+        vit_error.is_some() || (vit_enabled && vit_present && !vit_allowed),
+    );
+
+    let ir_enabled = pad_ir_enabled();
+    let ir_present = std::path::Path::new(ir_path).exists();
+    let ir_allowed = ir_enabled && ir_present && pad_model_load_allowed(ir_path, strict);
+    let (engine, ir_error) = if ir_allowed && reject_load_failure {
+        (engine.with_pad_ir_with_runtime(runtime, ir_path)?, None)
+    } else if ir_allowed {
+        engine.with_pad_ir_degraded_with_runtime(runtime, ir_path)
+    } else {
+        (engine, None)
+    };
+    let ir_status = pad_model_status(
+        ir_enabled,
+        ir_present,
+        engine.has_pad_ir(),
+        ir_error.is_some() || (ir_enabled && ir_present && !ir_allowed),
+    );
+    Ok((engine, rgb_status, ir_status))
+}
+
+#[cfg(test)]
 fn build_engine_from_config(
     config: &EngineBuildConfig,
     recognizer: Option<&irlume_common::HashedModel>,
@@ -382,34 +715,8 @@ fn build_engine_from_config(
     irlume_common::PadModelStatus,
     irlume_common::PadModelStatus,
 )> {
-    load_shipped_recognizer(&config.det, &config.model, recognizer)
-        .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
-        .and_then(|engine| engine.with_ir_adapter(&config.adapter))
-        // FaceMesh load failure disables rescue alignment but not head
-        // consent, which uses detector landmarks. Outside strict mode the
-        // daemon therefore stays available; strict mode retains the explicit
-        // operator-requested refusal.
-        .and_then(|engine| {
-            if strict_requested(
-                std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
-                std::io::stderr(),
-            ) {
-                return engine.with_mesh(&config.mesh);
-            }
-            let (engine, error) = engine.with_mesh_degraded(&config.mesh);
-            if let Some(error) = error {
-                eprintln!(
-                    "irlumed: FaceMesh did not load ({error}); continuing WITHOUT \
-                     the mesh: BlazeFace detection-rescue alignment is unavailable; \
-                     head nod approval and head-shake decline still work. Fix the \
-                     TFLite runtime (doctor: tflite-runtime) or \
-                     set IRLUME_MESH_MODEL to the ONNX mesh."
-                );
-            }
-            Ok(engine)
-        })
-        .and_then(|engine| engine.with_blaze_rescue(&config.blaze))
-        .map(|engine| load_pad_models(engine, &config.vit_pad, &config.pad_ir))
+    build_engine_for_candidate(config, recognizer, irlume_common::CandidateDevice::Cpu)
+        .map(|built| (built.engine, built.rgb_pad_status, built.ir_pad_status))
 }
 
 fn main() {
@@ -435,6 +742,13 @@ fn main() {
     // Shipped PAD cues (ADR-0013): default-on, kill-switchable.
     let vit_pad_path = env_or("IRLUME_VIT_PAD_MODEL", "/etc/irlume/liveness_vit.onnx");
     let pad_ir_path = env_or("IRLUME_PAD_IR_MODEL", "/etc/irlume/flir.onnx");
+    let execution_device = match irlume_common::config::execution_device_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("irlumed: invalid execution-device policy: {error}");
+            std::process::exit(1);
+        }
+    };
     let socket = std::env::var("IRLUME_SOCKET").unwrap_or_else(|_| SOCKET_PATH.into());
 
     // PREFER THE SOCKET SYSTEMD ALREADY BOUND, else bind our own.
@@ -499,6 +813,7 @@ fn main() {
     {
         let arbiter = std::sync::Arc::clone(&arbiter);
         let engine_ready = std::sync::Arc::clone(&engine_ready);
+        let startup_diagnostic_state = std::sync::Arc::clone(&diagnostic_state);
         std::thread::Builder::new()
             .name("irlume-startup".into())
             .spawn(move || {
@@ -639,14 +954,18 @@ fn main() {
                 pad_ir: pad_ir_path,
                 rgb_dev,
                 ir_dev,
+                execution_device,
+                accelerator_support: accelerator_support(),
+                openvino_cache_root: std::path::PathBuf::from("/var/cache/irlume/openvino"),
             };
             let build_engine = move |recognizer: Option<&irlume_common::HashedModel>| {
-                build_engine_from_config(&engine_config, recognizer)
+                build_resolved_engine(&engine_config, recognizer)
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
-            let engine = match build_engine(verified_recognizer.as_ref()) {
-                Ok((e, rgb_pad_status, ir_pad_status)) => {
+            let built = match build_engine(verified_recognizer.as_ref()) {
+                Ok(built) => {
+                    let e = &built.engine;
                     eprintln!(
                         "irlumed: IR adapter {}",
                         if e.has_ir_adapter() {
@@ -681,9 +1000,23 @@ fn main() {
                          in IR; print species; password-only switch: IRLUME_PAD_IR=0",
                         if e.has_pad_ir() { "loaded" } else { "UNAVAILABLE (secure and dark face authentication are password-only)" }
                     );
-                    (e, rgb_pad_status, ir_pad_status)
+                    eprintln!(
+                        "irlumed: inference policy={} resolved={:?} backend={:?}",
+                        built.inference.requested_policy,
+                        built.inference.resolved_device,
+                        built.inference.backend
+                    );
+                    built
                 }
                 Err(e) => {
+                    if startup_model_failure_action(execution_device.policy)
+                        == StartupModelFailureAction::KeepDaemonAvailable
+                    {
+                        eprintln!(
+                            "irlumed: explicit NPU engine unavailable ({e}); face authentication is unavailable and PAM will use password fallback"
+                        );
+                        return;
+                    }
                     eprintln!("irlumed: failed to load models: {e}");
                     std::process::exit(1);
                 }
@@ -692,8 +1025,19 @@ fn main() {
             // this buffer is 260MB of dead memory from here on: release it
             // before the enrollment sweep rather than at the end of startup.
             drop(verified_recognizer);
-            let (engine, rgb_pad_status, ir_pad_status) = engine;
-            publish_engine_bits(&engine, rgb_pad_status, ir_pad_status);
+            let BuiltEngine {
+                engine,
+                rgb_pad_status,
+                ir_pad_status,
+                inference: inference_report,
+            } = built;
+            publish_engine_bits(
+                &engine,
+                rgb_pad_status,
+                ir_pad_status,
+                &inference_report,
+                &startup_diagnostic_state,
+            );
 
             // One-time inoculation: stamp legacy (untagged) IR scans with the current
             // embedding space while it is still the space they were captured under.
@@ -844,6 +1188,7 @@ fn main() {
             // read yet cannot be prioritised.
             let _worker = {
                 let arbiter = std::sync::Arc::clone(&arbiter);
+                let worker_diagnostic_state = std::sync::Arc::clone(&startup_diagnostic_state);
                 std::thread::Builder::new()
                     .name("irlume-camera".into())
                     .spawn(move || {
@@ -854,6 +1199,12 @@ fn main() {
                         // Attaching it is part of becoming the worker's engine, not a
                         // startup step: see WorkerEngine (#359).
                         let mut engine = WorkerEngine::attach(engine, &arbiter);
+                        let mut inference_report = inference_report;
+                        irlume_common::dlog!(
+                            "worker inference resolution: {:?} via {:?}",
+                            inference_report.resolved_device,
+                            inference_report.backend
+                        );
                         while let Some(job) = arbiter.take() {
                             note_worker_progress();
                             let Queued {
@@ -926,17 +1277,26 @@ fn main() {
                                     // systemd kill the daemon MID-REBUILD.
                                     note_worker_progress();
                                     match build_engine(None) {
-                                        Ok((fresh, rgb_pad_status, ir_pad_status)) => {
+                                        Ok(fresh) => {
                                             // Back through `attach`, because a bare
                                             // Engine has no stop signal and assigning
                                             // one here is exactly what #359 was.
-                                            engine = WorkerEngine::attach(fresh, &arbiter);
+                                            let fresh_engine =
+                                                WorkerEngine::attach(fresh.engine, &arbiter);
+                                            engine = fresh_engine;
+                                            inference_report = fresh.inference;
                                             publish_engine_bits(
                                                 &engine,
-                                                rgb_pad_status,
-                                                ir_pad_status,
+                                                fresh.rgb_pad_status,
+                                                fresh.ir_pad_status,
+                                                &inference_report,
+                                                &worker_diagnostic_state,
                                             );
-                                            eprintln!("irlumed: engine rebuilt after panic");
+                                            eprintln!(
+                                                "irlumed: engine rebuilt after panic on {:?} via {:?}",
+                                                inference_report.resolved_device,
+                                                inference_report.backend
+                                            );
                                         }
                                         Err(e) => eprintln!(
                                             "irlumed: engine rebuild after panic FAILED ({e}); continuing \
@@ -3106,6 +3466,7 @@ struct EngineBits {
     tier: String,
     rgb_dev: Option<String>,
     ir_dev: Option<String>,
+    inference: Option<irlume_common::InferenceResolutionReport>,
 }
 
 fn engine_bits() -> &'static std::sync::Mutex<EngineBits> {
@@ -3121,6 +3482,8 @@ fn publish_engine_bits(
     engine: &irlume_auth::Engine,
     rgb_pad: irlume_common::PadModelStatus,
     ir_pad: irlume_common::PadModelStatus,
+    inference: &irlume_common::InferenceResolutionReport,
+    diagnostic_state: &diagnostics::DiagnosticState,
 ) {
     // One probe, at load, on the thread that owns the engine. Every later
     // Health answer reads this copy.
@@ -3139,6 +3502,7 @@ fn publish_engine_bits(
     } else {
         "none"
     };
+    let inference = irlume_common::diagnostics::bounded_inference_report(inference.clone());
     publish_engine_bits_raw(EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
@@ -3147,7 +3511,9 @@ fn publish_engine_bits(
         tier: tier.into(),
         rgb_dev,
         ir_dev,
+        inference: Some(inference.clone()),
     });
+    diagnostic_state.publish_inference_report(inference);
 }
 
 /// One user's enrollment as the status path may report it, published by the
@@ -3445,21 +3811,23 @@ fn dispatch_status_with_diagnostics(
     if let Some(resp) = pregate(req, peer) {
         return Some(resp);
     }
+    let bits = engine_bits()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let Request::SupportSnapshot { since_ms } = req {
         return Some(match diagnostic_state {
-            Some(state) => Response::SupportSnapshot(Box::new(
-                state.snapshot(std::time::Duration::from_millis(*since_ms)),
-            )),
+            Some(state) => {
+                let mut snapshot = state.snapshot(std::time::Duration::from_millis(*since_ms));
+                snapshot.inference = bits.inference;
+                Response::SupportSnapshot(Box::new(snapshot))
+            }
             None => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
                 retryable: false,
             },
         });
     }
-    let bits = engine_bits()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
     Some(match req {
         Request::Ping => Response::Pong,
         Request::Health => {
@@ -3479,6 +3847,7 @@ fn dispatch_status_with_diagnostics(
                 ir_pad: bits.ir_pad,
                 version: env!("CARGO_PKG_VERSION").into(),
                 apparmor: apparmor_confinement(),
+                inference: bits.inference,
             }
         }
         // The peer's right to ask about this account was settled by the
@@ -5475,6 +5844,233 @@ fn journal_safe(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn resolve_engine_candidate_order_is_policy_and_build_capability_owned() {
+        use irlume_common::config::ExecutionDevicePolicy::{Auto, Cpu, Npu};
+        use irlume_common::CandidateDevice::{Cpu as CpuDevice, Gpu, Npu as NpuDevice};
+
+        assert_eq!(
+            candidate_order(Auto, AcceleratorSupport::Experimental).unwrap(),
+            &[NpuDevice, Gpu, CpuDevice]
+        );
+        assert_eq!(
+            candidate_order(Cpu, AcceleratorSupport::Disabled).unwrap(),
+            &[CpuDevice]
+        );
+        assert_eq!(
+            candidate_order(Auto, AcceleratorSupport::Disabled).unwrap(),
+            &[CpuDevice]
+        );
+        assert_eq!(
+            candidate_order(Npu, AcceleratorSupport::Experimental).unwrap(),
+            &[NpuDevice]
+        );
+        assert!(candidate_order(Npu, AcceleratorSupport::Disabled).is_err());
+    }
+
+    #[test]
+    fn resolve_engine_drops_a_failed_candidate_before_trying_the_next() {
+        use irlume_common::config::ExecutionDevicePolicy::Auto;
+        use irlume_common::CandidateDevice::{Gpu, Npu};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Partial(Arc<AtomicUsize>);
+        impl Drop for Partial {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut calls = Vec::new();
+        let resolved =
+            resolve_engine_candidates_with(Auto, AcceleratorSupport::Experimental, |candidate| {
+                calls.push(candidate);
+                if candidate == Npu {
+                    let _partial = Partial(Arc::clone(&dropped));
+                    return Err(irlume_common::Error::Hardware(
+                        "raw /tmp/model tensor embedding credential score".into(),
+                    ));
+                }
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                Ok(candidate)
+            })
+            .unwrap();
+
+        assert_eq!(resolved.value, Gpu);
+        assert_eq!(calls, [Npu, Gpu]);
+        assert_eq!(resolved.rejected.len(), 1);
+        assert_eq!(
+            resolved.rejected[0].reason,
+            "hardware candidate unavailable"
+        );
+    }
+
+    #[test]
+    fn resolve_engine_experimental_auto_records_rejections_and_reaches_cpu() {
+        use irlume_common::config::ExecutionDevicePolicy::Auto;
+        use irlume_common::CandidateDevice::{Cpu, Gpu, Npu};
+
+        let mut calls = Vec::new();
+        let resolved =
+            resolve_engine_candidates_with(Auto, AcceleratorSupport::Experimental, |candidate| {
+                calls.push(candidate);
+                if candidate == Cpu {
+                    Ok(candidate)
+                } else {
+                    Err(irlume_common::Error::Hardware(
+                        "accelerator runtime absent".into(),
+                    ))
+                }
+            })
+            .unwrap();
+
+        assert_eq!(calls, [Npu, Gpu, Cpu]);
+        assert_eq!(resolved.value, Cpu);
+        assert_eq!(resolved.rejected.len(), 2);
+        assert!(resolved
+            .rejected
+            .iter()
+            .all(|rejection| rejection.reason == "hardware candidate unavailable"));
+    }
+
+    #[test]
+    fn resolve_engine_explicit_npu_never_invokes_another_candidate() {
+        use irlume_common::config::ExecutionDevicePolicy::Npu;
+        use irlume_common::CandidateDevice::Npu as NpuDevice;
+
+        let mut calls = Vec::new();
+        let result = resolve_engine_candidates_with(
+            Npu,
+            AcceleratorSupport::Experimental,
+            |candidate| -> irlume_common::Result<()> {
+                calls.push(candidate);
+                Err(irlume_common::Error::Hardware("NPU rejected".into()))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls, [NpuDevice]);
+    }
+
+    #[test]
+    fn resolve_engine_explicit_npu_failure_keeps_password_fallback_available() {
+        use irlume_common::config::ExecutionDevicePolicy::{Auto, Cpu, Npu};
+
+        assert_eq!(
+            startup_model_failure_action(Npu),
+            StartupModelFailureAction::KeepDaemonAvailable
+        );
+        assert_eq!(
+            startup_model_failure_action(Auto),
+            StartupModelFailureAction::Exit
+        );
+        assert_eq!(
+            startup_model_failure_action(Cpu),
+            StartupModelFailureAction::Exit
+        );
+    }
+
+    #[test]
+    fn resolve_engine_tflite_mesh_failure_never_rejects_an_onnx_candidate() {
+        use irlume_common::config::ExecutionDevicePolicy::Auto;
+        use irlume_common::CandidateDevice::{Cpu, Npu};
+
+        assert!(!mesh_failure_rejects_candidate(Auto, Npu, true));
+        assert!(mesh_failure_rejects_candidate(Auto, Npu, false));
+        assert!(!mesh_failure_rejects_candidate(Auto, Cpu, false));
+    }
+
+    #[test]
+    fn resolve_engine_prepares_the_versioned_openvino_cache_root() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-openvino-cache-{}-openvino-v1",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        prepare_openvino_cache_root(&root).unwrap();
+
+        assert!(root.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_engine_base_auto_builds_one_complete_cpu_engine_from_captured_policy() {
+        let _guard = env_lock();
+        ort_init();
+        let dir =
+            std::env::temp_dir().join(format!("irlume-resolve-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let absent = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let policy = irlume_common::config::EffectiveExecutionDevicePolicy {
+            policy: irlume_common::config::ExecutionDevicePolicy::Auto,
+            source: irlume_common::config::ExecutionDevicePolicySource::Default,
+        };
+        let config = EngineBuildConfig {
+            det: model_path("face_detection_yunet_2023mar.onnx"),
+            model: model_path("glintr100.onnx"),
+            adapter: absent("adapter.onnx"),
+            mesh: absent("mesh.onnx"),
+            blaze: absent("blaze.onnx"),
+            vit_pad: absent("vit.onnx"),
+            pad_ir: absent("flir.onnx"),
+            rgb_dev: "/dev/irlume-test-none-rgb".into(),
+            ir_dev: "/dev/irlume-test-none-ir".into(),
+            execution_device: policy,
+            accelerator_support: AcceleratorSupport::Disabled,
+            openvino_cache_root: dir.join("openvino-v1"),
+        };
+        std::env::set_var("IRLUME_EXECUTION_DEVICE", "npu");
+
+        let built = build_resolved_engine(&config, None).unwrap();
+
+        assert_eq!(
+            built.inference.resolved_device,
+            irlume_common::ResolvedExecutionDevice::Cpu
+        );
+        assert_eq!(
+            built.inference.backend,
+            irlume_common::InferenceBackend::OnnxRuntime
+        );
+        assert_eq!(built.rgb_pad_status, irlume_common::PadModelStatus::Missing);
+        assert_eq!(built.ir_pad_status, irlume_common::PadModelStatus::Missing);
+        assert!(!built.engine.has_blaze_rescue());
+
+        std::env::remove_var("IRLUME_EXECUTION_DEVICE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panic_rebuild_failure_retains_the_old_engine_and_report_together() {
+        #[derive(Debug, Eq, PartialEq)]
+        struct Published {
+            engine: &'static str,
+            report: &'static str,
+        }
+
+        let mut published = Published {
+            engine: "old engine",
+            report: "old report",
+        };
+        let result = replace_built_engine_on_success(&mut published, || {
+            Err::<Published, _>(irlume_common::Error::Hardware("rebuild failed".into()))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            published,
+            Published {
+                engine: "old engine",
+                report: "old report"
+            }
+        );
+    }
+
     /// The #340 trigger rule: enrollment probes exactly the unmeasured pair.
     /// A stored verdict of either value suppresses the probe entirely, which
     /// is also the fail-closed half: enrolling again can never re-measure or
@@ -5910,6 +6506,12 @@ mod tests {
             pad_ir: dir.join("absent-flir.onnx").to_string_lossy().into_owned(),
             rgb_dev: "/dev/irlume-test-none-rgb".into(),
             ir_dev: "/dev/irlume-test-none-ir".into(),
+            execution_device: irlume_common::config::EffectiveExecutionDevicePolicy {
+                policy: irlume_common::config::ExecutionDevicePolicy::Cpu,
+                source: irlume_common::config::ExecutionDevicePolicySource::Default,
+            },
+            accelerator_support: AcceleratorSupport::Disabled,
+            openvino_cache_root: dir.join("openvino-v1"),
         };
 
         let (_, rgb_pad, ir_pad) = build_engine_from_config(&config, None)
@@ -5923,15 +6525,18 @@ mod tests {
     }
 
     #[test]
-    fn panic_rebuild_republishes_both_pad_statuses() {
+    fn panic_rebuild_publishes_one_complete_build_without_rereading_policy() {
         let source = include_str!("main.rs");
         let rebuild = &source[source.find("match build_engine(None)").unwrap()
             ..source.find("Response::Error(\"request failed\"").unwrap()];
 
-        assert!(rebuild.contains("Ok((fresh, rgb_pad_status, ir_pad_status))"));
-        assert!(rebuild.contains("rgb_pad_status,"));
-        assert!(rebuild.contains("ir_pad_status,"));
+        assert!(rebuild.contains("Ok(fresh)"));
+        assert!(rebuild.contains("fresh.engine"));
+        assert!(rebuild.contains("fresh.inference"));
+        assert!(rebuild.contains("fresh.rgb_pad_status"));
+        assert!(rebuild.contains("fresh.ir_pad_status"));
         assert!(rebuild.contains("publish_engine_bits"));
+        assert!(!rebuild.contains("execution_device_policy"));
     }
 
     // Startup asks for one model and gets back exactly that file's bytes with
@@ -8013,6 +8618,12 @@ mod tests {
 
     #[test]
     fn health_reports_the_published_engine_bits() {
+        let inference = irlume_common::InferenceResolutionReport::new(
+            irlume_common::ExecutionDevicePolicy::Auto,
+            irlume_common::ExecutionDevicePolicySource::Default,
+            irlume_common::ResolvedExecutionDevice::Cpu,
+            irlume_common::InferenceBackend::OnnxRuntime,
+        );
         publish_engine_bits_raw(EngineBits {
             mesh: true,
             adapter: true,
@@ -8021,6 +8632,7 @@ mod tests {
             tier: "none".into(),
             rgb_dev: None,
             ir_dev: None,
+            inference: Some(inference.clone()),
         });
         let peer = Peer {
             uid: 0,
@@ -8034,13 +8646,43 @@ mod tests {
                 adapter,
                 rgb_pad,
                 ir_pad,
+                inference: published_inference,
                 ..
             } => {
                 assert!(mesh && adapter);
                 assert_eq!(rgb_pad, Some(irlume_common::PadModelStatus::Loaded));
                 assert_eq!(ir_pad, Some(irlume_common::PadModelStatus::Disabled));
+                assert_eq!(published_inference, Some(inference));
             }
             other => panic!("expected Health, got {other:?}"),
+        }
+        publish_engine_bits_raw(EngineBits::default());
+    }
+
+    #[test]
+    fn support_snapshot_uses_the_same_atomic_inference_publication_as_health() {
+        let inference = irlume_common::InferenceResolutionReport::new(
+            irlume_common::ExecutionDevicePolicy::Auto,
+            irlume_common::ExecutionDevicePolicySource::Default,
+            irlume_common::ResolvedExecutionDevice::Cpu,
+            irlume_common::InferenceBackend::OnnxRuntime,
+        );
+        publish_engine_bits_raw(EngineBits {
+            inference: Some(inference.clone()),
+            ..EngineBits::default()
+        });
+        let state = diagnostics::DiagnosticState::default();
+        let response = dispatch_status_with_diagnostics(
+            &Request::SupportSnapshot { since_ms: 60_000 },
+            &peer(0),
+            Some(&state),
+        )
+        .unwrap();
+        match response {
+            Response::SupportSnapshot(snapshot) => {
+                assert_eq!(snapshot.inference, Some(inference));
+            }
+            other => panic!("expected SupportSnapshot, got {other:?}"),
         }
         publish_engine_bits_raw(EngineBits::default());
     }

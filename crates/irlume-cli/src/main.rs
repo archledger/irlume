@@ -214,6 +214,7 @@ fn main() -> std::process::ExitCode {
         (Some("credential-release-challenge"), sub) => {
             commands::credential_release_challenge(sub, &args)
         }
+        (Some("inference-device"), sub) => commands::inference_device(sub, &args),
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("camera-tune"), _) => camera_tune(&args),
         (Some("camera-mode"), _) => camera_mode(&args),
@@ -3650,6 +3651,88 @@ fn selected_stream_minimum_checks(
     stream_minimum_checks(report, &rgb_node, &ir_node);
 }
 
+fn diagnostic_name<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn report_inference_resolution(
+    report: &mut crate::doctor_report::Report,
+    inference: Option<&irlume_common::InferenceResolutionReport>,
+) {
+    use crate::doctor_report::State;
+    let Some(inference) = inference else {
+        for id in [
+            "execution-device-policy",
+            "inference-resolution",
+            "openvino-runtime",
+            "inference-cache",
+        ] {
+            report.check_detail(
+                id,
+                State::Unknown,
+                "daemon did not report inference resolution",
+            );
+        }
+        dout!(
+            report,
+            "[doctor] inference resolution: unavailable from daemon"
+        );
+        return;
+    };
+
+    let policy = format!(
+        "{} ({})",
+        inference.requested_policy,
+        diagnostic_name(inference.policy_source)
+    );
+    report.check_detail("execution-device-policy", State::Info, &policy);
+    let device = format!(
+        "{} via {}",
+        diagnostic_name(inference.resolved_device),
+        diagnostic_name(inference.backend)
+    );
+    report.check_detail("inference-resolution", State::Pass, &device);
+    let rejected = if inference.rejected_candidates.is_empty() {
+        "none".into()
+    } else {
+        inference
+            .rejected_candidates
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{}: {}",
+                    diagnostic_name(candidate.device),
+                    candidate.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let openvino = format!(
+        "version {}; devices {}; rejected {}",
+        inference.openvino_version.as_deref().unwrap_or("not used"),
+        if inference.available_openvino_devices.is_empty() {
+            "none".into()
+        } else {
+            inference.available_openvino_devices.join(",")
+        },
+        rejected
+    );
+    report.check_detail("openvino-runtime", State::Info, &openvino);
+    let cache = inference.cache.as_ref().map_or_else(
+        || "not applicable".into(),
+        |cache| format!("{} at {}", diagnostic_name(cache.state), cache.root),
+    );
+    report.check_detail("inference-cache", State::Info, &cache);
+    dout!(report, "[doctor] inference policy: {policy}");
+    dout!(report, "[doctor] inference device: {device}");
+    dout!(report, "[doctor] inference candidates rejected: {rejected}");
+    dout!(report, "[doctor] inference cache: {cache}");
+}
+
 /// One pass over the machine. Prints the human report or stays silent and
 /// records, depending on `report`.
 /// `args` carries `--user`, which doctor reports on in eight per-user lines.
@@ -3881,6 +3964,11 @@ fn doctor_run(
     }
 
     // --- models / runtime --------------------------------------------------
+    let inference_health = match daemon_request(&irlume_common::Request::Health) {
+        Ok(irlume_common::Response::Health { inference, .. }) => inference,
+        _ => None,
+    };
+    report_inference_resolution(report, inference_health.as_ref());
     dout!(report, "[doctor] models:");
     if commands::daemon_models_loaded() == Some(true) {
         dout!(report, "  loaded by the daemon ✓");

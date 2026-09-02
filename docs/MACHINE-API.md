@@ -147,7 +147,19 @@ asked about.
   "keyring": { "known": true, "armed": true, "policy": "…" },
   "recovery": { "known": true, "passphrase_set": true, "key_present": true },
   "camera": { "rgb": true, "ir": true },
-  "fingerprint": false
+  "fingerprint": false,
+  "inference": {
+    "requested_policy": "auto",
+    "policy_source": "settings",
+    "resolved_device": "npu",
+    "backend": "open-vino",
+    "ort_version": null,
+    "openvino_version": "2026.0",
+    "available_openvino_devices": ["NPU", "GPU"],
+    "rejected_candidates": [],
+    "cache": { "root": "/var/cache/irlume/openvino/2026.0", "state": "warm", "runtime_version": "2026.0" },
+    "tflite_facemesh_loaded": true
+  }
 }
 ```
 
@@ -161,6 +173,13 @@ Anything derived from the daemon carries `known`. **Unknown is not zero**: when
 `known` is false the counts are absent entirely rather than reported as `0`, so a
 consumer cannot mistake "we could not find out" for "this account has nothing
 enrolled".
+
+`inference` is the daemon-proven resolution for the complete configured ONNX
+engine. It distinguishes the requested policy and its source from the physical
+device and backend that actually loaded. Rejected candidates carry bounded
+categorical reasons; FaceMesh is reported separately because it remains on
+TFLite and does not participate in ONNX device resolution. The field is absent,
+not `null`, when the daemon is unreachable or predates inference reporting.
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 
@@ -223,6 +242,10 @@ reused for a different meaning. The registry as of this contract:
 | `ir-stream-hello-minimum` | the negotiated IR stream compared with the published Windows Hello IR minimum (340x340@15fps). `info` when no IR node is selected or the dimensions meet it with no reported rate; `unknown` when the node cannot be negotiated right now |
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
+| `execution-device-policy` | the daemon's requested `auto`, `cpu`, or `npu` policy and the source that selected it |
+| `inference-resolution` | the one physical device and backend proven for the complete ONNX engine |
+| `openvino-runtime` | the direct OpenVINO version, available devices, and globally rejected candidates with bounded categorical reasons |
+| `inference-cache` | the direct OpenVINO cache state and versioned root, or that no cache applies |
 | `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
 | `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: BlazeFace detection-rescue alignment is unavailable. Head consent uses the primary detector's five landmarks and is unaffected |
 | `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |

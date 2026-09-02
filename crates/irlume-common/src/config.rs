@@ -844,6 +844,160 @@ mod consent_gesture_tests {
     }
 }
 
+/// Environment override for the ONNX execution-device policy.
+pub const EXECUTION_DEVICE_ENV: &str = "IRLUME_EXECUTION_DEVICE";
+
+/// Key holding the persisted ONNX execution-device policy in settings.conf.
+pub const EXECUTION_DEVICE_KEY: &str = "execution_device";
+
+/// Operator-requested ONNX execution-device policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionDevicePolicy {
+    /// Resolve one device for the complete ONNX model set.
+    Auto,
+    /// Use the ONNX Runtime CPU backend.
+    Cpu,
+    /// Require the direct OpenVINO NPU backend without fallback.
+    Npu,
+}
+
+impl ExecutionDevicePolicy {
+    /// Parse one exact public policy value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "cpu" => Some(Self::Cpu),
+            "npu" => Some(Self::Npu),
+            _ => None,
+        }
+    }
+
+    /// Stable spelling used by settings.conf and command-line surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Npu => "npu",
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionDevicePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where the effective execution-device policy came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionDevicePolicySource {
+    /// No override or persisted setting was present.
+    Default,
+    /// The policy came from settings.conf.
+    Settings,
+    /// The environment override won over settings.conf.
+    Environment,
+}
+
+/// Effective policy together with the source that selected it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveExecutionDevicePolicy {
+    pub policy: ExecutionDevicePolicy,
+    pub source: ExecutionDevicePolicySource,
+}
+
+/// A configured execution-device policy could not be resolved safely.
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutionDevicePolicyError {
+    #[error("{policy_source:?} execution-device policy must be exactly auto, cpu, or npu; got {value:?}")]
+    InvalidValue {
+        policy_source: ExecutionDevicePolicySource,
+        value: String,
+    },
+    #[error("environment execution-device policy is not valid Unicode")]
+    NonUnicodeEnvironment,
+    #[error("cannot read execution-device policy from settings.conf: {0}")]
+    UnreadableSettings(#[source] std::io::Error),
+}
+
+/// Resolve explicit inputs using environment-over-settings precedence.
+///
+/// # Errors
+///
+/// Returns an error when the highest-precedence value is non-Unicode or is not
+/// exactly `auto`, `cpu`, or `npu`.
+pub fn resolve_execution_device_policy(
+    environment: Option<&std::ffi::OsStr>,
+    settings: Option<&str>,
+) -> Result<EffectiveExecutionDevicePolicy, ExecutionDevicePolicyError> {
+    let (value, source) = if let Some(value) = environment {
+        (
+            value
+                .to_str()
+                .ok_or(ExecutionDevicePolicyError::NonUnicodeEnvironment)?,
+            ExecutionDevicePolicySource::Environment,
+        )
+    } else if let Some(value) = settings {
+        (value, ExecutionDevicePolicySource::Settings)
+    } else {
+        return Ok(EffectiveExecutionDevicePolicy {
+            policy: ExecutionDevicePolicy::Auto,
+            source: ExecutionDevicePolicySource::Default,
+        });
+    };
+
+    let policy = ExecutionDevicePolicy::parse(value).ok_or_else(|| {
+        ExecutionDevicePolicyError::InvalidValue {
+            policy_source: source,
+            value: value.to_owned(),
+        }
+    })?;
+    Ok(EffectiveExecutionDevicePolicy { policy, source })
+}
+
+/// Read and resolve the effective ONNX execution-device policy.
+///
+/// # Errors
+///
+/// Returns an error when the environment override or persisted setting is
+/// invalid, or when a present settings.conf cannot be read.
+pub fn execution_device_policy(
+) -> Result<EffectiveExecutionDevicePolicy, ExecutionDevicePolicyError> {
+    let environment = std::env::var_os(EXECUTION_DEVICE_ENV);
+    if environment.is_some() {
+        return resolve_execution_device_policy(environment.as_deref(), None);
+    }
+    match observe_execution_device_setting() {
+        KvObservation::Value(value) => resolve_execution_device_policy(None, Some(&value)),
+        KvObservation::Absent => resolve_execution_device_policy(None, None),
+        KvObservation::Unknown(error) => Err(ExecutionDevicePolicyError::UnreadableSettings(error)),
+    }
+}
+
+fn observe_execution_device_setting() -> KvObservation {
+    let text = match std::fs::read_to_string(config_path("settings.conf")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return KvObservation::Absent;
+        }
+        Err(error) => return KvObservation::Unknown(error),
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == EXECUTION_DEVICE_KEY {
+                return KvObservation::Value(value.trim().to_owned());
+            }
+        }
+    }
+    KvObservation::Absent
+}
+
 /// The spellings that turn a boolean settings.conf key off.
 pub fn falsy(v: &str) -> bool {
     matches!(
@@ -992,6 +1146,134 @@ pub fn privileged_face_consent_required() -> bool {
 mod tests {
     use super::*;
     use crate::testenv;
+
+    #[test]
+    fn execution_device_policy_precedence_is_strict() {
+        use ExecutionDevicePolicy::{Auto, Cpu, Npu};
+        use ExecutionDevicePolicySource::{Default, Environment, Settings};
+
+        assert_eq!(
+            resolve_execution_device_policy(None, None).unwrap(),
+            EffectiveExecutionDevicePolicy {
+                policy: Auto,
+                source: Default,
+            }
+        );
+        assert_eq!(
+            resolve_execution_device_policy(None, Some("cpu")).unwrap(),
+            EffectiveExecutionDevicePolicy {
+                policy: Cpu,
+                source: Settings,
+            }
+        );
+        assert_eq!(
+            resolve_execution_device_policy(Some(std::ffi::OsStr::new("npu")), Some("cpu"))
+                .unwrap(),
+            EffectiveExecutionDevicePolicy {
+                policy: Npu,
+                source: Environment,
+            }
+        );
+        assert!(
+            resolve_execution_device_policy(Some(std::ffi::OsStr::new("gpu")), Some("cpu"))
+                .is_err(),
+            "an invalid environment override must not fall through to settings"
+        );
+        for invalid in ["", "AUTO", " auto ", "gpu", "cuda"] {
+            assert!(
+                resolve_execution_device_policy(None, Some(invalid)).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_device_policy_rejects_non_unicode_environment() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert!(resolve_execution_device_policy(
+            Some(std::ffi::OsStr::from_bytes(&[0xff])),
+            Some("cpu")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn execution_device_policy_reads_environment_then_settings_then_default() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-cfg-execution-device-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var(EXECUTION_DEVICE_ENV);
+
+        assert_eq!(
+            execution_device_policy().unwrap(),
+            EffectiveExecutionDevicePolicy {
+                policy: ExecutionDevicePolicy::Auto,
+                source: ExecutionDevicePolicySource::Default,
+            }
+        );
+
+        std::fs::write(
+            config_path("settings.conf"),
+            "# retained\nother=value\nexecution_device=cpu\n",
+        )
+        .unwrap();
+        assert_eq!(
+            execution_device_policy().unwrap(),
+            EffectiveExecutionDevicePolicy {
+                policy: ExecutionDevicePolicy::Cpu,
+                source: ExecutionDevicePolicySource::Settings,
+            }
+        );
+
+        std::env::set_var(EXECUTION_DEVICE_ENV, "npu");
+        assert_eq!(
+            execution_device_policy().unwrap(),
+            EffectiveExecutionDevicePolicy {
+                policy: ExecutionDevicePolicy::Npu,
+                source: ExecutionDevicePolicySource::Environment,
+            }
+        );
+
+        write_kv("settings.conf", EXECUTION_DEVICE_KEY, "auto").unwrap();
+        let text = std::fs::read_to_string(config_path("settings.conf")).unwrap();
+        assert!(text.contains("# retained"));
+        assert!(text.contains("other=value"));
+        assert_eq!(text.matches("execution_device=").count(), 1);
+
+        std::env::remove_var(EXECUTION_DEVICE_ENV);
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execution_device_policy_rejects_empty_and_unreadable_settings() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-cfg-execution-device-errors-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var(EXECUTION_DEVICE_ENV);
+
+        std::fs::write(config_path("settings.conf"), "execution_device=\n").unwrap();
+        assert!(execution_device_policy().is_err());
+
+        std::fs::remove_file(config_path("settings.conf")).unwrap();
+        std::fs::create_dir(config_path("settings.conf")).unwrap();
+        assert!(execution_device_policy().is_err());
+
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The privileged-consent key reads env-over-settings like its neighbours,
     /// but Absent means ON: it exists to switch a protection off, so anything

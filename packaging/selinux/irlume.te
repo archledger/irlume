@@ -9,6 +9,12 @@ policy_module(irlume, 1.1.0)
 # (plasmalogin, gdm, sddm) runs CONFINED as `xdm_t`, so on a real graphical
 # login SELinux denies it write/connect access to the socket and pam_irlume
 # silently falls through to the password; face login never engages.
+# The daemon also uses /var/cache/irlume/openvino only in an experimental
+# accelerator build. systemd creates that root, and irlumed remains in
+# unconfined_service_t, so the existing Fedora label is sufficient. Do not add
+# accelerator device or library allows without AVC evidence from a future
+# dedicated daemon domain; the enforcing hardware gate must report zero related
+# denials.
 #
 #   avc: denied { write } ... comm="plasmalogin-hel" name="irlume.sock"
 #        scontext=...:xdm_t tcontext=...:var_run_t tclass=sock_file

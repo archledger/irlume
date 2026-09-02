@@ -65,6 +65,7 @@ fn daemon_exits_promptly_on_sigterm() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_irlumed"))
         .env("IRLUME_SOCKET", &socket)
+        .env("IRLUME_EXECUTION_DEVICE", "cpu")
         .env("IRLUME_DET_MODEL", &det)
         .env("IRLUME_MODEL", &model)
         .env("IRLUME_MESH_MODEL", &mesh)
@@ -154,6 +155,7 @@ fn the_socket_is_connectable_before_startup_finishes() {
     let started = Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_irlumed"))
         .env("IRLUME_SOCKET", &socket)
+        .env("IRLUME_EXECUTION_DEVICE", "cpu")
         .env("IRLUME_DET_MODEL", &det)
         .env("IRLUME_MODEL", &model)
         .env("IRLUME_MESH_MODEL", models.join("face_landmark.onnx"))

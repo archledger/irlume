@@ -8,6 +8,11 @@ license.workspace = true
 # embed + liveness gate -> match. Used by both the CLI and the irlumed daemon so
 # the security-critical pipeline lives in exactly one place.
 
+[features]
+default = []
+# Propagate only when an experimental daemon build requests direct OpenVINO.
+experimental-openvino = ["irlume-vision/experimental-openvino"]
+
 [dependencies]
 sha2.workspace = true
 irlume-common.workspace = true

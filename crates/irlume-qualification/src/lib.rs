@@ -8,6 +8,7 @@ mod lifecycle;
 mod policy;
 mod protocol;
 mod signature;
+mod statistics;
 
 pub use canonical::{
     CampaignDiagnostic, CampaignError, CanonicalDocument, Identifier, RatePpb, Sha256Digest,
@@ -37,4 +38,10 @@ pub use protocol::{
 pub use signature::{
     verify_document, DetachedSignatureVerifier, GpgDetachedSignatureVerifier, SignatureAlgorithm,
     SignatureMetadata, SignerRole, Verified, MAX_DETACHED_SIGNATURE_BYTES,
+};
+pub use statistics::{
+    clopper_pearson, clopper_pearson_upper, cluster_bootstrap_latency, minimum_paired_sample_size,
+    paired_mover_wilson, paired_mover_wilson_lower, ClopperPearsonUpper, ClusterLatency,
+    IntersectionDecision, LatencyResult, MoverWilsonResult, PairedLatencyUs, PairedTable,
+    PowerPlan,
 };

@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     canonical::private,
+    minimum_paired_sample_size,
     policy::{parse_canonical, to_canonical},
     BinaryGate, CampaignError, CampaignPolicy, CanonicalDocument, ExpectedOutcome, Identifier,
     PaiSpecies, PresentationClass, RatePpb, Sha256Digest, SignatureMetadata,
     SignedRateDifferencePpb, SignerFingerprint, SignerRole, StratificationAxis, Verified,
-    OVERALL_MARGIN_PPB, RATE_SCALE_PPB, REQUIRED_POWER_PPB, STRATUM_MARGIN_PPB,
+    OVERALL_MARGIN_PPB, RATE_SCALE_PPB, STRATUM_MARGIN_PPB,
 };
 
 pub const CAMPAIGN_PROTOCOL_SCHEMA_VERSION: u32 = 1;
@@ -633,7 +634,7 @@ fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), Camp
             || right.profile_side != ProfileSide::Candidate
             || left.order_position == right.order_position
             || !strata.iter().any(|stratum| {
-                stratum.stratum_id == left.stratum_id && stratum.minimum_cases == left.planned_count
+                stratum.stratum_id == left.stratum_id && left.planned_count >= stratum.minimum_cases
             })
         {
             return Err(CampaignError::ProtocolInvalid);
@@ -721,26 +722,40 @@ fn validate_locked_samples_against_policy(
     _policy: &CampaignPolicy,
     protocol: &CampaignProtocol,
 ) -> Result<(), CampaignError> {
-    let overall_cases: u32 = protocol
-        .strata
+    let overall_capture_target = protocol
+        .cases
         .iter()
-        .try_fold(0u32, |sum, stratum| sum.checked_add(stratum.minimum_cases))
+        .filter(|case| case.is_baseline())
+        .try_fold(0u64, |sum, case| {
+            sum.checked_add(u64::from(case.planned_count))
+        })
         .ok_or(CampaignError::ProtocolInvalid)?;
-    for sample in &protocol.locked_sample_sizes {
-        let (expected_margin, expected_cases) = match &sample.stratum_id {
-            None => (OVERALL_MARGIN_PPB, overall_cases),
+    for (pilot, sample) in protocol
+        .pilot_discordance
+        .iter()
+        .zip(&protocol.locked_sample_sizes)
+    {
+        let (expected_margin, capture_target) = match &sample.stratum_id {
+            None => (OVERALL_MARGIN_PPB, overall_capture_target),
             Some(stratum_id) => {
-                let stratum = protocol
-                    .strata
+                let case = protocol
+                    .cases
                     .iter()
-                    .find(|stratum| &stratum.stratum_id == stratum_id)
+                    .find(|case| case.is_baseline() && &case.stratum_id == stratum_id)
                     .ok_or(CampaignError::ProtocolInvalid)?;
-                (STRATUM_MARGIN_PPB, stratum.minimum_cases)
+                (STRATUM_MARGIN_PPB, u64::from(case.planned_count))
             }
         };
+        let margin_ppb = RatePpb::new(expected_margin.unsigned_abs())?;
+        let power = minimum_paired_sample_size(
+            pilot.candidate_only_success_ppb,
+            pilot.baseline_only_success_ppb,
+            margin_ppb,
+        )?;
         if sample.margin_ppb.get() != expected_margin
-            || sample.required_cases != expected_cases
-            || sample.planned_power_ppb.get() < REQUIRED_POWER_PPB
+            || u64::from(sample.required_cases) < power.minimum_pairs()
+            || u64::from(sample.required_cases) > capture_target
+            || sample.planned_power_ppb != power.target_power_ppb()
         {
             return Err(CampaignError::ProtocolInvalid);
         }
@@ -889,7 +904,7 @@ pub(crate) mod tests {
                     "pai_instrument_id": pai_species.map(|_| format!("instrument-{index:02}")),
                     "pai_production_method": pai_species.map(|_| "protocol-declared-2d-production"),
                     "pai_species": pai_species,
-                    "planned_count": 40,
+                    "planned_count": 99,
                     "presentation_class": presentation,
                     "profile_side": side,
                     "reference_relation": reference_relation,
@@ -917,7 +932,7 @@ pub(crate) mod tests {
                 "gate": gate,
                 "margin_ppb": -20000000,
                 "planned_power_ppb": 800000000,
-                "required_cases": 560,
+                "required_cases": 619,
                 "stopping_rule": "locked_sample_no_optional_stopping",
                 "stratum_id": null
             }));
@@ -932,7 +947,7 @@ pub(crate) mod tests {
                     "gate": gate,
                     "margin_ppb": -50000000,
                     "planned_power_ppb": 800000000,
-                    "required_cases": 40,
+                    "required_cases": 99,
                     "stopping_rule": "locked_sample_no_optional_stopping",
                     "stratum_id": stratum["stratum_id"]
                 }));
@@ -1225,6 +1240,69 @@ pub(crate) mod tests {
             json!(600000000);
         assert_eq!(
             validate(&impossible_discordance),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut below_recomputed_overall = protocol_value();
+        below_recomputed_overall["locked_sample_sizes"][0]["required_cases"] = json!(618);
+        assert_eq!(
+            validate(&below_recomputed_overall),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut below_recomputed_stratum = protocol_value();
+        let stratum_sample = below_recomputed_stratum["locked_sample_sizes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|sample| !sample["stratum_id"].is_null())
+            .unwrap();
+        stratum_sample["required_cases"] = json!(98);
+        assert_eq!(
+            validate(&below_recomputed_stratum),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut changed_pilot_requires_more_pairs = protocol_value();
+        changed_pilot_requires_more_pairs["pilot_discordance"][0]["candidate_only_success_ppb"] =
+            json!(15000000);
+        assert_eq!(
+            validate(&changed_pilot_requires_more_pairs),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut premature_capture = protocol_value();
+        let stratum_id = premature_capture["strata"][0]["stratum_id"].clone();
+        for case in premature_capture["cases"].as_array_mut().unwrap() {
+            if case["stratum_id"] == stratum_id {
+                case["planned_count"] = json!(98);
+            }
+        }
+        assert_eq!(
+            validate(&premature_capture),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        let mut supported_larger_lock = protocol_value();
+        let stratum_id = supported_larger_lock["strata"][0]["stratum_id"].clone();
+        for case in supported_larger_lock["cases"].as_array_mut().unwrap() {
+            if case["stratum_id"] == stratum_id {
+                case["planned_count"] = json!(100);
+            }
+        }
+        let stratum_sample = supported_larger_lock["locked_sample_sizes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|sample| sample["stratum_id"] == stratum_id)
+            .unwrap();
+        stratum_sample["required_cases"] = json!(100);
+        assert!(validate(&supported_larger_lock).is_ok());
+
+        let mut power_target_drift = protocol_value();
+        power_target_drift["locked_sample_sizes"][0]["planned_power_ppb"] = json!(800000001);
+        assert_eq!(
+            validate(&power_target_drift),
             Err(CampaignError::ProtocolInvalid)
         );
 

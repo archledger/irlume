@@ -54,6 +54,7 @@ pub mod lease;
 mod lifecycle;
 mod media_graph;
 pub mod profile;
+mod profile_commissioning;
 pub mod profile_qualification;
 mod rate_gate;
 mod release_qualification;

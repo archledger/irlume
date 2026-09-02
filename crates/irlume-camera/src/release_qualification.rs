@@ -13,6 +13,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    capture_qualification::{CameraEndpoint, QualificationContext},
     contracts::StreamRole,
     frame_interval::FrameInterval,
     profile::{CaptureSchedule, DecodedPixelFormat, PairTransportProfile, StreamTuple},
@@ -194,6 +195,29 @@ impl ReleaseHardwareScope {
         self.rgb.validate()?;
         self.ir.validate()?;
         Ok(())
+    }
+
+    pub(crate) fn matches_context(
+        &self,
+        context: &QualificationContext,
+        interface_layout_sha256: &str,
+    ) -> bool {
+        self.match_policy_version == HARDWARE_SCOPE_MATCH_POLICY_VERSION
+            && self.interface_layout_sha256 == interface_layout_sha256
+            && self.rgb.matches_endpoint(context.rgb_endpoint())
+            && self.ir.matches_endpoint(context.ir_endpoint())
+    }
+}
+
+impl ReleaseEndpointScope {
+    fn matches_endpoint(&self, endpoint: &CameraEndpoint) -> bool {
+        self.descriptor_sha256 == endpoint.descriptor_sha256()
+            && self.vid == endpoint.vid()
+            && self.pid == endpoint.pid()
+            && self.interface_number == endpoint.interface_number()
+            && self.driver == endpoint.connection().driver()
+            && self.backend == endpoint.connection().backend()
+            && self.speed_millimbps == endpoint.connection().speed_millimbps()
     }
 }
 

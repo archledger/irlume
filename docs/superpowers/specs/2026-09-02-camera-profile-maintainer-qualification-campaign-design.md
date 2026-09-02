@@ -1,6 +1,7 @@
 # Camera Profile Maintainer Qualification Campaign: Design
 
-Status: approved design; Delivery Phases 2 and 3 planned in
+Status: approved design; artifact-authority correction drafted for review;
+Delivery Phases 2 and 3 planned in
 `docs/superpowers/plans/2026-09-02-camera-profile-maintainer-qualification-contracts.md`
 Date: 2026-09-02
 Agent: opencode
@@ -105,7 +106,9 @@ a campaign protocol.
 
 **Campaign protocol**:
 A signed campaign-specific declaration applying one campaign policy to one
-exact hardware class and baseline/candidate profile pair before capture.
+exact hardware scope and baseline/candidate profile pair before capture. The
+hardware scope includes the release artifact's exact identity-free endpoint
+contracts, not only class and descriptor digests.
 
 **Private campaign bundle**:
 The frozen, encrypted, content-addressed biometric assets, manifests, consent
@@ -128,7 +131,9 @@ private transcript, public aggregate, policy checks, and approval outcome.
 **Reviewed aggregate**:
 A canonical envelope binding one passing public aggregate result to its valid
 matching independent review attestation. Its digest is the release artifact's
-campaign result digest.
+campaign result digest. The opaque reviewed authority also retains the exact
+validated protocol used during assembly so later compilation cannot infer or
+accept replacement target contracts.
 
 **Publication boundary**:
 The point at which a reviewed aggregate becomes an immutable released fact.
@@ -163,8 +168,8 @@ campaign policy
 | Freeze | Staging bundle | Frozen private bundle | Repair missing evidence or alter labels |
 | Evaluation | Frozen bundle and exact software | Private transcript and public aggregate | Change inputs, review itself, or create artifact authority |
 | Review | Frozen bundle, both results, policy, software | Signed pass/fail attestation | Edit inputs, results, labels, margins, or denominators |
-| Aggregate assembly | Passing public aggregate and attestation | Reviewed aggregate envelope | Change either reviewed input or declare release authority |
-| Artifact compilation | Reviewed aggregate envelope and exact target contracts | Canonical unsigned artifact bytes | Access vault, biometrics, release key, or selection store |
+| Aggregate assembly | Validated protocol, passing public aggregate, and attestation | Opaque reviewed authority and canonical envelope | Change any reviewed input or declare release authority |
+| Artifact compilation | Opaque reviewed authority and intended release signer fingerprint | Canonical unsigned artifact bytes | Accept caller-supplied target contracts or access vault, biometrics, release key, or selection store |
 | Release signing | Exact compiler bytes and publication approval | Detached signature | Recompute or repair campaign results |
 | Product verification | Packaged artifact, signature, allowlisted public key | Opaque verified release evidence | Access campaign data or infer missing authority |
 
@@ -218,7 +223,9 @@ The signed protocol contains:
 - schema version, campaign ID, policy ID, and policy digest;
 - planned creation, collection, evaluation, review, and expiry bounds;
 - exact source revision and evaluator build identity;
-- exact hardware scope and match-policy version;
+- exact identity-free hardware scope and match-policy version, including RGB
+  and IR descriptor digests, VID, PID, interface number, driver, backend, and
+  link speed;
 - exact baseline and candidate profile contracts, including requested and
   accepted RGB and IR tuples and schedules;
 - exact conditioning catalog and selected-policy digests;
@@ -625,13 +632,14 @@ new campaign ID after the cause is corrected.
 
 The artifact compiler runs outside the vault and accepts only:
 
-- a canonical reviewed aggregate envelope;
-- its canonical passing public aggregate and valid matching independent review
-  attestation for digest and signature verification;
-- exact schema-1 release artifact target values;
+- opaque reviewed authority retaining the canonical envelope, exact validated
+  protocol, passing public aggregate, and valid matching independent review
+  attestation;
 - the intended allowlisted release signer fingerprint.
 
-The compiler verifies every predecessor digest and projects:
+No target field is supplied separately by the compiler caller. The compiler
+recomputes the canonical protocol hardware and profile digests and requires
+them to equal the passing public result before projecting:
 
 - campaign ID, protocol digest, and reviewed aggregate envelope digest;
 - exact hardware scope;
@@ -643,6 +651,13 @@ The compiler verifies every predecessor digest and projects:
 - qualification time copied exactly from the signed review timestamp;
 - expiry no later than both protocol expiry and one year after collection;
 - release signature metadata.
+
+The protocol hardware scope is a strict superset of the schema-1 artifact
+hardware scope: it additionally binds the campaign hardware class while its
+identity-free RGB and IR endpoint contracts project exactly into the artifact.
+The compiler never copies a serial, device path, or mutable local-discovery
+label. Protocol expiry and collection end come from the retained validated
+protocol and matching public result, so a caller cannot extend validity.
 
 It emits canonical unsigned bytes only. It cannot access the private bundle,
 consent registry, biometric data, release private key, package root, local
@@ -826,7 +841,7 @@ one-year ceiling.
 
 - Every campaign document is bounded, canonical, versioned,
   content-addressed, and closed to unknown input.
-- One campaign binds one exact hardware class and one baseline/candidate pair.
+- One campaign binds one exact hardware scope and one baseline/candidate pair.
 - Labels, strata, attacks, margins, sample size, order, exclusions, software,
   models, and operating points are frozen before authorizing capture.
 - Security failures cannot be averaged away.

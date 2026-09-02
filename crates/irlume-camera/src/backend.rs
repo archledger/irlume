@@ -13,6 +13,7 @@ use crate::inventory::{
 use crate::lease::{
     CameraLease, CameraLeaseError, CameraOperationKind, CameraOperationSession, LeaseAuthority,
 };
+use crate::profile::StreamTuple;
 use crate::{CameraPair, IrCamera, NodeScan, RgbCamera, Role};
 
 /// One capture implementation owned by the process camera supervisor.
@@ -22,6 +23,18 @@ trait CameraBackend: Send + Sync + 'static {
     fn list_pairs(&self) -> Vec<CameraPair>;
     fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera>;
     fn open_ir(&self, device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera>;
+    fn open_rgb_profile(
+        &self,
+        device: &str,
+        lease: CameraLease,
+        profile: &StreamTuple,
+    ) -> irlume_common::Result<RgbCamera>;
+    fn open_ir_profile(
+        &self,
+        device: &str,
+        lease: CameraLease,
+        profile: &StreamTuple,
+    ) -> irlume_common::Result<IrCamera>;
 
     #[cfg(test)]
     fn has_exact_production_uvc_delegates(&self) -> bool {
@@ -167,6 +180,24 @@ impl CameraSupervisor {
     fn open_ir(&self, device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
         self.backend.open_ir(device, lease)
     }
+
+    fn open_rgb_profile(
+        &self,
+        device: &str,
+        lease: CameraLease,
+        profile: &StreamTuple,
+    ) -> irlume_common::Result<RgbCamera> {
+        self.backend.open_rgb_profile(device, lease, profile)
+    }
+
+    fn open_ir_profile(
+        &self,
+        device: &str,
+        lease: CameraLease,
+        profile: &StreamTuple,
+    ) -> irlume_common::Result<IrCamera> {
+        self.backend.open_ir_profile(device, lease, profile)
+    }
 }
 
 /// Existing direct V4L2 backend for video-node-centric UVC cameras.
@@ -241,6 +272,24 @@ impl CameraBackend for UvcV4l2Backend {
         (self.open_ir)(device, lease)
     }
 
+    fn open_rgb_profile(
+        &self,
+        device: &str,
+        lease: CameraLease,
+        profile: &StreamTuple,
+    ) -> irlume_common::Result<RgbCamera> {
+        RgbCamera::open_uvc_profile(device, lease, profile)
+    }
+
+    fn open_ir_profile(
+        &self,
+        device: &str,
+        lease: CameraLease,
+        profile: &StreamTuple,
+    ) -> irlume_common::Result<IrCamera> {
+        IrCamera::open_uvc_profile(device, lease, profile)
+    }
+
     #[cfg(test)]
     fn has_exact_production_uvc_delegates(&self) -> bool {
         std::ptr::fn_addr_eq(self.scan_nodes, production_scan_nodes as ScanNodes)
@@ -302,6 +351,22 @@ pub(crate) fn open_rgb(device: &str, lease: CameraLease) -> irlume_common::Resul
 
 pub(crate) fn open_ir(device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera> {
     with_camera_supervisor(|supervisor| supervisor.open_ir(device, lease))
+}
+
+pub(crate) fn open_rgb_profile(
+    device: &str,
+    lease: CameraLease,
+    profile: &StreamTuple,
+) -> irlume_common::Result<RgbCamera> {
+    with_camera_supervisor(|supervisor| supervisor.open_rgb_profile(device, lease, profile))
+}
+
+pub(crate) fn open_ir_profile(
+    device: &str,
+    lease: CameraLease,
+    profile: &StreamTuple,
+) -> irlume_common::Result<IrCamera> {
+    with_camera_supervisor(|supervisor| supervisor.open_ir_profile(device, lease, profile))
 }
 
 #[cfg(test)]
@@ -389,6 +454,38 @@ mod tests {
         fn open_ir(&self, device: &str, _: CameraLease) -> irlume_common::Result<IrCamera> {
             self.record(format!("open_ir:{device}"));
             Err(irlume_common::Error::Hardware("spy IR refusal".into()))
+        }
+
+        fn open_rgb_profile(
+            &self,
+            device: &str,
+            _: CameraLease,
+            profile: &StreamTuple,
+        ) -> irlume_common::Result<RgbCamera> {
+            self.record(format!(
+                "open_rgb_profile:{device}:{}x{}",
+                profile.width(),
+                profile.height()
+            ));
+            Err(irlume_common::Error::Hardware(
+                "spy RGB profile refusal".into(),
+            ))
+        }
+
+        fn open_ir_profile(
+            &self,
+            device: &str,
+            _: CameraLease,
+            profile: &StreamTuple,
+        ) -> irlume_common::Result<IrCamera> {
+            self.record(format!(
+                "open_ir_profile:{device}:{}x{}",
+                profile.width(),
+                profile.height()
+            ));
+            Err(irlume_common::Error::Hardware(
+                "spy IR profile refusal".into(),
+            ))
         }
     }
 
@@ -492,6 +589,51 @@ mod tests {
                 "list_pairs",
                 "open_rgb:/dev/spy-rgb",
                 "open_ir:/dev/spy-ir",
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_camera_entrypoints_route_exact_tuples_through_the_supervisor() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Arc::new(CameraSupervisor::from_arc(Arc::new(RecordingBackend {
+            calls: Arc::clone(&calls),
+        })));
+        seed_test_endpoints(&supervisor, &["/dev/spy-rgb", "/dev/spy-ir"]);
+        let _guard = install_test_supervisor(supervisor);
+        let interval = crate::frame_interval::FrameInterval::new(1, 15).unwrap();
+        let rgb = crate::profile::StreamTuple::new(
+            crate::contracts::StreamRole::Rgb,
+            crate::profile::DecodedPixelFormat::Yuyv,
+            640,
+            480,
+            interval,
+        )
+        .unwrap();
+        let ir = crate::profile::StreamTuple::new(
+            crate::contracts::StreamRole::Ir,
+            crate::profile::DecodedPixelFormat::Grey8,
+            640,
+            400,
+            interval,
+        )
+        .unwrap();
+
+        assert!(RgbCamera::open_profile("/dev/spy-rgb", &rgb)
+            .err()
+            .expect("spy RGB profile open must refuse")
+            .to_string()
+            .contains("spy RGB profile refusal"));
+        assert!(IrCamera::open_profile("/dev/spy-ir", &ir)
+            .err()
+            .expect("spy IR profile open must refuse")
+            .to_string()
+            .contains("spy IR profile refusal"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "open_rgb_profile:/dev/spy-rgb:640x480",
+                "open_ir_profile:/dev/spy-ir:640x400",
             ]
         );
     }

@@ -210,6 +210,17 @@ an authentication result. The selected conditioning policy is frozen for the
 attempt. Irlume does not open a hidden preflight stream solely to classify the
 scene.
 
+Task 5 provides no production constructor or factory for a scene observation.
+Camera-owned capture orchestration may mint one only after exact profile opens
+and immutable attempt-plan validation prove the camera incarnation, connection,
+full transport profile including requested and accepted RGB and IR tuples and
+capture schedule actually used, and after both canonical evidence manifests
+validate against that same plan. The observation binds that exact validated
+context rather than accepting context facts from its caller. Its freshness
+instant is the oldest contributing capture window start. Construction rejects
+RGB and IR windows separated beyond one fixed, versioned evidence-pair bound,
+so fresh evidence from one role can never renew older facts from the other.
+
 ### CanonicalPreprocessor
 
 The capture boundary owns V4L2 buffers and device-specific payload layouts.
@@ -267,7 +278,24 @@ alignment.
 
 ## Attempt Capture Plan
 
-Before streaming, one immutable `AttemptCapturePlan` binds:
+The immutable attempt authority has two layers so camera evidence validation does
+not depend on authentication or vision modules.
+
+`irlume-camera` owns `CameraAttemptContract`. It binds the exact RGB and IR
+camera incarnations and generations, connection context, requested and accepted
+transport tuples, capture schedule, conditioning selection, evidence-window
+rules, qualification facts, and policy versions. Camera capture validates
+canonical manifests against this contract. Only that validated camera-owned path
+may mint a process-local `SceneObservation` for a later attempt. Observation
+freshness starts at the oldest contributing capture-window start, and RGB/IR
+windows beyond the fixed versioned evidence-pair bound create no observation.
+
+`irlume-auth` owns `AttemptCapturePlan`. It composes one immutable
+`CameraAttemptContract` with preprocessing, calibration, and model contracts.
+This preserves the dependency direction: authentication depends on camera and
+vision, while camera depends on neither authentication nor vision.
+
+Before streaming, the composite `AttemptCapturePlan` binds:
 
 - Exact RGB and IR camera incarnation and generation.
 - Exact requested and accepted transport profiles.
@@ -282,6 +310,10 @@ The plan cannot change after the evidence window begins. Contract drift aborts
 the face attempt. Runtime degradation may mark concurrent capture unhealthy and
 select the already-qualified sequential schedule for a later attempt, matching
 the existing project definition. It does not create a new transport profile.
+
+Authentication validates the camera-owned contract and the auth-owned model and
+preprocessing fields before constructing any typed model input. Neither layer
+exposes mutators or a constructor that accepts an unvalidated observation.
 
 ## Evidence Manifest
 

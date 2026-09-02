@@ -252,25 +252,35 @@ pub struct ConditioningCatalog {
 }
 
 impl ConditioningCatalog {
-    /// Builds the fixed catalog only after every control request passes one
-    /// bounded standard-control inventory.
+    /// Builds the fixed catalog from one bounded standard-control inventory.
+    /// BLC 2 is included only when its exact integer request is eligible;
+    /// otherwise every policy retains its other safe settings without BLC.
     ///
     /// # Errors
     ///
-    /// Returns an error when any fixed policy names a control that is absent,
-    /// ineligible, type-incompatible, outside range, or off its exact lattice.
+    /// The fixed catalog currently has no mandatory control and therefore
+    /// cannot fail. The result keeps catalog construction at the validation
+    /// boundary used by manually authored policy validation.
     pub fn fixed(inventory: &CapabilityInventory) -> Result<Self, PolicyError> {
-        let catalog = Self::definition(CATALOG_VERSION);
-        for policy in &catalog.policies {
-            policy.validate_against(inventory)?;
-        }
-        Ok(catalog)
+        let domains: Vec<_> = inventory
+            .controls()
+            .iter()
+            .map(ControlDomain::from)
+            .collect();
+        Ok(Self::definition(
+            CATALOG_VERSION,
+            exact_blc_two_supported(&domains),
+        ))
     }
 
-    fn definition(version: u32) -> Self {
+    fn definition(version: u32, include_blc: bool) -> Self {
+        let controls: Vec<_> = include_blc
+            .then_some(ControlSetting::integer(V4L2_CID_BACKLIGHT_COMPENSATION, 2))
+            .into_iter()
+            .collect();
         let policy = |id| ConditioningPolicy {
             id,
-            controls: vec![ControlSetting::integer(V4L2_CID_BACKLIGHT_COMPENSATION, 2)],
+            controls: controls.clone(),
             auto_exposure_enabled: true,
             rgb_warmup_frames: 6,
             rgb_median_frames: 5,
@@ -291,6 +301,35 @@ impl ConditioningCatalog {
     #[must_use]
     pub const fn version(&self) -> u32 {
         self.version
+    }
+
+    /// Returns a canonical digest over every policy fact that affects capture.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut material = format!("conditioning-catalog-v1|version:{}", self.version);
+        for policy in &self.policies {
+            let _ = write!(
+                material,
+                "|policy:{}|ae:{}|warmup:{}|median:{}|ambient:{}|controls:{}",
+                policy.id.as_str(),
+                u8::from(policy.auto_exposure_enabled),
+                policy.rgb_warmup_frames,
+                policy.rgb_median_frames,
+                u8::from(policy.ambient_subtraction_enabled),
+                policy.controls.len(),
+            );
+            for control in &policy.controls {
+                let kind = match control.kind {
+                    ControlSettingKind::Integer => "integer",
+                    ControlSettingKind::Boolean => "boolean",
+                    ControlSettingKind::Menu => "menu",
+                };
+                let _ = write!(material, "|control:{}:{kind}:{}", control.id, control.value);
+            }
+        }
+        irlume_common::sha256_hex(material.as_bytes())
     }
 
     /// Returns all four IDs in deterministic catalog order.
@@ -331,8 +370,12 @@ impl ConditioningCatalog {
         &self,
         context: &ConditioningContext,
         now: Instant,
-        preceding_observation: Option<&SceneObservation>,
+        attempt: ConditioningAttempt<'_>,
     ) -> ConditioningSelection {
+        let preceding_observation = match attempt {
+            ConditioningAttempt::First => None,
+            ConditioningAttempt::Later(observation) => Some(observation),
+        };
         let scene = preceding_observation
             .filter(|observation| observation.context == *context)
             .filter(|observation| observation.catalog_version == self.version)
@@ -358,14 +401,34 @@ impl ConditioningCatalog {
 
     #[cfg(test)]
     fn with_version_for_test(version: u32) -> Self {
-        Self::definition(version)
+        Self::definition(version, true)
+    }
+
+    #[cfg(test)]
+    fn fixed_from_domains_for_test(domains: &[ControlDomain]) -> Self {
+        Self::definition(CATALOG_VERSION, exact_blc_two_supported(domains))
     }
 }
 
+pub(super) fn current_catalog() -> ConditioningCatalog {
+    ConditioningCatalog::definition(CATALOG_VERSION, true)
+}
+
+/// Digest of the fixed catalog used by production attempt selection.
+#[must_use]
+pub fn current_catalog_digest() -> String {
+    current_catalog().digest()
+}
+
 pub(super) fn current_safe_default() -> ConditioningPolicy {
-    ConditioningCatalog::definition(CATALOG_VERSION)
-        .safe_default()
-        .clone()
+    current_catalog().safe_default().clone()
+}
+
+fn exact_blc_two_supported(domains: &[ControlDomain]) -> bool {
+    let setting = ControlSetting::integer(V4L2_CID_BACKLIGHT_COMPENSATION, 2);
+    domains
+        .iter()
+        .any(|domain| domain.id == setting.id && domain.validate(setting).is_ok())
 }
 
 /// Exact process-local context that scopes one preceding scene observation.
@@ -392,6 +455,26 @@ impl ConditioningContext {
             connection,
             transport_profile,
         }
+    }
+
+    #[must_use]
+    pub const fn camera_instance_id(&self) -> &CameraInstanceId {
+        &self.camera_instance_id
+    }
+
+    #[must_use]
+    pub const fn camera_generation(&self) -> CameraGeneration {
+        self.camera_generation
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &ConnectionContext {
+        &self.connection
+    }
+
+    #[must_use]
+    pub const fn transport_profile(&self) -> &PairTransportProfile {
+        &self.transport_profile
     }
 }
 
@@ -469,6 +552,20 @@ impl SceneStatistics {
 }
 
 /// One process-local observation retained only for a later attempt.
+///
+/// Task 5 exposes no production construction path. External callers cannot
+/// fabricate an observation from arbitrary context, time, or statistics.
+///
+/// ```compile_fail
+/// use std::time::Instant;
+/// use irlume_camera::conditioning::{
+///     ConditioningContext, SceneObservation, SceneStatistics,
+/// };
+///
+/// fn fabricate(context: ConditioningContext, statistics: SceneStatistics) {
+///     let _ = SceneObservation::new(context, 1, Instant::now(), statistics);
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct SceneObservation {
     context: ConditioningContext,
@@ -478,9 +575,7 @@ pub struct SceneObservation {
 }
 
 impl SceneObservation {
-    /// Binds non-model scene statistics to their exact context, version, and instant.
-    #[must_use]
-    pub const fn new(
+    pub(crate) const fn from_validated_attempt(
         context: ConditioningContext,
         catalog_version: u32,
         observed_at: Instant,
@@ -493,6 +588,21 @@ impl SceneObservation {
             statistics,
         }
     }
+
+    /// Oldest contributing capture-window start used for freshness checks.
+    #[must_use]
+    pub const fn freshness_start(&self) -> Instant {
+        self.observed_at
+    }
+}
+
+/// Closed attempt phase for policy selection.
+#[derive(Clone, Copy, Debug)]
+pub enum ConditioningAttempt<'a> {
+    /// Initial attempt, which structurally carries no observation authority.
+    First,
+    /// Later attempt with one preceding camera-authorized observation.
+    Later(&'a SceneObservation),
 }
 
 /// Immutable catalog choice for one attempt.
@@ -722,6 +832,35 @@ struct AppliedControl {
 pub struct AppliedConditioningGuard<'a> {
     controls: &'a dyn ControlIo,
     applied: Vec<AppliedControl>,
+    required: Vec<ControlSetting>,
+    selection: Option<ConditioningSelection>,
+}
+
+/// Proof that one selected policy was exactly applied, read back, and restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConditioningRestoration {
+    selection: ConditioningSelection,
+}
+
+impl ConditioningRestoration {
+    #[must_use]
+    pub const fn selection(self) -> ConditioningSelection {
+        self.selection
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(selection: ConditioningSelection) -> Self {
+        Self { selection }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_policy_for_test(
+        mut selection: ConditioningSelection,
+        policy_id: ConditioningPolicyId,
+    ) -> Self {
+        selection.policy_id = policy_id;
+        Self { selection }
+    }
 }
 
 impl std::fmt::Debug for AppliedConditioningGuard<'_> {
@@ -738,6 +877,63 @@ impl AppliedConditioningGuard<'_> {
     #[must_use]
     pub fn is_armed(&self) -> bool {
         !self.applied.is_empty()
+    }
+
+    #[must_use]
+    pub const fn selection(&self) -> Option<ConditioningSelection> {
+        self.selection
+    }
+
+    /// Explicitly restores every displaced value and confirms exact readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership changed or restoration cannot be confirmed.
+    pub fn restore(mut self) -> Result<ConditioningRestoration, PolicyError> {
+        for setting in &self.required {
+            match self.controls.read_control(setting.id) {
+                Ok(value) if value == setting.value => {}
+                Ok(_) => return Err(PolicyError::ReadbackMismatch(setting.id)),
+                Err(error) => {
+                    return Err(PolicyError::ControlRead {
+                        id: setting.id,
+                        errno: error.raw_os_error(),
+                    });
+                }
+            }
+        }
+        while let Some(applied) = self.applied.pop() {
+            match self.controls.read_control(applied.id) {
+                Ok(now) if now == applied.requested => {}
+                Ok(_) => return Err(PolicyError::ReadbackMismatch(applied.id)),
+                Err(error) => {
+                    return Err(PolicyError::ControlRead {
+                        id: applied.id,
+                        errno: error.raw_os_error(),
+                    });
+                }
+            }
+            self.controls
+                .write_control(applied.id, applied.displaced)
+                .map_err(|error| PolicyError::ControlWrite {
+                    id: applied.id,
+                    errno: error.raw_os_error(),
+                })?;
+            match self.controls.read_control(applied.id) {
+                Ok(readback) if readback == applied.displaced => {}
+                Ok(_) => return Err(PolicyError::ReadbackMismatch(applied.id)),
+                Err(error) => {
+                    return Err(PolicyError::ControlRead {
+                        id: applied.id,
+                        errno: error.raw_os_error(),
+                    });
+                }
+            }
+        }
+        self.selection
+            .take()
+            .map(|selection| ConditioningRestoration { selection })
+            .ok_or(PolicyError::InvalidPolicy)
     }
 }
 
@@ -771,6 +967,8 @@ pub(super) fn apply_policy<'a>(
     let mut guard = AppliedConditioningGuard {
         controls,
         applied: Vec::with_capacity(ordered.len()),
+        required: ordered.clone(),
+        selection: None,
     };
 
     for setting in ordered {
@@ -810,6 +1008,81 @@ pub(super) fn apply_policy<'a>(
         }
     }
     Ok(guard)
+}
+
+pub(super) fn apply_selected_policy<'a>(
+    controls: &'a dyn ControlIo,
+    selection: ConditioningSelection,
+    policy: &ConditioningPolicy,
+) -> Result<AppliedConditioningGuard<'a>, PolicyError> {
+    if selection.catalog_version == 0 || selection.policy_id != policy.id {
+        return Err(PolicyError::InvalidPolicy);
+    }
+    let optional_blc = match policy.controls.as_slice() {
+        [setting] if setting.id == V4L2_CID_BACKLIGHT_COMPENSATION => Some(*setting),
+        _ => None,
+    };
+    let mut guard = if let Some(setting) = optional_blc {
+        apply_optional_control(controls, setting)?
+    } else {
+        apply_policy(controls, policy)?
+    };
+    guard.selection = Some(selection);
+    Ok(guard)
+}
+
+fn apply_optional_control<'a>(
+    controls: &'a dyn ControlIo,
+    setting: ControlSetting,
+) -> Result<AppliedConditioningGuard<'a>, PolicyError> {
+    let empty = || AppliedConditioningGuard {
+        controls,
+        applied: Vec::new(),
+        required: Vec::new(),
+        selection: None,
+    };
+    let displaced = match controls.read_control(setting.id) {
+        Ok(value) => value,
+        Err(_) => return Ok(empty()),
+    };
+    if displaced == setting.value {
+        return Ok(AppliedConditioningGuard {
+            controls,
+            applied: Vec::new(),
+            required: vec![setting],
+            selection: None,
+        });
+    }
+    if controls.write_control(setting.id, setting.value).is_err() {
+        return Ok(empty());
+    }
+    if matches!(controls.read_control(setting.id), Ok(value) if value == setting.value) {
+        return Ok(AppliedConditioningGuard {
+            controls,
+            applied: vec![AppliedControl {
+                id: setting.id,
+                requested: setting.value,
+                displaced,
+            }],
+            required: vec![setting],
+            selection: None,
+        });
+    }
+
+    controls
+        .write_control(setting.id, displaced)
+        .map_err(|error| PolicyError::ControlWrite {
+            id: setting.id,
+            errno: error.raw_os_error(),
+        })?;
+    match controls.read_control(setting.id) {
+        Ok(value) if value == displaced => Ok(empty()),
+        Ok(_) => Err(PolicyError::ReadbackMismatch(setting.id)),
+        Err(error) => Err(PolicyError::ControlRead {
+            id: setting.id,
+            errno: error.raw_os_error(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -982,11 +1255,37 @@ mod tests {
     }
 
     fn catalog() -> ConditioningCatalog {
-        ConditioningCatalog::definition(CATALOG_VERSION)
+        ConditioningCatalog::definition(CATALOG_VERSION, true)
+    }
+
+    fn observation(
+        context: ConditioningContext,
+        catalog_version: u32,
+        observed_at: Instant,
+        statistics: SceneStatistics,
+    ) -> SceneObservation {
+        SceneObservation {
+            context,
+            catalog_version,
+            observed_at,
+            statistics,
+        }
     }
 
     fn integer(id: u32, minimum: i32, maximum: i32, step: i32) -> ControlDomain {
         ControlDomain::for_test(id, ControlKind::Integer, minimum, maximum, step, &[], true)
+    }
+
+    #[test]
+    fn production_observation_minting_is_crate_private_and_attempt_validated() {
+        let production = include_str!("conditioning.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module marker remains present")
+            .0;
+
+        assert!(!production.contains("fn observe("));
+        assert!(production.contains("pub(crate) const fn from_validated_attempt("));
+        assert!(!production.contains("pub const fn from_validated_attempt("));
     }
 
     #[test]
@@ -1124,9 +1423,124 @@ mod tests {
     }
 
     #[test]
+    fn catalog_digest_binds_version_controls_and_reduction_policy() {
+        let with_blc = ConditioningCatalog::definition(1, true);
+        let without_blc = ConditioningCatalog::definition(1, false);
+        let newer = ConditioningCatalog::definition(2, true);
+
+        assert_eq!(with_blc.digest().len(), 64);
+        assert_ne!(with_blc.digest(), without_blc.digest());
+        assert_ne!(with_blc.digest(), newer.digest());
+        assert_eq!(with_blc.digest(), with_blc.digest());
+    }
+
+    #[test]
+    fn fixed_catalog_omits_blc_unless_exact_integer_two_is_eligible() {
+        let absent = Vec::new();
+        let ineligible = vec![ControlDomain::for_test(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            ControlKind::Integer,
+            0,
+            4,
+            1,
+            &[],
+            false,
+        )];
+        let wrong_type = vec![ControlDomain::for_test(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            ControlKind::Boolean,
+            0,
+            1,
+            1,
+            &[],
+            true,
+        )];
+        let out_of_range = vec![integer(V4L2_CID_BACKLIGHT_COMPENSATION, 0, 1, 1)];
+        let off_lattice = vec![integer(V4L2_CID_BACKLIGHT_COMPENSATION, 0, 4, 3)];
+        for domains in [
+            &absent,
+            &ineligible,
+            &wrong_type,
+            &out_of_range,
+            &off_lattice,
+        ] {
+            let catalog = ConditioningCatalog::fixed_from_domains_for_test(domains);
+            assert!(catalog
+                .policy_ids()
+                .iter()
+                .all(|id| catalog.policy(*id).controls().is_empty()));
+        }
+
+        let supported = ConditioningCatalog::fixed_from_domains_for_test(&[integer(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            0,
+            4,
+            1,
+        )]);
+        assert!(supported.policy_ids().iter().all(|id| {
+            supported.policy(*id).controls()
+                == [ControlSetting::integer(V4L2_CID_BACKLIGHT_COMPENSATION, 2)]
+        }));
+    }
+
+    #[test]
+    fn manual_blc_policy_still_rejects_every_unsupported_domain() {
+        let requested = policy(vec![ControlSetting::integer(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            2,
+        )]);
+        let ineligible = ControlDomain::for_test(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            ControlKind::Integer,
+            0,
+            4,
+            1,
+            &[],
+            false,
+        );
+        let wrong_type = ControlDomain::for_test(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            ControlKind::Boolean,
+            0,
+            1,
+            1,
+            &[],
+            true,
+        );
+        for (domains, expected) in [
+            (
+                Vec::new(),
+                PolicyError::UnsupportedControl(V4L2_CID_BACKLIGHT_COMPENSATION),
+            ),
+            (
+                vec![ineligible],
+                PolicyError::IneligibleControl(V4L2_CID_BACKLIGHT_COMPENSATION),
+            ),
+            (
+                vec![wrong_type],
+                PolicyError::ControlTypeMismatch(V4L2_CID_BACKLIGHT_COMPENSATION),
+            ),
+            (
+                vec![integer(V4L2_CID_BACKLIGHT_COMPENSATION, 0, 1, 1)],
+                PolicyError::OutOfRange(V4L2_CID_BACKLIGHT_COMPENSATION),
+            ),
+            (
+                vec![integer(V4L2_CID_BACKLIGHT_COMPENSATION, 0, 4, 3)],
+                PolicyError::OffStepLattice(V4L2_CID_BACKLIGHT_COMPENSATION),
+            ),
+        ] {
+            assert_eq!(requested.validate_against_domains(&domains), Err(expected));
+        }
+    }
+
+    #[test]
     fn first_attempt_always_selects_the_safe_default() {
         let catalog = catalog();
-        let selected = catalog.select(&context('a', 1, "usb-a", "profile-a"), Instant::now(), None);
+        let selected = catalog.select(
+            &context('a', 1, "usb-a", "profile-a"),
+            Instant::now(),
+            ConditioningAttempt::First,
+        );
         assert_eq!(selected.scene(), SceneClass::Lit);
         assert_eq!(selected.policy_id(), ConditioningPolicyId::LitAuto);
     }
@@ -1136,7 +1550,7 @@ mod tests {
         let catalog = catalog();
         let now = Instant::now();
         let exact = context('a', 1, "usb-a", "profile-a");
-        let observation = SceneObservation::new(
+        let observation = observation(
             exact.clone(),
             catalog.version(),
             now,
@@ -1147,14 +1561,18 @@ mod tests {
                 .select(
                     &exact,
                     now + CATALOG_TTL - Duration::from_nanos(1),
-                    Some(&observation)
+                    ConditioningAttempt::Later(&observation)
                 )
                 .policy_id(),
             ConditioningPolicyId::BacklitAuto
         );
         assert_eq!(
             catalog
-                .select(&exact, now + CATALOG_TTL, Some(&observation))
+                .select(
+                    &exact,
+                    now + CATALOG_TTL,
+                    ConditioningAttempt::Later(&observation),
+                )
                 .policy_id(),
             ConditioningPolicyId::LitAuto,
             "an observation expires at the exact TTL"
@@ -1166,7 +1584,7 @@ mod tests {
         let catalog = catalog();
         let now = Instant::now();
         let original = context('a', 1, "usb-a", "profile-a");
-        let observation = SceneObservation::new(
+        let observation = observation(
             original.clone(),
             catalog.version(),
             now,
@@ -1181,14 +1599,33 @@ mod tests {
         for candidate in &changed {
             assert_eq!(
                 catalog
-                    .select(candidate, now, Some(&observation))
+                    .select(candidate, now, ConditioningAttempt::Later(&observation))
                     .policy_id(),
                 ConditioningPolicyId::LitAuto
             );
         }
         assert_eq!(
             ConditioningCatalog::with_version_for_test(catalog.version() + 1)
-                .select(&original, now, Some(&observation))
+                .select(&original, now, ConditioningAttempt::Later(&observation),)
+                .policy_id(),
+            ConditioningPolicyId::LitAuto
+        );
+    }
+
+    #[test]
+    fn future_observation_defaults_instead_of_gaining_authority() {
+        let catalog = catalog();
+        let now = Instant::now();
+        let exact = context('a', 1, "usb-a", "profile-a");
+        let future = observation(
+            exact.clone(),
+            catalog.version(),
+            now + Duration::from_nanos(1),
+            stats(0, 20, 100, 0, 40, IlluminationFacts::new(false, false)),
+        );
+        assert_eq!(
+            catalog
+                .select(&exact, now, ConditioningAttempt::Later(&future))
                 .policy_id(),
             ConditioningPolicyId::LitAuto
         );
@@ -1305,5 +1742,58 @@ mod tests {
         controls.external_write(GAIN, 6);
         drop(guard);
         assert_eq!(controls.value(GAIN), 6);
+    }
+
+    #[test]
+    fn selected_policy_requires_apply_readback_and_explicit_restoration_proof() {
+        let controls = FakeControls::with_values(&[(GAIN, 3)]);
+        let selected = ConditioningSelection {
+            scene: SceneClass::Lit,
+            policy_id: ConditioningPolicyId::LitAuto,
+            catalog_version: CATALOG_VERSION,
+        };
+        let requested = policy(vec![ControlSetting::integer(GAIN, 8)]);
+
+        let applied = apply_selected_policy(&controls, selected, &requested).unwrap();
+        assert_eq!(controls.value(GAIN), 8, "exact readback gates application");
+
+        let proof = applied.restore().unwrap();
+        assert_eq!(proof.selection(), selected);
+        assert_eq!(controls.value(GAIN), 3, "proof follows exact restoration");
+    }
+
+    #[test]
+    fn external_change_prevents_restoration_proof() {
+        let controls = FakeControls::with_values(&[(GAIN, 3)]);
+        let selected = ConditioningSelection {
+            scene: SceneClass::Lit,
+            policy_id: ConditioningPolicyId::LitAuto,
+            catalog_version: CATALOG_VERSION,
+        };
+        let requested = policy(vec![ControlSetting::integer(GAIN, 8)]);
+        let applied = apply_selected_policy(&controls, selected, &requested).unwrap();
+
+        controls.external_write(GAIN, 6);
+
+        assert!(applied.restore().is_err());
+        assert_eq!(controls.value(GAIN), 6);
+    }
+
+    #[test]
+    fn selected_policy_omits_unavailable_optional_blc_and_still_proves_restoration() {
+        let controls = FakeControls::with_values(&[]);
+        let selected = ConditioningSelection {
+            scene: SceneClass::Lit,
+            policy_id: ConditioningPolicyId::LitAuto,
+            catalog_version: CATALOG_VERSION,
+        };
+        let requested = policy(vec![ControlSetting::integer(
+            V4L2_CID_BACKLIGHT_COMPENSATION,
+            2,
+        )]);
+
+        let applied = apply_selected_policy(&controls, selected, &requested).unwrap();
+        assert!(!applied.is_armed());
+        assert_eq!(applied.restore().unwrap().selection(), selected);
     }
 }

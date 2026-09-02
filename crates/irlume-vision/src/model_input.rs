@@ -123,34 +123,80 @@ impl ModelInputContract {
     }
 }
 
-const PRODUCTION_IDS: [ModelInputContractId; 8] = [
-    ModelInputContractId::YuNetLetterbox640V1,
-    ModelInputContractId::ArcFace112RgbV1,
-    ModelInputContractId::VitRgbPadM96V1,
-    ModelInputContractId::FlirIrPad112V1,
-    ModelInputContractId::BlazeFaceLetterbox128V1,
-    ModelInputContractId::BlazeFaceFullRangeLetterbox192V1,
-    ModelInputContractId::FaceMesh192RgbV1,
-    ModelInputContractId::FaceMesh256RgbV1,
-];
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ModelContractSet;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelContractSet {
+    slots: [Option<ModelInputContractId>; 8],
+}
 
 impl ModelContractSet {
     #[must_use]
-    pub const fn production_v1() -> Self {
-        Self
+    pub const fn from_slots(slots: [Option<ModelInputContractId>; 8]) -> Self {
+        Self { slots }
     }
 
     #[must_use]
-    pub const fn ids(self) -> &'static [ModelInputContractId] {
-        &PRODUCTION_IDS
+    pub const fn production_v1() -> Self {
+        Self {
+            slots: [
+                Some(ModelInputContractId::YuNetLetterbox640V1),
+                Some(ModelInputContractId::ArcFace112RgbV1),
+                Some(ModelInputContractId::VitRgbPadM96V1),
+                Some(ModelInputContractId::FlirIrPad112V1),
+                Some(ModelInputContractId::BlazeFaceLetterbox128V1),
+                Some(ModelInputContractId::BlazeFaceFullRangeLetterbox192V1),
+                Some(ModelInputContractId::FaceMesh192RgbV1),
+                Some(ModelInputContractId::FaceMesh256RgbV1),
+            ],
+        }
+    }
+
+    /// Reconstructs authority from the adapters initialized in one auth engine.
+    #[must_use]
+    #[cfg(feature = "onnx")]
+    pub fn from_initialized_adapters(
+        detector: &crate::Detector,
+        embedder: &crate::Embedder,
+        vit_pad: Option<&crate::PadVit>,
+        ir_pad: Option<&crate::PadIr>,
+        blaze: Option<&crate::BlazeRescue>,
+        mesh: Option<&crate::FaceMesh>,
+    ) -> Self {
+        let mut slots = [None; 8];
+        slots[0] = Some(detector.input_contract());
+        slots[1] = Some(embedder.input_contract());
+        slots[2] = vit_pad.map(crate::PadVit::input_contract);
+        slots[3] = ir_pad.map(crate::PadIr::input_contract);
+        slots[4] = blaze.map(crate::BlazeRescue::input_contract);
+        if let Some(contract) = mesh.map(crate::FaceMesh::input_contract) {
+            let index = match contract {
+                ModelInputContractId::FaceMesh192RgbV1 => 6,
+                ModelInputContractId::FaceMesh256RgbV1 => 7,
+                _ => unreachable!("FaceMesh exposes only closed mesh contracts"),
+            };
+            slots[index] = Some(contract);
+        }
+        Self { slots }
+    }
+
+    #[must_use]
+    pub const fn slots(self) -> [Option<ModelInputContractId>; 8] {
+        self.slots
     }
 
     #[must_use]
     pub const fn require(self, id: ModelInputContractId) -> Option<ModelInputContract> {
-        Some(contract(id))
+        let index = id as usize;
+        if matches!(self.slots[index], Some(active) if active as usize == index) {
+            Some(contract(id))
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for ModelContractSet {
+    fn default() -> Self {
+        Self::production_v1()
     }
 }
 
@@ -257,6 +303,9 @@ pub struct CanonicalRgbView<'a> {
 }
 
 impl<'a> CanonicalRgbView<'a> {
+    /// Stable identity of the canonical RGB producer boundary.
+    pub const PREPROCESSING_ID: &'static str = "canonical-rgb8-v1";
+
     /// Validate an immutable RGB8 payload against its geometry.
     ///
     /// # Errors
@@ -330,6 +379,9 @@ pub struct CanonicalGreyView<'a> {
 }
 
 impl<'a> CanonicalGreyView<'a> {
+    /// Stable identity of the canonical GREY producer boundary.
+    pub const PREPROCESSING_ID: &'static str = "canonical-grey8-v1";
+
     /// Validate an immutable GREY8 payload against its geometry.
     ///
     /// # Errors
@@ -998,16 +1050,16 @@ mod tests {
     fn production_contract_set_is_closed_and_frozen() {
         let contracts = ModelContractSet::production_v1();
         assert_eq!(
-            contracts.ids(),
-            &[
-                ModelInputContractId::YuNetLetterbox640V1,
-                ModelInputContractId::ArcFace112RgbV1,
-                ModelInputContractId::VitRgbPadM96V1,
-                ModelInputContractId::FlirIrPad112V1,
-                ModelInputContractId::BlazeFaceLetterbox128V1,
-                ModelInputContractId::BlazeFaceFullRangeLetterbox192V1,
-                ModelInputContractId::FaceMesh192RgbV1,
-                ModelInputContractId::FaceMesh256RgbV1,
+            contracts.slots(),
+            [
+                Some(ModelInputContractId::YuNetLetterbox640V1),
+                Some(ModelInputContractId::ArcFace112RgbV1),
+                Some(ModelInputContractId::VitRgbPadM96V1),
+                Some(ModelInputContractId::FlirIrPad112V1),
+                Some(ModelInputContractId::BlazeFaceLetterbox128V1),
+                Some(ModelInputContractId::BlazeFaceFullRangeLetterbox192V1),
+                Some(ModelInputContractId::FaceMesh192RgbV1),
+                Some(ModelInputContractId::FaceMesh256RgbV1),
             ]
         );
 

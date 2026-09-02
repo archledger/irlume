@@ -30,6 +30,7 @@
 //! RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
+pub mod attempt_contract;
 mod backend;
 pub mod capability_inventory;
 pub mod capture_qualification;
@@ -53,7 +54,9 @@ pub mod lease;
 mod lifecycle;
 mod media_graph;
 pub mod profile;
+pub mod profile_qualification;
 mod rate_gate;
+mod release_qualification;
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.
@@ -1014,6 +1017,97 @@ fn negotiate_interval_after_format<S: CameraState>(
         requested,
         accepted,
     })
+}
+
+fn negotiate_exact_interval_after_format<S: CameraState>(
+    state: &S,
+    device: &str,
+    dev: &S::Device,
+    accepted_format: &Format,
+    requested: frame_interval::FrameInterval,
+) -> irlume_common::Result<NegotiatedInterval> {
+    state
+        .require_endpoint()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let domain = state.interval_domain(dev, accepted_format)?;
+    let query = frame_interval::FrameIntervalQuery::new(
+        accepted_format.fourcc.repr,
+        accepted_format.width,
+        accepted_format.height,
+    )
+    .map_err(|error| Error::Hardware(format!("{device}: {error}")))?;
+    if !domain.contains(requested) {
+        let (numerator, denominator) = requested.parts();
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: exact profile interval {numerator}/{denominator} was not advertised"
+        )));
+    }
+    let accepted = state.set_interval(dev, query, requested, "exact profile request")?;
+    if accepted != requested {
+        let (requested_num, requested_den) = requested.parts();
+        let (accepted_num, accepted_den) = accepted.parts();
+        return Err(Error::Hardware(format!(
+            "{device}: {query:?}: driver adjusted exact profile interval from \
+             {requested_num}/{requested_den} to {accepted_num}/{accepted_den}"
+        )));
+    }
+    verify_stream_state(
+        state,
+        device,
+        dev,
+        accepted_format,
+        accepted,
+        "after exact profile negotiation",
+    )?;
+    Ok(NegotiatedInterval {
+        requested,
+        accepted,
+    })
+}
+
+fn set_exact_profile_format<S: CameraState>(
+    state: &S,
+    device: &str,
+    dev: &S::Device,
+    tuple: &profile::StreamTuple,
+) -> irlume_common::Result<Format> {
+    let fourcc = match (tuple.role(), tuple.format()) {
+        (contracts::StreamRole::Rgb, profile::DecodedPixelFormat::Yuyv) => b"YUYV",
+        (contracts::StreamRole::Rgb, profile::DecodedPixelFormat::Nv12) => b"NV12",
+        (contracts::StreamRole::Ir, profile::DecodedPixelFormat::Yuyv) => b"YUYV",
+        (contracts::StreamRole::Ir, profile::DecodedPixelFormat::Nv12) => b"NV12",
+        (contracts::StreamRole::Ir, profile::DecodedPixelFormat::Grey8) => b"GREY",
+        (contracts::StreamRole::Ir, profile::DecodedPixelFormat::Grey16) => b"Y16 ",
+        _ => {
+            return Err(Error::Hardware(format!(
+                "{device}: decoded format {:?} is invalid for {:?} stream role",
+                tuple.format(),
+                tuple.role()
+            )))
+        }
+    };
+    state
+        .require_endpoint()
+        .map_err(|error| Error::Hardware(error.to_string()))?;
+    let requested = Format::new(tuple.width(), tuple.height(), FourCC::new(fourcc));
+    let accepted = state
+        .set_format(dev, &requested)
+        .map_err(|error| Error::Hardware(format!("{device}: set exact profile format: {error}")))?;
+    if accepted.fourcc.repr != requested.fourcc.repr
+        || accepted.width != requested.width
+        || accepted.height != requested.height
+    {
+        return Err(Error::Hardware(format!(
+            "{device}: driver adjusted exact profile format from {} {}x{} to {} {}x{}",
+            fourcc_str(&requested.fourcc.repr),
+            requested.width,
+            requested.height,
+            fourcc_str(&accepted.fourcc.repr),
+            accepted.width,
+            accepted.height
+        )));
+    }
+    Ok(accepted)
 }
 
 fn verify_stream_state<S: CameraState>(
@@ -3653,6 +3747,25 @@ impl conditioning::ControlIo for RgbCamera {
     }
 }
 
+fn diagnostic_profile_lease(device: &str) -> irlume_common::Result<lease::CameraLease> {
+    if let Some(lease) =
+        lease::active_permit(device).map_err(|error| Error::Hardware(error.to_string()))?
+    {
+        if lease.operation() != lease::CameraOperationKind::Diagnostics {
+            return Err(Error::Hardware(format!(
+                "{device}: exact profile opens require a diagnostics operation lease"
+            )));
+        }
+        return Ok(lease);
+    }
+    lease::permit_for_endpoint(
+        device,
+        lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| Error::Hardware(error.to_string()))
+}
+
 impl RgbCamera {
     /// Verify, open and negotiate. Does not start streaming: no buffers are
     /// allocated and the capture LED stays off until a session is opened.
@@ -3676,6 +3789,24 @@ impl RgbCamera {
             Err(error) => return Err(Error::Hardware(error.to_string())),
         };
         backend::open_rgb(device, operation.into_lease())
+    }
+
+    /// Open one exact stream tuple under a diagnostics operation lease.
+    ///
+    /// This entry point is for qualification diagnostics and tests. Production
+    /// capture continues to use [`Self::open`] and its established defaults.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn open_profile(
+        device: &str,
+        profile: &profile::StreamTuple,
+    ) -> irlume_common::Result<Self> {
+        if profile.role() != contracts::StreamRole::Rgb {
+            return Err(Error::Hardware(format!(
+                "{device}: RGB profile open requires the RGB stream role"
+            )));
+        }
+        let lease = diagnostic_profile_lease(device)?;
+        backend::open_rgb_profile(device, lease, profile)
     }
 
     fn open_uvc(device: &str, lease: lease::CameraLease) -> irlume_common::Result<Self> {
@@ -3722,6 +3853,44 @@ impl RgbCamera {
         })
     }
 
+    fn open_uvc_profile(
+        device: &str,
+        lease: lease::CameraLease,
+        profile: &profile::StreamTuple,
+    ) -> irlume_common::Result<Self> {
+        let state = V4l2CameraState::new(device, lease.clone());
+        state
+            .require_endpoint()
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        verify_pinned(device)?;
+        if privacy_engaged_with_permit(device) {
+            return Err(Error::Hardware(format!(
+                "{device}: hardware privacy switch is ON"
+            )));
+        }
+        let dev = Device::with_path(device).map_err(|error| map_io(device, error))?;
+        let format = set_exact_profile_format(&state, device, &dev, profile)?;
+        let interval = negotiate_exact_interval_after_format(
+            &state,
+            device,
+            &dev,
+            &format,
+            profile.interval(),
+        )?;
+        Ok(Self {
+            lease,
+            session_active: std::sync::atomic::AtomicBool::new(false),
+            device: device.to_owned(),
+            dev,
+            chosen: format.fourcc.repr,
+            width: format.width,
+            height: format.height,
+            negotiated: format,
+            requested_interval: interval.requested,
+            accepted_interval: interval.accepted,
+        })
+    }
+
     /// Start streaming. The returned session holds the buffers and the running
     /// stream until it is dropped, so keep it exactly as long as the burst of
     /// captures that needs it and no longer.
@@ -3738,6 +3907,31 @@ impl RgbCamera {
     pub fn session_with_progress(
         &self,
         progress: &Progress,
+    ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress_and_conditioning(progress, None)
+    }
+
+    fn session_with_conditioning(
+        &self,
+        selection: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress_and_conditioning(&no_progress(), Some(selection))
+    }
+
+    /// Opens a session with one immutable plan-selected conditioning policy.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn session_with_selected_conditioning(
+        &self,
+        progress: &Progress,
+        selection: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_progress_and_conditioning(progress, Some(selection))
+    }
+
+    fn session_with_progress_and_conditioning(
+        &self,
+        progress: &Progress,
+        selection: Option<conditioning::ConditioningSelection>,
     ) -> irlume_common::Result<RgbSession<'_>> {
         self.lease
             .require_endpoint(&self.device)
@@ -3759,7 +3953,24 @@ impl RgbCamera {
         // it. Guard rather than session-drop bookkeeping, because a stream
         // open that fails below must restore too, and the first version did
         // not (the Codex round's finding 1 on this PR).
-        let conditioning_restore = apply_default_conditioning(self);
+        let conditioning_restore = if let Some(selection) = selection {
+            let catalog = conditioning::current_catalog();
+            if catalog.version() != selection.catalog_version() {
+                return Err(Error::Hardware(
+                    "selected conditioning catalog is no longer current".into(),
+                ));
+            }
+            Some(
+                conditioning::apply_selected_policy(
+                    self,
+                    selection,
+                    catalog.policy(selection.policy_id()),
+                )
+                .map_err(|error| Error::Hardware(error.to_string()))?,
+            )
+        } else {
+            apply_default_conditioning(self)
+        };
         let stream = SafeStream::open(
             V4l2CameraState::with_interval(
                 &self.device,
@@ -3824,8 +4035,8 @@ impl RgbCamera {
             )?,
             capture_qualification::StreamContract::from_negotiated(
                 capture_qualification::QualifiedStreamRole::Rgb,
-                RGB_W,
-                RGB_H,
+                self.width,
+                self.height,
                 self.chosen,
                 self.requested_interval,
                 &self.negotiated,
@@ -4037,6 +4248,66 @@ pub struct RgbSession<'a> {
 }
 
 impl<'a> RgbSession<'a> {
+    /// Applies the selected policy around the next held-session evidence window.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn ensure_conditioning(
+        &mut self,
+        expected: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<()> {
+        if let Some(guard) = self._conditioning_restore.as_ref() {
+            if guard.selection() == Some(expected) {
+                return Ok(());
+            }
+            return Err(Error::Hardware("selected conditioning changed".into()));
+        }
+        let catalog = conditioning::current_catalog();
+        if catalog.version() != expected.catalog_version() {
+            return Err(Error::Hardware(
+                "selected conditioning catalog is no longer current".into(),
+            ));
+        }
+        self._conditioning_restore = Some(
+            conditioning::apply_selected_policy(
+                self.cam,
+                expected,
+                catalog.policy(expected.policy_id()),
+            )
+            .map_err(|error| Error::Hardware(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    /// Restores exact displaced values after one conditioned evidence window.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn restore_conditioning(
+        &mut self,
+        expected: conditioning::ConditioningSelection,
+    ) -> irlume_common::Result<conditioning::ConditioningRestoration> {
+        let guard = self
+            ._conditioning_restore
+            .take()
+            .ok_or_else(|| Error::Hardware("selected conditioning was not applied".into()))?;
+        if guard.selection() != Some(expected) {
+            return Err(Error::Hardware("selected conditioning changed".into()));
+        }
+        guard
+            .restore()
+            .map_err(|error| Error::Hardware(error.to_string()))
+    }
+
+    fn finish_conditioning(self) -> irlume_common::Result<conditioning::ConditioningRestoration> {
+        let RgbSession {
+            stream,
+            _conditioning_restore: conditioning_restore,
+            ..
+        } = self;
+        drop(stream);
+        conditioning_restore
+            .ok_or_else(|| Error::Hardware("selected conditioning was not applied".into()))?
+            .restore()
+            .map_err(|error| Error::Hardware(error.to_string()))
+    }
+
     /// Rebuild this session's stream on the SAME open device after a
     /// mid-stream fault.
     ///
@@ -4770,6 +5041,30 @@ pub fn capture_rgb_denoised_with_progress(
     )?)
 }
 
+/// Captures canonical RGB evidence under one immutable conditioning selection.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn capture_rgb_denoised_with_progress_and_conditioning(
+    device: &str,
+    progress: &Progress,
+    selection: conditioning::ConditioningSelection,
+) -> irlume_common::Result<(CanonicalRgbEvidence, conditioning::ConditioningRestoration)> {
+    let opened = std::time::Instant::now();
+    let cam = RgbCamera::open(device)?;
+    let open_ms = opened.elapsed().as_millis();
+    let armed = std::time::Instant::now();
+    let mut session = cam.session_with_selected_conditioning(progress, selection)?;
+    let arm_ms = armed.elapsed().as_millis();
+    let captured = std::time::Instant::now();
+    let evidence = session.denoised()?;
+    let proof = session.finish_conditioning()?;
+    let capture_ms = captured.elapsed().as_millis();
+    irlume_common::dlog!(
+        "{}",
+        capture_stage_summary("rgb", device, open_ms, arm_ms, capture_ms)
+    );
+    Ok((evidence, proof))
+}
+
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
 /// across the burst, keeps the middle value). Returns the lone frame unchanged
 /// for a degenerate burst. Private on purpose: callers must pass at least one
@@ -4911,6 +5206,24 @@ impl IrCamera {
         backend::open_ir(device, operation.into_lease())
     }
 
+    /// Open one exact stream tuple under a diagnostics operation lease.
+    ///
+    /// This entry point is for qualification diagnostics and tests. Production
+    /// capture continues to use [`Self::open`] and its established defaults.
+    #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+    pub fn open_profile(
+        device: &str,
+        profile: &profile::StreamTuple,
+    ) -> irlume_common::Result<Self> {
+        if profile.role() != contracts::StreamRole::Ir {
+            return Err(Error::Hardware(format!(
+                "{device}: IR profile open requires the IR stream role"
+            )));
+        }
+        let lease = diagnostic_profile_lease(device)?;
+        backend::open_ir_profile(device, lease, profile)
+    }
+
     fn open_uvc(device: &str, lease: lease::CameraLease) -> irlume_common::Result<Self> {
         let state = V4l2CameraState::new(device, lease.clone());
         state
@@ -4935,6 +5248,50 @@ impl IrCamera {
             accepted_interval: interval.accepted,
             width: fmt.width,
             height: fmt.height,
+            card,
+        })
+    }
+
+    fn open_uvc_profile(
+        device: &str,
+        lease: lease::CameraLease,
+        profile: &profile::StreamTuple,
+    ) -> irlume_common::Result<Self> {
+        let state = V4l2CameraState::new(device, lease.clone());
+        state
+            .require_endpoint()
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        verify_pinned(device)?;
+        let dev = Device::with_path(device).map_err(|error| map_io(device, error))?;
+        require_ir_privacy_released(device, &dev, "before exact IR negotiation")?;
+        let format = set_exact_profile_format(&state, device, &dev, profile)?;
+        let interval = negotiate_exact_interval_after_format(
+            &state,
+            device,
+            &dev,
+            &format,
+            profile.interval(),
+        )?;
+        let pixel = match profile.format() {
+            profile::DecodedPixelFormat::Grey8 => IrPixel::Grey8,
+            profile::DecodedPixelFormat::Grey16 => IrPixel::Grey16,
+            profile::DecodedPixelFormat::Nv12 => IrPixel::Nv12Luma,
+            profile::DecodedPixelFormat::Yuyv => IrPixel::YuyvLuma,
+        };
+        let card = dev.query_caps().map(|caps| caps.card).unwrap_or_default();
+        Ok(Self {
+            lease,
+            session_active: std::sync::atomic::AtomicBool::new(false),
+            device: device.to_owned(),
+            dev,
+            pix: pixel,
+            quantization: format.quantization,
+            fourcc: fourcc_str(&format.fourcc.repr),
+            negotiated: format,
+            requested_interval: interval.requested,
+            accepted_interval: interval.accepted,
+            width: profile.width(),
+            height: profile.height(),
             card,
         })
     }
@@ -4973,8 +5330,8 @@ impl IrCamera {
             )?,
             capture_qualification::StreamContract::from_negotiated(
                 capture_qualification::QualifiedStreamRole::Ir,
-                IR_W,
-                IR_H,
+                self.width,
+                self.height,
                 self.negotiated.fourcc.repr,
                 self.requested_interval,
                 &self.negotiated,
@@ -7114,6 +7471,83 @@ pub struct StoredCaptureQualificationState {
     pub last_attempt_outcome: Option<capture_qualification::AttemptOutcome>,
     pub authoritative_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
     pub latest_attempt_rate_shortfalls: Option<irlume_common::diagnostics::RateShortfallsByArm>,
+    attempt_authority: Option<StoredAttemptQualificationAuthority>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoredAttemptQualificationAuthority {
+    producer_engine_version: u32,
+    policy_version: u32,
+    invalidation_generation: u64,
+    resolution: capture_qualification::QualificationResolution,
+}
+
+impl StoredAttemptQualificationAuthority {
+    pub(crate) const fn producer_engine_version(self) -> u32 {
+        self.producer_engine_version
+    }
+
+    pub(crate) const fn policy_version(self) -> u32 {
+        self.policy_version
+    }
+
+    pub(crate) const fn invalidation_generation(self) -> u64 {
+        self.invalidation_generation
+    }
+
+    pub(crate) const fn resolution(self) -> capture_qualification::QualificationResolution {
+        self.resolution
+    }
+}
+
+impl StoredCaptureQualificationState {
+    #[must_use]
+    pub fn unqualified(
+        runtime_key: impl Into<String>,
+        mismatch: capture_qualification::QualificationMismatch,
+    ) -> Self {
+        Self {
+            resolution: capture_qualification::QualificationResolution::Unqualified(mismatch),
+            runtime_key: runtime_key.into(),
+            last_attempt_outcome: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
+            attempt_authority: None,
+        }
+    }
+
+    pub(crate) const fn attempt_authority(&self) -> Option<StoredAttemptQualificationAuthority> {
+        self.attempt_authority
+    }
+
+    #[cfg(test)]
+    fn qualified_for_test(
+        runtime_key: &str,
+        resolution: capture_qualification::QualificationResolution,
+        invalidation_generation: u64,
+    ) -> Self {
+        Self {
+            resolution,
+            runtime_key: runtime_key.into(),
+            last_attempt_outcome: None,
+            authoritative_rate_shortfalls: None,
+            latest_attempt_rate_shortfalls: None,
+            attempt_authority: Some(StoredAttemptQualificationAuthority {
+                producer_engine_version: capture_qualification::PRODUCER_ENGINE_VERSION,
+                policy_version: capture_qualification::POLICY_VERSION,
+                invalidation_generation,
+                resolution,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn unqualified_for_test(
+        runtime_key: &str,
+        mismatch: capture_qualification::QualificationMismatch,
+    ) -> Self {
+        Self::unqualified(runtime_key, mismatch)
+    }
 }
 
 /// Exact live contract a concurrent production pair must satisfy before use.
@@ -7134,6 +7568,16 @@ impl RuntimePairContract {
     #[must_use]
     pub fn runtime_key(&self) -> &str {
         &self.runtime_key
+    }
+
+    #[must_use]
+    pub const fn rgb_binding(&self) -> &frame_provenance::FrameBinding {
+        &self.rgb_binding
+    }
+
+    #[must_use]
+    pub const fn ir_binding(&self) -> &frame_provenance::FrameBinding {
+        &self.ir_binding
     }
 
     /// Current RGB camera incarnation captured by this contract.
@@ -7555,12 +7999,28 @@ fn resolve_capture_qualification_record(
         }
         capture_qualification::QualificationResolution::Unqualified(_) => None,
     };
+    let attempt_authority = record.as_ref().and_then(|record| {
+        let authoritative = record.authoritative()?;
+        match resolution {
+            capture_qualification::QualificationResolution::ConcurrentQualified
+            | capture_qualification::QualificationResolution::SequentialRequired(_) => {
+                Some(StoredAttemptQualificationAuthority {
+                    producer_engine_version: authoritative.producer_engine_version(),
+                    policy_version: record.policy_version(),
+                    invalidation_generation: record.revision(),
+                    resolution,
+                })
+            }
+            capture_qualification::QualificationResolution::Unqualified(_) => None,
+        }
+    });
     StoredCaptureQualificationState {
         resolution,
         runtime_key,
         last_attempt_outcome,
         authoritative_rate_shortfalls,
         latest_attempt_rate_shortfalls,
+        attempt_authority,
     }
 }
 
@@ -9879,6 +10339,99 @@ mod tests {
     }
 
     #[test]
+    fn profile_interval_negotiation_rejects_adjustment_and_requires_exact_readback() {
+        let format = fake_format(b"GREY");
+        let requested = interval(1, 15);
+        let (mut exact, calls) = FakeCameraState::new(format);
+        exact.interval_domain =
+            frame_interval::FrameIntervalDomain::discrete(vec![interval(1, 30), requested])
+                .unwrap();
+        exact.set_interval_response = requested;
+        exact.current_interval = requested;
+        let evidence =
+            negotiate_exact_interval_after_format(&exact, "/dev/fake", &(), &format, requested)
+                .expect("exact advertised interval");
+        assert_eq!(evidence.requested, requested);
+        assert_eq!(evidence.accepted, requested);
+        assert!(calls.borrow().contains(&"set_interval"));
+
+        let (mut adjusted, _) = FakeCameraState::new(format);
+        adjusted.interval_domain =
+            frame_interval::FrameIntervalDomain::discrete(vec![interval(1, 30), requested])
+                .unwrap();
+        adjusted.set_interval_response = interval(1, 30);
+        assert!(negotiate_exact_interval_after_format(
+            &adjusted,
+            "/dev/fake",
+            &(),
+            &format,
+            requested,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("adjusted exact profile interval"));
+
+        let (outside, calls) = FakeCameraState::new(format);
+        assert!(negotiate_exact_interval_after_format(
+            &outside,
+            "/dev/fake",
+            &(),
+            &format,
+            requested,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not advertised"));
+        assert!(!calls.borrow().contains(&"set_interval"));
+    }
+
+    #[test]
+    fn profile_format_request_rejects_role_format_or_geometry_adjustment() {
+        let requested = profile::StreamTuple::new(
+            contracts::StreamRole::Ir,
+            profile::DecodedPixelFormat::Grey8,
+            2,
+            2,
+            interval(1, 30),
+        )
+        .unwrap();
+        let format = fake_format(b"GREY");
+        let (exact, _) = FakeCameraState::new(format);
+        let accepted = set_exact_profile_format(&exact, "/dev/fake", &(), &requested)
+            .expect("exact profile format");
+        assert_eq!(accepted.fourcc.repr, format.fourcc.repr);
+        assert_eq!(
+            (accepted.width, accepted.height),
+            (format.width, format.height)
+        );
+
+        let wrong_role = profile::StreamTuple::new(
+            contracts::StreamRole::Rgb,
+            profile::DecodedPixelFormat::Grey8,
+            2,
+            2,
+            interval(1, 30),
+        )
+        .unwrap();
+        assert!(
+            set_exact_profile_format(&exact, "/dev/fake", &(), &wrong_role)
+                .unwrap_err()
+                .to_string()
+                .contains("role")
+        );
+
+        let mut adjusted_format = format;
+        adjusted_format.width = 4;
+        let (adjusted, _) = FakeCameraState::new(adjusted_format);
+        assert!(
+            set_exact_profile_format(&adjusted, "/dev/fake", &(), &requested)
+                .unwrap_err()
+                .to_string()
+                .contains("adjusted exact profile format")
+        );
+    }
+
+    #[test]
     fn factory_post_set_readback_detects_every_full_format_field() {
         let format = fake_format(b"GREY");
         let mut moved = Vec::new();
@@ -11720,20 +12273,31 @@ mod tests {
         fourcc: &str,
         interval: (u32, u32),
     ) -> capture_qualification::StreamContract {
+        runtime_gate_adjusted_stream(role, fourcc, (4, 1), fourcc, (4, 1), interval)
+    }
+
+    fn runtime_gate_adjusted_stream(
+        role: capture_qualification::QualifiedStreamRole,
+        requested_fourcc: &str,
+        requested_geometry: (u32, u32),
+        accepted_fourcc: &str,
+        accepted_geometry: (u32, u32),
+        interval: (u32, u32),
+    ) -> capture_qualification::StreamContract {
         use capture_qualification::{AcceptedStream, ExactInterval, ExactRate, RequestedStream};
         capture_qualification::StreamContract::new(
             role,
             RequestedStream::new(
-                4,
-                1,
-                fourcc.into(),
+                requested_geometry.0,
+                requested_geometry.1,
+                requested_fourcc.into(),
                 ExactInterval::new(interval.0, interval.1).unwrap(),
             )
             .unwrap(),
             AcceptedStream::new(
-                4,
-                1,
-                fourcc.into(),
+                accepted_geometry.0,
+                accepted_geometry.1,
+                accepted_fourcc.into(),
                 4,
                 4,
                 0,
@@ -11800,6 +12364,319 @@ mod tests {
 
     fn runtime_gate_contract() -> RuntimePairContract {
         runtime_gate_contract_with_interval((2, 15))
+    }
+
+    fn camera_attempt_fixture(
+        schedule: profile::CaptureSchedule,
+        pair_bound: std::time::Duration,
+    ) -> attempt_contract::CameraAttemptContract {
+        use capture_qualification::QualifiedStreamRole;
+
+        let context = capture_qualification::QualificationContext::new(
+            runtime_gate_endpoint(QualifiedStreamRole::Rgb, 0),
+            runtime_gate_endpoint(QualifiedStreamRole::Ir, 1),
+            runtime_gate_stream(QualifiedStreamRole::Rgb, "YUYV", (2, 15)),
+            runtime_gate_stream(QualifiedStreamRole::Ir, "GREY", (2, 15)),
+        )
+        .unwrap();
+        let instance = contracts::CameraInstanceId::new("a".repeat(32)).unwrap();
+        let runtime = RuntimePairContract {
+            context: context.clone(),
+            rgb_binding: frame_provenance::FrameBinding::new(
+                instance.clone(),
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Rgb,
+            ),
+            ir_binding: frame_provenance::FrameBinding::new(
+                instance.clone(),
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Ir,
+            ),
+            runtime_key: "attempt-runtime-key".into(),
+        };
+        let interval = frame_interval::FrameInterval::new(2, 15).unwrap();
+        let profile = profile::PairTransportProfile::new(
+            "attempt-profile-v1",
+            profile::StreamTuple::new(
+                contracts::StreamRole::Rgb,
+                profile::DecodedPixelFormat::Yuyv,
+                4,
+                1,
+                interval,
+            )
+            .unwrap(),
+            profile::StreamTuple::new(
+                contracts::StreamRole::Ir,
+                profile::DecodedPixelFormat::Grey8,
+                4,
+                1,
+                interval,
+            )
+            .unwrap(),
+            schedule,
+        )
+        .unwrap();
+        let conditioning_context = conditioning::ConditioningContext::new(
+            instance,
+            contracts::CameraGeneration::INITIAL,
+            context.rgb_endpoint().connection().clone(),
+            profile.clone(),
+        );
+        let conditioning = conditioning::current_catalog().select(
+            &conditioning_context,
+            std::time::Instant::now(),
+            conditioning::ConditioningAttempt::First,
+        );
+        attempt_contract::CameraAttemptContract::new(
+            runtime,
+            profile,
+            conditioning_context,
+            conditioning,
+            attempt_contract::EvidenceWindowRules::new(1, 1, pair_bound, 1).unwrap(),
+            attempt_contract::QualificationAuthority::new(1, 1, 0, true).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn immutable_camera_attempt_rejects_schedule_drift_and_mints_from_exact_manifests() {
+        let contract = camera_attempt_fixture(
+            profile::CaptureSchedule::Concurrent,
+            std::time::Duration::from_secs(1),
+        );
+        let changed = camera_attempt_fixture(
+            profile::CaptureSchedule::Sequential,
+            std::time::Duration::from_secs(1),
+        );
+        assert_eq!(
+            contract.validate_contract(&changed),
+            Err(attempt_contract::CapturePlanViolation::CaptureSchedule)
+        );
+
+        let rgb = CanonicalRgbEvidence::from_temporal_median(vec![runtime_gate_frame(
+            contracts::StreamRole::Rgb,
+            Spectrum::Rgb,
+            contracts::IlluminationProvenance::Unknown,
+            'a',
+            1,
+            *b"YUYV",
+            true,
+            false,
+        )])
+        .unwrap();
+        let ir = CanonicalIrEvidence::from_test_frame(
+            runtime_gate_frame(
+                contracts::StreamRole::Ir,
+                Spectrum::Ir,
+                contracts::IlluminationProvenance::ActiveIr,
+                'a',
+                1,
+                *b"GREY",
+                true,
+                false,
+            ),
+            stats(80.0),
+        )
+        .unwrap();
+        let statistics = conditioning::SceneStatistics::new(
+            conditioning::BrightnessDistribution::new(20, 80, 160).unwrap(),
+            0,
+            80,
+            conditioning::IlluminationFacts::new(false, true),
+        )
+        .unwrap();
+        let observation = contract
+            .mint_observation(
+                contract.runtime(),
+                contract.profile(),
+                contract.conditioning_context(),
+                contract.conditioning(),
+                conditioning::ConditioningRestoration::for_test(contract.conditioning()),
+                &rgb,
+                &ir,
+                statistics,
+            )
+            .unwrap();
+        assert_eq!(
+            observation.freshness_start(),
+            rgb.capture_window().start.min(ir.capture_window().start)
+        );
+
+        let narrow = camera_attempt_fixture(
+            profile::CaptureSchedule::Concurrent,
+            std::time::Duration::from_nanos(1),
+        );
+        assert!(matches!(
+            narrow.mint_observation(
+                narrow.runtime(),
+                narrow.profile(),
+                narrow.conditioning_context(),
+                narrow.conditioning(),
+                conditioning::ConditioningRestoration::for_test(narrow.conditioning()),
+                &rgb,
+                &ir,
+                statistics,
+            ),
+            Err(attempt_contract::CapturePlanViolation::EvidencePairWindow)
+        ));
+
+        let current = attempt_contract::CameraAttemptContract::from_runtime(
+            contract.runtime().clone(),
+            profile::CaptureSchedule::Concurrent,
+            attempt_contract::QualificationAuthority::new(1, 1, 1, true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current.evidence_windows().rgb_contributors(), RGB_BURST);
+        assert_eq!(current.evidence_windows().ir_contributors(), IR_BURST);
+        assert_eq!(
+            current.evidence_windows().role_pair_bound(),
+            attempt_contract::EVIDENCE_PAIR_BOUND_V1
+        );
+    }
+
+    #[test]
+    fn immutable_camera_attempt_names_an_ir_tuple_mismatch() {
+        let contract = camera_attempt_fixture(
+            profile::CaptureSchedule::Concurrent,
+            std::time::Duration::from_secs(1),
+        );
+        let rgb = CanonicalRgbEvidence::from_temporal_median(vec![runtime_gate_frame(
+            contracts::StreamRole::Rgb,
+            Spectrum::Rgb,
+            contracts::IlluminationProvenance::Unknown,
+            'a',
+            1,
+            *b"YUYV",
+            true,
+            false,
+        )])
+        .unwrap();
+        let ir = CanonicalIrEvidence::from_test_frame(
+            runtime_gate_frame(
+                contracts::StreamRole::Ir,
+                Spectrum::Ir,
+                contracts::IlluminationProvenance::ActiveIr,
+                'a',
+                1,
+                *b"Y16 ",
+                true,
+                false,
+            ),
+            stats(80.0),
+        )
+        .unwrap();
+
+        assert_eq!(
+            contract.validate_canonical_pair(&rgb, &ir),
+            Err(attempt_contract::CapturePlanViolation::IrTuple)
+        );
+    }
+
+    #[test]
+    fn normal_attempt_preserves_driver_adjusted_requested_and_accepted_ir_tuples() {
+        use capture_qualification::QualifiedStreamRole;
+
+        let context = capture_qualification::QualificationContext::new(
+            runtime_gate_endpoint(QualifiedStreamRole::Rgb, 0),
+            runtime_gate_endpoint(QualifiedStreamRole::Ir, 1),
+            runtime_gate_stream(QualifiedStreamRole::Rgb, "YUYV", (2, 15)),
+            runtime_gate_adjusted_stream(
+                QualifiedStreamRole::Ir,
+                "GREY",
+                (640, 400),
+                "GREY",
+                (4, 1),
+                (2, 15),
+            ),
+        )
+        .unwrap();
+        let instance = contracts::CameraInstanceId::new("a".repeat(32)).unwrap();
+        let runtime = RuntimePairContract {
+            context,
+            rgb_binding: frame_provenance::FrameBinding::new(
+                instance.clone(),
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Rgb,
+            ),
+            ir_binding: frame_provenance::FrameBinding::new(
+                instance,
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Ir,
+            ),
+            runtime_key: "adjusted-attempt-runtime-key".into(),
+        };
+
+        let qualification = StoredCaptureQualificationState::qualified_for_test(
+            runtime.runtime_key(),
+            capture_qualification::QualificationResolution::SequentialRequired(
+                capture_qualification::SequentialReason::ConcurrentUnavailable,
+            ),
+            7,
+        );
+        let contract = attempt_contract::CameraAttemptContract::from_qualified_runtime(
+            runtime,
+            &qualification,
+            profile::CaptureSchedule::Sequential,
+        )
+        .expect("normal runtime authority permits a legitimate driver adjustment");
+
+        assert_eq!(contract.profile().requested_ir().width(), 640);
+        assert_eq!(contract.profile().requested_ir().height(), 400);
+        assert_eq!(contract.profile().accepted_ir().width(), 4);
+        assert_eq!(contract.profile().accepted_ir().height(), 1);
+        assert_eq!(contract.qualification().invalidation_generation(), 7);
+    }
+
+    #[test]
+    fn camera_attempt_rejects_unavailable_and_mismatched_qualification_authority() {
+        let runtime = runtime_gate_contract_with_interval((2, 15));
+        let unavailable = StoredCaptureQualificationState::unqualified_for_test(
+            runtime.runtime_key(),
+            capture_qualification::QualificationMismatch::NoAuthority,
+        );
+        assert_eq!(
+            attempt_contract::CameraAttemptContract::from_qualified_runtime(
+                runtime.clone(),
+                &unavailable,
+                profile::CaptureSchedule::Sequential,
+            )
+            .unwrap_err(),
+            attempt_contract::CapturePlanViolation::Qualification
+        );
+
+        let mismatched = StoredCaptureQualificationState::qualified_for_test(
+            "different-runtime-key",
+            capture_qualification::QualificationResolution::ConcurrentQualified,
+            8,
+        );
+        assert_eq!(
+            attempt_contract::CameraAttemptContract::from_qualified_runtime(
+                runtime,
+                &mismatched,
+                profile::CaptureSchedule::Concurrent,
+            )
+            .unwrap_err(),
+            attempt_contract::CapturePlanViolation::Qualification
+        );
+    }
+
+    #[test]
+    fn camera_attempt_requires_matching_conditioning_restoration_before_inference() {
+        let contract = camera_attempt_fixture(
+            profile::CaptureSchedule::Concurrent,
+            attempt_contract::EVIDENCE_PAIR_BOUND_V1,
+        );
+        let matching = conditioning::ConditioningRestoration::for_test(contract.conditioning());
+        assert_eq!(contract.validate_conditioning_restoration(matching), Ok(()));
+
+        let changed = conditioning::ConditioningRestoration::with_policy_for_test(
+            contract.conditioning(),
+            conditioning::ConditioningPolicyId::BacklitAuto,
+        );
+        assert_eq!(
+            contract.validate_conditioning_restoration(changed),
+            Err(attempt_contract::CapturePlanViolation::Conditioning)
+        );
     }
 
     fn qualification_arm_with_shortfalls(

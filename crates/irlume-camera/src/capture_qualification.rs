@@ -286,7 +286,7 @@ impl CameraEndpoint {
         )
     }
 
-    fn validate(&self) -> Result<(), QualificationError> {
+    pub(crate) fn validate(&self) -> Result<(), QualificationError> {
         if self.descriptor_sha256.len() != 64
             || !self
                 .descriptor_sha256
@@ -327,6 +327,16 @@ impl CameraEndpoint {
     #[cfg(test)]
     fn clear_serial_for_test(&mut self) {
         self.serial = None;
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &ConnectionContext {
+        &self.connection
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> QualifiedStreamRole {
+        self.role
     }
 }
 
@@ -549,6 +559,42 @@ impl StreamContract {
         self.minimum_rate
     }
 
+    pub(crate) fn requested_tuple(&self) -> Option<crate::profile::StreamTuple> {
+        self.tuple_from_parts(
+            self.requested.width,
+            self.requested.height,
+            &self.requested.fourcc,
+            self.requested.interval,
+        )
+    }
+
+    pub(crate) fn accepted_tuple(&self) -> Option<crate::profile::StreamTuple> {
+        self.tuple_from_parts(
+            self.accepted.width,
+            self.accepted.height,
+            &self.accepted.fourcc,
+            self.accepted.interval,
+        )
+    }
+
+    fn tuple_from_parts(
+        &self,
+        width: u32,
+        height: u32,
+        fourcc: &str,
+        interval: ExactInterval,
+    ) -> Option<crate::profile::StreamTuple> {
+        let role = match self.role {
+            QualifiedStreamRole::Rgb => crate::contracts::StreamRole::Rgb,
+            QualifiedStreamRole::Ir => crate::contracts::StreamRole::Ir,
+        };
+        let fourcc: [u8; 4] = fourcc.as_bytes().try_into().ok()?;
+        let format = crate::profile::DecodedPixelFormat::from_fourcc(fourcc)?;
+        let (numerator, denominator) = interval.parts();
+        let interval = crate::frame_interval::FrameInterval::new(numerator, denominator).ok()?;
+        crate::profile::StreamTuple::new(role, format, width, height, interval).ok()
+    }
+
     pub(crate) fn diagnostic_contracts(
         &self,
     ) -> Result<
@@ -654,7 +700,7 @@ impl QualificationContext {
         Ok(value)
     }
 
-    fn validate(&self) -> Result<(), QualificationError> {
+    pub(crate) fn validate(&self) -> Result<(), QualificationError> {
         if self.rgb_endpoint.role != QualifiedStreamRole::Rgb
             || self.rgb_stream.role != QualifiedStreamRole::Rgb
             || self.ir_endpoint.role != QualifiedStreamRole::Ir
@@ -1058,6 +1104,11 @@ pub struct QualificationAttempt {
 }
 
 impl QualificationAttempt {
+    #[must_use]
+    pub const fn producer_engine_version(&self) -> u32 {
+        self.producer_engine_version
+    }
+
     /// Construct and validate one complete qualification attempt.
     ///
     /// # Errors
@@ -1217,6 +1268,11 @@ pub struct CaptureQualificationRecord {
 }
 
 impl CaptureQualificationRecord {
+    #[must_use]
+    pub const fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
     /// Construct one complete record at `revision`.
     ///
     /// # Errors

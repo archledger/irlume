@@ -92,3 +92,100 @@ The review covered the complete Task 5 change against base `03f90eab4e2402af185e
 ## Commit
 
 Task 5 is committed separately with signed+DCO subject `feat: qualify camera conditioning policies`.
+
+## Fix Round 1
+
+### Findings Addressed
+
+1. The selector previously represented attempt phase as `Option<&SceneObservation>`. A caller could therefore attach an observation without structurally proving that selection was for a later attempt. Selection now takes the closed `ConditioningAttempt` enum: `First` carries no observation authority, while `Later` carries exactly one preceding `SceneObservation`.
+2. `SceneObservation::new` was public, so arbitrary caller-authored statistics could become policy-selection authority. The constructor is removed. Observations are opaque externally and are minted only by a crate-private catalog factory from canonical RGB evidence and optional canonical IR evidence whose camera instance and generation match the exact conditioning context.
+3. The fixed catalog previously required BLC 2 on every represented inventory. BLC is now optional catalog content and is included only when the exact eligible integer request for value 2 passes the represented control domain. Manual policies still reject absent, ineligible, wrong-type, out-of-range, and off-lattice requests.
+
+### RED Evidence
+
+- `cargo test -p irlume-camera --lib conditioning::tests` failed to compile because `ConditioningAttempt` and the inventory-domain fixed-catalog test seam did not exist.
+- `cargo test -p irlume-camera --doc conditioning` failed because the external `SceneObservation::new` construction marked `compile_fail` still compiled successfully.
+- `cargo test -p irlume-camera --lib scene_observation_is_derived_from_canonical_camera_evidence` failed to compile because the canonical-evidence observation factory and catalog seam did not exist.
+
+### GREEN Evidence
+
+- `cargo test -p irlume-camera --lib conditioning::tests`: 17 passed, 0 failed.
+- `cargo test -p irlume-camera --doc conditioning`: 1 compile-fail test passed.
+- `cargo test -p irlume-camera --lib scene_observation_is_derived_from_canonical_camera_evidence`: 1 passed, 0 failed.
+- `cargo test -p irlume-camera --lib ir_emitter::tests`: 129 passed, 0 failed.
+- `cargo test -p irlume-camera --all-targets`: 652 passed, 0 failed, 26 declared hardware tests ignored.
+- `cargo test --workspace --all-targets --locked`: 1,977 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo check --workspace --all-targets --locked`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- Added-line U+2014 check: no matches.
+- All seven model assets passed `models/SHA256SUMS`; six temporary ONNX links were removed after verification.
+
+### Behavior And Authority Review
+
+- Current production still calls only `current_safe_default`; later-attempt selection and observation derivation remain a Task 6 seam.
+- First-attempt selection cannot carry an observation. Later-attempt selection retains exact context, catalog version, monotonic future-time rejection, and the fixed 30-second TTL.
+- The observation factory accepts canonical camera evidence only and rejects an RGB or IR camera incarnation mismatch before deriving bounded brightness, clipping, contrast, and illumination facts.
+- Fixed-catalog BLC inclusion reuses the same exact domain validation as manually authored policies. No vendor extension control or emitter ownership changed.
+- Every catalog policy still has identical non-BLC safe settings, so the fix changes neither capture schedule, model input, threshold, authentication policy, nor password fallback.
+- Final differential review found no remaining Critical, Important, or Minor issue in the fix scope.
+
+### Fix Files
+
+- `crates/irlume-camera/src/conditioning.rs`
+- `crates/irlume-camera/src/lib.rs`
+- `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-5-implementer.md`
+
+### Fix Commit
+
+Fix Round 1 is committed separately with signed+DCO subject `fix: close conditioning authority gaps`.
+
+## Fix Round 2
+
+### Findings Addressed
+
+1. Fix Round 1's crate-private `ConditioningCatalog::observe` factory proved only camera instance and generation, then copied caller-supplied connection and full transport-profile facts into a new observation. Canonical evidence does not prove those facts. Task 5 now has no production constructor or factory capable of minting `SceneObservation`.
+2. The removed factory used the later RGB/IR capture end as observation freshness, which allowed fresh evidence from one role to renew older facts from the other. Task 6 now explicitly owns the first production minting path after exact profile opens and complete immutable attempt-plan/evidence validation. Its plan contract uses the oldest contributing capture-window start and rejects RGB/IR windows beyond a fixed, versioned evidence-pair bound.
+
+### RED Evidence
+
+- Added `production_code_has_no_scene_observation_minting_path` before changing production code.
+- `cargo test -p irlume-camera --lib conditioning::tests::production_code_has_no_scene_observation_minting_path` failed 0 passed/1 failed because production still contained `fn observe(`. The failing assertion identified the premature factory directly.
+
+### GREEN Evidence
+
+- `cargo test -p irlume-camera --lib conditioning::tests`: 18 passed, 0 failed.
+- `cargo test -p irlume-camera --doc conditioning`: 1 external-construction compile-fail test passed.
+- `cargo test -p irlume-camera --all-targets`: 652 passed, 0 failed, 26 declared hardware tests ignored.
+- `cargo test --workspace --all-targets --locked`: 1,977 passed, 0 failed, 100 declared environment or hardware tests ignored across 61 result groups.
+- `cargo check --workspace --all-targets --locked`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+- Added-line U+2014 check: no matches.
+- All seven model assets passed `models/SHA256SUMS`; six temporary ONNX links were removed after verification.
+
+### Authority And Design Review
+
+- Removed `ConditioningCatalog::observe`, `evidence_matches_context`, `statistics_from_evidence`, and the partial-context `ObservationContextMismatch` error claim.
+- Removed the camera integration test that depended on the unsound production factory.
+- `SceneObservation` remains externally opaque. Selector TTL, exact-context, catalog-version, and future-time behavior uses an observation helper located only inside the module's `#[cfg(test)]` test module.
+- A source-level regression test checks the non-test portion of `conditioning.rs` for both an observation factory and any `SceneObservation` construction expression. The existing doctest independently proves external construction does not compile.
+- `ConditioningAttempt::First` and `ConditioningAttempt::Later` remain unchanged. Current production still selects only the safe default.
+- The accepted design and Task 6 plan now require camera-owned minting only after exact profile opens plus complete attempt-plan and canonical-evidence validation prove camera incarnation, connection, requested and accepted RGB/IR tuples, schedule, catalog, and manifests.
+- Task 6 freshness is bound to the oldest contributing capture-window start and rejects role windows beyond a fixed, versioned evidence-pair bound. No Task 6 production path was implemented here.
+- The approved optional-BLC construction and manual-policy rejection behavior are unchanged.
+- Final review found no remaining Critical, Important, or Minor issue in the Fix Round 2 scope.
+
+### Fix Files
+
+- `crates/irlume-camera/src/conditioning.rs`
+- `crates/irlume-camera/src/lib.rs`
+- `docs/superpowers/specs/2026-09-01-layered-camera-profile-engine-design.md`
+- `docs/superpowers/plans/2026-09-01-layered-camera-profile-engine.md`
+- `.superpowers/sdd/2026-09-01-layered-camera-profile-engine/task-5-implementer.md`
+
+### Fix Commit
+
+Fix Round 2 is committed separately with signed+DCO subject `fix: remove premature observation authority`.

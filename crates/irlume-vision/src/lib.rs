@@ -777,6 +777,11 @@ mod onnx {
     }
 
     impl Embedder {
+        #[must_use]
+        pub const fn input_contract(&self) -> crate::model_input::ModelInputContractId {
+            crate::model_input::ModelInputContractId::ArcFace112RgbV1
+        }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             let mut runtime = CandidateRuntime::ort_cpu()?;
@@ -1037,6 +1042,11 @@ mod onnx {
     }
 
     impl FaceMesh {
+        #[must_use]
+        pub const fn input_contract(&self) -> crate::model_input::ModelInputContractId {
+            self.input_contract
+        }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             // TFLite flatbuffers carry the "TFL3" identifier at offset 4;
@@ -1290,6 +1300,11 @@ mod onnx {
     }
 
     impl Detector {
+        #[must_use]
+        pub const fn input_contract(&self) -> crate::model_input::ModelInputContractId {
+            crate::model_input::ModelInputContractId::YuNetLetterbox640V1
+        }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             let mut runtime = CandidateRuntime::ort_cpu()?;
@@ -1435,6 +1450,11 @@ mod onnx {
     }
 
     impl BlazeRescue {
+        #[must_use]
+        pub const fn input_contract(&self) -> crate::model_input::ModelInputContractId {
+            crate::model_input::ModelInputContractId::BlazeFaceLetterbox128V1
+        }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             let mut runtime = CandidateRuntime::ort_cpu()?;
@@ -1600,6 +1620,11 @@ mod onnx {
     }
 
     impl PadVit {
+        #[must_use]
+        pub const fn input_contract(&self) -> crate::model_input::ModelInputContractId {
+            crate::model_input::ModelInputContractId::VitRgbPadM96V1
+        }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             let mut runtime = CandidateRuntime::ort_cpu()?;
@@ -1779,6 +1804,11 @@ mod onnx {
     }
 
     impl PadIr {
+        #[must_use]
+        pub const fn input_contract(&self) -> crate::model_input::ModelInputContractId {
+            crate::model_input::ModelInputContractId::FlirIrPad112V1
+        }
+
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             let mut runtime = CandidateRuntime::ort_cpu()?;

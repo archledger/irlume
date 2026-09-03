@@ -265,6 +265,9 @@ impl CameraEndpoint {
     }
 
     /// Collect persistent identity and USB connection facts from a live camera fd.
+    /// Exact paths admitted by the root-controlled virtual-camera test escape
+    /// receive synthetic virtual topology so integration tests can bind an
+    /// unqualified sequential attempt; other non-USB fds remain errors.
     ///
     /// `backend` names the capture implementation that negotiated this endpoint.
     ///
@@ -277,8 +280,21 @@ impl CameraEndpoint {
         role: QualifiedStreamRole,
         backend: &str,
     ) -> Result<Self, QualificationError> {
-        let observed = crate::uvc_descriptor::identity_and_connection_from_fd(fd)
-            .map_err(|error| QualificationError::System(error.to_string()))?;
+        let observed = match crate::uvc_descriptor::identity_and_connection_from_fd(fd) {
+            Ok(observed) => observed,
+            Err(error) => {
+                let fd_path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                    .ok()
+                    .and_then(|path| path.into_os_string().into_string().ok());
+                if let Some(device) = fd_path
+                    .as_deref()
+                    .filter(|device| crate::virtual_camera_allowed(device))
+                {
+                    return Self::virtual_test_endpoint(device, role, backend);
+                }
+                return Err(QualificationError::System(error.to_string()));
+            }
+        };
         let identity = observed.identity;
         let connection = ConnectionContext::new(
             observed.connection.controller_devpath,
@@ -293,6 +309,33 @@ impl CameraEndpoint {
             identity.serial,
             identity.interface_number,
             identity.usb_devpath,
+            role,
+            connection,
+        )
+    }
+
+    fn virtual_test_endpoint(
+        device: &str,
+        role: QualifiedStreamRole,
+        backend: &str,
+    ) -> Result<Self, QualificationError> {
+        let digest = irlume_common::sha256_hex(device.as_bytes());
+        let connection = ConnectionContext::new(
+            "/devices/virtual/video4linux".to_owned(),
+            1,
+            "v4l2loopback".to_owned(),
+            backend.to_owned(),
+        )?;
+        Self::new(
+            digest.clone(),
+            0,
+            0,
+            None,
+            match role {
+                QualifiedStreamRole::Rgb => 0,
+                QualifiedStreamRole::Ir => 1,
+            },
+            format!("/devices/virtual/video4linux/{digest}"),
             role,
             connection,
         )

@@ -1569,6 +1569,147 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
     }
 }
 
+/// Configure the next daemon startup's complete-engine inference policy, or
+/// report configuration separately from the running daemon's resolved device.
+pub fn inference_device(sub: Option<&str>, args: &[String]) -> ExitCode {
+    use irlume_common::config::{
+        ExecutionDevicePolicy, ExecutionDevicePolicySource, EXECUTION_DEVICE_ENV,
+        EXECUTION_DEVICE_KEY,
+    };
+
+    const TAG: &str = "[inference-device]";
+    let valid_shape = args.len() == 2 && args.first().is_some_and(|arg| arg == "inference-device");
+    if !valid_shape {
+        eprintln!("{TAG} usage: irlume inference-device <auto|cpu|npu|status>");
+        return ExitCode::from(2);
+    }
+
+    if sub == Some("status") {
+        let persisted = irlume_common::config::read_kv("settings.conf", EXECUTION_DEVICE_KEY);
+        println!(
+            "{TAG} persisted policy: {}",
+            persisted.as_deref().unwrap_or("unset (defaults to auto)")
+        );
+        let environment = std::env::var_os(EXECUTION_DEVICE_ENV);
+        println!(
+            "{TAG} environment override: {}",
+            environment
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or(if environment.is_some() {
+                    "invalid non-Unicode value"
+                } else {
+                    "unset"
+                })
+        );
+        match irlume_common::config::execution_device_policy() {
+            Ok(effective) => {
+                let source = match effective.source {
+                    ExecutionDevicePolicySource::Default => "default",
+                    ExecutionDevicePolicySource::Settings => "settings",
+                    ExecutionDevicePolicySource::Environment => "environment",
+                };
+                println!("{TAG} effective policy: {}", effective.policy);
+                println!("{TAG} policy source: {source}");
+            }
+            Err(error) => {
+                println!("{TAG} effective policy: invalid ({error})");
+                println!("{TAG} policy source: invalid");
+            }
+        }
+        match crate::daemon_request(&Request::Health) {
+            Ok(Response::Health {
+                inference: Some(report),
+                ..
+            }) => {
+                let source = match report.policy_source {
+                    ExecutionDevicePolicySource::Default => "default",
+                    ExecutionDevicePolicySource::Settings => "settings",
+                    ExecutionDevicePolicySource::Environment => "environment",
+                };
+                let device = match report.resolved_device {
+                    irlume_common::ResolvedExecutionDevice::Cpu => "cpu",
+                    irlume_common::ResolvedExecutionDevice::Gpu => "gpu",
+                    irlume_common::ResolvedExecutionDevice::Npu => "npu",
+                };
+                let backend = match report.backend {
+                    irlume_common::InferenceBackend::OnnxRuntime => "onnx-runtime",
+                    irlume_common::InferenceBackend::OpenVino => "openvino",
+                };
+                println!(
+                    "{TAG} daemon requested policy: {} ({source})",
+                    report.requested_policy
+                );
+                println!("{TAG} resolved device: {device}");
+                println!("{TAG} backend: {backend}");
+                if let Some(version) = report.ort_version {
+                    println!("{TAG} ONNX Runtime: {version}");
+                }
+                if let Some(version) = report.openvino_version {
+                    println!("{TAG} OpenVINO: {version}");
+                }
+                if !report.available_openvino_devices.is_empty() {
+                    println!(
+                        "{TAG} available OpenVINO devices: {}",
+                        report.available_openvino_devices.join(", ")
+                    );
+                }
+                for rejected in report.rejected_candidates {
+                    let rejected_device = match rejected.device {
+                        irlume_common::ResolvedExecutionDevice::Cpu => "cpu",
+                        irlume_common::ResolvedExecutionDevice::Gpu => "gpu",
+                        irlume_common::ResolvedExecutionDevice::Npu => "npu",
+                    };
+                    println!("{TAG} rejected {rejected_device}: {}", rejected.reason);
+                }
+                if let Some(cache) = report.cache {
+                    println!("{TAG} inference cache: {} ({:?})", cache.root, cache.state);
+                }
+                println!(
+                    "{TAG} TFLite FaceMesh: {}",
+                    match report.tflite_facemesh_loaded {
+                        Some(true) => "loaded",
+                        Some(false) => "not loaded",
+                        None => "unknown",
+                    }
+                );
+            }
+            Ok(Response::Health {
+                inference: None, ..
+            }) => {
+                println!("{TAG} daemon inference resolution: unknown (older daemon)");
+            }
+            _ => println!("{TAG} daemon inference resolution: unknown (daemon unavailable)"),
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(policy) = sub.and_then(ExecutionDevicePolicy::parse) else {
+        eprintln!("{TAG} usage: irlume inference-device <auto|cpu|npu|status>");
+        return ExitCode::from(2);
+    };
+    if !crate::is_root() {
+        eprintln!(
+            "{TAG} needs root: sudo irlume inference-device {}",
+            policy.as_str()
+        );
+        return ExitCode::FAILURE;
+    }
+    match irlume_common::config::write_kv("settings.conf", EXECUTION_DEVICE_KEY, policy.as_str()) {
+        Ok(()) => {
+            println!(
+                "{TAG} policy set to {}; restart irlumed to resolve and apply it",
+                policy.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{TAG} could not update settings.conf: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// `irlume credential-release-challenge [<service>] <on|off|status>`: the
 /// per-service head-gesture toggle, plus the global credential-release gate on
 /// releasing the sealed login-keyring password (`credential_release_challenge` in
@@ -2139,6 +2280,9 @@ SYSTEM INTEGRATION
                         subcommands are removed (ADR-0015) and answer with a notice
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
+  inference-device <auto|cpu|npu|status>
+                        choose the complete-engine inference policy for the next
+                        daemon start, or report policy and resolved device separately
   credential-release-challenge [<service>] <on|off|status>
                         optional experimental head gesture: keep nodding to approve;
                         shake your head to decline. Named with a service (sudo, su,

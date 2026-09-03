@@ -8,11 +8,20 @@ license.workspace = true
 name = "irlumed"
 path = "src/main.rs"
 
+[features]
+default = []
+# Qualification is incomplete; released base-package builds omit this feature.
+experimental-openvino = [
+    "irlume-auth/experimental-openvino",
+    "irlume-vision/experimental-openvino",
+]
+
 [dependencies]
 irlume-common.workspace = true
 irlume-auth.workspace = true
 irlume-core.workspace = true
 irlume-liveness.workspace = true
+irlume-vision.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true

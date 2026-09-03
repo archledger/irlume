@@ -106,6 +106,11 @@ ProtectSystem=full
 # directive systemd does NOT chown to User=, and this unit has no User=
 # anyway; the files inside are written 0600 by the daemon.
 ConfigurationDirectory=irlume
+# OpenVINO entry names are runtime-owned. The daemon creates only a sanitized
+# runtime-version directory below this private root when the experimental build
+# is used; ordinary ORT-only packages leave it empty.
+CacheDirectory=irlume
+CacheDirectoryMode=0700
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

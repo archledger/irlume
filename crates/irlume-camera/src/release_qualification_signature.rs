@@ -1207,8 +1207,7 @@ mod tests {
             (
                 "duplicate",
                 format!(
-                    "[GNUPG:] VALIDSIG {0} rest\n[GNUPG:] VALIDSIG {0} rest\n",
-                    ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT
+                    "[GNUPG:] VALIDSIG {ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT} rest\n[GNUPG:] VALIDSIG {ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT} rest\n"
                 ),
                 0,
                 ReleaseSignatureError::InvalidStatus,
@@ -1216,18 +1215,14 @@ mod tests {
             (
                 "conflicting",
                 format!(
-                    "[GNUPG:] VALIDSIG {} rest\n[GNUPG:] BADSIG BD7F30C6 bad\n",
-                    ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT
+                    "[GNUPG:] VALIDSIG {ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT} rest\n[GNUPG:] BADSIG BD7F30C6 bad\n"
                 ),
                 0,
                 ReleaseSignatureError::InvalidSignature,
             ),
             (
                 "nonzero",
-                format!(
-                    "[GNUPG:] VALIDSIG {} rest\n",
-                    ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT
-                ),
+                format!("[GNUPG:] VALIDSIG {ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT} rest\n"),
                 2,
                 ReleaseSignatureError::ProcessFailed,
             ),
@@ -1263,10 +1258,8 @@ mod tests {
 
     #[test]
     fn gpg_rejects_import_failure_oversized_status_and_timeout() {
-        let valid_status = format!(
-            "[GNUPG:] VALIDSIG {} rest\n",
-            ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT
-        );
+        let valid_status =
+            format!("[GNUPG:] VALIDSIG {ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT} rest\n");
         let oversized_status = "x".repeat(64 * 1024 + 1);
         for (tag, spec, expected) in [
             (
@@ -1373,10 +1366,7 @@ mod tests {
     fn synthetic_package_root_verifies_through_current_owner_seam() {
         let root = TestDir::new("package-success");
         let paths = write_package_fixture(&root, "candidate_15-15");
-        let status = format!(
-            "[GNUPG:] VALIDSIG {} rest\n",
-            ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT
-        );
+        let status = format!("[GNUPG:] VALIDSIG {ALLOWLISTED_RELEASE_SIGNER_FINGERPRINT} rest\n");
         let (executable, _) = write_fake_gpg(
             &root,
             "fake-gpg",

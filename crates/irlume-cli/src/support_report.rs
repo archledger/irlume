@@ -269,6 +269,87 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
     }
 
     writeln!(body).unwrap();
+    writeln!(body, "Inference resolution").unwrap();
+    match report
+        .daemon
+        .as_ref()
+        .and_then(|snapshot| snapshot.inference.as_ref())
+    {
+        Some(inference) => {
+            writeln!(
+                body,
+                "  requested: {} ({})",
+                inference.requested_policy,
+                inference_policy_source_name(inference.policy_source)
+            )
+            .unwrap();
+            writeln!(
+                body,
+                "  resolved: {} via {}",
+                inference_device_name(inference.resolved_device),
+                inference_backend_name(inference.backend)
+            )
+            .unwrap();
+            writeln!(
+                body,
+                "  ONNX Runtime: {}",
+                inference.ort_version.as_deref().unwrap_or("not used")
+            )
+            .unwrap();
+            writeln!(
+                body,
+                "  OpenVINO: {}",
+                inference.openvino_version.as_deref().unwrap_or("not used")
+            )
+            .unwrap();
+            writeln!(
+                body,
+                "  available OpenVINO devices: {}",
+                if inference.available_openvino_devices.is_empty() {
+                    "none".into()
+                } else {
+                    inference.available_openvino_devices.join(", ")
+                }
+            )
+            .unwrap();
+            if inference.rejected_candidates.is_empty() {
+                writeln!(body, "  rejected candidates: none").unwrap();
+            } else {
+                for candidate in &inference.rejected_candidates {
+                    writeln!(
+                        body,
+                        "  rejected {}: {}",
+                        inference_device_name(candidate.device),
+                        candidate.reason
+                    )
+                    .unwrap();
+                }
+            }
+            match &inference.cache {
+                Some(cache) => writeln!(
+                    body,
+                    "  cache: {} at {}",
+                    inference_cache_state_name(cache.state),
+                    cache.root
+                )
+                .unwrap(),
+                None => writeln!(body, "  cache: not applicable").unwrap(),
+            }
+            writeln!(
+                body,
+                "  TFLite FaceMesh: {}",
+                match inference.tflite_facemesh_loaded {
+                    Some(true) => "loaded",
+                    Some(false) => "not loaded",
+                    None => "unknown",
+                }
+            )
+            .unwrap();
+        }
+        None => writeln!(body, "  unavailable from daemon").unwrap(),
+    }
+
+    writeln!(body).unwrap();
     writeln!(body, "Camera context").unwrap();
     match &report.daemon {
         Some(snapshot) if snapshot.cameras().is_empty() => {
@@ -455,6 +536,41 @@ pub(crate) fn render_text(report: &SupportReport) -> Result<Vec<u8>, &'static st
         return Err("support report exceeds 1 MiB");
     }
     Ok(body.into_bytes())
+}
+
+fn inference_policy_source_name(
+    source: irlume_common::config::ExecutionDevicePolicySource,
+) -> &'static str {
+    match source {
+        irlume_common::config::ExecutionDevicePolicySource::Default => "default",
+        irlume_common::config::ExecutionDevicePolicySource::Settings => "settings",
+        irlume_common::config::ExecutionDevicePolicySource::Environment => "environment",
+    }
+}
+
+fn inference_device_name(device: irlume_common::ResolvedExecutionDevice) -> &'static str {
+    match device {
+        irlume_common::ResolvedExecutionDevice::Cpu => "cpu",
+        irlume_common::ResolvedExecutionDevice::Gpu => "gpu",
+        irlume_common::ResolvedExecutionDevice::Npu => "npu",
+    }
+}
+
+fn inference_backend_name(backend: irlume_common::InferenceBackend) -> &'static str {
+    match backend {
+        irlume_common::InferenceBackend::OnnxRuntime => "onnx-runtime",
+        irlume_common::InferenceBackend::OpenVino => "open-vino",
+    }
+}
+
+fn inference_cache_state_name(state: irlume_common::InferenceCacheState) -> &'static str {
+    match state {
+        irlume_common::InferenceCacheState::Disabled => "disabled",
+        irlume_common::InferenceCacheState::Cold => "cold",
+        irlume_common::InferenceCacheState::Warm => "warm",
+        irlume_common::InferenceCacheState::Rebuilt => "rebuilt",
+        irlume_common::InferenceCacheState::Unavailable => "unavailable",
+    }
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -947,6 +1063,7 @@ mod tests {
             vec![camera],
             Vec::new(),
             Vec::new(),
+            None,
         ));
         report
     }
@@ -1001,6 +1118,32 @@ mod tests {
             digest_line.trim(),
             irlume_common::sha256_hex(body.as_bytes())
         );
+    }
+
+    #[test]
+    fn human_report_renders_the_daemon_inference_resolution() {
+        let mut report = fixture_camera_report();
+        report.daemon.as_mut().unwrap().inference = Some(
+            irlume_common::InferenceResolutionReport::new(
+                irlume_common::config::ExecutionDevicePolicy::Auto,
+                irlume_common::config::ExecutionDevicePolicySource::Environment,
+                irlume_common::ResolvedExecutionDevice::Gpu,
+                irlume_common::InferenceBackend::OpenVino,
+            )
+            .with_available_openvino_devices(vec!["GPU".into(), "NPU".into()])
+            .with_rejected_candidates(vec![irlume_common::RejectedInferenceCandidate::new(
+                irlume_common::ResolvedExecutionDevice::Npu,
+                "model compilation failed",
+            )])
+            .with_tflite_facemesh_loaded(Some(true)),
+        );
+
+        let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+        assert!(text.contains("Inference resolution"));
+        assert!(text.contains("requested: auto (environment)"));
+        assert!(text.contains("resolved: gpu via open-vino"));
+        assert!(text.contains("rejected npu: model compilation failed"));
+        assert!(text.contains("TFLite FaceMesh: loaded"));
     }
 
     #[test]

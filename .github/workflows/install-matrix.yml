@@ -40,6 +40,23 @@ jobs:
       - name: Build the .deb (packaging/debian/build-deb-container.sh)
         run: bash packaging/debian/build-deb-container.sh
 
+      - name: Inspect base .deb dependency fields and files
+        run: |
+          shopt -s nullglob
+          debs=(irlume_*_amd64.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "expected one .deb, found ${#debs[@]}" >&2
+            exit 1
+          fi
+          deb=${debs[0]}
+          fields=$(dpkg-deb -f "$deb" Depends Recommends Suggests)
+          files=$(dpkg-deb -c "$deb")
+          combined="${fields}"$'\n'"${files}"
+          if grep -Eiq 'openvino|level.?zero|intel.?npu|ze_loader|ze_intel' <<<"$combined"; then
+            echo 'base .deb contains an accelerator dependency or payload' >&2
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: irlume-deb

@@ -82,6 +82,7 @@ struct Inner {
     next_sequence: u64,
     capture: Option<CaptureStatus>,
     cameras: Vec<SanitizedCameraContext>,
+    inference: Option<irlume_common::InferenceResolutionReport>,
 }
 
 struct TimedShareSafeEvent {
@@ -153,8 +154,28 @@ impl DiagnosticState {
             .collect();
         let capture = inner.capture.clone();
         let cameras = inner.cameras.clone();
+        let inference = inner.inference.clone();
         drop(inner);
-        SupportSnapshot::bounded(now_ms, MAX_HISTORY_MS, capture, cameras, events, Vec::new())
+        SupportSnapshot::bounded(
+            now_ms,
+            MAX_HISTORY_MS,
+            capture,
+            cameras,
+            events,
+            Vec::new(),
+            inference,
+        )
+    }
+
+    pub(crate) fn publish_inference_report(
+        &self,
+        report: irlume_common::InferenceResolutionReport,
+    ) {
+        self.shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inference = Some(irlume_common::diagnostics::bounded_inference_report(report));
     }
 
     fn publish_support_context(
@@ -668,6 +689,24 @@ mod tests {
 
         assert_eq!(snapshot.capture(), Some(&capture));
         assert_eq!(snapshot.cameras(), &[camera()]);
+    }
+
+    #[test]
+    fn latest_inference_resolution_is_retained_in_support_snapshots() {
+        let state = DiagnosticState::default();
+        let report = irlume_common::InferenceResolutionReport::new(
+            irlume_common::ExecutionDevicePolicy::Auto,
+            irlume_common::ExecutionDevicePolicySource::Environment,
+            irlume_common::ResolvedExecutionDevice::Npu,
+            irlume_common::InferenceBackend::OpenVino,
+        );
+
+        state.publish_inference_report(report.clone());
+
+        assert_eq!(
+            state.snapshot(Duration::from_secs(60)).inference,
+            Some(report)
+        );
     }
 
     #[test]

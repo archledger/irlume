@@ -1,0 +1,36 @@
+name: OpenVINO NPU hardware evidence
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openvino-hardware
+  cancel-in-progress: false
+
+jobs:
+  evidence:
+    name: trusted Lunar Lake NPU gate
+    runs-on: [self-hosted, lunar-lake, npu]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: refs/heads/main
+
+      - name: Run trusted OpenVINO hardware gate
+        run: bash scripts/hardware/run-openvino-hardware.sh "$(git rev-parse HEAD)" "$RUNNER_TEMP/openvino-evidence.json"
+
+      - name: Upload bounded JSON evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: openvino-npu-evidence
+          path: ${{ runner.temp }}/openvino-evidence.json
+          if-no-files-found: error
+          retention-days: 30

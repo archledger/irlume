@@ -11,3 +11,6 @@ self-hosted-runner:
     # minihost (Intel N100, CachyOS) capability labels.
     - cachyos
     - n100
+    # UX5406SA Lunar Lake accelerator capability labels.
+    - lunar-lake
+    - npu

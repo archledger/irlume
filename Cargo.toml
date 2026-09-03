@@ -83,6 +83,9 @@ rustfft    = "6"        # 2D FFT for the RGB-only moiré/screen-replay PAD cue
 # ONNX inference. `load-dynamic` => libonnxruntime.so is dlopened at runtime, so
 # this builds without the native lib present (you supply it on the target).
 ort     = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-24"] }
+# Direct explicit-device compilation. Runtime linking keeps released binaries
+# free of load-time OpenVINO and Level Zero dependencies.
+openvino = { version = "=0.11.0", default-features = false, features = ["runtime-linking"] }
 
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
 

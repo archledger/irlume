@@ -12368,6 +12368,53 @@ mod tests {
         runtime_gate_contract_with_interval((2, 15))
     }
 
+    fn legacy_attempt_runtime_contract_with_rgb(
+        fourcc: &str,
+        geometry: (u32, u32),
+    ) -> RuntimePairContract {
+        use capture_qualification::QualifiedStreamRole;
+        let context = capture_qualification::QualificationContext::new(
+            runtime_gate_endpoint(QualifiedStreamRole::Rgb, 0),
+            runtime_gate_endpoint(QualifiedStreamRole::Ir, 1),
+            runtime_gate_adjusted_stream(
+                QualifiedStreamRole::Rgb,
+                fourcc,
+                geometry,
+                fourcc,
+                geometry,
+                (1, 30),
+            ),
+            runtime_gate_adjusted_stream(
+                QualifiedStreamRole::Ir,
+                "GREY",
+                (640, 400),
+                "GREY",
+                (640, 360),
+                (1, 15),
+            ),
+        )
+        .unwrap();
+        let instance = contracts::CameraInstanceId::new("a".repeat(32)).unwrap();
+        RuntimePairContract {
+            context,
+            rgb_binding: frame_provenance::FrameBinding::new(
+                instance.clone(),
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Rgb,
+            ),
+            ir_binding: frame_provenance::FrameBinding::new(
+                instance,
+                contracts::CameraGeneration::INITIAL,
+                contracts::StreamRole::Ir,
+            ),
+            runtime_key: "legacy-attempt-runtime-key".into(),
+        }
+    }
+
+    fn legacy_attempt_runtime_contract() -> RuntimePairContract {
+        legacy_attempt_runtime_contract_with_rgb("YUYV", (640, 480))
+    }
+
     fn camera_attempt_fixture(
         schedule: profile::CaptureSchedule,
         pair_bound: std::time::Duration,
@@ -12626,7 +12673,13 @@ mod tests {
         assert_eq!(contract.profile().requested_ir().height(), 400);
         assert_eq!(contract.profile().accepted_ir().width(), 4);
         assert_eq!(contract.profile().accepted_ir().height(), 1);
-        assert_eq!(contract.qualification().invalidation_generation(), 7);
+        assert_eq!(
+            contract
+                .qualification()
+                .expect("qualified contract retains stored authority")
+                .invalidation_generation(),
+            7,
+        );
     }
 
     #[test]
@@ -12660,6 +12713,47 @@ mod tests {
             .unwrap_err(),
             attempt_contract::CapturePlanViolation::Qualification
         );
+    }
+
+    #[test]
+    fn legacy_unqualified_attempt_is_baseline_sequential_only() {
+        let runtime = legacy_attempt_runtime_contract();
+        let contract = attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+            runtime.clone(),
+            profile::CaptureSchedule::Sequential,
+        )
+        .expect("the fixed legacy profile remains available without stored qualification");
+
+        assert_eq!(contract.qualification(), None);
+        assert_eq!(
+            contract.profile().schedule(),
+            profile::CaptureSchedule::Sequential
+        );
+        assert_eq!(contract.profile().requested_rgb().width(), 640);
+        assert_eq!(contract.profile().requested_rgb().height(), 480);
+        assert_eq!(contract.profile().requested_ir().width(), 640);
+        assert_eq!(contract.profile().requested_ir().height(), 400);
+        assert_eq!(
+            attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+                runtime,
+                profile::CaptureSchedule::Concurrent,
+            )
+            .unwrap_err(),
+            attempt_contract::CapturePlanViolation::Qualification,
+        );
+        for runtime in [
+            legacy_attempt_runtime_contract_with_rgb("YUYV", (320, 240)),
+            legacy_attempt_runtime_contract_with_rgb("GREY", (640, 480)),
+        ] {
+            assert_eq!(
+                attempt_contract::CameraAttemptContract::from_legacy_unqualified_runtime(
+                    runtime,
+                    profile::CaptureSchedule::Sequential,
+                )
+                .unwrap_err(),
+                attempt_contract::CapturePlanViolation::Qualification,
+            );
+        }
     }
 
     #[test]

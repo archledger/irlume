@@ -20,6 +20,7 @@ pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;
 pub mod detect;
+pub mod inference;
 pub mod light;
 pub mod model_input;
 pub mod moire;
@@ -244,17 +245,273 @@ pub type Embedding = [f32; EMBED_DIM];
 mod onnx {
     use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
-    use ort::session::{builder::GraphOptimizationLevel, Session};
-    use ort::value::{Tensor, TensorElementType};
+    use crate::inference::{
+        CandidateRuntime, DimensionContract, InferenceSession, ModelCompiler, SessionContract,
+        TensorContract, TensorInput,
+    };
 
-    /// Intra-op threads per ONNX session. 2 matches the measured TFLite
-    /// XNNPACK knee for these small single-image models, and the ONNX
-    /// determinism notes (by the PINNED_EMBEDDING gate) found counts 1-8
-    /// bit-identical, so a small fixed cap only removes idle-pool contention
-    /// with capture threads.
-    const ORT_INTRA_THREADS: usize = 2;
+    static AURAFACE_OUTPUTS: &[TensorContract] = &[TensorContract::f32(
+        "1333",
+        &[DimensionContract::Fixed(1), DimensionContract::Fixed(512)],
+    )];
+    static AURAFACE_CONTRACT: SessionContract = SessionContract {
+        model: "auraface",
+        input: TensorContract::f32(
+            "data",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::Fixed(3),
+                DimensionContract::Fixed(112),
+                DimensionContract::Fixed(112),
+            ],
+        ),
+        outputs: AURAFACE_OUTPUTS,
+    };
 
-    fn err<E: std::fmt::Display>(e: E) -> irlume_common::Error {
+    static ADAPTER_OUTPUTS: &[TensorContract] = &[TensorContract::f32(
+        "adapted",
+        &[
+            DimensionContract::BatchOneOrDynamic,
+            DimensionContract::Fixed(512),
+        ],
+    )];
+    static ADAPTER_CONTRACT: SessionContract = SessionContract {
+        model: "ir-adapter",
+        input: TensorContract::f32(
+            "emb",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::Fixed(512),
+            ],
+        ),
+        outputs: ADAPTER_OUTPUTS,
+    };
+
+    static YUNET_OUTPUTS: &[TensorContract] = &[
+        TensorContract::f32(
+            "cls_8",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(6400),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "cls_16",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1600),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "cls_32",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(400),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "obj_8",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(6400),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "obj_16",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1600),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "obj_32",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(400),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "bbox_8",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(6400),
+                DimensionContract::Fixed(4),
+            ],
+        ),
+        TensorContract::f32(
+            "bbox_16",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1600),
+                DimensionContract::Fixed(4),
+            ],
+        ),
+        TensorContract::f32(
+            "bbox_32",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(400),
+                DimensionContract::Fixed(4),
+            ],
+        ),
+        TensorContract::f32(
+            "kps_8",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(6400),
+                DimensionContract::Fixed(10),
+            ],
+        ),
+        TensorContract::f32(
+            "kps_16",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1600),
+                DimensionContract::Fixed(10),
+            ],
+        ),
+        TensorContract::f32(
+            "kps_32",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(400),
+                DimensionContract::Fixed(10),
+            ],
+        ),
+    ];
+    static YUNET_CONTRACT: SessionContract = SessionContract {
+        model: "yunet",
+        input: TensorContract::f32(
+            "input",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(3),
+                DimensionContract::Fixed(640),
+                DimensionContract::Fixed(640),
+            ],
+        ),
+        outputs: YUNET_OUTPUTS,
+    };
+
+    static BLAZEFACE_OUTPUTS: &[TensorContract] = &[
+        TensorContract::f32(
+            "regressors",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(896),
+                DimensionContract::Fixed(16),
+            ],
+        ),
+        TensorContract::f32(
+            "classificators",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(896),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+    ];
+    static BLAZEFACE_CONTRACT: SessionContract = SessionContract {
+        model: "blazeface",
+        input: TensorContract::f32(
+            "input",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(128),
+                DimensionContract::Fixed(128),
+                DimensionContract::Fixed(3),
+            ],
+        ),
+        outputs: BLAZEFACE_OUTPUTS,
+    };
+
+    static VIT_PAD_OUTPUTS: &[TensorContract] = &[TensorContract::f32(
+        "logits",
+        &[
+            DimensionContract::BatchOneOrDynamic,
+            DimensionContract::Fixed(2),
+        ],
+    )];
+    static VIT_PAD_CONTRACT: SessionContract = SessionContract {
+        model: "vit-pad",
+        input: TensorContract::f32(
+            "pixel_values",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::Fixed(3),
+                DimensionContract::Fixed(224),
+                DimensionContract::Fixed(224),
+            ],
+        ),
+        outputs: VIT_PAD_OUTPUTS,
+    };
+
+    static FLIR_PAD_OUTPUTS: &[TensorContract] = &[TensorContract::f32(
+        "131",
+        &[DimensionContract::Fixed(1), DimensionContract::Fixed(2)],
+    )];
+    static FLIR_PAD_CONTRACT: SessionContract = SessionContract {
+        model: "flir-pad",
+        input: TensorContract::f32(
+            "input.1",
+            &[
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(3),
+                DimensionContract::Fixed(112),
+                DimensionContract::Fixed(112),
+            ],
+        ),
+        outputs: FLIR_PAD_OUTPUTS,
+    };
+
+    static FACEMESH_OUTPUTS: &[TensorContract] = &[
+        TensorContract::f32(
+            "Identity",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1),
+                DimensionContract::FixedOneOf(&[MESH_N * 3, MESH_N_IRIS * 3]),
+            ],
+        ),
+        TensorContract::f32(
+            "Identity_1",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1),
+                DimensionContract::Fixed(1),
+            ],
+        ),
+        TensorContract::f32(
+            "Identity_2",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::Fixed(1),
+            ],
+        ),
+    ];
+    static FACEMESH_CONTRACT: SessionContract = SessionContract {
+        model: "facemesh",
+        input: TensorContract::f32(
+            "input_12",
+            &[
+                DimensionContract::BatchOneOrDynamic,
+                DimensionContract::FixedOneOf(&[192, 256]),
+                DimensionContract::FixedOneOf(&[192, 256]),
+                DimensionContract::Fixed(3),
+            ],
+        ),
+        outputs: FACEMESH_OUTPUTS,
+    };
+
+    pub(crate) fn err<E: std::fmt::Display>(e: E) -> irlume_common::Error {
         irlume_common::Error::Hardware(format!("onnx: {e}"))
     }
 
@@ -445,7 +702,7 @@ mod onnx {
     /// environment is never written: mutating it here would be unsound once
     /// any other thread exists, and this crate's constructors are public API
     /// with no single-threaded guarantee.
-    fn ensure_ort_resolvable() -> irlume_common::Result<()> {
+    pub(crate) fn ensure_ort_resolvable() -> irlume_common::Result<()> {
         use std::sync::OnceLock;
         static VERDICT: OnceLock<Result<(), String>> = OnceLock::new();
         VERDICT
@@ -514,55 +771,9 @@ mod onnx {
         (candidate, verdict)
     }
 
-    fn build(model: &[u8]) -> irlume_common::Result<Session> {
-        ensure_ort_resolvable()?;
-        #[allow(unused_mut)]
-        let mut b = Session::builder().map_err(err)?;
-        // Register a hardware execution provider if compiled in (cf. howrs).
-        // These fall back to CPU if the EP can't initialize at runtime.
-        #[cfg(feature = "cuda")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::CUDA::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "openvino")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::OpenVINO::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "tensorrt")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::TensorRT::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "coreml")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::CoreML::default().build()])
-                .map_err(err)?;
-        }
-        // Cap the intra-op pool explicitly. The runtime default sizes one pool
-        // per session to the physical-core count; this daemon holds up to four
-        // ONNX sessions plus a TFLite session, and idle pools contend with the
-        // capture and consent-watch threads inside the seconds-scale auth
-        // budget. The repo's own measurement (see the determinism notes by the
-        // PINNED_EMBEDDING gate) found intra-op thread counts 1, 2, 4 and 8
-        // bit-identical for the embedder, so capping costs nothing and removes
-        // the contention.
-        b.with_intra_threads(ORT_INTRA_THREADS)
-            .map_err(err)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(err)?
-            .commit_from_memory(model)
-            .map_err(err)
-    }
-
     /// AuraFace embedder (ONNX). Loaded once in the daemon.
     pub struct Embedder {
-        session: Session,
+        session: InferenceSession,
     }
 
     impl Embedder {
@@ -573,8 +784,17 @@ mod onnx {
 
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: runtime.compile(model, &AURAFACE_CONTRACT)?,
             })
         }
 
@@ -666,10 +886,17 @@ mod onnx {
                     data.len()
                 )));
             }
-            let tensor = Tensor::from_array(([1i64, 3, n, n], data.to_vec())).map_err(err)?;
-            // Positional input (single-input model); avoids needing the input name.
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
-            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+            let shape = [1, 3, n as usize, n as usize];
+            let outputs = self.session.run_f32(TensorInput {
+                name: "data",
+                shape: &shape,
+                values: data,
+            })?;
+            let raw = &outputs
+                .iter()
+                .find(|output| output.name == "1333")
+                .ok_or_else(|| err("AuraFace output 1333 missing"))?
+                .values;
             if raw.len() != EMBED_DIM {
                 return Err(err(format!("expected {EMBED_DIM}-D, got {}", raw.len())));
             }
@@ -689,14 +916,23 @@ mod onnx {
     /// their own adapter via `--adapter` / `IRLUME_IR_ADAPTER`, and a residual
     /// form (out = x + k·A(x)) is the expected shape.
     pub struct Adapter {
-        session: Session,
+        session: InferenceSession,
     }
 
     impl Adapter {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: runtime.compile(model, &ADAPTER_CONTRACT)?,
             })
         }
 
@@ -709,11 +945,18 @@ mod onnx {
         /// Adapt one IR embedding -> adapted vector (already L2-normalized).
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn apply(&mut self, emb: &[f32]) -> irlume_common::Result<Vec<f32>> {
-            let tensor =
-                Tensor::from_array(([1i64, emb.len() as i64], emb.to_vec())).map_err(err)?;
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
-            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
-            Ok(raw.to_vec())
+            let shape = [1, EMBED_DIM];
+            let outputs = self.session.run_f32(TensorInput {
+                name: "emb",
+                shape: &shape,
+                values: emb,
+            })?;
+            Ok(outputs
+                .iter()
+                .find(|output| output.name == "adapted")
+                .ok_or_else(|| err("IR adapter output adapted missing"))?
+                .values
+                .clone())
         }
     }
 
@@ -738,7 +981,7 @@ mod onnx {
     /// return the same landmark layout, proven equivalent by the mesh_parity
     /// gate (mean NME 6.9e-7 over all 478 points, iris tail included).
     enum MeshBackend {
-        Onnx(Session),
+        Onnx(InferenceSession),
         Tflite(crate::tflite::TfliteSession),
     }
 
@@ -767,37 +1010,33 @@ mod onnx {
     /// Landmark count of the face_landmarker-generation mesh.
     pub const MESH_N_IRIS: usize = 478;
 
-    fn facemesh_contract_for_onnx_tensor(
-        input: Option<(TensorElementType, &[i64])>,
+    fn facemesh_contract_for_dimensions(
+        dimensions: &[Option<usize>],
     ) -> irlume_common::Result<crate::model_input::ModelInputContractId> {
-        let Some((element_type, shape)) = input else {
-            return Err(err("onnx mesh: input is not a tensor"));
-        };
-        if element_type != TensorElementType::Float32 {
+        let [batch, height, width, channels] = dimensions else {
             return Err(err(format!(
-                "onnx mesh: input element type {element_type:?} is not Float32"
-            )));
-        }
-        let [batch, height, width, channels] = shape else {
-            return Err(err(format!(
-                "onnx mesh: input shape {shape:?} must have rank 4"
+                "onnx mesh: input shape {dimensions:?} must have rank 4"
             )));
         };
-        if !matches!(*batch, -1 | 1) {
+        if !matches!(*batch, None | Some(1)) {
             return Err(err(format!(
-                "onnx mesh: batch {batch} must be dynamic or static 1"
+                "onnx mesh: batch {batch:?} must be dynamic or static 1"
             )));
         }
-        if *channels != 3 {
+        if *channels != Some(3) {
             return Err(err(format!(
-                "onnx mesh: channel dimension {channels} must be static 3"
+                "onnx mesh: channel dimension {channels:?} must be static 3"
             )));
         }
         match (*height, *width) {
-            (192, 192) => Ok(crate::model_input::ModelInputContractId::FaceMesh192RgbV1),
-            (256, 256) => Ok(crate::model_input::ModelInputContractId::FaceMesh256RgbV1),
+            (Some(192), Some(192)) => {
+                Ok(crate::model_input::ModelInputContractId::FaceMesh192RgbV1)
+            }
+            (Some(256), Some(256)) => {
+                Ok(crate::model_input::ModelInputContractId::FaceMesh256RgbV1)
+            }
             _ => Err(err(format!(
-                "onnx mesh: spatial dimensions [{height},{width}] must be static 192x192 or 256x256"
+                "onnx mesh: spatial dimensions [{height:?},{width:?}] must be static 192x192 or 256x256"
             ))),
         }
     }
@@ -835,17 +1074,24 @@ mod onnx {
                     input_contract: crate::model_input::ModelInputContractId::FaceMesh256RgbV1,
                 });
             }
-            let session = build(model)?;
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
+            if model.len() >= 8 && &model[4..8] == b"TFL3" {
+                return Self::load_from_memory(model);
+            }
+            let session = runtime.compile(model, &FACEMESH_CONTRACT)?;
             // The pinned 256 graph declares a dynamic batch. The declaration
             // may therefore be unknown or static 1, but the selected contract
             // and every tensor produced by FaceMeshInput remain [1,H,W,3].
             let input_contract =
-                facemesh_contract_for_onnx_tensor(session.inputs().first().and_then(|i| {
-                    match i.dtype() {
-                        ort::value::ValueType::Tensor { ty, shape, .. } => Some((*ty, &shape[..])),
-                        _ => None,
-                    }
-                }))?;
+                facemesh_contract_for_dimensions(&session.input_metadata().dimensions)?;
             Ok(Self {
                 backend: MeshBackend::Onnx(session),
                 input_contract,
@@ -896,18 +1142,16 @@ mod onnx {
             let is_lm = |d: &[f32]| d.len() == MESH_N * 3 || d.len() == MESH_N_IRIS * 3;
             let raw = match &mut self.backend {
                 MeshBackend::Onnx(session) => {
-                    let s = input_side as i64;
-                    let tensor =
-                        Tensor::from_array(([1i64, s, s, 3], data.to_vec())).map_err(err)?;
-                    let outputs = session.run(ort::inputs![tensor]).map_err(err)?;
-                    let mut lm_raw: Option<Vec<f32>> = None;
-                    for i in 0..outputs.len() {
-                        let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
-                        if is_lm(raw) {
-                            lm_raw = Some(raw.to_vec());
-                        }
-                    }
-                    lm_raw
+                    let shape = [1, input_side, input_side, 3];
+                    session
+                        .run_f32(TensorInput {
+                            name: "input_12",
+                            shape: &shape,
+                            values: data,
+                        })?
+                        .into_iter()
+                        .map(|output| output.values)
+                        .find(|values| is_lm(values))
                 }
                 MeshBackend::Tflite(session) => session
                     .run_f32(data)?
@@ -1047,7 +1291,7 @@ mod onnx {
 
     /// YuNet detector (ONNX). Loaded once in the daemon.
     pub struct Detector {
-        session: Session,
+        session: InferenceSession,
         /// Reused letterbox scratch (~4.9 MB at INPUT_SIZE 640). The consent
         /// watch feeds the detector ~120 IR frames per authentication; the
         /// zeroed tail (letterbox bars) is re-zeroed only where the previous
@@ -1063,8 +1307,17 @@ mod onnx {
 
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: runtime.compile(model, &YUNET_CONTRACT)?,
                 input_scratch: Vec::new(),
             })
         }
@@ -1094,23 +1347,20 @@ mod onnx {
             self.input_scratch.clear();
             self.input_scratch.resize(3 * n * n, 0.0);
             letterbox_bgr_into(input, scale, n, &mut self.input_scratch);
-            let ni = n as i64;
-            // Borrow the scratch: the tensor views our buffer, the session
-            // reads it, and the buffer stays owned here for the next call.
-            let tensor = ort::value::TensorRef::<f32>::from_array_view((
-                [1i64, 3, ni, ni],
-                self.input_scratch.as_slice(),
-            ))
-            .map_err(err)?;
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            let shape = [1, 3, n, n];
+            let outputs = self.session.run_f32(TensorInput {
+                name: "input",
+                shape: &shape,
+                values: &self.input_scratch,
+            })?;
 
             // Group output tensors by (channels, stride) using shape; decode
             // from the borrowed slices in place.
             let mut by: std::collections::HashMap<(usize, usize), Vec<&[f32]>> =
                 std::collections::HashMap::new();
-            for i in 0..outputs.len() {
-                let (shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
-                let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+            for output in &outputs {
+                let dims = &output.shape;
+                let raw = output.values.as_slice();
                 let ch = *dims.last().unwrap_or(&1);
                 let count = raw.len().checked_div(ch).unwrap_or(0);
                 let stride = STRIDES.iter().copied().find(|&s| {
@@ -1173,7 +1423,7 @@ mod onnx {
     /// to anchor centers) + 896 logits (sigmoid, clipped +/-100). Anchors:
     /// 16x16 cells x2 (stride 8) then 8x8 x6 (stride 16), sizes 1.0.
     pub struct BlazeRescue {
-        session: Session,
+        session: InferenceSession,
         anchors: Vec<(f32, f32)>,
     }
 
@@ -1207,8 +1457,17 @@ mod onnx {
 
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: runtime.compile(model, &BLAZEFACE_CONTRACT)?,
                 anchors: blaze_anchors(),
             })
         }
@@ -1243,16 +1502,18 @@ mod onnx {
                 .map_err(|error| err(error.to_string()))?;
             let side = input.frame_side();
             let data = input.tensor();
-            let s = BLAZE_INPUT as i64;
-            let tensor = Tensor::from_array(([1i64, s, s, 3], data.to_vec())).map_err(err)?;
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
+            let shape = [1, BLAZE_INPUT, BLAZE_INPUT, 3];
+            let outputs = self.session.run_f32(TensorInput {
+                name: "input",
+                shape: &shape,
+                values: data,
+            })?;
             // Identify the two heads by length (order-agnostic).
             let (mut reg, mut cls): (Option<Vec<f32>>, Option<Vec<f32>>) = (None, None);
-            for i in 0..outputs.len() {
-                let (_shape, raw) = outputs[i].try_extract_tensor::<f32>().map_err(err)?;
-                match raw.len() {
-                    l if l == 896 * 16 => reg = Some(raw.to_vec()),
-                    896 => cls = Some(raw.to_vec()),
+            for output in outputs {
+                match output.values.len() {
+                    l if l == 896 * 16 => reg = Some(output.values),
+                    896 => cls = Some(output.values),
                     _ => {}
                 }
             }
@@ -1355,7 +1616,7 @@ mod onnx {
     /// the crop margin is part of the operating point; tight and m25 overlap
     /// genuine), bilinear-resize to 224.
     pub struct PadVit {
-        session: Session,
+        session: InferenceSession,
     }
 
     impl PadVit {
@@ -1366,8 +1627,17 @@ mod onnx {
 
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: runtime.compile(model, &VIT_PAD_CONTRACT)?,
             })
         }
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -1385,10 +1655,17 @@ mod onnx {
             input
                 .require(crate::model_input::ModelInputContractId::VitRgbPadM96V1)
                 .map_err(|error| err(error.to_string()))?;
-            let tensor =
-                Tensor::from_array(([1i64, 3, 224, 224], input.tensor().to_vec())).map_err(err)?;
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
-            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+            let shape = [1, 3, 224, 224];
+            let outputs = self.session.run_f32(TensorInput {
+                name: "pixel_values",
+                shape: &shape,
+                values: input.tensor(),
+            })?;
+            let raw = &outputs
+                .iter()
+                .find(|output| output.name == "logits")
+                .ok_or_else(|| err("ViT PAD output logits missing"))?
+                .values;
             if raw.len() < 2 {
                 return Err(err("ViT PAD model: expected 2 output logits"));
             }
@@ -1523,7 +1800,7 @@ mod onnx {
     /// about its center, fill out-of-crop with 127 gray, resize to 128, take
     /// the center 112.
     pub struct PadIr {
-        session: Session,
+        session: InferenceSession,
     }
 
     impl PadIr {
@@ -1534,8 +1811,17 @@ mod onnx {
 
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
+            let mut runtime = CandidateRuntime::ort_cpu()?;
+            Self::load_from_memory_with_runtime(&mut runtime, model)
+        }
+
+        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        pub fn load_from_memory_with_runtime(
+            runtime: &mut dyn ModelCompiler,
+            model: &[u8],
+        ) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: runtime.compile(model, &FLIR_PAD_CONTRACT)?,
             })
         }
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -1553,10 +1839,17 @@ mod onnx {
             input
                 .require(crate::model_input::ModelInputContractId::FlirIrPad112V1)
                 .map_err(|error| err(error.to_string()))?;
-            let tensor =
-                Tensor::from_array(([1i64, 3, 112, 112], input.tensor().to_vec())).map_err(err)?;
-            let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
-            let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+            let shape = [1, 3, 112, 112];
+            let outputs = self.session.run_f32(TensorInput {
+                name: "input.1",
+                shape: &shape,
+                values: input.tensor(),
+            })?;
+            let raw = &outputs
+                .iter()
+                .find(|output| output.name == "131")
+                .ok_or_else(|| err("FLIR PAD output 131 missing"))?
+                .values;
             if raw.len() < 2 {
                 return Err(err("PAD model: expected 2 output logits"));
             }
@@ -1596,6 +1889,124 @@ mod onnx {
             passed,
             format!("cosine(same chip, twice) = {cos:.6} (want ~1.0)"),
         )
+    }
+
+    #[cfg(test)]
+    mod runtime_constructor_tests {
+        use super::*;
+        use crate::inference::{
+            DimensionContract, InferenceSession, ModelCompiler, OwnedTensor, SessionContract,
+            SessionMetadata, TensorMetadata,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingCompiler {
+            models: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl ModelCompiler for RecordingCompiler {
+            fn compile(
+                &mut self,
+                _model: &[u8],
+                contract: &'static SessionContract,
+            ) -> irlume_common::Result<InferenceSession> {
+                self.models.lock().unwrap().push(contract.model);
+                let dimensions = |dimensions: &[DimensionContract]| {
+                    dimensions
+                        .iter()
+                        .map(|dimension| match dimension {
+                            DimensionContract::Fixed(value) => Some(*value),
+                            DimensionContract::FixedOneOf(values) => values.last().copied(),
+                            DimensionContract::BatchOneOrDynamic => Some(1),
+                        })
+                        .collect()
+                };
+                let metadata = SessionMetadata {
+                    input: TensorMetadata::f32(
+                        contract.input.name,
+                        dimensions(contract.input.dimensions),
+                    ),
+                    outputs: contract
+                        .outputs
+                        .iter()
+                        .map(|output| {
+                            TensorMetadata::f32(output.name, dimensions(output.dimensions))
+                        })
+                        .collect(),
+                };
+                InferenceSession::new(contract, metadata, move |input| {
+                    let outputs = contract
+                        .outputs
+                        .iter()
+                        .map(|output| {
+                            let shape: Vec<usize> = output
+                                .dimensions
+                                .iter()
+                                .map(|dimension| match dimension {
+                                    DimensionContract::Fixed(value) => *value,
+                                    DimensionContract::FixedOneOf(values) => {
+                                        *values.last().unwrap()
+                                    }
+                                    DimensionContract::BatchOneOrDynamic => 1,
+                                })
+                                .collect();
+                            let len = shape.iter().product();
+                            OwnedTensor {
+                                name: output.name.into(),
+                                shape,
+                                values: if contract.model == "ir-adapter" {
+                                    input.values.to_vec()
+                                } else {
+                                    vec![1.0; len]
+                                },
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(outputs)
+                })
+            }
+        }
+
+        #[test]
+        fn every_onnx_wrapper_compiles_through_the_injected_runtime() {
+            let models = Arc::new(Mutex::new(Vec::new()));
+            let mut compiler = RecordingCompiler {
+                models: Arc::clone(&models),
+            };
+
+            let mut embedder =
+                Embedder::load_from_memory_with_runtime(&mut compiler, b"auraface").unwrap();
+            let chip = vec![128; 112 * 112 * 3];
+            let input = crate::model_input::ArcFaceInput::try_from_aligned_rgb(chip).unwrap();
+            assert_eq!(embedder.embed(&input).unwrap().len(), EMBED_DIM);
+
+            let mut adapter =
+                Adapter::load_from_memory_with_runtime(&mut compiler, b"adapter").unwrap();
+            assert_eq!(
+                adapter.apply(&vec![0.5; EMBED_DIM]).unwrap().len(),
+                EMBED_DIM
+            );
+
+            let _detector =
+                Detector::load_from_memory_with_runtime(&mut compiler, b"yunet").unwrap();
+            let _blaze =
+                BlazeRescue::load_from_memory_with_runtime(&mut compiler, b"blaze").unwrap();
+            let _pad_vit = PadVit::load_from_memory_with_runtime(&mut compiler, b"vit").unwrap();
+            let _pad_ir = PadIr::load_from_memory_with_runtime(&mut compiler, b"flir").unwrap();
+            let _mesh = FaceMesh::load_from_memory_with_runtime(&mut compiler, b"mesh").unwrap();
+            assert_eq!(
+                *models.lock().unwrap(),
+                [
+                    "auraface",
+                    "ir-adapter",
+                    "yunet",
+                    "blazeface",
+                    "vit-pad",
+                    "flir-pad",
+                    "facemesh"
+                ]
+            );
+        }
     }
 
     #[cfg(test)]
@@ -1815,63 +2226,42 @@ mod onnx {
 
     #[cfg(test)]
     mod facemesh_input_shape_tests {
-        use super::facemesh_contract_for_onnx_tensor;
+        use super::facemesh_contract_for_dimensions;
         use crate::model_input::ModelInputContractId;
-        use ort::value::TensorElementType;
 
         #[test]
-        fn dynamic_or_static_one_batch_f32_nhwc_selects_the_matching_contract() {
+        fn dynamic_or_static_one_batch_nhwc_selects_the_matching_contract() {
             assert_eq!(
-                facemesh_contract_for_onnx_tensor(Some((
-                    TensorElementType::Float32,
-                    &[1, 192, 192, 3],
-                )))
-                .unwrap(),
+                facemesh_contract_for_dimensions(&[Some(1), Some(192), Some(192), Some(3)])
+                    .unwrap(),
                 ModelInputContractId::FaceMesh192RgbV1
             );
             assert_eq!(
-                facemesh_contract_for_onnx_tensor(Some((
-                    TensorElementType::Float32,
-                    &[1, 256, 256, 3],
-                )))
-                .unwrap(),
+                facemesh_contract_for_dimensions(&[Some(1), Some(256), Some(256), Some(3)])
+                    .unwrap(),
                 ModelInputContractId::FaceMesh256RgbV1
             );
             assert_eq!(
-                facemesh_contract_for_onnx_tensor(Some((
-                    TensorElementType::Float32,
-                    &[-1, 256, 256, 3],
-                )))
-                .unwrap(),
+                facemesh_contract_for_dimensions(&[None, Some(256), Some(256), Some(3)]).unwrap(),
                 ModelInputContractId::FaceMesh256RgbV1
             );
         }
 
         #[test]
-        fn missing_dynamic_malformed_and_non_f32_inputs_are_rejected() {
-            assert!(facemesh_contract_for_onnx_tensor(None).is_err());
+        fn dynamic_and_malformed_dimensions_are_rejected() {
             for shape in [
-                &[1, 256, 256][..],
-                &[2, 256, 256, 3],
-                &[1, 192, 256, 3],
-                &[1, 256, 256, 1],
-                &[1, 3, 256, 256],
-                &[1, -1, 256, 3],
-                &[1, 256, -1, 3],
-                &[1, 256, 256, -1],
-                &[1, 224, 224, 3],
+                &[Some(1), Some(256), Some(256)][..],
+                &[Some(2), Some(256), Some(256), Some(3)],
+                &[Some(1), Some(192), Some(256), Some(3)],
+                &[Some(1), Some(256), Some(256), Some(1)],
+                &[Some(1), Some(3), Some(256), Some(256)],
+                &[Some(1), None, Some(256), Some(3)],
+                &[Some(1), Some(256), None, Some(3)],
+                &[Some(1), Some(256), Some(256), None],
+                &[Some(1), Some(224), Some(224), Some(3)],
             ] {
-                assert!(facemesh_contract_for_onnx_tensor(Some((
-                    TensorElementType::Float32,
-                    shape,
-                )))
-                .is_err());
+                assert!(facemesh_contract_for_dimensions(shape).is_err());
             }
-            assert!(facemesh_contract_for_onnx_tensor(Some((
-                TensorElementType::Uint8,
-                &[1, 256, 256, 3],
-            )))
-            .is_err());
         }
     }
 }

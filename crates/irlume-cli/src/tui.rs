@@ -442,6 +442,7 @@ struct HealthInfo {
     /// the field. Authoritative: the on-disk profile can exist while the daemon
     /// runs unconfined (a failed apparmor_parser load).
     apparmor: Option<String>,
+    inference: Option<irlume_common::InferenceResolutionReport>,
 }
 
 /// Template-encryption + recovery status (`RecoveryStatus`).
@@ -882,6 +883,8 @@ impl LightState {
                 ir_pad,
                 version,
                 apparmor,
+                inference,
+                ..
             }) => Some(HealthInfo {
                 tier,
                 rgb_dev,
@@ -892,6 +895,7 @@ impl LightState {
                 ir_pad,
                 version,
                 apparmor,
+                inference,
             }),
             _ => None, // older daemon / daemon down → Repair falls back to local probes
         };
@@ -1513,6 +1517,26 @@ impl App {
                 "loaded (reported by the daemon)".into(),
                 Fix::None,
             ));
+            v.push(match h.inference.as_ref() {
+                Some(inference) => mk(
+                    "Inference device",
+                    Sev::Ok,
+                    format!(
+                        "requested {} ({}) → resolved {} via {}",
+                        inference.requested_policy,
+                        crate::diagnostic_name(inference.policy_source),
+                        crate::diagnostic_name(inference.resolved_device),
+                        crate::diagnostic_name(inference.backend),
+                    ),
+                    Fix::None,
+                ),
+                None => mk(
+                    "Inference device",
+                    Sev::Warn,
+                    "not reported by this daemon version".into(),
+                    Fix::None,
+                ),
+            });
             v.push(mk(
                 "Models",
                 Sev::Ok,
@@ -8423,6 +8447,7 @@ mod tests {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: "test".into(),
             apparmor: None,
+            inference: None,
         };
         let caps = App::caps_from_health(&secure);
         assert!(
@@ -8569,6 +8594,7 @@ mod tests {
             ir_pad: None,
             version: "test".into(),
             apparmor: None,
+            inference: None,
         });
         let start = std::time::Instant::now();
         app.refresh_light();
@@ -10653,6 +10679,7 @@ mod tests {
             ir_pad: None,
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         });
         let text = draw_text(&app);
         assert!(text.contains("no camera hardware"), "{text}");
@@ -10737,6 +10764,7 @@ mod tests {
             ir_pad: None,
             version: "1.0".into(),
             apparmor: None,
+            inference: None,
         });
         let text = draw_text(&app);
         assert!(
@@ -11082,6 +11110,12 @@ mod tests {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: Some(irlume_common::InferenceResolutionReport::new(
+                irlume_common::config::ExecutionDevicePolicy::Auto,
+                irlume_common::config::ExecutionDevicePolicySource::Settings,
+                irlume_common::ResolvedExecutionDevice::Npu,
+                irlume_common::InferenceBackend::OpenVino,
+            )),
         });
         app.run_checks();
         let find = |label: &str| {
@@ -11098,6 +11132,10 @@ mod tests {
         let ort = find("ONNX Runtime");
         assert!(ort.sev == Sev::Ok);
         assert!(ort.detail.contains("reported by the daemon"));
+        let inference = find("Inference device");
+        assert!(inference.sev == Sev::Ok);
+        assert!(inference.detail.contains("requested auto (settings)"));
+        assert!(inference.detail.contains("resolved npu via open-vino"));
         let models = find("Models");
         assert!(models.detail.contains("+ IR adapter"));
         assert!(models.detail.contains("+ FaceMesh"));
@@ -11140,6 +11178,7 @@ mod tests {
             ir_pad: None,
             version: "0.0.1-old".into(),
             apparmor: None,
+            inference: None,
         });
         app.enroll_error = Some("bad ciphertext".into());
         app.run_checks();
@@ -11195,6 +11234,7 @@ mod tests {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
+            inference: None,
         });
 
         app.run_checks();
@@ -11228,9 +11268,18 @@ mod tests {
             ir_pad: None,
             version: "0.11.3-legacy".into(),
             apparmor: None,
+            inference: None,
         });
 
         app.run_checks();
+        let inference = app
+            .repair
+            .iter()
+            .find(|check| check.label == "Inference device")
+            .expect("inference check row");
+        assert!(inference.sev == Sev::Warn);
+        assert!(inference.detail.contains("not reported"));
+        assert!(!inference.detail.contains("cpu"));
         let pad = app
             .repair
             .iter()

@@ -1543,3 +1543,19 @@ After acceptance, the next separately approved plan is Delivery Phase 4:
 synthetic vault, descriptor-safe filesystem verification, and deterministic
 evaluator adapters. Real campaign protocol design remains Delivery Phase 6 and
 requires another explicit user gate.
+
+---
+
+## Task 8 Review Remediation
+
+The independent full-slice review requested changes for five findings: required
+attack stages could be `NotApplicable`, attack counts could authorize bona fide
+power, the signed public-cell floor was inert, signed lifecycle limits were not
+fully consumed, and the signed balanced-order seed did not determine ordering.
+
+The approved correction design is
+`docs/superpowers/specs/2026-09-02-maintainer-qualification-review-remediation-design.md`.
+Its implementation plan is
+`docs/superpowers/plans/2026-09-02-maintainer-qualification-review-remediation.md`.
+Those documents supersede only conflicting enforcement details and do not
+authorize Delivery Phase 4, real campaign work, or production changes.

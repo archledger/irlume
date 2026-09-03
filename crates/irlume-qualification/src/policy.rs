@@ -161,6 +161,47 @@ impl ExpiryRules {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CampaignPolicyLimits {
+    artifact_seconds: u64,
+    bundle_seconds: u64,
+    minimum_public_cell_size: u32,
+    private_asset_retention_seconds: u64,
+    protocol_seconds: u64,
+    result_seconds: u64,
+    review_seconds: u64,
+}
+
+impl CampaignPolicyLimits {
+    pub(crate) const fn artifact_seconds(self) -> u64 {
+        self.artifact_seconds
+    }
+
+    pub(crate) const fn bundle_seconds(self) -> u64 {
+        self.bundle_seconds
+    }
+
+    pub(crate) const fn minimum_public_cell_size(self) -> u32 {
+        self.minimum_public_cell_size
+    }
+
+    pub(crate) const fn private_asset_retention_seconds(self) -> u64 {
+        self.private_asset_retention_seconds
+    }
+
+    pub(crate) const fn protocol_seconds(self) -> u64 {
+        self.protocol_seconds
+    }
+
+    pub(crate) const fn result_seconds(self) -> u64 {
+        self.result_seconds
+    }
+
+    pub(crate) const fn review_seconds(self) -> u64 {
+        self.review_seconds
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignPolicy {
@@ -271,8 +312,16 @@ impl CampaignPolicy {
         self.private_asset_retention_seconds
     }
 
-    pub(crate) fn protocol_expiry_seconds(&self) -> u64 {
-        self.expiry_rules.protocol_seconds
+    pub(crate) const fn limits(&self) -> CampaignPolicyLimits {
+        CampaignPolicyLimits {
+            artifact_seconds: self.expiry_rules.artifact_seconds,
+            bundle_seconds: self.expiry_rules.bundle_seconds,
+            minimum_public_cell_size: self.minimum_public_cell_size,
+            private_asset_retention_seconds: self.private_asset_retention_seconds,
+            protocol_seconds: self.expiry_rules.protocol_seconds,
+            result_seconds: self.expiry_rules.result_seconds,
+            review_seconds: self.expiry_rules.review_seconds,
+        }
     }
 
     pub(crate) fn permits_hardware_class(&self, hardware_class: &Identifier) -> bool {
@@ -411,6 +460,21 @@ pub(crate) mod tests {
 
     fn parse(value: &Value) -> Result<CampaignPolicy, CampaignError> {
         CampaignPolicy::from_canonical_json(&canonical(value))
+    }
+
+    #[test]
+    fn policy_exposes_every_validated_limit_as_one_immutable_snapshot() {
+        let policy: CampaignPolicy = serde_json::from_value(policy_value()).unwrap();
+        policy.validate().unwrap();
+        let limits = policy.limits();
+
+        assert_eq!(limits.protocol_seconds(), 2_592_000);
+        assert_eq!(limits.bundle_seconds(), 2_592_000);
+        assert_eq!(limits.result_seconds(), 2_592_000);
+        assert_eq!(limits.review_seconds(), 604_800);
+        assert_eq!(limits.artifact_seconds(), 31_536_000);
+        assert_eq!(limits.private_asset_retention_seconds(), 31_536_000);
+        assert_eq!(limits.minimum_public_cell_size(), 20);
     }
 
     #[test]

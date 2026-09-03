@@ -113,6 +113,7 @@ pub fn reduce_campaign(
             return Err(CampaignError::ProvenanceMismatch);
         }
     }
+    validate_realized_public_cells(context.protocol.limits().minimum_public_cell_size(), &cases)?;
 
     if cases.iter().any(|case| {
         case.presentation != PresentationClass::BonaFide && case.candidate.authentication_accept
@@ -120,10 +121,9 @@ pub fn reduce_campaign(
         return Err(CampaignError::SecurityGateFailed);
     }
     if cases.iter().any(|case| {
-        case.presentation == PresentationClass::BonaFide
-            && required_stages(case)
-                .into_iter()
-                .any(|outcome| matches!(outcome, StageOutcome::NotApplicable))
+        required_stages(case)
+            .into_iter()
+            .any(|outcome| matches!(outcome, StageOutcome::NotApplicable))
     }) {
         return Err(CampaignError::CaptureIncomplete);
     }
@@ -250,6 +250,43 @@ pub fn reduce_campaign(
 
 fn case_key(case: &EvaluatedPairedCase) -> (&Identifier, u32) {
     (&case.case_id, case.instance_position)
+}
+
+fn validate_realized_public_cells(
+    minimum: u32,
+    cases: &[EvaluatedPairedCase],
+) -> Result<(), CampaignError> {
+    let mut categories = std::collections::BTreeMap::new();
+    let mut bona_fide_strata = std::collections::BTreeMap::new();
+    for case in cases {
+        let category_count = categories.entry(case.presentation).or_insert(0u64);
+        *category_count = category_count
+            .checked_add(1)
+            .ok_or(CampaignError::CohortIncomplete)?;
+        if case.presentation == PresentationClass::BonaFide {
+            for stratum_id in &case.stratum_ids {
+                let stratum_count = bona_fide_strata.entry(stratum_id).or_insert(0u64);
+                *stratum_count = stratum_count
+                    .checked_add(1)
+                    .ok_or(CampaignError::CohortIncomplete)?;
+            }
+        }
+    }
+    let minimum = u64::from(minimum);
+    if [
+        PresentationClass::BonaFide,
+        PresentationClass::DisplayReplay,
+        PresentationClass::NoFace,
+        PresentationClass::NonMatedLiveCrossIdentity,
+        PresentationClass::Print,
+    ]
+    .into_iter()
+    .any(|presentation| categories.get(&presentation).copied().unwrap_or(0) < minimum)
+        || bona_fide_strata.values().any(|count| *count < minimum)
+    {
+        return Err(CampaignError::CohortIncomplete);
+    }
+    Ok(())
 }
 
 fn required_stages(case: &EvaluatedPairedCase) -> [StageOutcome; 10] {
@@ -496,11 +533,12 @@ fn build_latency(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        reduce_campaign, EvaluatedPairedCase, ProfileCaseOutcome, ReductionContext, StageOutcome,
+        reduce_campaign, validate_realized_public_cells, EvaluatedPairedCase, ProfileCaseOutcome,
+        ReductionContext, StageOutcome,
     };
     use crate::{
-        lifecycle::tests::reduction_inputs, CampaignError, Sha256Digest, SignatureMetadata,
-        SignerFingerprint,
+        lifecycle::tests::reduction_inputs, CampaignError, ExpectedOutcome, Identifier,
+        PresentationClass, Sha256Digest, SignatureMetadata, SignerFingerprint,
     };
 
     fn outcome(authentication_accept: bool) -> ProfileCaseOutcome {
@@ -535,8 +573,107 @@ pub(crate) mod tests {
             .collect()
     }
 
+    fn synthetic_case(
+        presentation: PresentationClass,
+        stratum: &str,
+        instance_position: u32,
+    ) -> EvaluatedPairedCase {
+        EvaluatedPairedCase {
+            case_id: Identifier::new(&format!("{presentation:?}-{stratum}").to_lowercase())
+                .unwrap(),
+            instance_position,
+            stratum_ids: vec![Identifier::new(stratum).unwrap()],
+            presentation,
+            expected: if presentation == PresentationClass::BonaFide {
+                ExpectedOutcome::Accept
+            } else {
+                ExpectedOutcome::Reject
+            },
+            baseline: outcome(presentation == PresentationClass::BonaFide),
+            candidate: outcome(presentation == PresentationClass::BonaFide),
+            attempt_history_sha256: Sha256Digest::of(b"synthetic-history"),
+        }
+    }
+
+    #[test]
+    fn every_realized_public_category_obeys_the_signed_cell_floor() {
+        let presentations = [
+            PresentationClass::BonaFide,
+            PresentationClass::DisplayReplay,
+            PresentationClass::NoFace,
+            PresentationClass::NonMatedLiveCrossIdentity,
+            PresentationClass::Print,
+        ];
+        let complete: Vec<_> = presentations
+            .into_iter()
+            .flat_map(|presentation| {
+                (0..20).map(move |position| synthetic_case(presentation, "stratum-a", position))
+            })
+            .collect();
+        assert_eq!(validate_realized_public_cells(20, &complete), Ok(()));
+
+        for presentation in presentations {
+            let mut below = complete.clone();
+            let position = below
+                .iter()
+                .rposition(|case| case.presentation == presentation)
+                .unwrap();
+            below.remove(position);
+            assert_eq!(
+                validate_realized_public_cells(20, &below),
+                Err(CampaignError::CohortIncomplete),
+                "{presentation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_realized_bona_fide_stratum_obeys_the_signed_cell_floor() {
+        let mut cases: Vec<_> = ["stratum-a", "stratum-b"]
+            .into_iter()
+            .flat_map(|stratum| {
+                (0..20).map(move |position| {
+                    synthetic_case(PresentationClass::BonaFide, stratum, position)
+                })
+            })
+            .collect();
+        for presentation in [
+            PresentationClass::DisplayReplay,
+            PresentationClass::NoFace,
+            PresentationClass::NonMatedLiveCrossIdentity,
+            PresentationClass::Print,
+        ] {
+            cases.extend(
+                (0..20).map(|position| synthetic_case(presentation, "stratum-a", position)),
+            );
+        }
+        assert_eq!(validate_realized_public_cells(20, &cases), Ok(()));
+        cases.remove(
+            cases
+                .iter()
+                .rposition(|case| {
+                    case.presentation == PresentationClass::BonaFide
+                        && case.stratum_ids[0].as_str() == "stratum-b"
+                })
+                .unwrap(),
+        );
+        assert_eq!(
+            validate_realized_public_cells(20, &cases),
+            Err(CampaignError::CohortIncomplete)
+        );
+    }
+
     pub(crate) fn passing_output() -> crate::ReductionOutput {
         let (protocol, bundle, evaluation) = reduction_inputs();
+        passing_output_for(&protocol, &bundle, &evaluation, 1789000001)
+    }
+
+    pub(crate) fn passing_output_for(
+        protocol: &crate::ValidatedProtocol,
+        bundle: &crate::ValidatedFrozenBundle,
+        evaluation: &crate::ValidatedEvaluationEligibility,
+        evaluated_at_unix: u64,
+    ) -> crate::ReductionOutput {
         let evaluator_fingerprint =
             SignerFingerprint::new("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC").unwrap();
         let evaluator_provenance_sha256 = Sha256Digest::of(b"evaluator-v1");
@@ -548,15 +685,15 @@ pub(crate) mod tests {
         .unwrap();
         reduce_campaign(
             ReductionContext {
-                protocol: &protocol,
-                bundle: &bundle,
-                evaluation: &evaluation,
+                protocol,
+                bundle,
+                evaluation,
                 evaluator_fingerprint: &evaluator_fingerprint,
                 evaluator_provenance_sha256: &evaluator_provenance_sha256,
-                evaluated_at_unix: 1789000001,
+                evaluated_at_unix,
                 signature: &signature,
             },
-            complete_cases(&bundle),
+            complete_cases(bundle),
         )
         .unwrap()
     }
@@ -782,6 +919,113 @@ pub(crate) mod tests {
             reduce_campaign(context, slow),
             Err(CampaignError::LatencyFailed)
         );
+    }
+
+    #[test]
+    fn every_required_stage_fails_closed_for_every_presentation() {
+        let (protocol, bundle, evaluation) = reduction_inputs();
+        let evaluator_fingerprint =
+            SignerFingerprint::new("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC").unwrap();
+        let evaluator_provenance_sha256 = Sha256Digest::of(b"evaluator-v1");
+        let signature: SignatureMetadata = serde_json::from_value(serde_json::json!({
+            "algorithm": "open_pgp",
+            "role": "evaluator",
+            "signer_fingerprint": evaluator_fingerprint.as_str()
+        }))
+        .unwrap();
+        let context = ReductionContext {
+            protocol: &protocol,
+            bundle: &bundle,
+            evaluation: &evaluation,
+            evaluator_fingerprint: &evaluator_fingerprint,
+            evaluator_provenance_sha256: &evaluator_provenance_sha256,
+            evaluated_at_unix: 1789000001,
+            signature: &signature,
+        };
+        let complete = complete_cases(&bundle);
+
+        for presentation in [
+            PresentationClass::BonaFide,
+            PresentationClass::DisplayReplay,
+            PresentationClass::NoFace,
+            PresentationClass::NonMatedLiveCrossIdentity,
+            PresentationClass::Print,
+        ] {
+            for stage_position in 0..10 {
+                let mut unavailable = complete.clone();
+                let case = unavailable
+                    .iter_mut()
+                    .find(|case| case.presentation == presentation)
+                    .unwrap();
+                let stage = match stage_position {
+                    0 => &mut case.baseline.detection,
+                    1 => &mut case.baseline.recognition,
+                    2 => &mut case.baseline.liveness,
+                    3 => &mut case.baseline.rgb_pad,
+                    4 => &mut case.baseline.ir_pad,
+                    5 => &mut case.candidate.detection,
+                    6 => &mut case.candidate.recognition,
+                    7 => &mut case.candidate.liveness,
+                    8 => &mut case.candidate.rgb_pad,
+                    9 => &mut case.candidate.ir_pad,
+                    _ => unreachable!(),
+                };
+                *stage = StageOutcome::NotApplicable;
+                assert_eq!(
+                    reduce_campaign(context, unavailable),
+                    Err(CampaignError::CaptureIncomplete),
+                    "{presentation:?} stage {stage_position}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incorrect_attack_stages_remain_in_private_evidence() {
+        let (protocol, bundle, evaluation) = reduction_inputs();
+        let evaluator_fingerprint =
+            SignerFingerprint::new("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC").unwrap();
+        let evaluator_provenance_sha256 = Sha256Digest::of(b"evaluator-v1");
+        let signature: SignatureMetadata = serde_json::from_value(serde_json::json!({
+            "algorithm": "open_pgp",
+            "role": "evaluator",
+            "signer_fingerprint": evaluator_fingerprint.as_str()
+        }))
+        .unwrap();
+
+        for presentation in [
+            PresentationClass::DisplayReplay,
+            PresentationClass::NoFace,
+            PresentationClass::NonMatedLiveCrossIdentity,
+            PresentationClass::Print,
+        ] {
+            let mut cases = complete_cases(&bundle);
+            cases
+                .iter_mut()
+                .find(|case| case.presentation == presentation)
+                .unwrap()
+                .candidate
+                .detection = StageOutcome::Incorrect;
+            let output = reduce_campaign(
+                ReductionContext {
+                    protocol: &protocol,
+                    bundle: &bundle,
+                    evaluation: &evaluation,
+                    evaluator_fingerprint: &evaluator_fingerprint,
+                    evaluator_provenance_sha256: &evaluator_provenance_sha256,
+                    evaluated_at_unix: 1789000001,
+                    signature: &signature,
+                },
+                cases,
+            )
+            .unwrap();
+            assert!(output.private_transcript_shards.iter().any(|shard| {
+                shard.cases.iter().any(|case| {
+                    case.presentation == presentation
+                        && case.candidate.detection == StageOutcome::Incorrect
+                })
+            }));
+        }
     }
 
     #[test]

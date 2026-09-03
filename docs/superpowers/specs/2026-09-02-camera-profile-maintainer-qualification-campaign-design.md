@@ -11,6 +11,11 @@ not authorize recruitment, biometric access, vault creation, hardware capture,
 release signing, artifact publication, packaging, local commissioning, profile
 selection writes, or production changes.
 
+Correction: the policy-enforcement details identified by the Task 8 full-slice
+review are superseded only where they conflict with
+`docs/superpowers/specs/2026-09-02-maintainer-qualification-review-remediation-design.md`.
+All other decisions and scope boundaries in this design remain in force.
+
 Amends:
 
 - `docs/superpowers/specs/2026-09-01-camera-profile-release-qualification-design.md`

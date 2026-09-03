@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     canonical::private,
     minimum_paired_sample_size,
-    policy::{parse_canonical, to_canonical},
+    policy::{parse_canonical, to_canonical, CampaignPolicyLimits},
     BinaryGate, CampaignError, CampaignPolicy, CanonicalDocument, ExpectedOutcome, Identifier,
     PaiSpecies, PresentationClass, RatePpb, Sha256Digest, SignatureMetadata,
     SignedRateDifferencePpb, SignerFingerprint, SignerRole, StratificationAxis, Verified,
@@ -545,7 +545,7 @@ impl CampaignProtocol {
         self.candidate.validate(&self.contracts)?;
         validate_operating_points(&self.operating_points)?;
         validate_strata_order(&self.strata)?;
-        validate_cases(&self.cases, &self.strata)?;
+        validate_cases(&self.cases, &self.strata, &self.balanced_order_seed)?;
         validate_sample_matrix(
             &self.pilot_discordance,
             &self.locked_sample_sizes,
@@ -666,6 +666,7 @@ impl CanonicalDocument for CampaignProtocol {
 pub struct ValidatedProtocol {
     protocol: Verified<CampaignProtocol>,
     policy_sha256: Sha256Digest,
+    limits: CampaignPolicyLimits,
 }
 
 impl ValidatedProtocol {
@@ -680,15 +681,17 @@ impl ValidatedProtocol {
         protocol: Verified<CampaignProtocol>,
     ) -> Result<Self, CampaignError> {
         let document = protocol.document();
+        let limits = policy.document().limits();
+        let protocol_not_after = document
+            .created_at_unix
+            .checked_add(limits.protocol_seconds())
+            .ok_or(CampaignError::ProtocolInvalid)?;
         if document.policy_id != *policy.document().policy_id()
             || document.policy_sha256 != *policy.digest()
             || !policy
                 .document()
                 .permits_hardware_class(&document.hardware_scope.hardware_class)
-            || document
-                .expires_at_unix
-                .checked_sub(document.created_at_unix)
-                .is_none_or(|duration| duration > policy.document().protocol_expiry_seconds())
+            || document.expires_at_unix > protocol_not_after
             || document
                 .equipment_invalidations
                 .iter()
@@ -698,9 +701,15 @@ impl ValidatedProtocol {
         }
         validate_policy_strata(policy.document(), &document.strata)?;
         validate_locked_samples_against_policy(policy.document(), document)?;
+        validate_planned_public_cells(
+            limits.minimum_public_cell_size(),
+            &document.cases,
+            &document.strata,
+        )?;
         Ok(Self {
             policy_sha256: policy.digest().clone(),
             protocol,
+            limits,
         })
     }
 
@@ -717,6 +726,10 @@ impl ValidatedProtocol {
     #[must_use]
     pub const fn policy_sha256(&self) -> &Sha256Digest {
         &self.policy_sha256
+    }
+
+    pub(crate) const fn limits(&self) -> CampaignPolicyLimits {
+        self.limits
     }
 }
 
@@ -749,7 +762,11 @@ fn validate_strata_order(strata: &[StratumPlan]) -> Result<(), CampaignError> {
     Ok(())
 }
 
-fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), CampaignError> {
+fn validate_cases(
+    cases: &[CasePlan],
+    strata: &[StratumPlan],
+    balanced_order_seed: &Sha256Digest,
+) -> Result<(), CampaignError> {
     if cases.is_empty()
         || !cases.len().is_multiple_of(2)
         || !strictly_sorted_by(cases, |left, right| left.case_id.cmp(&right.case_id))
@@ -759,6 +776,13 @@ fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), Camp
     let mut baseline_first = 0usize;
     let mut candidate_first = 0usize;
     let mut logical_case_ids = std::collections::BTreeSet::new();
+    let expected_order = expected_baseline_first(
+        balanced_order_seed,
+        cases
+            .chunks_exact(2)
+            .filter_map(|pair| pair.first())
+            .map(|case| &case.logical_case_id),
+    )?;
     for pair in cases.chunks_exact(2) {
         let left = &pair[0];
         let right = &pair[1];
@@ -768,6 +792,9 @@ fn validate_cases(cases: &[CasePlan], strata: &[StratumPlan]) -> Result<(), Camp
             || left.profile_side != ProfileSide::Baseline
             || right.profile_side != ProfileSide::Candidate
             || left.order_position == right.order_position
+            || expected_order
+                .get(&left.logical_case_id)
+                .is_none_or(|expected| left.is_first() != *expected)
             || !strata.iter().any(|stratum| {
                 stratum.stratum_id == left.stratum_id && left.planned_count >= stratum.minimum_cases
             })
@@ -861,14 +888,7 @@ fn validate_locked_samples_against_policy(
     _policy: &CampaignPolicy,
     protocol: &CampaignProtocol,
 ) -> Result<(), CampaignError> {
-    let overall_capture_target = protocol
-        .cases
-        .iter()
-        .filter(|case| case.is_baseline())
-        .try_fold(0u64, |sum, case| {
-            sum.checked_add(u64::from(case.planned_count))
-        })
-        .ok_or(CampaignError::ProtocolInvalid)?;
+    let overall_capture_target = planned_count(&protocol.cases, PresentationClass::BonaFide, None)?;
     for (pilot, sample) in protocol
         .pilot_discordance
         .iter()
@@ -876,14 +896,14 @@ fn validate_locked_samples_against_policy(
     {
         let (expected_margin, capture_target) = match &sample.stratum_id {
             None => (OVERALL_MARGIN_PPB, overall_capture_target),
-            Some(stratum_id) => {
-                let case = protocol
-                    .cases
-                    .iter()
-                    .find(|case| case.is_baseline() && &case.stratum_id == stratum_id)
-                    .ok_or(CampaignError::ProtocolInvalid)?;
-                (STRATUM_MARGIN_PPB, u64::from(case.planned_count))
-            }
+            Some(stratum_id) => (
+                STRATUM_MARGIN_PPB,
+                planned_count(
+                    &protocol.cases,
+                    PresentationClass::BonaFide,
+                    Some(stratum_id),
+                )?,
+            ),
         };
         let margin_ppb = RatePpb::new(expected_margin.unsigned_abs())?;
         let power = minimum_paired_sample_size(
@@ -900,6 +920,82 @@ fn validate_locked_samples_against_policy(
         }
     }
     Ok(())
+}
+
+fn planned_count(
+    cases: &[CasePlan],
+    presentation: PresentationClass,
+    stratum_id: Option<&Identifier>,
+) -> Result<u64, CampaignError> {
+    cases
+        .iter()
+        .filter(|case| case.is_baseline())
+        .filter(|case| case.presentation_class() == presentation)
+        .filter(|case| stratum_id.is_none_or(|id| case.stratum_id() == id))
+        .try_fold(0u64, |sum, case| {
+            sum.checked_add(u64::from(case.planned_count()))
+                .ok_or(CampaignError::ProtocolInvalid)
+        })
+}
+
+fn validate_planned_public_cells(
+    minimum: u32,
+    cases: &[CasePlan],
+    strata: &[StratumPlan],
+) -> Result<(), CampaignError> {
+    for presentation in [
+        PresentationClass::BonaFide,
+        PresentationClass::DisplayReplay,
+        PresentationClass::NoFace,
+        PresentationClass::NonMatedLiveCrossIdentity,
+        PresentationClass::Print,
+    ] {
+        if planned_count(cases, presentation, None)? < u64::from(minimum) {
+            return Err(CampaignError::ProtocolInvalid);
+        }
+    }
+    for stratum in strata {
+        if planned_count(
+            cases,
+            PresentationClass::BonaFide,
+            Some(&stratum.stratum_id),
+        )? < u64::from(minimum)
+        {
+            return Err(CampaignError::ProtocolInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn order_rank(seed: &Sha256Digest, logical_case_id: &Identifier) -> Sha256Digest {
+    let mut bytes = b"irlume-campaign-order-v1\0".to_vec();
+    bytes.extend_from_slice(seed.as_str().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(logical_case_id.as_str().as_bytes());
+    Sha256Digest::of(&bytes)
+}
+
+fn expected_baseline_first<'a>(
+    seed: &Sha256Digest,
+    logical_case_ids: impl Iterator<Item = &'a Identifier>,
+) -> Result<std::collections::BTreeMap<Identifier, bool>, CampaignError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ranked = Vec::new();
+    for logical_case_id in logical_case_ids {
+        if !seen.insert(logical_case_id.clone()) {
+            return Err(CampaignError::ProtocolInvalid);
+        }
+        ranked.push((order_rank(seed, logical_case_id), logical_case_id.clone()));
+    }
+    if ranked.len() % 2 != 0 {
+        return Err(CampaignError::ProtocolInvalid);
+    }
+    ranked.sort();
+    Ok(ranked
+        .into_iter()
+        .enumerate()
+        .map(|(position, (_, logical_case_id))| (logical_case_id, position % 2 == 0))
+        .collect())
 }
 
 fn sample_key(gate: BinaryGate, stratum_id: &Option<Identifier>) -> (BinaryGate, Option<&str>) {
@@ -1011,7 +1107,7 @@ pub(crate) mod tests {
         strata
     }
 
-    fn cases(strata: &[Value]) -> Vec<Value> {
+    fn cases(strata: &[Value], seed: &Sha256Digest) -> Vec<Value> {
         let mut cells: Vec<_> = strata
             .iter()
             .map(|stratum| (stratum, "bona_fide", None, "accept"))
@@ -1059,6 +1155,22 @@ pub(crate) mod tests {
                     "stratum_id": stratum["stratum_id"]
                 }));
             }
+        }
+        let logical_ids: Vec<_> = cases
+            .iter()
+            .filter(|case| case["profile_side"] == "baseline")
+            .map(|case| Identifier::new(case["logical_case_id"].as_str().unwrap()).unwrap())
+            .collect();
+        let assignments = expected_baseline_first(seed, logical_ids.iter()).unwrap();
+        for case in &mut cases {
+            let logical_id = Identifier::new(case["logical_case_id"].as_str().unwrap()).unwrap();
+            let baseline_first = assignments[&logical_id];
+            let is_baseline = case["profile_side"] == "baseline";
+            case["order_position"] = json!(if is_baseline == baseline_first {
+                "first"
+            } else {
+                "second"
+            });
         }
         cases.sort_by(|left, right| left["case_id"].as_str().cmp(&right["case_id"].as_str()));
         cases
@@ -1110,10 +1222,11 @@ pub(crate) mod tests {
     pub(crate) fn protocol_value() -> Value {
         let policy = policy_bytes();
         let strata = strata();
-        let cases = cases(&strata);
+        let balanced_order_seed = Sha256Digest::new(&"8".repeat(64)).unwrap();
+        let cases = cases(&strata, &balanced_order_seed);
         let (pilot_discordance, locked_sample_sizes) = pilot_and_samples(&strata);
         json!({
-            "balanced_order_seed": digest("8"),
+            "balanced_order_seed": balanced_order_seed.as_str(),
             "baseline": profile("baseline-30fps", 30),
             "campaign_id": "campaign-2026-09-02-a",
             "candidate": profile("candidate-15fps", 15),
@@ -1177,8 +1290,43 @@ pub(crate) mod tests {
         })
     }
 
+    fn apply_seeded_order(value: &mut Value) {
+        let seed = Sha256Digest::new(value["balanced_order_seed"].as_str().unwrap()).unwrap();
+        let logical_ids: Vec<_> = value["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| case["profile_side"] == "baseline")
+            .map(|case| Identifier::new(case["logical_case_id"].as_str().unwrap()).unwrap())
+            .collect();
+        let assignments = expected_baseline_first(&seed, logical_ids.iter()).unwrap();
+        for case in value["cases"].as_array_mut().unwrap() {
+            let logical_id = Identifier::new(case["logical_case_id"].as_str().unwrap()).unwrap();
+            case["order_position"] = json!(if (case["profile_side"] == "baseline")
+                == assignments[&logical_id]
+            {
+                "first"
+            } else {
+                "second"
+            });
+        }
+    }
+
     fn verified_policy() -> crate::Verified<CampaignPolicy> {
         let bytes = policy_bytes();
+        let signer = SignerFingerprint::new(POLICY_AUTHOR).unwrap();
+        verify_document(
+            &bytes,
+            b"policy-signature",
+            SignerRole::PolicyAuthor,
+            &signer,
+            &AcceptSigner(POLICY_AUTHOR),
+        )
+        .unwrap()
+    }
+
+    fn verified_policy_value(value: &Value) -> crate::Verified<CampaignPolicy> {
+        let bytes = serde_json::to_vec(value).unwrap();
         let signer = SignerFingerprint::new(POLICY_AUTHOR).unwrap();
         verify_document(
             &bytes,
@@ -1206,6 +1354,31 @@ pub(crate) mod tests {
 
     pub(crate) fn validate(value: &Value) -> Result<ValidatedProtocol, CampaignError> {
         ValidatedProtocol::new(&verified_policy(), verified_protocol(value)?)
+    }
+
+    pub(crate) fn validate_with_policy(
+        policy_value: &Value,
+        protocol_value: &Value,
+    ) -> Result<ValidatedProtocol, CampaignError> {
+        let mut protocol_value = protocol_value.clone();
+        protocol_value["policy_sha256"] =
+            json!(Sha256Digest::of(&serde_json::to_vec(policy_value).unwrap()).as_str());
+        ValidatedProtocol::new(
+            &verified_policy_value(policy_value),
+            verified_protocol(&protocol_value)?,
+        )
+    }
+
+    #[test]
+    fn protocol_rejects_expiry_beyond_signed_protocol_lifetime() {
+        assert!(validate(&protocol_value()).is_ok());
+
+        let mut policy = policy_value();
+        policy["expiry_rules"]["protocol_seconds"] = json!(1);
+        assert_eq!(
+            validate_with_policy(&policy, &protocol_value()),
+            Err(CampaignError::ProtocolInvalid)
+        );
     }
 
     #[test]
@@ -1600,6 +1773,175 @@ pub(crate) mod tests {
             validate(&with_public_evidence),
             Err(CampaignError::ProtocolInvalid)
         );
+    }
+
+    #[test]
+    fn attack_counts_cannot_authorize_a_bona_fide_stratum_lock() {
+        let mut value = protocol_value();
+        let stratum_id = value["strata"][0]["stratum_id"].clone();
+        for case in value["cases"].as_array_mut().unwrap() {
+            if case["stratum_id"] == stratum_id && case["presentation_class"] == "bona_fide" {
+                case["planned_count"] = json!(40);
+            }
+            if case["stratum_id"] == stratum_id && case["presentation_class"] == "display_replay" {
+                let side = case["profile_side"].as_str().unwrap();
+                case["case_id"] = json!(format!("attack-first-{side}"));
+            }
+        }
+        value["cases"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| left["case_id"].as_str().cmp(&right["case_id"].as_str()));
+
+        assert_eq!(validate(&value), Err(CampaignError::ProtocolInvalid));
+    }
+
+    #[test]
+    fn every_planned_public_category_obeys_the_signed_cell_floor() {
+        for presentation in [
+            "display_replay",
+            "no_face",
+            "non_mated_live_cross_identity",
+            "print",
+        ] {
+            let mut policy = policy_value();
+            policy["minimum_public_cell_size"] = json!(100);
+            let mut value = protocol_value();
+            for case in value["cases"].as_array_mut().unwrap() {
+                case["planned_count"] = json!(100);
+                if case["presentation_class"] == presentation {
+                    case["planned_count"] = json!(99);
+                }
+            }
+            assert_eq!(
+                validate_with_policy(&policy, &value),
+                Err(CampaignError::ProtocolInvalid),
+                "{presentation}"
+            );
+
+            for case in value["cases"].as_array_mut().unwrap() {
+                if case["presentation_class"] == presentation {
+                    case["planned_count"] = json!(100);
+                }
+            }
+            assert!(
+                validate_with_policy(&policy, &value).is_ok(),
+                "{presentation}"
+            );
+        }
+    }
+
+    #[test]
+    fn planned_bona_fide_cells_use_the_same_public_floor_validator() {
+        let mut value = protocol_value();
+        let cases: Vec<CasePlan> = serde_json::from_value(value["cases"].clone()).unwrap();
+        let strata: Vec<StratumPlan> = serde_json::from_value(value["strata"].clone()).unwrap();
+        assert_eq!(
+            validate_planned_public_cells(100, &cases, &strata),
+            Err(CampaignError::ProtocolInvalid)
+        );
+
+        for case in value["cases"].as_array_mut().unwrap() {
+            case["planned_count"] = json!(100);
+        }
+        let cases: Vec<CasePlan> = serde_json::from_value(value["cases"].clone()).unwrap();
+        assert_eq!(validate_planned_public_cells(100, &cases, &strata), Ok(()));
+    }
+
+    #[test]
+    fn balanced_order_seed_has_pinned_domain_separated_assignments() {
+        let seed =
+            Sha256Digest::new("2c624232cdd221771294dfbb310aca000a0df6ac8b66b696d90ef06fdefb64a3")
+                .unwrap();
+        let ids: Vec<_> = ["logical-00", "logical-01", "logical-02", "logical-03"]
+            .into_iter()
+            .map(|id| Identifier::new(id).unwrap())
+            .collect();
+        for (id, expected) in [
+            (
+                "logical-00",
+                "283c6dc79c4ace764bacf6b96e6fe01b335e7c06e19e7b0c3313230e9ff19721",
+            ),
+            (
+                "logical-01",
+                "b1e16e16c3803b5043df4da8d473063a944c315a06cbe0e2b685f2686de6c023",
+            ),
+            (
+                "logical-02",
+                "4f9388ca5b948e70e38b23e28f6118425aab54c1c5287ad95924583f38dcb823",
+            ),
+            (
+                "logical-03",
+                "8dda5e7acac64d77259aa78165d014c79e3762453f50984b5a147311154f3126",
+            ),
+        ] {
+            assert_eq!(
+                order_rank(&seed, &Identifier::new(id).unwrap()).as_str(),
+                expected
+            );
+        }
+        let assignments = expected_baseline_first(&seed, ids.iter()).unwrap();
+        assert!(assignments[&ids[0]]);
+        assert!(!assignments[&ids[1]]);
+        assert!(!assignments[&ids[2]]);
+        assert!(assignments[&ids[3]]);
+    }
+
+    #[test]
+    fn protocol_order_is_seed_derived_and_input_order_independent() {
+        let value = protocol_value();
+        assert!(validate(&value).is_ok());
+        let seed = Sha256Digest::new(value["balanced_order_seed"].as_str().unwrap()).unwrap();
+        let ids: Vec<_> = value["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| case["profile_side"] == "baseline")
+            .map(|case| Identifier::new(case["logical_case_id"].as_str().unwrap()).unwrap())
+            .collect();
+        let forward = expected_baseline_first(&seed, ids.iter()).unwrap();
+        let reverse = expected_baseline_first(&seed, ids.iter().rev()).unwrap();
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn protocol_rejects_one_swapped_seeded_assignment() {
+        let mut value = protocol_value();
+        let baseline_cases: Vec<_> = value["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| case["profile_side"] == "baseline")
+            .collect();
+        let first = baseline_cases
+            .iter()
+            .find(|case| case["order_position"] == "first")
+            .unwrap()["logical_case_id"]
+            .clone();
+        let second = baseline_cases
+            .iter()
+            .find(|case| case["order_position"] == "second")
+            .unwrap()["logical_case_id"]
+            .clone();
+        for case in value["cases"].as_array_mut().unwrap() {
+            if case["logical_case_id"] == first || case["logical_case_id"] == second {
+                case["order_position"] = json!(if case["order_position"] == "first" {
+                    "second"
+                } else {
+                    "first"
+                });
+            }
+        }
+        assert_eq!(validate(&value), Err(CampaignError::ProtocolInvalid));
+    }
+
+    #[test]
+    fn changing_seed_requires_matching_new_assignments() {
+        let mut value = protocol_value();
+        value["balanced_order_seed"] = digest("f");
+        assert_eq!(validate(&value), Err(CampaignError::ProtocolInvalid));
+        apply_seeded_order(&mut value);
+        assert!(validate(&value).is_ok());
     }
 
     #[test]

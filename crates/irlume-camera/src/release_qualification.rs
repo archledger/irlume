@@ -710,8 +710,42 @@ mod tests {
         })
     }
 
+    fn apply_seeded_case_order(cases: &mut [Value], seed: &str) {
+        let mut ranked: Vec<_> = cases
+            .iter()
+            .filter(|case| case["profile_side"] == "baseline")
+            .map(|case| {
+                let logical_id = case["logical_case_id"].as_str().unwrap();
+                let mut bytes = b"irlume-campaign-order-v1\0".to_vec();
+                bytes.extend_from_slice(seed.as_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(logical_id.as_bytes());
+                (
+                    qualification::Sha256Digest::of(&bytes),
+                    logical_id.to_owned(),
+                )
+            })
+            .collect();
+        ranked.sort();
+        let assignments: std::collections::BTreeMap<_, _> = ranked
+            .into_iter()
+            .enumerate()
+            .map(|(position, (_, logical_id))| (logical_id, position % 2 == 0))
+            .collect();
+        for case in cases {
+            let baseline_first = assignments[case["logical_case_id"].as_str().unwrap()];
+            case["order_position"] =
+                json!(if (case["profile_side"] == "baseline") == baseline_first {
+                    "first"
+                } else {
+                    "second"
+                });
+        }
+    }
+
     fn campaign_protocol_value(policy_bytes: &[u8]) -> Value {
         let policy = campaign_policy_value();
+        let balanced_order_seed = "8".repeat(64);
         let mut strata = Vec::new();
         for field in ["demographic_axes", "operational_axes"] {
             for axis in policy[field].as_array().unwrap() {
@@ -760,6 +794,7 @@ mod tests {
                 }));
             }
         }
+        apply_seeded_case_order(&mut cases, &balanced_order_seed);
         cases.sort_by(|a, b| a["case_id"].as_str().cmp(&b["case_id"].as_str()));
         let mut pilot = Vec::new();
         let mut samples = Vec::new();
@@ -772,7 +807,7 @@ mod tests {
             }
         }
         json!({
-            "balanced_order_seed": qdigest("8"), "baseline": qprofile("baseline-30fps", 30), "campaign_id": "campaign-2026-09-02-a",
+            "balanced_order_seed": balanced_order_seed, "baseline": qprofile("baseline-30fps", 30), "campaign_id": "campaign-2026-09-02-a",
             "candidate": qprofile("candidate-15fps", 15), "cases": cases, "collection_not_after_unix": 1788998400u64,
             "collection_not_before_unix": 1788393600u64, "contracts": qcontracts(), "created_at_unix": 1788307200u64,
             "equipment_invalidations": [{"code": "device_disconnect", "detection_phase": "pre_outcome", "maximum_repeats": 2}],

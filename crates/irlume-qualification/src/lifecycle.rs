@@ -158,6 +158,16 @@ pub fn validate_collection_eligibility(
     now_unix: u64,
 ) -> Result<ValidatedCollectionEligibility, CampaignError> {
     let document = snapshot.document();
+    let bundle_limit = protocol
+        .protocol()
+        .collection_not_after_unix()
+        .checked_add(protocol.limits().bundle_seconds())
+        .ok_or(CampaignError::ConsentIneligible)?;
+    let private_limit = protocol
+        .protocol()
+        .collection_not_after_unix()
+        .checked_add(protocol.limits().private_asset_retention_seconds())
+        .ok_or(CampaignError::ConsentIneligible)?;
     if document.phase != EligibilityPhase::Collection
         || document.predecessor_sha256.is_some()
         || document.registry_revision != 1
@@ -165,6 +175,8 @@ pub fn validate_collection_eligibility(
         || snapshot.signer() != protocol.protocol().operator_fingerprint()
         || document.collection_opens_unix != protocol.protocol().collection_not_before_unix()
         || document.collection_closes_unix != protocol.protocol().collection_not_after_unix()
+        || document.retention_expires_unix > bundle_limit
+        || document.retention_expires_unix > private_limit
         || document.retention_expires_unix > protocol.protocol().expires_at_unix()
         || now_unix < document.collection_opens_unix
         || now_unix > document.collection_closes_unix
@@ -632,6 +644,9 @@ impl ValidatedFrozenBundle {
     pub(crate) const fn operator_fingerprint(&self) -> &crate::SignerFingerprint {
         &self.operator_fingerprint
     }
+    pub(crate) const fn retention_expires_unix(&self) -> u64 {
+        self.retention_expires_unix
+    }
 }
 
 /// Validates a frozen metadata index without opening any asset path.
@@ -926,7 +941,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
-        protocol::tests::{protocol_value, validate},
+        policy::tests::policy_value,
+        protocol::tests::{protocol_value, validate, validate_with_policy},
         verify_document, CampaignError, DetachedSignatureVerifier, Sha256Digest, SignerFingerprint,
         SignerRole,
     };
@@ -999,6 +1015,26 @@ pub(crate) mod tests {
             &signer,
             &AcceptOperator,
         )
+    }
+
+    fn protocol_with_retention_limits(
+        bundle_seconds: u64,
+        private_seconds: u64,
+    ) -> ValidatedProtocol {
+        let mut policy = policy_value();
+        policy["expiry_rules"]["bundle_seconds"] = json!(bundle_seconds);
+        policy["private_asset_retention_seconds"] = json!(private_seconds);
+        validate_with_policy(&policy, &protocol_value()).unwrap()
+    }
+
+    fn snapshot_after(protocol: &ValidatedProtocol, seconds: u64) -> Verified<EligibilitySnapshot> {
+        let mut value = snapshot_value(protocol.protocol_sha256());
+        value["retention_expires_unix"] = json!(protocol
+            .protocol()
+            .collection_not_after_unix()
+            .checked_add(seconds)
+            .unwrap());
+        verified_snapshot(&value).unwrap()
     }
 
     fn verified_snapshot_as(
@@ -1137,15 +1173,23 @@ pub(crate) mod tests {
         validate_frozen_bundle(protocol, collection, index, vec![shard])
     }
 
-    fn bundle_inputs() -> (ValidatedProtocol, ValidatedCollectionEligibility, Value) {
+    fn bundle_inputs_with_policy(
+        policy: &Value,
+        retention_expires_unix: u64,
+    ) -> (ValidatedProtocol, ValidatedCollectionEligibility, Value) {
         let protocol_value = protocol_value();
-        let protocol = validate(&protocol_value).unwrap();
-        let collection_snapshot =
-            verified_snapshot(&snapshot_value(protocol.protocol_sha256())).unwrap();
+        let protocol = validate_with_policy(policy, &protocol_value).unwrap();
+        let mut snapshot = snapshot_value(protocol.protocol_sha256());
+        snapshot["retention_expires_unix"] = json!(retention_expires_unix);
+        let collection_snapshot = verified_snapshot(&snapshot).unwrap();
         let collection =
             validate_collection_eligibility(&protocol, collection_snapshot, 1788500000).unwrap();
         let shard = shard_value(&protocol_value, protocol.protocol_sha256());
         (protocol, collection, shard)
+    }
+
+    fn bundle_inputs() -> (ValidatedProtocol, ValidatedCollectionEligibility, Value) {
+        bundle_inputs_with_policy(&policy_value(), 1790899200)
     }
 
     pub(crate) fn reduction_inputs() -> (
@@ -1153,9 +1197,22 @@ pub(crate) mod tests {
         ValidatedFrozenBundle,
         ValidatedEvaluationEligibility,
     ) {
-        let (protocol, collection, shard) = bundle_inputs();
+        reduction_inputs_with_policy(&policy_value(), 1790899200)
+    }
+
+    pub(crate) fn reduction_inputs_with_policy(
+        policy: &Value,
+        retention_expires_unix: u64,
+    ) -> (
+        ValidatedProtocol,
+        ValidatedFrozenBundle,
+        ValidatedEvaluationEligibility,
+    ) {
+        let (protocol, collection, shard) =
+            bundle_inputs_with_policy(policy, retention_expires_unix);
         let bundle = freeze_bundle(&protocol, &collection, &shard).unwrap();
         let mut value = snapshot_value(protocol.protocol_sha256());
+        value["retention_expires_unix"] = json!(retention_expires_unix);
         value["phase"] = json!("evaluation");
         value["registry_revision"] = json!(2);
         value["predecessor_sha256"] = json!(collection.snapshot_sha256().as_str());
@@ -1169,8 +1226,24 @@ pub(crate) mod tests {
         ValidatedFrozenBundle,
         ValidatedPublicationEligibility,
     ) {
-        let (protocol, bundle, evaluation) = reduction_inputs();
+        let (protocol, bundle, _, publication) =
+            review_inputs_with_policy(&policy_value(), 1790899200);
+        (protocol, bundle, publication)
+    }
+
+    pub(crate) fn review_inputs_with_policy(
+        policy: &Value,
+        retention_expires_unix: u64,
+    ) -> (
+        ValidatedProtocol,
+        ValidatedFrozenBundle,
+        ValidatedEvaluationEligibility,
+        ValidatedPublicationEligibility,
+    ) {
+        let (protocol, bundle, evaluation) =
+            reduction_inputs_with_policy(policy, retention_expires_unix);
         let mut value = snapshot_value(protocol.protocol_sha256());
+        value["retention_expires_unix"] = json!(retention_expires_unix);
         value["phase"] = json!("publication");
         value["registry_revision"] = json!(3);
         value["predecessor_sha256"] = json!(evaluation.snapshot_sha256().as_str());
@@ -1179,7 +1252,7 @@ pub(crate) mod tests {
         let snapshot = verified_snapshot(&value).unwrap();
         let publication =
             validate_publication_eligibility(&evaluation, snapshot, 1789000001).unwrap();
-        (protocol, bundle, publication)
+        (protocol, bundle, evaluation, publication)
     }
 
     fn publication_inputs() -> (
@@ -1243,6 +1316,83 @@ pub(crate) mod tests {
         let snapshot = verified_snapshot(&value).unwrap();
         assert_eq!(
             validate_collection_eligibility(&protocol, snapshot, 1788500000),
+            Err(CampaignError::ConsentIneligible)
+        );
+    }
+
+    #[test]
+    fn collection_retention_obeys_signed_bundle_lifetime() {
+        let protocol = protocol_with_retention_limits(1, MAX_PRIVATE_RETENTION_SECONDS);
+        assert!(validate_collection_eligibility(
+            &protocol,
+            snapshot_after(&protocol, 1),
+            1788500000
+        )
+        .is_ok());
+        assert_eq!(
+            validate_collection_eligibility(&protocol, snapshot_after(&protocol, 2), 1788500000),
+            Err(CampaignError::ConsentIneligible)
+        );
+
+        let mut policy = policy_value();
+        policy["expiry_rules"]["bundle_seconds"] = json!(1);
+        let mut protocol_value = protocol_value();
+        protocol_value["created_at_unix"] = json!(u64::MAX - 2_592_000);
+        protocol_value["collection_not_before_unix"] = json!(u64::MAX - 1);
+        protocol_value["collection_not_after_unix"] = json!(u64::MAX);
+        protocol_value["evaluation_not_after_unix"] = json!(u64::MAX);
+        protocol_value["review_not_after_unix"] = json!(u64::MAX);
+        protocol_value["expires_at_unix"] = json!(u64::MAX);
+        let protocol = validate_with_policy(&policy, &protocol_value).unwrap();
+        let mut value = snapshot_value(protocol.protocol_sha256());
+        value["collection_opens_unix"] = json!(u64::MAX - 1);
+        value["collection_closes_unix"] = json!(u64::MAX);
+        value["retention_expires_unix"] = json!(u64::MAX);
+        assert_eq!(
+            validate_collection_eligibility(
+                &protocol,
+                verified_snapshot(&value).unwrap(),
+                u64::MAX - 1
+            ),
+            Err(CampaignError::ConsentIneligible)
+        );
+    }
+
+    #[test]
+    fn collection_retention_obeys_signed_private_lifetime() {
+        let protocol = protocol_with_retention_limits(MAX_PRIVATE_RETENTION_SECONDS, 1);
+        assert!(validate_collection_eligibility(
+            &protocol,
+            snapshot_after(&protocol, 1),
+            1788500000
+        )
+        .is_ok());
+        assert_eq!(
+            validate_collection_eligibility(&protocol, snapshot_after(&protocol, 2), 1788500000),
+            Err(CampaignError::ConsentIneligible)
+        );
+
+        let mut policy = policy_value();
+        policy["expiry_rules"]["bundle_seconds"] = json!(1);
+        policy["private_asset_retention_seconds"] = json!(2);
+        let mut protocol_value = protocol_value();
+        protocol_value["created_at_unix"] = json!(u64::MAX - 2_592_000);
+        protocol_value["collection_not_before_unix"] = json!(u64::MAX - 2);
+        protocol_value["collection_not_after_unix"] = json!(u64::MAX - 1);
+        protocol_value["evaluation_not_after_unix"] = json!(u64::MAX);
+        protocol_value["review_not_after_unix"] = json!(u64::MAX);
+        protocol_value["expires_at_unix"] = json!(u64::MAX);
+        let protocol = validate_with_policy(&policy, &protocol_value).unwrap();
+        let mut value = snapshot_value(protocol.protocol_sha256());
+        value["collection_opens_unix"] = json!(u64::MAX - 2);
+        value["collection_closes_unix"] = json!(u64::MAX - 1);
+        value["retention_expires_unix"] = json!(u64::MAX);
+        assert_eq!(
+            validate_collection_eligibility(
+                &protocol,
+                verified_snapshot(&value).unwrap(),
+                u64::MAX - 2
+            ),
             Err(CampaignError::ConsentIneligible)
         );
     }

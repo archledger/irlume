@@ -275,12 +275,23 @@ fn validate_target_bindings(
 fn bounded_expiry(
     protocol_expiry: u64,
     collection_not_after: u64,
+    private_retention_seconds: u64,
+    artifact_seconds: u64,
     qualified_at: u64,
 ) -> Result<u64, CampaignError> {
-    let collection_expiry = collection_not_after
+    let private_limit = collection_not_after
+        .checked_add(private_retention_seconds)
+        .ok_or(CampaignError::ArtifactCompileFailed)?;
+    let framework_limit = collection_not_after
         .checked_add(MAX_ARTIFACT_LIFETIME_SECONDS)
         .ok_or(CampaignError::ArtifactCompileFailed)?;
-    let expires_at = protocol_expiry.min(collection_expiry);
+    let artifact_limit = qualified_at
+        .checked_add(artifact_seconds)
+        .ok_or(CampaignError::ArtifactCompileFailed)?;
+    let expires_at = protocol_expiry
+        .min(private_limit)
+        .min(framework_limit)
+        .min(artifact_limit);
     if qualified_at == 0 || expires_at <= qualified_at {
         return Err(CampaignError::ArtifactCompileFailed);
     }
@@ -312,6 +323,8 @@ fn compile(
     let expires_at_unix = bounded_expiry(
         document.expires_at_unix(),
         document.collection_not_after_unix(),
+        protocol.limits().private_asset_retention_seconds(),
+        protocol.limits().artifact_seconds(),
         qualified_at_unix,
     )?;
     let contracts = document.runtime_contracts();
@@ -525,18 +538,48 @@ mod tests {
     #[test]
     fn compiler_expiry_is_checked_bounded_and_strictly_live() {
         assert_eq!(
-            bounded_expiry(u64::MAX, u64::MAX, 1),
+            bounded_expiry(u64::MAX, u64::MAX, 0, 0, 1),
             Err(CampaignError::ArtifactCompileFailed)
         );
         assert_eq!(
-            bounded_expiry(200, 100, 0),
+            bounded_expiry(200, 100, 100, 100, 0),
             Err(CampaignError::ArtifactCompileFailed)
         );
         assert_eq!(
-            bounded_expiry(200, 100, 200),
+            bounded_expiry(200, 100, 100, 100, 200),
             Err(CampaignError::ArtifactCompileFailed)
         );
-        assert_eq!(bounded_expiry(200, 100, 99), Ok(200));
-        assert_eq!(bounded_expiry(u64::MAX, 100, 99), Ok(31_536_100));
+        assert_eq!(bounded_expiry(200, 100, 100, 100, 99), Ok(199));
+        assert_eq!(
+            bounded_expiry(u64::MAX, 100, 40_000_000, 40_000_000, 99),
+            Ok(31_536_100)
+        );
+    }
+
+    #[test]
+    fn compiler_expiry_obeys_every_signed_and_framework_limit() {
+        assert_eq!(bounded_expiry(1_000, 100, 1_000, 1, 200), Ok(201));
+        assert_eq!(bounded_expiry(1_000, 100, 1, 1_000, 99), Ok(101));
+        assert_eq!(bounded_expiry(150, 100, 1_000, 1_000, 101), Ok(150));
+        assert_eq!(
+            bounded_expiry(u64::MAX, 100, 40_000_000, 40_000_000, 101),
+            Ok(31_536_100)
+        );
+        assert_eq!(
+            bounded_expiry(u64::MAX, u64::MAX, 1, 1, 1),
+            Err(CampaignError::ArtifactCompileFailed)
+        );
+        assert_eq!(
+            bounded_expiry(u64::MAX, 0, 1, 1, u64::MAX),
+            Err(CampaignError::ArtifactCompileFailed)
+        );
+        assert_eq!(
+            bounded_expiry(u64::MAX, u64::MAX, 0, 1, 1),
+            Err(CampaignError::ArtifactCompileFailed)
+        );
+        assert_eq!(
+            bounded_expiry(100, 0, 1_000, 1_000, 100),
+            Err(CampaignError::ArtifactCompileFailed)
+        );
     }
 }

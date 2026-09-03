@@ -543,6 +543,28 @@ pub struct ReviewContext<'a> {
     pub reproduced_public_result_sha256: &'a Sha256Digest,
 }
 
+fn validate_review_lifetimes(
+    evaluated_at_unix: u64,
+    reviewed_at_unix: u64,
+    result_seconds: u64,
+    review_seconds: u64,
+    retention_expires_unix: u64,
+) -> Result<(), CampaignError> {
+    let result_not_after = evaluated_at_unix
+        .checked_add(result_seconds)
+        .ok_or(CampaignError::ReviewRejected)?;
+    let review_not_after = evaluated_at_unix
+        .checked_add(review_seconds)
+        .ok_or(CampaignError::ReviewRejected)?;
+    if reviewed_at_unix > result_not_after
+        || reviewed_at_unix > review_not_after
+        || reviewed_at_unix > retention_expires_unix
+    {
+        return Err(CampaignError::ReviewRejected);
+    }
+    Ok(())
+}
+
 /// Binds a verified passing result to its exact independent review authority.
 ///
 /// # Errors
@@ -560,6 +582,13 @@ pub fn assemble_reviewed_aggregate(
     let attestation = review.document();
     let protocol = context.protocol.protocol();
     let snapshots = context.publication.snapshot_sha256();
+    validate_review_lifetimes(
+        public.evaluated_at_unix,
+        attestation.reviewed_at_unix,
+        context.protocol.limits().result_seconds(),
+        context.protocol.limits().review_seconds(),
+        context.bundle.retention_expires_unix(),
+    )?;
 
     if attestation.decision != ReviewDecision::Passed
         || !attestation.checks.all_passed()
@@ -626,8 +655,10 @@ pub fn assemble_reviewed_aggregate(
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        lifecycle::tests::review_inputs, reducer::tests::passing_output, verify_document,
-        DetachedSignatureVerifier, ReviewContext, SignerFingerprint, Verified,
+        lifecycle::tests::{review_inputs, review_inputs_with_policy},
+        policy::tests::policy_value,
+        reducer::tests::{passing_output, passing_output_for},
+        verify_document, DetachedSignatureVerifier, ReviewContext, SignerFingerprint, Verified,
     };
 
     const EVALUATOR: &str = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
@@ -660,12 +691,13 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn review_value(
+    fn review_value_at(
         protocol: &crate::ValidatedProtocol,
         bundle: &crate::ValidatedFrozenBundle,
         publication: &crate::ValidatedPublicationEligibility,
         transcript: &Verified<PrivateTranscriptIndex>,
         public_result: &Verified<PublicAggregateResult>,
+        reviewed_at_unix: u64,
     ) -> serde_json::Value {
         let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
         serde_json::json!({
@@ -692,7 +724,7 @@ pub(crate) mod tests {
             "public_result_sha256": public_result.digest().as_str(),
             "publication_eligibility_sha256": publication.snapshot_sha256()[2].as_str(),
             "reproduced_public_result_sha256": public_result.digest().as_str(),
-            "reviewed_at_unix": 1789000002u64,
+            "reviewed_at_unix": reviewed_at_unix,
             "reviewer_fingerprint": reviewer.as_str(),
             "schema_version": 1,
             "signature": {
@@ -703,6 +735,23 @@ pub(crate) mod tests {
             "source_revision": protocol.protocol().source_revision().as_str(),
             "transcript_sha256": transcript.digest().as_str()
         })
+    }
+
+    fn review_value(
+        protocol: &crate::ValidatedProtocol,
+        bundle: &crate::ValidatedFrozenBundle,
+        publication: &crate::ValidatedPublicationEligibility,
+        transcript: &Verified<PrivateTranscriptIndex>,
+        public_result: &Verified<PublicAggregateResult>,
+    ) -> serde_json::Value {
+        review_value_at(
+            protocol,
+            bundle,
+            publication,
+            transcript,
+            public_result,
+            1789000002,
+        )
     }
 
     fn verified_review_inputs() -> (
@@ -768,6 +817,54 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    fn assemble_with_lifetimes(
+        result_seconds: u64,
+        review_seconds: u64,
+        evaluated_at_unix: u64,
+        reviewed_at_unix: u64,
+        retention_expires_unix: u64,
+    ) -> Result<ReviewedAggregate, CampaignError> {
+        let mut policy = policy_value();
+        policy["expiry_rules"]["result_seconds"] = serde_json::json!(result_seconds);
+        policy["expiry_rules"]["review_seconds"] = serde_json::json!(review_seconds);
+        let (protocol, bundle, evaluation, publication) =
+            review_inputs_with_policy(&policy, retention_expires_unix);
+        let output = passing_output_for(&protocol, &bundle, &evaluation, evaluated_at_unix);
+        let evaluator = SignerFingerprint::new(EVALUATOR).unwrap();
+        let transcript = verified(
+            &output.private_transcript_index,
+            SignerRole::Evaluator,
+            &evaluator,
+        );
+        let public_result = verified(&output.public_result, SignerRole::Evaluator, &evaluator);
+        let reviewer = SignerFingerprint::new(REVIEWER).unwrap();
+        let review = verified(
+            &serde_json::from_value::<ReviewAttestation>(review_value_at(
+                &protocol,
+                &bundle,
+                &publication,
+                &transcript,
+                &public_result,
+                reviewed_at_unix,
+            ))
+            .unwrap(),
+            SignerRole::Reviewer,
+            &reviewer,
+        );
+        let reproduced = public_result.digest().clone();
+        assemble_reviewed_aggregate(
+            ReviewContext {
+                protocol: &protocol,
+                bundle: &bundle,
+                publication: &publication,
+                transcript: &transcript,
+                reproduced_public_result_sha256: &reproduced,
+            },
+            public_result,
+            Some(review),
+        )
+    }
+
     #[test]
     fn result_documents_round_trip_only_in_canonical_evaluator_form() {
         let output = passing_output();
@@ -828,6 +925,44 @@ pub(crate) mod tests {
         assert_eq!(
             reviewed.envelope_sha256(),
             &reviewed.envelope().digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn review_obeys_signed_result_lifetime() {
+        assert_eq!(validate_review_lifetimes(100, 101, 1, 10, 200), Ok(()));
+        assert_eq!(
+            validate_review_lifetimes(100, 102, 1, 10, 200),
+            Err(CampaignError::ReviewRejected)
+        );
+        assert_eq!(
+            validate_review_lifetimes(u64::MAX, u64::MAX, 1, 1, u64::MAX),
+            Err(CampaignError::ReviewRejected)
+        );
+        assert_eq!(
+            validate_review_lifetimes(u64::MAX, u64::MAX, 0, 1, u64::MAX),
+            Err(CampaignError::ReviewRejected)
+        );
+    }
+
+    #[test]
+    fn review_obeys_signed_review_lifetime() {
+        let evaluated = 1789000001;
+        assert!(assemble_with_lifetimes(10, 1, evaluated, evaluated + 1, 1790899200).is_ok());
+        assert_eq!(
+            assemble_with_lifetimes(10, 1, evaluated, evaluated + 2, 1790899200),
+            Err(CampaignError::ReviewRejected)
+        );
+    }
+
+    #[test]
+    fn review_cannot_outlive_accepted_bundle_retention() {
+        let evaluated = 1789000001;
+        let retention = evaluated + 1;
+        assert!(assemble_with_lifetimes(10, 10, evaluated, retention, retention).is_ok());
+        assert_eq!(
+            assemble_with_lifetimes(10, 10, evaluated, retention + 1, retention),
+            Err(CampaignError::ReviewRejected)
         );
     }
 

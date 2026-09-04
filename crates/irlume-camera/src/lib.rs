@@ -1892,17 +1892,27 @@ impl<S: ValidatedStream> TrackedStream<S> {
 
     /// Boundedly establish the 30-delta window before the next delivered frame.
     fn fill_rate_evidence(&mut self) -> std::io::Result<()> {
+        self.fill_rate_evidence_with_startup(false)
+    }
+
+    fn fill_rate_evidence_with_startup(&mut self, adaptive_ir: bool) -> std::io::Result<()> {
         if self.rate_window.ready() {
             return Ok(());
         }
-        // First fill: flush the STREAMON transient before measuring. The
-        // flush length is per role and measured per fleet node (see
-        // [`rate_gate::startup_flush`]); it resets before measuring so the
-        // startup deltas do not count against the floor.
-        for _ in 0..rate_gate::startup_flush(self.rate_config.role()) {
-            self.next_discarded()?;
+        // Exclude a role's measured STREAMON transient. With no exclusion
+        // (RGB), retain successful timing observations from AE warm-up: they
+        // already belong to this stream's rate window, whose full size and
+        // floor remain unchanged. Warm-up pixels are still discarded.
+        let flush = rate_gate::startup_flush(self.rate_config.role());
+        let adaptive_ir = adaptive_ir && self.rate_config.role() == contracts::StreamRole::Ir;
+        if flush > 0 {
+            if !adaptive_ir {
+                for _ in 0..flush {
+                    self.next_discarded()?;
+                }
+            }
+            self.rate_window.reset();
         }
-        self.rate_window.reset();
         let mut attempts = 0;
         while !self.rate_window.ready() && attempts < MAX_RATE_FILL_ATTEMPTS {
             self.next_discarded()?;
@@ -1912,6 +1922,23 @@ impl<S: ValidatedStream> TrackedStream<S> {
             return Err(std::io::Error::other(
                 "could not establish delivered-rate evidence within the bounded fill",
             ));
+        }
+        if adaptive_ir {
+            // One-shot IR may settle before the fixed exclusion is needed.
+            // Keep the full window and spend at most the existing flush budget
+            // sliding past startup. Delivery still checks the next frame's
+            // updated window, including a typed BelowFloor refusal if needed.
+            let policy = self.rate_config.policy();
+            for _ in 0..flush {
+                if self.rate_window.meets_floor(
+                    policy.floor_num(),
+                    policy.floor_den(),
+                    policy.tolerance_percent(),
+                ) {
+                    break;
+                }
+                self.next_discarded()?;
+            }
         }
         Ok(())
     }
@@ -4949,11 +4976,35 @@ pub fn capture_ir_with_stats_and_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    capture_ir_with_startup(device, progress, false)
+}
+
+/// Capture IR alone, allowing a healthy full rate window to end startup early.
+///
+/// Use only after the RGB stream has stopped. Concurrent callers must use
+/// [`capture_ir_with_stats_and_progress`] or held sessions instead.
+///
+/// # Errors
+///
+/// Returns the same camera, privacy and delivered-rate errors as
+/// [`capture_ir_with_stats_and_progress`].
+pub fn capture_ir_sequential_with_stats_and_progress(
+    device: &str,
+    progress: &Progress,
+) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    capture_ir_with_startup(device, progress, true)
+}
+
+fn capture_ir_with_startup(
+    device: &str,
+    progress: &Progress,
+    adaptive_ir: bool,
+) -> irlume_common::Result<(Frame, IrCaptureStats)> {
     let opened = std::time::Instant::now();
     let cam = IrCamera::open(device)?;
     let open_ms = opened.elapsed().as_millis();
     let armed = std::time::Instant::now();
-    let mut session = cam.session_with_progress(progress)?;
+    let mut session = cam.session_with_startup(progress, adaptive_ir)?;
     let arm_ms = armed.elapsed().as_millis();
     let captured = std::time::Instant::now();
     let shot = session.capture_with_stats();
@@ -5114,6 +5165,14 @@ impl IrCamera {
         &self,
         progress: &Progress,
     ) -> irlume_common::Result<IrSession<'_>> {
+        self.session_with_startup(progress, false)
+    }
+
+    fn session_with_startup(
+        &self,
+        progress: &Progress,
+        adaptive_ir: bool,
+    ) -> irlume_common::Result<IrSession<'_>> {
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -5194,7 +5253,7 @@ impl IrCamera {
         // requeued before the first frame a caller can observe.
         let fill_started = std::time::Instant::now();
         let fill_result = fill_rate_then_drain_metadata(
-            || stream.fill_rate_evidence(),
+            || stream.fill_rate_evidence_with_startup(adaptive_ir),
             || {
                 if let Some(log) = meta.as_mut() {
                     log.drain();
@@ -7025,7 +7084,7 @@ fn measure_contention_in_operation(
         },
         || {
             operation
-                .run(|| capture_ir_with_stats_and_progress(ir_dev, progress))
+                .run(|| capture_ir_sequential_with_stats_and_progress(ir_dev, progress))
                 .map_err(|error| Error::Hardware(error.to_string()))?
         },
         held_concurrent_arm(rgb_dev, ir_dev, operation, context),
@@ -10558,6 +10617,229 @@ mod tests {
             timestamp: v4l::timestamp::Timestamp::new(seconds, 0),
             ..v4l::buffer::Metadata::default()
         }
+    }
+
+    fn rate_fill_fixture(
+        role: contracts::StreamRole,
+        frames: u32,
+        interval_us: i64,
+    ) -> TrackedStream<QueuedContinuityFixture> {
+        let interval = frame_interval::FrameInterval::new(1, 15).unwrap();
+        let metadata = (1..=frames)
+            .map(|sequence| {
+                let micros = 1_000_000 + i64::from(sequence) * interval_us;
+                let mut metadata = continuity_metadata(
+                    sequence,
+                    micros / 1_000_000,
+                    v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+                );
+                metadata.timestamp =
+                    v4l::timestamp::Timestamp::new(micros / 1_000_000, micros % 1_000_000);
+                metadata
+            })
+            .collect();
+        TrackedStream::new(
+            QueuedContinuityFixture {
+                payload: [1],
+                metadata,
+            },
+            rate_gate::StreamRateConfig::new(role, interval, interval),
+        )
+    }
+
+    #[test]
+    fn rate_fill_reuses_rgb_warmup_without_shortening_window() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Rgb, 32, 66_667);
+        // One recovery dequeue and six AE dequeues, as in RgbSession::warm_up.
+        for _ in 0..1 + AE_WARMUP {
+            stream.next_discarded().unwrap();
+        }
+        let (_, facts, _, _, evidence) = stream.next().expect("reuse valid warmup timing");
+        assert_eq!(facts.sequence_raw(), 32);
+        assert_eq!(evidence.window_count(), 30);
+        assert_eq!(evidence.window_span_us(), 30 * 66_667);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn rate_fill_without_warmup_still_requires_the_full_window() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Rgb, 31, 66_667);
+        stream.fill_rate_evidence().unwrap();
+        assert_eq!(stream.rate_window.count(), 30);
+        // Establishing transport health did not supply a capture frame.
+        assert!(stream.next().is_err());
+    }
+
+    #[test]
+    fn rate_fill_preserves_ir_startup_exclusion() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 49, 66_667);
+        for _ in 0..7 {
+            stream.next_discarded().unwrap();
+        }
+        // Seven prior frames, ten excluded startup frames, 31 measurement
+        // frames, then the delivered frame. IR must not reuse startup timing.
+        let (_, facts, _, _, evidence) = stream.next().unwrap();
+        assert_eq!(facts.sequence_raw(), 49);
+        assert_eq!(evidence.window_count(), 30);
+        assert_eq!(evidence.window_span_us(), 30 * 66_667);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn rate_fill_reused_rgb_warmup_still_refuses_slow_delivery() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Rgb, 64, 200_000);
+        for _ in 0..1 + AE_WARMUP {
+            stream.next_discarded().unwrap();
+        }
+        assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
+    }
+
+    #[test]
+    fn rate_fill_reuses_only_the_recovered_rgb_streams_warmup() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Rgb, 32, 66_667);
+        stream.next().unwrap();
+        stream.take();
+        let replacement = rate_fill_fixture(contracts::StreamRole::Rgb, 32, 100_000)
+            .take()
+            .unwrap();
+        stream.install_recovered(replacement).unwrap();
+        for _ in 0..1 + AE_WARMUP {
+            stream.next_discarded().unwrap();
+        }
+        let (_, facts, sequence, timestamp, evidence) = stream.next().unwrap();
+        assert_eq!(facts.sequence_raw(), 32);
+        assert_eq!(sequence.stream_epoch(), 1);
+        assert_eq!(timestamp.stream_epoch(), 1);
+        assert_eq!(evidence.window_count(), 30);
+        assert_eq!(evidence.window_span_us(), 30 * 100_000);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn adaptive_ir_startup_delivers_early_only_with_a_full_healthy_window() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 32, 66_667);
+        stream.fill_rate_evidence_with_startup(true).unwrap();
+        let (_, facts, _, _, evidence) = stream.next().unwrap();
+        assert_eq!(facts.sequence_raw(), 32);
+        assert_eq!(evidence.window_count(), 30);
+        assert_eq!(evidence.window_span_us(), 30 * 66_667);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn adaptive_ir_startup_waits_for_a_slow_initial_interval_to_leave_the_window() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 42, 66_667);
+        // One long interval before frame 5. It leaves the 30-interval window
+        // at frame 35; earlier windows are below the IR floor.
+        for metadata in stream.stream_mut().unwrap().metadata.iter_mut().skip(4) {
+            let micros = 1_800_000 + i64::from(metadata.sequence) * 66_667;
+            metadata.timestamp =
+                v4l::timestamp::Timestamp::new(micros / 1_000_000, micros % 1_000_000);
+        }
+        stream.fill_rate_evidence_with_startup(true).unwrap();
+        let (_, facts, _, _, evidence) = stream.next().unwrap();
+        assert_eq!(facts.sequence_raw(), 36);
+        assert_eq!(evidence.window_count(), 30);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn adaptive_ir_startup_bounds_persistently_slow_and_bursty_delivery() {
+        for bursty in [false, true] {
+            let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 200_000);
+            if bursty {
+                let mut micros = 1_000_000;
+                for metadata in &mut stream.stream_mut().unwrap().metadata {
+                    // Groups of fast deliveries cannot hide repeated stalls.
+                    micros += if metadata.sequence % 5 == 0 {
+                        600_000
+                    } else {
+                        20_000
+                    };
+                    metadata.timestamp =
+                        v4l::timestamp::Timestamp::new(micros / 1_000_000, micros % 1_000_000);
+                }
+            }
+            stream.fill_rate_evidence_with_startup(true).unwrap();
+            assert_eq!(stream.observations, 41);
+            // Preserve the existing typed rate refusal on attempted delivery.
+            assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
+        }
+    }
+
+    #[test]
+    fn adaptive_ir_startup_does_not_waive_later_rate_failures() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 32, 66_667);
+        let last = stream.stream_mut().unwrap().metadata.back_mut().unwrap();
+        last.timestamp = v4l::timestamp::Timestamp::new(5, 0);
+        stream.fill_rate_evidence_with_startup(true).unwrap();
+        assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
+    }
+
+    #[test]
+    fn adaptive_ir_startup_propagates_missing_and_invalid_frames() {
+        let mut missing = rate_fill_fixture(contracts::StreamRole::Ir, 5, 66_667);
+        assert!(missing.fill_rate_evidence_with_startup(true).is_err());
+        assert_eq!(missing.observations, 5);
+
+        let mut invalid = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        invalid.stream_mut().unwrap().metadata[4].timestamp =
+            v4l::timestamp::Timestamp::new(1, 1_000_000);
+        assert!(invalid.fill_rate_evidence_with_startup(true).is_err());
+        assert!(invalid.next().is_err(), "invalid epoch cannot heal");
+    }
+
+    #[test]
+    fn adaptive_ir_startup_does_not_count_corrupt_payloads_as_delivered() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 42, 66_667);
+        stream.stream_mut().unwrap().metadata[4].flags |= v4l::buffer::Flags::ERROR;
+        stream.fill_rate_evidence_with_startup(true).unwrap();
+        let (_, facts, _, _, evidence) = stream.next().unwrap();
+        // Through frame 35, the window spans 31 periods for 30 successful
+        // intervals: 14.516 fps, below the 14.55 fps tolerated IR floor.
+        // The doubled interval ends at frame 6 and leaves at frame 36.
+        assert_eq!(facts.sequence_raw(), 37);
+        assert_eq!(evidence.window_count(), 30);
+        assert_eq!(evidence.window_span_us(), 30 * 66_667);
+    }
+
+    #[test]
+    fn adaptive_ir_startup_recovery_cannot_reuse_a_previous_healthy_window() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 42, 66_667);
+        stream.next().unwrap();
+        stream.take();
+        let replacement = rate_fill_fixture(contracts::StreamRole::Ir, 100, 200_000)
+            .take()
+            .unwrap();
+        stream.install_recovered(replacement).unwrap();
+        stream.fill_rate_evidence_with_startup(true).unwrap();
+        assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
+    }
+
+    #[test]
+    fn adaptive_ir_startup_propagates_timeout_without_retrying() {
+        struct SilentStream(usize);
+        impl ValidatedStream for SilentStream {
+            fn next_validated(
+                &mut self,
+            ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError>
+            {
+                self.0 += 1;
+                Err(ValidatedDequeueError::Io(
+                    std::io::ErrorKind::TimedOut.into(),
+                ))
+            }
+        }
+        let config = rate_fill_fixture(contracts::StreamRole::Ir, 0, 66_667).rate_config;
+        let mut stream = TrackedStream::new(SilentStream(0), config);
+        assert_eq!(
+            stream
+                .fill_rate_evidence_with_startup(true)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(stream.stream_mut().unwrap().0, 1);
     }
 
     #[test]

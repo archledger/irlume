@@ -4043,8 +4043,10 @@ impl Engine {
                     (rgb, rgb_ms, Ok(None), 0, false)
                 } else {
                     let t = std::time::Instant::now();
-                    let ir =
-                        irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress);
+                    let ir = irlume_camera::capture_ir_sequential_with_stats_and_progress(
+                        &self.ir_dev,
+                        &progress,
+                    );
                     (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis(), false)
                 }
             } else {
@@ -4169,8 +4171,10 @@ impl Engine {
                 },
                 || {
                     let started = std::time::Instant::now();
-                    let frame =
-                        irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?;
+                    let frame = irlume_camera::capture_ir_sequential_with_stats_and_progress(
+                        &self.ir_dev,
+                        &progress,
+                    )?;
                     Ok((frame, started.elapsed().as_millis()))
                 },
             );

@@ -3161,9 +3161,19 @@ fn publish_engine_bits(
 #[derive(Clone)]
 struct EnrollmentSummary {
     profiles: Vec<irlume_common::ProfileSummary>,
-    require_eyes_open: bool,
-    closure_calibrated: bool,
     ir_ratio_calibrated: bool,
+}
+
+impl EnrollmentSummary {
+    fn into_response(self) -> Response {
+        Response::Enrollment {
+            profiles: self.profiles,
+            // Retired settings remain on the wire for older clients.
+            require_eyes_open: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: self.ir_ratio_calibrated,
+        }
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -3202,8 +3212,6 @@ fn summarize_enrollment(
                     }
                 })
                 .collect(),
-            require_eyes_open: false,
-            closure_calibrated: false,
             ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
         },
         // A successful load that found nothing IS an observation: publishing
@@ -3211,8 +3219,6 @@ fn summarize_enrollment(
         // the worker instead of missing on every tick.
         None => EnrollmentSummary {
             profiles: Vec::new(),
-            require_eyes_open: false,
-            closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
     }
@@ -3514,12 +3520,7 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             match cached_enrollment_summary(user) {
-                Some(sum) => Response::Enrollment {
-                    profiles: sum.profiles,
-                    require_eyes_open: sum.require_eyes_open,
-                    closure_calibrated: sum.closure_calibrated,
-                    ir_ratio_calibrated: sum.ir_ratio_calibrated,
-                },
+                Some(sum) => sum.into_response(),
                 None => return None,
             }
         }
@@ -4205,12 +4206,7 @@ fn dispatch_scoped(
                     // thread.
                     let sum = summarize_enrollment(enr.as_ref(), engine.embed_space());
                     publish_enrollment_summary(&user, sum.clone());
-                    Response::Enrollment {
-                        profiles: sum.profiles,
-                        require_eyes_open: sum.require_eyes_open,
-                        closure_calibrated: sum.closure_calibrated,
-                        ir_ratio_calibrated: sum.ir_ratio_calibrated,
-                    }
+                    sum.into_response()
                 }
                 Err(e) => fail(
                     irlume_common::OperationErrorCode::OperationFailed,
@@ -7872,8 +7868,6 @@ mod tests {
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
                 }],
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: true,
             },
         );
@@ -7961,8 +7955,6 @@ mod tests {
             SAMPLE_USER,
             EnrollmentSummary {
                 profiles: Vec::new(),
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
         );
@@ -9490,8 +9482,6 @@ mod tests {
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
                 }],
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
         );
@@ -9903,8 +9893,6 @@ mod tests {
                 "carol",
                 EnrollmentSummary {
                     profiles: Vec::new(),
-                    require_eyes_open: false,
-                    closure_calibrated: false,
                     ir_ratio_calibrated: false,
                 },
             );
@@ -10019,8 +10007,6 @@ mod tests {
             "carol",
             EnrollmentSummary {
                 profiles: Vec::new(),
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
         );
@@ -10108,10 +10094,17 @@ mod tests {
             "a refused enable must leave the stored flag alone"
         );
         assert!(
-            !cached_enrollment_summary("carol")
-                .expect("refused ON must preserve the summary")
-                .require_eyes_open,
-            "the preserved summary must keep the retired field frozen false"
+            matches!(
+                cached_enrollment_summary("carol")
+                    .expect("refused ON must preserve the summary")
+                    .into_response(),
+                Response::Enrollment {
+                    require_eyes_open: false,
+                    closure_calibrated: false,
+                    ..
+                }
+            ),
+            "the preserved summary must report the retired fields as false"
         );
 
         for attempt in 1..=2 {
@@ -10131,10 +10124,17 @@ mod tests {
                 .expect("the enrollment exists");
             assert!(!enr.require_eyes_open, "OFF attempt {attempt} must persist");
             assert!(
-                !cached_enrollment_summary("carol")
-                    .expect("OFF must publish the saved summary")
-                    .require_eyes_open,
-                "OFF attempt {attempt} must publish the cleared flag"
+                matches!(
+                    cached_enrollment_summary("carol")
+                        .expect("OFF must publish the saved summary")
+                        .into_response(),
+                    Response::Enrollment {
+                        require_eyes_open: false,
+                        closure_calibrated: false,
+                        ..
+                    }
+                ),
+                "OFF attempt {attempt} must report the retired fields as false"
             );
         }
     }

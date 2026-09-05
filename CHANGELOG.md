@@ -3,6 +3,13 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Bound paired camera streaming to each assessment, coordinate paired startup,
+  and service companion queues through burst completion.
+
 ## [0.11.3] - 2026-08-29
 
 ### Added

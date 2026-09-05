@@ -188,6 +188,33 @@ pub struct Assessment {
     pub sequential_pair: bool,
 }
 
+// An unfinished assessment cannot enter the public identity-admission boundary.
+// Its identity inputs carry actual detected faces, not placeholder embeddings.
+mod grouped_auth;
+
+struct DeferredAssessment<I> {
+    assessment: Assessment,
+    identity: I,
+}
+
+struct IdentityImage {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    face: Detection,
+}
+
+type PairIdentity = (Option<IdentityImage>, Option<IdentityImage>);
+
+struct PairAssessmentContext<'a> {
+    sequential: bool,
+    pair_sequential_retried: bool,
+    rgb_hard_retried: bool,
+    held_sessions: bool,
+    ir_ms: Option<u128>,
+    diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+}
+
 /// The authentication decision for a user.
 // Debug is diagnostic-only (tests, dlog); derives add no behavior.
 #[derive(Debug)]
@@ -4317,7 +4344,7 @@ impl Engine {
         // switch, missing node) fails again with the same error. Logged so a
         // silent retry can't make the timing lines below lie about a slow login.
         let mut rgb_hard_retried = pair_sequential_retried;
-        let mut rgb = match rgb_res {
+        let rgb = match rgb_res {
             Ok(f) => f,
             // Standalone reopen is only safe when THIS call opened one-shot:
             // with held sessions the device queue belongs to the caller's
@@ -4337,8 +4364,46 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
+        let (rgb_faces, rgb_top) = self.detect_rgb_assessment(&rgb, Some(rgb_ms), diagnostics)?;
+
+        // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
+        // above already returned, so reaching here with `None` is unreachable,
+        // but capture alone rather than unwrap to stay panic-free.
+        let (ir, ir_stats) = match ir_res {
+            Ok(Some(f)) => f,
+            Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
+            Err(e) if !held_sessions && !pair_sequential_retried => {
+                irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
+                irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let evidence = self.assess_captured_pair(
+            rgb,
+            ir,
+            ir_stats,
+            (rgb_faces, rgb_top),
+            PairAssessmentContext {
+                sequential,
+                pair_sequential_retried,
+                rgb_hard_retried,
+                held_sessions,
+                ir_ms: Some(ir_ms),
+                diagnostics,
+            },
+        )?;
+        self.materialize_pair_identity(evidence)
+            .map_err(CapturePathError::from)
+    }
+
+    fn detect_rgb_assessment(
+        &mut self,
+        rgb: &irlume_camera::Frame,
+        rgb_ms: Option<u128>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<(Vec<Detection>, Option<Detection>)> {
         let rgb_detection_started = std::time::Instant::now();
-        let mut rgb_faces = self.det.detect(&align::RgbView {
+        let rgb_faces = self.det.detect(&align::RgbView {
             data: &rgb.data,
             width: rgb.width,
             height: rgb.height,
@@ -4349,8 +4414,10 @@ impl Engine {
                 .unwrap_or(u64::MAX),
         });
         let mut rgb_top = top_detection(&rgb_faces).cloned();
+        let capture_timing =
+            rgb_ms.map_or_else(|| "from grouped capture".into(), |ms| format!("in {ms}ms"));
         irlume_common::dlog!(
-            "assess: rgb {}x{} in {rgb_ms}ms, faces={} top-det={:.2}",
+            "assess: rgb {}x{} {capture_timing}, faces={} top-det={:.2}",
             rgb.width,
             rgb.height,
             rgb_faces.len(),
@@ -4367,18 +4434,26 @@ impl Engine {
             );
         }
 
-        // `None` = sequential mode skipped IR after an RGB fault; the RGB `?`
-        // above already returned, so reaching here with `None` is unreachable,
-        // but capture alone rather than unwrap to stay panic-free.
-        let (ir, ir_stats) = match ir_res {
-            Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
-            Err(e) if !held_sessions && !pair_sequential_retried => {
-                irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?
-            }
-            Err(e) => return Err(e.into()),
-        };
+        Ok((rgb_faces, rgb_top))
+    }
+
+    fn assess_captured_pair(
+        &mut self,
+        mut rgb: irlume_camera::Frame,
+        ir: irlume_camera::Frame,
+        ir_stats: irlume_camera::IrCaptureStats,
+        (mut rgb_faces, mut rgb_top): (Vec<Detection>, Option<Detection>),
+        context: PairAssessmentContext<'_>,
+    ) -> Result<DeferredAssessment<PairIdentity>, CapturePathError> {
+        let PairAssessmentContext {
+            sequential,
+            pair_sequential_retried,
+            rgb_hard_retried,
+            held_sessions,
+            ir_ms,
+            diagnostics,
+        } = context;
+        let progress = self.capture_progress();
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
         let ir_view = align::RgbView {
             data: &ir_grey_rgb,
@@ -4393,8 +4468,10 @@ impl Engine {
                 .unwrap_or(u64::MAX),
         });
         let mut ir_top = top_detection(&ir_faces).cloned();
+        let capture_timing =
+            ir_ms.map_or_else(|| "from grouped capture".into(), |ms| format!("in {ms}ms"));
         irlume_common::dlog!(
-            "assess: ir {}x{} in {ir_ms}ms, faces={} top-det={:.2}",
+            "assess: ir {}x{} {capture_timing}, faces={} top-det={:.2}",
             ir.width,
             ir.height,
             ir_faces.len(),
@@ -4530,7 +4607,7 @@ impl Engine {
                     verdict: irlume_common::diagnostics::TraceVerdict::Uncertain,
                     measurements,
                 });
-                return Ok(Assessment {
+                return Ok(DeferredAssessment { assessment: Assessment {
                     verdict: Verdict::Uncertain,
                     rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
                     reason: format!(
@@ -4548,7 +4625,7 @@ impl Engine {
                     rgb_pad: PadEvidence::NotApplicable,
                     ir_pad: PadEvidence::NotApplicable,
                     sequential_pair: false, // rejected pair: no pair survives
-                });
+                }, identity: (None, None) });
             }
         };
         if stale_pair_reason.is_some() {
@@ -4742,39 +4819,12 @@ impl Engine {
             verdict, &signals,
         ));
 
-        // Rebuild the view against the final RGB frame (it may have been
-        // recaptured by the cross-spectrum self-heal above).
-        let rgb_view = align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
-        };
-        let embedding = match &rgb_top {
-            Some(f) => {
-                let chip = align::align_to_arcface(&rgb_view, &f.landmarks)?;
-                Some(self.emb.embed_tta(&chip)?) // TTA flip-average (RGB only; cuts FRR)
-            }
-            None => None,
-        };
-        // IR-face embedding (for dark operation): align + embed the IR image,
-        // then apply the domain-adaptation adapter if loaded.
-        let ir_embedding = match &ir_top {
-            Some(f) => {
-                let chip = align::align_to_arcface(&ir_view, &f.landmarks)?;
-                let raw = self.emb.embed(&chip)?;
-                Some(match &mut self.ir_adapter {
-                    Some(a) => a.apply(&raw)?,
-                    None => raw.to_vec(),
-                })
-            }
-            None => None,
-        };
-        Ok(Assessment {
+        let assessment = Assessment {
             verdict,
             reason,
-            embedding,
+            embedding: None,
             rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
-            ir_embedding,
+            ir_embedding: None,
             signals,
             ir_center_edge_ratio,
             ir_brightness,
@@ -4792,7 +4842,70 @@ impl Engine {
             // ceiling: the bursts ran as separated one-shots (ADR-0014). Such
             // pairs defer the RGB-primary grant (rgb_primary_grant_admissible).
             sequential_pair: pair_admitted_sequentially(skew, rgb_top.is_some()),
+        };
+        Ok(DeferredAssessment {
+            assessment,
+            identity: (
+                rgb_top.map(|face| IdentityImage {
+                    data: rgb.data,
+                    width: rgb.width,
+                    height: rgb.height,
+                    face,
+                }),
+                ir_top.map(|face| IdentityImage {
+                    data: ir_grey_rgb,
+                    width: ir.width,
+                    height: ir.height,
+                    face,
+                }),
+            ),
         })
+    }
+
+    fn materialize_pair_identity(
+        &mut self,
+        evidence: DeferredAssessment<PairIdentity>,
+    ) -> irlume_common::Result<Assessment> {
+        let DeferredAssessment {
+            mut assessment,
+            identity: (rgb, ir),
+        } = evidence;
+        let started = std::time::Instant::now();
+        assessment.embedding = match rgb {
+            Some(image) => {
+                let view = align::RgbView {
+                    data: &image.data,
+                    width: image.width,
+                    height: image.height,
+                };
+                let chip = align::align_to_arcface(&view, &image.face.landmarks)?;
+                Some(self.emb.embed_tta(&chip)?)
+            }
+            None => None,
+        };
+        let rgb_embedding_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        assessment.ir_embedding = match ir {
+            Some(image) => {
+                let view = align::RgbView {
+                    data: &image.data,
+                    width: image.width,
+                    height: image.height,
+                };
+                let chip = align::align_to_arcface(&view, &image.face.landmarks)?;
+                let raw = self.emb.embed(&chip)?;
+                Some(match &mut self.ir_adapter {
+                    Some(a) => a.apply(&raw)?,
+                    None => raw.to_vec(),
+                })
+            }
+            None => None,
+        };
+        irlume_common::dlog!(
+            "[assessment-stage] embeddings: rgb={rgb_embedding_ms}ms ir={}ms",
+            started.elapsed().as_millis()
+        );
+        Ok(assessment)
     }
 
     /// Capture a temporal IR sequence and record per-frame HEAD POSE (pitch and
@@ -5373,6 +5486,20 @@ impl Engine {
             );
         }
         let sequential = capture_mode.is_sequential();
+        let grouped = grouped_auth::eligible(
+            &capture_mode,
+            self.ir_available,
+            self.has_vit_pad(),
+            self.has_pad_ir(),
+            window,
+            purpose,
+            service,
+        );
+        let (grouped_cams, resolved_cams) = if grouped {
+            (resolved_cams, None)
+        } else {
+            (None, resolved_cams)
+        };
         let held_cams = cameras_for_held_pair(sequential, resolved_cams);
         // Resolve enrollment before streaming. A loader wait can exceed a
         // camera queue's capacity; no stream may be armed across this wait.
@@ -5417,6 +5544,33 @@ impl Engine {
             if let Some(outcome) = self.enrollment_policy_refusal(user, &enr) {
                 return Ok(outcome);
             }
+        }
+        if let Some(cameras) = grouped_cams {
+            let mut costliest_attempt = std::time::Duration::ZERO;
+            return self
+                .authentication_attempt_loop_with(
+                    deadline,
+                    window,
+                    &mut costliest_attempt,
+                    |engine| {
+                        (
+                            Self::run_camera_operation(&camera_operation, || {
+                                engine.authenticate_grouped_once(
+                                    &enr,
+                                    purpose,
+                                    service,
+                                    &cameras,
+                                    &capture_mode,
+                                    deadline,
+                                    diagnostics,
+                                )
+                            }),
+                            false,
+                        )
+                    },
+                    std::time::Instant::now,
+                )
+                .0;
         }
         if held_cams.is_none() || !self.ir_available {
             drop(held_cams);
@@ -5676,6 +5830,17 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
         self.qualify_rgb_pad_evidence(&mut a);
+        self.authenticate_qualified_assessment(enr, purpose, service, a, diagnostics)
+    }
+
+    fn authenticate_qualified_assessment(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        a: Assessment,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
         // An unreadable frame is reported as unreadable before anything derived
         // from it is consulted. Uncertain is the only verdict this promotes; a
         // Spoof still reaches its own branch below with its own reason.
@@ -10388,6 +10553,7 @@ mod pad_cue_tests {
 /// build (the 512-D recognizer session), so one instance is shared.
 #[cfg(test)]
 mod engine_tests {
+    mod grouped_tests;
     use super::tests::env_guard;
     use super::*;
     use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};

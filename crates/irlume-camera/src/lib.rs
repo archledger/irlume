@@ -50,6 +50,8 @@ pub mod lease;
 mod lifecycle;
 mod media_graph;
 mod rate_gate;
+mod sequential_batch;
+pub use sequential_batch::{capture_sequential_batch_with_progress, SequentialBatchRequest};
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.
@@ -9336,6 +9338,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod sequential_batch_tests {
+        include!("sequential_batch_tests.rs");
+    }
     /// #586: the round-continuity verdict is four nameable conditions; the
     /// classifier must pick the right one, in check order, for every shape.
     #[test]

@@ -1049,7 +1049,7 @@ fn legacy_eye_policy(enrollment: &irlume_core::storage::Enrollment) -> Result<()
 
 /// True for a presence-class failure: the attempt never reached a match
 /// verdict because no usable face was in frame (absent, off-angle, or missing
-/// in one spectrum).
+/// in one spectrum), or because the required PAD vote is still incomplete.
 ///
 /// These are the ONLY outcomes the grace window may retry: they are
 /// FAR-neutral (no matcher ran) and give an attacker nothing. The daemon
@@ -1262,6 +1262,7 @@ enum PadEvidence {
     NotApplicable,
     Unavailable,
     InferenceFailed,
+    Pending,
     Score(f32),
 }
 
@@ -1284,6 +1285,12 @@ fn pad_evidence_refusal(modality: PadModality, evidence: PadEvidence) -> Option<
         PadModality::Ir => "IR",
     };
     let reason = match evidence {
+        PadEvidence::Pending => {
+            return Some(Outcome::deny(
+                OutcomeKind::Uncertain,
+                format!("collecting {modality} PAD evidence"),
+            ));
+        }
         PadEvidence::Unavailable => {
             format!("{modality} PAD is unavailable; use your password")
         }
@@ -1305,8 +1312,16 @@ fn pad_policy_refusal(
 ) -> Option<Outcome> {
     match requirements {
         PadRequirements::RgbOnly => pad_evidence_refusal(PadModality::Rgb, rgb),
-        PadRequirements::RgbAndIr => pad_evidence_refusal(PadModality::Rgb, rgb)
-            .or_else(|| pad_evidence_refusal(PadModality::Ir, ir)),
+        PadRequirements::RgbAndIr => {
+            // An incomplete RGB vote must not hide a permanent IR refusal.
+            if rgb == PadEvidence::Pending {
+                pad_evidence_refusal(PadModality::Ir, ir)
+                    .or_else(|| pad_evidence_refusal(PadModality::Rgb, rgb))
+            } else {
+                pad_evidence_refusal(PadModality::Rgb, rgb)
+                    .or_else(|| pad_evidence_refusal(PadModality::Ir, ir))
+            }
+        }
         PadRequirements::IrOnly => pad_evidence_refusal(PadModality::Ir, ir),
     }
 }
@@ -3398,6 +3413,25 @@ impl Engine {
         }
         self.vit_scores.push(score);
         vit_vote_denies(&self.vit_scores)
+    }
+
+    /// A produced score is not yet a completed five-score PAD decision.
+    /// Both credential and enrollment admission must wait for that decision.
+    /// A break in usable evidence invalidates the partial presentation window.
+    fn qualify_rgb_pad_evidence(&mut self, a: &mut Assessment) {
+        match a.rgb_pad {
+            PadEvidence::Score(p) if p.is_finite() && a.verdict == Verdict::Live => {
+                if self.vit_scores.len() < VIT_PAD_VOTE_N {
+                    a.rgb_pad = PadEvidence::Pending;
+                }
+            }
+            _ => {
+                self.vit_scores.clear();
+                if matches!(a.rgb_pad, PadEvidence::Score(p) if !p.is_finite()) {
+                    a.rgb_pad = PadEvidence::InferenceFailed;
+                }
+            }
+        }
     }
 
     /// Detection rescue (cascade stage 2): when YuNet returns no face, try
@@ -5560,7 +5594,7 @@ impl Engine {
                 return (Ok(out), false);
             }
             irlume_common::dlog!(
-                "grace: attempt {attempt} found no usable face ({}); retrying within window",
+                "grace: attempt {attempt} has incomplete face evidence ({}); retrying within window",
                 out.reason
             );
             self.note_capture_boundary();
@@ -5594,17 +5628,34 @@ impl Engine {
         let a = match assessment {
             Ok(assessment) => assessment,
             Err(CapturePathError::ConcurrentPair(error)) => {
+                self.vit_scores.clear();
                 if let Some(failed) = held_pair_failed {
                     *failed = true;
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error.into_inner()),
+            Err(error) => {
+                self.vit_scores.clear();
+                return Err(error.into_inner());
+            }
         };
-        // The situation line of a failed attempt reads THIS attempt's facts
-        // (#616 step 2): snapshot them before any Outcome branch returns.
+        // Snapshot capture facts before any decision branch returns. This stays
+        // on the attempt path so failed-attempt diagnostics describe this take.
         self.last_attempt_facts = AttemptFacts::from_assessment(&a);
+        self.authenticate_assessment(enr, purpose, service, a, diagnostics)
+    }
 
+    /// Decide using a captured assessment after its streaming owners have been
+    /// released. Capture/inference and authorization remain separate boundaries.
+    fn authenticate_assessment(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        mut a: Assessment,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        self.qualify_rgb_pad_evidence(&mut a);
         // An unreadable frame is reported as unreadable before anything derived
         // from it is consulted. Uncertain is the only verdict this promotes; a
         // Spoof still reaches its own branch below with its own reason.
@@ -6257,6 +6308,7 @@ impl Engine {
             ) {
                 Ok(scans) => return Ok(scans),
                 Err(CapturePathError::ConcurrentPair(error)) => {
+                    self.vit_scores.clear();
                     demote_after_concurrent_capture_failure(&mut capture_mode);
                     irlume_common::dlog!("enroll: {error}; restarting RGB then IR");
                 }
@@ -6363,21 +6415,49 @@ impl Engine {
             // decides whether the frame is kept, so a turned/tilted (but live)
             // face can't be saved as a bad template even if the user moved during
             // the countdown. Same bounds (and neutral) the enrollment guide uses.
-            if a.verdict == Verdict::Live && frontal_signals(&a.signals, pitch_neutral) {
-                if let Some(e) = a.embedding {
-                    out.push(CapturedScan {
-                        rgb: e.to_vec(),
-                        ir: a.ir_embedding.clone(),
-                        center_edge_ratio: a.ir_center_edge_ratio,
-                        brightness: a.ir_brightness,
-                        pitch: a.signals.head_pitch_frac,
-                        ambient_share: a.ir_ambient_share,
-                    });
-                }
+            if let Some(scan) = self.enrollment_scan(a, policy.use_ir, pitch_neutral)? {
+                out.push(scan);
             }
         }
         observed.include(shape);
         Ok(out)
+    }
+
+    /// Admit one assessed enrollment sample. A request for one scan uses the
+    /// same admission boundary as a multi-scan enrollment.
+    fn enrollment_scan(
+        &mut self,
+        mut a: Assessment,
+        use_ir: bool,
+        pitch_neutral: Option<f32>,
+    ) -> Result<Option<CapturedScan>, CapturePathError> {
+        self.qualify_rgb_pad_evidence(&mut a);
+        if a.verdict == Verdict::Live && frontal_signals(&a.signals, pitch_neutral) {
+            let requirements = if use_ir {
+                PadRequirements::RgbAndIr
+            } else {
+                PadRequirements::RgbOnly
+            };
+            if let Some(refusal) = pad_policy_refusal(requirements, a.rgb_pad, a.ir_pad) {
+                if refusal.kind == OutcomeKind::Uncertain {
+                    return Ok(None);
+                }
+                return Err(CapturePathError::Other(irlume_common::Error::Protocol(
+                    refusal.reason,
+                )));
+            }
+            if let Some(e) = a.embedding {
+                return Ok(Some(CapturedScan {
+                    rgb: e.to_vec(),
+                    ir: a.ir_embedding,
+                    center_edge_ratio: a.ir_center_edge_ratio,
+                    brightness: a.ir_brightness,
+                    pitch: a.signals.head_pitch_frac,
+                    ambient_share: a.ir_ambient_share,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// One solo RGB frame after the held sessions were released, to say whether
@@ -10095,6 +10175,35 @@ mod pad_cue_tests {
     }
 
     #[test]
+    fn pending_rgb_pad_is_retryable_but_does_not_mask_required_ir_failure() {
+        let pending = pad_policy_refusal(
+            PadRequirements::RgbOnly,
+            PadEvidence::Pending,
+            PadEvidence::NotApplicable,
+        )
+        .unwrap();
+        assert!(!pending.granted);
+        assert!(super::presence_retryable(&pending));
+        for ir in [
+            PadEvidence::Unavailable,
+            PadEvidence::InferenceFailed,
+            PadEvidence::NotApplicable,
+        ] {
+            let refusal =
+                pad_policy_refusal(PadRequirements::RgbAndIr, PadEvidence::Pending, ir).unwrap();
+            assert!(!refusal.granted);
+            assert!(!super::presence_retryable(&refusal));
+            assert!(refusal.reason.starts_with("IR PAD"));
+        }
+        assert!(pad_policy_refusal(
+            PadRequirements::IrOnly,
+            PadEvidence::Pending,
+            PadEvidence::Score(0.1)
+        )
+        .is_none());
+    }
+
+    #[test]
     fn every_authentication_grant_path_checks_required_pad_first() {
         let source = include_str!("lib.rs");
         let auth = &source[source.find("fn authenticate_once").unwrap()
@@ -10436,6 +10545,207 @@ mod engine_tests {
             ir_brightness: 90.0,
             pitch: 0.5,
         }
+    }
+
+    // Synthetic matching inputs: no camera or biometric payloads. Only capture
+    // and inference are substituted; voting and the real grant decision run.
+    fn pad_matching_fixture(p: f32, deny: bool) -> (Enrollment, Assessment) {
+        let mut embedding = [0.0; EMBED_DIM];
+        embedding[0] = 1.0;
+        let mut enr = Enrollment::new("pad-contract");
+        enr.profiles.push(FaceProfile {
+            name: "fixture".into(),
+            scans: vec![FaceScan {
+                name: "fixture".into(),
+                rgb: embedding.to_vec(),
+                ir: None,
+                ir_space: None,
+                embed_space: None,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.5,
+            }],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        let a = Assessment {
+            verdict: if deny { Verdict::Spoof } else { Verdict::Live },
+            reason: if deny {
+                "RGB PAD cue flags a spoof"
+            } else {
+                "live fixture"
+            }
+            .into(),
+            embedding: Some(embedding),
+            ir_embedding: None,
+            signals: Signals::default(),
+            ir_center_edge_ratio: 0.0,
+            ir_brightness: 0.0,
+            ir_ambient_share: None,
+            rgb_frame_mean: 120.0,
+            shipped_ir_fake: None,
+            rgb_pad: PadEvidence::Score(p),
+            ir_pad: PadEvidence::NotApplicable,
+            sequential_pair: false,
+        };
+        (enr, a)
+    }
+
+    #[test]
+    fn rgb_matching_cannot_grant_before_the_vit_vote_completes() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        e.vit_scores.clear();
+        for sample in 1..=5 {
+            let deny = e.vit_pad_votes_deny(0.99);
+            let (enr, a) = pad_matching_fixture(0.99, deny);
+            let out = e
+                .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
+                .unwrap();
+            assert!(
+                !out.granted,
+                "high PAD sample {sample} granted before a completed decision: {out:?}"
+            );
+            assert_eq!(
+                out.kind,
+                if sample < 5 {
+                    OutcomeKind::Uncertain
+                } else {
+                    OutcomeKind::Spoof
+                }
+            );
+        }
+        e.vit_scores.clear();
+    }
+
+    #[test]
+    fn single_scan_enrollment_waits_for_the_complete_vit_vote() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        e.vit_scores.clear();
+        for sample in 1..=5 {
+            let deny = e.vit_pad_votes_deny(0.20);
+            let (_, a) = pad_matching_fixture(0.20, deny);
+            let scan = e
+                .enrollment_scan(a, false, None)
+                .unwrap_or_else(|_| panic!("unexpected capture refusal"));
+            assert_eq!(
+                scan.is_some(),
+                sample == 5,
+                "enrollment admitted incomplete PAD at sample {sample}"
+            );
+        }
+        e.vit_scores.clear();
+    }
+
+    #[test]
+    fn completed_vit_median_allows_genuine_match_despite_one_outlier() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        e.vit_scores.clear();
+        for (index, p) in [0.20, 0.20, 0.99, 0.20, 0.20].into_iter().enumerate() {
+            let deny = e.vit_pad_votes_deny(p);
+            let (enr, a) = pad_matching_fixture(p, deny);
+            let out = e
+                .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
+                .unwrap();
+            assert_eq!(out.granted, index == 4, "sample {index}: {out:?}");
+            if index < 4 {
+                assert_eq!(out.score, 0.0, "pending evidence must not reach matching");
+                assert!(presence_retryable(&out));
+            }
+        }
+        e.vit_scores.clear();
+    }
+
+    #[test]
+    fn paired_and_sequential_grants_wait_for_complete_rgb_pad() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        let prior_ir = e.ir_available;
+        e.ir_available = true;
+        for sequential in [false, true] {
+            e.vit_scores.clear();
+            let deny = e.vit_pad_votes_deny(0.20);
+            let (mut enr, mut a) = pad_matching_fixture(0.20, deny);
+            a.ir_pad = PadEvidence::Score(0.10);
+            a.ir_embedding = Some(a.embedding.unwrap().to_vec());
+            a.sequential_pair = sequential;
+            enr.profiles[0].scans[0].ir = a.ir_embedding.clone();
+            let out = e
+                .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
+                .unwrap();
+            assert!(!out.granted);
+            assert_eq!(out.kind, OutcomeKind::Uncertain);
+            assert_eq!(out.score, 0.0);
+        }
+        e.ir_available = prior_ir;
+        e.vit_scores.clear();
+    }
+
+    #[test]
+    fn broken_pad_evidence_resets_the_presentation_vote() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        for evidence in [
+            PadEvidence::NotApplicable,
+            PadEvidence::Unavailable,
+            PadEvidence::InferenceFailed,
+            PadEvidence::Score(f32::NAN),
+        ] {
+            e.vit_scores.clear();
+            for _ in 0..4 {
+                e.vit_pad_votes_deny(0.20);
+            }
+            let (enr, mut a) = pad_matching_fixture(0.20, false);
+            a.rgb_pad = evidence;
+            let out = e
+                .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
+                .unwrap();
+            assert!(!out.granted);
+            assert!(!presence_retryable(&out));
+            assert!(e.vit_scores.is_empty());
+            let deny = e.vit_pad_votes_deny(0.20);
+            let (enr, a) = pad_matching_fixture(0.20, deny);
+            let out = e
+                .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
+                .unwrap();
+            assert_eq!(out.kind, OutcomeKind::Uncertain);
+        }
+        e.vit_scores.clear();
+    }
+
+    #[test]
+    fn enrollment_rejects_spoof_and_required_pad_failures() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        e.vit_scores.clear();
+        for _ in 0..10 {
+            let deny = e.vit_pad_votes_deny(0.99);
+            let (_, a) = pad_matching_fixture(0.99, deny);
+            assert!(matches!(e.enrollment_scan(a, false, None), Ok(None)));
+        }
+        for evidence in [
+            PadEvidence::Unavailable,
+            PadEvidence::InferenceFailed,
+            PadEvidence::NotApplicable,
+        ] {
+            e.vit_scores.clear();
+            let (_, mut a) = pad_matching_fixture(0.20, false);
+            a.rgb_pad = evidence;
+            assert!(e.enrollment_scan(a, false, None).is_err());
+            let (_, mut a) = pad_matching_fixture(0.20, false);
+            e.vit_pad_votes_deny(0.20);
+            a.ir_pad = evidence;
+            assert!(e.enrollment_scan(a, true, None).is_err());
+        }
+        e.vit_scores.clear();
     }
 
     #[test]

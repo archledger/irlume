@@ -10,6 +10,10 @@ All notable changes to irlume are documented here. This project adheres to
 - Bound paired camera streaming to each assessment, coordinate paired startup,
   and service companion queues through burst completion.
 
+### Fixed
+
+- Require the complete RGB PAD vote before authentication and enrollment admission.
+
 ## [0.11.3] - 2026-08-29
 
 ### Added

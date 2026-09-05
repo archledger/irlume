@@ -2348,75 +2348,11 @@ fn support_probe_result(
     }
 }
 
-/// Consecutive dimming self-heals on one camera pairing before irlume stops
-/// asking that pairing to capture concurrently (#100).
-///
-/// THREE, CHOSEN BY THE REPO OWNER, NOT MEASURED. Every other number this rule
-/// leans on was earned on hardware and says so in its own doc comment
-/// ([`irlume_camera::CONCURRENT_SIGNAL_FLOOR`] at 0.80,
-/// [`irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS`] at 100.0, the NexiGo's
-/// measured 42-56% retention). Nothing in this repo has ever counted self-heal
-/// firings, because the only trace they leave is a `dlog!` that is off unless
-/// `IRLUME_LOG` is set, so there is no rate to fit a threshold to. That is
-/// precisely why every clause around this number errs toward UNDER-counting:
-/// not switching costs one extra RGB capture per login, which is the behaviour
-/// that already ships, while switching wrongly taxes every later capture.
+/// Consecutive IR-only enrollment attempts before a confirmed solo probe may
+/// trigger the A/B/A check. Chosen by the repository owner in #100, not fitted
+/// from hardware measurements. Only confirmed signal loss can demote the live
+/// capture context; the count alone never changes capture policy.
 const SELF_HEAL_SWITCH_AFTER: u32 = 3;
-
-/// What one assessment observed about capturing both sensors at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // used in capture_mode_switch_tests
-enum CaptureModeSignal {
-    /// The overlapped RGB frame lost the face AND arrived measurably dimmer
-    /// than the same camera's solo frame: the contention signature.
-    Dimming,
-    /// The overlapped RGB frame found the face on its own. Counter-evidence.
-    Clean,
-    /// Neither established: says nothing, changes nothing.
-    Inconclusive,
-}
-
-/// Did this self-heal measure the fault the switch exists for?
-///
-/// Pure over the two RGB frame means the enrolment path already holds, so the
-/// rule is testable without a camera. Two clauses, and BOTH are needed:
-///
-/// `recovered` alone is not the signature. `rgb_top.is_none() && ir_top.is_some()`
-/// is also the shape of a legitimate DARK login, which this codebase supports on
-/// purpose (see `uncertain_short_circuits`, observed live: rgb faces=0, ir
-/// faces=1 at 0.92). It is equally the shape of a user still walking up, where
-/// the solo recapture succeeds ~700ms later because the person stopped moving,
-/// not because the link went idle. Counting either would demote a healthy camera.
-///
-/// So the second clause asks the question the probe asks: did the overlapped
-/// frame arrive DIM? That is `CONCURRENT_SIGNAL_FLOOR`, applied to one round
-/// instead of the probe's six, which is what counting to three compensates for.
-/// The `CONCLUSIVE_SCENE_BRIGHTNESS` floor throws away the light level where the
-/// repo has already measured this reading to be worthless: the same NexiGo read
-/// 0.42-0.56 retention against a sequential arm at 117-143, then 0.91 an hour
-/// later in a dark room against an arm at 62. A dark scene hides the fault, so
-/// it must not be allowed to manufacture it either.
-#[allow(dead_code)] // used in capture_mode_switch_tests
-fn self_heal_is_dimming(recovered: bool, concurrent_mean: f32, solo_mean: f32) -> bool {
-    recovered
-        && solo_mean >= irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS
-        && concurrent_mean < solo_mean * irlume_camera::CONCURRENT_SIGNAL_FLOOR
-}
-
-/// Fold one observation into the consecutive streak.
-///
-/// `Clean` resets to zero rather than merely not incrementing: a capture that
-/// found the face with both sensors running is direct counter-evidence, and an
-/// action that OVERWRITES an operator's measurement must not be reached by
-/// summing coincidences a healthy camera produced weeks apart.
-#[allow(dead_code)] // used in capture_mode_switch_tests
-fn self_heal_streak(prev: u32, signal: CaptureModeSignal) -> u32 {
-    match signal {
-        CaptureModeSignal::Dimming => prev.saturating_add(1),
-        CaptureModeSignal::Clean => 0,
-        CaptureModeSignal::Inconclusive => prev,
-    }
-}
 
 #[cfg(test)]
 mod capture_mode_decision_tests {
@@ -2936,41 +2872,18 @@ mod capture_mode_switch_tests {
         );
     }
 
-    /// Both clauses are required, and neither is sufficient. The four rows are
-    /// the four situations this rule exists to separate, each with numbers the
-    /// repo has already measured on hardware.
-    #[test]
-    fn a_counted_event_needs_recovery_and_measured_dimming() {
-        // The NexiGo shape: concurrent parks near 60 while the solo arm tracks
-        // the lit room at 117-143. This is the fault the switch exists for.
-        assert!(self_heal_is_dimming(true, 60.0, 130.0));
-        // The recapture did not recover the face, so nothing was demonstrated:
-        // the frame may simply not have held one.
-        assert!(!self_heal_is_dimming(false, 60.0, 130.0));
-        // The dark-login shape. A night login legitimately shows a face in IR
-        // and none in RGB, and the same camera measured 0.91 retention in a dark
-        // room, so a ratio taken here says nothing. Counting it would demote a
-        // healthy camera for anyone who logs in after dark.
-        assert!(!self_heal_is_dimming(true, 30.0, 62.0));
-        // The healthy/settling shape: the user was still moving, and the solo
-        // frame is no dimmer than the overlapped one (the ASUS measured 1.04).
-        assert!(!self_heal_is_dimming(true, 125.0, 130.0));
-    }
-
     /// Both boundaries in both directions, so a mutant that relaxes `<` to `<=`
     /// or `>=` to `>` dies, and the constants stay the camera crate's rather
     /// than drifting local copies.
     #[test]
-    fn the_dimming_test_is_the_probes_own_rule_at_both_boundaries() {
-        assert_eq!(irlume_camera::CONCURRENT_SIGNAL_FLOOR, 0.80);
-        assert_eq!(irlume_camera::CONCLUSIVE_SCENE_BRIGHTNESS, 100.0);
+    fn solo_probe_uses_the_probes_rule_at_both_boundaries() {
         // The scene-brightness floor: a solo arm at the floor can be judged, one
         // just under it cannot.
-        assert!(self_heal_is_dimming(true, 79.9, 100.0));
-        assert!(!self_heal_is_dimming(true, 79.9, 99.9));
+        assert!(solo_probe_confirms_starvation(79.9, 100.0, true));
+        assert!(!solo_probe_confirms_starvation(79.9, 99.9, true));
         // The retention floor: exactly 80% retained is not a loss; a hair under is.
-        assert!(!self_heal_is_dimming(true, 80.0, 100.0));
-        assert!(self_heal_is_dimming(true, 79.99, 100.0));
+        assert!(!solo_probe_confirms_starvation(80.0, 100.0, true));
+        assert!(solo_probe_confirms_starvation(79.99, 100.0, true));
     }
 
     /// The threshold itself, pinned in both directions so a mutant that changes
@@ -2996,28 +2909,6 @@ mod capture_mode_switch_tests {
             capture_mode_decision(None, None).0,
             "the unmeasured default is sequential"
         );
-    }
-
-    /// The three-way split matters: a mutant that folds `Inconclusive` into
-    /// either neighbour changes when a camera gets demoted.
-    #[test]
-    fn a_clean_concurrent_capture_clears_the_streak() {
-        let fold = |signals: &[CaptureModeSignal]| {
-            signals
-                .iter()
-                .fold(0u32, |acc, s| self_heal_streak(acc, *s))
-        };
-        use CaptureModeSignal::{Clean, Dimming, Inconclusive};
-        // Counter-evidence in the middle resets, so this never reaches three.
-        assert_eq!(fold(&[Dimming, Dimming, Clean, Dimming, Dimming]), 2);
-        // Inconclusive is neutral in both directions.
-        assert_eq!(
-            fold(&[Dimming, Inconclusive, Dimming, Inconclusive, Dimming]),
-            3
-        );
-        assert_eq!(self_heal_streak(2, Clean), 0);
-        assert_eq!(self_heal_streak(2, Inconclusive), 2);
-        assert_eq!(self_heal_streak(2, Dimming), 3);
     }
 
     /// A mode the operator forced is never narrowed by runtime learning.

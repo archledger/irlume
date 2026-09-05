@@ -5516,6 +5516,43 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         costliest_attempt: &mut std::time::Duration,
     ) -> (irlume_common::Result<Outcome>, bool) {
+        self.authentication_attempt_loop_with(
+            deadline,
+            window,
+            costliest_attempt,
+            |engine| {
+                let mut held_pair_failed = false;
+                let result = Self::run_camera_operation(camera_operation, || {
+                    engine.authenticate_once(
+                        enr,
+                        purpose,
+                        service,
+                        cameras,
+                        AuthenticationCaptureContext {
+                            mode: Some(capture_mode),
+                            operation: Some(camera_operation),
+                            held_pair_failed: Some(&mut held_pair_failed),
+                            diagnostics,
+                        },
+                    )
+                });
+                (result, held_pair_failed)
+            },
+            std::time::Instant::now,
+        )
+    }
+
+    /// The production retry loop, with capture and monotonic time supplied at
+    /// the boundary. Tests replace only those two dependencies, so PAD admission,
+    /// retry classification, cost estimation and deadline settlement stay real.
+    fn authentication_attempt_loop_with(
+        &mut self,
+        deadline: std::time::Instant,
+        window: u64,
+        costliest_attempt: &mut std::time::Duration,
+        mut capture_attempt: impl FnMut(&mut Self) -> (irlume_common::Result<Outcome>, bool),
+        now: impl Fn() -> std::time::Instant,
+    ) -> (irlume_common::Result<Outcome>, bool) {
         let mut attempt = 0_u32;
         // The costliest attempt so far (caller-seeded: the sequential fallback
         // starts with the concurrent loop's observed worst). A retry that
@@ -5526,23 +5563,9 @@ impl Engine {
         // attempt now includes fresh stream arming and rate establishment.
         loop {
             attempt += 1;
-            let mut held_pair_failed = false;
-            let attempt_started = std::time::Instant::now();
-            let attempt_result = Self::run_camera_operation(camera_operation, || {
-                self.authenticate_once(
-                    enr,
-                    purpose,
-                    service,
-                    cameras,
-                    AuthenticationCaptureContext {
-                        mode: Some(capture_mode),
-                        operation: Some(camera_operation),
-                        held_pair_failed: Some(&mut held_pair_failed),
-                        diagnostics,
-                    },
-                )
-            });
-            *costliest_attempt = (*costliest_attempt).max(attempt_started.elapsed());
+            let attempt_started = now();
+            let (attempt_result, held_pair_failed) = capture_attempt(self);
+            *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
             let out = match attempt_result {
                 Ok(out) => out,
                 Err(error) => {
@@ -5569,17 +5592,14 @@ impl Engine {
                 // reader can never prompt off a stale failure.
                 self.last_attempt_situation = None;
             }
-            let expired = std::time::Instant::now() >= deadline;
+            let expired = now() >= deadline;
             let retry_wont_fit = !expired
                 && presence_retryable(&out)
-                && deadline.saturating_duration_since(std::time::Instant::now())
-                    < *costliest_attempt;
+                && deadline.saturating_duration_since(now()) < *costliest_attempt;
             if retry_wont_fit {
                 irlume_common::dlog!(
                     "grace: retry skipped ({}ms left, costliest attempt {}ms); settling",
-                    deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .as_millis(),
+                    deadline.saturating_duration_since(now()).as_millis(),
                     costliest_attempt.as_millis()
                 );
             }
@@ -10589,6 +10609,177 @@ mod engine_tests {
             sequential_pair: false,
         };
         (enr, a)
+    }
+
+    /// Script capture cost, but retain the production retry loop, PAD voting
+    /// and actual synthetic-identity admission boundary. No camera is opened.
+    fn scripted_pad_retry(
+        e: &mut Engine,
+        window_ms: u64,
+        setup_ms: u64,
+        costs_ms: &[u64],
+        score: f32,
+        seed_cost_ms: u64,
+    ) -> (Outcome, usize, std::time::Duration) {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let clock = Cell::new(start + Duration::from_millis(setup_ms));
+        let calls = Cell::new(0);
+        let mut costliest = Duration::from_millis(seed_cost_ms);
+        e.vit_scores.clear();
+        let (result, fallback) = e.authentication_attempt_loop_with(
+            start + Duration::from_millis(window_ms),
+            window_ms,
+            &mut costliest,
+            |engine| {
+                let index = calls.get();
+                let cost = costs_ms.get(index).expect("unexpected extra assessment");
+                calls.set(index + 1);
+                clock.set(clock.get() + Duration::from_millis(*cost));
+                let deny = engine.vit_pad_votes_deny(score);
+                let (enr, assessment) = pad_matching_fixture(score, deny);
+                (
+                    engine.authenticate_assessment(
+                        &enr,
+                        AuthenticationPurpose::Verify,
+                        Some("login"),
+                        assessment,
+                        &(),
+                    ),
+                    false,
+                )
+            },
+            || clock.get(),
+        );
+        e.vit_scores.clear();
+        assert!(!fallback);
+        assert_eq!(e.head_consent_before_match, HeadConsentVerdict::NoGesture);
+        (result.unwrap(), calls.get(), costliest)
+    }
+
+    #[test]
+    fn pending_pad_retry_loop_stops_when_second_slow_assessment_cannot_fit() {
+        let _guard = env_guard();
+        let mut s = shared();
+        // A representative 7.8s assessment plus 0.1s setup: 7.1s remains.
+        // These are scripted timings, not recovered live scheduler measurements.
+        let (out, calls, cost) = scripted_pad_retry(&mut s.engine, 15_000, 100, &[7_800], 0.20, 0);
+        assert_eq!(calls, 1);
+        assert!(!out.granted);
+        assert_eq!(out.kind, OutcomeKind::Uncertain);
+        assert!(out.reason.contains("collecting RGB PAD evidence"));
+        assert_eq!(out.score, 0.0);
+        assert_eq!(cost, std::time::Duration::from_millis(7_800));
+    }
+
+    #[test]
+    fn pending_pad_retry_loop_completes_five_assessments_when_they_fit() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (out, calls, _) = scripted_pad_retry(&mut s.engine, 15_000, 100, &[2_500; 5], 0.20, 0);
+        assert_eq!(calls, 5);
+        assert!(out.granted);
+        assert_eq!(s.engine.last_attempt_situation_label(), None);
+    }
+
+    #[test]
+    fn pending_pad_retry_loop_admits_equal_budget_and_settles_at_deadline() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (out, calls, _) = scripted_pad_retry(&mut s.engine, 15_000, 0, &[7_500; 2], 0.20, 0);
+        assert_eq!(
+            calls, 2,
+            "an exactly fitting retry is admitted, a third is not"
+        );
+        assert!(!out.granted);
+        assert_eq!(out.kind, OutcomeKind::Uncertain);
+    }
+
+    #[test]
+    fn pending_pad_retry_loop_keeps_costliest_attempt_and_fallback_seed() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (out, calls, cost) = scripted_pad_retry(
+            &mut s.engine,
+            15_000,
+            0,
+            &[6_000, 2_000, 2_000, 2_000, 2_000],
+            0.20,
+            0,
+        );
+        assert_eq!(
+            calls, 3,
+            "a cheap latest attempt must not erase the observed worst"
+        );
+        assert!(!out.granted);
+        assert_eq!(cost, std::time::Duration::from_millis(6_000));
+        let (out, calls, cost) =
+            scripted_pad_retry(&mut s.engine, 15_000, 0, &[1_000], 0.20, 14_001);
+        assert_eq!(
+            calls, 1,
+            "the caller's fallback seed survives a cheaper attempt"
+        );
+        assert!(!out.granted);
+        assert_eq!(cost, std::time::Duration::from_millis(14_001));
+    }
+
+    #[test]
+    fn pending_pad_retry_loop_respects_elevation_window_and_terminal_pad_deny() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (out, calls, _) = scripted_pad_retry(&mut s.engine, 5_000, 0, &[1_100; 4], 0.20, 0);
+        assert_eq!(calls, 4);
+        assert!(!out.granted);
+        assert_eq!(out.kind, OutcomeKind::Uncertain);
+        let (out, calls, _) = scripted_pad_retry(&mut s.engine, 15_000, 0, &[1_000; 5], 0.99, 0);
+        assert_eq!(calls, 5);
+        assert!(!out.granted);
+        assert_eq!(out.kind, OutcomeKind::Spoof);
+    }
+
+    #[test]
+    fn retry_loop_preserves_terminal_match_and_capture_error_exits() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let e = &mut s.engine;
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(15);
+        for fails in [false, true] {
+            let mut calls = 0;
+            let mut costliest = std::time::Duration::ZERO;
+            e.head_consent_before_match = HeadConsentVerdict::Approve;
+            let (out, fallback) = e.authentication_attempt_loop_with(
+                deadline,
+                15_000,
+                &mut costliest,
+                |_| {
+                    calls += 1;
+                    assert_eq!(calls, 1, "terminal outcomes cannot spend retry attempts");
+                    if fails {
+                        (
+                            Err(irlume_common::Error::Hardware(
+                                "scripted capture error".into(),
+                            )),
+                            true,
+                        )
+                    } else {
+                        (
+                            Ok(Outcome::deny(
+                                OutcomeKind::BelowThreshold,
+                                "scripted match denial",
+                            )),
+                            false,
+                        )
+                    }
+                },
+                || now,
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(fallback, fails);
+            assert_eq!(out.is_err(), fails);
+            assert_eq!(e.head_consent_before_match, HeadConsentVerdict::NoGesture);
+        }
     }
 
     #[test]

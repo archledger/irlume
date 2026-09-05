@@ -246,11 +246,9 @@ mod onnx {
     use ort::session::{builder::GraphOptimizationLevel, Session};
     use ort::value::Tensor;
 
-    /// Intra-op threads per ONNX session. 2 matches the measured TFLite
-    /// XNNPACK knee for these small single-image models, and the ONNX
-    /// determinism notes (by the PINNED_EMBEDDING gate) found counts 1-8
-    /// bit-identical, so a small fixed cap only removes idle-pool contention
-    /// with capture threads.
+    /// Intra-op threads per ONNX session. Keep two threads for model latency;
+    /// disable idle spinning separately in `build` so resident sessions do
+    /// not spend CPU time waiting for their next inference.
     const ORT_INTRA_THREADS: usize = 2;
 
     fn err<E: std::fmt::Display>(e: E) -> irlume_common::Error {
@@ -543,15 +541,11 @@ mod onnx {
                 .with_execution_providers([ort::ep::CoreML::default().build()])
                 .map_err(err)?;
         }
-        // Cap the intra-op pool explicitly. The runtime default sizes one pool
-        // per session to the physical-core count; this daemon holds up to four
-        // ONNX sessions plus a TFLite session, and idle pools contend with the
-        // capture and consent-watch threads inside the seconds-scale auth
-        // budget. The repo's own measurement (see the determinism notes by the
-        // PINNED_EMBEDDING gate) found intra-op thread counts 1, 2, 4 and 8
-        // bit-identical for the embedder, so capping costs nothing and removes
-        // the contention.
+        // Each resident model has its own pool. Let idle workers block while
+        // another model runs, retaining two threads for each active inference.
         b.with_intra_threads(ORT_INTRA_THREADS)
+            .map_err(err)?
+            .with_intra_op_spinning(false)
             .map_err(err)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(err)?

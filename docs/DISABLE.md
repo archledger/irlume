@@ -114,8 +114,9 @@ A deliberate head-shake cancellation ends the request without adding a failure
 or clearing previous failures. No-face and uncertain-evidence outcomes also do
 not consume strikes; hard spoof and below-threshold rejections do. Login face
 verification and face-gated password release share this per-user counter.
-Missing or empty enrollment, a retired eyes-open setting, and invalid or retired
-consent settings end the request without adding or clearing strikes. Fixing those
+Missing or empty enrollment, scans belonging only to a different recognition
+model, a retired eyes-open setting, and invalid or retired consent settings end
+the request without adding or clearing strikes. Fixing those
 settings does not erase earlier face rejections or cancel an active cooldown.
 Camera-binding refusals, missing consent gestures, PAD failures and grouped
 capture timeouts retain their existing strike behavior.

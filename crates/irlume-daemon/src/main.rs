@@ -9624,23 +9624,44 @@ mod tests {
     #[test]
     fn setup_refusals_preserve_verify_retry_history() {
         let _g = env_lock();
-        setup_refusals_preserve_retry_history(false);
+        setup_refusals_preserve_retry_history(false, false);
     }
 
     #[test]
     fn setup_refusals_preserve_unseal_retry_history() {
         let _g = env_lock();
-        setup_refusals_preserve_retry_history(true);
+        setup_refusals_preserve_retry_history(true, false);
+    }
+
+    #[test]
+    fn recognizer_mismatch_preserves_verify_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(false, true);
+    }
+
+    #[test]
+    fn recognizer_mismatch_preserves_unseal_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(true, true);
     }
 
     // Runs under the callers' environment lock, using the real engine and
     // persistent store. Only camera devices and enrolled data are fixtures.
-    fn setup_refusals_preserve_retry_history(unseal: bool) {
+    fn setup_refusals_preserve_retry_history(unseal: bool, foreign_model: bool) {
         let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         for prior_rejection in [false, true] {
             let sb = sandbox("setup-retry");
             plant_fake_envelope(&user);
+            let expected = if foreign_model {
+                let mut enrollment = enrollment_with(&user, &["Legacy model scan"]);
+                enrollment.profiles[0].scans[0].embed_space = Some("embed:retired-fixture".into());
+                assert_ne!(e.embed_space(), "embed:retired-fixture");
+                write_enrollment(&sb.dir, &enrollment);
+                format!("'{user}' has no face scans for the current recognition model; add scans to an existing profile or enroll")
+            } else {
+                format!("'{user}' is not enrolled")
+            };
             let record = sb.dir.join("retry/0.json");
             if prior_rejection {
                 retry_throttle::record(
@@ -9684,13 +9705,10 @@ mod tests {
                         ..
                     } if !unseal => {
                         assert!(!granted && !live && !declined_by_gesture);
-                        assert_eq!(reason, format!("'{user}' is not enrolled"));
+                        assert_eq!(reason, expected);
                     }
                     Response::Error(reason) if unseal => {
-                        assert_eq!(
-                            reason,
-                            format!("face not granted: '{user}' is not enrolled")
-                        );
+                        assert_eq!(reason, format!("face not granted: {expected}"));
                     }
                     other => panic!("setup must remain a terminal refusal: {other:?}"),
                 }

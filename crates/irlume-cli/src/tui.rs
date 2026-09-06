@@ -10,6 +10,8 @@
 //! and auto-capture, instead of a live video preview (which a terminal can't
 //! show). A thin client: all work happens in the daemon.
 
+mod actions;
+
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -140,7 +142,7 @@ const SIDEBAR_MIN_COLS: u16 = 90;
 /// so disabling any of them asks for confirmation first. The keyring-release path
 /// has its own `g` toggle, so it is not repeated here.
 const SETTINGS_GESTURE_SERVICES: &[&str] = &["sudo", "su", "doas", "polkit-1"];
-const MAX_PROFILES: usize = 3;
+const MAX_PROFILES: usize = irlume_core::storage::MAX_PROFILES;
 const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
 /// Scans captured per improve-recognition round (add to an existing profile).
 const ADD_SCANS: usize = irlume_core::storage::IMPROVE_SCANS;
@@ -203,6 +205,7 @@ enum Row {
 }
 
 enum Pending {
+    ActionField(actions::Invocation),
     EnrollName,
     RenameProfile(String),
     RenameScan(String, String),
@@ -236,6 +239,8 @@ impl Pending {
 /// instead (masked entry → socket), so they're not here.
 #[derive(Clone)]
 enum Suspend {
+    MoreAction(actions::Invocation),
+    TraceRecord,
     FingerprintAdd,
     LoginStatus,
     LoginEnable,
@@ -278,10 +283,6 @@ enum Suspend {
     FingerprintDisable,
     /// Wipe enrolled fingers; TUI y/n-confirmed first, root op.
     FingerprintReset,
-    /// Enable a third-party PAD model BY NAME. Deliberately runs the CLI's own
-    /// interactive flow under sudo (license text, name typed back, y/N): that
-    /// friction is the point of the models policy, so the TUI hosts it in the
-    /// cooked terminal instead of bypassing it.
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
@@ -476,6 +477,8 @@ enum WMsg {
     /// daemon merged it into `profile` instead. The worker ends here and hands
     /// off to the UI, which confirms with the user before adding the rest.
     /// `added_scans` are the scan(s) already appended (undo target on decline).
+    SessionMerge(SessionMerge),
+    Authorizing,
     MergePrompt {
         profile: String,
         /// Ambient-lit count of the scan(s) the merge already added, so the
@@ -501,7 +504,15 @@ struct MergeConfirm {
     ambient_lit: usize,
 }
 
+#[derive(Debug)]
+struct SessionMerge {
+    profile: String,
+    remaining: usize,
+    answer: mpsc::Sender<bool>,
+}
+
 struct EnrollUi {
+    session_merge: Option<SessionMerge>,
     rx: mpsc::Receiver<WMsg>,
     stop: Arc<AtomicBool>,
     profile: String,
@@ -530,9 +541,62 @@ struct Op {
     rx: mpsc::Receiver<(bool, String)>,
 }
 
-/// TUI state. Seven `Option` fields act as modal overlays; when several are
+/// Camera metadata gathered off the event thread; failed fields retain their previous values.
+#[derive(Default)]
+struct CameraListing {
+    pairs: Option<Vec<irlume_common::CameraPairInfo>>,
+    mode: Option<String>,
+}
+
+impl CameraListing {
+    fn gather() -> Self {
+        let mut listing = Self::default();
+        if let Ok(Response::Cameras(pairs)) = crate::daemon_poll(&Request::ListCameras) {
+            listing.pairs = Some(pairs);
+        }
+        // The same camera-class slot as the listing above: the arbiter
+        // serializes this against captures, and it is refreshed on screen
+        // entry (not per frame). A refusal or older daemon leaves the last
+        // answer in place — unknown is not "default".
+        if let Ok(Response::CaptureModeStatus {
+            mode,
+            source,
+            qualification_state,
+            qualification_reason,
+            runtime_degradation,
+            ..
+        }) = crate::daemon_poll(&Request::CaptureModeStatus)
+        {
+            // The qualification state tells the user WHY their camera is in
+            // this mode: "measured_sequential" (the camera cannot sustain
+            // concurrent) reads very differently from
+            // "unqualified_context_changed" (kernel or USB changed; re-tune).
+            // Both are actionable facts the bare mode string hides (#586
+            // audit: a user who never runs camera-mode or doctor has no way
+            // to learn their qualification is stale).
+            let mut text = format!("{mode} (source: {source})");
+            if !qualification_state.is_empty() {
+                text.push_str("; qualification: ");
+                text.push_str(&qualification_state);
+                if let Some(reason) = &qualification_reason {
+                    text.push_str(" (");
+                    text.push_str(reason);
+                    text.push(')');
+                }
+            }
+            if let Some(why) = runtime_degradation {
+                text.push_str("; degraded: ");
+                text.push_str(&why);
+            }
+            listing.mode = Some(text);
+        }
+        listing
+    }
+}
+
+/// TUI state. `Option` fields act as modal overlays; when several are
 /// `Some`, `on_key` consumes input in this order (first match wins):
-/// `error` (any key dismisses) > `enroll` (Esc only) > `op` (q/Esc only) >
+/// `error` (any key dismisses) > `more_actions` (search/navigation) > `enroll` (Esc only) > `op` (q/Esc only) >
 /// `input` (text entry) > `confirm` (y/n) > `enroll_merge` (y/n) > normal
 /// screen keys. `suspend` is not a key state: the main loop takes it after
 /// each key/tick, leaves the TUI, and runs the command. PageUp/PageDown
@@ -570,6 +634,7 @@ struct App {
     /// the Cameras info block — e.g. "sequential (source: measured; …)".
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
     capture_mode: Option<String>,
+    camera_load: Option<mpsc::Receiver<CameraListing>>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
     confirm: Option<Confirm>,
@@ -581,6 +646,7 @@ struct App {
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
+    more_actions: Option<(String, usize)>,
     /// Selected row of the Welcome hub (Enter jumps to its screen).
     hub_sel: usize,
     op: Option<Op>,
@@ -943,8 +1009,9 @@ impl LightState {
 pub fn run(args: &[String]) -> std::io::Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        eprintln!("irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.");
-        return Ok(());
+        return Err(std::io::Error::other(
+            "irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.",
+        ));
     }
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(
@@ -1027,12 +1094,14 @@ impl App {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            camera_load: None,
             activity: Vec::new(),
             input: None,
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
+            more_actions: None,
             hub_sel: 0,
             op: None,
             enroll: None,
@@ -1234,50 +1303,14 @@ impl App {
     /// blanking it, because neither is an observation that the cameras are
     /// gone.
     fn refresh_camera_listing(&mut self) {
-        if let Ok(Response::Cameras(pairs)) = crate::daemon_poll(&Request::ListCameras) {
-            self.pairs = pairs;
-            self.pairs_known = true;
-            let n = self.pairs.len().max(1);
-            if self.cam_sel >= n {
-                self.cam_sel = n - 1;
-            }
+        if self.camera_load.is_some() {
+            return;
         }
-        // The same camera-class slot as the listing above: the arbiter
-        // serializes this against captures, and it is refreshed on screen
-        // entry (not per frame). A refusal or older daemon leaves the last
-        // answer in place — unknown is not "default".
-        if let Ok(Response::CaptureModeStatus {
-            mode,
-            source,
-            qualification_state,
-            qualification_reason,
-            runtime_degradation,
-            ..
-        }) = crate::daemon_poll(&Request::CaptureModeStatus)
-        {
-            // The qualification state tells the user WHY their camera is in
-            // this mode: "measured_sequential" (the camera cannot sustain
-            // concurrent) reads very differently from
-            // "unqualified_context_changed" (kernel or USB changed; re-tune).
-            // Both are actionable facts the bare mode string hides (#586
-            // audit: a user who never runs camera-mode or doctor has no way
-            // to learn their qualification is stale).
-            let mut text = format!("{mode} (source: {source})");
-            if !qualification_state.is_empty() {
-                text.push_str("; qualification: ");
-                text.push_str(&qualification_state);
-                if let Some(reason) = &qualification_reason {
-                    text.push_str(" (");
-                    text.push_str(reason);
-                    text.push(')');
-                }
-            }
-            if let Some(why) = runtime_degradation {
-                text.push_str("; degraded: ");
-                text.push_str(&why);
-            }
-            self.capture_mode = Some(text);
-        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(CameraListing::gather());
+        });
+        self.camera_load = Some(rx);
     }
 
     /// Capabilities as the DAEMON reports them, for use whenever it is
@@ -1320,7 +1353,8 @@ impl App {
             self.refresh_profiles();
         }
         let max = self.rows().len().max(1);
-        if self.sel >= max {
+        // One past the list is an intentionally cleared selection after a removal.
+        if self.sel > max {
             self.sel = max - 1;
         }
         let pairs = self.pairs.len().max(1);
@@ -2286,6 +2320,22 @@ impl App {
         v
     }
 
+    fn profile_row_name(&self, row: Row) -> (String, Option<String>) {
+        match row {
+            Row::Profile(pi) => (self.profiles[pi].name.clone(), None),
+            Row::Scan(pi, si) => (
+                self.profiles[pi].name.clone(),
+                Some(self.profiles[pi].scans[si].clone()),
+            ),
+        }
+    }
+
+    fn selected_profile_row(&self) -> Option<(String, Option<String>)> {
+        self.rows()
+            .get(self.sel)
+            .map(|row| self.profile_row_name(*row))
+    }
+
     fn next_profile_name(&self) -> String {
         for n in 1..=MAX_PROFILES {
             let c = format!("Face Profile {n}");
@@ -2361,6 +2411,7 @@ impl App {
             format!("guided enroll → '{profile}' ({target} scan(s))"),
         );
         self.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop,
             profile,
@@ -2396,6 +2447,7 @@ impl App {
         let ambient_base = mc.ambient_lit;
         std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
         self.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop,
             profile: mc.profile,
@@ -2454,6 +2506,25 @@ impl App {
     }
 
     fn poll(&mut self) {
+        if let Some(rx) = &self.camera_load {
+            match rx.try_recv() {
+                Ok(listing) => {
+                    self.camera_load = None;
+                    if let Some(pairs) = listing.pairs {
+                        self.pairs = pairs;
+                        self.pairs_known = true;
+                        self.cam_sel = self.cam_sel.min(self.pairs.len().saturating_sub(1));
+                    }
+                    if let Some(mode) = listing.mode {
+                        self.capture_mode = Some(mode);
+                    }
+                    self.run_checks();
+                    self.recompute_visible();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.camera_load = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self.heavy_at.elapsed() >= Self::HEAVY_TTL {
             self.refresh_heavy();
         }
@@ -2480,7 +2551,18 @@ impl App {
                 self.profiles_load = None;
                 match outcome {
                     ProfilesOutcome::Loaded { profiles } => {
+                        let selected = self.selected_profile_row();
+                        let selection_cleared = !self.profiles.is_empty() && selected.is_none();
                         self.profiles = profiles;
+                        if let Some(selected) = selected {
+                            self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
+                                self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
+                                self.rows().len()
+                            });
+                        }
+                        if selection_cleared {
+                            self.sel = self.rows().len();
+                        }
                         self.enroll_error = None;
                         self.profiles_loaded = true;
                     }
@@ -2529,6 +2611,22 @@ impl App {
             let mut merge: Option<MergeConfirm> = None;
             for m in msgs {
                 match m {
+                    WMsg::SessionMerge(prompt) => {
+                        if let Some(e) = &mut self.enroll {
+                            e.profile = prompt.profile.clone();
+                            e.session_merge = Some(prompt);
+                            e.count = None;
+                        }
+                    }
+                    WMsg::Authorizing => {
+                        self.log(
+                            '·',
+                            "approve the system authentication dialog for this enrollment",
+                        );
+                        if let Some(e) = &mut self.enroll {
+                            e.count = None;
+                        }
+                    }
                     WMsg::Cue(r) => {
                         if let Some(e) = &mut self.enroll {
                             e.last = Some(r);
@@ -2551,6 +2649,7 @@ impl App {
                         let base = self.enroll.as_ref().map(|e| e.base).unwrap_or(0);
                         if let Some(e) = &mut self.enroll {
                             e.captured = n;
+                            e.target = t;
                             e.count = None;
                         }
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
@@ -2908,6 +3007,41 @@ impl App {
         // so they cannot hold a borrow of `self.user` across the call.
         let target = self.user.clone();
         match s {
+            Suspend::TraceRecord => self.sudo_step(
+                "record a 60-second diagnostic trace",
+                &["irlume", "trace", "record", "--duration", "60s"],
+            ),
+            Suspend::MoreAction(invocation) => {
+                let args = invocation.args(&self.user);
+                if invocation.action.root {
+                    let mut command = vec!["irlume"];
+                    command.extend(args.iter().map(String::as_str));
+                    self.sudo_step(invocation.action.label, &command);
+                } else {
+                    // Exec our current build, with literal argument values. A
+                    // child gets normal Ctrl-C behavior while the TUI survives.
+                    let result = std::process::Command::new(Self::self_exe())
+                        .args(&args)
+                        .status();
+                    match result {
+                        Ok(status) if status.success() => self.log(
+                            '✓',
+                            format!(
+                                "{}: command completed; see the result above",
+                                invocation.action.label
+                            ),
+                        ),
+                        Ok(status) => self.set_error(format!(
+                            "{}: command failed or was cancelled ({status}); review its output",
+                            invocation.action.label
+                        )),
+                        Err(error) => self.set_error(format!(
+                            "{}: could not start: {error}",
+                            invocation.action.label
+                        )),
+                    }
+                }
+            }
             Suspend::FingerprintAdd => {
                 crate::fingerprint::run(Some("add"), &for_user);
             }
@@ -3114,6 +3248,35 @@ impl App {
             self.error = None;
             return;
         }
+        if let Some((query, selected)) = self.more_actions.as_mut() {
+            match code {
+                KeyCode::Esc | KeyCode::F(2) => self.more_actions = None,
+                KeyCode::Char(c) if !c.is_control() && query.len() < 128 => {
+                    query.push(c);
+                    *selected = 0;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                }
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    *selected =
+                        (*selected + 1).min(actions::matching(query).len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = actions::matching(query).get(*selected).copied() {
+                        self.more_actions = None;
+                        self.prepare_action(actions::Invocation {
+                            action,
+                            values: Vec::new(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         // Activity history scroll works in every state except text entry:
         // mid-enroll and mid-op, when lines stream fastest, is exactly when
         // the user wants to read back. Handled before the state gates below
@@ -3138,6 +3301,33 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if self
+            .enroll
+            .as_ref()
+            .is_some_and(|e| e.session_merge.is_some())
+        {
+            match code {
+                KeyCode::Char('y') => {
+                    if let Some(e) = &mut self.enroll {
+                        if let Some(prompt) = e.session_merge.take() {
+                            let _ = prompt.answer.send(true);
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    if let Some(e) = self.enroll.take() {
+                        if let Some(prompt) = e.session_merge {
+                            let _ = prompt.answer.send(false);
+                        }
+                        e.stop.store(true, Ordering::Relaxed);
+                    }
+                    self.log('·', "enrollment cancelled; pending scans were not saved");
+                    self.refresh_profiles();
+                }
+                _ => {}
+            }
+            return;
         }
         // Guided enroll: only Esc (cancel).
         if let Some(e) = &self.enroll {
@@ -3243,6 +3433,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc => self.go_home(),
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::F(2) => self.more_actions = Some((String::new(), 0)),
             // Home: jump back to the Welcome hub from any tab, so the "at a
             // glance" summary is one key away instead of a Tab walk. (Home the
             // KEY is taken by activity scroll; 'h' for home is unused globally.)
@@ -3341,7 +3532,15 @@ impl App {
             SC_WELCOME => &mut self.hub_sel,
             _ => &mut self.sel,
         };
-        *cur = (((*cur as i32 + d) % n + n) % n) as usize;
+        *cur = if *cur >= len {
+            if d < 0 {
+                len.saturating_sub(1)
+            } else {
+                0
+            }
+        } else {
+            (((*cur as i32 + d) % n + n) % n) as usize
+        };
     }
 
     fn on_action(&mut self, code: KeyCode) {
@@ -3437,7 +3636,7 @@ impl App {
                     '→',
                     "sudo irlume logs: the daemon/PAM/keyring journal in one view",
                 );
-                self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
+                self.log('·', "For bounded diagnostics use [T] Record Trace; review sensitive measurements before sharing.");
                 self.suspend = Some(Suspend::Logs);
             }
             // Full `irlume doctor` readout: the complete authoritative dump,
@@ -3448,15 +3647,12 @@ impl App {
                 self.log('→', "irlume diag: TPM seal + PCR-drift readout (sudo adds envelope detail)");
                 self.suspend = Some(Suspend::Diag);
             }
-            (SC_REPAIR, KeyCode::Char('v')) => {
-                // Trace RECORD is root-only and lasts the full window, so it
-                // runs cooked under sudo; the command itself prints the
-                // output path and the `irlume trace explain` follow-up.
-                self.log('→', "irlume trace record: 60s privileged diagnostic (no frames or credentials recorded)");
-                self.sudo_step(
-                    "record a 60-second diagnostic trace",
-                    &["irlume", "trace", "record", "--duration", "60s"],
-                );
+            (SC_REPAIR, KeyCode::Char('T')) => {
+                self.confirm = Some((
+                    "Record a 60-second trace? Requires administrator access and records sensitive diagnostic measurements. No frames, embeddings or credentials. Review before sharing.".into(),
+                    "Record",
+                    ConfirmAct::Sus(Suspend::TraceRecord),
+                ));
             }
             (SC_REPAIR, KeyCode::Char('d')) => {
                 self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
@@ -3500,7 +3696,7 @@ impl App {
                     concat!(
                         "Tune capture mode? This holds the camera and fires the ",
                         "IR emitter for up to a minute, then stores the verdict ",
-                        "in /etc/irlume/cameras.conf. Your password will be ",
+                        "for this exact camera and connection context. Your password will be ",
                         "requested."
                     )
                         .into(),
@@ -3849,22 +4045,17 @@ impl App {
             return;
         }
         if self.profiles.len() >= MAX_PROFILES {
-            // A new PERSON can't be added at the cap. Refreshing your OWN face
-            // (the merge path) is what [a] Improve Recognition does, so point
-            // there instead of only "delete one".
-            self.log(
-                '✗',
-                format!(
-                    "at the max {MAX_PROFILES} profiles (people). To refresh your own face, use [a] Improve Recognition; to add a different person, delete a profile first."
-                ),
-            );
-        } else {
-            self.input = Some((
-                "New profile name (blank = default):".into(),
-                String::new(),
-                Pending::EnrollName,
+            self.log('·', format!(
+                "All {MAX_PROFILES} person slots are used. A matching face can still Improve Recognition; a new person requires deleting a profile first."
             ));
         }
+        // Let the daemon recognize an existing person even at the profile cap.
+        // It remains authoritative for both merge eligibility and the cap.
+        self.input = Some((
+            "New profile name, for a new person only (blank = automatic). A matching face will use its saved profile:".into(),
+            String::new(),
+            Pending::EnrollName,
+        ));
     }
 
     fn sel_profile(&self) -> Option<String> {
@@ -3933,6 +4124,93 @@ impl App {
         }
     }
 
+    fn prepare_action(&mut self, invocation: actions::Invocation) {
+        if let Some(field) = invocation.action.fields.get(invocation.values.len()) {
+            self.input = Some((
+                field.label.into(),
+                String::new(),
+                Pending::ActionField(invocation),
+            ));
+        } else {
+            let scope = if invocation.action.per_user {
+                format!("Account: {}", self.user)
+            } else {
+                "Scope: this system or the specified file".into()
+            };
+            // Debug quoting makes spaces and punctuation unambiguous. This is
+            // only a preview: execution passes the vector directly, no shell.
+            let command = invocation
+                .args(&self.user)
+                .iter()
+                .map(|arg| format!("{arg:?}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.confirm = Some((
+                format!(
+                    "{}\n{scope}\n{}\nRun: {}irlume {command}",
+                    invocation.action.label,
+                    invocation.action.description,
+                    if invocation.action.root { "sudo " } else { "" }
+                ),
+                "Run",
+                ConfirmAct::Sus(Suspend::MoreAction(invocation)),
+            ));
+        }
+    }
+
+    fn draw_more_actions(&self, f: &mut Frame, query: &str, selected: usize) {
+        let area = f.area();
+        let width = area.width.saturating_sub(2).min(100);
+        let height = area.height.saturating_sub(2).min(24);
+        let rect = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, rect);
+        let block = Block::bordered()
+            .title(" More actions (F2 / Esc closes) ")
+            .border_style(Style::new().fg(th().accent));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let rows = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+        f.render_widget(
+            Paragraph::new(format!(
+                "Search: {query}▏\nType to filter; arrows select; Enter opens"
+            )),
+            rows[0],
+        );
+        let matches = actions::matching(query);
+        if matches.is_empty() {
+            f.render_widget(
+                Paragraph::new("No matching actions. Backspace to change the search."),
+                rows[1],
+            );
+            return;
+        }
+        let items: Vec<_> = matches.iter().map(|a| ListItem::new(a.label)).collect();
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_style(selected_style())
+                .highlight_symbol("› "),
+            rows[1],
+            &mut state,
+        );
+        if let Some(action) = matches.get(selected) {
+            f.render_widget(
+                Paragraph::new(action.description).wrap(Wrap { trim: true }),
+                rows[2],
+            );
+        }
+    }
+
     fn submit_input(&mut self) {
         let Some((_, buf, pending)) = self.input.take() else {
             return;
@@ -3942,6 +4220,20 @@ impl App {
         // in the non-secret arms so a password never leaves a plain-String copy.
         let buf = zeroize::Zeroizing::new(buf);
         match pending {
+            Pending::ActionField(mut invocation) => {
+                let field = invocation.action.fields[invocation.values.len()];
+                let value = buf.trim();
+                if let Err(message) = field.validate(value) {
+                    self.input = Some((
+                        format!("{}: {message}", field.label),
+                        value.into(),
+                        Pending::ActionField(invocation),
+                    ));
+                    return;
+                }
+                invocation.values.push(value.into());
+                self.prepare_action(invocation);
+            }
             // The uninstall challenge: only the exact word proceeds; anything
             // else (including empty / Esc, which submits nothing) cancels.
             Pending::UninstallConfirm => {
@@ -4086,6 +4378,7 @@ impl App {
             format!("guided enroll → '{name}' ({ENROLL_SCANS} scans)"),
         );
         self.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop,
             profile: name,
@@ -4155,18 +4448,23 @@ impl App {
                 "Confirm",
                 &format!("{what}\n[n]/Esc Cancel    [y] {verb}"),
             );
+        } else if let Some(prompt) = self.enroll.as_ref().and_then(|e| e.session_merge.as_ref()) {
+            self.modal(f, "Already enrolled", &format!(
+                "This capture matches '{}'. Improve Recognition for this person?\n\nNo scans have been saved. Continue with up to {} more scans, then save the completed capture.\n\n[y] Continue    [n]/Esc Cancel", prompt.profile, prompt.remaining));
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
             let body = format!(
-                "This face is already enrolled as '{}' (a face owns one profile). \
-                 Add these scans to it?   [y] add   ·   [n] cancel",
-                mc.profile
+                "This capture matches '{}' on this account. Improve Recognition for this person instead of creating another profile?\n\nOne scan has been added; [y] keeps it and captures up to {} more. [n]/Esc cancels and removes that scan.\n\n[y] add scans   [n]/Esc cancel",
+                mc.profile, mc.remaining
             );
             self.modal(f, "Already enrolled", &body);
         }
         // Tier two of the key-disclosure ladder; drawn last so it sits above
         // everything except nothing (help is always answerable).
+        if let Some((query, selected)) = &self.more_actions {
+            self.draw_more_actions(f, query, *selected);
+        }
         if self.show_help {
             self.modal(f, "Keys  ([?] or Esc to close)", &self.help_body());
         }
@@ -4414,6 +4712,7 @@ impl App {
         });
         if activity_hit
             && !self.show_help
+            && self.more_actions.is_none()
             && self.error.is_none()
             && self.input.is_none()
             && self.confirm.is_none()
@@ -4422,7 +4721,8 @@ impl App {
             self.on_key(KeyCode::Char('A'));
             return;
         }
-        if self.show_help
+        if self.more_actions.is_some()
+            || self.show_help
             || self.error.is_some()
             || self.input.is_some()
             || self.confirm.is_some()
@@ -4684,6 +4984,9 @@ impl App {
             ]),
             Line::raw(""),
         ];
+        lines.push(Line::raw(
+            "  Approve the system dialog when prompted to continue.",
+        ));
         if let Some(err) = &e.stalled {
             // Not a biometric verdict: the guide stopped answering, so EVERY
             // live reading (quality bar, checklist, guidance) is stale and
@@ -4779,37 +5082,6 @@ impl App {
             return;
         }
         let rows = self.rows();
-        // Profile rows can occupy two terminal lines when a recognizer warning
-        // is present. Register their actual rendered height so a pointer lands
-        // on the same row the user sees, including that warning line.
-        let mut row_y = area.y;
-        for (i, row) in rows.iter().enumerate() {
-            let height = match row {
-                Row::Profile(pi) => {
-                    let p = &self.profiles[*pi];
-                    let live_count = p
-                        .live_recognizer
-                        .as_deref()
-                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
-                        .unwrap_or(0);
-                    let misleading = p.scans_by_recognizer.len() > 1
-                        || (p.live_recognizer.is_some() && live_count != p.scans.len());
-                    if misleading && live_count == 0 {
-                        2
-                    } else {
-                        1
-                    }
-                }
-                Row::Scan(_, _) => 1,
-            };
-            if row_y < area.y.saturating_add(area.height) {
-                self.hit(
-                    Rect::new(area.x, row_y, area.width, height),
-                    Click::Select(i),
-                );
-            }
-            row_y = row_y.saturating_add(height);
-        }
         let items: Vec<ListItem> = rows
             .iter()
             .map(|r| match r {
@@ -4860,6 +5132,15 @@ impl App {
         // these: `sel` is clamped to the real rows above).
         let mut items = items;
         items.push(ListItem::new(Line::raw("")));
+        items.push(ListItem::new(
+            "  One profile per person sharing this Linux account (up to 3).",
+        ));
+        items.push(ListItem::new(
+            "  [e] Add a person; [a] improve the selected person's recognition.",
+        ));
+        items.push(ListItem::new(
+            "  Each enrolled person can authenticate as this account.",
+        ));
         // Pre-split like the two lines below: ratatui Lists never wrap a
         // ListItem, so one long line here was clipped at the terminal edge
         // and the sentence ended mid-word at every width. 74 columns is the
@@ -4881,12 +5162,47 @@ impl App {
             Style::new().dim(),
         ))));
         let mut st =
-            ListState::default().with_selected(Some(self.sel.min(rows.len().saturating_sub(1))));
+            ListState::default().with_selected((self.sel < rows.len()).then_some(self.sel));
         f.render_stateful_widget(
             List::new(items).highlight_style(selected_style()),
             area,
             &mut st,
         );
+        // Hit targets must use the offset chosen by the rendered List. Long
+        // profiles scroll; row zero in the viewport is not row zero in storage.
+        let mut row_y = area.y;
+        for (i, row) in rows.iter().enumerate().skip(st.offset()) {
+            let height = match row {
+                Row::Profile(pi) => {
+                    let p = &self.profiles[*pi];
+                    let live_count = p
+                        .live_recognizer
+                        .as_deref()
+                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
+                        .unwrap_or(0);
+                    let misleading = p.scans_by_recognizer.len() > 1
+                        || (p.live_recognizer.is_some() && live_count != p.scans.len());
+                    if misleading && live_count == 0 {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                Row::Scan(_, _) => 1,
+            };
+            if row_y < area.y.saturating_add(area.height) {
+                self.hit(
+                    Rect::new(
+                        area.x,
+                        row_y,
+                        area.width,
+                        height.min(area.y.saturating_add(area.height).saturating_sub(row_y)),
+                    ),
+                    Click::Select(i),
+                );
+            }
+            row_y = row_y.saturating_add(height);
+        }
     }
 
     /// The Settings tab's fixed confirmation and optional-gesture section: the
@@ -6447,7 +6763,7 @@ impl App {
                 ("r", "Recheck"),
                 ("d", "Full Diagnostics"),
                 ("a", "TPM Diagnostics"),
-                ("v", "Record Trace (60s)"),
+                ("T", "Record Trace (60s)"),
                 ("s", "Create Support Report"),
                 ("l", "Test Infrared Camera"),
                 ("g", "Show Logs"),
@@ -6609,6 +6925,15 @@ impl App {
                 );
             }
         }
+        let more_x = x;
+        let chip = key("F2");
+        x = x.saturating_add(chip.content.chars().count() as u16 + 10);
+        spans.push(chip);
+        spans.push(Span::styled(" actions  ", Style::new().dim()));
+        self.hit(
+            Rect::new(more_x, inner_y, x.saturating_sub(more_x), 1),
+            Click::Key(KeyCode::F(2)),
+        );
         let help_x = x;
         let s = key("?");
         let w = s.content.chars().count() as u16;
@@ -6631,7 +6956,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n         PgUp/Dn  scroll activity history\n               h  Overview              q  quit\n           click  rows and action chips\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n         PgUp/Dn  scroll activity history\n               h  Overview              q  quit\n           click  rows and action chips\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -7144,9 +7469,102 @@ fn merge_confirmation_required(first_new_profile_scan: bool, created: bool) -> b
     first_new_profile_scan && !created
 }
 
+/// One framing/countdown phase followed by one authorized batch connection.
+fn enroll_worker(
+    user: String,
+    profile: String,
+    add: Option<String>,
+    target: usize,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<WMsg>,
+) {
+    let send = |m| tx.send(m).is_ok();
+    let mut misses = 0;
+    loop {
+        match guide_until_capture(&user, &stop, &send, &mut crate::daemon_sample, &mut misses) {
+            GuideOutcome::Ready => break,
+            GuideOutcome::Reframe => continue,
+            GuideOutcome::Halt => return,
+        }
+    }
+    if !send(WMsg::Authorizing) {
+        return;
+    }
+    let request = Request::EnrollmentSession {
+        user: user.clone(),
+        profile: Some(profile.clone()),
+        scans: target,
+        improve: add.is_some(),
+    };
+    let mut started = false;
+    let result = irlume_common::client::enrollment_session(&request, &stop, |event| {
+        match event {
+            irlume_common::EnrollmentEvent::Started => {
+                started = true;
+            }
+            irlume_common::EnrollmentEvent::Progress { captured, target } => {
+                if !send(WMsg::Captured(captured, target)) {
+                    return Err(std::io::Error::other("enrollment UI closed"));
+                }
+            }
+            irlume_common::EnrollmentEvent::Merge { profile, remaining } => {
+                let (answer, reply) = mpsc::channel();
+                if !send(WMsg::SessionMerge(SessionMerge {
+                    profile,
+                    remaining,
+                    answer,
+                })) {
+                    return Err(std::io::Error::other("enrollment UI closed"));
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    if stop.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::other("enrollment cancelled"));
+                    }
+                    match reply.recv_timeout(Duration::from_millis(100)) {
+                        Ok(accept) => return Ok(Some(accept)),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(std::io::Error::other("enrollment UI closed"))
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }
+        }
+        Ok(None)
+    });
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    match result {
+        Ok(Response::Enrolled { ambient_lit, .. }) => {
+            let _ = send(WMsg::Done {
+                ambient_lit: ambient_lit.unwrap_or(0),
+            });
+        }
+        // The old daemon answers an unknown request with exactly "bad request".
+        // Only that pre-acceptance parse refusal permits the old path. Never repeat an accepted operation after a lost reply.
+        Ok(Response::Error(error)) if !started && error == "bad request" => {
+            let _ = send(WMsg::Stall("older daemon: using per-scan enrollment; update and restart irlumed for the faster flow".into()));
+            legacy_enroll_worker(user, profile, add, target, stop, tx);
+        }
+        Ok(Response::Error(error)) => {
+            let _ = send(WMsg::Err(error));
+        }
+        Ok(other) => {
+            let _ = send(WMsg::Err(format!("unexpected enrollment reply: {other:?}")));
+        }
+        Err(error) => {
+            let _ = send(WMsg::Err(format!(
+                "enrollment connection ended: {error}; refresh profiles before retrying"
+            )));
+        }
+    }
+}
+
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,
 /// then capture, repeating until `target` scans. Streams cues to the UI.
-fn enroll_worker(
+fn legacy_enroll_worker(
     user: String,
     profile: String,
     add: Option<String>,
@@ -7199,7 +7617,13 @@ fn enroll_worker(
                     report_enrollment: true,
                 }
             };
-            match crate::daemon_request(&req) {
+            match irlume_common::client::request_cancellable(
+                &req,
+                std::time::Duration::from_secs(380),
+                &stop,
+            )
+            .map_err(|error| error.to_string())
+            {
                 // Scan 1 of a new-profile enroll matched an existing identity:
                 // the daemon merged it. Hand off to the UI to confirm before
                 // adding the rest; the worker ends here (the UI spawns a
@@ -7273,6 +7697,127 @@ mod tests {
     /// That meant an empty dashboard for a configured user, and `[a]`/`[e]`
     /// sealing a password and enrolling a face under the wrong account. The rule
     /// lives in `user_arg`; this pins the TUI to it.
+    #[test]
+    fn guided_merge_prompt_keeps_one_operation_and_cancel_never_deletes_a_saved_scan() {
+        let _guard = dead_socket();
+        for accept in [true, false] {
+            let mut app = test_app();
+            let (_tx, mut enrollment) = fake_enroll(0, 10);
+            let stop = enrollment.stop.clone();
+            let (answer, reply) = mpsc::channel();
+            enrollment.session_merge = Some(SessionMerge {
+                profile: "Existing".into(),
+                remaining: 9,
+                answer,
+            });
+            app.enroll = Some(enrollment);
+            let text = draw_text(&app);
+            assert!(text.contains("No scans have been saved"));
+            app.on_key(KeyCode::Char(if accept { 'y' } else { 'n' }));
+            assert_eq!(reply.try_recv().unwrap(), accept);
+            assert_eq!(app.enroll.is_some(), accept);
+            assert_eq!(stop.load(Ordering::Relaxed), !accept);
+            assert!(
+                app.op.is_none(),
+                "pending-session decline must not send a compensating DeleteScan"
+            );
+            // Decline refreshes light state and probes as well as profiles.
+            // Keep the dead socket installed until all three workers finish;
+            // otherwise a delayed Ping can enter the next test's fixture.
+            drain_loads(&mut app);
+            assert!(app.light_load.is_none());
+            assert!(app.profiles_load.is_none());
+            assert!(app.probes_load.is_none());
+        }
+    }
+
+    #[test]
+    fn guided_enrollment_uses_one_batch_after_one_countdown() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let path =
+            std::env::temp_dir().join(format!("irlume-guided-batch-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&socket)
+                    .read_line(&mut line)
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Request>(&line).unwrap(),
+                    Request::PositionSample { .. }
+                ));
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&Response::Position(good_report("Ready"))).unwrap()
+                )
+                .unwrap();
+            }
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&socket)
+                .read_line(&mut line)
+                .unwrap();
+            let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
+            if !batch {
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&Response::Error("expected one batch".into())).unwrap()
+                )
+                .unwrap();
+                return false;
+            }
+            for response in [
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Started),
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Progress {
+                    captured: 10,
+                    target: 10,
+                }),
+                Response::Enrolled {
+                    profile: "New".into(),
+                    created: true,
+                    added: 10,
+                    total: 10,
+                    room: Some(20),
+                    added_scans: vec![],
+                    ambient_lit: Some(0),
+                },
+            ] {
+                writeln!(socket, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            true
+        });
+        let (tx, rx) = mpsc::channel();
+        enroll_worker(
+            "test-user".into(),
+            "New".into(),
+            None,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        let batch = server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            batch,
+            "guided enrollment must authorize and capture one bounded batch"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, WMsg::Count(_)))
+                .count(),
+            3
+        );
+        assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+    }
+
     #[test]
     fn the_tui_targets_the_invoking_user_not_the_sudo_environment() {
         // The rule itself: SUDO_USER wins over the root $USER that sudo sets.
@@ -7700,6 +8245,260 @@ mod tests {
         a
     }
 
+    #[test]
+    fn audit_trace_shortcut_requires_confirmation_and_defers_execution() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        let advanced = app.advanced;
+        app.on_key(KeyCode::Char('T'));
+        assert!(
+            app.confirm.is_some(),
+            "trace needs a visible confirmation before sudo"
+        );
+        assert!(app.suspend.is_none());
+        assert_eq!(app.advanced, advanced);
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none());
+        assert!(app.suspend.is_none());
+        app.on_key(KeyCode::Char('T'));
+        app.on_key(KeyCode::Char('y'));
+        assert!(
+            app.suspend.is_some(),
+            "run only after leaving the alternate screen"
+        );
+    }
+
+    #[test]
+    fn audit_more_actions_is_searchable_and_cannot_execute_behind_a_modal() {
+        let mut app = test_app();
+        app.on_key(KeyCode::F(2));
+        for c in "trace explain".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        assert!(draw_text(&app).contains("Explain a recorded trace"));
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.input.is_some(),
+            "ask for the trace file, not a shell command"
+        );
+        app.on_key(KeyCode::F(2));
+        assert!(
+            app.input.is_some(),
+            "F2 cannot replace an active input flow"
+        );
+        app.on_key(KeyCode::Esc);
+        assert!(app.suspend.is_none());
+    }
+
+    #[test]
+    fn audit_profile_refresh_preserves_the_selected_person_and_scan() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["b1"])];
+        app.sel = 3; // Bob's b1 scan
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["a1", "a2"]), profile("Bob", &["b1"])],
+        })
+        .unwrap();
+        app.poll();
+        app.begin_delete();
+        assert!(
+            matches!(app.confirm, Some((_, _, ConfirmAct::Daemon(Request::DeleteScan { ref profile, ref scan, .. }))) if profile == "Bob" && scan == "b1")
+        );
+    }
+
+    #[test]
+    fn audit_removed_selection_cannot_silently_target_another_person() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["b1"])];
+        app.sel = 2;
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["a1"]), profile("Carol", &["c1"])],
+        })
+        .unwrap();
+        app.poll();
+        app.begin_delete();
+        assert!(app.confirm.is_none(), "removed Bob must not become Carol");
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["a1", "a2"]), profile("Carol", &["c1"])],
+        })
+        .unwrap();
+        app.poll();
+        app.begin_delete();
+        assert!(
+            app.confirm.is_none(),
+            "another refresh must keep selection cleared"
+        );
+        app.move_sel(1);
+        assert!(
+            app.sel_profile().is_some(),
+            "arrow keys restore an explicit selection"
+        );
+    }
+
+    #[test]
+    fn audit_clicking_a_scrolled_profile_list_selects_the_visible_scan() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let scans: Vec<_> = (0..30).map(|n| format!("scan-{n:02}")).collect();
+        let names: Vec<_> = scans.iter().map(String::as_str).collect();
+        app.profiles = vec![profile("Alice", &names)];
+        app.sel = 25;
+        let area = Rect::new(0, 0, 70, 8);
+        let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| app.draw_profiles(f, area)).unwrap();
+        let text = rendered(&terminal);
+        let y = text
+            .lines()
+            .position(|line| line.contains("scan-20"))
+            .expect("scrolled scan must be visible");
+        app.on_click(5, y as u16, area);
+        app.begin_delete();
+        assert!(
+            matches!(app.confirm, Some((_, _, ConfirmAct::Daemon(Request::DeleteScan { ref scan, .. }))) if scan == "scan-20")
+        );
+    }
+
+    #[test]
+    fn audit_camera_refresh_does_not_block_navigation_on_daemon_latency() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let sock = std::env::temp_dir().join(format!(
+            "irlume-tui-camera-audit-{}.sock",
+            std::process::id()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &sock);
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in [
+                Response::Cameras(vec![]),
+                Response::Error("old daemon".into()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                requests.push(serde_json::from_str::<Request>(&line).unwrap());
+                std::thread::sleep(Duration::from_millis(150));
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            requests
+        });
+        let mut app = test_app();
+        let started = std::time::Instant::now();
+        app.refresh_camera_listing();
+        let blocked = started.elapsed();
+        let requests = server.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !app.pairs_known && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_file(sock).unwrap();
+        assert!(
+            app.pairs_known,
+            "the completed background result must land; requests={requests:?}"
+        );
+        assert!(
+            blocked < Duration::from_millis(100),
+            "camera metadata blocked navigation for {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn audit_more_actions_preserves_literal_arguments_and_selected_account() {
+        let mut app = test_app();
+        app.user = "shared-account".into();
+        app.on_key(KeyCode::F(2));
+        for c in "profiles add-scan".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "Person with glasses; $(literal)".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "3".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(app.suspend.is_none(), "review before executing");
+        assert!(draw_text(&app).contains("shared-account"));
+        app.on_key(KeyCode::Char('y'));
+        let Some(Suspend::MoreAction(invocation)) = app.suspend else {
+            panic!("confirmed action missing");
+        };
+        assert_eq!(
+            invocation.args("shared-account"),
+            [
+                "profiles",
+                "add-scan",
+                "--profile",
+                "Person with glasses; $(literal)",
+                "--scans",
+                "3",
+                "--user",
+                "shared-account"
+            ]
+        );
+        assert!(
+            !invocation.action.root,
+            "account enrollment must retain the OS authorization gate"
+        );
+    }
+
+    #[test]
+    fn audit_more_action_fields_reject_options_and_zero_scan_count() {
+        let mut app = test_app();
+        app.on_key(KeyCode::F(2));
+        for c in "chosen scan count".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "--reset".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_some());
+        assert!(app.confirm.is_none());
+        for _ in 0..7 {
+            app.on_key(KeyCode::Backspace);
+        }
+        app.on_key(KeyCode::Enter); // omitted optional name
+        app.on_key(KeyCode::Char('0'));
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_some());
+        assert!(app.confirm.is_none());
+        app.on_key(KeyCode::Esc);
+        assert!(app.suspend.is_none());
+    }
+
+    #[test]
+    fn audit_more_actions_renders_at_small_terminal_sizes() {
+        let mut app = test_app();
+        app.on_key(KeyCode::F(2));
+        for (w, h) in [(0, 0), (1, 1), (20, 6), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            if w == 80 {
+                assert!(rendered(&terminal).contains("More actions"));
+            }
+        }
+    }
+
     fn test_app() -> App {
         let caps = irlume_camera::Caps {
             ir_pair: false,
@@ -7718,12 +8517,14 @@ mod tests {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            camera_load: None,
             activity: Vec::new(),
             input: None,
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
+            more_actions: None,
             hub_sel: 0,
             op: None,
             enroll: None,
@@ -7783,6 +8584,7 @@ mod tests {
         (
             tx,
             EnrollUi {
+                session_merge: None,
                 rx,
                 stop: Arc::new(AtomicBool::new(false)),
                 profile: "p".into(),
@@ -7846,6 +8648,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.op.is_none(), "async op never finished");
+        drain_loads(app);
     }
 
     /// Drive poll() until the guided-enroll worker ends (dead socket → Err).
@@ -7856,6 +8659,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.enroll.is_none(), "enroll worker never finished");
+        drain_loads(app);
     }
 
     /// Wait for every in-flight background load to land (or the budget to
@@ -7864,12 +8668,22 @@ mod tests {
     /// request time and connects to whatever socket that test set up.
     fn drain_loads(app: &mut App) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while (app.light_load.is_some() || app.probes_load.is_some() || app.profiles_load.is_some())
+        while (app.light_load.is_some()
+            || app.probes_load.is_some()
+            || app.profiles_load.is_some()
+            || app.camera_load.is_some())
             && std::time::Instant::now() < deadline
         {
             app.poll();
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            app.light_load.is_none()
+                && app.probes_load.is_none()
+                && app.profiles_load.is_none()
+                && app.camera_load.is_none(),
+            "background loads must finish before releasing the test socket"
+        );
     }
 
     /// Render the full frame at 120x50 and return the flattened text.
@@ -8250,7 +9064,7 @@ mod tests {
     // first"; refreshing your own face is what [a] Improve Recognition does,
     // so the at-cap message must point there.
     #[test]
-    fn enroll_at_cap_points_to_improve_recognition() {
+    fn audit_enroll_at_cap_points_to_improve_recognition() {
         let mut app = test_app();
         app.daemon_up = true; // skip the daemon gate; the cap check is next
         app.profiles = (0..MAX_PROFILES)
@@ -8262,7 +9076,10 @@ mod tests {
             })
             .collect();
         app.begin_enroll();
-        assert!(app.input.is_none(), "no name prompt at the profile cap");
+        assert!(
+            app.input.is_some(),
+            "an existing person must still reach matching at the profile cap"
+        );
         let (_, msg) = app.activity.last().expect("a cap message is logged");
         assert!(
             msg.contains("Improve Recognition"),
@@ -9361,7 +10178,7 @@ mod tests {
             .join(" ");
         assert!(
             flat.contains("fires the IR emitter for up to a minute")
-                && flat.contains("/etc/irlume/cameras.conf")
+                && flat.contains("stores the verdict for this exact camera and connection context")
                 && flat.contains("password will be requested"),
             "the pre-run confirmation must render every material effect:\n{text}"
         );
@@ -9780,6 +10597,7 @@ mod tests {
             app.enroll_merge.as_ref().unwrap().remaining,
             ENROLL_SCANS - 1
         );
+        drain_loads(&mut app);
     }
 
     /// The upgrade window: a 0.9.0 TUI talking to a still-running 0.8.1
@@ -9826,6 +10644,7 @@ mod tests {
             0,
             "an explicit zero is a real answer and must still cap"
         );
+        drain_loads(&mut app);
     }
 
     /// The mixed-recognizer state this release creates: a profile can hold more
@@ -9855,6 +10674,7 @@ mod tests {
             ENROLL_SCANS - 1,
             "a full profile-wide count must not zero out a recognizer with room"
         );
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -10001,6 +10821,7 @@ mod tests {
             "completion must be logged"
         );
         assert!(app.error.is_none());
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -12068,6 +12889,7 @@ mod tests {
         let mut app = test_app();
         let (_tx, rx) = mpsc::channel();
         app.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             profile: "BEN".into(),

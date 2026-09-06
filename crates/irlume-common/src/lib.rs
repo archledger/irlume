@@ -435,7 +435,22 @@ pub enum IntentAttestation {
     PolicyWaived,
 }
 
-/// Request from an (untrusted) client to the (privileged) daemon.
+/// Public progress contains counts and a profile label, never biometric scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EnrollmentEvent {
+    Started,
+    Progress { captured: usize, target: usize },
+    Merge { profile: String, remaining: usize },
+}
+
+/// The sole continuation accepted on an enrollment session's own socket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentDecision {
+    pub accept: bool,
+}
+
+/// Request from an untrusted client to the privileged daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     /// Attempt to authenticate `user` from a live capture. The default,
@@ -454,14 +469,22 @@ pub enum Request {
     },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
-    /// `reset` (default false) wipes the user's existing enrollment first, a
-    /// clean re-enroll that also clears a stale camera binding.
+    /// `reset` (default false) replaces profiles and the camera binding only
+    /// after successful capture, preserving the template key and recovery setup.
     Enroll {
         user: String,
         profile: Option<String>,
         scans: Option<usize>,
         #[serde(default)]
         reset: bool,
+    },
+    /// One authorized guided operation. Only this opt-in request receives
+    /// streamed enrollment events and can answer a merge on the same socket.
+    EnrollmentSession {
+        user: String,
+        profile: Option<String>,
+        scans: usize,
+        improve: bool,
     },
     /// 1:N identify ("who is this?"): one live capture, no claimed identity.
     /// Unprivileged (no credential release), but NOT unscoped: a root peer is
@@ -816,6 +839,8 @@ pub enum PadModelStatus {
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    /// Progress for an explicitly requested guided enrollment operation.
+    EnrollmentSession(EnrollmentEvent),
     /// Authentication decision plus the evidence behind it.
     AuthResult {
         granted: bool,
@@ -1251,6 +1276,16 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enrollment_session_is_an_explicit_bounded_request() {
+        let wire =
+            r#"{"EnrollmentSession":{"user":"alice","profile":null,"scans":10,"improve":false}}"#;
+        let parsed = serde_json::from_str::<super::Request>(wire);
+        assert!(
+            parsed.is_ok(),
+            "guided enrollment needs its own opt-in request: {parsed:?}"
+        );
+    }
 
     /// `AuthResult.situation` (#616 step 3) is `#[serde(default)]` so an
     /// OLDER daemon's reply, which predates the field, still decodes: the

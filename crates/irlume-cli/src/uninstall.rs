@@ -284,6 +284,9 @@ fn remove_source_files() -> Result<String, String> {
     ] {
         targets.push(PathBuf::from(d).join("pam_irlume.so"));
     }
+    targets.push(PathBuf::from(
+        "/usr/share/polkit-1/actions/org.irlume.enroll.policy",
+    ));
     // The systemd unit and any drop-ins.
     targets.push(PathBuf::from("/etc/systemd/system/irlumed.service"));
     let _ = std::fs::remove_dir_all("/etc/systemd/system/irlumed.service.d");

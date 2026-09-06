@@ -39,6 +39,7 @@ BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
 BuildRequires:  pam-devel
+BuildRequires:  dbus-devel
 BuildRequires:  tpm2-tss-devel
 BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
@@ -52,6 +53,7 @@ BuildRequires:  selinux-policy-devel
 
 # Runtime: onnxruntime is bundled (see Source1); the PAM stack + TPM + fprintd
 # companion remain normal deps.
+Requires:       polkit
 Requires:       pam
 Requires:       tpm2-tss
 Recommends:     fprintd
@@ -111,6 +113,7 @@ cargo build --release --locked
 make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux irlume.pp
 
 %install
+install -Dm0644 packaging/polkit/org.irlume.enroll.policy %{buildroot}%{_datadir}/polkit-1/actions/org.irlume.enroll.policy
 install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
 install -Dm0755 target/release/irlume  %{buildroot}%{_bindir}/irlume
 install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/pam_irlume.so
@@ -240,6 +243,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 [ $1 -eq 0 ] && semodule -r irlume 2>/dev/null || :
 
 %files
+%{_datadir}/polkit-1/actions/org.irlume.enroll.policy
 %license LICENSE
 %doc README.md docs/SECURITY_AT_REST.md docs/MACHINE-API.md docs/INTEGRATION.md
 %{_bindir}/irlumed

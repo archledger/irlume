@@ -53,6 +53,9 @@ fi
 # State lives under the invoking user's home (single-admin install for now).
 STATE_HOME="$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)"
 
+install -Dm0644 "$REPO/packaging/polkit/org.irlume.enroll.policy" \
+  /usr/share/polkit-1/actions/org.irlume.enroll.policy
+printf "%s\n" "Enrollment requires polkit and a desktop or registered terminal authentication agent."
 install -m 0755 "$REPO/target/release/irlumed" "$REPO/target/release/irlume" /usr/local/bin/
 
 cat > /etc/systemd/system/irlumed.service <<EOF

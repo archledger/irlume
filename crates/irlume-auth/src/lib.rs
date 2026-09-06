@@ -592,10 +592,50 @@ pub fn apply_known_ir_emitter_subject_region(
     Ok(verdict)
 }
 
+/// Interaction confined to one authorized enrollment operation.
+pub trait EnrollmentObserver {
+    /// # Errors
+    /// Returns an error when this operation must stop before further work.
+    fn check(&self) -> irlume_common::Result<()> {
+        Ok(())
+    }
+    /// # Errors
+    /// Returns an error when progress cannot be delivered or capture is cancelled.
+    fn progress(&self, _captured: usize, _target: usize) -> irlume_common::Result<()> {
+        self.check()
+    }
+    /// # Errors
+    /// Returns an error on decline, cancellation or failure to obtain permission.
+    fn confirm_merge(&self, _profile: &str, _remaining: usize) -> irlume_common::Result<()> {
+        self.check()
+    }
+}
+impl EnrollmentObserver for () {}
+
+struct EnrollmentPublication<'a> {
+    replace: bool,
+    observer: &'a dyn EnrollmentObserver,
+}
+
+struct EnrollmentProgress<'a> {
+    observer: &'a dyn EnrollmentObserver,
+    base: usize,
+    target: usize,
+}
+impl EnrollmentObserver for EnrollmentProgress<'_> {
+    fn check(&self) -> irlume_common::Result<()> {
+        self.observer.check()
+    }
+    fn progress(&self, captured: usize, _target: usize) -> irlume_common::Result<()> {
+        self.observer.progress(self.base + captured, self.target)
+    }
+}
+
 struct EnrollmentCapturePolicy<'a> {
     mode: &'a CaptureModeSelection,
     use_ir: bool,
     diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    observer: &'a dyn EnrollmentObserver,
 }
 
 /// What one add-scan capture stored, with everything the daemon's reply
@@ -6297,14 +6337,16 @@ impl Engine {
     /// Each Live capture yields one [`CapturedScan`]. No enrolling from a
     /// photo; the liveness gate rejects spoofs. `pitch_neutral` centres the
     /// frontal gate on this user's camera (None on first enroll).
-    fn capture_scans(
+    fn capture_scans_observed(
         &mut self,
         want: usize,
         pitch_neutral: Option<f32>,
         observed: &mut CaptureShape,
         force_rgb_only: bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
+        observer.check()?;
         // Fresh ViT PAD vote ring per enrollment, mirroring the
         // per-authentication reset: the 5-median vote must describe ONE
         // presentation (the enrollment), and a banner presented to enroll is
@@ -6378,6 +6420,7 @@ impl Engine {
                     mode: &capture_mode,
                     use_ir,
                     diagnostics,
+                    observer,
                 },
                 &operation,
                 observed,
@@ -6414,6 +6457,7 @@ impl Engine {
                 mode: &capture_mode,
                 use_ir,
                 diagnostics,
+                observer,
             },
             &operation,
             observed,
@@ -6424,7 +6468,7 @@ impl Engine {
     /// The enrolment loop arms fresh paired streams per assessment when
     /// `cameras` is given, otherwise it uses the per-capture strategy.
     ///
-    /// Split out from [`Self::capture_scans`] so the per-frame path runs with
+    /// Split out from [`Self::capture_scans_observed`] so the per-frame path runs with
     /// the held cameras already dropped: the two capture strategies must never
     /// have the devices open at the same time (#187).
     fn capture_scan_loop(
@@ -6453,6 +6497,7 @@ impl Engine {
             // The safe boundary: between whole captures, before the next one
             // opens. Nothing is written until the caller finishes, so returning
             // here leaves no partial profile behind and no device mid-stream.
+            policy.observer.check().map_err(CapturePathError::Other)?;
             if self.should_stop() {
                 return Err(CapturePathError::Other(irlume_common::Error::Preempted(
                     "an authentication needed the camera; nothing was saved, please retry".into(),
@@ -6493,6 +6538,10 @@ impl Engine {
             // the countdown. Same bounds (and neutral) the enrollment guide uses.
             if let Some(scan) = self.enrollment_scan(a, policy.use_ir, pitch_neutral)? {
                 out.push(scan);
+                policy
+                    .observer
+                    .progress(out.len(), want)
+                    .map_err(CapturePathError::Other)?;
             }
         }
         observed.include(shape);
@@ -6714,7 +6763,7 @@ impl Engine {
         profile_name: Option<String>,
         want: usize,
     ) -> irlume_common::Result<EnrollOutcome> {
-        self.enroll_profile_with_capture_policy(user, profile_name, want, |_| true, &())
+        self.enroll_profile_with_capture_policy(user, profile_name, want, |_| true, &(), false)
     }
 
     /// Run a user-present IR readiness check only after the enrollment's
@@ -6730,7 +6779,7 @@ impl Engine {
         want: usize,
         ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
     ) -> irlume_common::Result<EnrollOutcome> {
-        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, &())
+        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, &(), false)
     }
 
     /// [`Self::enroll_profile_with_ir_preflight`] while publishing bounded,
@@ -6744,7 +6793,39 @@ impl Engine {
         ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<EnrollOutcome> {
-        self.enroll_profile_with_capture_policy(user, profile_name, want, ir_preflight, diagnostics)
+        self.enroll_profile_with_capture_policy(
+            user,
+            profile_name,
+            want,
+            ir_preflight,
+            diagnostics,
+            false,
+        )
+    }
+
+    /// Replace all profiles and the camera binding after a complete enrollment
+    /// capture. The existing template key and recovery setup are retained.
+    ///
+    /// # Errors
+    /// Returns capture, validation, or storage errors. Capture failure preserves
+    /// the saved enrollment. A storage error after publication explicitly reports
+    /// that the replacement is visible but its durability is uncertain.
+    pub fn replace_enrollment_with_ir_preflight_and_diagnostics(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<EnrollOutcome> {
+        self.enroll_profile_with_capture_policy(
+            user,
+            profile_name,
+            want,
+            ir_preflight,
+            diagnostics,
+            true,
+        )
     }
 
     fn enroll_profile_with_capture_policy(
@@ -6754,11 +6835,64 @@ impl Engine {
         want: usize,
         ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        replace: bool,
     ) -> irlume_common::Result<EnrollOutcome> {
-        use irlume_core::storage::{
-            self, Enrollment, FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE,
+        self.enroll_profile_capture(
+            user,
+            profile_name,
+            want,
+            ir_preflight,
+            diagnostics,
+            EnrollmentPublication {
+                replace,
+                observer: &(),
+            },
+        )
+    }
+
+    /// Capture a complete candidate with bounded caller-owned interaction.
+    ///
+    /// # Errors
+    /// Returns authorization-session cancellation, capture, validation or storage errors.
+    pub fn enroll_profile_observed(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<EnrollOutcome> {
+        self.enroll_profile_capture(
+            user,
+            profile_name,
+            want,
+            ir_preflight,
+            diagnostics,
+            EnrollmentPublication {
+                replace: false,
+                observer,
+            },
+        )
+    }
+
+    fn enroll_profile_capture(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        publication: EnrollmentPublication<'_>,
+    ) -> irlume_common::Result<EnrollOutcome> {
+        let EnrollmentPublication { replace, observer } = publication;
+        observer.check()?;
+        use irlume_core::storage::{self, Enrollment, MAX_SCANS_PER_PROFILE};
+        let enr = if replace {
+            Enrollment::new(user)
+        } else {
+            storage::load(user)?.unwrap_or_else(|| Enrollment::new(user))
         };
-        let mut enr = storage::load(user)?.unwrap_or_else(|| Enrollment::new(user));
         let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
         // Fail fast on an explicit duplicate name, before the camera opens. The
         // auto-generated name can't collide.
@@ -6781,6 +6915,81 @@ impl Engine {
             })?;
         }
         let force_rgb_only = !self.ir_available || preflight_dark;
+        let mut completed = 0;
+        let (enr, outcome) = self.capture_enrollment_observed(
+            enr,
+            profile_name,
+            want,
+            |engine, count, pitch, observed| {
+                let progress = EnrollmentProgress {
+                    observer,
+                    base: completed,
+                    target: if completed == 0 {
+                        want
+                    } else {
+                        completed + count
+                    },
+                };
+                let scans = engine.capture_scans_observed(
+                    count,
+                    pitch,
+                    observed,
+                    force_rgb_only,
+                    diagnostics,
+                    &progress,
+                )?;
+                completed += scans.len();
+                Ok(scans)
+            },
+            observer,
+        )?;
+        observer.check()?;
+        if self.should_stop() {
+            return Err(irlume_common::Error::Preempted(
+                "enrollment stopped before publication".into(),
+            ));
+        }
+        if replace {
+            storage::save_replacement(&enr)?;
+        } else {
+            storage::save(&enr)?;
+        }
+        Ok(outcome)
+    }
+
+    // Capture and assemble the entire candidate before the caller publishes it.
+    // The capture callback is the hardware boundary, also used by deterministic
+    // tests of short captures, cancellation and successful replacement.
+    #[cfg(test)]
+    fn capture_enrollment(
+        &mut self,
+        enr: irlume_core::storage::Enrollment,
+        profile_name: Option<String>,
+        want: usize,
+        capture: impl FnMut(
+            &mut Self,
+            usize,
+            Option<f32>,
+            &mut CaptureShape,
+        ) -> irlume_common::Result<Vec<CapturedScan>>,
+    ) -> irlume_common::Result<(irlume_core::storage::Enrollment, EnrollOutcome)> {
+        self.capture_enrollment_observed(enr, profile_name, want, capture, &())
+    }
+
+    fn capture_enrollment_observed(
+        &mut self,
+        mut enr: irlume_core::storage::Enrollment,
+        profile_name: Option<String>,
+        want: usize,
+        mut capture: impl FnMut(
+            &mut Self,
+            usize,
+            Option<f32>,
+            &mut CaptureShape,
+        ) -> irlume_common::Result<Vec<CapturedScan>>,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<(irlume_core::storage::Enrollment, EnrollOutcome)> {
+        use irlume_core::storage::{FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE};
         // Probe scan first: it decides whether this face merges into an existing
         // profile, and therefore how many scans to capture at all. A profile
         // with 5 free slots gets a 5-scan top-up instead of a 10-scan session
@@ -6793,13 +7002,7 @@ impl Engine {
         // the first observed and the message cannot claim "on every attempt"
         // about a subset of them.
         let mut observed = CaptureShape::default();
-        let probe_scans = self.capture_scans(
-            1,
-            enr.pitch_neutral(),
-            &mut observed,
-            force_rgb_only,
-            diagnostics,
-        )?;
+        let probe_scans = capture(self, 1, enr.pitch_neutral(), &mut observed)?;
         let solo_probe = if probe_scans.is_empty() {
             self.solo_rgb_starvation_probe(observed)
         } else {
@@ -6818,6 +7021,7 @@ impl Engine {
             let advice = capture_advice(observed, solo_probe);
             irlume_common::Error::Protocol(format!("no live scan captured; {advice}"))
         })?;
+        let mut confirmed_merge = None;
         let goal = match enroll_merge_target(
             &enr,
             &[probe.rgb.as_slice()],
@@ -6839,19 +7043,23 @@ impl Engine {
                          some of its scans first"
                     )));
                 }
+                observer.confirm_merge(&target, want.min(room).saturating_sub(1))?;
+                confirmed_merge = Some(target);
                 want.min(room)
             }
-            None => want,
+            None => {
+                if enr.profiles.len() >= MAX_PROFILES {
+                    return Err(irlume_common::Error::Protocol(format!(
+                        "at the max of {MAX_PROFILES} face profiles; delete one first"
+                    )));
+                }
+                want
+            }
         };
+        observer.check()?;
         let mut captured = vec![probe];
         if goal > 1 {
-            captured.extend(self.capture_scans(
-                goal - 1,
-                enr.pitch_neutral(),
-                &mut observed,
-                force_rgb_only,
-                diagnostics,
-            )?);
+            captured.extend(capture(self, goal - 1, enr.pitch_neutral(), &mut observed)?);
         }
         if captured.len() < goal {
             let solo_probe = self.solo_rgb_starvation_probe(observed);
@@ -6877,6 +7085,10 @@ impl Engine {
         if let Some(target) =
             enroll_merge_target(&enr, &rgbs, &self.embed_space, self.rgb_threshold)?
         {
+            if confirmed_merge.as_deref() != Some(target.as_str()) {
+                observer.confirm_merge(&target, 0)?;
+            }
+            observer.check()?;
             // The face already owns a profile: merge the capture into it.
             let idx = enr
                 .profiles
@@ -6918,15 +7130,17 @@ impl Engine {
             // (#290), so compute it from the same helper enrollment itself
             // uses rather than leaving a client to derive it from `total`.
             let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
-            storage::save(&enr)?;
-            return Ok(EnrollOutcome::Merged {
-                name: target,
-                added,
-                total,
-                room,
-                added_scans,
-                ambient_lit,
-            });
+            return Ok((
+                enr,
+                EnrollOutcome::Merged {
+                    name: target,
+                    added,
+                    total,
+                    room,
+                    added_scans,
+                    ambient_lit,
+                },
+            ));
         }
         if enr.profiles.len() >= MAX_PROFILES {
             return Err(irlume_common::Error::Protocol(format!(
@@ -6964,12 +7178,14 @@ impl Engine {
         if enr.camera_binding.is_none() {
             enr.camera_binding = Some(self.current_binding());
         }
-        storage::save(&enr)?;
-        Ok(EnrollOutcome::New {
-            name,
-            scans: n,
-            ambient_lit,
-        })
+        Ok((
+            enr,
+            EnrollOutcome::New {
+                name,
+                scans: n,
+                ambient_lit,
+            },
+        ))
     }
 
     /// Snapshot the identity of the cameras this engine is bound to, for
@@ -7066,6 +7282,22 @@ impl Engine {
         count: usize,
         ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
     ) -> irlume_common::Result<AddScanOutcome> {
+        self.add_scan_observed(user, profile_name, count, ir_preflight, &())
+    }
+
+    /// Add a complete capture with progress and cancellation before publication.
+    ///
+    /// # Errors
+    /// Returns capture, cross-profile validation, cancellation or storage errors.
+    pub fn add_scan_observed(
+        &mut self,
+        user: &str,
+        profile_name: &str,
+        count: usize,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<AddScanOutcome> {
+        observer.check()?;
         use irlume_core::storage::{self, FaceScan, MAX_SCANS_PER_PROFILE};
         let mut enr = storage::load(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
@@ -7098,12 +7330,13 @@ impl Engine {
         let force_rgb_only = !self.ir_available || preflight_dark;
         let want = count.clamp(1, room);
         let mut observed = CaptureShape::default();
-        let captured = self.capture_scans(
+        let captured = self.capture_scans_observed(
             want,
             enr.pitch_neutral(),
             &mut observed,
             force_rgb_only,
             &(),
+            observer,
         )?;
         let solo_probe = if captured.len() < want {
             self.solo_rgb_starvation_probe(observed)
@@ -7172,6 +7405,12 @@ impl Engine {
         }
         let total = enr.profiles[idx].scans_in(&self.embed_space);
         let room = scan_room_in(&enr.profiles[idx], &self.embed_space);
+        observer.check()?;
+        if self.should_stop() {
+            return Err(irlume_common::Error::Preempted(
+                "enrollment stopped before publication".into(),
+            ));
+        }
         storage::save(&enr)?;
         Ok(AddScanOutcome {
             added_scans: added,
@@ -11901,6 +12140,280 @@ mod engine_tests {
         assert!(enrollment_ir_enabled(true, false));
         assert!(!enrollment_ir_enabled(true, true));
         assert!(!enrollment_ir_enabled(false, false));
+    }
+
+    #[test]
+    fn replacement_capture_preserves_old_state_on_failure_or_preemption() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("replacement");
+        let mut old = Enrollment::new("replacement-test");
+        old.profiles.push(FaceProfile {
+            name: "Existing".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &old);
+        let path = dir.join("replacement-test.json");
+        let before = std::fs::read(&path).unwrap();
+
+        // Reusing the old name must reach capture, not duplicate-name refusal.
+        let err = s
+            .engine
+            .replace_enrollment_with_ir_preflight_and_diagnostics(
+                &old.user,
+                Some("Existing".into()),
+                3,
+                |_| true,
+                &(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no camera found"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        s.engine.set_stop_signal(std::sync::Arc::new(|| true));
+        let result = s
+            .engine
+            .replace_enrollment_with_ir_preflight_and_diagnostics(
+                &old.user,
+                None,
+                3,
+                |_| true,
+                &(),
+            );
+        s.engine.stop_requested = None;
+        assert!(matches!(result, Err(irlume_common::Error::Preempted(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn guided_merge_accept_keeps_the_requested_scan_budget() {
+        let _g = env_guard();
+        let mut s = shared();
+        let mut enrollment = Enrollment::new("guided-accept-test");
+        enrollment.profiles.push(FaceProfile {
+            name: "Existing".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        struct Accept(std::cell::Cell<usize>);
+        impl super::EnrollmentObserver for Accept {
+            fn confirm_merge(&self, name: &str, remaining: usize) -> irlume_common::Result<()> {
+                assert_eq!(name, "Existing");
+                assert_eq!(remaining, 9);
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+        }
+        let observer = Accept(std::cell::Cell::new(0));
+        let mut captures = 0;
+        let (candidate, outcome) = s
+            .engine
+            .capture_enrollment_observed(
+                enrollment,
+                None,
+                10,
+                |_, count, _, _| {
+                    if captures > 0 {
+                        assert_eq!(observer.0.get(), 1, "confirm before further capture");
+                    }
+                    captures += count;
+                    Ok((0..count)
+                        .map(|_| CapturedScan {
+                            rgb: unit512(1),
+                            ir: None,
+                            center_edge_ratio: 1.0,
+                            brightness: 100.0,
+                            pitch: 0.4,
+                            ambient_share: None,
+                        })
+                        .collect())
+                },
+                &observer,
+            )
+            .unwrap();
+        assert_eq!(captures, 10);
+        assert_eq!(candidate.profiles.len(), 1);
+        assert_eq!(candidate.profiles[0].scans.len(), 11);
+        assert!(matches!(outcome, EnrollOutcome::Merged { added: 10, .. }));
+        assert_eq!(observer.0.get(), 1);
+    }
+
+    #[test]
+    fn guided_late_merge_also_requires_permission_before_candidate_publication() {
+        let _g = env_guard();
+        let mut s = shared();
+        let mut enrollment = Enrollment::new("guided-late-test");
+        enrollment.profiles.push(FaceProfile {
+            name: "Existing".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        struct Decline;
+        impl super::EnrollmentObserver for Decline {
+            fn confirm_merge(&self, name: &str, remaining: usize) -> irlume_common::Result<()> {
+                assert_eq!(name, "Existing");
+                assert_eq!(remaining, 0);
+                Err(irlume_common::Error::Preempted(
+                    "declined late match".into(),
+                ))
+            }
+        }
+        let mut calls = 0;
+        let result = s.engine.capture_enrollment_observed(
+            enrollment,
+            None,
+            2,
+            |_, count, _, _| {
+                calls += 1;
+                let rgb = if calls == 1 {
+                    unit512(1).into_iter().map(|v| -v).collect()
+                } else {
+                    unit512(1)
+                };
+                Ok((0..count)
+                    .map(|_| CapturedScan {
+                        rgb: rgb.clone(),
+                        ir: None,
+                        center_edge_ratio: 1.0,
+                        brightness: 100.0,
+                        pitch: 0.4,
+                        ambient_share: None,
+                    })
+                    .collect())
+            },
+            &Decline,
+        );
+        assert!(
+            matches!(result,Err(irlume_common::Error::Preempted(ref e)) if e=="declined late match")
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn guided_merge_decline_discards_the_probe_before_more_capture() {
+        let _g = env_guard();
+        let mut s = shared();
+        let mut enrollment = Enrollment::new("guided-merge-test");
+        enrollment.profiles.push(FaceProfile {
+            name: "Existing".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        struct Decline(std::cell::Cell<usize>);
+        impl super::EnrollmentObserver for Decline {
+            fn confirm_merge(&self, name: &str, remaining: usize) -> irlume_common::Result<()> {
+                assert_eq!(name, "Existing");
+                assert_eq!(remaining, 9);
+                self.0.set(self.0.get() + 1);
+                Err(irlume_common::Error::Preempted("declined".into()))
+            }
+        }
+        let observer = Decline(std::cell::Cell::new(0));
+        let mut captures = 0;
+        let result = s.engine.capture_enrollment_observed(
+            enrollment,
+            None,
+            10,
+            |_, count, _, _| {
+                captures += count;
+                Ok((0..count)
+                    .map(|_| CapturedScan {
+                        rgb: unit512(1),
+                        ir: None,
+                        center_edge_ratio: 1.0,
+                        brightness: 100.0,
+                        pitch: 0.4,
+                        ambient_share: None,
+                    })
+                    .collect())
+            },
+            &observer,
+        );
+        assert!(result.is_err(), "declining must discard the candidate");
+        assert_eq!(captures, 1, "no further captures after merge decline");
+        assert_eq!(observer.0.get(), 1);
+    }
+
+    #[test]
+    fn enrollment_candidate_requires_complete_capture_before_publication() {
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("candidate");
+        let mut old = Enrollment::new("candidate-test");
+        old.profiles.push(FaceProfile {
+            name: "Old".into(),
+            scans: vec![scan512(1, false, None)],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &old);
+        let path = dir.join("candidate-test.json");
+        let before = std::fs::read(&path).unwrap();
+        let scan = || CapturedScan {
+            rgb: unit512(2),
+            ir: None,
+            center_edge_ratio: 1.0,
+            brightness: 100.0,
+            pitch: 0.4,
+            ambient_share: None,
+        };
+        for preempt in [false, true] {
+            let mut calls = 0;
+            let result = s.engine.capture_enrollment(
+                Enrollment::new(&old.user),
+                None,
+                3,
+                |_, count, pitch, _| {
+                    calls += 1;
+                    assert_eq!(pitch, None, "replacement must not inherit old pitch");
+                    if calls == 1 {
+                        assert_eq!(count, 1);
+                        Ok(vec![scan()])
+                    } else {
+                        assert_eq!(count, 2);
+                        if preempt {
+                            Err(irlume_common::Error::Preempted(
+                                "injected cancellation".into(),
+                            ))
+                        } else {
+                            Ok(vec![scan()])
+                        }
+                    }
+                },
+            );
+            let err = result.unwrap_err();
+            if preempt {
+                assert!(matches!(err, irlume_common::Error::Preempted(_)));
+            } else {
+                assert!(
+                    err.to_string().contains("only 2 live scans (need 3)"),
+                    "{err}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let (candidate, outcome) = s
+            .engine
+            .capture_enrollment(
+                Enrollment::new(&old.user),
+                Some("Replacement".into()),
+                3,
+                |_, count, _, _| Ok((0..count).map(|_| scan()).collect()),
+            )
+            .unwrap();
+        assert!(matches!(outcome, EnrollOutcome::New { scans: 3, .. }));
+        assert_eq!(candidate.profiles.len(), 1);
+        assert_eq!(candidate.profiles[0].name, "Replacement");
+        assert_eq!(candidate.profiles[0].scans.len(), 3);
+        assert!(candidate.camera_binding.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        teardown_sandbox(&dir);
     }
 
     #[test]

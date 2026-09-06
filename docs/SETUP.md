@@ -16,6 +16,10 @@ you out.
 
 ## Guided setup (TUI)
 
+See [TUI workflows and CLI parity](TUI.md) for F2 More actions and the
+existing-person versus new-person enrollment flow.
+
+
 ```sh
 irlume tui
 ```
@@ -100,7 +104,13 @@ Look at the camera. It captures ten scans and saves a profile:
 ```
 
 Options: `--name "Alex"` names the profile, `--scans K` sets the scan count,
-`--reset` wipes existing profiles first. Name a separate profile for a
+`--reset` replaces existing profiles and the camera binding after a complete,
+validated capture. Failed or cancelled captures keep the saved enrollment. The
+template key and recovery setup are retained. If the key cannot be unsealed,
+use `irlume recovery restore`; `--reset` no longer discards an unusable key.
+Without recovery, deliberate removal of the old enrollment, sealed template
+key and recovery envelope is required before a fresh enrollment.
+Name a separate profile for a
 *different person* you trust (up to three); for your own glasses/lighting
 variants, add scans to your own profile instead. On a machine with a TPM, the
 templates are now
@@ -551,3 +561,11 @@ Your password login is never touched. To remove just face-`sudo` while keeping
 the greeter, re-run `login enable --apply` *without* `--with-sudo`. For every
 off-switch in one place (per-surface tiers, standing face down without touching
 PAM, canceling a running scan, full uninstall), read [DISABLE.md](DISABLE.md).
+
+### Authorization before enrollment
+
+Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
+
+Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment. Missing authority or agent, denial, cancellation and expired approval refuse enrollment. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
+
+The daemon enforces this rule. Restart into the updated daemon after upgrading; a new client with an older running daemon does not provide this protection. Older clients can meet the new dialog but retain their shorter reply timeout.

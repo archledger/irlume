@@ -15,6 +15,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Clear previous authentication hints when a new request is refused during setup,
+  so missing enrollment cannot prompt the user to look at the camera.
+
 - Require the complete RGB PAD vote before authentication and enrollment admission.
 
 ## [0.11.3] - 2026-08-29

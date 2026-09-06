@@ -129,6 +129,13 @@ profile irlumed /usr/local/bin/irlumed {
   /etc/irlume/*.lock rwk,
   /home/*/.local/share/irlume/ rw,
   /home/*/.local/share/irlume/** rw,
+  # Retry accounting verifies its fixed ancestors, reads the boot identity,
+  # and flocks the private directory inode before publishing account records.
+  / r,
+  /var/ r,
+  /var/lib/ r,
+  /proc/sys/kernel/random/boot_id r,
+  /var/lib/irlume/retry/ rwk,
   /var/lib/irlume/ rw,
   /var/lib/irlume/** rw,
 

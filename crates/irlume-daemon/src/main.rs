@@ -62,6 +62,7 @@ mod diagnostics;
 mod enrollment_authorization;
 mod enrollment_session;
 mod position_session;
+mod retry_throttle;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -1109,96 +1110,33 @@ fn main() {
     // The accept loop above only ends if the listener dies; nothing to join.
 }
 
-// ---------------------------------------------------------------------------
-// Consecutive-failure throttle (NIST SP 800-63B-4 s3.2.3 intent).
-//
-// After a run of failed face attempts, stop firing the camera on the gesture
-// for a short cooldown and let PAM fall straight to the password. Deliberately
-// a THROTTLE, not a hard biometric-disable: irlume's password is always the
-// fallback and there is no account lockout, so the standard's disable-and-
-// offer-another-factor tier would only add friction (the "other factor" that
-// re-enables face IS the password the throttled user is already typing). Every
-// platform (Face ID, Android, Windows Hello) also uses ~5 fails then falls to a
-// non-biometric factor. State is per-user and in-memory only; a daemon restart
-// clears it (there is nothing to protect on disk since the password is the
-// floor). Tunable/testable via env; 0 strikes disables the throttle.
-// ---------------------------------------------------------------------------
-#[derive(Default)]
-struct FailState {
-    strikes: u32,
-    cooldown_until: Option<std::time::Instant>,
+/// A retry-state error is an ordinary refusal, never a gesture abort. The same
+/// completion boundary guards both verification and sealed-password release.
+fn recorded_face_response(
+    record: impl FnOnce() -> Result<(), &'static str>,
+    refuse: fn(&str) -> Response,
+    complete: impl FnOnce() -> Response,
+) -> Response {
+    match record() {
+        Ok(()) => complete(),
+        Err(reason) => refuse(reason),
+    }
 }
 
-fn rate_state() -> &'static std::sync::Mutex<std::collections::HashMap<String, FailState>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, FailState>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn retry_verify_refusal(reason: &str) -> Response {
+    Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: reason.into(),
+        declined_by_gesture: false,
+        refused_by_policy: true,
+        situation: String::new(),
+    }
 }
 
-fn rate_max_strikes() -> u32 {
-    env_or("IRLUME_RATE_LIMIT", "5").parse().unwrap_or(5)
-}
-
-fn rate_cooldown() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        env_or("IRLUME_RATE_COOLDOWN_SECS", "30")
-            .parse()
-            .unwrap_or(30),
-    )
-}
-
-/// True when `user` is in a cooldown window: skip the camera and fall to the
-/// password. Clears an expired window as a side effect.
-fn rate_limited(user: &str) -> bool {
-    if rate_max_strikes() == 0 {
-        return false;
-    }
-    let mut map = rate_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = map.get_mut(user) {
-        if let Some(until) = s.cooldown_until {
-            if std::time::Instant::now() < until {
-                return true;
-            }
-            s.cooldown_until = None;
-            s.strikes = 0;
-        }
-    }
-    false
-}
-
-/// Record a face attempt's outcome. A grant resets the user; a rejected real
-/// presentation is a strike, and `rate_max_strikes()` of them starts a cooldown.
-/// `faced` is the *strike-worthy* signal: it must be true for a genuine failed
-/// presentation, which includes a hard spoof rejection (those return
-/// `live=false, score=0`, so an earlier `live || score>0` test never struck on
-/// the actual attack it is meant to throttle). Callers pass
-/// `!presence_retryable(&outcome)`: false only for the retryable no-face /
-/// uncertain-liveness outcomes (nobody in frame, walk-away, transient
-/// uncertainty), which must never count against the user.
-fn rate_record(user: &str, granted: bool, faced: bool) {
-    if rate_max_strikes() == 0 {
-        return;
-    }
-    let mut map = rate_state().lock().unwrap_or_else(|e| e.into_inner());
-    let s = map.entry(user.to_string()).or_default();
-    if granted {
-        s.strikes = 0;
-        s.cooldown_until = None;
-        return;
-    }
-    if !faced {
-        return;
-    }
-    s.strikes += 1;
-    if s.strikes >= rate_max_strikes() {
-        s.cooldown_until = Some(std::time::Instant::now() + rate_cooldown());
-        s.strikes = 0;
-        eprintln!(
-            "irlumed: '{user}' hit {} consecutive face failures; face throttled for {}s (password still works)",
-            rate_max_strikes(),
-            rate_cooldown().as_secs()
-        );
-    }
+fn retry_unseal_refusal(reason: &str) -> Response {
+    Response::Error(reason.into())
 }
 
 /// Minimum interval in seconds between unprivileged camera probes. Two seconds
@@ -4465,70 +4403,65 @@ fn dispatch_scoped_session(
                 }
             }
             // Too many recent failures: don't fire the camera, fall to password.
-            if rate_limited(&user) {
-                return Response::AuthResult {
-                    granted: false,
-                    score: 0.0,
-                    live: false,
-                    reason: "too many recent face attempts; use your password".into(),
-                    declined_by_gesture: false,
-                    refused_by_policy: true,
-                    situation: String::new(),
-                };
+            if let Err(reason) = retry_throttle::check(&user) {
+                return retry_verify_refusal(reason);
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
             match engine.authenticate_with_diagnostics(&user, service.as_deref(), scope) {
-                Ok(o) => {
-                    rate_record(&user, o.granted, !irlume_auth::presence_retryable(&o));
-                    if convenience || irlume_common::dbglog::on() {
-                        // Denied score + reason measurements quantized/redacted
-                        // unless tracing (anti-oracle); grants log exact.
-                        let (score, reason) = if o.granted {
-                            (format!("{:.3}", o.score), o.reason.clone())
-                        } else {
-                            (deny_score(o.score), deny_reason(&o.reason))
-                        };
-                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
+                Ok(o) => recorded_face_response(
+                    || retry_throttle::record(&user, &o),
+                    retry_verify_refusal,
+                    || {
+                        if convenience || irlume_common::dbglog::on() {
+                            // Denied score + reason measurements quantized/redacted
+                            // unless tracing (anti-oracle); grants log exact.
+                            let (score, reason) = if o.granted {
+                                (format!("{:.3}", o.score), o.reason.clone())
+                            } else {
+                                (deny_score(o.score), deny_reason(&o.reason))
+                            };
+                            eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
                             o.granted, o.live);
-                    }
-                    irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
-                    Response::AuthResult {
-                        granted: o.granted,
-                        score: o.score,
-                        live: o.live,
-                        // The ONE site that carries the engine outcome onto the wire:
-                        // a deliberate head-shake becomes the flag pam_irlume aborts a
-                        // polkit dialog on, and only it. Every other outcome kind, and
-                        // every policy early-return above, is false. `is_gesture_decline`
-                        // and the shared `gesture_declined` constructor are unit-tested
-                        // (a revert of the shake kind to OtherDeny fails there), but this
-                        // call site itself, and the live detection path shake ->
-                        // gesture_declined, are covered ONLY by the hardware gesture test:
-                        // nothing camera-less forces a GestureDeclined outcome through
-                        // dispatch, so a `false` slip here would pass the suite (see the
-                        // handoff's coverage gap). Evaluated before the `reason` move: it
-                        // borrows `o`, the move does not.
-                        declined_by_gesture: irlume_auth::is_gesture_decline(&o),
-                        // This arm carries an ENGINE verdict: a face was looked
-                        // at (or looked for). The policy refusals return above,
-                        // before the camera.
-                        refused_by_policy: false,
-                        // #616 step 3: the final failed attempt's situation,
-                        // in the stable journal vocabulary, for pam's action
-                        // wording; empty on a grant and on every pre-camera
-                        // refusal (they send `situation: String::new()`).
-                        situation: if o.granted {
-                            String::new()
-                        } else {
-                            engine
-                                .last_attempt_situation_label()
-                                .unwrap_or_default()
-                                .to_string()
-                        },
-                        reason: o.reason,
-                    }
-                }
+                        }
+                        irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
+                        Response::AuthResult {
+                            granted: o.granted,
+                            score: o.score,
+                            live: o.live,
+                            // The ONE site that carries the engine outcome onto the wire:
+                            // a deliberate head-shake becomes the flag pam_irlume aborts a
+                            // polkit dialog on, and only it. Every other outcome kind, and
+                            // every policy early-return above, is false. `is_gesture_decline`
+                            // and the shared `gesture_declined` constructor are unit-tested
+                            // (a revert of the shake kind to OtherDeny fails there), but this
+                            // call site itself, and the live detection path shake ->
+                            // gesture_declined, are covered ONLY by the hardware gesture test:
+                            // nothing camera-less forces a GestureDeclined outcome through
+                            // dispatch, so a `false` slip here would pass the suite (see the
+                            // handoff's coverage gap). Evaluated before the `reason` move: it
+                            // borrows `o`, the move does not.
+                            declined_by_gesture: irlume_auth::is_gesture_decline(&o),
+                            // This arm carries an ENGINE verdict: a face was looked
+                            // at (or looked for). The policy refusals return above,
+                            // before the camera.
+                            refused_by_policy: false,
+                            // #616 step 3: the final failed attempt's situation,
+                            // in the stable journal vocabulary, for pam's action
+                            // wording; empty on a grant and on every pre-camera
+                            // refusal (they send `situation: String::new()`).
+                            situation: if o.granted {
+                                String::new()
+                            } else {
+                                engine
+                                    .last_attempt_situation_label()
+                                    .unwrap_or_default()
+                                    .to_string()
+                            },
+                            reason: o.reason.clone(),
+                        }
+                    },
+                ),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -5495,8 +5428,8 @@ fn do_unseal_password_scoped(
     }
     // Same failure throttle as the login/sudo path: after a run of failures,
     // skip the camera and let PAM fall to the password.
-    if rate_limited(user) {
-        return Response::Error("too many recent face attempts; use your password".into());
+    if let Err(reason) = retry_throttle::check(user) {
+        return retry_unseal_refusal(reason);
     }
     let outcome = match engine.authenticate_for_with_diagnostics(
         user,
@@ -5520,11 +5453,18 @@ fn do_unseal_password_scoped(
             return Response::Error(e.to_string());
         }
     };
-    rate_record(
-        user,
-        outcome.granted,
-        !irlume_auth::presence_retryable(&outcome),
-    );
+    recorded_face_response(
+        || retry_throttle::record(user, &outcome),
+        retry_unseal_refusal,
+        || finish_unseal_password(user, &outcome, t),
+    )
+}
+
+fn finish_unseal_password(
+    user: &str,
+    outcome: &irlume_auth::Outcome,
+    t: std::time::Instant,
+) -> Response {
     if !outcome.granted {
         // Denied-attempt scores are QUANTIZED to one decimal unless tracing is
         // on: a 4-decimal score after every try is a gradient a journal-reading
@@ -6496,9 +6436,17 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 7] = [
+        let sources: [(&str, &str); 8] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
+            (
+                "retry_throttle.rs",
+                concat!(
+                    include_str!("retry_throttle.rs"),
+                    "\n",
+                    include_str!("retry_throttle/tests.rs")
+                ),
+            ),
             ("arbiter.rs", include_str!("arbiter.rs")),
             ("position_session.rs", include_str!("position_session.rs")),
             (
@@ -6519,6 +6467,9 @@ mod tests {
             "pregate(",
             "authorized_for(",
             "uid_of(",
+            "retry_throttle::check(",
+            "retry_throttle::record(",
+            "account(",
             "uid_for_name(",
             "name_for_uid(",
             "identify_scope(",
@@ -8835,54 +8786,6 @@ mod tests {
     }
 
     #[test]
-    fn rate_throttle_trips_after_the_limit_and_resets_on_grant() {
-        let _g = env_lock();
-        std::env::set_var("IRLUME_RATE_LIMIT", "3");
-        std::env::set_var("IRLUME_RATE_COOLDOWN_SECS", "30");
-        // Unique user so the process-global map does not bleed across tests.
-        let u = format!("throttle-{}", std::process::id());
-
-        // Below the limit: strikes accumulate, not yet throttled.
-        assert!(!rate_limited(&u));
-        rate_record(&u, false, true); // strike 1
-        rate_record(&u, false, true); // strike 2
-        assert!(!rate_limited(&u), "under the limit must not throttle");
-        rate_record(&u, false, true); // strike 3 -> cooldown
-        assert!(rate_limited(&u), "at the limit the user is throttled");
-
-        // No-face outcomes (nobody in frame) never count: fresh user stays open
-        // even after many of them.
-        let u2 = format!("noface-{}", std::process::id());
-        for _ in 0..10 {
-            rate_record(&u2, false, false);
-        }
-        assert!(!rate_limited(&u2), "absence must not throttle");
-
-        // A grant clears the throttle immediately.
-        let u3 = format!("grant-{}", std::process::id());
-        rate_record(&u3, false, true);
-        rate_record(&u3, false, true);
-        rate_record(&u3, false, true);
-        assert!(rate_limited(&u3));
-        rate_record(&u3, true, true);
-        assert!(!rate_limited(&u3), "a grant resets the throttle");
-
-        // Limit of 0 disables the throttle entirely.
-        std::env::set_var("IRLUME_RATE_LIMIT", "0");
-        let u4 = format!("disabled-{}", std::process::id());
-        for _ in 0..20 {
-            rate_record(&u4, false, true);
-        }
-        assert!(
-            !rate_limited(&u4),
-            "IRLUME_RATE_LIMIT=0 disables the throttle"
-        );
-
-        std::env::remove_var("IRLUME_RATE_LIMIT");
-        std::env::remove_var("IRLUME_RATE_COOLDOWN_SECS");
-    }
-
-    #[test]
     fn env_or_prefers_the_env_var_over_the_default() {
         let _g = env_lock();
         std::env::remove_var("IRLUME_TEST_ENV_OR");
@@ -9660,6 +9563,7 @@ mod tests {
     #[test]
     fn authenticate_refuses_an_unenrolled_user_before_the_camera() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         let sb = sandbox("auth-ghost");
         let _ = &sb;
@@ -9668,7 +9572,7 @@ mod tests {
         // capture (the devices don't exist, so reaching the camera would error).
         match dispatch(
             Request::Authenticate {
-                user: "irlume-test-ghost".into(),
+                user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
             },
@@ -9682,7 +9586,7 @@ mod tests {
                 ..
             } => {
                 assert!(!granted && !live);
-                assert_eq!(reason, "'irlume-test-ghost' is not enrolled");
+                assert_eq!(reason, format!("'{user}' is not enrolled"));
                 // The reason must survive journal redaction unchanged (no
                 // numeric payload for a spoofer to tune against).
                 assert_eq!(deny_reason(&reason), reason);
@@ -9694,12 +9598,13 @@ mod tests {
     #[test]
     fn authenticate_surfaces_a_capture_error_for_an_enrolled_user() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         let sb = sandbox("auth-cam");
-        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
         match dispatch(
             Request::Authenticate {
-                user: "carol".into(),
+                user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
             },
@@ -10838,31 +10743,32 @@ mod tests {
     #[test]
     fn do_unseal_password_requires_an_armed_seal_then_a_granted_face() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         let sb = sandbox("do-unseal");
         // Nothing armed: refused before any capture or TPM traffic.
-        match do_unseal_password("carol", None, &mut e) {
+        match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => {
                 assert_eq!(
                     msg,
-                    "no sealed password for 'carol': run `irlume keyring arm`"
+                    format!("no sealed password for '{user}': run `irlume keyring arm`")
                 )
             }
             other => panic!("unarmed unseal must be refused, got {other:?}"),
         }
         // Armed (existence check only) but the user is not enrolled: the face
         // check denies before the camera and the envelope is never opened.
-        plant_fake_envelope("carol");
-        match do_unseal_password("carol", None, &mut e) {
+        plant_fake_envelope(&user);
+        match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => {
-                assert_eq!(msg, "face not granted: 'carol' is not enrolled")
+                assert_eq!(msg, format!("face not granted: '{user}' is not enrolled"))
             }
             other => panic!("unenrolled unseal must be refused, got {other:?}"),
         }
         // Enrolled: the capture itself fails on this hardware and maps to a
         // clean Error (the non-drift branch: no remedy hint appended).
-        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
-        match do_unseal_password("carol", None, &mut e) {
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
+        match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
         }

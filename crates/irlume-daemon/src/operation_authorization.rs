@@ -41,6 +41,10 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
         Request::AddScan { .. } | Request::EnrollmentSession { improve: true, .. } => {
             (ACTION, "add face scans")
         }
+        // Either operation can remove the final profile and retire recovery.
+        // Authorize before queue admission, without a racy storage preflight.
+        Request::DeleteProfile { .. } => (ACTION, "delete a face profile"),
+        Request::ForgetRecognizer { .. } => (ACTION, "remove a recognizer's face data"),
         Request::RecoverySetup { .. } => (
             "org.irlume.recovery-manage",
             "set or replace the recovery passphrase",
@@ -399,6 +403,87 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_removal_requires_bound_approval_but_scan_edits_do_not() {
+        let _passwd = crate::tests::passwd_lock();
+        let caller = peer();
+        let user = crate::users::name_for_uid(caller.uid).unwrap();
+        let owner = Peer {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
+        let root = Peer {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for (req, changed, operation) in [
+            (
+                Request::DeleteProfile {
+                    user: user.clone(),
+                    profile: "primary".into(),
+                },
+                Request::DeleteProfile {
+                    user: user.clone(),
+                    profile: "other".into(),
+                },
+                "delete a face profile",
+            ),
+            (
+                Request::ForgetRecognizer {
+                    user: user.clone(),
+                    space: "embed:one".into(),
+                },
+                Request::ForgetRecognizer {
+                    user: user.clone(),
+                    space: "embed:two".into(),
+                },
+                "remove a recognizer's face data",
+            ),
+        ] {
+            assert!(
+                required(&req, &owner),
+                "removal can retire the recovery envelope"
+            );
+            assert!(!required(&req, &root), "root retains administration");
+            let subject = Subject::capture(&caller).unwrap();
+            let message = approval_message(":1.42", &subject, &req).unwrap();
+            type Args = (
+                (String, PropMap),
+                String,
+                HashMap<String, String>,
+                u32,
+                String,
+            );
+            let (_, action, details, flags, _): Args = message.read_all().unwrap();
+            assert_eq!(action, "org.irlume.enroll");
+            assert_eq!(details["operation"], operation);
+            assert_eq!(flags, 1);
+            let grant = || Grant {
+                subject: Subject::capture(&caller).unwrap(),
+                request: request_binding(&req).unwrap(),
+                approved: Instant::now(),
+            };
+            grant().consume(&req, &caller).unwrap();
+            assert!(grant().consume(&changed, &caller).is_err());
+        }
+        for req in [
+            Request::DeleteScan {
+                user: user.clone(),
+                profile: "primary".into(),
+                scan: "one".into(),
+            },
+            Request::RenameProfile {
+                user,
+                profile: "primary".into(),
+                new_name: "renamed".into(),
+            },
+        ] {
+            assert!(!required(&req, &owner));
+        }
+    }
+
+    #[test]
     fn recovery_management_requires_approval_but_restore_and_status_do_not() {
         let owner = Peer {
             uid: 1000,
@@ -680,32 +765,45 @@ mod tests {
     #[test]
     fn real_dbus_exchange_checks_subject_action_denial_and_cancellation() {
         let _passwd = crate::tests::passwd_lock();
-        for (mode, recovery) in ["allow", "deny", "malformed", "cancel", "forged"]
+        for (mode, kind) in ["allow", "deny", "malformed", "cancel", "forged"]
             .into_iter()
-            .flat_map(|mode| [(mode, false), (mode, true)])
+            .flat_map(|mode| {
+                ["enroll", "recovery", "profile", "recognizer"].map(|kind| (mode, kind))
+            })
         {
             let (_bus, address) = bus();
             let server = dbus::blocking::Connection::new_address(&address).unwrap();
             server.request_name(AUTHORITY, false, true, false).unwrap();
             let client = dbus::blocking::Connection::new_address(&address).unwrap();
             let peer = peer();
-            let req = if recovery {
-                Request::RecoverySetup {
-                    user: crate::users::name_for_uid(peer.uid).unwrap(),
-                    passphrase: SecretBytes::new(b"synthetic phrase".to_vec()),
-                }
-            } else {
-                request(&peer)
-            };
-            let expected_action = if recovery {
-                "org.irlume.recovery-manage"
-            } else {
-                "org.irlume.enroll"
-            };
-            let expected_operation = if recovery {
-                "set or replace the recovery passphrase"
-            } else {
-                "enroll a face"
+            let user = crate::users::name_for_uid(peer.uid).unwrap();
+            let (req, expected_action, expected_operation) = match kind {
+                "recovery" => (
+                    Request::RecoverySetup {
+                        user,
+                        passphrase: SecretBytes::new(b"synthetic phrase".to_vec()),
+                    },
+                    "org.irlume.recovery-manage",
+                    "set or replace the recovery passphrase",
+                ),
+                "profile" => (
+                    Request::DeleteProfile {
+                        user,
+                        profile: "primary".into(),
+                    },
+                    "org.irlume.enroll",
+                    "delete a face profile",
+                ),
+                "recognizer" => (
+                    Request::ForgetRecognizer {
+                        user,
+                        space: "embed:synthetic".into(),
+                    },
+                    "org.irlume.enroll",
+                    "remove a recognizer's face data",
+                ),
+                "enroll" => (request(&peer), "org.irlume.enroll", "enroll a face"),
+                _ => unreachable!(),
             };
             let subject = Subject::capture(&peer).unwrap();
             let expected = (subject.pid, subject.uid, subject.start);

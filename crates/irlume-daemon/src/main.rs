@@ -7456,6 +7456,14 @@ mod tests {
                 passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
             },
             Request::RecoveryForget { user: user.into() },
+            Request::DeleteProfile {
+                user: user.into(),
+                profile: "primary".into(),
+            },
+            Request::ForgetRecognizer {
+                user: user.into(),
+                space: "embed:synthetic".into(),
+            },
         ] {
             let (mut client, server) = UnixStream::pair().unwrap();
             client
@@ -8189,6 +8197,14 @@ mod tests {
                 passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
             },
             Request::RecoveryForget { user: user.into() },
+            Request::DeleteProfile {
+                user: user.into(),
+                profile: "primary".into(),
+            },
+            Request::ForgetRecognizer {
+                user: user.into(),
+                space: "embed:synthetic".into(),
+            },
         ] {
             publish_enrollment_summary(
                 user,
@@ -10987,6 +11003,73 @@ mod tests {
                 )
             }
             other => panic!("empty reseal must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrollment_removal_preserves_all_state_until_approved_then_retires_recovery() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("removal-authorization");
+        // Bind approvals to the live test process, as production does.
+        // SAFETY: credential getters have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let owner = Peer {
+            uid,
+            gid,
+            pid: std::process::id() as i32,
+        };
+        let user = users::name_for_uid(uid).unwrap();
+        for request in [
+            Request::DeleteProfile {
+                user: user.clone(),
+                profile: "Face Profile 1".into(),
+            },
+            Request::ForgetRecognizer {
+                user: user.clone(),
+                space: "embed:synthetic-removal".into(),
+            },
+        ] {
+            let mut enrollment = enrollment_with(&user, &["Face Scan 1"]);
+            enrollment.profiles[0].scans[0].embed_space = Some("embed:synthetic-removal".into());
+            write_enrollment(&sb.dir, &enrollment);
+            let paths = [
+                irlume_core::storage::profile_path(&user),
+                irlume_core::template_key::key_path(&user),
+                irlume_core::template_key::recovery_path(&user),
+            ];
+            // Deletion should unlink these files without trying to unseal.
+            // The plaintext enrollment and sentinels contain no real face data.
+            for path in &paths[1..] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"synthetic teardown sentinel").unwrap();
+            }
+            let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+            let other = peer(if uid == NOBODY { 1 } else { NOBODY });
+            assert!(matches!(
+                dispatch(request.clone(), &other, &mut e),
+                Response::Error(_)
+            ));
+            if uid != 0 {
+                assert!(matches!(dispatch(request.clone(), &owner, &mut e),
+                    Response::Error(ref message) if message == operation_authorization::REFUSED));
+            }
+            for (path, bytes) in paths.iter().zip(&before) {
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            }
+            let (_client, server) = UnixStream::pair().unwrap();
+            let grant =
+                operation_authorization::authorize_for_test(&request, &owner, &server).unwrap();
+            let diagnostic = diagnostics::DiagnosticState::default();
+            let scope = diagnostic.begin(diagnostic_operation_class(&request));
+            assert!(matches!(
+                dispatch_scoped(request, &owner, &mut e, &scope, grant),
+                Response::Ok(_)
+            ));
+            assert!(
+                paths.iter().all(|p| !p.exists()),
+                "approved teardown must retire all three files"
+            );
         }
     }
 

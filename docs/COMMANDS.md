@@ -116,6 +116,16 @@ IRLUME_DEV=1 irlume gesturecap replay nod.jsonl
 
 Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
 
+Removing a whole profile (`profiles delete --profile ...` without `--scan`) or
+a recognizer's face data (`profiles forget-model`) also requires the
+`org.irlume.enroll` approval, including the TUI and direct socket clients.
+Removing the final profile retires its template key and recovery passphrase.
+Denied or cancelled approval leaves the enrollment and recovery files unchanged.
+Deleting individual scans and renaming profiles/scans keep their existing behavior;
+a profile's final scan cannot be deleted individually. Root retains administrative
+access. These approval checks require the updated daemon; an older daemon does not
+enforce them even when called by a newer client.
+
 Setting, replacing or erasing a recovery passphrase (`recovery setup` and
 `recovery forget`) also requires OS authorization for non-root users, including
 TUI and direct socket requests. The dialog identifies the account and operation;
@@ -133,6 +143,6 @@ Older clients can use the new daemon with an available authorization agent;
 older daemons, including after a binary rollback, do not enforce this new gate.
 Rollback leaves recovery envelopes and retry records intact.
 
-Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment. Missing authority or agent, denial, cancellation and expired approval refuse enrollment. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
+Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment or profile/model removal. Missing authority or agent, denial, cancellation and expired approval refuse the operation. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
 
 The daemon enforces this rule. Restart into the updated daemon after upgrading; a new client with an older running daemon does not provide this protection. Older clients can meet the new dialog but retain their shorter reply timeout.

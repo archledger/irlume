@@ -307,13 +307,22 @@ impl Store {
         if policy.limit == 0 {
             return Ok(());
         }
-        // No fresh record or write solely for absence, uncertainty or cancellation.
-        // Preflight already validated the store. An explicit cancellation remains final.
-        if !outcome.granted
-            && (irlume_auth::presence_retryable(outcome)
-                || irlume_auth::is_gesture_decline(outcome))
-        {
-            return Ok(());
+        // Capture retryability and account strikes are separate decisions:
+        // setup failures are terminal but must not spend or replenish history.
+        // Keep this exhaustive so every new outcome needs an accounting choice.
+        if !outcome.granted {
+            use irlume_auth::OutcomeKind;
+            match outcome.kind {
+                OutcomeKind::NoFace
+                | OutcomeKind::Uncertain
+                | OutcomeKind::SpoofNoIrFace
+                | OutcomeKind::GestureDeclined
+                | OutcomeKind::SetupUnavailable => return Ok(()),
+                OutcomeKind::Granted
+                | OutcomeKind::Spoof
+                | OutcomeKind::BelowThreshold
+                | OutcomeKind::OtherDeny => (),
+            }
         }
         let now = clock()?;
         if !valid_boot(&now.boot) {

@@ -9622,6 +9622,108 @@ mod tests {
     }
 
     #[test]
+    fn setup_refusals_preserve_verify_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(false);
+    }
+
+    #[test]
+    fn setup_refusals_preserve_unseal_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(true);
+    }
+
+    // Runs under the callers' environment lock, using the real engine and
+    // persistent store. Only camera devices and enrolled data are fixtures.
+    fn setup_refusals_preserve_retry_history(unseal: bool) {
+        let user = users::name_for_uid(0).expect("root NSS account");
+        let mut e = engine();
+        for prior_rejection in [false, true] {
+            let sb = sandbox("setup-retry");
+            plant_fake_envelope(&user);
+            let record = sb.dir.join("retry/0.json");
+            if prior_rejection {
+                retry_throttle::record(
+                    &user,
+                    &irlume_auth::Outcome {
+                        granted: false,
+                        live: true,
+                        score: 0.1,
+                        reason: "synthetic rejected match".into(),
+                        kind: irlume_auth::OutcomeKind::BelowThreshold,
+                    },
+                )
+                .unwrap();
+            }
+            let read_history = || match std::fs::read(&record) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("retry history read failed: {error}"),
+            };
+            let before = read_history();
+            for _ in 0..6 {
+                let response = if unseal {
+                    do_unseal_password(&user, None, &mut e)
+                } else {
+                    dispatch(
+                        Request::Authenticate {
+                            user: user.clone(),
+                            service: Some("kde".into()),
+                            intent_confirmation: None,
+                        },
+                        &peer(0),
+                        &mut e,
+                    )
+                };
+                match response {
+                    Response::AuthResult {
+                        granted,
+                        live,
+                        declined_by_gesture,
+                        reason,
+                        ..
+                    } if !unseal => {
+                        assert!(!granted && !live && !declined_by_gesture);
+                        assert_eq!(reason, format!("'{user}' is not enrolled"));
+                    }
+                    Response::Error(reason) if unseal => {
+                        assert_eq!(
+                            reason,
+                            format!("face not granted: '{user}' is not enrolled")
+                        );
+                    }
+                    other => panic!("setup must remain a terminal refusal: {other:?}"),
+                }
+                assert_eq!(
+                    read_history(),
+                    before,
+                    "setup refusal must neither create nor change retry history"
+                );
+            }
+            // Repairing enrollment reaches the missing-camera boundary. It
+            // must not replenish the account's prior face retry budget.
+            write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
+            let response = if unseal {
+                do_unseal_password(&user, None, &mut e)
+            } else {
+                dispatch(
+                    Request::Authenticate {
+                        user: user.clone(),
+                        service: Some("kde".into()),
+                        intent_confirmation: None,
+                    },
+                    &peer(0),
+                    &mut e,
+                )
+            };
+            assert!(
+                matches!(response, Response::Error(ref reason) if reason.contains("no camera found"))
+            );
+            assert_eq!(read_history(), before);
+        }
+    }
+
+    #[test]
     fn authenticate_surfaces_a_capture_error_for_an_enrolled_user() {
         let _g = env_lock();
         let user = users::name_for_uid(0).expect("root NSS account");

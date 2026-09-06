@@ -255,6 +255,9 @@ pub enum OutcomeKind {
     /// The authentication deadline expired before complete evidence could be
     /// accepted. Terminal and non-retryable, with password fallback guidance.
     DeadlineExpired,
+    /// Required PAD evidence could not be evaluated, or the IR format cannot
+    /// support exposure measurement. Terminal; keeps existing retry accounting.
+    RuntimeUnavailable,
     /// Every other refusal: pre-camera policy/state denials, camera-binding
     /// mismatches, challenge-gate failures.
     OtherDeny,
@@ -363,6 +366,7 @@ fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttemptSituation {
     TimedOut,
+    Unavailable,
     NoFace,
     TooFar,
     OffCenter,
@@ -381,6 +385,7 @@ enum AttemptSituation {
 const fn attempt_situation_label(situation: AttemptSituation) -> &'static str {
     match situation {
         AttemptSituation::TimedOut => "timed out",
+        AttemptSituation::Unavailable => "unavailable",
         AttemptSituation::NoFace => "no face",
         AttemptSituation::TooFar => "too far",
         AttemptSituation::OffCenter => "off-center",
@@ -423,8 +428,8 @@ impl AttemptFacts {
     }
 }
 
-/// Classify one failed attempt. A terminal deadline takes precedence over
-/// framing facts, which remain available in the debug line. Otherwise,
+/// Classify one failed attempt. Deadlines and unavailable evidence take
+/// precedence over framing facts, which remain in the debug line. Otherwise,
 /// precedence mirrors the framing guide's
 /// severity order, usability situations first, so a genuine user's #617
 /// shape (a Spoof verdict on a turned head) reads `looking away` rather
@@ -433,6 +438,9 @@ impl AttemptFacts {
 fn auth_attempt_situation(kind: OutcomeKind, f: &AttemptFacts) -> AttemptSituation {
     if kind == OutcomeKind::DeadlineExpired {
         return AttemptSituation::TimedOut;
+    }
+    if kind == OutcomeKind::RuntimeUnavailable {
+        return AttemptSituation::Unavailable;
     }
     if kind == OutcomeKind::GestureDeclined {
         return AttemptSituation::Declined;
@@ -1198,10 +1206,10 @@ fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
         // retries. An unmeasurable IR format is neither: it is a property of
         // the camera that will hold for every frame, so retrying spends the
         // whole window to reach the same answer while telling the user to
-        // adjust something that cannot help (#358). OtherDeny is the
-        // non-retryable class for a state refusal like this.
+        // adjust something that cannot help (#358). Report unavailable,
+        // preserving terminal fallback and the existing account strike.
         Verdict::Uncertain if reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX) => {
-            OutcomeKind::OtherDeny
+            OutcomeKind::RuntimeUnavailable
         }
         Verdict::Uncertain => OutcomeKind::Uncertain,
         Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
@@ -1397,7 +1405,7 @@ fn pad_evidence_refusal(modality: PadModality, evidence: PadEvidence) -> Option<
         }
         PadEvidence::Score(_) => return None,
     };
-    Some(Outcome::deny(OutcomeKind::OtherDeny, reason))
+    Some(Outcome::deny(OutcomeKind::RuntimeUnavailable, reason))
 }
 
 fn pad_policy_refusal(
@@ -8670,7 +8678,7 @@ mod tests {
         let kind = liveness_deny_kind(verdict, &reason);
         assert_eq!(
             kind,
-            OutcomeKind::OtherDeny,
+            OutcomeKind::RuntimeUnavailable,
             "must leave the retryable class"
         );
         assert!(
@@ -8701,7 +8709,7 @@ mod tests {
             "the dark evaluator stopped producing the pinned prefix: {dr}"
         );
         let dk = liveness_deny_kind(dv, &dr);
-        assert_eq!(dk, OutcomeKind::OtherDeny, "{dr}");
+        assert_eq!(dk, OutcomeKind::RuntimeUnavailable, "{dr}");
         assert!(!presence_retryable(&denied(dk, &dr, false)), "{dr}");
 
         // And the dark path's ordinary refusals stay exactly as they were, so
@@ -10539,11 +10547,67 @@ mod pad_cue_tests {
     use irlume_liveness::Verdict;
 
     #[test]
+    fn runtime_failure_situations_override_framing() {
+        use super::{attempt_situation_label, auth_attempt_situation, AttemptFacts};
+        let facts = [
+            AttemptFacts::default(),
+            AttemptFacts {
+                rgb_face: Some((0.9, 0.9)),
+                face_frac: 0.2,
+                rgb_face_brightness: 150.0,
+                ..Default::default()
+            },
+            AttemptFacts {
+                rgb_face: Some((0.5, 0.5)),
+                face_frac: 0.2,
+                rgb_face_brightness: 150.0,
+                glint: Some(0.0),
+                ..Default::default()
+            },
+        ];
+        let mut kinds = Vec::new();
+        for modality in [PadModality::Rgb, PadModality::Ir] {
+            for evidence in [
+                PadEvidence::Unavailable,
+                PadEvidence::InferenceFailed,
+                PadEvidence::NotApplicable,
+            ] {
+                let out = pad_evidence_refusal(modality, evidence).unwrap();
+                assert!(!out.granted && !out.live);
+                assert_eq!(out.score, 0.0);
+                assert!(!super::presence_retryable(&out));
+                assert!(!super::is_gesture_decline(&out));
+                kinds.push(out.kind);
+            }
+        }
+        kinds.push(super::liveness_deny_kind(
+            Verdict::Uncertain,
+            super::EXPOSURE_UNMEASURABLE_PREFIX,
+        ));
+        for kind in kinds {
+            for f in &facts {
+                assert_eq!(
+                    attempt_situation_label(auth_attempt_situation(kind, f)),
+                    "unavailable",
+                    "{kind:?}: {f:?}"
+                );
+            }
+        }
+        // Only the explicit operational refusal overrides these measurements.
+        for (f, expected) in facts.iter().zip(["no face", "off-center", "glint below"]) {
+            assert_eq!(
+                attempt_situation_label(auth_attempt_situation(super::OutcomeKind::OtherDeny, f)),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn applicable_pad_unavailable_is_terminal_password_fallback_not_abstention() {
         let refusal = pad_evidence_refusal(PadModality::Rgb, PadEvidence::Unavailable)
             .expect("required unavailable PAD must refuse face authentication");
 
-        assert_eq!(refusal.kind, super::OutcomeKind::OtherDeny);
+        assert_eq!(refusal.kind, super::OutcomeKind::RuntimeUnavailable);
         assert!(!super::presence_retryable(&refusal));
         assert!(refusal.reason.contains("RGB PAD is unavailable"));
         assert!(refusal.reason.contains("use your password"));
@@ -10605,7 +10669,7 @@ mod pad_cue_tests {
         )
         .expect("required failed PAD inference must refuse face authentication");
 
-        assert_eq!(refusal.kind, super::OutcomeKind::OtherDeny);
+        assert_eq!(refusal.kind, super::OutcomeKind::RuntimeUnavailable);
         assert!(!super::presence_retryable(&refusal));
         assert!(refusal.reason.contains("IR PAD inference failed"));
         assert!(refusal.reason.contains("use your password"));
@@ -11381,7 +11445,9 @@ mod engine_tests {
             let out = e
                 .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
                 .unwrap();
-            assert!(!out.granted);
+            assert!(!out.granted && !out.live);
+            assert_eq!(out.kind, OutcomeKind::RuntimeUnavailable);
+            assert_eq!(out.score, 0.0);
             assert!(!presence_retryable(&out));
             assert!(e.vit_scores.is_empty());
             let deny = e.vit_pad_votes_deny(0.20);

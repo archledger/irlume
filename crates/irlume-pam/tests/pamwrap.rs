@@ -630,7 +630,7 @@ fn pamwrap_empty_input_clears_before_password_fallback() {
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_face_denial_clears_yes_before_password_fallback() {
-    for situation in ["", "timed out"] {
+    for situation in ["", "timed out", "unavailable"] {
         let Some(h) = Harness::try_new("intent-face-denial") else {
             return;
         };
@@ -671,6 +671,12 @@ fn pamwrap_face_denial_clears_yes_before_password_fallback() {
             out.matches("authentication timed out; use your password")
                 .count(),
             usize::from(situation == "timed out"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("face authentication unavailable; use your password")
+                .count(),
+            usize::from(situation == "unavailable"),
             "{out}"
         );
         let requests = log.lock().unwrap();

@@ -50,7 +50,7 @@ echo "==> building universal .deb in $BASE (rustup $RUST_VER)"
     apt-get update -qq
     # clang/libclang-dev: bindgen (v4l2-sys-mit) needs libclang at build time.
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
-        libtss2-dev libpam0g-dev libudev-dev clang libclang-dev git xz-utils >/dev/null
+        libtss2-dev libpam0g-dev libudev-dev libdbus-1-dev dbus-daemon clang libclang-dev git xz-utils >/dev/null
     curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain '"$RUST_VER"' --profile minimal >/dev/null
     . "$HOME/.cargo/env"
     # Pinned nfpm, verified against its published (goreleaser-signed) checksums.

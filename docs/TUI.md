@@ -1,0 +1,122 @@
+# TUI and CLI workflows
+
+Run `irlume tui` as your account. `--user ACCOUNT` selects the same account as
+the CLI; managing another account still requires the existing administrator
+permissions. Read the account name in the header before making changes.
+
+Tab and arrow keys navigate, Enter activates the selected item, and `?` shows
+this screen's shortcuts. `v` reveals technical sections. **F2 opens More actions**
+from any idle screen. Type a task or CLI command to filter the list, use Up/Down
+to select, and Enter to open it. Esc closes the list or cancels a field.
+
+More actions supplies guided fields for less frequent tasks and shows the
+account, effects, and literal command arguments before asking you to run it.
+Blank optional fields use the CLI default; required fields cannot be blank.
+It executes the same running CLI build, then returns to the TUI after you
+press Enter. Commands needing administrator access use sudo; password and
+recovery prompts stay in the command's private terminal input. Fields in the
+menu are never shell commands. Paths beginning with `-` can use a `./` prefix.
+
+## Several people on one account
+
+A profile represents one person. An account supports up to **three people**;
+any enrolled person can authenticate as that account. Scans represent that
+person's appearances or conditions, such as glasses or different lighting.
+Use **Improve Recognition** (`a`) on that person's profile to add scans.
+The current limit is 30 scans per profile for each recognizer.
+
+**Enroll Face** (`e`) also handles a face that is already enrolled:
+
+1. Enter a name to use if this is a new person, or leave it blank for an
+   automatic name. A supplied name must be unused.
+2. Follow the framing guide and initial countdown, then approve the system
+   authorization prompt once for the whole capture operation. Enrollment collects
+   10 scans; Improve Recognition collects 5, subject to the profile's available room.
+3. Watch the continuous scan progress. Quality, liveness and identity checks still
+   apply to each capture; only the initial framing guide and countdown are repeated
+   when starting a new operation.
+4. If the capture matches an existing profile, the TUI names it and asks
+   whether to improve recognition instead of creating another profile. Yes keeps
+   the pending probe and captures the remaining scans. Cancel discards the pending
+   scans. Nothing is saved while this confirmation is open. A target discovered
+   only after later captures also requires confirmation before saving.
+5. If the face does not match an existing profile, enrollment creates a new
+   profile, provided a person slot is available. At three profiles, an existing
+   person can still take the improvement route; a fourth person is refused.
+
+The guided operation uses one connection and has a bounded duration. A merge
+prompt expires after 60 seconds. Cancellation or interruption before the final
+save discards the pending batch. A connection lost after the save can hide the
+success reply; refresh the profile list before starting again.
+
+During an upgrade, an older daemon may reject the new guided request. The TUI
+then warns and uses its older per-scan flow. That flow repeats approval/countdown
+and saves the first matching scan before confirmation; Cancel attempts to remove
+it, and abrupt termination can leave it saved. Update and restart the daemon to
+use the bounded guided flow.
+
+Use F2 for custom scan counts or **Replace face enrollment**. Replacement
+replaces all profiles for the account after successful capture, so it is a
+different task from improving one person's recognition. The review screen
+explains the scope before it runs.
+
+The daemon rejects added scans that match a different enrolled profile.
+This is a check against known profiles, not a guarantee that every unrecognized
+person will be classified correctly. Only the intended person should be in
+view during an enrollment or improvement session.
+
+Selection follows a profile and scan by name when the list refreshes. If that
+item disappears or is renamed elsewhere, selection clears until you choose a
+row again. Mouse selection follows the visible rows even in long, scrolled
+scan lists. Rename and Delete confirmations name their exact target.
+
+## CLI and TUI parity
+
+| CLI task | TUI route |
+|---|---|
+| `setup`, `status`, `detect` | Overview, guided setup and Diagnostics |
+| `doctor`, `diag` | Diagnostics: Full Diagnostics and TPM Diagnostics |
+| `deps`, `version` | F2: runtime dependencies and version |
+| `enroll` | Faces: Enroll Face (`e`); matching faces offer improvement |
+| `enroll --scans`, `enroll --reset` | F2: chosen scan count or Replace face enrollment |
+| `profiles list` | Faces; F2 lists full recognizer tags |
+| `profiles add-scan` | Faces: Improve Recognition (`a`); F2 accepts a chosen scan count |
+| `profiles rename`, `profiles delete` | Faces: select profile/scan, then Rename/Delete; F2 also works without camera navigation |
+| `profiles forget-model`, `profiles eyes-open off` | F2: remove recognizer scans or clear the legacy blocker |
+| `identify` | Overview / Test Recognition |
+| `auth test` | F2: Test authentication for this account; JSON `granted` is the verdict |
+| `keyring arm/status/forget`, `reseal` | Password Wallet |
+| `keyring forget --force` | F2: Forget wallet secret without rekeying; review the consequence carefully |
+| `recovery status/setup/restore/forget` | Recovery; F2 also works with the camera disconnected |
+| `fingerprint status/add/verify/reset/enable/disable` | Fingerprint |
+| `fingerprint enable --fingerprint-only` | F2: Enable fingerprint-only login |
+| `login status/enable/disable` | Login & Apps |
+| `login enable --with-sudo/--with-polkit` | Login & Apps; F2 can apply both together |
+| `login reconcile` | Diagnostics repair or F2: Reconcile login wiring |
+| login preview and `login plan/apply/verify/rollback` | F2: preview, prepared transaction, verification and rollback |
+| `bitwarden status/setup` | Login & Apps: app unlock |
+| `biopolicy`, `credential-release-challenge` | Preferences |
+| `logs`, `logs --since`, `logs -f` | Diagnostics: Show Logs; F2: history window or live follow |
+| `logs debug on/off` | Diagnostics: Toggle Debug Logs (`t`) |
+| `trace record` | Diagnostics: Record Trace (`T`); F2 accepts duration/output |
+| `trace explain` | F2: Explain a recorded trace |
+| `support-report` | Diagnostics: Create Support Report (`s`); F2 accepts output/history |
+| `support-report --probe` | F2: report with camera probe, with explicit review |
+| `camera census`, `camera diagnostics --json`, `camera-mode` | F2: all devices, diagnostics or full qualification; Cameras shows the active summary |
+| `set-cameras`, `ir-setup`, `ir-setup --dry-run` | Cameras: select pair, Set Up Emitter, List Units |
+| `camera-tune` | Cameras: Tune Capture; F2 accepts a chosen round count |
+| `selftest liveness` | Diagnostics: Test Infrared Camera |
+| `selinux status/load` | Diagnostics repair; F2 shows full SELinux status |
+| `update`, `update --check` | Overview: Update; F2: Check for updates |
+| `uninstall`, `uninstall --keep-data` | Overview: Uninstall; F2: uninstall while retaining enrollment data |
+
+JSON contract negotiation and event framing are automation formats, rather
+than separate end-user tasks. Where an operation is machine-only, More actions
+displays that output in the terminal. Developer tools gated by `IRLUME_DEV=1`
+remain CLI-only: they include direct camera access and raw research outputs
+and are outside the normal operator interface.
+
+The standalone authentication test does not exercise PAM or polkit. A
+successful command exit also does not imply its diagnostic verdict passed;
+read the reported verdict. A face failure followed by a successful password
+is password approval, even when the overall system operation succeeds.

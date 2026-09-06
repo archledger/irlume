@@ -18,6 +18,7 @@
   tpm2-tss,
   linux-pam,
   systemd,
+  dbus,
   libxcrypt,
   linuxHeaders,
   fetchurl,
@@ -104,6 +105,7 @@ rustPlatform.buildRustPackage {
   buildInputs = [
     tpm2-tss # tss-esapi links tss2-*
     linux-pam # the PAM cdylib links libpam
+    dbus # system libdbus, maintained by the distribution
     systemd # the udev adapter links libudev
     # irlumed declares #[link(name = "crypt")] for its /etc/shadow fallback.
     # nixpkgs stopped providing libcrypt transitively, and `nix build` failed
@@ -169,6 +171,9 @@ rustPlatform.buildRustPackage {
     # speaks.
     install -Dm0644 schemas/machine-api-v1.schema.json \
       "$out/share/irlume/schemas/machine-api-v1.schema.json"
+
+    install -Dm0644 packaging/polkit/org.irlume.enroll.policy \
+      "$out/share/polkit-1/actions/org.irlume.enroll.policy"
 
     # tmpfiles.d rule for the setgid root:video emitter-lock directory (#542);
     # the NixOS module applies it via systemd.tmpfiles.rules.

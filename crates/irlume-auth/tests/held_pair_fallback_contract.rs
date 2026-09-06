@@ -89,7 +89,7 @@ fn enrollment_fallback_restarts_without_held_sessions() {
         .expect("read auth source");
     let capture = function(
         &source,
-        "    fn capture_scans(",
+        "    fn capture_scans_observed(",
         "\n    fn capture_scan_loop(",
     );
 

@@ -59,6 +59,8 @@ pub(crate) mod test_support {
 
 mod arbiter;
 mod diagnostics;
+mod enrollment_authorization;
+mod enrollment_session;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -857,6 +859,8 @@ fn main() {
                         while let Some(job) = arbiter.take() {
                             note_worker_progress();
                             let Queued {
+                                authorization,
+                                session,
                                 req,
                                 peer,
                                 reply,
@@ -885,7 +889,7 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                dispatch_scoped(req, &peer, &mut engine, &scope)
+                                dispatch_scoped_session(req, &peer, &mut engine, &scope, authorization, session.as_ref())
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
@@ -1433,6 +1437,8 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// the worker, so a client that stops reading stalls its own connection thread
 /// instead of the one thread every login needs.
 struct Queued {
+    authorization: Option<enrollment_authorization::Grant>,
+    session: Option<enrollment_session::Worker>,
     req: Request,
     peer: Peer,
     reply: std::sync::mpsc::Sender<Response>,
@@ -2650,6 +2656,10 @@ fn serve_peer(
                 scope.finish(categorical_outcome(&resp));
                 return respond(stream, &resp);
             }
+            let authorization = match enrollment_authorization::authorize(&req, &peer, &stream) {
+                Ok(grant) => grant,
+                Err(error) => return respond(stream, &Response::Error(error)),
+            };
             let class = arbiter::classify(&req);
             // Status is answered HERE, on the connection's own thread: it is
             // read-only, engine-free, and possibly slow (ListProfiles is a
@@ -2669,10 +2679,19 @@ fn serve_peer(
                     return respond(stream, &resp);
                 }
             }
+            let (session, mut session_connection) =
+                if matches!(req, Request::EnrollmentSession { .. }) {
+                    let (worker, connection) = enrollment_session::channel(arbiter.cancel_token());
+                    (Some(worker), Some(connection))
+                } else {
+                    (None, None)
+                };
             let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
             let (reply, answer) = std::sync::mpsc::channel();
             let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
+                authorization,
+                session,
                 req,
                 peer: peer.clone(),
                 reply,
@@ -2695,10 +2714,26 @@ fn serve_peer(
             // the rest of the budget for an answer nobody will read.
             let deadline = std::time::Instant::now() + WORKER_REPLY_TIMEOUT;
             let resp = loop {
+                if let Some(connection) = &mut session_connection {
+                    if let Err(error) = connection.pump(&stream) {
+                        if link.abandon() {
+                            arbiter.cancel_token().request_stop();
+                        }
+                        return Err(error);
+                    }
+                }
                 match answer.recv_timeout(CLIENT_ALIVE_POLL) {
-                    Ok(resp) => break resp,
+                    Ok(resp) => {
+                        if let Some(connection) = &mut session_connection {
+                            connection.pump(&stream)?;
+                        }
+                        break resp;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if std::time::Instant::now() >= deadline {
+                            if session_connection.is_some() && link.abandon() {
+                                arbiter.cancel_token().request_stop();
+                            }
                             break Response::Error("request did not complete".into());
                         }
                         if peer_gone(&stream) {
@@ -2866,6 +2901,8 @@ enum EnrollmentEffect {
     /// Rewrites the enrollment, or the key material it is sealed under, so the
     /// summary must be dropped before the request runs.
     Mutates,
+    /// Adds trusted templates and requires a per-request OS authorization.
+    AddsTrust,
 }
 
 /// Everything the daemon must know about a request before it runs it.
@@ -2889,14 +2926,13 @@ struct RequestPosture<'a> {
 /// hand-maintained lists, and a `_ => None` arm meant neither the compiler nor
 /// the test that existed to catch exactly that could see the omission.
 fn posture(req: &Request) -> RequestPosture<'_> {
-    use EnrollmentEffect::{Mutates, Reads};
+    use EnrollmentEffect::{AddsTrust, Mutates, Reads};
     use Privilege::{AnyPeer, RootOnly, RootOrTarget};
     use Request::*;
     match req {
         // Storage-only management of one account's enrollment. Same refusal
         // wording ("modify") and same invalidation for all of them.
-        AddScan { user, .. }
-        | DeleteProfile { user, .. }
+        DeleteProfile { user, .. }
         | DeleteScan { user, .. }
         | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
@@ -2906,10 +2942,15 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: Mutates,
         },
-        Enroll { user, .. } => RequestPosture {
+        AddScan { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "modify" },
+            user: Some(user.as_str()),
+            enrollment: AddsTrust,
+        },
+        Enroll { user, .. } | EnrollmentSession { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "enroll" },
             user: Some(user.as_str()),
-            enrollment: Mutates,
+            enrollment: AddsTrust,
         },
         // Recovery counts as a mutation: it changes the key material the
         // enrollment is sealed under.
@@ -3275,7 +3316,7 @@ fn enrollment_mutating_user(req: &Request) -> Option<&str> {
         // A mutation that named no account has nothing to invalidate. The
         // table declares no such variant and a test walks every one of them to
         // keep it that way, so this is the shape of the miss, not a live case.
-        EnrollmentEffect::Mutates => posture.user,
+        EnrollmentEffect::Mutates | EnrollmentEffect::AddsTrust => posture.user,
     }
 }
 
@@ -3356,6 +3397,21 @@ fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
 /// Both checks read the same table, so a variant cannot pass one and skip the
 /// other the way `ReleaseTokenForDisarm` did (#344).
 fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
+    if let Request::EnrollmentSession {
+        scans,
+        improve,
+        profile,
+        ..
+    } = req
+    {
+        if !(1..=irlume_core::storage::MAX_SCANS_PER_PROFILE).contains(scans)
+            || (*improve && profile.as_ref().is_none_or(|name| name.is_empty()))
+        {
+            return Some(Response::Error(
+                "invalid guided enrollment scan count or target".into(),
+            ));
+        }
+    }
     let posture = posture(req);
     if let Some(u) = posture.user {
         if !valid_username(u) {
@@ -4013,7 +4069,9 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
             OperationClass::Authentication
         }
-        Enroll { .. } | AddScan { .. } | PositionSample { .. } => OperationClass::Enrollment,
+        Enroll { .. } | EnrollmentSession { .. } | AddScan { .. } | PositionSample { .. } => {
+            OperationClass::Enrollment
+        }
         Identify => OperationClass::Identification,
         TuneCaptureMode { .. } => OperationClass::CaptureQualification,
         SupportProbe { .. } => OperationClass::SupportProbe,
@@ -4076,16 +4134,29 @@ fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::Categ
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     let state = diagnostics::DiagnosticState::default();
     let scope = state.begin(diagnostic_operation_class(&req));
-    let response = dispatch_scoped(req, peer, engine, &scope);
+    let response = dispatch_scoped(req, peer, engine, &scope, None);
     scope.finish(categorical_outcome(&response));
     response
 }
 
+#[cfg(test)]
 fn dispatch_scoped(
     req: Request,
     peer: &Peer,
     engine: &mut irlume_auth::Engine,
     scope: &diagnostics::OperationScope,
+    authorization: Option<enrollment_authorization::Grant>,
+) -> Response {
+    dispatch_scoped_session(req, peer, engine, scope, authorization, None)
+}
+
+fn dispatch_scoped_session(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+    authorization: Option<enrollment_authorization::Grant>,
+    session: Option<&enrollment_session::Worker>,
 ) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
@@ -4099,6 +4170,45 @@ fn dispatch_scoped(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
+    if enrollment_authorization::required(&req, peer) {
+        let result = authorization
+            .ok_or_else(|| "enrollment requires OS authorization".to_owned())
+            .and_then(|grant| grant.consume(&req, peer));
+        if let Err(error) = result {
+            return Response::Error(error);
+        }
+    }
+    let req = match req {
+        Request::EnrollmentSession {
+            user,
+            profile,
+            scans,
+            improve,
+        } => {
+            let Some(observer) = session else {
+                return Response::Error("guided enrollment requires its live connection".into());
+            };
+            if let Err(error) = observer.started() {
+                return Response::Error(error.to_string());
+            }
+            if improve {
+                Request::AddScan {
+                    user,
+                    profile: profile.unwrap_or_default(),
+                    scans: Some(scans),
+                    report_enrollment: true,
+                }
+            } else {
+                Request::Enroll {
+                    user,
+                    profile,
+                    scans: Some(scans),
+                    reset: false,
+                }
+            }
+        }
+        other => other,
+    };
     // Eyes-open enforcement is retired (#386). Turning it OFF remains available
     // so a legacy enrollment carrying the flag is never trapped.
     //
@@ -4131,6 +4241,9 @@ fn dispatch_scoped(
         invalidate_enrollment_summary(user);
     }
     match req {
+        Request::EnrollmentSession { .. } => {
+            Response::Error("guided enrollment requires its live connection".into())
+        }
         // These four are answered by dispatch_status above; the arm is
         // unreachable and exists so the match stays exhaustive without a
         // second implementation to drift.
@@ -4441,13 +4554,6 @@ fn dispatch_scoped(
             scans,
             reset,
         } => {
-            if reset {
-                // Clean slate: drop the old enrollment (and its stale camera
-                // binding) before enrolling fresh.
-                if let Err(e) = irlume_core::storage::delete(&user) {
-                    return Response::Error(format!("reset failed: {e}"));
-                }
-            }
             let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
             // Apply the known emitter control so dark-mode scans enroll cleanly.
             // Asking to enroll a face is not consent to probe camera firmware
@@ -4497,15 +4603,26 @@ fn dispatch_scoped(
                         ProbeStore::AutomaticIfAbsent,
                     )
                 },
-                || match engine.enroll_profile_with_ir_preflight_and_diagnostics(
-                    &user,
-                    profile,
-                    want,
-                    |det| prepare_enrollment_ir(&ir_dev, det),
-                    scope,
-                ) {
-                    Ok(outcome) => enroll_response(outcome),
-                    Err(e) => Response::Error(e.to_string()),
+                || {
+                    let preflight =
+                        |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+                    let result = if let Some(observer) = session {
+                        engine.enroll_profile_observed(
+                            &user, profile, want, preflight, scope, observer,
+                        )
+                    } else if reset {
+                        engine.replace_enrollment_with_ir_preflight_and_diagnostics(
+                            &user, profile, want, preflight, scope,
+                        )
+                    } else {
+                        engine.enroll_profile_with_ir_preflight_and_diagnostics(
+                            &user, profile, want, preflight, scope,
+                        )
+                    };
+                    match result {
+                        Ok(outcome) => enroll_response(outcome),
+                        Err(e) => Response::Error(e.to_string()),
+                    }
                 },
             )
         }
@@ -4568,9 +4685,13 @@ fn dispatch_scoped(
             report_enrollment,
         } => {
             let ir_dev = engine.ir_device().to_owned();
-            match engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), |det| {
-                prepare_enrollment_ir(&ir_dev, det)
-            }) {
+            let preflight = |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+            let result = if let Some(observer) = session {
+                engine.add_scan_observed(&user, &profile, scans.unwrap_or(1), preflight, observer)
+            } else {
+                engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), preflight)
+            };
+            match result {
                 // The structured reply, opted into: the TUI needs the
                 // ambient-lit count of EVERY scan for the #312 completion
                 // note, and AddScan carries every scan after the first.
@@ -6310,7 +6431,7 @@ mod tests {
     /// Shared. For a test that only reaches a passwd lookup, which reads
     /// `environ` rather than writing it. Several may be held at once, so this
     /// does not serialise the socket work the exclusive guard would.
-    fn passwd_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+    pub(super) fn passwd_lock() -> std::sync::RwLockReadGuard<'static, ()> {
         crate::test_support::env_read()
     }
 
@@ -6333,11 +6454,19 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 4] = [
+        let sources: [(&str, &str); 6] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
             ("arbiter.rs", include_str!("arbiter.rs")),
+            (
+                "enrollment_session.rs",
+                include_str!("enrollment_session.rs"),
+            ),
             ("diagnostics.rs", include_str!("diagnostics.rs")),
+            (
+                "enrollment_authorization.rs",
+                include_str!("enrollment_authorization.rs"),
+            ),
         ];
         // The calls that end in glibc's getpwnam_r/getpwuid_r. `serve(` is
         // here because it REACHES them: `dispatch_status`/`dispatch_before_engine`
@@ -6669,6 +6798,7 @@ mod tests {
             service: Some("kde".into()),
             intent_confirmation: None,
         },
+        EnrollmentSession => Request::EnrollmentSession { user: u(), profile: None, scans: 10, improve: false },
         Enroll => Request::Enroll {
             user: u(),
             profile: None,
@@ -6837,7 +6967,7 @@ mod tests {
             }
             // A mutation with no account has no summary to invalidate, so the
             // status path would keep serving one that no longer matches disk.
-            if posture.enrollment == EnrollmentEffect::Mutates {
+            if posture.enrollment != EnrollmentEffect::Reads {
                 assert!(
                     posture.user.is_some(),
                     "{} mutates an enrollment but names no account",
@@ -7289,6 +7419,79 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_authorization_rejects_exited_owner_before_queue() {
+        // Removing the pre-queue authorization gate makes these requests
+        // reach the stand-in worker and return Ok. No engine or camera runs.
+        let _passwd = passwd_lock();
+        let user = "nobody";
+        let uid = uid_of(user).expect("test host has nobody account");
+        assert_ne!(uid, 0);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                while let Some(job) = arbiter.take() {
+                    let _ = job.payload.reply.send(Response::Ok("queued".into()));
+                    arbiter.finish(job.class, job.uid);
+                }
+            })
+        };
+        let mut responses = Vec::new();
+        for req in [
+            Request::Enroll {
+                user: user.into(),
+                profile: None,
+                scans: None,
+                reset: false,
+            },
+            Request::Enroll {
+                user: user.into(),
+                profile: None,
+                scans: None,
+                reset: true,
+            },
+            Request::AddScan {
+                user: user.into(),
+                profile: "primary".into(),
+                scans: None,
+                report_enrollment: false,
+            },
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let wire = serde_json::to_string(&req).unwrap() + "\n";
+            client.write_all(wire.as_bytes()).unwrap();
+            let ready = std::sync::atomic::AtomicBool::new(true);
+            let state = diagnostics::DiagnosticState::default();
+            serve_peer(
+                server,
+                &arbiter,
+                &ready,
+                &state,
+                Peer {
+                    uid,
+                    gid: uid,
+                    pid: i32::MAX,
+                },
+            )
+            .unwrap();
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            responses.push(serde_json::from_str::<Response>(&line).unwrap());
+        }
+        arbiter.close();
+        worker.join().unwrap();
+        for response in responses {
+            assert!(
+                matches!(response, Response::Error(_)),
+                "unauthorized request reached worker: {response:?}"
+            );
+        }
+    }
+
+    #[test]
     fn serve_routes_a_request_through_the_arbiter_and_answers_the_client() {
         // Held by the PARENT across the spawn and the join, not by the child.
         // A read guard already excludes every writer for as long as it is held,
@@ -7354,6 +7557,8 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    authorization: None,
+                    session: None,
                     req: Request::Ping,
                     peer: Peer {
                         uid: 0,
@@ -7663,6 +7868,8 @@ mod tests {
                 for _ in 0..2 {
                     let job = authorized.take().expect("authorized tombstone queued");
                     let Queued {
+                        authorization,
+                        session: _,
                         req,
                         peer,
                         reply,
@@ -7670,7 +7877,7 @@ mod tests {
                         scope,
                     } = job.payload;
                     assert!(link.claim());
-                    let response = dispatch_scoped(req, &peer, &mut engine, &scope);
+                    let response = dispatch_scoped(req, &peer, &mut engine, &scope, authorization);
                     scope.finish(categorical_outcome(&response));
                     link.released();
                     authorized.finish(job.class, job.uid);
@@ -7904,6 +8111,7 @@ mod tests {
         // it changes the key material the enrollment is sealed under.
         let mutates = [
             "Enroll",
+            "EnrollmentSession",
             "AddScan",
             "DeleteProfile",
             "DeleteScan",
@@ -7941,6 +8149,87 @@ mod tests {
     /// account's summary with a mutation it is not allowed to perform, and
     /// charge that account's next listing a storage load and its TPM work
     /// (#349). The authorized mutation must still invalidate before it runs.
+    #[test]
+    fn enrollment_authorization_worker_refuses_missing_grant_without_cache_mutation() {
+        let _g = enrollment_summary_test_lock();
+        let mut engine = engine();
+        let _sandbox = sandbox("enrollment-authorization");
+        let user = "nobody";
+        let owner = peer(uid_of(user).unwrap());
+        assert_ne!(owner.uid, 0);
+        for request in [
+            Request::Enroll {
+                user: user.into(),
+                profile: None,
+                scans: None,
+                reset: true,
+            },
+            Request::AddScan {
+                user: user.into(),
+                profile: "primary".into(),
+                scans: None,
+                report_enrollment: false,
+            },
+            Request::EnrollmentSession {
+                user: user.into(),
+                profile: None,
+                scans: 10,
+                improve: false,
+            },
+            Request::EnrollmentSession {
+                user: user.into(),
+                profile: Some("primary".into()),
+                scans: 5,
+                improve: true,
+            },
+        ] {
+            publish_enrollment_summary(
+                user,
+                EnrollmentSummary {
+                    profiles: Vec::new(),
+                    ir_ratio_calibrated: false,
+                },
+            );
+            let response = dispatch(request, &owner, &mut engine);
+            assert!(
+                matches!(response, Response::Error(ref message) if message == "enrollment requires OS authorization")
+            );
+            assert!(cached_enrollment_summary(user).is_some());
+        }
+        invalidate_enrollment_summary(user);
+    }
+
+    #[test]
+    fn guided_enrollment_rejects_invalid_budgets_and_missing_improvement_targets() {
+        let _passwd = passwd_lock();
+        let root = peer(0);
+        for (scans, profile, improve) in [
+            (0, None, false),
+            (irlume_core::storage::MAX_SCANS_PER_PROFILE + 1, None, false),
+            (5, None, true),
+            (5, Some(String::new()), true),
+        ] {
+            let request = Request::EnrollmentSession {
+                user: "root".into(),
+                scans,
+                profile,
+                improve,
+            };
+            assert!(matches!(pregate(&request, &root), Some(Response::Error(_))));
+        }
+        let request = Request::EnrollmentSession {
+            user: "root".into(),
+            scans: 10,
+            profile: None,
+            improve: false,
+        };
+        assert!(pregate(&request, &root).is_none());
+        let mut engine = engine();
+        assert!(
+            matches!(dispatch(request, &root, &mut engine), Response::Error(ref message) if message == "guided enrollment requires its live connection")
+        );
+    }
+
     #[test]
     fn only_an_authorized_mutation_drops_the_cached_summary() {
         let _g = enrollment_summary_test_lock();
@@ -8057,6 +8346,8 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    authorization: None,
+                    session: None,
                     req: Request::Ping,
                     peer: Peer {
                         uid: 0,
@@ -9018,6 +9309,7 @@ mod tests {
             &root,
             &mut engine,
             &scope,
+            None,
         );
 
         let Response::SupportProbe(result) = response else {
@@ -10305,8 +10597,16 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
         }
-        // reset:true wipes the old enrollment even though the capture then
-        // fails: the reset half of the arm ran.
+        // A failed replacement must preserve the enrollment and recovery setup.
+        let previous = std::fs::read(sb.dir.join("carol.json")).unwrap();
+        for directory in ["template-keys", "recovery"] {
+            std::fs::create_dir_all(sb.dir.join(directory)).unwrap();
+            std::fs::write(
+                sb.dir.join(directory).join("carol.json"),
+                b"synthetic fixture",
+            )
+            .unwrap();
+        }
         match dispatch(
             Request::Enroll {
                 user: "carol".into(),
@@ -10320,10 +10620,13 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
         }
-        assert!(
-            !sb.dir.join("carol.json").exists(),
-            "Enroll{{reset:true}} must delete the previous enrollment first"
-        );
+        assert_eq!(std::fs::read(sb.dir.join("carol.json")).unwrap(), previous);
+        for directory in ["template-keys", "recovery"] {
+            assert_eq!(
+                std::fs::read(sb.dir.join(directory).join("carol.json")).unwrap(),
+                b"synthetic fixture"
+            );
+        }
     }
 
     #[test]

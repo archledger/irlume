@@ -35,7 +35,7 @@ Conventions that apply everywhere:
 
 | Command | What it does |
 |---|---|
-| `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` starts the profile space over |
+| `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded) |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
@@ -78,6 +78,12 @@ Conventions that apply everywhere:
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, then print the package-removal command |
 
+## TUI access
+
+Press **F2** in the TUI to search additional CLI tasks, fill their options, and
+review the account and effects before running them. See the [workflow and parity
+reference](TUI.md), including multi-person profiles and appearance scans.
+
 ## Developer and benchmark tools
 
 Hidden unless `IRLUME_DEV=1` is set, because they open the camera directly and
@@ -105,3 +111,11 @@ IRLUME_DEV=1 irlume gesturecap replay nod.jsonl
 - Versioned JSON for desktop integrations: [MACHINE-API.md](MACHINE-API.md)
 - Reading scores, gate reasons, and PAM decisions: [DEBUGGING.md](DEBUGGING.md)
 - NixOS module instead of imperative wiring: [NIXOS.md](NIXOS.md)
+
+### Authorization before enrollment
+
+Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
+
+Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment. Missing authority or agent, denial, cancellation and expired approval refuse enrollment. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
+
+The daemon enforces this rule. Restart into the updated daemon after upgrading; a new client with an older running daemon does not provide this protection. Older clients can meet the new dialog but retain their shorter reply timeout.

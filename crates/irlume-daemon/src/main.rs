@@ -11202,17 +11202,18 @@ mod tests {
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_authenticate_dispatches_to_a_no_face_denial() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = loopback_engine();
         let sb = sandbox("lb-auth");
         // One-shot capture instead of a grace window: a no-face run finishes
         // in one camera round.
         std::env::set_var("IRLUME_GRACE_MS", "0");
-        write_enrollment(&sb.dir, &enrollment_with("lbuser", &["Face Scan 1"]));
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
         // "kde" is a ScreenUnlock in every tier, so the dispatch gates pass
         // whether or not the runner's loopback nodes register as an IR pair.
         let resp = dispatch(
             Request::Authenticate {
-                user: "lbuser".into(),
+                user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
             },
@@ -11225,10 +11226,15 @@ mod tests {
                 granted,
                 live,
                 reason,
+                refused_by_policy,
                 ..
             } => {
                 assert!(!granted, "no face on the feed must never grant");
                 assert!(!live);
+                assert!(
+                    !refused_by_policy,
+                    "the loopback fixture must reach the engine"
+                );
                 assert!(
                     reason.to_lowercase().contains("face"),
                     "denial should name the missing face, got: {reason}"

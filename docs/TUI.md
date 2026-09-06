@@ -136,3 +136,17 @@ The standalone authentication test does not exercise PAM or polkit. A
 successful command exit also does not imply its diagnostic verdict passed;
 read the reported verdict. A face failure followed by a successful password
 is password approval, even when the overall system operation succeeds.
+
+### IR compatibility in Faces
+
+Each profile shows IR compatibility for the recognizer currently loaded by
+the daemon. Missing, unknown and incompatible IR scans are listed separately.
+Use **[a] Improve Recognition** on that profile with an IR camera to add fresh
+IR coverage; existing scans remain. The CLI shows the same explanation in
+`irlume profiles list`, with a command targeting the selected account/profile.
+
+A paused-calibration message means unknown IR scans still prevent use of that
+profile's stored calibration. Compatible IR scans can still match without it;
+adding scans alone does not remove the restriction while unknown scans remain.
+Older daemons show “not reported”, not an empty or broken IR enrollment. These
+counts describe templates and do not certify camera or authentication readiness.

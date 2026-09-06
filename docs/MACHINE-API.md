@@ -371,6 +371,23 @@ list would be the unknown-as-zero mistake. Treat a missing `recognizers` as
 unknown and fall back to `scans`; do not treat it as a profile that needs
 re-enrolling.
 
+Profiles may also carry `ir`, reported by the daemon for its loaded
+recognizer and IR pipeline. Its `compatible_scans`, `missing_scans`,
+`unknown_scans`, and `incompatible_scans` partition that recognizer's scans.
+Missing means no IR template; unknown means no recorded IR pipeline tag;
+incompatible means a different pipeline tag or embedding dimension. Scans
+for other recognizers remain in the existing `recognizers` breakdown.
+
+`calibration_withheld` reports a stored raw-IR calibration that cannot be used
+while unknown IR scans for this recognizer remain in the profile. Compatible
+IR scans can still match without calibration. Adding fresh scans alone does
+not clear this restriction while the unknown scans remain.
+
+An absent `ir` means the daemon did not report compatibility; do not treat it
+as zero scans or prescribe re-enrollment. These are template counts, not a
+camera/liveness check or a guarantee that dark authentication will succeed.
+The field is additive within contract 1; older consumers ignore it.
+
 ### `irlume models list --json`
 
 Capability: `models-list-json`.

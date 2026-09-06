@@ -3147,9 +3147,41 @@ fn enrollment_summaries(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn summarize_profile_ir(
+    profile: &irlume_core::storage::FaceProfile,
+    recognizer: &str,
+    ir_space: &str,
+    dim: usize,
+) -> irlume_common::ProfileIrSummary {
+    use irlume_core::storage::{recognizer_space_matches, IR_RAW_SPACE, LEGACY_RECOGNIZER_SPACE};
+    let mut summary = irlume_common::ProfileIrSummary::default();
+    for scan in &profile.scans {
+        if !recognizer_space_matches(scan.embed_space.as_deref(), recognizer) {
+            continue;
+        }
+        match (&scan.ir, scan.ir_space.as_deref()) {
+            (None, _) => summary.missing_scans += 1,
+            (Some(_), None) => summary.unknown_scans += 1,
+            (Some(ir), Some(space)) if space == ir_space && ir.len() == dim => {
+                summary.compatible_scans += 1;
+            }
+            _ => summary.incompatible_scans += 1,
+        }
+    }
+    let stored_calibration = profile.ir_calibs.contains_key(recognizer)
+        || (recognizer == LEGACY_RECOGNIZER_SPACE && profile.ir_calib.is_some());
+    summary.calibration_withheld = ir_space == IR_RAW_SPACE
+        && stored_calibration
+        && summary.unknown_scans > 0
+        && profile.calib_for(recognizer).is_none();
+    summary
+}
+
 fn summarize_enrollment(
     enr: Option<&irlume_core::storage::Enrollment>,
     live_recognizer: &str,
+    live_ir_space: &str,
+    ir_dim: usize,
 ) -> EnrollmentSummary {
     match enr {
         Some(enr) => EnrollmentSummary {
@@ -3171,6 +3203,12 @@ fn summarize_enrollment(
                         scans: p.scans.iter().map(|s| s.name.clone()).collect(),
                         scans_by_recognizer,
                         live_recognizer: Some(live_recognizer.to_string()),
+                        ir: Some(summarize_profile_ir(
+                            p,
+                            live_recognizer,
+                            live_ir_space,
+                            ir_dim,
+                        )),
                     }
                 })
                 .collect(),
@@ -4241,7 +4279,12 @@ fn dispatch_scoped_session(
                     // re-sealed the template key, which is exactly why the
                     // load lives HERE on the worker and not on a connection
                     // thread.
-                    let sum = summarize_enrollment(enr.as_ref(), engine.embed_space());
+                    let sum = summarize_enrollment(
+                        enr.as_ref(),
+                        engine.embed_space(),
+                        engine.ir_space(),
+                        engine.ir_dim(),
+                    );
                     publish_enrollment_summary(&user, sum.clone());
                     sum.into_response()
                 }
@@ -5139,9 +5182,12 @@ fn dispatch_scoped_session(
             s.name = new_name.clone();
             Ok(format!("renamed scan to '{new_name}'"))
         }),
-        Request::SetRequireEyesOpen { user, .. } => {
-            set_require_eyes_open_off(&user, engine.embed_space())
-        }
+        Request::SetRequireEyesOpen { user, .. } => set_require_eyes_open_off(
+            &user,
+            engine.embed_space(),
+            engine.ir_space(),
+            engine.ir_dim(),
+        ),
         Request::CaptureEarMedian { .. } => Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
         Request::SetClosureCalibration { .. } => {
             Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into())
@@ -5258,7 +5304,12 @@ fn mutate_enrollment(
     }
 }
 
-fn set_require_eyes_open_off(user: &str, embed_space: &str) -> Response {
+fn set_require_eyes_open_off(
+    user: &str,
+    embed_space: &str,
+    ir_space: &str,
+    ir_dim: usize,
+) -> Response {
     let mut enrollment = match irlume_core::storage::load(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
@@ -5267,7 +5318,7 @@ fn set_require_eyes_open_off(user: &str, embed_space: &str) -> Response {
     enrollment.require_eyes_open = false;
     match irlume_core::storage::save(&enrollment) {
         Ok(()) => {
-            let summary = summarize_enrollment(Some(&enrollment), embed_space);
+            let summary = summarize_enrollment(Some(&enrollment), embed_space, ir_space, ir_dim);
             publish_enrollment_summary(user, summary);
             Response::Ok("require-eyes-open disabled".into())
         }
@@ -6137,7 +6188,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let sum = summarize_enrollment(Some(&enr), "embed:model-b");
+        let sum = summarize_enrollment(Some(&enr), "embed:model-b", "raw", 512);
         let p = &sum.profiles[0];
         assert_eq!(p.scans.len(), 4, "the flat list is unchanged");
         assert_eq!(p.scans_by_recognizer.get("embed:model-a"), Some(&2));
@@ -6149,6 +6200,90 @@ mod tests {
             "untagged scans count under the recognizer that predates tagging"
         );
         assert_eq!(p.live_recognizer.as_deref(), Some("embed:model-b"));
+    }
+
+    #[test]
+    fn profile_ir_summary_partitions_only_live_recognizer_scans_and_reports_cache() {
+        use irlume_core::storage::{Enrollment, FaceProfile, FaceScan, LEGACY_RECOGNIZER_SPACE};
+        let scan = |tag: Option<&str>, dim: usize| FaceScan {
+            name: "synthetic".into(),
+            rgb: vec![0.0; 4],
+            ir: Some(vec![0.0; dim]),
+            ir_space: tag.map(str::to_string),
+            embed_space: None,
+            ir_center_edge_ratio: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        };
+        let mut p = FaceProfile {
+            name: "P".into(),
+            scans: vec![
+                scan(Some("raw"), 4),
+                FaceScan {
+                    ir: None,
+                    ..scan(None, 4)
+                },
+                scan(None, 4),
+                scan(Some("adapter:old"), 4),
+                scan(Some("raw"), 2),
+                FaceScan {
+                    embed_space: Some("embed:other".into()),
+                    ..scan(None, 4)
+                },
+            ],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        };
+        let c = irlume_core::calib::IrCalibration {
+            m: vec![],
+            n_rows: vec![],
+            lambda: 0.5,
+            fitted_pairs: 3,
+        };
+        let plain = summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "raw", 4);
+        assert_eq!(
+            plain,
+            irlume_common::ProfileIrSummary {
+                compatible_scans: 1,
+                missing_scans: 1,
+                unknown_scans: 1,
+                incompatible_scans: 2,
+                calibration_withheld: false
+            }
+        );
+        p.ir_calib = Some(c.clone());
+        assert!(summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "raw", 4).calibration_withheld);
+        p.ir_calib = None;
+        p.ir_calibs.insert(LEGACY_RECOGNIZER_SPACE.into(), c);
+        assert!(summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "raw", 4).calibration_withheld);
+        let adapted = summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "adapter:old", 4);
+        assert_eq!(adapted.compatible_scans, 1);
+        assert!(!adapted.calibration_withheld);
+        assert_eq!(
+            summarize_profile_ir(&p, "embed:other", "raw", 4).unknown_scans,
+            1
+        );
+        assert_eq!(
+            summarize_profile_ir(&p, "embed:absent", "raw", 4),
+            Default::default()
+        );
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(p);
+        let before = serde_json::to_value(&enr).unwrap();
+        let summary = summarize_enrollment(Some(&enr), LEGACY_RECOGNIZER_SPACE, "raw", 4);
+        assert!(
+            summary.profiles[0]
+                .ir
+                .as_ref()
+                .unwrap()
+                .calibration_withheld
+        );
+        assert_eq!(serde_json::to_value(&enr).unwrap(), before);
+        assert!(
+            summarize_enrollment(None, LEGACY_RECOGNIZER_SPACE, "raw", 4)
+                .profiles
+                .is_empty()
+        );
     }
 
     #[test]
@@ -7324,6 +7459,7 @@ mod tests {
                                 scans: vec!["s1".into()],
                                 scans_by_recognizer: Default::default(),
                                 live_recognizer: None,
+                                ir: None,
                             }],
                             require_eyes_open: false,
                             closure_calibrated: false,
@@ -8044,6 +8180,7 @@ mod tests {
                     scans: vec!["s1".into()],
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
+                    ir: None,
                 }],
                 ir_ratio_calibrated: true,
             },
@@ -9831,6 +9968,7 @@ mod tests {
                     scans: vec!["Face Scan 9".into()],
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
+                    ir: None,
                 }],
                 ir_ratio_calibrated: false,
             },
@@ -10422,7 +10560,7 @@ mod tests {
 
         publish_enrollment_summary(
             "carol",
-            summarize_enrollment(Some(&enrollment), e.embed_space()),
+            summarize_enrollment(Some(&enrollment), e.embed_space(), e.ir_space(), e.ir_dim()),
         );
 
         match dispatch(

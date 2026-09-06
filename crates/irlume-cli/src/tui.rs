@@ -5109,6 +5109,12 @@ impl App {
                             Style::new().fg(th().warn),
                         )));
                     }
+                    for line in crate::profile_ir::lines(p) {
+                        item.push(Line::from(Span::styled(format!("     {line}"), Style::new().dim())));
+                    }
+                    if crate::profile_ir::needs_capture(p) {
+                        item.push(Line::from("     [a] Improve Recognition with an IR camera."));
+                    }
                     ListItem::new(item)
                 }
                 Row::Scan(pi, si) => ListItem::new(Line::from(Span::raw(format!(
@@ -5171,11 +5177,9 @@ impl App {
                         .unwrap_or(0);
                     let misleading = p.scans_by_recognizer.len() > 1
                         || (p.live_recognizer.is_some() && live_count != p.scans.len());
-                    if misleading && live_count == 0 {
-                        2
-                    } else {
-                        1
-                    }
+                    1 + u16::from(misleading && live_count == 0)
+                        + crate::profile_ir::lines(p).len() as u16
+                        + u16::from(crate::profile_ir::needs_capture(p))
                 }
                 Row::Scan(_, _) => 1,
             };
@@ -8338,6 +8342,46 @@ mod tests {
     }
 
     #[test]
+    fn profile_ir_guidance_renders_and_mouse_rows_follow_scrolled_heights() {
+        for (height, selected) in [(20, 0), (8, 3)] {
+            let mut app = test_app();
+            app.screen = SC_PROFILES;
+            app.profiles = vec![profile("one", &["scan-one"]), profile("two", &["scan-two"])];
+            app.profiles[0].ir = Some(irlume_common::ProfileIrSummary {
+                compatible_scans: 2,
+                unknown_scans: 1,
+                calibration_withheld: true,
+                ..Default::default()
+            });
+            app.sel = selected;
+            let area = Rect::new(0, 0, 80, height);
+            let mut term = Terminal::new(TestBackend::new(80, height)).unwrap();
+            term.draw(|f| app.draw_profiles(f, area)).unwrap();
+            let text = rendered(&term);
+            if selected == 0 {
+                for line in crate::profile_ir::lines(&app.profiles[0]) {
+                    assert!(text.contains(&line), "missing {line}: {text}");
+                }
+                assert!(text.contains("[a] Improve Recognition with an IR camera."));
+            }
+            let mut checked = 0;
+            for (rect, click) in app.click_targets.borrow().iter() {
+                if let Click::Select(i) = click {
+                    let label = ["● one", "↳ scan-one", "● two", "↳ scan-two"][*i];
+                    let row = text.lines().nth(rect.y as usize).unwrap();
+                    assert!(
+                        row.contains(label),
+                        "hit {i} points at {row:?}, expected {label}"
+                    );
+                    assert!(rect.y + rect.height <= height);
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0);
+        }
+    }
+
+    #[test]
     fn clicking_a_profile_or_diagnostic_row_selects_it() {
         let area = Rect::new(0, 0, 120, 40);
         let mut app = test_app();
@@ -8916,6 +8960,7 @@ mod tests {
             scans: scans.iter().map(|s| s.to_string()).collect(),
             scans_by_recognizer: Default::default(),
             live_recognizer: None,
+            ir: None,
         }
     }
 
@@ -9284,6 +9329,7 @@ mod tests {
                 scans: Vec::new(),
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             })
             .collect();
         app.begin_enroll();

@@ -1532,7 +1532,8 @@ fn recovery_success_paths_with_a_live_daemon() {
         "correct horse\n",
     );
     assert_eq!(code, 0);
-    assert!(out.contains("face unlock is restored"), "{out}");
+    assert!(out.contains("template key restored"), "{out}");
+    assert!(!out.contains("face unlock is restored"), "{out}");
 
     let (code, out, _) = run(&mut sb.cmd(&["recovery", "forget", "--user", "tester"]));
     assert_eq!(code, 0);

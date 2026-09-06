@@ -59,8 +59,8 @@ pub(crate) mod test_support {
 
 mod arbiter;
 mod diagnostics;
-mod enrollment_authorization;
 mod enrollment_session;
+mod operation_authorization;
 mod position_session;
 mod retry_throttle;
 mod users;
@@ -1377,7 +1377,7 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// the worker, so a client that stops reading stalls its own connection thread
 /// instead of the one thread every login needs.
 struct Queued {
-    authorization: Option<enrollment_authorization::Grant>,
+    authorization: Option<operation_authorization::Grant>,
     session: Option<enrollment_session::Worker>,
     position: Option<position_session::Worker>,
     req: Request,
@@ -2597,7 +2597,7 @@ fn serve_peer(
                 scope.finish(categorical_outcome(&resp));
                 return respond(stream, &resp);
             }
-            let authorization = match enrollment_authorization::authorize(&req, &peer, &stream) {
+            let authorization = match operation_authorization::authorize(&req, &peer, &stream) {
                 Ok(grant) => grant,
                 Err(error) => return respond(stream, &Response::Error(error)),
             };
@@ -4109,7 +4109,7 @@ fn dispatch_scoped(
     peer: &Peer,
     engine: &mut irlume_auth::Engine,
     scope: &diagnostics::OperationScope,
-    authorization: Option<enrollment_authorization::Grant>,
+    authorization: Option<operation_authorization::Grant>,
 ) -> Response {
     dispatch_scoped_session(req, peer, engine, scope, authorization, None, None)
 }
@@ -4119,7 +4119,7 @@ fn dispatch_scoped_session(
     peer: &Peer,
     engine: &mut irlume_auth::Engine,
     scope: &diagnostics::OperationScope,
-    authorization: Option<enrollment_authorization::Grant>,
+    authorization: Option<operation_authorization::Grant>,
     session: Option<&enrollment_session::Worker>,
     position: Option<&position_session::Worker>,
 ) -> Response {
@@ -4135,9 +4135,9 @@ fn dispatch_scoped_session(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
-    if enrollment_authorization::required(&req, peer) {
+    if operation_authorization::required(&req, peer) {
         let result = authorization
-            .ok_or_else(|| "enrollment requires OS authorization".to_owned())
+            .ok_or_else(|| operation_authorization::REFUSED.to_owned())
             .and_then(|grant| grant.consume(&req, peer));
         if let Err(error) = result {
             return Response::Error(error);
@@ -6455,8 +6455,8 @@ mod tests {
             ),
             ("diagnostics.rs", include_str!("diagnostics.rs")),
             (
-                "enrollment_authorization.rs",
-                include_str!("enrollment_authorization.rs"),
+                "operation_authorization.rs",
+                include_str!("operation_authorization.rs"),
             ),
         ];
         // The calls that end in glibc's getpwnam_r/getpwuid_r. `serve(` is
@@ -7414,7 +7414,7 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_authorization_rejects_exited_owner_before_queue() {
+    fn operation_authorization_rejects_exited_owner_before_queue() {
         // Removing the pre-queue authorization gate makes these requests
         // reach the stand-in worker and return Ok. No engine or camera runs.
         let _passwd = passwd_lock();
@@ -7451,6 +7451,11 @@ mod tests {
                 scans: None,
                 report_enrollment: false,
             },
+            Request::RecoverySetup {
+                user: user.into(),
+                passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+            },
+            Request::RecoveryForget { user: user.into() },
         ] {
             let (mut client, server) = UnixStream::pair().unwrap();
             client
@@ -8147,7 +8152,7 @@ mod tests {
     /// charge that account's next listing a storage load and its TPM work
     /// (#349). The authorized mutation must still invalidate before it runs.
     #[test]
-    fn enrollment_authorization_worker_refuses_missing_grant_without_cache_mutation() {
+    fn operation_authorization_worker_refuses_missing_grant_without_cache_mutation() {
         let _g = enrollment_summary_test_lock();
         let mut engine = engine();
         let _sandbox = sandbox("enrollment-authorization");
@@ -8179,6 +8184,11 @@ mod tests {
                 scans: 5,
                 improve: true,
             },
+            Request::RecoverySetup {
+                user: user.into(),
+                passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+            },
+            Request::RecoveryForget { user: user.into() },
         ] {
             publish_enrollment_summary(
                 user,
@@ -8189,7 +8199,7 @@ mod tests {
             );
             let response = dispatch(request, &owner, &mut engine);
             assert!(
-                matches!(response, Response::Error(ref message) if message == "enrollment requires OS authorization")
+                matches!(response, Response::Error(ref message) if message == operation_authorization::REFUSED)
             );
             assert!(cached_enrollment_summary(user).is_some());
         }
@@ -10978,6 +10988,75 @@ mod tests {
             }
             other => panic!("empty reseal must be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recovery_authorization_preserves_envelope_on_refusal_and_allows_approved_removal() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("recovery-authorization");
+        // Real process identity is required by the grant, including start time.
+        // SAFETY: these credential getters have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let owner = Peer {
+            uid,
+            gid,
+            pid: std::process::id() as i32,
+        };
+        let user = users::name_for_uid(uid).unwrap();
+        let envelope = irlume_core::recovery::wrap(b"synthetic old passphrase", &[7; 32]).unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let path = sb.dir.join("recovery").join(format!("{user}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let setup = Request::RecoverySetup {
+            user: user.clone(),
+            passphrase: irlume_common::SecretBytes::new(b"synthetic new passphrase".to_vec()),
+        };
+        let forget = Request::RecoveryForget { user: user.clone() };
+        let other = peer(if uid == NOBODY { 1 } else { NOBODY });
+        for req in [setup.clone(), forget.clone()] {
+            assert!(matches!(dispatch(req, &other, &mut e), Response::Error(_)));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        // Missing approval must also preserve a same-user envelope. Root is
+        // explicitly exempt; that branch is exercised below as administration.
+        if uid != 0 {
+            for req in [setup.clone(), forget.clone()] {
+                assert!(
+                    matches!(dispatch(req, &owner, &mut e), Response::Error(ref error) if error.contains("requires OS authorization"))
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+        let (client, server) = UnixStream::pair().unwrap();
+        let grant = operation_authorization::authorize_for_test(&setup, &owner, &server).unwrap();
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin(diagnostic_operation_class(&setup));
+        // Approval reaches the real setup operation; without a TPM-sealed key
+        // it must return the storage error and preserve the existing envelope.
+        assert!(
+            matches!(dispatch_scoped(setup, &owner, &mut e, &scope, grant), Response::Error(ref error) if error.contains("no template key sealed"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let restore = Request::RecoveryRestore {
+            user: user.clone(),
+            passphrase: irlume_common::SecretBytes::new(b"wrong synthetic passphrase".to_vec()),
+        };
+        assert!(
+            matches!(dispatch(restore, &owner, &mut e), Response::Error(ref error) if error.contains("wrong recovery passphrase"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let grant = operation_authorization::authorize_for_test(&forget, &owner, &server).unwrap();
+        assert!(matches!(
+            dispatch_scoped(forget, &owner, &mut e, &scope, grant),
+            Response::Ok(_)
+        ));
+        assert!(
+            !path.exists(),
+            "approved removal must reach the real filesystem mutation"
+        );
+        drop(client);
     }
 
     #[test]

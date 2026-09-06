@@ -44,6 +44,8 @@ recommends:
 contents:
   - src: ../polkit/org.irlume.enroll.policy
     dst: /usr/share/polkit-1/actions/org.irlume.enroll.policy
+  - src: ../polkit/org.irlume.recovery-manage.policy
+    dst: /usr/share/polkit-1/actions/org.irlume.recovery-manage.policy
   - src: ../../target/release/irlumed
     dst: /usr/bin/irlumed
   - src: ../../target/release/irlume

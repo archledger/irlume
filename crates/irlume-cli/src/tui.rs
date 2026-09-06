@@ -7932,6 +7932,7 @@ mod tests {
 
     #[test]
     fn first_run_tab_exits_but_advanced_toggle_only_changes_future_navigation() {
+        let _guard = dead_socket();
         let mut advanced = test_app();
         advanced.caps = irlume_camera::Caps {
             ir_pair: true,
@@ -7953,6 +7954,7 @@ mod tests {
         tabbed.on_key(KeyCode::Tab);
         assert!(!tabbed.is_first_run());
         assert_ne!(tabbed.screen, SC_WELCOME);
+        drain_loads(&mut tabbed);
     }
 
     #[test]
@@ -7999,6 +8001,7 @@ mod tests {
 
     #[test]
     fn clicking_a_sidebar_row_navigates_to_it() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.caps = irlume_camera::Caps {
             ir_pair: true,
@@ -8023,6 +8026,7 @@ mod tests {
         let inner = Block::bordered().inner(app.body_split(body).0.unwrap());
         app.on_click(inner.x, inner.y + idx as u16, area);
         assert_eq!(app.screen, target, "clicking a row jumps to its screen");
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -8073,6 +8077,7 @@ mod tests {
 
     #[test]
     fn clicking_an_overview_status_row_opens_its_section() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.daemon_up = true;
         app.profiles_loaded = true;
@@ -8096,6 +8101,7 @@ mod tests {
             .expect("Overview status rows are clickable");
         app.on_click(row.x, row.y, area);
         assert_eq!(app.screen, target);
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -8919,6 +8925,7 @@ mod tests {
 
     #[test]
     fn hub_selection_and_enter_jump_to_the_picked_screen() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.screen = SC_WELCOME;
         app.visible = (0..SCREENS.len()).collect();
@@ -8938,6 +8945,7 @@ mod tests {
         app.hub_sel = 0;
         app.move_sel(-1);
         assert_eq!(app.hub_sel, app.hub_rows().len() - 1);
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -9709,6 +9717,7 @@ mod tests {
 
     #[test]
     fn tab_steps_wrap_and_walk_only_visible_screens() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.caps = irlume_camera::Caps {
             ir_pair: false,
@@ -9733,6 +9742,7 @@ mod tests {
         );
         app.on_key(KeyCode::Tab);
         assert_eq!(app.screen, SC_WELCOME, "Tab from the last step wraps");
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -9839,6 +9849,7 @@ mod tests {
             "[r] must announce the refresh in Activity"
         );
         assert!(!app.daemon_up, "the dead socket means daemon down");
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -12680,6 +12691,7 @@ mod tests {
                 app.screen = screen;
                 app.on_key(*key);
                 let _ = draw_text(&app);
+                wait_op_done(&mut app);
 
                 // Same key with a selection pushed past the end of every list,
                 // which is what an empty profile list plus a remembered index
@@ -12691,6 +12703,7 @@ mod tests {
                 app.settings_svc_sel = 99;
                 app.on_key(*key);
                 let _ = draw_text(&app);
+                wait_op_done(&mut app);
             }
         }
 
@@ -12764,6 +12777,7 @@ mod tests {
                     "screen {screen_name} ({screen}) advertises [{key}] {label}, \
                      and pressing it changed nothing"
                 );
+                wait_op_done(&mut app);
             }
         }
 
@@ -12781,6 +12795,7 @@ mod tests {
     /// Enter opens nothing at all.
     #[test]
     fn the_hub_selection_survives_the_list_shrinking() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.screen = SC_WELCOME;
         app.advanced = true;
@@ -12809,6 +12824,7 @@ mod tests {
         let target = app.hub_rows()[app.hub_sel].2;
         app.on_key(KeyCode::Enter);
         assert_eq!(app.screen, target, "Enter opens the highlighted section");
+        drain_loads(&mut app);
     }
 
     /// An encrypted enrollment whose template key is gone must not read as a

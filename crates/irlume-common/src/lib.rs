@@ -888,8 +888,8 @@ pub enum Response {
         #[serde(default)]
         declined_by_gesture: bool,
         /// The final FAILED attempt's situation, in the #616 step 2 stable
-        /// vocabulary ("no face", "too far", ...), carried so pam_irlume can
-        /// word its prompt (#616 step 3). Empty on a grant, on every
+        /// vocabulary ("timed out", "no face", "too far", ...), carried so
+        /// pam_irlume can word its prompt (#616 step 3). Empty on a grant, on every
         /// pre-camera policy refusal, and from an older daemon
         /// (`#[serde(default)]`); attack-shaped labels are carried too, but
         /// the PAM layer stays silent on them: no threshold value ever

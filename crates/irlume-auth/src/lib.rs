@@ -252,6 +252,9 @@ pub enum OutcomeKind {
     /// Missing, empty or recognizer-incompatible enrollment, or retired/invalid settings.
     /// Terminal (not presence-retryable), but preserves account retry history.
     SetupUnavailable,
+    /// The authentication deadline expired before complete evidence could be
+    /// accepted. Terminal and non-retryable, with password fallback guidance.
+    DeadlineExpired,
     /// Every other refusal: pre-camera policy/state denials, camera-binding
     /// mismatches, challenge-gate failures.
     OtherDeny,
@@ -355,10 +358,11 @@ fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
 
 /// One failed authentication attempt's situation, in the stable vocabulary a
 /// person reads in `irlume logs` (#616 step 2). Reporting only: derived from
-/// facts the attempt already measured, it gates nothing, scores nothing, and
-/// moves no bar.
+/// the outcome and facts the attempt already measured, it gates nothing,
+/// scores nothing, and moves no bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttemptSituation {
+    TimedOut,
     NoFace,
     TooFar,
     OffCenter,
@@ -376,6 +380,7 @@ enum AttemptSituation {
 /// string each, so `irlume logs` greps by situation.
 const fn attempt_situation_label(situation: AttemptSituation) -> &'static str {
     match situation {
+        AttemptSituation::TimedOut => "timed out",
         AttemptSituation::NoFace => "no face",
         AttemptSituation::TooFar => "too far",
         AttemptSituation::OffCenter => "off-center",
@@ -418,12 +423,17 @@ impl AttemptFacts {
     }
 }
 
-/// Classify one failed attempt. Precedence mirrors the framing guide's
+/// Classify one failed attempt. A terminal deadline takes precedence over
+/// framing facts, which remain available in the debug line. Otherwise,
+/// precedence mirrors the framing guide's
 /// severity order, usability situations first, so a genuine user's #617
 /// shape (a Spoof verdict on a turned head) reads `looking away` rather
 /// than the attack label. Dark-path attempts enter with no RGB face by
 /// design and fall through to the IR facts and the outcome kind.
 fn auth_attempt_situation(kind: OutcomeKind, f: &AttemptFacts) -> AttemptSituation {
+    if kind == OutcomeKind::DeadlineExpired {
+        return AttemptSituation::TimedOut;
+    }
     if kind == OutcomeKind::GestureDeclined {
         return AttemptSituation::Declined;
     }

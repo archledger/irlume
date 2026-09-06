@@ -321,6 +321,9 @@ impl Store {
                 OutcomeKind::Granted
                 | OutcomeKind::Spoof
                 | OutcomeKind::BelowThreshold
+                // Grouped expiry previously used OtherDeny and consumed a
+                // strike; the diagnostic label does not change that policy.
+                | OutcomeKind::DeadlineExpired
                 | OutcomeKind::OtherDeny => (),
             }
         }

@@ -630,51 +630,59 @@ fn pamwrap_empty_input_clears_before_password_fallback() {
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_face_denial_clears_yes_before_password_fallback() {
-    let Some(h) = Harness::try_new("intent-face-denial") else {
-        return;
-    };
-    let log = serve(&h.socket, |_| Response::AuthResult {
-        granted: false,
-        score: 0.0,
-        live: false,
-        reason: "no match".into(),
-        declined_by_gesture: false,
-        refused_by_policy: false,
-        situation: String::new(),
-    });
-    let checker = h.token_checker("face-denial", FIXED_TEST_TOKEN);
-    h.write_service(
-        "sudo",
-        &[
-            h.auth_line("sufficient", ""),
-            format!(
-                "auth required pam_exec.so expose_authtok {}",
-                checker.display()
-            ),
-        ],
-    );
+    for situation in ["", "timed out"] {
+        let Some(h) = Harness::try_new("intent-face-denial") else {
+            return;
+        };
+        let log = serve(&h.socket, move |_| Response::AuthResult {
+            granted: false,
+            score: 0.0,
+            live: false,
+            reason: "no match".into(),
+            declined_by_gesture: false,
+            refused_by_policy: false,
+            situation: situation.into(),
+        });
+        let checker = h.token_checker("face-denial", FIXED_TEST_TOKEN);
+        h.write_service(
+            "sudo",
+            &[
+                h.auth_line("sufficient", ""),
+                format!(
+                    "auth required pam_exec.so expose_authtok {}",
+                    checker.display()
+                ),
+            ],
+        );
 
-    let (ok, out) = h.run(
-        "sudo",
-        &["authenticate"],
-        &format!("yes\n{FIXED_TEST_TOKEN}\n"),
-        None,
-    );
-    assert!(
-        ok,
-        "face denial must preserve fresh password fallback: {out}"
-    );
-    assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
-    assert!(!out.contains(FIXED_TEST_TOKEN), "secret displayed: {out}");
-    let requests = log.lock().unwrap();
-    assert_eq!(requests.len(), 1, "exactly one face request: {requests:?}");
-    assert!(matches!(
-        &requests[0],
-        Request::Authenticate {
-            intent_confirmation: Some(IntentAttestation::PamConversation),
-            ..
-        }
-    ));
+        let (ok, out) = h.run(
+            "sudo",
+            &["authenticate"],
+            &format!("yes\n{FIXED_TEST_TOKEN}\n"),
+            None,
+        );
+        assert!(
+            ok,
+            "face denial must preserve fresh password fallback: {out}"
+        );
+        assert_eq!(out.matches(FACE_INTENT_INFO).count(), 1, "{out}");
+        assert!(!out.contains(FIXED_TEST_TOKEN), "secret displayed: {out}");
+        assert_eq!(
+            out.matches("authentication timed out; use your password")
+                .count(),
+            usize::from(situation == "timed out"),
+            "{out}"
+        );
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 1, "exactly one face request: {requests:?}");
+        assert!(matches!(
+            &requests[0],
+            Request::Authenticate {
+                intent_confirmation: Some(IntentAttestation::PamConversation),
+                ..
+            }
+        ));
+    }
 }
 
 /// A password supplied by an earlier PAM module is not fresh face intent. It

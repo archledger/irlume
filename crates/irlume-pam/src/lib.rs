@@ -844,6 +844,7 @@ fn read_stdout_bounded(
 /// numbers live in the journal and the diagnostic trace, root-visible).
 fn situation_prompt(situation: &str) -> Option<&'static str> {
     match situation {
+        "timed out" => Some("authentication timed out; use your password"),
         "no face" => Some("look at the camera"),
         "too far" => Some("come closer"),
         "off-center" => Some("center your face in the frame"),
@@ -1384,6 +1385,10 @@ mod tests {
     fn usability_situations_get_action_wording_attack_signals_stay_silent() {
         use super::situation_prompt;
         assert_eq!(situation_prompt("no face"), Some("look at the camera"));
+        assert_eq!(
+            situation_prompt("timed out"),
+            Some("authentication timed out; use your password")
+        );
         assert_eq!(situation_prompt("too far"), Some("come closer"));
         assert_eq!(
             situation_prompt("off-center"),
@@ -1431,6 +1436,7 @@ mod tests {
     fn no_situation_prompt_wording_ever_carries_a_number() {
         use super::situation_prompt;
         for label in [
+            "timed out",
             "no face",
             "too far",
             "off-center",

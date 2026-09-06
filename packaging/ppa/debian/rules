@@ -33,6 +33,8 @@ override_dh_clean:
 override_dh_auto_install:
 	install -D -m0644 packaging/polkit/org.irlume.enroll.policy \
 		debian/irlume/usr/share/polkit-1/actions/org.irlume.enroll.policy
+	install -D -m0644 packaging/polkit/org.irlume.recovery-manage.policy \
+		debian/irlume/usr/share/polkit-1/actions/org.irlume.recovery-manage.policy
 	install -D -m0755 target/release/irlumed debian/irlume/usr/bin/irlumed
 	install -D -m0755 target/release/irlume debian/irlume/usr/bin/irlume
 	install -D -m0644 target/release/libpam_irlume.so \

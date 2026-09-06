@@ -1262,6 +1262,31 @@ fn recovery_accepts_a_flag_before_the_subcommand() {
 }
 
 #[test]
+fn recovery_restore_does_not_claim_a_successful_face_authentication() {
+    let sb = Sandbox::new("recovery-restore-scope");
+    serve(&sb.sock(), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::RecoveryRestore { user, passphrase }
+            if user == "tester" && passphrase.expose() == b"synthetic passphrase" =>
+        {
+            Response::Ok("template key restored and re-sealed for 'tester'".into())
+        }
+        _ => Response::Error("unexpected recovery request".into()),
+    });
+    let (code, out, err) = run_stdin(
+        &mut sb.cmd(&["recovery", "restore", "--user", "tester"]),
+        "synthetic passphrase\n",
+        "recovery restore scope",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("template key restored"), "{out}");
+    assert!(
+        !out.contains("face unlock is restored"),
+        "key restoration does not override authentication policy: {out}"
+    );
+}
+
+#[test]
 fn fingerprint_accepts_a_flag_before_the_subcommand() {
     // status answers without fprintd installed (it reports the absence), so
     // the discriminating assertion is the usage line: the position-1 binding

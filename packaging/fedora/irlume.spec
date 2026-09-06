@@ -114,6 +114,7 @@ make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux irlume.pp
 
 %install
 install -Dm0644 packaging/polkit/org.irlume.enroll.policy %{buildroot}%{_datadir}/polkit-1/actions/org.irlume.enroll.policy
+install -Dm0644 packaging/polkit/org.irlume.recovery-manage.policy %{buildroot}%{_datadir}/polkit-1/actions/org.irlume.recovery-manage.policy
 install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
 install -Dm0755 target/release/irlume  %{buildroot}%{_bindir}/irlume
 install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/pam_irlume.so
@@ -244,6 +245,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 
 %files
 %{_datadir}/polkit-1/actions/org.irlume.enroll.policy
+%{_datadir}/polkit-1/actions/org.irlume.recovery-manage.policy
 %license LICENSE
 %doc README.md docs/SECURITY_AT_REST.md docs/MACHINE-API.md docs/INTEGRATION.md
 %{_bindir}/irlumed

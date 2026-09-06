@@ -17,6 +17,10 @@ press Enter. Commands needing administrator access use sudo; password and
 recovery prompts stay in the command's private terminal input. Fields in the
 menu are never shell commands. Paths beginning with `-` can use a `./` prefix.
 
+If a command fails or is interrupted, some changes may already have been
+applied. Review its terminal output and the refreshed status before retrying.
+An unsuccessful daemon-start command does not automatically resume enrollment.
+
 ## Several people on one account
 
 A profile represents one person. An account supports up to **three people**;

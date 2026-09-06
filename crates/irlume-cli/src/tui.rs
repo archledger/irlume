@@ -2872,16 +2872,6 @@ impl App {
         }
     }
 
-    /// Run a privileged sub-step via `sudo` and surface its ACTUAL outcome. A
-    /// cancelled or failed sudo (wrong password ×3, subcommand error) must not
-    /// look like success: `refresh()` re-probes what it can, but a one-shot like
-    /// `ir-setup` reports its own outcome and is not re-probed here, so we log ✓
-    /// on success and raise the error banner on failure.
-    ///
-    /// It DOES leave re-checkable state now: an interrupted run leaves an undo
-    /// record, which `irlume doctor` reports as `emitter-undo-pending`. This
-    /// step does not read it, because the record is about a camera control and
-    /// this is the sudo wrapper's own success or failure.
     /// Absolute path to the running binary, for re-invoking ourselves as root
     /// instead of whatever `irlume` PATH resolves to (a running TUI must not
     /// shell out to a different, older installed build for its privileged half).
@@ -2919,6 +2909,9 @@ impl App {
         }
     }
 
+    /// Run a privileged command and report its exit outcome. Failure does not
+    /// prove rollback: a command can change state before exiting unsuccessfully.
+    /// Suspend-return refreshes diagnostics; refresh the app cache here too.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
         // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
         // to. Resolve the first "irlume" arg to the current exe; leave
@@ -2963,31 +2956,27 @@ impl App {
         unsafe {
             libc::signal(libc::SIGINT, old_int)
         };
+        if status.is_ok() {
+            // A child can change app policy before failing. Refresh after any
+            // exit, since the exit status alone says nothing about rollback.
+            self.refresh_heavy();
+        }
         match status {
             Ok(st) if st.success() => {
-                // A step can enable a model or install the Bitwarden policy, and
-                // the draw path reads a cache: take it again now rather than let
-                // the screen show the pre-action state until the TTL expires.
-                self.refresh_heavy();
                 self.log('✓', format!("{what}: done"));
             }
             Ok(st) => {
-                // A failed/cancelled sudo can't have started the daemon; drop
-                // any parked enrollment so the resume path doesn't sit through
-                // its bounded daemon wait for nothing.
+                // Without confirmed success, do not automatically continue a
+                // parked enrollment, even if the daemon may have started.
                 self.resume_enroll = None;
-                match st.code() {
-                    Some(c) => self.set_error(format!(
-                        "{what}: sudo exited {c}; not applied (cancelled or failed)"
-                    )),
-                    None => {
-                        self.set_error(format!("{what}: sudo terminated by a signal; not applied"))
-                    }
-                }
+                self.set_error(format!(
+                    "{what}: command did not complete ({st}); some changes may already be applied; \
+                     review its output and current status before retrying"
+                ));
             }
             Err(e) => {
                 self.resume_enroll = None;
-                self.set_error(format!("{what}: could not launch sudo: {e}"));
+                self.set_error(format!("{what}: could not start command: {e}"));
             }
         }
     }
@@ -9496,7 +9485,8 @@ mod tests {
         std::env::set_var("PATH", &new_path);
         let mut app = test_app();
         app.resume_enroll = Some(ResumeEnroll::New);
-        app.sudo_step("start the daemon", &["systemctl", "start", "irlumed"]);
+        // A root test process bypasses sudo. Keep that path harmless too.
+        app.sudo_step("start the daemon", &[fake.to_str().unwrap()]);
         std::env::set_var("PATH", &old_path);
         assert!(
             app.resume_enroll.is_none(),
@@ -9506,6 +9496,86 @@ mod tests {
             app.error.is_some(),
             "the failure must raise the error banner"
         );
+    }
+
+    /// Exercise the real child-process path with a harmless partial write.
+    /// The fake sudo only execs our temporary script, without elevation.
+    fn privileged_command_outcome(script: Option<&str>) -> (App, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-command-outcome-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let command = dir.join("command");
+        if let Some(script) = script {
+            let sudo = dir.join("sudo");
+            std::fs::write(&sudo, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                &command,
+                format!("#!/bin/sh\nprintf applied > \"$1\"\n{script}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let marker = dir.join("partial-change");
+        let old_path = std::env::var_os("PATH");
+        let mut app = test_app();
+        app.resume_enroll = Some(ResumeEnroll::New);
+        std::env::set_var("PATH", &dir);
+        app.sudo_step(
+            "test action",
+            &[command.to_str().unwrap(), marker.to_str().unwrap()],
+        );
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let changed = marker.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (app, changed)
+    }
+
+    #[test]
+    fn sudo_failure_does_not_claim_a_partial_change_was_rolled_back() {
+        for script in ["exit 7", "kill -TERM $$"] {
+            let (app, changed) = privileged_command_outcome(Some(script));
+            assert!(changed, "the command changed state before failing");
+            let error = app.error.as_ref().expect("failed action must be visible");
+            assert!(
+                !error.contains("not applied"),
+                "false rollback claim: {error}"
+            );
+            assert!(
+                error.contains("may"),
+                "partial completion is uncertain: {error}"
+            );
+            assert!(error.contains("review"), "show a recovery step: {error}");
+            assert!(app.resume_enroll.is_none());
+            assert!(!app.activity.iter().any(|(icon, _)| *icon == '✓'));
+        }
+    }
+
+    #[test]
+    fn sudo_launch_failure_never_claims_completion_or_resumes_enrollment() {
+        let (app, changed) = privileged_command_outcome(None);
+        assert!(!changed);
+        let error = app.error.as_ref().expect("launch failure must be visible");
+        assert!(error.contains("could not start"), "got: {error}");
+        assert!(app.resume_enroll.is_none());
+        assert!(!app.activity.iter().any(|(icon, _)| *icon == '✓'));
+    }
+
+    #[test]
+    fn sudo_success_preserves_parked_enrollment_and_reports_completion() {
+        let (app, changed) = privileged_command_outcome(Some("exit 0"));
+        assert!(changed);
+        assert!(app.error.is_none());
+        assert!(app.resume_enroll.is_some());
+        assert!(app.activity.iter().any(|(icon, _)| *icon == '✓'));
     }
 
     // ---- pure helpers -----------------------------------------------------

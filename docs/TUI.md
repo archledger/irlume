@@ -48,7 +48,14 @@ The current limit is 30 scans per profile for each recognizer.
    profile, provided a person slot is available. At three profiles, an existing
    person can still take the improvement route; a fourth person is refused.
 
-The guided operation uses one connection and has a bounded duration. A merge
+The framing guide keeps the RGB camera open through its initial checks and
+countdown. It loads the account's calibration once and requests a new report
+for each check. Framing ends after one minute if you have not completed the
+guide; start again when ready. Cancelling releases the camera, and login
+requests can interrupt the guide. After interruption, start a new operation.
+
+The camera is released before the system authorization prompt. The authorized
+capture operation then uses one connection and has a bounded duration. A merge
 prompt expires after 60 seconds. Cancellation or interruption before the final
 save discards the pending batch. A connection lost after the save can hide the
 success reply; refresh the profile list before starting again.
@@ -58,6 +65,11 @@ then warns and uses its older per-scan flow. That flow repeats approval/countdow
 and saves the first matching scan before confirmation; Cancel attempts to remove
 it, and abrupt termination can leave it saved. Update and restart the daemon to
 use the bounded guided flow.
+
+If only the framing-session request is unsupported, the TUI uses individual
+framing checks, with the same cues and countdown. Update and restart the daemon
+to use the continuous framing session. A failure after a session starts stops
+the operation; it does not silently switch to the older flow.
 
 Use F2 for custom scan counts or **Replace face enrollment**. Replacement
 replaces all profiles for the account after successful capture, so it is a

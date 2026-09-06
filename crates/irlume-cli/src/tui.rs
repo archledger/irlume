@@ -7469,11 +7469,35 @@ fn enroll_worker(
 ) {
     let send = |m| tx.send(m).is_ok();
     let mut misses = 0;
+    let mut session = match irlume_common::client::PositionSession::connect(&user, &stop) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = send(WMsg::Err(format!("camera guide could not start: {error}")));
+            return;
+        }
+    };
     loop {
-        match guide_until_capture(&user, &stop, &send, &mut crate::daemon_sample, &mut misses) {
+        let mut sample = |request: &Request| match session.as_mut() {
+            Some(session) => Ok(match session.sample(&stop) {
+                Ok(report) => Response::Position(report),
+                // An accepted session cannot safely resume through another
+                // connection after a framing, transport or deadline failure.
+                Err(error) => Response::Error(format!("camera guide stopped: {error}")),
+            }),
+            None => crate::daemon_sample(request),
+        };
+        match guide_until_capture(&user, &stop, &send, &mut sample, &mut misses) {
             GuideOutcome::Ready => break,
             GuideOutcome::Reframe => continue,
             GuideOutcome::Halt => return,
+        }
+    }
+    // Await release, not just socket close: the daemon polls disconnects, so
+    // a second camera request could otherwise overtake release of this one.
+    if let Some(session) = session {
+        if let Err(error) = session.finish(&stop) {
+            let _ = send(WMsg::Err(format!("camera guide could not finish: {error}")));
+            return;
         }
     }
     if !send(WMsg::Authorizing) {
@@ -7729,6 +7753,24 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
+            // The compatibility daemon rejects the new request before any
+            // framing session is accepted, then serves the original API.
+            let (mut unsupported, _) = listener.accept().unwrap();
+            let mut initial = String::new();
+            std::io::BufReader::new(&unsupported)
+                .read_line(&mut initial)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&initial).unwrap(),
+                Request::PositionSession { .. }
+            ));
+            writeln!(
+                unsupported,
+                "{}",
+                serde_json::to_string(&Response::Error("bad request".into())).unwrap()
+            )
+            .unwrap();
+            drop(unsupported);
             for _ in 0..6 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut line = String::new();
@@ -7805,6 +7847,178 @@ mod tests {
             3
         );
         assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+    }
+
+    #[test]
+    fn guided_enrollment_reuses_framing_connection_and_releases_it_before_authorization() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let path =
+            std::env::temp_dir().join(format!("irlume-guided-framing-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut guide, _) = listener.accept().unwrap();
+            guide
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(guide.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if serde_json::from_str::<serde_json::Value>(&line).unwrap()
+                != serde_json::json!({"PositionSession":{"user":"test-user"}})
+            {
+                return false;
+            }
+            writeln!(guide, "\"PositionSessionStarted\"").unwrap();
+            for _ in 0..6 {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                    "Sample"
+                );
+                writeln!(
+                    guide,
+                    "{}",
+                    serde_json::to_string(&Response::Position(good_report("Ready"))).unwrap()
+                )
+                .unwrap();
+            }
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "client must request and await camera release before enrollment"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                "Finish"
+            );
+            writeln!(guide, "\"PositionSessionEnded\"").unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "framing must close before enrollment authorization starts"
+            );
+            drop(reader);
+            drop(guide);
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&socket)
+                .read_line(&mut line)
+                .unwrap();
+            let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
+            if !batch {
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&Response::Error("expected one batch".into())).unwrap()
+                )
+                .unwrap();
+                return false;
+            }
+            for response in [
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Started),
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Progress {
+                    captured: 10,
+                    target: 10,
+                }),
+                Response::Enrolled {
+                    profile: "New".into(),
+                    created: true,
+                    added: 10,
+                    total: 10,
+                    room: Some(20),
+                    added_scans: vec![],
+                    ambient_lit: Some(0),
+                },
+            ] {
+                writeln!(socket, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            true
+        });
+        let (tx, rx) = mpsc::channel();
+        enroll_worker(
+            "test-user".into(),
+            "New".into(),
+            None,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        let batch = server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            batch,
+            "guided enrollment must authorize and capture one bounded batch"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, WMsg::Count(_)))
+                .count(),
+            3
+        );
+        assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+    }
+
+    #[test]
+    fn accepted_framing_failure_never_falls_back_or_starts_enrollment() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let path =
+            std::env::temp_dir().join(format!("irlume-guide-accepted-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::PositionSession { .. }
+            ));
+            writeln!(stream, "\"PositionSessionStarted\"").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "\"Sample\"\n");
+            // The compatibility phrase is only meaningful BEFORE acceptance.
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&Response::Error("bad request".into())).unwrap()
+            )
+            .unwrap();
+            line.clear();
+            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let (tx, rx) = mpsc::channel();
+        enroll_worker(
+            "test-user".into(),
+            "New".into(),
+            None,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(messages.iter().any(|m| matches!(m, WMsg::Err(_))));
+        assert!(!messages
+            .iter()
+            .any(|m| matches!(m, WMsg::Authorizing | WMsg::Done { .. })));
     }
 
     #[test]

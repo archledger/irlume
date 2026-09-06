@@ -450,6 +450,19 @@ pub struct EnrollmentDecision {
     pub accept: bool,
 }
 
+/// Control an accepted framing connection. Reports are never generated ahead
+/// of demand. Finish waits for camera release; disconnect cancels instead.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PositionSessionControl {
+    Sample,
+    Finish,
+}
+
+/// Hard protocol bounds for one interactive framing operation.
+pub const POSITION_SESSION_SECONDS: u64 = 60;
+/// Bounds an untrusted peer independently of the elapsed-time limit.
+pub const POSITION_SESSION_MAX_SAMPLES: usize = 256;
+
 /// Request from an untrusted client to the privileged daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -625,6 +638,12 @@ pub enum Request {
     /// enrolled: it tunes the pitch band to that user's calibrated neutral (a
     /// read-only lookup) so the guide matches the capture gate. `None` = default band.
     PositionSample { user: Option<String> },
+    /// A bounded RGB framing session, with the same account-hint rules as
+    /// `PositionSample`. After `PositionSessionStarted`, each
+    /// `PositionSessionControl::Sample` receives one fresh `Position` report.
+    /// Finish receives `PositionSessionEnded` after camera release. Closing
+    /// the connection cancels. No enrollment or auth.
+    PositionSession { user: Option<String> },
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
@@ -1015,6 +1034,11 @@ pub enum Response {
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
+    /// Framing connection accepted. Errors after acceptance must not cause
+    /// a client to silently restart through the one-shot compatibility path.
+    PositionSessionStarted,
+    /// Framing finished and the camera worker released its operation slot.
+    PositionSessionEnded,
     /// Delivered-rate diagnostic report (`CameraDiagnostics`).
     CameraDiagnostics(Box<CameraDiagnosticsReport>),
     /// Retired `CaptureEarMedian` response tombstone. No current request

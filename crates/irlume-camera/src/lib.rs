@@ -2149,6 +2149,38 @@ fn drain_pair_frame<S: ValidatedStream>(
     Ok(())
 }
 
+/// Process captured pixels while their owning thread continues validating the
+/// camera queue. A failed tail drain invalidates even successful processing.
+fn process_while_draining<T: Send, R: Send>(
+    frame: T,
+    process: impl FnOnce(T) -> irlume_common::Result<R> + Send,
+    mut drain: impl FnMut() -> irlume_common::Result<()>,
+) -> irlume_common::Result<R> {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || process(frame));
+        let mut transport = Ok(());
+        let mut drained = 0;
+        while !worker.is_finished() {
+            if drained == 2 * MAX_RATE_FILL_ATTEMPTS {
+                transport = Err(Error::Hardware(
+                    "framing processing exceeded its bounded drain".into(),
+                ));
+                break;
+            }
+            if let Err(error) = drain() {
+                transport = Err(error);
+                break;
+            }
+            drained += 1;
+        }
+        let processed = worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        transport?;
+        processed
+    })
+}
+
 fn fill_rate_then_drain_metadata<E>(
     fill_rate: impl FnOnce() -> Result<(), E>,
     drain_metadata: impl FnOnce(),
@@ -4399,6 +4431,37 @@ impl<'a> RgbSession<'a> {
         self.burst(1)?
             .pop()
             .ok_or_else(|| Error::Hardware("no frames captured".into()))
+    }
+
+    /// Consume one validated frame without converting or retaining its pixels.
+    /// Use between framing requests so a live stream never accumulates old work.
+    ///
+    /// # Errors
+    /// Preserves warm-up, lease, rate, continuity and transport refusals.
+    pub fn discard_frame(&mut self) -> irlume_common::Result<()> {
+        self.warm_up()?;
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        drain_pair_frame(&mut self.stream, &self.cam.device)
+    }
+
+    /// Process a fresh frame while this thread continues servicing the stream.
+    /// The processing worker is scoped to this call and always joined.
+    ///
+    /// # Errors
+    /// Returns capture/processing errors or invalidates processing when the
+    /// subsequent bounded transport drain fails.
+    ///
+    /// # Panics
+    /// Resumes a processing callback panic after its worker has been joined.
+    pub fn process_frame<R: Send>(
+        &mut self,
+        process: impl FnOnce(Frame) -> irlume_common::Result<R> + Send,
+    ) -> irlume_common::Result<R> {
+        let frame = self.frame()?;
+        process_while_draining(frame, process, || self.discard_frame())
     }
 
     /// The recognition path's denoised frame: a per-pixel temporal median over
@@ -16857,6 +16920,87 @@ mod tests {
             error.to_string().contains("continuity"),
             "a cached success cannot hide a later gap"
         );
+    }
+
+    #[test]
+    fn framing_processing_keeps_consuming_while_the_processor_waits() {
+        let (release, waiting) = std::sync::mpsc::sync_channel(0);
+        let mut release = Some(release);
+        let mut drained = 0;
+        let result = process_while_draining(
+            7,
+            move |frame| {
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Ok(frame * 2)
+            },
+            || {
+                drained += 1;
+                if let Some(release) = release.take() {
+                    release.send(()).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, 14);
+        assert!(drained > 0, "processing must not pause the camera queue");
+    }
+
+    #[test]
+    fn framing_processing_discards_success_if_the_tail_drain_fails() {
+        struct Processed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Processed {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let discarded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = discarded.clone();
+        let (release, waiting) = std::sync::mpsc::sync_channel(0);
+        let result = process_while_draining(
+            (),
+            move |_| {
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Ok(Processed(observed))
+            },
+            || {
+                release.send(()).unwrap();
+                Err(Error::Hardware("fixture continuity failure".into()))
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::Hardware(ref error)) if error == "fixture continuity failure")
+        );
+        assert!(discarded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn framing_processing_joins_and_drops_the_frame_before_resuming_a_panic() {
+        struct Pixels(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Pixels {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = dropped.clone();
+        let panic = std::panic::catch_unwind(|| {
+            let _: irlume_common::Result<()> = process_while_draining(
+                Pixels(observed),
+                |_pixels| panic!("fixture processing panic"),
+                || {
+                    std::thread::yield_now();
+                    Ok(())
+                },
+            );
+        });
+        assert!(panic.is_err());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

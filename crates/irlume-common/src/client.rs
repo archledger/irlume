@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+mod position_session;
+pub use position_session::PositionSession;
+
 /// Bounded wait for the initial connect (distinct from the read timeout, which
 /// must be long enough for a camera capture).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

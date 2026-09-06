@@ -592,6 +592,21 @@ pub fn apply_known_ir_emitter_subject_region(
     Ok(verdict)
 }
 
+/// Demand and reporting confined to one live framing connection. Implementors
+/// must never block the camera worker on socket input or output.
+pub trait PositionObserver {
+    /// Check for one command without waiting. `None` keeps draining the camera.
+    ///
+    /// # Errors
+    /// Returns disconnect, cancellation or protocol errors.
+    fn next(&self) -> irlume_common::Result<Option<irlume_common::PositionSessionControl>>;
+    /// Publish the one report requested by the connection.
+    ///
+    /// # Errors
+    /// Returns cancellation or delivery errors instead of blocking capture.
+    fn report(&self, report: irlume_common::PositionReport) -> irlume_common::Result<()>;
+}
+
 /// Interaction confined to one authorized enrollment operation.
 pub trait EnrollmentObserver {
     /// # Errors
@@ -7431,13 +7446,6 @@ impl Engine {
         &mut self,
         user: Option<&str>,
     ) -> irlume_common::Result<irlume_common::PositionReport> {
-        use irlume_common::PositionReport;
-        // Face width as a fraction of frame width; center tolerance; dim-face
-        // luma bound. MIN_FRAC, CENTER_TOL, and DIM are module-level (shared
-        // with the attempt situation line, #616 step 2); only the upper
-        // bounds stay local to the guide.
-        const MAX_FRAC: f32 = 0.55;
-        const BRIGHT: f32 = 235.0;
         // This user's calibrated pitch neutral, if any (read-only; absent = global default).
         let pitch_neutral = user
             .and_then(|u| irlume_core::storage::load(u).ok().flatten())
@@ -7450,86 +7458,170 @@ impl Engine {
         )?
         .pop()
         .ok_or_else(|| irlume_common::Error::Hardware("no frames captured".into()))?;
-        let view = align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
-        };
-        let faces = self.det.detect(&view)?;
-        let top = top_detection(&faces);
-        // NB: the framing guide is RGB-only so it stays fast enough to poll (the
-        // IR burst would make each sample multi-second). IR readiness is checked
-        // at the actual capture, not in the guide.
-        let ir_ok = false;
-        let (fw, fh) = (rgb.width as f32, rgb.height as f32);
-        let Some(f) = top else {
-            return Ok(PositionReport {
-                ir_ok,
-                guidance: "No face detected; look straight at the camera and center yourself"
-                    .into(),
-                ..Default::default()
-            });
-        };
-        let [x1, y1, x2, y2] = f.bbox;
-        let face_frac = (x2 - x1).max(0.0) / fw;
-        let centered = ((x1 + x2) / 2.0 - fw / 2.0).abs() <= CENTER_TOL * fw
-            && ((y1 + y2) / 2.0 - fh / 2.0).abs() <= CENTER_TOL * fh;
-        let pose = irlume_vision::head_pose(&f.landmarks);
-        let brightness = luma_in_bbox(&rgb.data, rgb.width, rgb.height, &f.bbox);
+        position_report(&mut self.det, &rgb, pitch_neutral)
+    }
 
-        // Quality starts at 100 and the first failing gate deducts by
-        // severity: 45 for too-far (smallest face, least usable capture), 30
-        // for the mid-tier framing/pose/darkness faults, 20 for over-bright
-        // (the mildest; recognition still works under glare more often than
-        // under the other faults).
-        let mut q = 100i32;
-        let mut guidance = "Hold still, looking good".to_string();
-        let mut well = true;
-        let (plo, phi) = pitch_band(pitch_neutral);
-        let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX && (plo..=phi).contains(&pose.pitch_frac);
-        // Live pose numbers for calibrating the framing bounds to a given camera
-        // (`IRLUME_LOG=debug`); `neutral` is this user's calibrated centre (or -).
-        irlume_common::dlog!("framing: yaw_asym={:.2} yaw_signed={:.2} pitch={:.2} band=[{:.2},{:.2}] neutral={} face_frac={:.2} bright={:.0}",
+    /// Serve one bounded framing connection with a single calibration lookup
+    /// and RGB streaming session. The actual enrollment still captures and
+    /// validates its own fresh evidence after this operation has released.
+    ///
+    /// # Errors
+    /// Returns calibration-independent camera/transport/inference errors,
+    /// cancellation, deadline or sample-limit refusals. Calibration lookup
+    /// failures use the same default band as `position_sample`.
+    pub fn position_session(
+        &mut self,
+        user: Option<&str>,
+        observer: &dyn PositionObserver,
+    ) -> irlume_common::Result<()> {
+        use irlume_common::{
+            PositionSessionControl, POSITION_SESSION_MAX_SAMPLES, POSITION_SESSION_SECONDS,
+        };
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(POSITION_SESSION_SECONDS);
+        if self.should_stop() {
+            return Err(irlume_common::Error::Preempted("framing cancelled".into()));
+        }
+        let pitch_neutral = user
+            .and_then(|u| irlume_core::storage::load(u).ok().flatten())
+            .and_then(|e| e.pitch_neutral());
+        if self.should_stop() || std::time::Instant::now() >= deadline {
+            return Err(irlume_common::Error::Preempted(
+                "framing cancelled before camera open".into(),
+            ));
+        }
+        let device = self.rgb_dev.clone();
+        let operation = irlume_camera::lease::acquire_camera_operation(
+            &[device.as_str()],
+            irlume_camera::lease::CameraOperationKind::Enrollment,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        if self.should_stop() || std::time::Instant::now() >= deadline {
+            return Err(irlume_common::Error::Preempted(
+                "framing cancelled while waiting for camera ownership".into(),
+            ));
+        }
+        let camera = operation.open_rgb(&device)?;
+        let mut session = camera.session_with_progress(&self.capture_progress())?;
+        let mut samples = 0;
+        loop {
+            if self.should_stop() {
+                return Err(irlume_common::Error::Preempted("framing cancelled".into()));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(irlume_common::Error::Protocol(
+                    "framing session expired; restart the guide".into(),
+                ));
+            }
+            match observer.next()? {
+                Some(PositionSessionControl::Finish) => return Ok(()),
+                Some(PositionSessionControl::Sample) => {
+                    if samples >= POSITION_SESSION_MAX_SAMPLES {
+                        return Err(irlume_common::Error::Protocol(
+                            "framing sample limit reached".into(),
+                        ));
+                    }
+                    samples += 1;
+                    // Only YuNet crosses into the scoped processor. The rest
+                    // of the Engine, including TFLite, stays on its owner thread.
+                    let det = &mut self.det;
+                    let report = session
+                        .process_frame(move |rgb| position_report(det, &rgb, pitch_neutral))?;
+                    observer.report(report)?;
+                }
+                None => session.discard_frame()?,
+            }
+        }
+    }
+}
+
+fn position_report(
+    det: &mut Detector,
+    rgb: &irlume_camera::Frame,
+    pitch_neutral: Option<f32>,
+) -> irlume_common::Result<irlume_common::PositionReport> {
+    use irlume_common::PositionReport;
+    const MAX_FRAC: f32 = 0.55;
+    const BRIGHT: f32 = 235.0;
+    let view = align::RgbView {
+        data: &rgb.data,
+        width: rgb.width,
+        height: rgb.height,
+    };
+    let faces = det.detect(&view)?;
+    let top = top_detection(&faces);
+    // NB: the framing guide is RGB-only so it stays fast enough to poll (the
+    // IR burst would make each sample multi-second). IR readiness is checked
+    // at the actual capture, not in the guide.
+    let ir_ok = false;
+    let (fw, fh) = (rgb.width as f32, rgb.height as f32);
+    let Some(f) = top else {
+        return Ok(PositionReport {
+            ir_ok,
+            guidance: "No face detected; look straight at the camera and center yourself".into(),
+            ..Default::default()
+        });
+    };
+    let [x1, y1, x2, y2] = f.bbox;
+    let face_frac = (x2 - x1).max(0.0) / fw;
+    let centered = ((x1 + x2) / 2.0 - fw / 2.0).abs() <= CENTER_TOL * fw
+        && ((y1 + y2) / 2.0 - fh / 2.0).abs() <= CENTER_TOL * fh;
+    let pose = irlume_vision::head_pose(&f.landmarks);
+    let brightness = luma_in_bbox(&rgb.data, rgb.width, rgb.height, &f.bbox);
+
+    // Quality starts at 100 and the first failing gate deducts by
+    // severity: 45 for too-far (smallest face, least usable capture), 30
+    // for the mid-tier framing/pose/darkness faults, 20 for over-bright
+    // (the mildest; recognition still works under glare more often than
+    // under the other faults).
+    let mut q = 100i32;
+    let mut guidance = "Hold still, looking good".to_string();
+    let mut well = true;
+    let (plo, phi) = pitch_band(pitch_neutral);
+    let frontal = pose.yaw_asym <= FRAME_YAW_ASYM_MAX && (plo..=phi).contains(&pose.pitch_frac);
+    // Live pose numbers for calibrating the framing bounds to a given camera
+    // (`IRLUME_LOG=debug`); `neutral` is this user's calibrated centre (or -).
+    irlume_common::dlog!("framing: yaw_asym={:.2} yaw_signed={:.2} pitch={:.2} band=[{:.2},{:.2}] neutral={} face_frac={:.2} bright={:.0}",
             pose.yaw_asym, pose.yaw_signed, pose.pitch_frac, plo, phi,
             pitch_neutral.map(|n| format!("{n:.2}")).unwrap_or_else(|| "-".into()), face_frac, brightness);
-        if face_frac < MIN_FRAC {
-            guidance = "Move closer".into();
-            well = false;
-            q -= 45;
-        } else if face_frac > MAX_FRAC {
-            guidance = "Move back a little".into();
-            well = false;
-            q -= 30;
-        } else if !centered {
-            guidance = "Center your face in the frame".into();
-            well = false;
-            q -= 30;
-        } else if !frontal {
-            guidance = frontality_hint(&pose, pitch_neutral);
-            well = false;
-            q -= 30;
-        } else if brightness < DIM {
-            guidance = "Too dark: add light or face a window".into();
-            well = false;
-            q -= 30;
-        } else if brightness > BRIGHT {
-            guidance = "Too bright: reduce glare/backlight".into();
-            well = false;
-            q -= 20;
-        }
-        Ok(PositionReport {
-            face: true,
-            face_frac,
-            centered,
-            yaw_asym: pose.yaw_asym,
-            pitch_frac: pose.pitch_frac,
-            brightness,
-            ir_ok,
-            quality: q.clamp(0, 100) as u8,
-            well_framed: well,
-            guidance,
-        })
+    if face_frac < MIN_FRAC {
+        guidance = "Move closer".into();
+        well = false;
+        q -= 45;
+    } else if face_frac > MAX_FRAC {
+        guidance = "Move back a little".into();
+        well = false;
+        q -= 30;
+    } else if !centered {
+        guidance = "Center your face in the frame".into();
+        well = false;
+        q -= 30;
+    } else if !frontal {
+        guidance = frontality_hint(&pose, pitch_neutral);
+        well = false;
+        q -= 30;
+    } else if brightness < DIM {
+        guidance = "Too dark: add light or face a window".into();
+        well = false;
+        q -= 30;
+    } else if brightness > BRIGHT {
+        guidance = "Too bright: reduce glare/backlight".into();
+        well = false;
+        q -= 20;
     }
+    Ok(PositionReport {
+        face: true,
+        face_frac,
+        centered,
+        yaw_asym: pose.yaw_asym,
+        pitch_frac: pose.pitch_frac,
+        brightness,
+        ir_ok,
+        quality: q.clamp(0, 100) as u8,
+        well_framed: well,
+        guidance,
+    })
 }
 
 /// Framing-guide frontality bounds: deliberately STRICTER than the liveness

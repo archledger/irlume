@@ -144,6 +144,7 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         (Kind::Uncertain, false),
         (Kind::SpoofNoIrFace, false),
         (Kind::GestureDeclined, false),
+        (Kind::SetupUnavailable, false),
         (Kind::Spoof, true),
         (Kind::BelowThreshold, true),
         (Kind::OtherDeny, true),
@@ -168,12 +169,52 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         );
         if matches!(
             kind,
-            Kind::NoFace | Kind::Uncertain | Kind::SpoofNoIrFace | Kind::GestureDeclined
+            Kind::NoFace
+                | Kind::Uncertain
+                | Kind::SpoofNoIrFace
+                | Kind::GestureDeclined
+                | Kind::SetupUnavailable
         ) {
             assert!(
                 !f.path().exists(),
                 "ignored outcomes must not create records"
             );
+        }
+    }
+}
+
+#[test]
+fn setup_unavailable_preserves_missing_partial_and_cooldown_history() {
+    for live in [false, true] {
+        for strikes in [0, 2, 3] {
+            let f = Fixture::new();
+            for _ in 0..strikes {
+                f.record(Kind::BelowThreshold);
+            }
+            let before = (strikes > 0).then(|| f.bytes());
+            let refusal = irlume_auth::Outcome {
+                // A configuration change can also be caught by the defensive
+                // post-match consent check. It must not reset earlier strikes.
+                live,
+                score: if live { 0.9 } else { 0.0 },
+                ..outcome(Kind::SetupUnavailable)
+            };
+            assert!(!irlume_auth::presence_retryable(&refusal));
+            assert!(!irlume_auth::is_gesture_decline(&refusal));
+            for _ in 0..6 {
+                f.store
+                    .record(&account_one(), POLICY, &refusal, bad_clock, before_rename)
+                    .expect("setup refusal must not reach the clock or writer");
+                match &before {
+                    Some(bytes) => assert_eq!(&f.bytes(), bytes),
+                    None => assert!(!f.path().exists()),
+                }
+            }
+            // Real rejections still consume the original remaining budget.
+            for _ in strikes..3 {
+                f.record(Kind::Spoof);
+            }
+            assert!(f.check());
         }
     }
 }

@@ -1067,6 +1067,43 @@ fn daemon_error_responses_surface_per_command() {
 }
 
 #[test]
+fn profile_removal_explains_approval_and_recovery_cleanup() {
+    let sb = Sandbox::new("removalapproval");
+    serve(&sb.sock(), |_| Response::Ok("removed".into()));
+    for args in [
+        vec![
+            "profiles",
+            "delete",
+            "--profile",
+            "primary",
+            "--user",
+            "tester",
+        ],
+        vec!["profiles", "forget-model", "shipped", "--user", "tester"],
+    ] {
+        let (code, out, err) = run(&mut sb.cmd(&args), "profile removal");
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("OS approval"), "{out}");
+        assert!(out.contains("recovery passphrase"), "{out}");
+    }
+    let (code, out, err) = run(
+        &mut sb.cmd(&[
+            "profiles",
+            "delete",
+            "--profile",
+            "primary",
+            "--scan",
+            "one",
+            "--user",
+            "tester",
+        ]),
+        "scan removal",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("OS approval"), "{out}");
+}
+
+#[test]
 fn forget_model_sends_the_resolved_space_over_the_wire() {
     // The CLI resolves the model NAME to its embedding-space tag; the daemon
     // only ever sees the tag. The fake daemon asserts the exact request, so a

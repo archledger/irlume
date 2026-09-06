@@ -575,6 +575,13 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         },
         _ => return usage_profiles(),
     };
+    if matches!(
+        req,
+        Request::DeleteProfile { .. } | Request::ForgetRecognizer { .. }
+    ) {
+        println!("[profiles] Removing a profile or a recognizer's face data requires OS approval for a non-root user.");
+        println!("[profiles] If no profiles remain, the template key and recovery passphrase are also erased.");
+    }
     match daemon_request(&req) {
         Ok(Response::Enrollment {
             profiles,
@@ -1304,6 +1311,8 @@ pub(crate) fn daemon_request(
             | irlume_common::Request::AddScan { .. }
             | irlume_common::Request::RecoverySetup { .. }
             | irlume_common::Request::RecoveryForget { .. }
+            | irlume_common::Request::DeleteProfile { .. }
+            | irlume_common::Request::ForgetRecognizer { .. }
     ) {
         380
     } else {

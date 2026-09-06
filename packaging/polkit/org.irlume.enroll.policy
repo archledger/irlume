@@ -5,7 +5,7 @@
   <vendor>Irlume</vendor>
   <vendor_url>https://github.com/archledger/irlume</vendor_url>
   <action id="org.irlume.enroll">
-    <description>Add or replace trusted faces</description>
+    <description>Add, replace or remove trusted faces</description>
     <message>Authenticate to change trusted faces in Irlume</message>
     <defaults>
       <allow_any>auth_self</allow_any>

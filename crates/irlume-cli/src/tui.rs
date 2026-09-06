@@ -4085,7 +4085,7 @@ impl App {
             Some(Row::Profile(pi)) => {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
-                    format!("Delete profile '{p}' and all its scans?"),
+                    format!("Delete profile '{p}' and all its scans? OS approval is required for non-root users. Removing the last profile also erases its recovery passphrase."),
                     "Delete",
                     ConfirmAct::Daemon(Request::DeleteProfile {
                         user: self.user.clone(),
@@ -10293,6 +10293,8 @@ mod tests {
         match &app.confirm {
             Some((q, _, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
                 assert!(q.contains("Delete profile 'p1'"), "got: {q}");
+                assert!(q.contains("OS approval"), "got: {q}");
+                assert!(q.contains("recovery"), "got: {q}");
                 assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
             }
             _ => panic!("expected the delete-profile confirm"),

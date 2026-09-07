@@ -539,7 +539,7 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
                 .flatten()
                 .and_then(|c| c.to_str().ok().map(str::to_string));
             // `true` is accurate here, not a convenient lie. The flag drives
-            // exactly one decision: whether a PASSWORD-keyed keyring is
+            // exactly one decision: whether a password-derived keyring secret is
             // already served. By the session phase it always is, either
             // because the user typed a password or because the auth phase
             // released the sealed one into `PAM_AUTHTOK`; and if neither
@@ -547,6 +547,8 @@ fn deliver_gnome_token(pamh: &Pam, user: &str) {
             // instead would make the daemon unseal a login password on every
             // session open, which this hook then discards, spending a TPM
             // round trip (seconds on a discrete TPM) per login for nothing.
+            // KDE wallet keys are password-derived too. This GNOME-only hook
+            // cannot deliver one, so the daemon must skip them here as well.
             match request(&Request::UnsealKeyring {
                 user: user.to_string(),
                 service,

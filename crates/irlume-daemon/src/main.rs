@@ -2428,7 +2428,7 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
             return Response::Error(format!("keyring unseal not allowed for {class:?}"));
         }
     }
-    // A typed password already opens a password-keyed keyring, so touching the
+    // A typed password already opens a password-keyed keyring or KDE wallet, so touching the
     // TPM would spend an unseal (up to seconds on a discrete TPM) to release a
     // secret the caller then discards. For a token envelope the typed password
     // opens nothing, so the release must proceed. The kind read here is a
@@ -2436,8 +2436,13 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
     // atomically, so a concurrent re-arm at worst turns this into the old
     // always-unseal behaviour.
     if have_password
-        && irlume_core::keyring::sealed_kind(&user)
-            == Some(irlume_core::envelope::SecretKind::LoginPassword)
+        && matches!(
+            irlume_core::keyring::sealed_kind(&user),
+            Some(
+                irlume_core::envelope::SecretKind::LoginPassword
+                    | irlume_core::envelope::SecretKind::KdeWalletKey
+            )
+        )
     {
         return Response::KeyringUnlockNotNeeded;
     }
@@ -10921,6 +10926,49 @@ mod tests {
         match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn password_present_skips_kde_key_release_before_tpm_access() {
+        let _g = env_lock();
+        let _sb = sandbox("password-present-kde");
+        let path = irlume_core::keyring::envelope_path("carol");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An invalid TCTI prevents every release arm from opening a real TPM.
+        // Metadata-only skip paths must still work when the TPM is unavailable.
+        let previous = std::env::var_os("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TCTI", "invalid-irlume-test-tcti");
+        let mut outcomes = Vec::new();
+        for kind in ["LoginPassword", "KdeWalletKey", "GnomeKeyringToken"] {
+            let envelope = serde_json::json!({
+                "version": 1, "secret": kind, "pcrs": [], "public": "", "private": ""
+            });
+            std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+            outcomes.push((
+                kind,
+                unseal_keyring("carol", Some("plasmalogin"), true, &peer(0)),
+                unseal_keyring("carol", Some("plasmalogin"), false, &peer(0)),
+                unseal_keyring("carol", Some("sudo"), true, &peer(0)),
+                unseal_keyring("carol", Some("plasmalogin"), true, &peer(NOBODY)),
+            ));
+        }
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        for (kind, password_present, no_password, elevation, unprivileged) in outcomes {
+            if kind == "GnomeKeyringToken" {
+                assert!(matches!(password_present, Response::Error(_)));
+            } else {
+                assert!(
+                    matches!(password_present, Response::KeyringUnlockNotNeeded),
+                    "{kind}"
+                );
+            }
+            assert!(matches!(no_password, Response::Error(_)));
+            assert!(matches!(elevation, Response::Error(_)));
+            assert!(matches!(unprivileged, Response::Error(_)));
         }
     }
 

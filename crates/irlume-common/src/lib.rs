@@ -686,8 +686,8 @@ pub enum Request {
         #[serde(default)]
         service: Option<String>,
         /// Whether the PAM stack already holds a typed password. For a
-        /// `LoginPassword` envelope that makes the unseal pointless (the keyring
-        /// self-unlocks from the typed password) and the daemon answers
+        /// `LoginPassword` or `KdeWalletKey` envelope that makes the unseal
+        /// pointless (the keyring/wallet opens from the typed password) and the daemon answers
         /// [`Response::KeyringUnlockNotNeeded`] without touching the TPM. For a
         /// `GnomeKeyringToken` envelope the typed password does NOT open the
         /// keyring, so the unseal proceeds regardless. The decision lives in
@@ -1098,8 +1098,8 @@ pub enum Response {
         #[serde(default)]
         minted: bool,
     },
-    /// `UnsealKeyring` with `have_password: true` against a `LoginPassword`
-    /// envelope: the typed password already opens the keyring, so nothing was
+    /// `UnsealKeyring` with `have_password: true` against a `LoginPassword` or
+    /// `KdeWalletKey` envelope: the password already opens it, so nothing was
     /// unsealed and nothing needs releasing.
     KeyringUnlockNotNeeded,
     /// Face matched and the TPM released the secret (`UnsealPassword` /

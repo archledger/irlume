@@ -28,44 +28,43 @@ fn grouped_five_votes_materialize_only_final_sample_and_admit_once_qualified() {
     let _guard = env_guard();
     let mut s = shared();
     let e = &mut s.engine;
-    let calls = Cell::new(0);
-    let result = e
-        .evaluate_grouped_samples_with(
-            (0..5).collect(),
-            Instant::now() + Duration::from_secs(15),
-            |e, i| Ok(sample(e, i, 0.2)),
-            |_, mut evidence| {
-                calls.set(calls.get() + 1);
-                assert_eq!(evidence.identity.0, 4);
-                evidence.assessment.embedding = Some(evidence.identity.1);
-                evidence.assessment.ir_embedding = Some(evidence.identity.1.to_vec());
-                Ok(evidence.assessment)
-            },
-            Instant::now,
-        )
-        .unwrap();
-    assert_eq!(calls.get(), 1);
-    let PreparedGroup::Ready(a) = result else {
-        panic!("complete live group refused")
-    };
-    let (mut enr, _) = pad_matching_fixture(0.2, false);
-    enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
-    // This fixture models a new raw-IR capture, whose producer records a tag.
-    enr.profiles[0].scans[0].ir_space = Some("raw".into());
-    let prior_ir = e.ir_available;
-    e.ir_available = true;
-    let out = e
-        .authenticate_qualified_assessment(
-            &enr,
-            AuthenticationPurpose::Verify,
-            Some("login"),
-            *a,
-            &(),
-        )
-        .unwrap();
-    e.vit_scores.clear();
-    e.ir_available = prior_ir;
-    assert!(out.granted, "{}", out.reason);
+    for purpose in [
+        AuthenticationPurpose::Verify,
+        AuthenticationPurpose::CredentialRelease,
+    ] {
+        let calls = Cell::new(0);
+        let result = e
+            .evaluate_grouped_samples_with(
+                (0..5).collect(),
+                Instant::now() + Duration::from_secs(15),
+                |e, i| Ok(sample(e, i, 0.2)),
+                |_, mut evidence| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(evidence.identity.0, 4);
+                    evidence.assessment.embedding = Some(evidence.identity.1);
+                    evidence.assessment.ir_embedding = Some(evidence.identity.1.to_vec());
+                    Ok(evidence.assessment)
+                },
+                Instant::now,
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        let PreparedGroup::Ready(a) = result else {
+            panic!("complete live group refused")
+        };
+        let (mut enr, _) = pad_matching_fixture(0.2, false);
+        enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
+        // This fixture models a new raw-IR capture, whose producer records a tag.
+        enr.profiles[0].scans[0].ir_space = Some("raw".into());
+        let prior_ir = e.ir_available;
+        e.ir_available = true;
+        let out = e
+            .authenticate_qualified_assessment(&enr, purpose, Some("login"), *a, &())
+            .unwrap();
+        e.vit_scores.clear();
+        e.ir_available = prior_ir;
+        assert!(out.granted, "{}", out.reason);
+    }
 }
 
 #[test]
@@ -651,16 +650,16 @@ fn grouped_eligibility_keeps_service_and_purpose_scope_despite_long_override() {
     std::env::set_var("IRLUME_GRACE_MS", "30000");
     let mode = measured_sequential_configuration();
     let mut results = Vec::new();
-    for (service, expected) in [
-        (Some("login"), true),
-        (Some("swaylock"), true),
-        (None, true),
-        (Some("unknown-local-service"), true),
-        (Some(" sudo "), false),
-        (Some("su"), false),
-        (Some("doas"), false),
-        (Some("polkit-1"), false),
-        (Some("sshd"), false),
+    for (service, verify, release) in [
+        (Some("login"), true, true),
+        (Some("swaylock"), true, true),
+        (None, true, false),
+        (Some("unknown-local-service"), true, false),
+        (Some(" sudo "), false, false),
+        (Some("su"), false, false),
+        (Some("doas"), false, false),
+        (Some("polkit-1"), false, false),
+        (Some("sshd"), false, false),
     ] {
         for purpose in [
             AuthenticationPurpose::Verify,
@@ -680,7 +679,11 @@ fn grouped_eligibility_keeps_service_and_purpose_scope_despite_long_override() {
                 service,
                 purpose,
                 actual,
-                expected && purpose == AuthenticationPurpose::Verify,
+                match purpose {
+                    AuthenticationPurpose::Verify => verify,
+                    AuthenticationPurpose::CredentialRelease => release,
+                    AuthenticationPurpose::AppConsent => false,
+                },
             ));
         }
     }
@@ -694,53 +697,81 @@ fn grouped_eligibility_keeps_service_and_purpose_scope_despite_long_override() {
 }
 
 #[test]
+fn grouped_cold_login_release_uses_complete_collection_only_for_known_local_services() {
+    let mode = measured_sequential_configuration();
+    for (service, expected) in [
+        (Some("plasmalogin"), true),
+        (Some("gdm-password"), true),
+        (Some("cosmic-greeter"), true),
+        (Some("login"), true),
+        (Some("kde"), true),
+        (Some("sudo"), false),
+        (Some("polkit-1"), false),
+        (Some("sshd"), false),
+        (Some("unknown-local-service"), false),
+        (None, false),
+    ] {
+        assert_eq!(
+            crate::grouped_auth::eligible_configuration(
+                &mode,
+                true,
+                true,
+                true,
+                15_000,
+                AuthenticationPurpose::CredentialRelease,
+                service,
+            ),
+            expected,
+            "service={service:?}"
+        );
+    }
+}
+
+#[test]
 fn grouped_eligibility_requires_qualification_models_budget_and_exact_contract() {
     use irlume_common::diagnostics::QualificationState;
-    let check = |mode: &CaptureModeSelection, ir, rgb_pad, ir_pad, window| {
-        crate::grouped_auth::eligible_configuration(
-            mode,
-            ir,
-            rgb_pad,
-            ir_pad,
-            window,
-            AuthenticationPurpose::Verify,
-            Some("login"),
-        )
-    };
-    let mut mode = measured_sequential_configuration();
-    assert!(check(&mode, true, true, true, 15000));
-    assert!(check(&mode, true, true, true, 30000));
-    for (ir, rgb_pad, ir_pad, window) in [
-        (false, true, true, 15000),
-        (true, false, true, 15000),
-        (true, true, false, 15000),
-        (true, true, true, 14999),
+    for purpose in [
+        AuthenticationPurpose::Verify,
+        AuthenticationPurpose::CredentialRelease,
     ] {
-        assert!(!check(&mode, ir, rgb_pad, ir_pad, window));
+        let check = |mode: &CaptureModeSelection, ir, rgb_pad, ir_pad, window| {
+            crate::grouped_auth::eligible_configuration(
+                mode,
+                ir,
+                rgb_pad,
+                ir_pad,
+                window,
+                purpose,
+                Some("login"),
+            )
+        };
+        let mut mode = measured_sequential_configuration();
+        assert!(check(&mode, true, true, true, 15000));
+        assert!(check(&mode, true, true, true, 30000));
+        for (ir, rgb_pad, ir_pad, window) in [
+            (false, true, true, 15000),
+            (true, false, true, 15000),
+            (true, true, false, 15000),
+            (true, true, true, 14999),
+        ] {
+            assert!(!check(&mode, ir, rgb_pad, ir_pad, window));
+        }
+        assert!(
+            !crate::grouped_auth::eligible(&mode, true, true, true, 15000, purpose, Some("login")),
+            "configuration cannot manufacture a runtime contract"
+        );
+        mode.sequential = false;
+        assert!(!check(&mode, true, true, true, 15000));
+        mode.sequential = true;
+        mode.source = ENV_CAPTURE_MODE_SOURCE;
+        assert!(!check(&mode, true, true, true, 15000));
+        mode.source = STORED_CAPTURE_MODE_SOURCE;
+        mode.qualification_state = QualificationState::QualifiedConcurrent;
+        assert!(!check(&mode, true, true, true, 15000));
+        mode.qualification_state = QualificationState::MeasuredSequential;
+        mode.operation_demoted.set(true);
+        assert!(!check(&mode, true, true, true, 15000));
     }
-    assert!(
-        !crate::grouped_auth::eligible(
-            &mode,
-            true,
-            true,
-            true,
-            15000,
-            AuthenticationPurpose::Verify,
-            Some("login")
-        ),
-        "configuration cannot manufacture a runtime contract"
-    );
-    mode.sequential = false;
-    assert!(!check(&mode, true, true, true, 15000));
-    mode.sequential = true;
-    mode.source = ENV_CAPTURE_MODE_SOURCE;
-    assert!(!check(&mode, true, true, true, 15000));
-    mode.source = STORED_CAPTURE_MODE_SOURCE;
-    mode.qualification_state = QualificationState::QualifiedConcurrent;
-    assert!(!check(&mode, true, true, true, 15000));
-    mode.qualification_state = QualificationState::MeasuredSequential;
-    mode.operation_demoted.set(true);
-    assert!(!check(&mode, true, true, true, 15000));
 }
 
 #[test]

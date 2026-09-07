@@ -1102,6 +1102,14 @@ pub enum Response {
     /// `KdeWalletKey` envelope: the password already opens it, so nothing was
     /// unsealed and nothing needs releasing.
     KeyringUnlockNotNeeded,
+    /// `UnsealPassword` was refused before face authentication because credential
+    /// release is unavailable (peer privilege, device tier, or no armed secret).
+    /// An identity-only caller may request `Authenticate`, which independently
+    /// enforces authorization and policy. This is not a face grant, and must
+    /// never represent a failed capture, denial, throttle or secret delivery.
+    UnsealUnavailable {
+        reason: String,
+    },
     /// Face matched and the TPM released the secret (`UnsealPassword` /
     /// `UnsealKeyring`).
     PasswordUnsealed {

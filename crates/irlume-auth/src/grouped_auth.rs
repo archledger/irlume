@@ -41,16 +41,26 @@ pub(super) fn eligible_configuration(
     purpose: AuthenticationPurpose,
     service: Option<&str>,
 ) -> bool {
-    // Unknown/absent services deliberately share the login eligibility default.
-    // A budget override cannot opt elevation, app consent or release into it.
-    purpose == AuthenticationPurpose::Verify
-        && matches!(
-            service.and_then(irlume_common::pam_service::classify),
-            None | Some(
-                irlume_common::pam_service::ServiceKind::Greeter
-                    | irlume_common::pam_service::ServiceKind::ScreenUnlock
-            )
+    let local_session = matches!(
+        service.and_then(irlume_common::pam_service::classify),
+        Some(
+            irlume_common::pam_service::ServiceKind::Greeter
+                | irlume_common::pam_service::ServiceKind::ScreenUnlock
         )
+    );
+    // Preserve Verify's unknown-service default. Credential release must name
+    // a recognized local login/lock service; budgets cannot widen this scope.
+    let in_scope = match purpose {
+        AuthenticationPurpose::Verify => {
+            local_session
+                || service
+                    .and_then(irlume_common::pam_service::classify)
+                    .is_none()
+        }
+        AuthenticationPurpose::CredentialRelease => local_session,
+        AuthenticationPurpose::AppConsent => false,
+    };
+    in_scope
         && mode.is_sequential()
         && mode.source == STORED_CAPTURE_MODE_SOURCE
         && !mode.operation_demoted.get()

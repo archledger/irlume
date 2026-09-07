@@ -3409,6 +3409,9 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
             }
             if matches!(req, Request::UnsealPassword { .. }) {
                 note_unseal_password_refusal(peer.uid);
+                return Some(Response::UnsealUnavailable {
+                    reason: format!("{command} requires root (peer uid {})", peer.uid),
+                });
             }
             Some(Response::Error(format!(
                 "{command} requires root (peer uid {})",
@@ -4840,9 +4843,9 @@ fn dispatch_scoped_session(
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
             if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
                 eprintln!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
-                return Response::Error(
-                    "RGB-only convenience: face cannot release the login credential".into(),
-                );
+                return Response::UnsealUnavailable {
+                    reason: "RGB-only convenience: face cannot release the login credential".into(),
+                };
             }
             // Refresh the external-camera prohibition on the credential-release
             // path too: live-read, applies to the next request.
@@ -5416,9 +5419,9 @@ fn do_unseal_password_scoped(
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
-        return Response::Error(format!(
-            "no sealed password for '{user}': run `irlume keyring arm`"
-        ));
+        return Response::UnsealUnavailable {
+            reason: format!("no sealed password for '{user}': run `irlume keyring arm`"),
+        };
     }
     // Same failure throttle as the login/sudo path: after a run of failures,
     // skip the camera and let PAM fall to the password.
@@ -7134,6 +7137,14 @@ mod tests {
                     ),
                 },
                 Privilege::RootOnly { command } => match refused {
+                    Some(Response::UnsealUnavailable { reason })
+                        if matches!(req, Request::UnsealPassword { .. }) =>
+                    {
+                        assert_eq!(
+                            reason,
+                            format!("{command} requires root (peer uid {NOBODY})")
+                        );
+                    }
                     Some(Response::Error(msg)) => assert_eq!(
                         msg,
                         format!("{command} requires root (peer uid {NOBODY})"),
@@ -10830,7 +10841,7 @@ mod tests {
             &peer(NOBODY),
             &mut e,
         ) {
-            Response::Error(msg) => {
+            Response::UnsealUnavailable { reason: msg } => {
                 assert_eq!(
                     msg,
                     format!("unseal_password requires root (peer uid {NOBODY})")
@@ -10868,7 +10879,7 @@ mod tests {
             &peer(0),
             &mut e,
         ) {
-            Response::Error(msg) => assert_eq!(
+            Response::UnsealUnavailable { reason: msg } => assert_eq!(
                 msg,
                 "RGB-only convenience: face cannot release the login credential"
             ),
@@ -10906,7 +10917,7 @@ mod tests {
         let sb = sandbox("do-unseal");
         // Nothing armed: refused before any capture or TPM traffic.
         match do_unseal_password(&user, None, &mut e) {
-            Response::Error(msg) => {
+            Response::UnsealUnavailable { reason: msg } => {
                 assert_eq!(
                     msg,
                     format!("no sealed password for '{user}': run `irlume keyring arm`")

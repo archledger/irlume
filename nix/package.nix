@@ -174,6 +174,8 @@ rustPlatform.buildRustPackage {
 
     install -Dm0644 packaging/polkit/org.irlume.enroll.policy \
       "$out/share/polkit-1/actions/org.irlume.enroll.policy"
+    install -Dm0644 packaging/polkit/org.irlume.recovery-manage.policy \
+      "$out/share/polkit-1/actions/org.irlume.recovery-manage.policy"
 
     # tmpfiles.d rule for the setgid root:video emitter-lock directory (#542);
     # the NixOS module applies it via systemd.tmpfiles.rules.

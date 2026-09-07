@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! Per-request OS authorization before trusted templates can be added.
+//! Per-request OS authorization for enrollment and recovery management.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use dbus::arg::{PropMap, Variant};
 use dbus::channel::Channel;
 use dbus::Message;
-use irlume_common::Request;
+use irlume_common::{Request, SecretBytes};
 
-use super::{peer_gone, posture, uid_of, EnrollmentEffect, Peer};
+use super::{peer_gone, posture, uid_of, Peer};
 
 const ACTION: &str = "org.irlume.enroll";
 const AUTHORITY: &str = "org.freedesktop.PolicyKit1";
@@ -25,10 +25,40 @@ const INTERFACE: &str = "org.freedesktop.PolicyKit1.Authority";
 const APPROVAL_BUDGET: Duration = Duration::from_secs(60);
 const QUEUE_FRESHNESS: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(100);
-const REFUSED: &str = "enrollment requires OS authorization; approve the system dialog or register a terminal agent with pkttyagent";
+pub(super) const REFUSED: &str = "operation requires OS authorization; approve the system dialog or register a terminal agent with pkttyagent; if the action is unavailable, repair the Irlume policy installation";
 
 pub(super) fn required(req: &Request, peer: &Peer) -> bool {
-    peer.uid != 0 && posture(req).enrollment == EnrollmentEffect::AddsTrust
+    peer.uid != 0 && approval_operation(req).is_some()
+}
+
+// Approval policy is independent of enrollment cache invalidation semantics.
+fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
+    Some(match req {
+        Request::Enroll { reset: true, .. } => (ACTION, "replace enrolled faces"),
+        Request::Enroll { .. } | Request::EnrollmentSession { improve: false, .. } => {
+            (ACTION, "enroll a face")
+        }
+        Request::AddScan { .. } | Request::EnrollmentSession { improve: true, .. } => {
+            (ACTION, "add face scans")
+        }
+        Request::RecoverySetup { .. } => (
+            "org.irlume.recovery-manage",
+            "set or replace the recovery passphrase",
+        ),
+        Request::RecoveryForget { .. } => (
+            "org.irlume.recovery-manage",
+            "erase the recovery passphrase",
+        ),
+        _ => return None,
+    })
+}
+
+// RecoverySetup contains a passphrase. Protect both the retained binding and
+// the comparison buffer; Debug redaction on Request does not affect serde.
+fn request_binding(req: &Request) -> Result<SecretBytes, String> {
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *bytes, req).map_err(|_| REFUSED)?;
+    Ok(SecretBytes::new(std::mem::take(&mut *bytes)))
 }
 
 /// An open proc directory keeps lookups on the original process even if its
@@ -121,14 +151,14 @@ fn uids_match(status: &str, uid: u32) -> bool {
 /// dispatch consumes it before it can invalidate or mutate enrollment state.
 pub(super) struct Grant {
     subject: Subject,
-    request: String,
+    request: SecretBytes,
     approved: Instant,
 }
 
 impl Grant {
     pub(super) fn consume(self, req: &Request, peer: &Peer) -> Result<(), String> {
         if self.approved.elapsed() >= QUEUE_FRESHNESS
-            || serde_json::to_string(req).map_err(|_| REFUSED)? != self.request
+            || request_binding(req)?.expose() != self.request.expose()
             || posture(req).user.and_then(uid_of) != Some(peer.uid)
         {
             return Err(REFUSED.into());
@@ -147,9 +177,7 @@ impl Pending {
     fn acquire(&self, uid: u32) -> Result<Slot<'_>, String> {
         let mut pending = self.0.lock().map_err(|_| REFUSED)?;
         if pending.len() >= 8 || !pending.insert(uid) {
-            return Err(
-                "another enrollment approval is pending; try again after it finishes".into(),
-            );
+            return Err("another Irlume approval is pending; try again after it finishes".into());
         }
         Ok(Slot { pending: self, uid })
     }
@@ -200,7 +228,7 @@ fn authorize_using(
     static PENDING: OnceLock<Pending> = OnceLock::new();
     let _slot = PENDING.get_or_init(Pending::default).acquire(peer.uid)?;
     let subject = Subject::capture(peer)?;
-    let request = serde_json::to_string(req).map_err(|_| REFUSED)?;
+    let request = request_binding(req)?;
     let deadline = Instant::now() + APPROVAL_BUDGET;
     verify(&subject, req, deadline)?;
     if peer_gone(stream) || Instant::now() >= deadline {
@@ -214,6 +242,17 @@ fn authorize_using(
     }))
 }
 
+// Tests replace only the external approval decision. Subject/request binding,
+// pending limits and freshness remain the production implementation.
+#[cfg(test)]
+pub(super) fn authorize_for_test(
+    req: &Request,
+    peer: &Peer,
+    stream: &UnixStream,
+) -> Result<Option<Grant>, String> {
+    authorize_using(req, peer, stream, |_, _, _| Ok(()))
+}
+
 fn method(owner: &str, name: &str) -> Result<Message, String> {
     Message::new_method_call(owner, OBJECT, INTERFACE, name).map_err(|_| REFUSED.into())
 }
@@ -225,16 +264,7 @@ fn approval_message(owner: &str, subject: &Subject, req: &Request) -> Result<Mes
     properties.insert("start-time".into(), Variant(Box::new(subject.start)));
     let mut details = HashMap::<String, String>::new();
     details.insert("user".into(), posture(req).user.ok_or(REFUSED)?.into());
-    let operation = match req {
-        Request::Enroll { reset: true, .. } => "replace enrolled faces",
-        Request::Enroll { .. } | Request::EnrollmentSession { improve: false, .. } => {
-            "enroll a face"
-        }
-        Request::AddScan { .. } | Request::EnrollmentSession { improve: true, .. } => {
-            "add face scans"
-        }
-        _ => return Err(REFUSED.into()),
-    };
+    let (action, operation) = approval_operation(req).ok_or(REFUSED)?;
     details.insert("operation".into(), operation.into());
     details.insert(
         "polkit.message".into(),
@@ -243,7 +273,7 @@ fn approval_message(owner: &str, subject: &Subject, req: &Request) -> Result<Mes
     // One private bus connection per request makes this cancellation ID unique
     // for its caller without exposing a token to the socket client.
     Ok(method(owner, "CheckAuthorization")?
-        .append3(("unix-process", properties), ACTION, details)
+        .append3(("unix-process", properties), action, details)
         .append2(1u32, "enrollment"))
 }
 
@@ -345,6 +375,7 @@ fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnrollmentEffect;
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
 
@@ -365,6 +396,119 @@ mod tests {
             scans: None,
             reset: false,
         }
+    }
+
+    #[test]
+    fn recovery_management_requires_approval_but_restore_and_status_do_not() {
+        let owner = Peer {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+        };
+        let root = Peer {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        for req in [
+            Request::RecoverySetup {
+                user: "alice".into(),
+                passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+            },
+            Request::RecoveryForget {
+                user: "alice".into(),
+            },
+        ] {
+            assert!(
+                required(&req, &owner),
+                "same-user recovery management needs approval"
+            );
+            assert!(!required(&req, &root), "root retains administration");
+            assert_eq!(posture(&req).enrollment, EnrollmentEffect::Mutates);
+        }
+        for req in [
+            Request::RecoveryRestore {
+                user: "alice".into(),
+                passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+            },
+            Request::RecoveryStatus {
+                user: "alice".into(),
+            },
+        ] {
+            assert!(!required(&req, &owner));
+        }
+    }
+
+    #[test]
+    fn recovery_approval_has_its_own_action_and_never_sends_the_secret_to_polkit() {
+        let peer = peer();
+        let subject = Subject::capture(&peer).unwrap();
+        for (req, operation) in [
+            (
+                Request::RecoverySetup {
+                    user: "alice".into(),
+                    passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+                },
+                "set or replace the recovery passphrase",
+            ),
+            (
+                Request::RecoveryForget {
+                    user: "alice".into(),
+                },
+                "erase the recovery passphrase",
+            ),
+        ] {
+            let message = approval_message(":1.42", &subject, &req).unwrap();
+            type Args = (
+                (String, PropMap),
+                String,
+                HashMap<String, String>,
+                u32,
+                String,
+            );
+            let (_, action, details, flags, _): Args = message.read_all().unwrap();
+            assert_eq!(action, "org.irlume.recovery-manage");
+            assert_eq!(flags, 1);
+            assert_eq!(details["user"], "alice");
+            assert_eq!(details["operation"], operation);
+            assert_eq!(
+                details.len(),
+                3,
+                "only user, operation and prompt may cross this boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_grant_redacts_binding_and_rejects_changed_secret_or_operation() {
+        let _passwd = crate::tests::passwd_lock();
+        let peer = peer();
+        let user = crate::users::name_for_uid(peer.uid).unwrap();
+        let req = Request::RecoverySetup {
+            user: user.clone(),
+            passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+        };
+        let grant = || Grant {
+            subject: Subject::capture(&peer).unwrap(),
+            request: request_binding(&req).unwrap(),
+            approved: Instant::now(),
+        };
+        assert!(
+            !format!("{:?}", grant().request).contains("RecoverySetup"),
+            "secret-bearing binding must have redacted Debug"
+        );
+        grant().consume(&req, &peer).unwrap();
+        let changed = Request::RecoverySetup {
+            user: user.clone(),
+            passphrase: irlume_common::SecretBytes::new(b"different phrase".to_vec()),
+        };
+        assert!(grant().consume(&changed, &peer).is_err());
+        assert!(grant()
+            .consume(&Request::RecoveryForget { user }, &peer)
+            .is_err());
+        let mut expired = grant();
+        expired.approved -= Duration::from_secs(16);
+        assert!(expired.consume(&req, &peer).is_err());
     }
 
     #[test]
@@ -408,7 +552,7 @@ mod tests {
         let req = request(&peer);
         let grant = || Grant {
             subject: Subject::capture(&peer).unwrap(),
-            request: serde_json::to_string(&req).unwrap(),
+            request: request_binding(&req).unwrap(),
             approved: Instant::now(),
         };
         grant().consume(&req, &peer).unwrap();
@@ -462,7 +606,7 @@ mod tests {
             );
             let grant = || Grant {
                 subject: Subject::capture(&peer).unwrap(),
-                request: serde_json::to_string(&req).unwrap(),
+                request: request_binding(&req).unwrap(),
                 approved: Instant::now(),
             };
             grant().consume(&req, &peer).unwrap();
@@ -536,13 +680,33 @@ mod tests {
     #[test]
     fn real_dbus_exchange_checks_subject_action_denial_and_cancellation() {
         let _passwd = crate::tests::passwd_lock();
-        for mode in ["allow", "deny", "malformed", "cancel", "forged"] {
+        for (mode, recovery) in ["allow", "deny", "malformed", "cancel", "forged"]
+            .into_iter()
+            .flat_map(|mode| [(mode, false), (mode, true)])
+        {
             let (_bus, address) = bus();
             let server = dbus::blocking::Connection::new_address(&address).unwrap();
             server.request_name(AUTHORITY, false, true, false).unwrap();
             let client = dbus::blocking::Connection::new_address(&address).unwrap();
             let peer = peer();
-            let req = request(&peer);
+            let req = if recovery {
+                Request::RecoverySetup {
+                    user: crate::users::name_for_uid(peer.uid).unwrap(),
+                    passphrase: SecretBytes::new(b"synthetic phrase".to_vec()),
+                }
+            } else {
+                request(&peer)
+            };
+            let expected_action = if recovery {
+                "org.irlume.recovery-manage"
+            } else {
+                "org.irlume.enroll"
+            };
+            let expected_operation = if recovery {
+                "set or replace the recovery passphrase"
+            } else {
+                "enroll a face"
+            };
             let subject = Subject::capture(&peer).unwrap();
             let expected = (subject.pid, subject.uid, subject.start);
             let expected_user = posture(&req).user.unwrap().to_owned();
@@ -568,14 +732,15 @@ mod tests {
                         );
                         let (subject, action, details, flags, cancellation): Args =
                             message.read_all().unwrap();
-                        assert_eq!(action, "org.irlume.enroll");
+                        assert_eq!(action, expected_action);
                         assert_eq!(flags, 1);
                         assert_eq!(subject.0, "unix-process");
                         assert_eq!(subject.1["pid"].0.as_u64(), Some(u64::from(expected.0)));
                         assert_eq!(subject.1["uid"].0.as_i64(), Some(i64::from(expected.1)));
                         assert_eq!(subject.1["start-time"].0.as_u64(), Some(expected.2));
                         assert_eq!(details["user"], expected_user);
-                        assert_eq!(details["operation"], "enroll a face");
+                        assert_eq!(details["operation"], expected_operation);
+                        assert_eq!(details.len(), 3);
                         assert_eq!(cancellation, "enrollment");
                         checked = true;
                         if mode == "forged" {

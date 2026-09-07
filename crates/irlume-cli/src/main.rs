@@ -1296,11 +1296,14 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
 pub(crate) fn daemon_request(
     req: &irlume_common::Request,
 ) -> Result<irlume_common::Response, String> {
-    // Enrollment allows OS approval, queue admission and the worker budget.
+    // Trust changes allow OS approval, queue admission and the worker budget.
     // Other operations keep their existing timeout, including authentication.
     let seconds = if matches!(
         req,
-        irlume_common::Request::Enroll { .. } | irlume_common::Request::AddScan { .. }
+        irlume_common::Request::Enroll { .. }
+            | irlume_common::Request::AddScan { .. }
+            | irlume_common::Request::RecoverySetup { .. }
+            | irlume_common::Request::RecoveryForget { .. }
     ) {
         380
     } else {

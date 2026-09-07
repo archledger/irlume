@@ -3778,7 +3778,7 @@ impl App {
             // Recovery: masked in-TUI entry.
             (SC_RECOVERY, KeyCode::Char('s')) => {
                 self.input = Some((
-                    "New recovery passphrase (••):".into(),
+                    "New recovery passphrase (OS approval follows):".into(),
                     String::new(),
                     Pending::RecoveryPw(None),
                 ));
@@ -3792,7 +3792,7 @@ impl App {
             }
             (SC_RECOVERY, KeyCode::Char('f')) => {
                 self.confirm = Some((
-                    "Erase the recovery passphrase? (templates stay encrypted)".into(),
+                    "Erase the recovery passphrase? OS approval follows; templates stay encrypted.".into(),
                     "Erase",
                     ConfirmAct::Daemon(Request::RecoveryForget {
                         user: self.user.clone(),

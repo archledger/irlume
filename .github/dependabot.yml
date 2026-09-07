@@ -53,6 +53,10 @@ updates:
       default-days: 7
       semver-major-days: 14
     groups:
+      # The fuzz workspace inherits the root Argon2 requirement. Updating its
+      # lockfile alone leaves the root --locked build inconsistent.
+      argon2:
+        patterns: ["argon2"]
       cargo-minor:
         update-types: ["minor", "patch"]
     commit-message:

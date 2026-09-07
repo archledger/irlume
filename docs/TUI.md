@@ -111,7 +111,7 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `login reconcile` | Diagnostics repair or F2: Reconcile login wiring |
 | login preview and `login plan/apply/verify/rollback` | F2: preview, prepared transaction, verification and rollback |
 | `bitwarden status/setup` | Login & Apps: app unlock |
-| `biopolicy`, `credential-release-challenge` | Preferences |
+| `biopolicy` | Preferences |
 | `logs`, `logs --since`, `logs -f` | Diagnostics: Show Logs; F2: history window or live follow |
 | `logs debug on/off` | Diagnostics: Toggle Debug Logs (`t`) |
 | `trace record` | Diagnostics: Record Trace (`T`); F2 accepts duration/output |

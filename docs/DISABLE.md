@@ -118,7 +118,7 @@ Missing or empty enrollment, scans belonging only to a different recognition
 model, a retired eyes-open setting, and invalid or retired consent settings end
 the request without adding or clearing strikes. Fixing those
 settings does not erase earlier face rejections or cancel an active cooldown.
-Camera-binding refusals, missing consent gestures, PAD failures and grouped
+Camera-binding refusals, PAD failures and grouped
 capture timeouts retain their existing strike behavior.
 
 A face grant or cooldown expiry resets it. Recorded failures and an active

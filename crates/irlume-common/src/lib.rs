@@ -898,13 +898,9 @@ pub enum Response {
         /// an older daemon decodes as false.
         #[serde(default)]
         refused_by_policy: bool,
-        /// True only when this refusal is a DELIBERATE head-shake decline (the
-        /// daemon's consent watch saw a shake and cancelled), never for a timeout,
-        /// a no-match, or a pre-camera policy denial. pam_irlume maps a polkit
-        /// shake-decline to `PAM_ABORT` so the agent closes its dialog; every other
-        /// non-grant stays a soft `IGNORE` that cascades to the password. Fail-safe:
-        /// a shake can only DENY, never grant. `#[serde(default)]` so an older
-        /// daemon that never sets it decodes as `false` (no abort).
+        /// Reserved compatibility field for an older daemon's explicit cancellation.
+        /// Current daemons always emit false; head gestures have been removed.
+        /// Readers may honor a legacy true value only as a denial, never a grant.
         #[serde(default)]
         declined_by_gesture: bool,
         /// The final FAILED attempt's situation, in the #616 step 2 stable

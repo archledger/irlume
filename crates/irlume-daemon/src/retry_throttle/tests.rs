@@ -143,7 +143,6 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         (Kind::NoFace, false),
         (Kind::Uncertain, false),
         (Kind::SpoofNoIrFace, false),
-        (Kind::GestureDeclined, false),
         (Kind::SetupUnavailable, false),
         (Kind::Spoof, true),
         (Kind::BelowThreshold, true),
@@ -171,11 +170,7 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         );
         if matches!(
             kind,
-            Kind::NoFace
-                | Kind::Uncertain
-                | Kind::SpoofNoIrFace
-                | Kind::GestureDeclined
-                | Kind::SetupUnavailable
+            Kind::NoFace | Kind::Uncertain | Kind::SpoofNoIrFace | Kind::SetupUnavailable
         ) {
             assert!(
                 !f.path().exists(),
@@ -224,7 +219,6 @@ fn setup_unavailable_preserves_missing_partial_and_cooldown_history() {
                 ..outcome(Kind::SetupUnavailable)
             };
             assert!(!irlume_auth::presence_retryable(&refusal));
-            assert!(!irlume_auth::is_gesture_decline(&refusal));
             for _ in 0..6 {
                 f.store
                     .record(&account_one(), POLICY, &refusal, bad_clock, before_rename)
@@ -240,53 +234,6 @@ fn setup_unavailable_preserves_missing_partial_and_cooldown_history() {
             }
             assert!(f.check());
         }
-    }
-}
-
-#[test]
-fn rate_throttle_cancellation_preserves_an_active_cooldown() {
-    let f = Fixture::new();
-    for _ in 0..3 {
-        f.record(Kind::Spoof);
-    }
-    let before = f.bytes();
-    assert!(f.saved().cooldown.is_some());
-    f.record(Kind::GestureDeclined);
-    assert!(f.check());
-    assert_eq!(
-        f.bytes(),
-        before,
-        "cancellation must neither extend nor clear cooldown"
-    );
-}
-
-#[test]
-fn rate_throttle_cancellation_does_not_add_or_clear_failures() {
-    for live in [false, true] {
-        let f = Fixture::new();
-        f.record(Kind::BelowThreshold);
-        f.record(Kind::BelowThreshold);
-        let before = f.bytes();
-        let decline = irlume_auth::Outcome {
-            live,
-            score: if live { 0.9 } else { 0.0 },
-            ..outcome(Kind::GestureDeclined)
-        };
-        for _ in 0..6 {
-            f.store
-                .record(
-                    &account_one(),
-                    POLICY,
-                    &decline,
-                    now,
-                    write_atomic_reporting,
-                )
-                .unwrap();
-            assert!(!f.check());
-            assert_eq!(f.bytes(), before);
-        }
-        f.record(Kind::BelowThreshold);
-        assert!(f.check(), "cancellation must not clear prior strikes");
     }
 }
 

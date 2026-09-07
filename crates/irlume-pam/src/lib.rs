@@ -381,61 +381,6 @@ impl PamServiceModule for IrlumePam {
                 _ => None,
             };
 
-            // An explicitly enabled head gesture is an additional gate after
-            // conventional confirmation. Tell the user only when the shared
-            // policy says that extra gate will actually run.
-            if intent_confirmation.is_some()
-                && service
-                    .as_deref()
-                    .is_some_and(irlume_common::config::service_gesture_required)
-            {
-                let policy = irlume_common::config::head_consent_policy();
-                let msg = match policy {
-                    irlume_common::config::HeadConsentPolicy::Ready => {
-                        "irlume: keep nodding your head to approve; shake your head to decline"
-                            .to_string()
-                    }
-                    irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_) => {
-                        format!("irlume: {}", policy.instruction("approve"))
-                    }
-                };
-                let _ = pamh.info(&msg);
-            }
-
-            // Same discoverability problem on the credential-release path: by
-            // default the daemon requires the deliberate gesture before it releases
-            // the sealed keyring password, and a greeter that just says "Password:"
-            // gives the user no way to know that. Shown only on the interactive
-            // greeter probe (`unseal` without `wait`): in `wait` mode KDE runs us as
-            // a parallel biometric device where an unsolicited message competes with
-            // the password field.
-            //
-            // The instruction comes from the same head-consent policy the engine
-            // gates on, so retired or malformed configuration prints its migration
-            // blocker instead of promising a gesture the daemon will refuse.
-            //
-            // Reading a root-only setting here is best-effort by design. Greeter and
-            // lock stacks run as root, so the read normally succeeds; a non-root PAM
-            // caller (a custom locker, `pamtester`) sees an unreadable file, which
-            // fails secure to ON and at worst over-instructs. It cannot obtain the
-            // credential either way, since the daemon refuses a non-root
-            // UnsealPassword.
-            if unseal && !wait && irlume_common::config::credential_release_gesture_required() {
-                let policy = irlume_common::config::head_consent_policy();
-                let how = match policy {
-                    irlume_common::config::HeadConsentPolicy::Ready => format!(
-                        "{}; shake your head to decline",
-                        policy.instruction("unlock your keyring")
-                    ),
-                    irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_) => {
-                        policy.instruction("unlock your keyring")
-                    }
-                };
-                let _ = pamh.info(&format!("irlume: {how}"));
-            }
-
             // In `wait` mode, retry until a match or the budget runs out; otherwise
             // a single attempt. Every non-SUCCESS path returns PAM_IGNORE so the
             // stack cascades to the password (NIST: a fallback must exist), with ONE
@@ -874,13 +819,6 @@ fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestat
         .ok()
         .flatten()
         .map(|s| s.to_string_lossy().into_owned());
-    // A shake aborts the stack ONLY on a polkit consent dialog. Scoped HERE, not
-    // in the daemon: the daemon reports the shake as a fact (`declined_by_gesture`);
-    // the PAM layer decides what each surface does with it. This is the SAME
-    // predicate the shake hint keys on (`wants_consent_instruction`, both = the
-    // AppConsent class), so the dialog only tells the user "shake to decline
-    // (closes the window)" where a shake actually closes it. On the greeter, lock
-    // screen, and sudo a shake stays a soft IGNORE and the password fallback lives.
     let is_polkit_consent = service
         .as_deref()
         .and_then(irlume_common::pam_service::classify)
@@ -895,11 +833,7 @@ fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestat
             live: true,
             ..
         }) => PamError::SUCCESS,
-        // A deliberate head-shake on a polkit dialog. Abort so the password module
-        // never prompts and the agent, seeing a total auth failure, closes its
-        // window (polkit ends the attempt on any non-success and hands one
-        // completed(FALSE) to the desktop agent; on this machine polkit-kde closes
-        // rather than re-prompts). Fail-safe: this branch can only DENY, never grant.
+        // Honor legacy daemons' explicit cancellation as deny-only compatibility.
         Ok(Response::AuthResult {
             granted: false,
             declined_by_gesture: true,

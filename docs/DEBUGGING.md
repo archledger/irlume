@@ -95,8 +95,7 @@ The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
 
 Authentication also has a presence grace window. On privileged services it
-starts only after hidden literal `yes`; an explicitly enabled head gesture is a
-later additional gate. Capture attempts repeat while no usable face is in frame,
+starts after PAM confirmation. Capture attempts repeat while no usable face is in frame,
 so walking up or settling into position still works (`grace:` debug lines show
 the attempts).
 The window is per-service: ~15 seconds for login and lock screens (you may be
@@ -271,10 +270,7 @@ or bbox jitter can override them on the daemon unit without a rebuild:
 A value that does not parse, is not finite, or sits outside the range its
 setting accepts is ignored: the default above stays in force and irlumed prints
 one line to the journal naming the variable and the reason. Check for that line
-before concluding a tuned threshold took effect. The same holds for
-`IRLUME_NOD_PITCH_MIN` and the retained head-shake thresholds. These are
-hardware-calibration overrides for the optional experimental gesture;
-`gesturecap capture` and `gesturecap replay` inspect the same pose classifier.
+before concluding a tuned threshold took effect.
 
 `IRLUME_DEBUG_IR` (any value) additionally logs the IR burst's
 ambient-subtraction decisions frame by frame.

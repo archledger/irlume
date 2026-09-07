@@ -4431,19 +4431,8 @@ fn dispatch_scoped_session(
                             granted: o.granted,
                             score: o.score,
                             live: o.live,
-                            // The ONE site that carries the engine outcome onto the wire:
-                            // a deliberate head-shake becomes the flag pam_irlume aborts a
-                            // polkit dialog on, and only it. Every other outcome kind, and
-                            // every policy early-return above, is false. `is_gesture_decline`
-                            // and the shared `gesture_declined` constructor are unit-tested
-                            // (a revert of the shake kind to OtherDeny fails there), but this
-                            // call site itself, and the live detection path shake ->
-                            // gesture_declined, are covered ONLY by the hardware gesture test:
-                            // nothing camera-less forces a GestureDeclined outcome through
-                            // dispatch, so a `false` slip here would pass the suite (see the
-                            // handoff's coverage gap). Evaluated before the `reason` move: it
-                            // borrows `o`, the move does not.
-                            declined_by_gesture: irlume_auth::is_gesture_decline(&o),
+                            // Reserved v1 response field; gestures are no longer produced.
+                            declined_by_gesture: false,
                             // This arm carries an engine verdict, including setup
                             // refusals before capture. Daemon policy refusals return
                             // above with refused_by_policy set.
@@ -5391,28 +5380,17 @@ fn deny_reason(r: &str) -> String {
     out
 }
 
-/// The purpose every credential release runs under. Releasing the sealed password
-/// hands over a REUSABLE secret rather than one session, so by default the face
-/// match must be followed by a deliberate gesture (a nod, or a calibrated eye
-/// closure).
-///
-/// The setting is read here, per request, so `irlume credential-release-challenge
-/// off` takes effect without a daemon restart; the engine receives the decision,
-/// not the policy lookup.
+/// Keep credential release distinct from session verification.
 fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
-    irlume_auth::AuthenticationPurpose::CredentialRelease {
-        temporal_challenge: irlume_common::config::credential_release_challenge(),
-    }
+    irlume_auth::AuthenticationPurpose::CredentialRelease
 }
 
 /// Face-verify `user` and, on a passing match, release the TPM-sealed password.
 /// The biometric check happens HERE (inside unseal), so a caller cannot get the
 /// password without a capture that clears the liveness gate and matches the
 /// enrolled templates. Clearing the gate is evidence, not proof, that a live
-/// person is present: the single-frame IR cues are defeatable by a good print
-/// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
-/// temporal consent gesture by default. We log the decision + cosine score, but
-/// never the password or its length.
+/// person is present. Automatic PAD remains required; see docs/PAD_SELFTEST.md
+/// for the measured limits. Never log the password or its length.
 #[cfg(test)]
 fn do_unseal_password(
     user: &str,
@@ -8960,78 +8938,6 @@ mod tests {
             assert!(!biopolicy_enforced(), "{falsy:?} must not enable");
         }
         std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
-        std::env::remove_var("IRLUME_CONFIG_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The POLICY read behind credential release: `temporal_challenge` tracks the
-    /// live setting so a toggle needs no daemon restart, and DEFAULT OFF means an
-    /// absent key releases the keyring with no nod (a greeter cold login / logout).
-    /// Only an explicit truthy opt-in adds the gesture.
-    ///
-    /// Scope, stated plainly: this covers the helper, not the dispatch. That
-    /// `UnsealPassword` runs under this purpose rests on
-    /// [`credential_release_purpose`] having exactly one caller,
-    /// [`do_unseal_password`], which is also the only path to
-    /// `keyring::unseal_password`. A camera-less test cannot observe the gesture
-    /// gate itself; the engine-side proof lives in irlume-auth
-    /// (`no_credential_release_failure_mode_ever_grants`) and the end-to-end proof
-    /// in irlume-pam (`pamwrap_refused_challenge_falls_through_to_the_password_module`).
-    #[test]
-    fn credential_release_purpose_defaults_to_no_challenge() {
-        use irlume_auth::AuthenticationPurpose::CredentialRelease;
-        let _g = env_lock();
-        let dir = std::env::temp_dir().join(format!("irlume-crp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
-
-        // No settings.conf at all: the challenge is OFF (the default).
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: false
-            },
-            "an absent key must release the keyring with no nod"
-        );
-        // An explicit opt-in, read live, is the only way to add it.
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=on\n",
-        )
-        .unwrap();
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: true
-            }
-        );
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=off\n",
-        )
-        .unwrap();
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: false
-            }
-        );
-        // Whatever the setting says, the purpose is never Verify or AppConsent:
-        // credential release can never be downgraded to a session-only gate.
-        for v in ["on", "off", "garbage"] {
-            std::fs::write(
-                dir.join("settings.conf"),
-                format!("credential_release_challenge={v}\n"),
-            )
-            .unwrap();
-            assert!(
-                matches!(credential_release_purpose(), CredentialRelease { .. }),
-                "'{v}' must stay a credential release"
-            );
-        }
-
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

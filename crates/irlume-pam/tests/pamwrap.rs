@@ -884,234 +884,6 @@ fn pamwrap_unseal_face_login_releases_sealed_password() {
     }
 }
 
-/// The credential-release challenge instruction, through a real PAM conversation.
-///
-/// Releasing the sealed keyring password CAN require a deliberate gesture, and a
-/// greeter that only says "Password:" gives the user no way to know that, so the
-/// module states it WHEN the gesture is required. The gate defaults OFF (a greeter
-/// cold login and logout release with no nod), so silence is the default. Two
-/// properties are pinned: the instruction appears exactly where the gesture is
-/// actually required (opted in, on a non-wait greeter), and it is silent
-/// everywhere else. A user told to nod on a screen that never asks for a nod would
-/// learn to ignore the message.
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_credential_release_challenge_instructs_only_the_greeter() {
-    const READY: &str = "keep nodding your head to unlock your keyring; shake your head to decline";
-    const DECLINE: &str = "shake your head to decline";
-    let Some(h) = Harness::try_new("crc-hint") else {
-        return;
-    };
-    // Every arm denies: the instruction is emitted before the outcome, and a deny
-    // is the case where the user most needs to know what was expected of them.
-    serve(&h.socket, |_| {
-        Response::Error("face not granted: nod your head to approve".into())
-    });
-
-    h.write_service(
-        "irlume-crc-login",
-        &[
-            h.auth_line("sufficient", "unseal"),
-            "auth required pam_permit.so".into(),
-        ],
-    );
-
-    // Default (no settings.conf): the gate is OFF, so the greeter stays silent.
-    h.write_settings(None);
-    let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-    assert!(ok, "a refused release must keep password fallback: {out}");
-    assert!(
-        !out.contains(READY),
-        "the default (off) must stay silent: {out}"
-    );
-
-    // Opted in with absent or explicit legacy `nod`: name both supported head
-    // gestures and preserve the password fallback after the daemon refusal.
-    for settings in [
-        "credential_release_challenge=1\n",
-        "credential_release_challenge=1\nconsent_gesture=nod\n",
-    ] {
-        h.write_settings(Some(settings));
-        let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-        assert!(ok, "a refused release must keep password fallback: {out}");
-        assert!(
-            out.contains(READY),
-            "a ready gate must name nod + shake: {out}"
-        );
-    }
-
-    // Retired closure and malformed settings get only their actionable blocker.
-    for (settings, blocker) in [
-        (
-            "credential_release_challenge=1\nconsent_gesture=closure\n",
-            "eye closure is retired; remove consent_gesture from settings.conf or set it to nod",
-        ),
-        (
-            "credential_release_challenge=1\nconsent_gesture=banana\n",
-            "consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod",
-        ),
-    ] {
-        h.write_settings(Some(settings));
-        let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-        assert!(ok, "a blocked release must keep password fallback: {out}");
-        assert!(
-            out.contains(blocker),
-            "a blocked gate must name its migration: {out}"
-        );
-        assert!(
-            !out.contains(READY) && !out.contains(DECLINE) && !out.contains("close your eyes"),
-            "a blocked gate must print only its migration blocker: {out}"
-        );
-    }
-
-    // Explicitly off: silent, the same as the default. Telling the user to nod
-    // would be a lie that costs them a login attempt.
-    h.write_settings(Some("credential_release_challenge=0\n"));
-    let (ok, out) = h.run("irlume-crc-login", &["authenticate"], "\n", None);
-    assert!(ok, "an opted-out release must keep fallback: {out}");
-    assert!(!out.contains(READY), "opted out must stay silent: {out}");
-
-    // Opted in, but `wait` (the KDE lock screen runs us as a parallel biometric
-    // device): an unsolicited message there competes with the password field.
-    h.write_settings(Some("credential_release_challenge=1\n"));
-    h.write_service("irlume-crc-lock", &[h.auth_line("required", "unseal wait")]);
-    let (_, out) = h.run("irlume-crc-lock", &["authenticate"], "", None);
-    assert!(!out.contains(READY), "wait mode must stay silent: {out}");
-
-    // Plain verify (sudo): releases no credential, so no gesture and no message.
-    h.write_service("irlume-crc-verify", &[h.auth_line("required", "")]);
-    let (_, out) = h.run("irlume-crc-verify", &["authenticate"], "", None);
-    assert!(!out.contains(READY), "verify must stay silent: {out}");
-}
-
-/// Conventional confirmation always comes first on polkit. The optional head
-/// instruction appears only after `yes` and only when explicitly enabled.
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_polkit_confirmation_precedes_the_optional_gesture() {
-    const APPROVE: &str = "keep nodding your head to approve";
-    const DECLINE: &str = "shake your head to decline";
-    let Some(h) = Harness::try_new("polkit-consent") else {
-        return;
-    };
-    // The instruction is emitted before the verdict, so a deny still shows it;
-    // the message is what we pin, not the outcome.
-    serve(&h.socket, |_| Response::AuthResult {
-        granted: false,
-        score: 0.0,
-        live: false,
-        reason: "face not granted".into(),
-        declined_by_gesture: false,
-        refused_by_policy: false,
-        situation: String::new(),
-    });
-
-    // A plain verify (no `unseal`) on the polkit service.
-    h.write_service("polkit-1", &[h.auth_line("required", "")]);
-
-    // Default off: `yes` reaches face auth without claiming a gesture is needed.
-    h.write_settings(None);
-    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
-    assert!(
-        out.contains(FACE_INTENT_INFO),
-        "confirmation missing: {out}"
-    );
-    assert!(
-        !out.contains(APPROVE) && !out.contains(DECLINE),
-        "default-off gesture must stay silent: {out}"
-    );
-
-    // Explicit opt-in: confirmation is followed by both gesture instructions.
-    h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=nod\n"));
-    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
-    assert!(
-        out.contains(FACE_INTENT_INFO),
-        "confirmation missing: {out}"
-    );
-    assert!(out.contains(APPROVE), "approval instruction missing: {out}");
-    assert!(out.contains(DECLINE), "decline instruction missing: {out}");
-
-    // Misconfigured mode: the instruction is a diagnostic sentence naming the bad
-    // setting; the decline clause is suppressed so it does not bury the fix.
-    h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=banana\n"));
-    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
-    assert!(
-        out.contains(
-            "consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod"
-        ),
-        "a misconfigured mode must name the bad setting: {out}"
-    );
-    assert!(
-        !out.contains(DECLINE),
-        "a misconfigured diagnostic must not carry a decline clause: {out}"
-    );
-
-    // Retired closure is blocked: print only the migration action and no gesture.
-    h.write_settings(Some(
-        "service_gesture.polkit-1=1\nconsent_gesture=closure\n",
-    ));
-    let (_, out) = h.run("polkit-1", &["authenticate"], "yes\n", None);
-    assert!(
-        out.contains(
-            "eye closure is retired; remove consent_gesture from settings.conf or set it to nod"
-        ),
-        "closure mode must name the migration action: {out}"
-    );
-    assert!(
-        !out.contains(APPROVE) && !out.contains(DECLINE) && !out.contains("close your eyes"),
-        "closure mode must print only its blocker: {out}"
-    );
-
-    // Elevation uses the same explicit additional-gesture contract.
-    h.write_settings(Some("service_gesture.sudo=1\n"));
-    h.write_service("sudo", &[h.auth_line("required", "")]);
-    let (_, out) = h.run("sudo", &["authenticate"], "yes\n", None);
-    assert!(out.contains(APPROVE) && out.contains(DECLINE), "{out}");
-}
-
-#[test]
-#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
-fn pamwrap_polkit_migration_remedy_tracks_the_environment_override() {
-    let Some(h) = Harness::try_new("polkit-consent-env") else {
-        return;
-    };
-    serve(&h.socket, |_| Response::AuthResult {
-        granted: false,
-        score: 0.0,
-        live: false,
-        reason: "face not granted".into(),
-        declined_by_gesture: false,
-        refused_by_policy: false,
-        situation: String::new(),
-    });
-    h.write_service("polkit-1", &[h.auth_line("required", "")]);
-    h.write_settings(Some("service_gesture.polkit-1=1\nconsent_gesture=nod\n"));
-
-    for (value, expected) in [
-        (
-            "closure",
-            "cannot approve: eye closure is retired; unset IRLUME_CONSENT_GESTURE or set it to nod",
-        ),
-        (
-            "banana",
-            "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or set it to nod",
-        ),
-    ] {
-        let (_, out) = h.run_with_consent_env(
-            "polkit-1",
-            &["authenticate"],
-            "yes\n",
-            None,
-            Some(value),
-        );
-        assert!(out.contains(expected), "{value}: {out}");
-        assert!(!out.contains("from settings.conf"), "{out}");
-        if value == "banana" {
-            assert!(!out.contains(value), "arbitrary value was echoed: {out}");
-        }
-    }
-}
-
 /// A head-shake on a polkit dialog ABORTS the PAM stack, so the password module
 /// after the abort=die control is never reached (and the agent closes its window).
 /// The SAME shake on a NON-polkit service, and a plain no-match on polkit, must
@@ -1831,5 +1603,41 @@ fn pamwrap_attack_situation_stays_silent_at_the_prompt() {
             "an attack-shaped situation must name nothing at the prompt \
          ({absent} leaked): {out}"
         );
+    }
+}
+
+/// Old gesture settings cannot add a prompt or prevent keyboard-confirmed face auth.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_removed_gesture_settings_do_not_change_privileged_confirmation() {
+    let Some(h) = Harness::try_new("retired-gesture") else {
+        return;
+    };
+    serve(&h.socket, |_| Response::AuthResult {
+        granted: true,
+        score: 0.9,
+        live: true,
+        reason: "match".into(),
+        declined_by_gesture: false,
+        refused_by_policy: false,
+        situation: String::new(),
+    });
+    for service in ["sudo", "polkit-1"] {
+        h.write_service(service, &[h.auth_line("required", "")]);
+        for value in ["nod", "closure", "invalid"] {
+            h.write_settings(Some(&format!(
+                "service_gesture.{service}=1\nconsent_gesture={value}\n"
+            )));
+            let (ok, out) = h.run(service, &["authenticate"], "yes\n", None);
+            assert!(ok && out.contains(FACE_INTENT_INFO), "{out}");
+            for removed in [
+                "nodding",
+                "shake your head",
+                "consent_gesture",
+                "eye closure",
+            ] {
+                assert!(!out.contains(removed), "{out}");
+            }
+        }
     }
 }

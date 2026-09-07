@@ -67,7 +67,6 @@ Conventions that apply everywhere:
 | `irlume bitwarden <status\|setup> [--apply]` | for setup | install Bitwarden's biometric-unlock polkit action, flavor-aware (flatpak/native install it; snap is snapd's job; ostree gets the layering steps); see docs/APP-INTEGRATION.md |
 | `irlume selinux <status\|load>` | for load | SELinux module for the login greeter (Fedora) |
 | `sudo irlume biopolicy <on\|off\|status>` | for on/off | the operation-class gate: when ENFORCING, a face match is accepted only for the operations its camera tier is trusted for (login and sudo require the Secure IR tier; screen unlock and app prompts stay allowed); off by default, and the password is always available either way |
-| `sudo irlume credential-release-challenge [<service>] <on\|off\|status>` | for on/off | with a privileged service (`sudo`, `su`, `doas`, `polkit-1`), toggles an additional experimental head gesture (nod to approve, shake to decline). It defaults off and never replaces the mandatory hidden `yes` PAM confirmation; enabling warns about false rejects, while disabling needs no risk confirmation. Bare, it toggles the separate default-off gesture before releasing the login-keyring credential |
 | `irlume ir-setup [--dry-run]` | yes | configure the IR emitter; rarely needed, and only ever run when you ask. Writes to the camera, so read the warning in SETUP.md. `--dry-run` lists the camera's extension units and writes nothing |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume camera-tune [--rounds N]` | yes | qualify the daemon's exact RGB+IR pair, accepted stream contracts, USB connection, delivered rates, continuity, illumination provenance, and concurrent signal retention. The versioned record selects concurrent only for that exact context; missing or changed evidence stays sequential. A successful explicit tune also clears this daemon generation's runtime degradation breaker |
@@ -91,19 +90,12 @@ bypass the daemon. Not needed for normal use.
 
 `capture`, `eval`, `irbench`, `genuine`, `calcapture`, `normprobe`,
 `liveness`, `selftest align`, `padcapture`, `padreport`, `verify`,
-`enrolldev`, `suncal`, `gesturecap`
+`enrolldev`, `suncal`
 
 Each prints its own usage line when run without arguments. `padcapture` /
 `padreport` are the presentation-attack self-test pair documented in
 [PAD_SELFTEST.md](PAD_SELFTEST.md); `suncal` is the outdoor/sunlight
 calibration analyzer.
-
-`gesturecap` captures or replays head-pose evidence with the shipped classifier:
-
-```console
-IRLUME_DEV=1 irlume gesturecap capture --label nod --det models/face_detection_yunet_2023mar.onnx --model models/glintr100.onnx --out nod.jsonl
-IRLUME_DEV=1 irlume gesturecap replay nod.jsonl
-```
 
 ## Where to go next
 

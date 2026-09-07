@@ -3287,7 +3287,7 @@ fn enrollment_mutating_user(req: &Request) -> Option<&str> {
 /// The refusal for a peer that may not act on `user`, in the wording the
 /// request's own arm used before #344 moved the check here.
 fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
-    // `ListProfiles` is the one request that can ask for a typed error, and it
+    // `ListProfiles` can ask for a typed authorization error, and it
     // only ever gets one if it asked: an older client cannot deserialize a
     // response variant it does not know, so sending one unasked breaks it
     // across the upgrade window (#93).
@@ -3302,6 +3302,18 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
         };
     }
     Response::Error(format!("not authorized to {verb} '{user}'"))
+}
+
+/// Preserve legacy replies unless the caller can understand typed errors.
+fn authentication_error(error: irlume_common::Error, structured: bool) -> Response {
+    if structured && matches!(error, irlume_common::Error::CameraBusy(_)) {
+        Response::OperationError {
+            code: irlume_common::OperationErrorCode::CameraBusy,
+            retryable: true,
+        }
+    } else {
+        Response::Error(error.to_string())
+    }
 }
 
 /// Validate the PAM assertion before startup routing, worker queueing, or any
@@ -4323,7 +4335,12 @@ fn dispatch_scoped_session(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::Authenticate { user, service, .. } => {
+        Request::Authenticate {
+            user,
+            service,
+            structured_errors,
+            ..
+        } => {
             // Root (PAM stacks) or the account owner only, from the posture
             // table. Without that gate any local peer could probe
             // Authenticate{other_user} and read the raw similarity score, a
@@ -4462,7 +4479,7 @@ fn dispatch_scoped_session(
                         }
                     },
                 ),
-                Err(e) => Response::Error(e.to_string()),
+                Err(e) => authentication_error(e, structured_errors),
             }
         }
         Request::Identify => {
@@ -6866,9 +6883,35 @@ mod tests {
         };
     }
 
+    #[test]
+    fn camera_busy_auth_error_is_opt_in_and_never_classifies_prose() {
+        use irlume_common::{Error, OperationErrorCode};
+        assert!(matches!(
+            authentication_error(Error::CameraBusy("private holder detail".into()), true),
+            Response::OperationError {
+                code: OperationErrorCode::CameraBusy,
+                retryable: true
+            }
+        ));
+        match authentication_error(Error::CameraBusy("legacy detail".into()), false) {
+            Response::Error(message) => assert_eq!(message, "hardware: legacy detail"),
+            other => panic!("legacy client got {other:?}"),
+        }
+        for error in [
+            Error::Hardware("camera busy".into()),
+            Error::NotAuthorized("camera busy".into()),
+        ] {
+            assert!(matches!(
+                authentication_error(error, true),
+                Response::Error(_)
+            ));
+        }
+    }
+
     request_catalog! {
         u, secret;
         Authenticate => Request::Authenticate {
+            structured_errors: false,
             user: u(),
             service: Some("kde".into()),
             intent_confirmation: None,
@@ -7168,6 +7211,7 @@ mod tests {
         let root = peer(0);
         let nobody = peer(NOBODY);
         let auth = |service: Option<&str>, intent_confirmation| Request::Authenticate {
+            structured_errors: false,
             user: "root".into(),
             service: service.map(str::to_string),
             intent_confirmation,
@@ -7227,6 +7271,7 @@ mod tests {
         let _g = env_lock();
         let response = dispatch_before_engine(
             Request::Authenticate {
+                structured_errors: false,
                 user: "root".into(),
                 service: Some("sudo".into()),
                 intent_confirmation: None,
@@ -7756,6 +7801,7 @@ mod tests {
         for (request, request_peer) in [
             (
                 Request::Authenticate {
+                    structured_errors: false,
                     user: "root".into(),
                     service: Some("sudo".into()),
                     intent_confirmation: None,
@@ -7764,6 +7810,7 @@ mod tests {
             ),
             (
                 Request::Authenticate {
+                    structured_errors: false,
                     user: "root".into(),
                     service: Some("sudo".into()),
                     intent_confirmation: Some(IntentAttestation::PamConversation),
@@ -7856,6 +7903,7 @@ mod tests {
             })
         };
         let request = Request::Authenticate {
+            structured_errors: false,
             user: "root".into(),
             service: Some("sudo".into()),
             intent_confirmation: Some(IntentAttestation::PamConversation),
@@ -8618,6 +8666,7 @@ mod tests {
     #[test]
     fn trace_correlation_ignores_a_client_supplied_operation_id() {
         let mut wire = serde_json::to_value(Request::Authenticate {
+            structured_errors: false,
             user: "carol".into(),
             service: Some("sudo".into()),
             intent_confirmation: None,
@@ -9191,6 +9240,7 @@ mod tests {
     fn policy_waiver_is_honoured_only_when_the_daemon_reads_the_same_policy() {
         let _g = env_lock();
         let sudo_with = |attestation| Request::Authenticate {
+            structured_errors: false,
             user: "root".into(),
             service: Some("sudo".into()),
             intent_confirmation: attestation,
@@ -9451,6 +9501,7 @@ mod tests {
                 structured_errors: false,
             },
             Request::Authenticate {
+                structured_errors: false,
                 user: "a/b".into(),
                 service: None,
                 intent_confirmation: None,
@@ -9518,6 +9569,7 @@ mod tests {
         let _ = &sb;
         match dispatch(
             Request::Authenticate {
+                structured_errors: false,
                 user: "carol".into(),
                 service: None,
                 intent_confirmation: None,
@@ -9539,6 +9591,7 @@ mod tests {
         std::env::set_var("IRLUME_METHOD_CONF", sb.dir.join("method"));
         match dispatch(
             Request::Authenticate {
+                structured_errors: false,
                 user: "carol".into(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
@@ -9581,6 +9634,7 @@ mod tests {
         for (service, class) in [("sshd", "Remote"), ("sudo", "Elevation")] {
             match dispatch(
                 Request::Authenticate {
+                    structured_errors: false,
                     user: "carol".into(),
                     service: Some(service.into()),
                     intent_confirmation: (service == "sudo")
@@ -9620,6 +9674,7 @@ mod tests {
         // capture (the devices don't exist, so reaching the camera would error).
         match dispatch(
             Request::Authenticate {
+                structured_errors: false,
                 user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
@@ -9710,6 +9765,7 @@ mod tests {
                 } else {
                     dispatch(
                         Request::Authenticate {
+                            structured_errors: false,
                             user: user.clone(),
                             service: Some("kde".into()),
                             intent_confirmation: None,
@@ -9748,6 +9804,7 @@ mod tests {
             } else {
                 dispatch(
                     Request::Authenticate {
+                        structured_errors: false,
                         user: user.clone(),
                         service: Some("kde".into()),
                         intent_confirmation: None,
@@ -9772,6 +9829,7 @@ mod tests {
         write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
         match dispatch(
             Request::Authenticate {
+                structured_errors: false,
                 user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
@@ -11561,6 +11619,7 @@ mod tests {
         // whether or not the runner's loopback nodes register as an IR pair.
         let resp = dispatch(
             Request::Authenticate {
+                structured_errors: false,
                 user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,

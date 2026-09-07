@@ -827,6 +827,7 @@ fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestat
         .and_then(irlume_common::pam_service::classify)
         .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
     match request(&Request::Authenticate {
+        structured_errors: false,
         user: user.to_string(),
         service,
         intent_confirmation,

@@ -472,6 +472,7 @@ fn pamwrap_privileged_yes_prompts_once_and_attests_every_service() {
     for (request, expected_service) in reqs.iter().zip(services) {
         match request {
             Request::Authenticate {
+                structured_errors: false,
                 user,
                 service,
                 intent_confirmation,

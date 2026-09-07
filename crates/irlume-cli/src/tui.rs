@@ -2976,7 +2976,20 @@ impl App {
             ),
             Suspend::MoreAction(invocation) => {
                 let args = invocation.args(&self.user);
-                if invocation.action.root {
+                if invocation.action.args == ["auth", "test", "--events=jsonl"] {
+                    println!("Look at the camera for the authentication test.");
+                    match actions::auth_test_feedback(
+                        std::process::Command::new(Self::self_exe())
+                            .args(&args)
+                            .output(),
+                    ) {
+                        Ok(true) => self.log('✓', "Face authentication succeeded."),
+                        Ok(false) => self.set_error(
+                            "Face authentication did not succeed. You can retry the test.",
+                        ),
+                        Err(message) => self.set_error(message),
+                    }
+                } else if invocation.action.root {
                     let mut command = vec!["irlume"];
                     command.extend(args.iter().map(String::as_str));
                     self.sudo_step(invocation.action.label, &command);

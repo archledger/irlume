@@ -240,12 +240,17 @@
             "daemon-unavailable",
             "not-authorized",
             "operation-failed",
-            "protocol-error"
+            "protocol-error",
+            "camera-busy"
           ]
         },
         "retryable": {
           "description": "Whether an identical request could plausibly succeed later with nothing changed by the caller. Not a promise, and it carries no suggested delay.",
           "type": "boolean"
+        },
+        "message": {
+          "type": "string",
+          "description": "Optional human guidance generated from a known error code, never daemon prose. Use code for decisions."
         }
       }
     },

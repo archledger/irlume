@@ -125,13 +125,6 @@ pub fn decide(class: OperationClass, tier: Tier) -> Action {
     }
 }
 
-/// Legacy classification retained for callers that distinguish app consent.
-/// Current gesture policy does not use this as a default: every head gesture is
-/// explicit-only, while privileged intent comes from PAM keyboard confirmation.
-pub fn requires_consent_gesture(class: OperationClass) -> bool {
-    matches!(class, OperationClass::AppConsent)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,19 +244,5 @@ mod tests {
             decide(OperationClass::AppConsent, Tier::Convenience),
             Action::Deny
         );
-    }
-
-    #[test]
-    fn legacy_consent_classifier_marks_only_polkit() {
-        assert!(requires_consent_gesture(classify(
-            "polkit-1",
-            SessionState::Cold
-        )));
-        for svc in ["sudo", "kde", "plasmalogin", "sshd", "nonsense"] {
-            assert!(
-                !requires_consent_gesture(classify(svc, SessionState::Cold)),
-                "{svc}"
-            );
-        }
     }
 }

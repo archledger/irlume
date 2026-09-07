@@ -150,13 +150,9 @@ client carries an additive typed assertion that the daemon validates against
 the shared service class and `SO_PEERCRED`. The assertion is not cryptographic
 proof against root or a compromised conversation provider.
 
-Head gesture is a separate, optional policy gate. Every service defaults off;
-an explicit opt-in adds repeated-nod approval and head-shake decline after
-privileged keyboard confirmation. It uses the primary detector's five
-landmarks, is experimental rather than population-qualified, and cannot bypass
-capture, matching, passive PAD, camera binding, rate limiting, or biopolicy.
-Greeter, lock, and cold-keyring release keep their separate default-off gesture
-policy. See [ADR-0010](adr/0010-conventional-face-intent-confirmation.md).
+Head gestures have been removed. Face matching, passive PAD, camera binding,
+retry limits, and operation-class policy remain the authentication boundaries.
+See [the migration notes](HEAD-GESTURE-REMOVAL.md).
 
 ## IR capture: strobe and ambient subtraction
 

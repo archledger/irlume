@@ -95,8 +95,7 @@ The same switch works per-run for CLI dev tools: `IRLUME_LOG=debug IRLUME_DEV=1
 irlume verify`.
 
 Authentication also has a presence grace window. On privileged services it
-starts only after hidden literal `yes`; an explicitly enabled head gesture is a
-later additional gate. Capture attempts repeat while no usable face is in frame,
+starts after PAM confirmation. Capture attempts repeat while no usable face is in frame,
 so walking up or settling into position still works (`grace:` debug lines show
 the attempts).
 The window is per-service: ~15 seconds for login and lock screens (you may be
@@ -106,6 +105,24 @@ face, off-angle, or the transient "RGB face / no IR face" a user makes while
 settling); a below-threshold match or a real spoof verdict settles immediately.
 `IRLUME_GRACE_MS` on the daemon overrides both windows; `0` restores the old
 one-shot behavior.
+
+When grouped authentication expires before complete evidence is accepted, its
+final situation is `timed out`. PAM says "authentication timed out; use your
+password". The detailed refusal reason remains in the daemon reply and journal;
+the debug `attempt:` line retains the available framing measurements alongside
+the timeout label. Those measurements describe the captured evidence, but do
+not replace the deadline as the reason for this refusal. Other denials retain
+their existing situation labels and retry rules. Grouped expiry still counts
+as one completed refusal for the account throttle. An ordinary grace-window
+expiry retains its last outcome and existing accounting.
+
+Required PAD evidence that is unavailable, fails inference or was not evaluated,
+and IR formats that cannot measure exposure, report `unavailable` when they are
+the deciding refusal. PAM says "face authentication unavailable; use your
+password" instead of deriving framing advice from incomplete evidence. These
+remain terminal, counted refusals. Existing spoof, consent and camera-binding
+precedence, optional modalities and ordinary retryable quality failures keep
+their behavior; the label does not classify every camera or engine error.
 
 **Security note: treat tracing as a diagnostic session, not a resident
 setting.** While tracing is on, *denied* attempts log their exact match score
@@ -253,10 +270,7 @@ or bbox jitter can override them on the daemon unit without a rebuild:
 A value that does not parse, is not finite, or sits outside the range its
 setting accepts is ignored: the default above stays in force and irlumed prints
 one line to the journal naming the variable and the reason. Check for that line
-before concluding a tuned threshold took effect. The same holds for
-`IRLUME_NOD_PITCH_MIN` and the retained head-shake thresholds. These are
-hardware-calibration overrides for the optional experimental gesture;
-`gesturecap capture` and `gesturecap replay` inspect the same pose classifier.
+before concluding a tuned threshold took effect.
 
 `IRLUME_DEBUG_IR` (any value) additionally logs the IR burst's
 ambient-subtraction decisions frame by frame.

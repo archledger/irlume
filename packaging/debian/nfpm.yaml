@@ -29,6 +29,8 @@ depends:
   # The bundled TFLite runtime is C++; its GLIBCXX floor is asserted by
   # build-deb.sh against the GCC-12-era baseline of the declared systems.
   - libstdc++6
+  - polkitd | policykit-1
+  - libdbus-1-3
   - libpam0g
   - libtss2-esys-3.0.2-0 | libtss2-esys-3.0.2-0t64
   # tctildr is the TCTI loader the binary links directly; it is NOT pulled in
@@ -40,6 +42,10 @@ recommends:
   - fprintd
 
 contents:
+  - src: ../polkit/org.irlume.enroll.policy
+    dst: /usr/share/polkit-1/actions/org.irlume.enroll.policy
+  - src: ../polkit/org.irlume.recovery-manage.policy
+    dst: /usr/share/polkit-1/actions/org.irlume.recovery-manage.policy
   - src: ../../target/release/irlumed
     dst: /usr/bin/irlumed
   - src: ../../target/release/irlume

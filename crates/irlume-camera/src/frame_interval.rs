@@ -623,55 +623,75 @@ pub fn frame_interval_capabilities(
     width: u32,
     height: u32,
 ) -> Result<FrameIntervalDomain, FrameIntervalError> {
-    let query = FrameIntervalQuery::new(fourcc, width, height)?;
-    crate::verify_pinned(device).map_err(|error| FrameIntervalError::Device {
-        device: device.to_owned(),
-        message: error.to_string(),
-    })?;
-    let permit = crate::lease::permit_for_endpoint(
-        device,
-        crate::lease::CameraOperationKind::Diagnostics,
-        std::time::Duration::from_secs(2),
-    )
-    .map_err(|error| FrameIntervalError::Device {
-        device: device.to_owned(),
-        message: error.to_string(),
-    })?;
-    permit
-        .require_endpoint(device)
-        .map_err(|error| FrameIntervalError::Device {
-            device: device.to_owned(),
-            message: error.to_string(),
-        })?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(device)
-        .map_err(|error| FrameIntervalError::Device {
-            device: device.to_owned(),
-            message: error.to_string(),
-        })?;
-    let mut source = DirectSource { file };
-    let domain = enumerate_via(query, &mut source).map_err(|error| error.with_device(device))?;
-    permit
-        .require_endpoint(device)
-        .map_err(|error| FrameIntervalError::Device {
-            device: device.to_owned(),
-            message: error.to_string(),
-        })?;
-    Ok(domain)
+    entrypoint_via(device, fourcc, width, height, &mut DeviceEntrypoint)
 }
 
-#[cfg(test)]
+// One lifecycle for the real endpoint and deterministic tests. The owned permit
+// stays alive until enumeration and the final coverage check have completed.
 trait EntrypointHooks {
+    type Permit;
     type Source: RecordSource;
 
     fn verify(&mut self, device: &str) -> Result<(), FrameIntervalError>;
-    fn permit(&mut self, device: &str) -> Result<(), FrameIntervalError>;
-    fn require_endpoint(&mut self, device: &str) -> Result<(), FrameIntervalError>;
+    fn permit(&mut self, device: &str) -> Result<Self::Permit, FrameIntervalError>;
+    fn require_endpoint(
+        &mut self,
+        permit: &Self::Permit,
+        device: &str,
+    ) -> Result<(), FrameIntervalError>;
     fn open(&mut self, device: &str) -> Result<Self::Source, FrameIntervalError>;
 }
 
-#[cfg(test)]
+struct DeviceEntrypoint;
+
+impl EntrypointHooks for DeviceEntrypoint {
+    type Permit = crate::lease::CameraLease;
+    type Source = DirectSource;
+
+    fn verify(&mut self, device: &str) -> Result<(), FrameIntervalError> {
+        crate::verify_pinned(device).map_err(|error| FrameIntervalError::Device {
+            device: device.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn permit(&mut self, device: &str) -> Result<Self::Permit, FrameIntervalError> {
+        crate::lease::permit_for_endpoint(
+            device,
+            crate::lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|error| FrameIntervalError::Device {
+            device: device.to_owned(),
+            message: error.to_string(),
+        })
+    }
+
+    fn require_endpoint(
+        &mut self,
+        permit: &Self::Permit,
+        device: &str,
+    ) -> Result<(), FrameIntervalError> {
+        permit
+            .require_endpoint(device)
+            .map_err(|error| FrameIntervalError::Device {
+                device: device.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    fn open(&mut self, device: &str) -> Result<Self::Source, FrameIntervalError> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(device)
+            .map(|file| DirectSource { file })
+            .map_err(|error| FrameIntervalError::Device {
+                device: device.to_owned(),
+                message: error.to_string(),
+            })
+    }
+}
+
 fn entrypoint_via<H: EntrypointHooks>(
     device: &str,
     fourcc: [u8; 4],
@@ -681,11 +701,11 @@ fn entrypoint_via<H: EntrypointHooks>(
 ) -> Result<FrameIntervalDomain, FrameIntervalError> {
     let query = FrameIntervalQuery::new(fourcc, width, height)?;
     hooks.verify(device)?;
-    hooks.permit(device)?;
-    hooks.require_endpoint(device)?;
+    let permit = hooks.permit(device)?;
+    hooks.require_endpoint(&permit, device)?;
     let mut source = hooks.open(device)?;
-    let domain = enumerate_via(query, &mut source)?;
-    hooks.require_endpoint(device)?;
+    let domain = enumerate_via(query, &mut source).map_err(|error| error.with_device(device))?;
+    hooks.require_endpoint(&permit, device)?;
     Ok(domain)
 }
 
@@ -1035,117 +1055,186 @@ mod tests {
         );
     }
 
+    struct TestPermit(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for TestPermit {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("release");
+        }
+    }
+
+    struct LoggedSource {
+        source: FixtureSource,
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl RecordSource for LoggedSource {
+        fn record(
+            &mut self,
+            query: FrameIntervalQuery,
+            index: u32,
+        ) -> Result<RawRecord, std::io::Error> {
+            self.log.borrow_mut().push("record");
+            self.source.record(query, index)
+        }
+    }
+
+    impl Drop for LoggedSource {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push("close");
+        }
+    }
+
     struct Hooks {
         log: Rc<RefCell<Vec<&'static str>>>,
         source: Option<FixtureSource>,
         coverage: VecDeque<Result<(), FrameIntervalError>>,
+        fail_at: Option<&'static str>,
+    }
+
+    impl Hooks {
+        fn new(last_errno: i32) -> Self {
+            Self {
+                log: Rc::new(RefCell::new(Vec::new())),
+                source: Some(FixtureSource::new([
+                    Ok(discrete(0, interval(1, 30))),
+                    Err(errno(last_errno)),
+                ])),
+                coverage: [Ok(()), Ok(())].into(),
+                fail_at: None,
+            }
+        }
+
+        fn step(&mut self, device: &str, name: &'static str) -> Result<(), FrameIntervalError> {
+            assert_eq!(device, "/dev/video-test");
+            self.log.borrow_mut().push(name);
+            if self.fail_at == Some(name) {
+                Err(FrameIntervalError::Device {
+                    device: device.into(),
+                    message: name.into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
     }
 
     impl EntrypointHooks for Hooks {
-        type Source = FixtureSource;
+        type Permit = TestPermit;
+        type Source = LoggedSource;
 
-        fn verify(&mut self, _device: &str) -> Result<(), FrameIntervalError> {
-            self.log.borrow_mut().push("verify");
-            Ok(())
+        fn verify(&mut self, device: &str) -> Result<(), FrameIntervalError> {
+            self.step(device, "verify")
         }
 
-        fn permit(&mut self, _device: &str) -> Result<(), FrameIntervalError> {
-            self.log.borrow_mut().push("permit");
-            Ok(())
+        fn permit(&mut self, device: &str) -> Result<Self::Permit, FrameIntervalError> {
+            self.step(device, "permit")?;
+            Ok(TestPermit(Rc::clone(&self.log)))
         }
 
-        fn require_endpoint(&mut self, _device: &str) -> Result<(), FrameIntervalError> {
-            self.log.borrow_mut().push("coverage");
+        fn require_endpoint(
+            &mut self,
+            _permit: &Self::Permit,
+            device: &str,
+        ) -> Result<(), FrameIntervalError> {
+            self.step(device, "coverage")?;
             self.coverage
                 .pop_front()
                 .expect("fixture must cover every endpoint check")
         }
 
-        fn open(&mut self, _device: &str) -> Result<Self::Source, FrameIntervalError> {
-            self.log.borrow_mut().push("open");
-            Ok(self.source.take().unwrap())
+        fn open(&mut self, device: &str) -> Result<Self::Source, FrameIntervalError> {
+            self.step(device, "open")?;
+            Ok(LoggedSource {
+                source: self.source.take().unwrap(),
+                log: Rc::clone(&self.log),
+            })
         }
     }
 
     #[test]
     fn entrypoint_orders_guards_and_never_returns_partial_capabilities() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let source =
-            FixtureSource::new([Ok(discrete(0, interval(1, 30))), Err(errno(libc::EINVAL))]);
-        let mut hooks = Hooks {
-            log: Rc::clone(&log),
-            source: Some(source),
-            coverage: [Ok(()), Ok(())].into(),
-        };
-        entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut hooks).unwrap();
+        let mut hooks = Hooks::new(libc::EINVAL);
+        let domain = entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut hooks).unwrap();
+        assert_eq!(domain.discrete_values().unwrap(), &[interval(1, 30)]);
         assert_eq!(
-            &*log.borrow(),
-            &["verify", "permit", "coverage", "open", "coverage"]
+            &*hooks.log.borrow(),
+            &[
+                "verify", "permit", "coverage", "open", "record", "record", "coverage", "close",
+                "release"
+            ]
         );
 
-        let zero_log = Rc::new(RefCell::new(Vec::new()));
-        let mut zero_hooks = Hooks {
-            log: Rc::clone(&zero_log),
-            source: None,
-            coverage: VecDeque::new(),
-        };
-        assert_eq!(
-            entrypoint_via("/dev/video-test", *b"YUYV", 0, 480, &mut zero_hooks),
-            Err(FrameIntervalError::ZeroWidth)
-        );
-        assert!(zero_log.borrow().is_empty());
-
-        let zero_height_log = Rc::new(RefCell::new(Vec::new()));
-        let mut zero_height_hooks = Hooks {
-            log: Rc::clone(&zero_height_log),
-            source: None,
-            coverage: VecDeque::new(),
-        };
-        assert_eq!(
-            entrypoint_via("/dev/video-test", *b"YUYV", 640, 0, &mut zero_height_hooks),
-            Err(FrameIntervalError::ZeroHeight)
-        );
-        assert!(zero_height_log.borrow().is_empty());
-
-        let fail_log = Rc::new(RefCell::new(Vec::new()));
-        let source =
-            FixtureSource::new([Ok(discrete(0, interval(1, 30))), Err(errno(libc::ENODEV))]);
-        let mut fail_hooks = Hooks {
-            log: Rc::clone(&fail_log),
-            source: Some(source),
-            coverage: [Ok(())].into(),
-        };
+        let mut fail_hooks = Hooks::new(libc::ENODEV);
         assert!(matches!(
             entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut fail_hooks),
-            Err(FrameIntervalError::Io { .. })
+            Err(FrameIntervalError::Io { device: Some(device), index: 1, errno: Some(libc::ENODEV), .. })
+                if device == "/dev/video-test"
         ));
         assert_eq!(
-            &*fail_log.borrow(),
-            &["verify", "permit", "coverage", "open"]
+            &*fail_hooks.log.borrow(),
+            &["verify", "permit", "coverage", "open", "record", "record", "close", "release"]
         );
 
-        let post_log = Rc::new(RefCell::new(Vec::new()));
-        let source =
-            FixtureSource::new([Ok(discrete(0, interval(1, 30))), Err(errno(libc::EINVAL))]);
-        let mut post_hooks = Hooks {
-            log: Rc::clone(&post_log),
-            source: Some(source),
-            coverage: [
-                Ok(()),
+        let mut post_hooks = Hooks::new(libc::EINVAL);
+        let stale = FrameIntervalError::Device {
+            device: "/dev/video-test".into(),
+            message: "stale endpoint".into(),
+        };
+        post_hooks.coverage = [Ok(()), Err(stale.clone())].into();
+        assert_eq!(
+            entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut post_hooks),
+            Err(stale)
+        );
+        assert_eq!(
+            &*post_hooks.log.borrow(),
+            &[
+                "verify", "permit", "coverage", "open", "record", "record", "coverage", "close",
+                "release"
+            ]
+        );
+    }
+
+    #[test]
+    fn entrypoint_invalid_geometry_has_no_device_side_effects() {
+        for (width, height, expected) in [
+            (0, 480, FrameIntervalError::ZeroWidth),
+            (640, 0, FrameIntervalError::ZeroHeight),
+        ] {
+            let mut hooks = Hooks::new(libc::EINVAL);
+            assert_eq!(
+                entrypoint_via("/dev/video-test", *b"YUYV", width, height, &mut hooks),
+                Err(expected.clone())
+            );
+            assert!(hooks.log.borrow().is_empty());
+            assert_eq!(
+                frame_interval_capabilities("/dev/video-test", *b"YUYV", width, height),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn entrypoint_stops_before_device_access_on_guard_or_open_failure() {
+        for (stage, expected) in [
+            ("verify", vec!["verify"]),
+            ("permit", vec!["verify", "permit"]),
+            ("coverage", vec!["verify", "permit", "coverage", "release"]),
+            (
+                "open",
+                vec!["verify", "permit", "coverage", "open", "release"],
+            ),
+        ] {
+            let mut hooks = Hooks::new(libc::EINVAL);
+            hooks.fail_at = Some(stage);
+            assert_eq!(
+                entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut hooks),
                 Err(FrameIntervalError::Device {
                     device: "/dev/video-test".into(),
-                    message: "stale endpoint".into(),
-                }),
-            ]
-            .into(),
-        };
-        assert!(matches!(
-            entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut post_hooks),
-            Err(FrameIntervalError::Device { .. })
-        ));
-        assert_eq!(
-            &*post_log.borrow(),
-            &["verify", "permit", "coverage", "open", "coverage"]
-        );
+                    message: stage.into(),
+                })
+            );
+            assert_eq!(&*hooks.log.borrow(), &expected);
+        }
     }
 }

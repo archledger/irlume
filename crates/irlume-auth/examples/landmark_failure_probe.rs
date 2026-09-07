@@ -26,7 +26,6 @@
 //!                  if the file is missing)
 
 use irlume_auth::eye_glint;
-use irlume_liveness::{detect_head_gesture, PoseSample};
 use irlume_vision::align::{align_to_arcface, RgbView};
 use irlume_vision::{head_pose, FaceMesh, Landmarks5};
 
@@ -157,23 +156,7 @@ fn main() {
         );
     }
 
-    println!("\n## B. Head-pose stream consumer\n");
-    let pose_stream = |p: Option<f32>| -> Vec<PoseSample> {
-        (0..40)
-            .map(|i| PoseSample {
-                idx: i,
-                pitch_frac: p,
-                yaw_signed: p.map(|_| 0.0),
-                bri: 120.0,
-            })
-            .collect()
-    };
-    println!(
-        "- detect_head_gesture over pitch=NaN: **{:?}**  ·  over pitch=0.5 constant (degenerate-geometry default): **{:?}**",
-        detect_head_gesture(&pose_stream(Some(f32::NAN))),
-        detect_head_gesture(&pose_stream(Some(0.5))),
-    );
-    println!("\n## C. FaceMesh.landmarks() against pathological detector boxes\n");
+    println!("\n## B. FaceMesh.landmarks() against pathological detector boxes\n");
     let mesh_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "models/face_landmark.onnx".into());

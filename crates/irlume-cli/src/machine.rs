@@ -2306,6 +2306,9 @@ fn profiles_data(profiles: Vec<ProfileSummary>, _require_eyes_open: bool) -> Val
             if let Some(recognizers) = recognizers {
                 obj["recognizers"] = json!(recognizers);
             }
+            if let Some(ir) = profile.ir {
+                obj["ir"] = json!(ir);
+            }
             obj
         })
         .collect::<Vec<_>>();
@@ -2326,6 +2329,22 @@ fn profiles_data(profiles: Vec<ProfileSummary>, _require_eyes_open: bool) -> Val
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn profile_ir_machine_data_preserves_reported_counts_and_omits_unknown() {
+        let old: ProfileSummary = serde_json::from_str(r#"{"name":"P","scans":["s"]}"#).unwrap();
+        let absent = profiles_data(vec![old.clone()], false);
+        assert!(absent["profiles"][0].get("ir").is_none());
+        let mut p = old;
+        p.ir = Some(irlume_common::ProfileIrSummary {
+            compatible_scans: 2,
+            unknown_scans: 1,
+            calibration_withheld: true,
+            ..Default::default()
+        });
+        let expected = serde_json::to_value(&p.ir).unwrap();
+        assert_eq!(profiles_data(vec![p], false)["profiles"][0]["ir"], expected);
+    }
 
     /// A refusal that never looked at a face must not be reported as a liveness
     /// verdict.
@@ -2476,6 +2495,7 @@ mod tests {
                 scans: vec!["s1".into(), "s2".into()],
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             }],
             false,
         );
@@ -2494,6 +2514,7 @@ mod tests {
                 scans: vec![],
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             }],
             false,
         );
@@ -2521,6 +2542,7 @@ mod tests {
                 scans: vec!["s1".into()],
                 scans_by_recognizer: counts,
                 live_recognizer: Some("embed:model-b".into()),
+                ir: None,
             }],
             false,
         );
@@ -3141,6 +3163,7 @@ mod tests {
                 scans: vec!["Scan 1".into()],
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             }],
             true,
         );

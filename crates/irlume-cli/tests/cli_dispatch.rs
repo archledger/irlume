@@ -205,6 +205,7 @@ fn one_profile() -> Vec<ProfileSummary> {
         scans: vec!["Scan 1".into(), "Scan 2".into()],
         scans_by_recognizer: Default::default(),
         live_recognizer: None,
+        ir: None,
     }]
 }
 
@@ -309,201 +310,6 @@ fn status_empty_legacy_enrollment_keeps_the_targeted_cleanup() {
             && out.contains("sudo irlume profiles eyes-open off --user 'tester'"),
         "{out}"
     );
-}
-
-// The credential-release challenge command: DEFAULT-OFF reporting, the root gate,
-// and the global toggle. Off is the default (a greeter cold login and logout
-// release the keyring with no nod), so neither direction confirms or warns; the
-// exact strings a user acts on are pinned here.
-#[test]
-fn credential_release_challenge_reports_defaults_and_toggles() {
-    let sb = Sandbox::new("crc");
-    let cfg = sb.path("cfg/settings.conf");
-    let cmd = "credential-release-challenge";
-
-    // No settings.conf at all: defaults shown, and status never fails.
-    let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
-    assert_eq!(code, 0);
-    assert!(
-        out.contains("sudo: Face confirmation: keyboard required"),
-        "{out}"
-    );
-    assert!(
-        out.contains("sudo: Additional head gesture: off (default)"),
-        "{out}"
-    );
-    assert!(
-        out.contains("polkit-1: Face confirmation: keyboard required"),
-        "{out}"
-    );
-    assert!(
-        out.contains("polkit-1: Additional head gesture: off (default)"),
-        "{out}"
-    );
-    assert!(out.contains("credential_release: off (default)"), "{out}");
-    assert!(
-        out.contains("global credential_release_challenge: off (default)"),
-        "{out}"
-    );
-
-    // No subcommand behaves as status (same as `irlume biopolicy`).
-    let (code, out, _) = run(&mut sb.cmd(&[cmd]), cmd);
-    assert_eq!(code, 0);
-    assert!(out.contains("sudo:"), "{out}");
-
-    // The per-service status form, still with no settings.conf. The usage
-    // line has always promised `[<service>] <on|off|status>`, and the TUI,
-    // setup and doctor all teach it, but the parser accepted only
-    // `<svc> on|off`: the exact command four surfaces recommended exited 2.
-    let (code, out, _) = run(&mut sb.cmd(&[cmd, "sudo", "status"]), cmd);
-    assert_eq!(code, 0, "the taught per-service form must work: {out}");
-    assert!(
-        out.contains("sudo: Face confirmation: keyboard required"),
-        "{out}"
-    );
-    assert!(
-        out.contains("sudo: Additional head gesture: off (default)"),
-        "{out}"
-    );
-    assert!(
-        !out.contains("polkit-1:"),
-        "one service asked, one service answered: {out}"
-    );
-    // A service without a verb is still a usage error, not a guess.
-    let (code, _, err) = run(&mut sb.cmd(&[cmd, "sudo"]), cmd);
-    assert_eq!(code, 2, "{err}");
-
-    // Opted IN globally: the global state and the keyring line show REQUIRED.
-    std::fs::write(&cfg, "credential_release_challenge=1\n").unwrap();
-    let (code, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
-    assert_eq!(code, 0);
-    assert!(
-        out.contains("global credential_release_challenge: REQUIRED"),
-        "{out}"
-    );
-    assert!(out.contains("credential_release: REQUIRED"), "{out}");
-
-    // An unrecognized value reads as the default (off), not on.
-    std::fs::write(&cfg, "credential_release_challenge=enabled\n").unwrap();
-    let (_, out, _) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
-    assert!(
-        out.contains("global credential_release_challenge: off (default)"),
-        "a typo must read as the default (off):\n{out}"
-    );
-
-    // Bad subcommand: usage, exit 2, and nothing written.
-    let (code, _, err) = run(&mut sb.cmd(&[cmd, "maybe"]), cmd);
-    assert_eq!(code, 2);
-    assert!(
-        err.contains("usage: irlume credential-release-challenge"),
-        "{err}"
-    );
-
-    if !is_root() {
-        // Writing needs root, and says the command to re-run.
-        for v in ["on", "off"] {
-            let (code, _, err) = run(&mut sb.cmd(&[cmd, v]), cmd);
-            assert_eq!(code, 1, "{v} must refuse without root");
-            assert!(
-                err.contains(&format!("sudo irlume credential-release-challenge {v}")),
-                "{err}"
-            );
-        }
-        // The refusal must not have touched the file.
-        assert!(
-            std::fs::read_to_string(&cfg).unwrap().contains("=enabled"),
-            "a refused write must leave settings.conf alone"
-        );
-        return;
-    }
-
-    // Running as root (containerized CI): the global toggle needs no confirm in
-    // either direction. `on` adds the opt-in gesture; `off` returns to the default.
-    let (code, out, _) = run(&mut sb.cmd(&[cmd, "on"]), cmd);
-    assert_eq!(code, 0);
-    assert!(out.contains("REQUIRED") && out.contains("nod"), "{out}");
-    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=1"));
-
-    let (code, out, _) = run(&mut sb.cmd(&[cmd, "off"]), cmd);
-    assert_eq!(code, 0);
-    assert!(out.contains("off (the default)"), "{out}");
-    assert!(std::fs::read_to_string(&cfg).unwrap().contains("=0"));
-
-    // Per-service gesture is only an experimental additional gate. Enabling
-    // warns about false rejects; disabling is direct and explicitly preserves
-    // mandatory keyboard confirmation.
-    let (code, out, err) = run(&mut sb.cmd(&[cmd, "sudo", "on"]), cmd);
-    assert_eq!(code, 0, "{out}{err}");
-    let text = format!("{out}{err}");
-    assert!(text.contains("experimental"), "{text}");
-    assert!(text.contains("may reject valid attempts"), "{text}");
-    assert!(!text.contains("face match alone"), "{text}");
-    assert!(std::fs::read_to_string(&cfg)
-        .unwrap()
-        .contains("service_gesture.sudo=1"));
-
-    let (code, out, err) = run(&mut sb.cmd(&[cmd, "sudo", "off"]), cmd);
-    assert_eq!(code, 0, "{out}{err}");
-    let text = format!("{out}{err}");
-    assert!(
-        text.contains("keyboard confirmation remains required"),
-        "{text}"
-    );
-    assert!(!text.contains("WARNING: Disabling"), "{text}");
-    assert!(std::fs::read_to_string(&cfg)
-        .unwrap()
-        .contains("service_gesture.sudo=0"));
-}
-
-#[test]
-fn credential_release_status_names_the_winning_gesture_migration_source() {
-    let sb = Sandbox::new("crc-source");
-    let cfg = sb.path("cfg/settings.conf");
-    let cmd = "credential-release-challenge";
-
-    for (value, expected) in [
-        (
-            "closure",
-            "cannot approve: eye closure is retired; remove consent_gesture from settings.conf or set it to nod",
-        ),
-        (
-            "banana",
-            "cannot approve: consent_gesture is invalid; remove consent_gesture from settings.conf or set it to nod",
-        ),
-    ] {
-        std::fs::write(&cfg, format!("consent_gesture={value}\n")).unwrap();
-        let (code, out, err) = run(&mut sb.cmd(&[cmd, "status"]), cmd);
-        assert_eq!(code, 0, "{err}");
-        assert!(out.contains(expected), "{value}: {out}");
-        assert!(!out.contains("unset IRLUME_CONSENT_GESTURE"), "{out}");
-        if value == "banana" {
-            assert!(!err.contains(value), "arbitrary value was echoed: {err}");
-        }
-    }
-
-    std::fs::write(&cfg, "consent_gesture=nod\n").unwrap();
-    for (value, expected) in [
-        (
-            "closure",
-            "cannot approve: eye closure is retired; unset IRLUME_CONSENT_GESTURE or set it to nod",
-        ),
-        (
-            "banana",
-            "cannot approve: consent_gesture is invalid; unset IRLUME_CONSENT_GESTURE or set it to nod",
-        ),
-    ] {
-        let (code, out, err) = run(
-            sb.cmd(&[cmd, "status"])
-                .env("IRLUME_CONSENT_GESTURE", value),
-            cmd,
-        );
-        assert_eq!(code, 0, "{err}");
-        assert!(out.contains(expected), "{value}: {out}");
-        assert!(!out.contains("from settings.conf"), "{out}");
-        if value == "banana" {
-            assert!(!err.contains(value), "arbitrary value was echoed: {err}");
-        }
-    }
 }
 
 // enrollment-query error is a distinct arm from "none"/populated; and when the
@@ -1067,6 +873,43 @@ fn daemon_error_responses_surface_per_command() {
 }
 
 #[test]
+fn profile_removal_explains_approval_and_recovery_cleanup() {
+    let sb = Sandbox::new("removalapproval");
+    serve(&sb.sock(), |_| Response::Ok("removed".into()));
+    for args in [
+        vec![
+            "profiles",
+            "delete",
+            "--profile",
+            "primary",
+            "--user",
+            "tester",
+        ],
+        vec!["profiles", "forget-model", "shipped", "--user", "tester"],
+    ] {
+        let (code, out, err) = run(&mut sb.cmd(&args), "profile removal");
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("OS approval"), "{out}");
+        assert!(out.contains("recovery passphrase"), "{out}");
+    }
+    let (code, out, err) = run(
+        &mut sb.cmd(&[
+            "profiles",
+            "delete",
+            "--profile",
+            "primary",
+            "--scan",
+            "one",
+            "--user",
+            "tester",
+        ]),
+        "scan removal",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("OS approval"), "{out}");
+}
+
+#[test]
 fn forget_model_sends_the_resolved_space_over_the_wire() {
     // The CLI resolves the model NAME to its embedding-space tag; the daemon
     // only ever sees the tag. The fake daemon asserts the exact request, so a
@@ -1262,6 +1105,31 @@ fn recovery_accepts_a_flag_before_the_subcommand() {
 }
 
 #[test]
+fn recovery_restore_does_not_claim_a_successful_face_authentication() {
+    let sb = Sandbox::new("recovery-restore-scope");
+    serve(&sb.sock(), |req| match req {
+        Request::Ping => Response::Pong,
+        Request::RecoveryRestore { user, passphrase }
+            if user == "tester" && passphrase.expose() == b"synthetic passphrase" =>
+        {
+            Response::Ok("template key restored and re-sealed for 'tester'".into())
+        }
+        _ => Response::Error("unexpected recovery request".into()),
+    });
+    let (code, out, err) = run_stdin(
+        &mut sb.cmd(&["recovery", "restore", "--user", "tester"]),
+        "synthetic passphrase\n",
+        "recovery restore scope",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("template key restored"), "{out}");
+    assert!(
+        !out.contains("face unlock is restored"),
+        "key restoration does not override authentication policy: {out}"
+    );
+}
+
+#[test]
 fn fingerprint_accepts_a_flag_before_the_subcommand() {
     // status answers without fprintd installed (it reports the absence), so
     // the discriminating assertion is the usage line: the position-1 binding
@@ -1347,4 +1215,15 @@ fn forget_model_finds_its_positional_after_a_leading_flag() {
         )],
         "the model name after the subcommand reached the daemon"
     );
+}
+
+#[test]
+fn tui_without_a_terminal_reports_failure() {
+    let s = Sandbox::new("tui-no-tty");
+    let out = s.cmd(&["tui"]).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a TUI that never started must not report success"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
 }

@@ -50,6 +50,8 @@ pub mod lease;
 mod lifecycle;
 mod media_graph;
 mod rate_gate;
+mod sequential_batch;
+pub use sequential_batch::{capture_sequential_batch_with_progress, SequentialBatchRequest};
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.
@@ -2048,6 +2050,135 @@ impl<S: ValidatedStream> TrackedStream<S> {
             rate_evidence,
         ))
     }
+}
+
+#[derive(Clone, Copy)]
+enum IrSessionStartup {
+    Fixed,
+    Adaptive,
+    Paired,
+}
+
+impl IrSessionStartup {
+    fn warm_up<S: ValidatedStream>(
+        self,
+        device: &str,
+        stream: &mut TrackedStream<S>,
+        progress: &Progress,
+    ) -> irlume_common::Result<()> {
+        match self {
+            // The mode and metadata are armed, but paired image STREAMON must
+            // wait until RGB has started. NexiGo otherwise sends JPEG-prefixed data
+            // through its negotiated YUYV endpoint.
+            Self::Paired => Ok(()),
+            Self::Fixed | Self::Adaptive => warm_up_stream(device, stream, progress),
+        }
+    }
+
+    fn fill<S: ValidatedStream>(self, stream: &mut TrackedStream<S>) -> std::io::Result<()> {
+        match self {
+            // The joint fill resets both windows and measures simultaneous
+            // delivery. A solo IR window would only be thrown away there.
+            Self::Paired => Ok(()),
+            Self::Fixed => stream.fill_rate_evidence(),
+            Self::Adaptive => stream.fill_rate_evidence_with_startup(true),
+        }
+    }
+}
+
+// Prime a fresh pair without claiming delivered-rate readiness. Observation
+// counters survive recovery, so a pending epoch also means streaming must start.
+fn start_rgb_before_ir<A: ValidatedStream, B: ValidatedStream>(
+    device: &str,
+    rgb: &mut TrackedStream<A>,
+    ir: &TrackedStream<B>,
+    progress: &Progress,
+) -> irlume_common::Result<()> {
+    if (rgb.observations == 0 || rgb.recovery_epoch_pending)
+        && (ir.observations == 0 || ir.recovery_epoch_pending)
+    {
+        warm_up_stream(device, rgb, progress)?;
+    }
+    Ok(())
+}
+
+// A finished burst must keep servicing its queue while its companion captures.
+fn capture_and_drain<S, R>(
+    session: &mut S,
+    completed: &std::sync::atomic::AtomicUsize,
+    capture: impl FnOnce(&mut S) -> irlume_common::Result<R>,
+    mut drain: impl FnMut(&mut S) -> irlume_common::Result<()>,
+) -> irlume_common::Result<R> {
+    use std::sync::atomic::Ordering;
+    struct Completed<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Drop for Completed<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+    let frame = {
+        let _completed = Completed(completed);
+        capture(session)
+    }?;
+    let mut drained = 0;
+    while completed.load(Ordering::Acquire) < 2 {
+        if drained == 2 * MAX_RATE_FILL_ATTEMPTS {
+            return Err(Error::Hardware(
+                "paired capture exceeded its bounded companion drain".into(),
+            ));
+        }
+        drain(session)?;
+        drained += 1;
+    }
+    Ok(frame)
+}
+
+// Discard pixels, but preserve every transport refusal, including a gap that
+// would otherwise occur after the cached capture's provenance was assembled.
+fn drain_pair_frame<S: ValidatedStream>(
+    stream: &mut TrackedStream<S>,
+    device: &str,
+) -> irlume_common::Result<()> {
+    let (_, _, sequence, timestamp, _) =
+        stream.next().map_err(|error| map_delivery(device, error))?;
+    if sequence.gap() != 0 || sequence.discontinuity() || timestamp.discontinuity() {
+        return Err(Error::Hardware(format!(
+            "{device}: continuity failed while draining paired capture"
+        )));
+    }
+    Ok(())
+}
+
+/// Process captured pixels while their owning thread continues validating the
+/// camera queue. A failed tail drain invalidates even successful processing.
+fn process_while_draining<T: Send, R: Send>(
+    frame: T,
+    process: impl FnOnce(T) -> irlume_common::Result<R> + Send,
+    mut drain: impl FnMut() -> irlume_common::Result<()>,
+) -> irlume_common::Result<R> {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || process(frame));
+        let mut transport = Ok(());
+        let mut drained = 0;
+        while !worker.is_finished() {
+            if drained == 2 * MAX_RATE_FILL_ATTEMPTS {
+                transport = Err(Error::Hardware(
+                    "framing processing exceeded its bounded drain".into(),
+                ));
+                break;
+            }
+            if let Err(error) = drain() {
+                transport = Err(error);
+                break;
+            }
+            drained += 1;
+        }
+        let processed = worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        transport?;
+        processed
+    })
 }
 
 fn fill_rate_then_drain_metadata<E>(
@@ -4302,6 +4433,37 @@ impl<'a> RgbSession<'a> {
             .ok_or_else(|| Error::Hardware("no frames captured".into()))
     }
 
+    /// Consume one validated frame without converting or retaining its pixels.
+    /// Use between framing requests so a live stream never accumulates old work.
+    ///
+    /// # Errors
+    /// Preserves warm-up, lease, rate, continuity and transport refusals.
+    pub fn discard_frame(&mut self) -> irlume_common::Result<()> {
+        self.warm_up()?;
+        self.cam
+            .lease
+            .require_endpoint(&self.cam.device)
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        drain_pair_frame(&mut self.stream, &self.cam.device)
+    }
+
+    /// Process a fresh frame while this thread continues servicing the stream.
+    /// The processing worker is scoped to this call and always joined.
+    ///
+    /// # Errors
+    /// Returns capture/processing errors or invalidates processing when the
+    /// subsequent bounded transport drain fails.
+    ///
+    /// # Panics
+    /// Resumes a processing callback panic after its worker has been joined.
+    pub fn process_frame<R: Send>(
+        &mut self,
+        process: impl FnOnce(Frame) -> irlume_common::Result<R> + Send,
+    ) -> irlume_common::Result<R> {
+        let frame = self.frame()?;
+        process_while_draining(frame, process, || self.discard_frame())
+    }
+
     /// The recognition path's denoised frame: a per-pixel temporal median over
     /// the burst, so one blurry or over-exposed frame cannot decide a match.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -4976,7 +5138,7 @@ pub fn capture_ir_with_stats_and_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
-    capture_ir_with_startup(device, progress, false)
+    capture_ir_with_startup(device, progress, IrSessionStartup::Fixed)
 }
 
 /// Capture IR alone, allowing a healthy full rate window to end startup early.
@@ -4992,19 +5154,19 @@ pub fn capture_ir_sequential_with_stats_and_progress(
     device: &str,
     progress: &Progress,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
-    capture_ir_with_startup(device, progress, true)
+    capture_ir_with_startup(device, progress, IrSessionStartup::Adaptive)
 }
 
 fn capture_ir_with_startup(
     device: &str,
     progress: &Progress,
-    adaptive_ir: bool,
+    startup: IrSessionStartup,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
     let opened = std::time::Instant::now();
     let cam = IrCamera::open(device)?;
     let open_ms = opened.elapsed().as_millis();
     let armed = std::time::Instant::now();
-    let mut session = cam.session_with_startup(progress, adaptive_ir)?;
+    let mut session = cam.session_with_startup(progress, startup)?;
     let arm_ms = armed.elapsed().as_millis();
     let captured = std::time::Instant::now();
     let shot = session.capture_with_stats();
@@ -5165,13 +5327,30 @@ impl IrCamera {
         &self,
         progress: &Progress,
     ) -> irlume_common::Result<IrSession<'_>> {
-        self.session_with_startup(progress, false)
+        self.session_with_startup(progress, IrSessionStartup::Fixed)
+    }
+
+    /// Arm IR for a held pair, deferring its rate window to [`establish_pair_rate`].
+    ///
+    /// Emitter setup and metadata ordering are preserved. Image STREAMON waits
+    /// for the joint fill, which starts RGB first before both streams are drained
+    /// together. Capturing directly still enforces the ordinary per-frame gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns camera, lease, emitter or privacy errors encountered while arming.
+    /// Rate-establishment errors are deferred to the joint fill or first capture.
+    pub fn session_for_pair_with_progress(
+        &self,
+        progress: &Progress,
+    ) -> irlume_common::Result<IrSession<'_>> {
+        self.session_with_startup(progress, IrSessionStartup::Paired)
     }
 
     fn session_with_startup(
         &self,
         progress: &Progress,
-        adaptive_ir: bool,
+        startup: IrSessionStartup,
     ) -> irlume_common::Result<IrSession<'_>> {
         self.lease
             .require_endpoint(&self.device)
@@ -5205,12 +5384,12 @@ impl IrCamera {
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
         // 25s when video went first). `SafeStream::open` only allocates
-        // buffers; STREAMON happens on the first dequeue, which is inside
-        // `warm_up_stream` below. This is the window, and it is the only one.
+        // buffers; STREAMON happens on the first dequeue, inside ordinary
+        // warm-up below or the paired joint fill. Metadata must start here.
         let meta_started = std::time::Instant::now();
         let mut meta = ir_metadata::IlluminationLog::open(&self.device);
         let metadata_ms = meta_started.elapsed().as_millis();
-        // BEFORE the warm-up, because the warm-up's first dequeue is STREAMON.
+        // BEFORE any image dequeue, because the first dequeue is STREAMON.
         // Microsoft's sequence sets the property and THEN starts streaming, and
         // this ran the other way round: every authentication set the mode under
         // an already-running stream, the mid-stream write the rest of #168
@@ -5246,14 +5425,14 @@ impl IrCamera {
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         let warmup_started = std::time::Instant::now();
-        warm_up_stream(&self.device, &mut stream, progress)?;
+        startup.warm_up(&self.device, &mut stream, progress)?;
         let warmup_ms = warmup_started.elapsed().as_millis();
         // Rate establishment internally discards more frames than the metadata
         // ring can hold. Drain those records now, after the fill, so buffers are
         // requeued before the first frame a caller can observe.
         let fill_started = std::time::Instant::now();
         let fill_result = fill_rate_then_drain_metadata(
-            || stream.fill_rate_evidence_with_startup(adaptive_ir),
+            || startup.fill(&mut stream),
             || {
                 if let Some(log) = meta.as_mut() {
                     log.drain();
@@ -5630,23 +5809,11 @@ impl IrSession<'_> {
                 }
             );
         }
-        // An unusable burst gets a DIAGNOSIS, not the old one-size hint. The
-        // single "run ir-setup" line fit one of a dark frame's six causes and
-        // sent users to write camera firmware for shutters, covers and range
-        // problems (#185); the evidence to do better is already in hand:
-        // whether irlume drove the control, the camera's own per-frame
-        // illumination metadata (#167), the privacy control, and the frame's
-        // mean and spread. Two bands carry a diagnosis: dark, and
-        // saturated-flat, because the most common cover case is not dark at
-        // all: an opaque cover under the active emitter reflects it straight
-        // back and saturates the sensor (#197, measured 252.8-255.0 covered on
-        // both test cameras). This range check is only a shortcut past the
-        // stddev pass on ordinary scenes; `ir_dark::diagnose` re-applies the
-        // real gates and answers None for anything that is a scene after all.
-        // `ir-setup` discovery advice survives only on the one cause it fits;
-        // the historical note about why irlume never recommends
-        // linux-enable-ir-emitter's blind search lives with that message's
-        // cause in `ir_dark` (#159).
+        // Whole-image darkness can be a bright face on a dark background
+        // (#677). Preserve its measurements as debug evidence; only the
+        // assessment layer knows whether the detected face is too dark.
+        // Direct privacy and saturated-flat warnings remain visible.
+        // This shortcut avoids a stddev pass outside both diagnostic bands.
         if (0.0..ir_dark::DARK_MEAN_MAX).contains(&best_mean)
             || best_mean >= ir_dark::SATURATED_MIN_MEAN
         {
@@ -5672,10 +5839,10 @@ impl IrSession<'_> {
                     .map(|(m, _)| *m)
                     .fold(0.0f64, f64::max),
             };
-            if let Some(line) = ir_dark::diagnose(&evidence)
-                .and_then(|cause| ir_dark::render(card, best_mean, &cause))
-            {
-                eprintln!("{line}");
+            match ir_dark::capture_message(card, &evidence) {
+                Some(ir_dark::CaptureMessage::Warning(line)) => eprintln!("{line}"),
+                Some(ir_dark::CaptureMessage::Debug(line)) => irlume_common::dlog!("{line}"),
+                None => {}
             }
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
@@ -5821,6 +5988,7 @@ pub fn establish_pair_rate(
     ir: &mut IrSession<'_>,
 ) -> irlume_common::Result<()> {
     let device = rgb.cam.device.clone();
+    start_rgb_before_ir(&device, &mut rgb.stream, &ir.stream, &rgb.progress)?;
     let result = establish_concurrent_rate(&mut rgb.stream, &mut ir.stream);
     let privacy_refused = ir.stream.privacy_refused();
     let result = finish_hidden_rate_fill(result, privacy_refused, || {
@@ -5841,6 +6009,64 @@ pub fn establish_pair_rate(
         return Err(ir.stop_after_privacy_refusal(refusal));
     }
     result.map_err(|error| map_io(&device, error))
+}
+
+/// Capture a held pair while draining the finished side until both captures end.
+///
+/// The callbacks retain their caller's capture/recovery policy. Successful
+/// pixels are returned only if the subsequent drain also stayed healthy. This
+/// prevents asymmetric bursts from overflowing the faster side's mmap queue.
+/// It does not keep streams serviced between calls, for example during inference.
+///
+/// # Errors
+///
+/// Each result preserves its callback error or a rate, continuity, privacy,
+/// lease or bounded-drain failure. Callers must discard both frames if either
+/// result fails. IR privacy refusal stops its queues and restores the emitter.
+///
+/// # Panics
+///
+/// Propagates a panic from either callback after joining the companion worker.
+pub fn capture_pair_with<R: Send, I: Send>(
+    rgb: &mut RgbSession<'_>,
+    ir: &mut IrSession<'_>,
+    capture_rgb: impl FnOnce(&mut RgbSession<'_>) -> irlume_common::Result<R>,
+    capture_ir: impl FnOnce(&mut IrSession<'_>) -> irlume_common::Result<I> + Send,
+) -> (irlume_common::Result<R>, irlume_common::Result<I>) {
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let ir_thread = scope.spawn(|| {
+            let lease = ir.cam.lease.clone();
+            lease.run_active(|| {
+                capture_and_drain(ir, &completed, capture_ir, |ir| {
+                    let result = drain_pair_frame(&mut ir.stream, &ir.cam.device);
+                    let privacy_refused = ir.stream.privacy_refused();
+                    let result = finish_hidden_rate_fill(result, privacy_refused, || {
+                        if let Some(log) = ir.meta.as_mut() {
+                            log.drain();
+                        }
+                    });
+                    if ir.stream.take_privacy_refusal() {
+                        let refusal = result.err().unwrap_or_else(|| {
+                            Error::Hardware("IR privacy refused paired drain".into())
+                        });
+                        return Err(ir.stop_after_privacy_refusal(refusal));
+                    }
+                    result
+                })
+            })
+        });
+        let lease = rgb.cam.lease.clone();
+        let rgb = lease.run_active(|| {
+            capture_and_drain(rgb, &completed, capture_rgb, |rgb| {
+                drain_pair_frame(&mut rgb.stream, &rgb.cam.device)
+            })
+        });
+        let ir = ir_thread
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        (rgb, ir)
+    })
 }
 
 /// Ambient-subtraction helpers (Windows-Hello-style illuminated minus ambient).
@@ -7764,9 +7990,11 @@ fn held_concurrent_arm<'d>(
                 ));
             }
         }
-        let sessions = rgb_cam
-            .session_with_progress(progress)
-            .and_then(|rs| ir_cam.session_with_progress(progress).map(|is| (rs, is)));
+        let sessions = rgb_cam.session_with_progress(progress).and_then(|rs| {
+            ir_cam
+                .session_for_pair_with_progress(progress)
+                .map(|is| (rs, is))
+        });
         let (mut rs, mut is) = match sessions {
             Ok(pair) => pair,
             Err(e) => {
@@ -7792,21 +8020,16 @@ fn held_concurrent_arm<'d>(
             let t0 = std::time::Instant::now();
             let (rgb, ir) = operation
                 .run(|| {
-                    std::thread::scope(|scope| {
-                        let ir_thread = scope.spawn(|| {
+                    capture_pair_with(
+                        &mut rs,
+                        &mut is,
+                        |session| session.burst(RGB_BURST).and_then(median_frame),
+                        |session| {
                             operation
-                                .run(|| is.capture_with_stats())
+                                .run(|| session.capture_with_stats())
                                 .map_err(|error| Error::Hardware(error.to_string()))?
-                        });
-                        let rgb = rs.burst(RGB_BURST).and_then(median_frame);
-                        let ir = match ir_thread.join() {
-                            Ok(result) => result,
-                            // Re-raise into the composer's catch_unwind: a panic is a
-                            // software defect, never a stored hardware verdict (#263).
-                            Err(payload) => std::panic::resume_unwind(payload),
-                        };
-                        (rgb, ir)
-                    })
+                        },
+                    )
                 })
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             accumulate(into, &mut continuity, &rgb, &ir, t0.elapsed(), context);
@@ -9166,6 +9389,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod sequential_batch_tests {
+        include!("sequential_batch_tests.rs");
+    }
     /// #586: the round-continuity verdict is four nameable conditions; the
     /// classifier must pick the right one, in check order, for every shape.
     #[test]
@@ -10713,6 +10939,142 @@ mod tests {
         assert_eq!(evidence.window_count(), 30);
         assert_eq!(evidence.window_span_us(), 30 * 100_000);
         assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn paired_startup_leaves_ir_unstarted_until_rgb_has_a_buffer() {
+        let mut rgb = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
+        let mut ir = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        IrSessionStartup::Paired
+            .warm_up("ir", &mut ir, &no_progress())
+            .unwrap();
+        assert_eq!(
+            ir.observations, 0,
+            "arming paired IR must not issue STREAMON"
+        );
+        start_rgb_before_ir("rgb", &mut rgb, &ir, &no_progress()).unwrap();
+        assert_eq!(rgb.observations, 1, "RGB must dequeue before IR starts");
+        assert_eq!(ir.observations, 0);
+        assert!(!rgb.rate_window.ready());
+        assert!(!ir.rate_window.ready());
+    }
+
+    #[test]
+    fn paired_startup_rejects_bad_rgb_before_starting_ir() {
+        let mut rgb = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
+        rgb.stream_mut().unwrap().metadata[0].bytesused = 0;
+        let ir = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        assert!(start_rgb_before_ir("rgb", &mut rgb, &ir, &no_progress()).is_err());
+        assert_eq!(ir.observations, 0);
+        assert!(!rgb.rate_window.ready());
+    }
+
+    #[test]
+    fn paired_startup_primes_rgb_again_when_both_streams_were_recovered() {
+        let mut rgb = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
+        let mut ir = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        rgb.next_discarded().unwrap();
+        ir.next_discarded().unwrap();
+        rgb.take();
+        ir.take();
+        rgb.install_recovered(
+            rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667)
+                .take()
+                .unwrap(),
+        )
+        .unwrap();
+        ir.install_recovered(
+            rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667)
+                .take()
+                .unwrap(),
+        )
+        .unwrap();
+        let before = (rgb.observations, ir.observations);
+        start_rgb_before_ir("rgb", &mut rgb, &ir, &no_progress()).unwrap();
+        assert_eq!(rgb.observations, before.0 + 1);
+        assert_eq!(ir.observations, before.1, "recovered IR must still wait");
+        assert!(!rgb.recovery_epoch_pending);
+        assert!(ir.recovery_epoch_pending);
+    }
+
+    #[test]
+    fn paired_startup_does_not_reprime_an_observed_pair() {
+        for observed_rgb in [true, false] {
+            let mut rgb = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
+            let mut ir = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+            if observed_rgb {
+                rgb.next_discarded().unwrap();
+            } else {
+                ir.next_discarded().unwrap();
+            }
+            let before = (rgb.observations, ir.observations);
+            start_rgb_before_ir("rgb", &mut rgb, &ir, &no_progress()).unwrap();
+            assert_eq!((rgb.observations, ir.observations), before);
+        }
+    }
+
+    #[test]
+    fn individual_ir_startup_keeps_its_existing_rate_work() {
+        for (startup, expected_observations) in [
+            (IrSessionStartup::Fixed, 42),
+            (IrSessionStartup::Adaptive, 32),
+        ] {
+            let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+            startup.warm_up("ir", &mut stream, &no_progress()).unwrap();
+            startup.fill(&mut stream).unwrap();
+            assert_eq!(stream.observations, expected_observations);
+            assert!(stream.rate_window.ready());
+        }
+    }
+
+    #[test]
+    fn paired_ir_startup_defers_rate_dequeues_without_claiming_readiness() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        IrSessionStartup::Paired
+            .warm_up("ir", &mut stream, &no_progress())
+            .unwrap();
+        IrSessionStartup::Paired.fill(&mut stream).unwrap();
+        assert_eq!(
+            stream.observations, 0,
+            "paired arming leaves image streaming to joint startup"
+        );
+        assert!(
+            !stream.rate_window.ready(),
+            "joint fill still owes a full window"
+        );
+    }
+
+    #[test]
+    fn paired_ir_startup_cannot_bypass_the_delivery_gate_without_joint_fill() {
+        for interval_us in [66_667, 200_000] {
+            let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, interval_us);
+            IrSessionStartup::Paired
+                .warm_up("ir", &mut stream, &no_progress())
+                .unwrap();
+            IrSessionStartup::Paired.fill(&mut stream).unwrap();
+            let result = stream.next();
+            if interval_us == 66_667 {
+                let (_, facts, _, _, evidence) = result.unwrap();
+                assert_eq!(facts.sequence_raw(), 42);
+                assert_eq!(evidence.window_count(), 30);
+                assert!(evidence.meets_floor());
+            } else {
+                assert!(matches!(result, Err(DeliveryError::BelowFloor(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn paired_ir_startup_does_not_hide_missing_rate_evidence() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 1, 66_667);
+        IrSessionStartup::Paired
+            .warm_up("ir", &mut stream, &no_progress())
+            .unwrap();
+        IrSessionStartup::Paired.fill(&mut stream).unwrap();
+        assert!(
+            stream.next().is_err(),
+            "warm-up alone cannot deliver a frame"
+        );
     }
 
     #[test]
@@ -15718,6 +16080,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a camera pair; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE"]
+    fn paired_capture_drain_privacy_refusal_stops_ir_before_returning() {
+        let (rgb_path, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str(), ir_path.as_str()],
+            lease::CameraOperationKind::Diagnostics,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire pair operation");
+        let rgb_camera = operation.open_rgb(&rgb_path).expect("open RGB");
+        let ir_camera = operation.open_ir(&ir_path).expect("open IR");
+        let mut rgb = rgb_camera.session().expect("arm RGB");
+        let mut ir = ir_camera.session().expect("arm IR");
+        let boundary = std::sync::Arc::new(std::sync::Barrier::new(2));
+        ir.stream.synchronize_next_boundary(boundary.clone());
+        ir.stream.refuse_privacy_after(1);
+        let (rgb_result, ir_result) = capture_pair_with(
+            &mut rgb,
+            &mut ir,
+            |_| {
+                boundary.wait();
+                Ok(())
+            },
+            |_| Ok(()), // a cached success must be invalidated by the tail drain
+        );
+        assert!(rgb_result.is_ok());
+        let error = ir_result.expect_err("the drain must propagate privacy refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("injected privacy boundary failure"),
+            "{error}"
+        );
+        assert!(ir.stream.stream.is_none(), "IR image queue must stop");
+        assert!(ir.meta.is_none(), "IR metadata queue must stop");
+        assert!(
+            !ir.lit && !ir._mode.owns_restore(),
+            "emitter guard must be restored and inert"
+        );
+        assert!(rgb.stream.stream.is_some(), "the companion stays reusable");
+    }
+
+    #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_pair_rate_privacy_refusal_stops_only_ir_and_cancels_rgb() {
         let (rgb_path, ir_path) = loopback_pair();
@@ -16488,6 +16893,205 @@ mod tests {
     }
 
     #[test]
+    fn paired_capture_drain_preserves_typed_rate_refusal_and_continuity() {
+        let mut slow = rate_fill_fixture(contracts::StreamRole::Ir, 100, 200_000);
+        assert!(matches!(
+            drain_pair_frame(&mut slow, "fixture"),
+            Err(Error::DeliveredRate(_))
+        ));
+        let mut gap = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
+        gap.next().unwrap(); // first capture has healthy provenance
+        let next = gap.stream_mut().unwrap().metadata.front_mut().unwrap();
+        next.sequence += 1;
+        let error = drain_pair_frame(&mut gap, "fixture").unwrap_err();
+        assert!(
+            error.to_string().contains("continuity"),
+            "a cached success cannot hide a later gap"
+        );
+    }
+
+    #[test]
+    fn framing_processing_keeps_consuming_while_the_processor_waits() {
+        let (release, waiting) = std::sync::mpsc::sync_channel(0);
+        let mut release = Some(release);
+        let mut drained = 0;
+        let result = process_while_draining(
+            7,
+            move |frame| {
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Ok(frame * 2)
+            },
+            || {
+                drained += 1;
+                if let Some(release) = release.take() {
+                    release.send(()).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, 14);
+        assert!(drained > 0, "processing must not pause the camera queue");
+    }
+
+    #[test]
+    fn framing_processing_discards_success_if_the_tail_drain_fails() {
+        struct Processed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Processed {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let discarded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = discarded.clone();
+        let (release, waiting) = std::sync::mpsc::sync_channel(0);
+        let result = process_while_draining(
+            (),
+            move |_| {
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Ok(Processed(observed))
+            },
+            || {
+                release.send(()).unwrap();
+                Err(Error::Hardware("fixture continuity failure".into()))
+            },
+        );
+        assert!(
+            matches!(result, Err(Error::Hardware(ref error)) if error == "fixture continuity failure")
+        );
+        assert!(discarded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn framing_processing_joins_and_drops_the_frame_before_resuming_a_panic() {
+        struct Pixels(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Pixels {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = dropped.clone();
+        let panic = std::panic::catch_unwind(|| {
+            let _: irlume_common::Result<()> = process_while_draining(
+                Pixels(observed),
+                |_pixels| panic!("fixture processing panic"),
+                || {
+                    std::thread::yield_now();
+                    Ok(())
+                },
+            );
+        });
+        assert!(panic.is_err());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn paired_capture_drains_a_finished_stream_until_its_companion_finishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let completed = AtomicUsize::new(0);
+        let mut drained = 0;
+        let frame = capture_and_drain(
+            &mut drained,
+            &completed,
+            |_| Ok(42),
+            |drained| {
+                *drained += 1;
+                if *drained == 3 {
+                    completed.fetch_add(1, Ordering::Release);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(frame, 42);
+        assert_eq!(drained, 3, "a finished burst must service its queue");
+    }
+
+    #[test]
+    fn paired_capture_does_not_drain_after_both_captures_finish() {
+        let completed = std::sync::atomic::AtomicUsize::new(1);
+        assert_eq!(
+            capture_and_drain(
+                &mut (),
+                &completed,
+                |_| Ok(42),
+                |_| panic!("unneeded dequeue")
+            )
+            .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn paired_capture_preserves_capture_and_drain_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let completed = AtomicUsize::new(0);
+        let error = capture_and_drain(
+            &mut (),
+            &completed,
+            |_| Err::<(), _>(Error::Hardware("capture failed".into())),
+            |_| panic!("failed capture must not drain"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("capture failed"));
+        assert_eq!(completed.load(Ordering::Acquire), 1);
+        let completed = AtomicUsize::new(0);
+        let error = capture_and_drain(
+            &mut (),
+            &completed,
+            |_| Ok(42),
+            |_| Err(Error::Hardware("privacy refusal".into())),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("privacy refusal"),
+            "do not return cached pixels after a drain refusal"
+        );
+    }
+
+    #[test]
+    fn paired_capture_notifies_its_companion_even_when_capture_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let completed = AtomicUsize::new(0);
+        let panic = std::panic::catch_unwind(|| {
+            capture_and_drain(
+                &mut (),
+                &completed,
+                |_| -> irlume_common::Result<()> { panic!("capture bug") },
+                |_| Ok(()),
+            )
+        });
+        assert!(panic.is_err());
+        assert_eq!(completed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn paired_capture_bounds_drain_work_when_its_companion_stalls() {
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let mut drained = 0;
+        let result = capture_and_drain(
+            &mut drained,
+            &completed,
+            |_| Ok(42),
+            |n| {
+                *n += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a stalled companion cannot license unbounded work"
+        );
+        assert_eq!(drained, 2 * MAX_RATE_FILL_ATTEMPTS);
+    }
+
+    #[test]
     fn concurrent_rate_fill_drains_both_streams_in_parallel() {
         // The fill must drive both streams on two threads SIMULTANEOUSLY. A
         // serial (round-robin) fill throttles the faster stream to the slower
@@ -16561,6 +17165,7 @@ mod tests {
 
         let (done, ready) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            IrSessionStartup::Paired.fill(&mut ir).unwrap();
             let result = establish_concurrent_rate(&mut rgb, &mut ir);
             let _ = done.send(result.map(|()| (rgb.rate_window.ready(), ir.rate_window.ready())));
         });

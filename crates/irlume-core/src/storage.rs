@@ -644,17 +644,62 @@ fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
 }
 
 fn persist_enrollment(path: &std::path::Path, bytes: &[u8]) -> irlume_common::Result<()> {
-    irlume_common::write_0600_atomic(path, bytes)
-        .map_err(|error| irlume_common::Error::Io(error.to_string()))
+    publication_result(irlume_common::write_atomic_reporting(path, bytes, 0o600))
+}
+
+fn publication_result(
+    result: std::io::Result<irlume_common::AtomicWrite>,
+) -> irlume_common::Result<()> {
+    match result {
+        Ok(irlume_common::AtomicWrite::Durable) => Ok(()),
+        Ok(irlume_common::AtomicWrite::VisibleNotDurable(error)) => Err(irlume_common::Error::Io(
+            format!("enrollment was published, but durability could not be confirmed: {error}; inspect profiles before retrying"),
+        )),
+        Err(error) => Err(irlume_common::Error::Io(error.to_string())),
+    }
 }
 
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
+    save_with_key(e, save_key)
+}
+
+/// Publish a replacement enrollment, preserving an existing template key and
+/// recovery envelope. An encrypted store cannot become plaintext if its key
+/// is missing or the TPM becomes unavailable.
+///
+/// # Errors
+/// Returns key, serialization, or filesystem errors. If publication succeeded
+/// but directory synchronization failed, the error explicitly says so.
+pub fn save_replacement(e: &Enrollment) -> irlume_common::Result<()> {
+    save_with_key(e, |user| {
+        replacement_key(user, template_key::load_key_unlocked, save_key)
+    })
+}
+
+fn replacement_key(
+    user: &str,
+    load_existing: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+    first_save: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
+    if template_key::has_key(user) || store_is_encrypted(user)? == Some(true) {
+        // Never mint a replacement key or fall back to plaintext on unseal
+        // failure. The user can restore recovery or explicitly delete state.
+        load_existing(user).map(Some)
+    } else {
+        first_save(user)
+    }
+}
+
+fn save_with_key(
+    e: &Enrollment,
+    resolve_key: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> irlume_common::Result<()> {
     let _state = template_key::UserStateLock::acquire(&e.user)?;
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
-    let key = save_key(&e.user)?;
+    let key = resolve_key(&e.user)?;
     let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
     persist_enrollment(&path, &bytes)
 }
@@ -1410,6 +1455,122 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert!(path.with_extension("json.tmp").is_dir());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publication_error_distinguishes_visible_replacement() {
+        use irlume_common::AtomicWrite;
+        let failure = || std::io::Error::other("injected storage failure");
+        assert!(publication_result(Ok(AtomicWrite::Durable)).is_ok());
+        let before = publication_result(Err(failure())).unwrap_err().to_string();
+        assert!(!before.contains("published"), "{before}");
+        let after = publication_result(Ok(AtomicWrite::VisibleNotDurable(failure())))
+            .unwrap_err()
+            .to_string();
+        assert!(after.contains("published"), "{after}");
+        assert!(after.contains("durability"), "{after}");
+    }
+
+    #[test]
+    fn replacement_reuses_key_and_preserves_state_on_key_failure() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-replacement-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("template-keys")).unwrap();
+        fs::create_dir_all(dir.join("recovery")).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let mut old = sample();
+        old.user = "replacement-test".into();
+        let key = vec![7u8; 32]; // Synthetic, never sealed against a real TPM.
+        let path = profile_path(&old.user);
+        let key_path = template_key::key_path(&old.user);
+        let recovery_path = dir.join("recovery/replacement-test.json");
+        let before = serialize_enrollment(&old, Some(&key)).unwrap();
+        fs::write(&path, &before).unwrap();
+        fs::write(&key_path, b"synthetic sealed key").unwrap();
+        fs::write(&recovery_path, b"synthetic recovery").unwrap();
+        let mut replacement = sample();
+        replacement.user = old.user.clone();
+        replacement.profiles[0].name = "Replacement".into();
+
+        // Exercise the same lock, key selection, encryption and publication as
+        // save_replacement; replace only the real TPM operation.
+        let err = save_with_key(&replacement, |user| {
+            replacement_key(
+                user,
+                |_| {
+                    Err(irlume_common::Error::Policy(
+                        "injected unseal failure".into(),
+                    ))
+                },
+                |_| panic!("an existing key must not be replaced"),
+            )
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("injected unseal failure"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        save_with_key(&replacement, |user| {
+            replacement_key(
+                user,
+                |_| Ok(Zeroizing::new(key.clone())),
+                |_| panic!("an existing key must not be replaced"),
+            )
+        })
+        .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap()
+            .get("enc")
+            .is_some());
+        assert_eq!(
+            deserialize_enrollment(&bytes, Some(&key)).unwrap().profiles[0].name,
+            "Replacement"
+        );
+        assert_eq!(fs::read(&key_path).unwrap(), b"synthetic sealed key");
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"synthetic recovery");
+
+        // Even with no key file, an encrypted enrollment cannot enter the
+        // first-save/plaintext fallback path. The real missing-key gate is
+        // safe to call: it refuses before touching the TPM.
+        fs::remove_file(&key_path).unwrap();
+        assert!(save_with_key(&old, |user| replacement_key(
+            user,
+            template_key::load_key_unlocked,
+            |_| panic!("an encrypted store must not generate a new key"),
+        ))
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!key_path.exists());
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"synthetic recovery");
+        // First enrollment and a plaintext store without a sealed key retain
+        // the existing first-save policy, represented here by a no-TPM result.
+        for plaintext_exists in [true, false] {
+            if plaintext_exists {
+                fs::write(&path, serialize_enrollment(&old, None).unwrap()).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            save_with_key(&replacement, |user| {
+                replacement_key(
+                    user,
+                    |_| panic!("there is no existing key to unseal"),
+                    |_| Ok(None),
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                deserialize_enrollment(&fs::read(&path).unwrap(), None)
+                    .unwrap()
+                    .profiles[0]
+                    .name,
+                "Replacement"
+            );
+        }
+        std::env::remove_var("IRLUME_STATE_DIR");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     // Regression: 0be786b. save() used fs::write straight onto the profile

@@ -633,7 +633,10 @@ fn enroll_fails_cleanly_without_a_daemon() {
         "enroll", "--user", "tester", "--name", "Work", "--scans", "3", "--reset",
     ]));
     assert_eq!(code, 1);
-    assert!(err.contains("[enroll] --reset: wiping 'tester'"), "{err}");
+    assert!(
+        err.contains("[enroll] --reset: replacing 'tester'"),
+        "{err}"
+    );
     assert!(err.contains("capturing a new face profile"), "{err}");
     assert!(err.contains("irlumed is not running"), "{err}");
 }

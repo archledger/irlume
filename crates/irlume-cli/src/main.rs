@@ -303,8 +303,9 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         Err(code) => return code,
     };
     let reset = args.iter().any(|a| a == "--reset");
+    eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
     if reset {
-        eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
+        eprintln!("[enroll] --reset: replacing '{user}'s enrollment after successful capture (preserves the template key and recovery setup)");
     }
     eprintln!(
         "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
@@ -478,6 +479,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                     Ok(s) => s,
                     Err(code) => return code,
                 };
+                eprintln!("[profiles] approve the system authentication dialog before capture");
                 match scans {
                     Some(n) if n > 1 => eprintln!(
                         "[profiles] adding {n} scans to '{p}'; stay in frame, vary your pose slightly…"
@@ -1294,10 +1296,18 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
 pub(crate) fn daemon_request(
     req: &irlume_common::Request,
 ) -> Result<irlume_common::Response, String> {
-    // Shared client: bounded connect timeout + zeroized wire buffers. The 120s
-    // read budget covers slow operations (guided enroll capture loops).
-    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120)).map_err(
-        |e| {
+    // Enrollment allows OS approval, queue admission and the worker budget.
+    // Other operations keep their existing timeout, including authentication.
+    let seconds = if matches!(
+        req,
+        irlume_common::Request::Enroll { .. } | irlume_common::Request::AddScan { .. }
+    ) {
+        380
+    } else {
+        120
+    };
+    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(seconds))
+        .map_err(|e| {
             // The connect-failure message already names irlumed and the exact
             // fix (client.rs); only append the hint where it adds information.
             let m = e.to_string();
@@ -1306,8 +1316,7 @@ pub(crate) fn daemon_request(
             } else {
                 format!("{m} (is irlumed running?)")
             }
-        },
-    )
+        })
 }
 
 /// A short-budget status poll (TUI periodic refresh): a busy/wedged daemon fails
@@ -1364,7 +1373,7 @@ pub(crate) fn user_arg(args: &[String]) -> String {
     // retargeted the command at the person typing it. On the destructive verbs
     // that is total, unconfirmed data loss: `sudo irlume enroll --reset --user`
     // put `{"Enroll":{"user":"<you>","reset":true}}` on the wire, and the
-    // daemon's reset deletes the enrollment, the template key, and the recovery
+    // daemon's reset then deleted the enrollment, the template key, and the recovery
     // envelope together. `recovery forget --user` and `keyring forget --user`
     // did the same.
     //

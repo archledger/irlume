@@ -1348,3 +1348,14 @@ fn forget_model_finds_its_positional_after_a_leading_flag() {
         "the model name after the subcommand reached the daemon"
     );
 }
+
+#[test]
+fn tui_without_a_terminal_reports_failure() {
+    let s = Sandbox::new("tui-no-tty");
+    let out = s.cmd(&["tui"]).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a TUI that never started must not report success"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
+}

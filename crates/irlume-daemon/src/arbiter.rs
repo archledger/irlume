@@ -102,6 +102,7 @@ pub fn classify(req: &Request) -> Class {
         PositionSample { .. }
         | Identify
         | Enroll { .. }
+        | EnrollmentSession { .. }
         | AddScan { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }

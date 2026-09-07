@@ -61,6 +61,7 @@ mod arbiter;
 mod diagnostics;
 mod enrollment_authorization;
 mod enrollment_session;
+mod position_session;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -861,6 +862,7 @@ fn main() {
                             let Queued {
                                 authorization,
                                 session,
+                                position,
                                 req,
                                 peer,
                                 reply,
@@ -889,7 +891,7 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                dispatch_scoped_session(req, &peer, &mut engine, &scope, authorization, session.as_ref())
+                                dispatch_scoped_session(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref())
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
@@ -1439,6 +1441,7 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 struct Queued {
     authorization: Option<enrollment_authorization::Grant>,
     session: Option<enrollment_session::Worker>,
+    position: Option<position_session::Worker>,
     req: Request,
     peer: Peer,
     reply: std::sync::mpsc::Sender<Response>,
@@ -2686,12 +2689,20 @@ fn serve_peer(
                 } else {
                     (None, None)
                 };
+            let (position, mut position_connection) =
+                if matches!(req, Request::PositionSession { .. }) {
+                    let (worker, connection) = position_session::channel(arbiter.cancel_token());
+                    (Some(worker), Some(connection))
+                } else {
+                    (None, None)
+                };
             let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
             let (reply, answer) = std::sync::mpsc::channel();
             let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
                 authorization,
                 session,
+                position,
                 req,
                 peer: peer.clone(),
                 reply,
@@ -2722,16 +2733,29 @@ fn serve_peer(
                         return Err(error);
                     }
                 }
+                if let Some(connection) = &mut position_connection {
+                    if let Err(error) = connection.pump(&stream) {
+                        if link.abandon() {
+                            arbiter.cancel_token().request_stop();
+                        }
+                        return Err(error);
+                    }
+                }
                 match answer.recv_timeout(CLIENT_ALIVE_POLL) {
                     Ok(resp) => {
                         if let Some(connection) = &mut session_connection {
+                            connection.pump(&stream)?;
+                        }
+                        if let Some(connection) = &mut position_connection {
                             connection.pump(&stream)?;
                         }
                         break resp;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if std::time::Instant::now() >= deadline {
-                            if session_connection.is_some() && link.abandon() {
+                            if (session_connection.is_some() || position_connection.is_some())
+                                && link.abandon()
+                            {
                                 arbiter.cancel_token().request_stop();
                             }
                             break Response::Error("request did not complete".into());
@@ -3109,7 +3133,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         },
         // Framing guide: the optional user only tunes the pitch band, but it is
         // still interpolated into a state path, so it is screened like the rest.
-        PositionSample { user } => RequestPosture {
+        PositionSample { user } | PositionSession { user } => RequestPosture {
             privilege: AnyPeer,
             user: user.as_deref(),
             enrollment: Reads,
@@ -4069,9 +4093,11 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
             OperationClass::Authentication
         }
-        Enroll { .. } | EnrollmentSession { .. } | AddScan { .. } | PositionSample { .. } => {
-            OperationClass::Enrollment
-        }
+        Enroll { .. }
+        | EnrollmentSession { .. }
+        | AddScan { .. }
+        | PositionSample { .. }
+        | PositionSession { .. } => OperationClass::Enrollment,
         Identify => OperationClass::Identification,
         TuneCaptureMode { .. } => OperationClass::CaptureQualification,
         SupportProbe { .. } => OperationClass::SupportProbe,
@@ -4147,7 +4173,7 @@ fn dispatch_scoped(
     scope: &diagnostics::OperationScope,
     authorization: Option<enrollment_authorization::Grant>,
 ) -> Response {
-    dispatch_scoped_session(req, peer, engine, scope, authorization, None)
+    dispatch_scoped_session(req, peer, engine, scope, authorization, None, None)
 }
 
 fn dispatch_scoped_session(
@@ -4157,6 +4183,7 @@ fn dispatch_scoped_session(
     scope: &diagnostics::OperationScope,
     authorization: Option<enrollment_authorization::Grant>,
     session: Option<&enrollment_session::Worker>,
+    position: Option<&position_session::Worker>,
 ) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
@@ -4325,6 +4352,21 @@ fn dispatch_scoped_session(
                     irlume_common::OperationErrorCode::OperationFailed,
                     e.to_string(),
                 ),
+            }
+        }
+        Request::PositionSession { user } => {
+            let Some(observer) = position else {
+                return Response::Error("framing requires its live connection".into());
+            };
+            if let Err(error) = observer.started() {
+                return Response::Error(error.to_string());
+            }
+            match engine.position_session(
+                user.as_deref().filter(|u| authorized_for(peer, u)),
+                observer,
+            ) {
+                Ok(()) => Response::PositionSessionEnded,
+                Err(error) => Response::Error(error.to_string()),
             }
         }
         Request::PositionSample { user } => {
@@ -6454,10 +6496,11 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 6] = [
+        let sources: [(&str, &str); 7] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
             ("arbiter.rs", include_str!("arbiter.rs")),
+            ("position_session.rs", include_str!("position_session.rs")),
             (
                 "enrollment_session.rs",
                 include_str!("enrollment_session.rs"),
@@ -6870,6 +6913,7 @@ mod tests {
         TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000 },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
+        PositionSession => Request::PositionSession { user: Some(u()) },
         SealPassword => Request::SealPassword {
             user: u(),
             password: secret(),
@@ -7559,6 +7603,7 @@ mod tests {
                 Queued {
                     authorization: None,
                     session: None,
+                    position: None,
                     req: Request::Ping,
                     peer: Peer {
                         uid: 0,
@@ -7870,6 +7915,7 @@ mod tests {
                     let Queued {
                         authorization,
                         session: _,
+                        position: _,
                         req,
                         peer,
                         reply,
@@ -8348,6 +8394,7 @@ mod tests {
                 Queued {
                     authorization: None,
                     session: None,
+                    position: None,
                     req: Request::Ping,
                     peer: Peer {
                         uid: 0,

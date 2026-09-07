@@ -100,6 +100,7 @@ pub fn classify(req: &Request) -> Class {
         // worker if a caller reaches this seam independently.
         | TraceSubscribe { .. } => Class::Status,
         PositionSample { .. }
+        | PositionSession { .. }
         | Identify
         | Enroll { .. }
         | EnrollmentSession { .. }
@@ -564,6 +565,10 @@ mod tests {
         );
         assert_eq!(
             classify(&Request::PositionSample { user: None }),
+            Class::Camera
+        );
+        assert_eq!(
+            classify(&Request::PositionSession { user: None }),
             Class::Camera
         );
         // Read-only status answers on the connection thread (#212): a TPM-

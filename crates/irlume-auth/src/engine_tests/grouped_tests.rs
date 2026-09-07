@@ -50,6 +50,8 @@ fn grouped_five_votes_materialize_only_final_sample_and_admit_once_qualified() {
     };
     let (mut enr, _) = pad_matching_fixture(0.2, false);
     enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
+    // This fixture models a new raw-IR capture, whose producer records a tag.
+    enr.profiles[0].scans[0].ir_space = Some("raw".into());
     let prior_ir = e.ir_available;
     e.ir_available = true;
     let out = e
@@ -235,13 +237,16 @@ fn grouped_sequential_pair_requires_final_ir_identity() {
     let e = &mut s.engine;
     let prior_ir = e.ir_available;
     e.ir_available = true;
-    for (gap_ms, ir_matches) in [
-        (1000, false),
-        (3000, false),
-        (3001, false),
-        (1000, true),
-        (3000, true),
-        (3001, true),
+    for (gap_ms, ir_matches, tagged) in [
+        (1000, false, true),
+        (3000, false, true),
+        (3001, false, true),
+        (1000, true, true),
+        (3000, true, true),
+        (3001, true, true),
+        (1000, true, false),
+        (3000, true, false),
+        (3001, true, false),
     ] {
         let identities = Cell::new(0);
         let result = e
@@ -275,6 +280,8 @@ fn grouped_sequential_pair_requires_final_ir_identity() {
         };
         let (mut enr, _) = pad_matching_fixture(0.2, false);
         enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
+        // This fixture models a new raw-IR capture, whose producer records a tag.
+        enr.profiles[0].scans[0].ir_space = tagged.then(|| "raw".into());
         let out = e
             .authenticate_qualified_assessment(
                 &enr,
@@ -285,8 +292,8 @@ fn grouped_sequential_pair_requires_final_ir_identity() {
             )
             .unwrap();
         assert_eq!(identities.get(), 1);
-        assert_eq!(out.granted, ir_matches, "{}", out.reason);
-        if !ir_matches {
+        assert_eq!(out.granted, ir_matches && tagged, "{}", out.reason);
+        if !ir_matches || !tagged {
             assert_eq!(out.kind, OutcomeKind::BelowThreshold);
             assert!(!presence_retryable(&out));
         }
@@ -302,11 +309,12 @@ fn grouped_dark_final_sample_uses_real_ir_presence_and_existing_gates() {
     let e = &mut s.engine;
     let prior_ir = e.ir_available;
     e.ir_available = true;
-    for (lit, ir_failure, ir_matches) in [
-        (false, false, true),
-        (true, false, true),
-        (false, true, true),
-        (false, false, false),
+    for (lit, ir_failure, ir_matches, tagged) in [
+        (false, false, true, true),
+        (true, false, true, true),
+        (false, true, true, true),
+        (false, false, false, true),
+        (false, false, true, false),
     ] {
         let identities = Cell::new(0);
         let result = e
@@ -357,6 +365,8 @@ fn grouped_dark_final_sample_uses_real_ir_presence_and_existing_gates() {
                 assert!(a.embedding.is_none());
                 let (mut enr, _) = pad_matching_fixture(0.2, false);
                 enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
+                // This fixture models a new raw-IR capture, whose producer records a tag.
+                enr.profiles[0].scans[0].ir_space = tagged.then(|| "raw".into());
                 e.authenticate_qualified_assessment(
                     &enr,
                     AuthenticationPurpose::Verify,
@@ -369,11 +379,15 @@ fn grouped_dark_final_sample_uses_real_ir_presence_and_existing_gates() {
         };
         assert_eq!(
             out.granted,
-            !lit && !ir_failure && ir_matches,
+            !lit && !ir_failure && ir_matches && tagged,
             "{}",
             out.reason
         );
         assert_eq!(identities.get(), usize::from(!lit && !ir_failure));
+        if !tagged {
+            assert_eq!(out.kind, OutcomeKind::OtherDeny);
+            assert!(out.reason.contains("no enrolled IR scans are compatible"));
+        }
     }
     e.ir_available = prior_ir;
     e.vit_scores.clear();
@@ -791,6 +805,8 @@ fn grouped_missing_face_not_applicable_is_retryable_before_valid_dark_identity()
         };
         let (mut enr, _) = pad_matching_fixture(0.2, false);
         enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
+        // This fixture models a new raw-IR capture, whose producer records a tag.
+        enr.profiles[0].scans[0].ir_space = Some("raw".into());
         let prior_ir = s.engine.ir_available;
         s.engine.ir_available = true;
         let out = s

@@ -699,86 +699,45 @@ fn main() {
             let (engine, rgb_pad_status, ir_pad_status) = engine;
             publish_engine_bits(&engine, rgb_pad_status, ir_pad_status);
 
-            // One-time inoculation: stamp legacy (untagged) IR scans with the current
-            // embedding space while it is still the space they were captured under.
-            // A later adapter swap/removal then degrades to a clear "re-enroll" for
-            // dark unlock instead of silently scoring across embedding spaces.
-            // Skip the whole sweep once it has completed for this embedding
-            // space. Asking a user whether they need a retag costs a TPM unseal,
-            // because the answer is inside the encrypted enrollment, and the TPM
-            // serializes: that startup work collided with the very login it was
-            // delaying, taking a keyring unseal from 2.70s to 18.97s on a
-            // discrete TPM (#249). The marker only skips work; a missing or
-            // stale one just runs the sweep as before.
-            let retag_space = engine.ir_space().to_string();
-            let sweep_needed = !irlume_core::storage::retag_done_for(&retag_space);
-            if !sweep_needed {
-                irlume_common::dlog!(
-                    "startup: IR retag already done for '{retag_space}'; skipping the sweep"
-                );
-            }
-            // A user whose load or save failed has NOT been swept, and marking
-            // the space done would retire the migration for them permanently:
-            // the marker is only written when every user was actually handled.
-            let mut all_swept = true;
-            for user in irlume_core::storage::list_users() {
-                if !sweep_needed {
-                    break;
-                }
-                let loaded = irlume_core::storage::load(&user);
-                if let Err(ref e) = loaded {
-                    eprintln!(
-                        "irlumed: could not read '{user}' during the IR retag sweep ({e}); \
-                         leaving the sweep owed"
-                    );
-                    all_swept = false;
-                }
-                if let Ok(Some(mut enr)) = loaded {
-                    let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
-                    if n > 0 {
-                        match irlume_core::storage::save(&enr) {
-                            Ok(()) => eprintln!(
-                                "irlumed: tagged {n} legacy IR scan(s) for '{user}' as '{}'",
-                                engine.ir_space()
-                            ),
-                            Err(e) => {
+            // Read-only compatibility notices. Historical untagged IR may be
+            // raw or adapted; the live pipeline cannot safely retag it. Keep
+            // the existing sweep marker to avoid repeated TPM unseals (#249).
+            // The marker only skips notices; matching always checks tags.
+            let ir_space = engine.ir_space();
+            let sweep_needed = !irlume_core::storage::retag_done_for(ir_space);
+            if sweep_needed {
+                let mut all_swept = true;
+                for user in irlume_core::storage::list_users() {
+                    match irlume_core::storage::load(&user) {
+                        Ok(Some(enr)) => {
+                            let stale = enr.stale_ir_scans(ir_space);
+                            if stale > 0 && enr.usable_ir_scans(ir_space) == 0 {
                                 eprintln!(
-                                    "irlumed: could not retag IR scans for '{user}': {e}"
+                                    "irlumed: NOTE for '{user}': {stale} IR template(s) have an \
+                                     unknown or different IR pipeline and cannot match. \
+                                     RGB templates are preserved; run `irlume enroll` to capture \
+                                     fresh scans into your existing profile for dark/dim login."
                                 );
-                                all_swept = false;
                             }
                         }
-                    }
-                    // Upgrade notice: IR scans enrolled under a now-absent adapter (e.g.
-                    // 0.1.x -> 0.2.0, where the research-only IR adapter was removed) are
-                    // in a foreign embedding space and cannot match. Bright-light RGB
-                    // login still works; dark/dim login needs a re-enroll. Surfaced here
-                    // (journal, and `irlume logs`) because the daemon restarts on upgrade.
-                    // Only an OUTAGE gets the notice: once the user re-enrolls, the fresh
-                    // usable scans coexist with the stale ones (whose RGB templates still
-                    // help), and nagging them to re-run the remedy they already ran is
-                    // noise on every restart.
-                    let stale = enr.stale_ir_scans(engine.ir_space());
-                    if stale > 0 && enr.usable_ir_scans(engine.ir_space()) == 0 {
-                        eprintln!(
-                            "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
-                             removed IR adapter and no longer match. Bright-light face login still works; \
-                             run `irlume enroll` to capture fresh scans into your existing profile and \
-                             restore dark/dim login."
-                        );
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "irlumed: could not read '{user}' during the IR compatibility \
+                                 sweep ({e}); leaving the sweep owed"
+                            );
+                            all_swept = false;
+                        }
                     }
                 }
-            }
-            // Recorded only after a sweep that actually reached every user, so a
-            // TPM error or an unwritable enrollment leaves the migration owed
-            // instead of silently retiring it for that user.
-            if sweep_needed && all_swept {
-                irlume_core::storage::mark_retag_done(&retag_space);
-            } else if sweep_needed {
-                eprintln!(
-                    "irlumed: the IR retag sweep did not complete for every user; \
-                     it will run again next start"
-                );
+                if all_swept {
+                    irlume_core::storage::mark_retag_done(ir_space);
+                } else {
+                    eprintln!(
+                        "irlumed: the IR compatibility sweep did not complete for every user; \
+                         it will run again next start"
+                    );
+                }
             }
 
             // SO_PEERCRED is the authorization boundary, and the socket mode must not

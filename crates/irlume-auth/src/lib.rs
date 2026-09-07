@@ -1302,10 +1302,9 @@ fn ir_match_in(
                 if ir.len() != probe.len() {
                     return None;
                 }
-                match &s.ir_space {
-                    Some(sp) if sp != space => None,
-                    _ => Some(ir.as_slice()),
-                }
+                // Before tagging, both raw and adapted IR shipped. An absent
+                // tag cannot establish either space, even at the same width.
+                (s.ir_space.as_deref() == Some(space)).then_some(ir.as_slice())
             })
             .collect();
         if tmpls.is_empty() {
@@ -3266,7 +3265,7 @@ impl Engine {
             if ir.len() != dim || s.rgb.len() != dim {
                 continue;
             }
-            if matches!(&s.ir_space, Some(sp) if sp != &self.ir_space) {
+            if s.ir_space.as_deref() != Some(self.ir_space.as_str()) {
                 continue;
             }
             ir_rows.push(ir.clone());
@@ -6068,8 +6067,9 @@ impl Engine {
                 let reason = if enr.ir_scans().is_empty() {
                     "dark, but no IR scans enrolled; re-enroll to enable dark unlock"
                 } else {
-                    "dark, but the enrolled IR scans are from a different IR \
-                     pipeline (adapter changed); re-enroll to refresh dark unlock"
+                    "dark, but no enrolled IR scans are compatible with the current \
+                     pipeline (unknown or changed IR space, recognizer or dimension); \
+                     add fresh scans to your profile to restore dark unlock"
                 };
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
@@ -9094,7 +9094,8 @@ mod tests {
         // keyed one puts another model's transform on these templates.
         let (mut prof, probe) = calibrated_profile(16);
         // Control: the calibration is in the legacy slot and the scans are
-        // untagged, so the shipped recognizer finds it and scores a centroid.
+        // recognizer-untagged but IR-tagged raw, so the shipped recognizer
+        // finds it and scores a centroid.
         let mut enr = Enrollment::new("u");
         enr.profiles.push(prof.clone());
         let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
@@ -10091,17 +10092,50 @@ mod tests {
     }
 
     #[test]
-    fn ir_match_grandfathers_untagged_templates_into_any_space() {
+    fn unknown_ir_never_reaches_matching_or_centroid_in_any_space() {
         let (mut prof, probe) = calibrated_profile(16);
         for s in &mut prof.scans {
-            s.ir_space = None; // pre-tagging enrollment
+            s.ir_space = None;
         }
         let mut enr = Enrollment::new("u");
         enr.profiles.push(prof);
-        for space in ["raw", "adapter:deadbeef0123"] {
-            let m = ir_match_in(space, LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
-            assert_eq!(m.n_templates, 5, "untagged templates must match in {space}");
+        for (space, adapter) in [("raw", false), ("adapter:deadbeef0123", true)] {
+            let m = ir_match_in(space, LEGACY_RECOGNIZER_SPACE, adapter, &enr, &probe);
+            assert_eq!(m.n_templates, 0, "unknown templates in {space}");
+            assert_eq!(m.best, f32::NEG_INFINITY);
+            assert!(m.best_who.is_empty());
+            assert!(m.centroid.is_none());
         }
+    }
+
+    #[test]
+    fn unknown_ir_cannot_influence_tagged_matches_through_cached_calibration() {
+        let (mut prof, probe) = calibrated_profile(16);
+        prof.scans[0].ir_space = None;
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(prof);
+        let before = serde_json::to_value(&enr).unwrap();
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
+        assert_eq!(m.n_templates, 4);
+        assert!(
+            m.centroid.is_none(),
+            "unattributable calibration must not create a centroid"
+        );
+        let expected = enr.profiles[0].scans[1..]
+            .iter()
+            .map(|s| align::cosine(&probe, s.ir.as_ref().unwrap()))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(
+            m.best, expected,
+            "tagged templates still score in raw space"
+        );
+        assert_eq!(serde_json::to_value(&enr).unwrap(), before);
+        // A different profile's fully tagged calibration remains available.
+        let (clean, _) = calibrated_profile(16);
+        enr.profiles.push(clean);
+        let m = ir_match_in("raw", LEGACY_RECOGNIZER_SPACE, false, &enr, &probe);
+        assert_eq!(m.n_templates, 9);
+        assert!(m.centroid.is_some());
     }
 
     #[test]
@@ -11141,6 +11175,58 @@ mod engine_tests {
     }
 
     #[test]
+    fn unknown_ir_preserves_rgb_grants_and_denies_ir_dependent_paths() {
+        let _guard = env_guard();
+        let mut s = shared();
+        for case in ["rgb", "below-rgb", "sequential", "dark"] {
+            let (mut enr, mut a) = pad_matching_fixture(0.0, false);
+            let identity = a.embedding.unwrap();
+            enr.profiles[0].scans[0].ir = Some(identity.to_vec());
+            a.ir_embedding = Some(identity.to_vec());
+            match case {
+                "below-rgb" => {
+                    let mut other = [0.0; EMBED_DIM];
+                    other[1] = 1.0;
+                    a.embedding = Some(other);
+                }
+                "sequential" => a.sequential_pair = true,
+                "dark" => {
+                    a.embedding = None;
+                    a.rgb_frame_mean = 0.0;
+                }
+                _ => {}
+            }
+            let out = s
+                .engine
+                .authenticate_qualified_assessment(
+                    &enr,
+                    AuthenticationPurpose::Verify,
+                    Some("login"),
+                    a,
+                    &(),
+                )
+                .unwrap();
+            match case {
+                "rgb" => assert!(out.granted, "RGB identity remains valid: {}", out.reason),
+                "dark" => {
+                    assert!(!out.granted);
+                    assert_eq!(out.kind, OutcomeKind::OtherDeny);
+                    assert!(out.reason.contains("no enrolled IR scans are compatible"));
+                }
+                _ => {
+                    assert!(!out.granted);
+                    assert_eq!(
+                        out.kind,
+                        OutcomeKind::BelowThreshold,
+                        "{case}: {}",
+                        out.reason
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn authentication_situation_is_request_local() {
         let _guard = env_guard();
         let mut s = shared();
@@ -11644,6 +11730,25 @@ mod engine_tests {
         };
         s.engine.refit_profile_calib(&mut foreign_rec);
         assert!(foreign_rec.ir_calib.is_none());
+        // Unknown IR cannot be used to fit or refresh either cached slot.
+        let mut unknown = prof.clone();
+        for scan in &mut unknown.scans {
+            scan.ir_space = None;
+        }
+        s.engine.refit_profile_calib(&mut unknown);
+        assert!(unknown.ir_calib.is_none());
+        assert!(!unknown
+            .ir_calibs
+            .contains_key(irlume_core::storage::LEGACY_RECOGNIZER_SPACE));
+        // Mixed input fits only known pairs; storage still withholds that cache
+        // until the profile no longer contains unknown IR for this recognizer.
+        let mut mixed = prof.clone();
+        mixed.scans.push(scan512(5, true, None));
+        s.engine.refit_profile_calib(&mut mixed);
+        assert_eq!(mixed.ir_calib.as_ref().unwrap().fitted_pairs, 5);
+        assert!(mixed
+            .calib_for(irlume_core::storage::LEGACY_RECOGNIZER_SPACE)
+            .is_none());
         // With a global adapter loaded, refit is a no-op: an existing
         // calibration is left untouched and none is fitted.
         let adapter = Adapter::load_from_file(&model_path("blaze_face_short_range.onnx")).unwrap();

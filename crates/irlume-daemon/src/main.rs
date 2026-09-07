@@ -4442,14 +4442,15 @@ fn dispatch_scoped_session(
                             // handoff's coverage gap). Evaluated before the `reason` move: it
                             // borrows `o`, the move does not.
                             declined_by_gesture: irlume_auth::is_gesture_decline(&o),
-                            // This arm carries an ENGINE verdict: a face was looked
-                            // at (or looked for). The policy refusals return above,
-                            // before the camera.
+                            // This arm carries an engine verdict, including setup
+                            // refusals before capture. Daemon policy refusals return
+                            // above with refused_by_policy set.
                             refused_by_policy: false,
                             // #616 step 3: the final failed attempt's situation,
                             // in the stable journal vocabulary, for pam's action
-                            // wording; empty on a grant and on every pre-camera
-                            // refusal (they send `situation: String::new()`).
+                            // wording. The engine resets it at request entry, so
+                            // early setup refusals cannot reuse an older hint;
+                            // grants and daemon policy refusals also send empty.
                             situation: if o.granted {
                                 String::new()
                             } else {

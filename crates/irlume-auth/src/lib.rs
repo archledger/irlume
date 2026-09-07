@@ -5278,6 +5278,9 @@ impl Engine {
         purpose: AuthenticationPurpose,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
+        // The daemon reuses this engine across requests. Setup refusals and
+        // errors can return before the attempt loop publishes a new situation.
+        self.last_attempt_situation = None;
         self.head_consent_before_match = HeadConsentVerdict::NoGesture;
         // Fresh ViT PAD vote ring per authentication: votes must not mix
         // presentations across requests (ADR-0013 protocol).
@@ -11061,6 +11064,73 @@ mod engine_tests {
         assert!(!fallback);
         assert_eq!(e.head_consent_before_match, HeadConsentVerdict::NoGesture);
         (result.unwrap(), calls.get(), costliest)
+    }
+
+    #[test]
+    fn authentication_situation_is_request_local() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("situation-reset");
+        let mut stale = Vec::new();
+        for purpose in [
+            AuthenticationPurpose::Verify,
+            AuthenticationPurpose::AppConsent,
+            AuthenticationPurpose::CredentialRelease {
+                temporal_challenge: false,
+            },
+        ] {
+            for case in ["missing", "fingerprint", "foreign-model", "camera-error"] {
+                // Establish a real failed-attempt label through the production
+                // retry loop; the next call reuses this same daemon engine.
+                let (out, calls, _) =
+                    scripted_pad_retry(&mut s.engine, 15_000, 100, &[7_800], 0.20, 0);
+                assert!(!out.granted);
+                assert_eq!(calls, 1);
+                assert!(s.engine.last_attempt_situation_label().is_some());
+                std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+                let user = "situation-next-request";
+                let path = dir.join(format!("{user}.json"));
+                if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+                match case {
+                    "fingerprint" => {
+                        std::fs::write(dir.join("method"), "fingerprint").unwrap();
+                        std::env::set_var("IRLUME_METHOD_CONF", dir.join("method"));
+                    }
+                    "foreign-model" | "camera-error" => {
+                        let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+                        enrollment.user = user.into();
+                        if case == "foreign-model" {
+                            enrollment.profiles[0].scans[0].embed_space =
+                                Some("embed:retired-fixture".into());
+                        }
+                        write_enrollment(&dir, &enrollment);
+                    }
+                    _ => (),
+                }
+                let result = s.engine.authenticate_for(user, Some("login"), purpose);
+                if case == "camera-error" {
+                    assert!(result.unwrap_err().to_string().contains(NO_RGB));
+                } else {
+                    let out = result.unwrap();
+                    assert!(!out.granted && !out.live);
+                    assert_eq!(
+                        out.kind,
+                        if case == "fingerprint" {
+                            OutcomeKind::OtherDeny
+                        } else {
+                            OutcomeKind::SetupUnavailable
+                        }
+                    );
+                }
+                if let Some(label) = s.engine.last_attempt_situation_label() {
+                    stale.push(format!("{purpose:?}/{case}: {label}"));
+                }
+            }
+        }
+        teardown_sandbox(&dir);
+        assert!(stale.is_empty(), "previous request hints leaked: {stale:?}");
     }
 
     #[test]

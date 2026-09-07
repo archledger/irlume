@@ -321,9 +321,10 @@ impl Store {
                 OutcomeKind::Granted
                 | OutcomeKind::Spoof
                 | OutcomeKind::BelowThreshold
-                // Grouped expiry previously used OtherDeny and consumed a
-                // strike; the diagnostic label does not change that policy.
+                // These terminal refusals previously used OtherDeny and
+                // consumed strikes; diagnostic labels do not change that policy.
                 | OutcomeKind::DeadlineExpired
+                | OutcomeKind::RuntimeUnavailable
                 | OutcomeKind::OtherDeny => (),
             }
         }

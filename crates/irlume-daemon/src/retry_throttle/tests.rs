@@ -148,6 +148,7 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         (Kind::Spoof, true),
         (Kind::BelowThreshold, true),
         (Kind::DeadlineExpired, true),
+        (Kind::RuntimeUnavailable, true),
         (Kind::OtherDeny, true),
     ] {
         let f = Fixture::new();
@@ -185,18 +186,24 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
 }
 
 #[test]
-fn deadline_expiry_preserves_existing_other_deny_accounting() {
-    for strikes in [0, 2, 3] {
-        let old = Fixture::new();
-        let deadline = Fixture::new();
-        for _ in 0..strikes {
+fn terminal_diagnostic_classes_preserve_existing_other_deny_accounting() {
+    for kind in [Kind::DeadlineExpired, Kind::RuntimeUnavailable] {
+        for strikes in [0, 2, 3] {
+            let old = Fixture::new();
+            let classified = Fixture::new();
+            for _ in 0..strikes {
+                old.record(Kind::OtherDeny);
+                classified.record(Kind::OtherDeny);
+            }
             old.record(Kind::OtherDeny);
-            deadline.record(Kind::OtherDeny);
+            classified.record(kind);
+            assert_eq!(
+                old.bytes(),
+                classified.bytes(),
+                "{kind:?}, strikes: {strikes}"
+            );
+            assert_eq!(old.check(), classified.check());
         }
-        old.record(Kind::OtherDeny);
-        deadline.record(Kind::DeadlineExpired);
-        assert_eq!(old.bytes(), deadline.bytes(), "prior strikes: {strikes}");
-        assert_eq!(old.check(), deadline.check());
     }
 }
 

@@ -117,6 +117,14 @@ their existing situation labels and retry rules. Grouped expiry still counts
 as one completed refusal for the account throttle. An ordinary grace-window
 expiry retains its last outcome and existing accounting.
 
+Required PAD evidence that is unavailable, fails inference or was not evaluated,
+and IR formats that cannot measure exposure, report `unavailable` when they are
+the deciding refusal. PAM says "face authentication unavailable; use your
+password" instead of deriving framing advice from incomplete evidence. These
+remain terminal, counted refusals. Existing spoof, consent and camera-binding
+precedence, optional modalities and ordinary retryable quality failures keep
+their behavior; the label does not classify every camera or engine error.
+
 **Security note: treat tracing as a diagnostic session, not a resident
 setting.** While tracing is on, *denied* attempts log their exact match score
 next to the threshold. To anyone who can read the system journal (root or the

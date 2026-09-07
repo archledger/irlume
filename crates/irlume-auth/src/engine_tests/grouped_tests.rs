@@ -143,7 +143,7 @@ fn grouped_required_pad_failure_is_terminal_before_identity() {
         let PreparedGroup::Refused(out) = result else {
             panic!("failed PAD admitted")
         };
-        assert_eq!(out.kind, OutcomeKind::OtherDeny);
+        assert_eq!(out.kind, OutcomeKind::RuntimeUnavailable);
         assert_eq!(calls.get(), 1);
         assert!(s.engine.vit_scores.is_empty());
     }
@@ -501,7 +501,7 @@ fn grouped_required_pad_failures_precede_retryable_outcomes_and_stop_before_dark
             let PreparedGroup::Refused(out) = result else {
                 panic!("failure reached final identity")
             };
-            assert_eq!(out.kind, OutcomeKind::OtherDeny);
+            assert_eq!(out.kind, OutcomeKind::RuntimeUnavailable);
             assert!(!presence_retryable(&out));
             assert!(s.engine.vit_scores.is_empty());
         }

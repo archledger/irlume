@@ -15,6 +15,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Report required PAD/runtime failures as unavailable with password guidance,
+  without changing authentication admission or retry accounting.
+
 - Report grouped authentication deadlines as a timeout with password guidance,
   while preserving retry accounting and captured diagnostic measurements.
 

@@ -845,6 +845,7 @@ fn read_stdout_bounded(
 fn situation_prompt(situation: &str) -> Option<&'static str> {
     match situation {
         "timed out" => Some("authentication timed out; use your password"),
+        "unavailable" => Some("face authentication unavailable; use your password"),
         "no face" => Some("look at the camera"),
         "too far" => Some("come closer"),
         "off-center" => Some("center your face in the frame"),
@@ -1433,10 +1434,19 @@ mod tests {
     /// diagnostic trace, NEVER at a prompt surface. No mapped wording may
     /// carry a digit, so no threshold value can leak through a label.
     #[test]
+    fn runtime_unavailable_prompts_password_fallback() {
+        assert_eq!(
+            super::situation_prompt("unavailable"),
+            Some("face authentication unavailable; use your password")
+        );
+    }
+
+    #[test]
     fn no_situation_prompt_wording_ever_carries_a_number() {
         use super::situation_prompt;
         for label in [
             "timed out",
+            "unavailable",
             "no face",
             "too far",
             "off-center",

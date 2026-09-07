@@ -249,7 +249,7 @@ pub enum OutcomeKind {
     Spoof,
     /// A real match verdict landed below the threshold.
     BelowThreshold,
-    /// Missing/empty enrollment or retired/invalid enrollment/consent settings.
+    /// Missing, empty or recognizer-incompatible enrollment, or retired/invalid settings.
     /// Terminal (not presence-retryable), but preserves account retry history.
     SetupUnavailable,
     /// Every other refusal: pre-camera policy/state denials, camera-binding
@@ -7217,7 +7217,7 @@ impl Engine {
 
     /// The enrollment-dependent policy refusals that gate an authentication
     /// before any capture is spent: retired-eye-policy migration, the
-    /// empty-profile refuse, and the anti-swap camera binding. A pure
+    /// empty-profile refusal, anti-swap camera binding and recognizer compatibility. A pure
     /// decision over the loaded enrollment (plus sysfs identities for the
     /// binding); runs synchronously for plaintext stores (before the camera)
     /// and at the loader join for encrypted stores (see
@@ -7240,6 +7240,19 @@ impl Engine {
             if let Some(reason) = self.binding_mismatch(bind) {
                 return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
+        }
+        // RGB and IR matching both exclude other recognizers' embedding spaces.
+        // A nonempty enrollment can therefore have nothing this engine can
+        // compare. Refuse before capture, retaining scans from every model.
+        if enr
+            .profiles
+            .iter()
+            .all(|profile| profile.scans_in(&self.embed_space) == 0)
+        {
+            return Some(Outcome::deny(
+                OutcomeKind::SetupUnavailable,
+                format!("'{user}' has no face scans for the current recognition model; add scans to an existing profile or enroll"),
+            ));
         }
         None
     }
@@ -11625,6 +11638,59 @@ mod engine_tests {
         };
         let msg = s.engine.binding_mismatch(&bind).expect("must refuse");
         assert!(msg.contains("IR camera changed or absent"), "{msg}");
+    }
+
+    #[test]
+    fn recognizer_preflight_requires_a_compatible_scan_in_any_profile() {
+        let _guard = env_guard();
+        let s = shared();
+        let (mut enrollment, _) = pad_matching_fixture(0.2, false);
+        // Untagged historical scans remain usable with the shipped recognizer.
+        assert!(s
+            .engine
+            .enrollment_policy_refusal("fixture", &enrollment)
+            .is_none());
+        enrollment.profiles[0].scans[0].embed_space = Some("embed:retired-fixture".into());
+        for index in 1..3 {
+            let mut profile = enrollment.profiles[0].clone();
+            profile.name = format!("Profile {index}");
+            enrollment.profiles.push(profile);
+        }
+        let refusal = s
+            .engine
+            .enrollment_policy_refusal("fixture", &enrollment)
+            .expect("foreign-model scans cannot justify starting capture");
+        assert!(!refusal.granted && !refusal.live);
+        assert_eq!(refusal.kind, OutcomeKind::SetupUnavailable);
+        assert!(!presence_retryable(&refusal));
+        assert!(!is_gesture_decline(&refusal));
+        assert!(refusal.reason.contains("add scans"));
+
+        // A changed bound camera keeps its security refusal even when all
+        // saved scans also belong to a different recognizer.
+        enrollment.camera_binding = Some(CameraBinding {
+            rgb: Some("dead:beef".into()),
+            ir: None,
+        });
+        assert_eq!(
+            s.engine
+                .enrollment_policy_refusal("fixture", &enrollment)
+                .unwrap()
+                .kind,
+            OutcomeKind::OtherDeny
+        );
+        enrollment.camera_binding = None;
+
+        // Any one of the three profiles can supply the current model's scan.
+        // Other profiles' old scans must not cause a false setup refusal.
+        for index in 0..3 {
+            enrollment.profiles[index].scans[0].embed_space = Some(s.engine.embed_space().into());
+            assert!(s
+                .engine
+                .enrollment_policy_refusal("fixture", &enrollment)
+                .is_none());
+            enrollment.profiles[index].scans[0].embed_space = Some("embed:retired-fixture".into());
+        }
     }
 
     #[test]

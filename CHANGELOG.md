@@ -7,6 +7,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Collect complete sequential login PAD evidence in bounded RGB/IR groups and
+  defer identity inference to the final eligible sample.
+
 - Bound paired camera streaming to each assessment, coordinate paired startup,
   and service companion queues through burst completion.
 

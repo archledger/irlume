@@ -5809,23 +5809,11 @@ impl IrSession<'_> {
                 }
             );
         }
-        // An unusable burst gets a DIAGNOSIS, not the old one-size hint. The
-        // single "run ir-setup" line fit one of a dark frame's six causes and
-        // sent users to write camera firmware for shutters, covers and range
-        // problems (#185); the evidence to do better is already in hand:
-        // whether irlume drove the control, the camera's own per-frame
-        // illumination metadata (#167), the privacy control, and the frame's
-        // mean and spread. Two bands carry a diagnosis: dark, and
-        // saturated-flat, because the most common cover case is not dark at
-        // all: an opaque cover under the active emitter reflects it straight
-        // back and saturates the sensor (#197, measured 252.8-255.0 covered on
-        // both test cameras). This range check is only a shortcut past the
-        // stddev pass on ordinary scenes; `ir_dark::diagnose` re-applies the
-        // real gates and answers None for anything that is a scene after all.
-        // `ir-setup` discovery advice survives only on the one cause it fits;
-        // the historical note about why irlume never recommends
-        // linux-enable-ir-emitter's blind search lives with that message's
-        // cause in `ir_dark` (#159).
+        // Whole-image darkness can be a bright face on a dark background
+        // (#677). Preserve its measurements as debug evidence; only the
+        // assessment layer knows whether the detected face is too dark.
+        // Direct privacy and saturated-flat warnings remain visible.
+        // This shortcut avoids a stddev pass outside both diagnostic bands.
         if (0.0..ir_dark::DARK_MEAN_MAX).contains(&best_mean)
             || best_mean >= ir_dark::SATURATED_MIN_MEAN
         {
@@ -5851,10 +5839,10 @@ impl IrSession<'_> {
                     .map(|(m, _)| *m)
                     .fold(0.0f64, f64::max),
             };
-            if let Some(line) = ir_dark::diagnose(&evidence)
-                .and_then(|cause| ir_dark::render(card, best_mean, &cause))
-            {
-                eprintln!("{line}");
+            match ir_dark::capture_message(card, &evidence) {
+                Some(ir_dark::CaptureMessage::Warning(line)) => eprintln!("{line}"),
+                Some(ir_dark::CaptureMessage::Debug(line)) => irlume_common::dlog!("{line}"),
+                None => {}
             }
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;

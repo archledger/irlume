@@ -8397,6 +8397,9 @@ mod tests {
 
     #[test]
     fn health_reports_the_published_engine_bits() {
+        // Health dispatch tests share this process-wide cache. Keep the
+        // synthetic model flags isolated until the default bits are restored.
+        let _g = env_lock();
         publish_engine_bits_raw(EngineBits {
             mesh: true,
             adapter: true,

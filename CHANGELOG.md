@@ -15,6 +15,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Keep whole-image IR darkness in debug diagnostics without emitter-repair advice;
+  a bright face against a dark background no longer triggers that warning (#677).
+  Face-quality failures and direct shutter/saturation warnings remain visible.
+
 - Report required PAD/runtime failures as unavailable with password guidance,
   without changing authentication admission or retry accounting.
 

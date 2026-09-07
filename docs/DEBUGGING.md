@@ -107,6 +107,16 @@ settling); a below-threshold match or a real spoof verdict settles immediately.
 `IRLUME_GRACE_MS` on the daemon overrides both windows; `0` restores the old
 one-shot behavior.
 
+When grouped authentication expires before complete evidence is accepted, its
+final situation is `timed out`. PAM says "authentication timed out; use your
+password". The detailed refusal reason remains in the daemon reply and journal;
+the debug `attempt:` line retains the available framing measurements alongside
+the timeout label. Those measurements describe the captured evidence, but do
+not replace the deadline as the reason for this refusal. Other denials retain
+their existing situation labels and retry rules. Grouped expiry still counts
+as one completed refusal for the account throttle. An ordinary grace-window
+expiry retains its last outcome and existing accounting.
+
 **Security note: treat tracing as a diagnostic session, not a resident
 setting.** While tracing is on, *denied* attempts log their exact match score
 next to the threshold. To anyone who can read the system journal (root or the

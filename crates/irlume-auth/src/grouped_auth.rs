@@ -64,7 +64,7 @@ pub(super) fn eligible_configuration(
 
 fn expired() -> Outcome {
     Outcome::deny(
-        OutcomeKind::OtherDeny,
+        OutcomeKind::DeadlineExpired,
         "authentication window expired while collecting complete face evidence; use your password",
     )
 }

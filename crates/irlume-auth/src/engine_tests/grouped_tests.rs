@@ -183,7 +183,15 @@ fn grouped_deadline_checks_before_and_after_inference() {
                 || clock.get(),
             )
             .unwrap();
-        assert!(matches!(result, PreparedGroup::Refused(_)));
+        let PreparedGroup::Refused(out) = result else {
+            panic!("expired group admitted")
+        };
+        assert_eq!(out.kind, OutcomeKind::DeadlineExpired);
+        assert!(!out.granted);
+        assert!(!out.live);
+        assert_eq!(out.score, 0.0);
+        assert!(!presence_retryable(&out));
+        assert!(!is_gesture_decline(&out));
         assert_eq!(identities.get(), usize::from(expire_at == 6));
         if expire_at == 0 {
             assert_eq!(assessed.get(), 0);
@@ -536,15 +544,77 @@ fn grouped_deadline_facts_are_current_or_empty_before_any_assessment() {
         let PreparedGroup::Refused(out) = result else {
             panic!("expired group admitted")
         };
+        let facts = &s.engine.last_attempt_facts;
+        if expire_after == 0 {
+            assert!(facts.rgb_face.is_none());
+            assert_eq!(facts.face_frac, 0.0);
+            assert_eq!(facts.yaw_asym, 0.0);
+        } else {
+            assert_eq!(facts.face_frac, 0.2);
+            assert_eq!(facts.rgb_face_brightness, 150.0);
+            assert_eq!(facts.yaw_asym, 1.0);
+            assert_ne!(facts.rgb_face, Some((0.9, 0.9)));
+        }
         assert_eq!(
-            auth_attempt_situation(out.kind, &s.engine.last_attempt_facts),
-            if expire_after == 0 {
-                AttemptSituation::NoFace
-            } else {
-                AttemptSituation::LookingAway
-            }
+            attempt_situation_label(auth_attempt_situation(out.kind, facts)),
+            "timed out"
         );
     }
+}
+
+#[test]
+fn grouped_deadline_keeps_timeout_label_through_retry_loop() {
+    let _guard = env_guard();
+    let mut s = shared();
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(15);
+    let clock = Cell::new(start);
+    let mut calls = 0;
+    let mut costliest = Duration::ZERO;
+    let (result, fallback) = s.engine.authentication_attempt_loop_with(
+        deadline,
+        15_000,
+        &mut costliest,
+        |engine| {
+            calls += 1;
+            assert_eq!(calls, 1, "expired evidence must not be retried");
+            let prepared = engine.evaluate_grouped_samples_with(
+                (0..5).collect(),
+                deadline,
+                |e, i| {
+                    let mut v = sample(e, i, 0.2);
+                    v.assessment.signals.face_frac = 0.2;
+                    v.assessment.signals.rgb_face_brightness = 150.0;
+                    v.assessment.signals.ir_eye_glint = Some(0.0);
+                    clock.set(deadline);
+                    Ok(v)
+                },
+                |_, _| panic!("expired group reached identity"),
+                || clock.get(),
+            );
+            let PreparedGroup::Refused(out) = prepared.unwrap() else {
+                panic!("expired group admitted")
+            };
+            (Ok(out), false)
+        },
+        || clock.get(),
+    );
+    let out = result.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(costliest, Duration::from_secs(15));
+    assert!(!fallback);
+    assert_eq!(out.kind, OutcomeKind::DeadlineExpired);
+    assert!(!out.granted);
+    assert!(!presence_retryable(&out));
+    assert_eq!(s.engine.last_attempt_situation_label(), Some("timed out"));
+    let facts = &s.engine.last_attempt_facts;
+    assert_eq!(facts.glint, Some(0.0));
+    assert!(attempt_situation_line(out.kind, out.score, facts).starts_with("attempt: timed out;"));
+    assert_eq!(
+        auth_attempt_situation(OutcomeKind::OtherDeny, facts),
+        AttemptSituation::GlintBelow,
+        "ordinary refusals must retain their framing classification"
+    );
 }
 
 fn measured_sequential_configuration() -> CaptureModeSelection {

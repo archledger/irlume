@@ -1737,8 +1737,8 @@ fn capture_mode_decision(
 /// and RGB has not already been re-fetched.
 ///
 /// `held_sessions` is the clause this function exists for. The recapture is a
-/// STANDALONE reopen of the RGB node, and enrolment holds both streams open for
-/// the whole capture loop, so under held sessions it opens a device this very
+/// STANDALONE reopen of the RGB node. Paired assessments hold both streams
+/// through inference, so under held sessions it opens a device this very
 /// process is already streaming. Most UVC modules permit that second open and
 /// nothing is visible; a module that answers EBUSY fails the enrolment outright,
 /// which is #187: a Chicony 04f2:b874 that never completed one capture cycle and
@@ -1748,8 +1748,7 @@ fn capture_mode_decision(
 ///
 /// Skipping the recovery when sessions are held costs little: the caller is a
 /// loop that captures repeatedly, so the next scan gets a fresh pair of frames
-/// anyway. Authentication is unaffected — it captures one-shot, holds nothing,
-/// and still self-heals exactly as before.
+/// anyway. Per-capture assessments can still use the standalone recovery.
 fn self_heal_may_recapture(
     rgb_lost_the_face: bool,
     ir_kept_the_face: bool,
@@ -2469,8 +2468,8 @@ mod capture_mode_decision_tests {
         // written for: RGB lost the face, IR kept it, captured concurrently,
         // nothing re-fetched yet.
         assert!(self_heal_may_recapture(true, true, false, false, false));
-        // The same signature during ENROLMENT, which holds both streams open
-        // for the whole capture loop. Recapturing here opens a device this
+        // The same signature during a paired assessment, which holds both
+        // streams through inference. Recapturing here opens a device this
         // process is already streaming, and a module that answers EBUSY to the
         // second open fails the enrolment outright (#187). The hard retry
         // above refuses for exactly this reason; so must this.
@@ -2996,20 +2995,10 @@ mod capture_mode_switch_tests {
     }
 }
 
-/// Hand the camera back before anything opens it again.
-///
-/// Dropping the sessions is the release: an `IrSession` owns the device's
-/// buffer queue, and uvcvideo grants stream privileges to one file handle at
-/// a time, so a consent watch that opens its own stream while one is alive
-/// gets EBUSY from this same process. Named rather than inlined so all seven
-/// release sites are one greppable thing, and so the next reader sees that
-/// the release is a DROP and not a flag.
-fn release_held(
-    rgb: &mut Option<irlume_camera::RgbSession<'_>>,
-    ir: &mut Option<irlume_camera::IrSession<'_>>,
-) {
-    *rgb = None;
-    *ir = None;
+/// Own streaming queues only for one assessment. The result cannot borrow
+/// either session, so both drop before matching, consent or another attempt.
+fn with_owned_pair<R, I, T>(mut pair: (R, I), assess: impl FnOnce(&mut R, &mut I) -> T) -> T {
+    assess(&mut pair.0, &mut pair.1)
 }
 
 /// Keep camera objects only when this operation will arm a held pair.
@@ -3601,7 +3590,7 @@ impl Engine {
             let progress = self.capture_progress();
             match arm_pair_transactionally(
                 || rgb.session_with_progress(&progress),
-                || ir.session_with_progress(&progress),
+                || ir.session_for_pair_with_progress(&progress),
             ) {
                 Ok((mut rgb_session, mut ir_session)) => {
                     match irlume_camera::establish_pair_rate(&mut rgb_session, &mut ir_session) {
@@ -3835,21 +3824,60 @@ impl Engine {
         })
     }
 
-    /// Streams held open across a run of captures, so a loop pays the open,
-    /// format negotiation, buffer mapping, STREAMON and auto-exposure warm-up
-    /// once instead of per capture. Measured on the ASUS built-in: ~700ms of
-    /// every RGB capture is that setup.
-    ///
-    /// Only handed to loops that capture repeatedly under one request, never
-    /// held across requests: an idle stream reserves the camera against other
-    /// applications, keeps the capture LED lit, and would go stale across a
-    /// suspend.
+    /// Assess one pair using the selected per-capture strategy.
     fn assess_full(
         &mut self,
         operation: &irlume_camera::lease::CameraOperationSession,
     ) -> irlume_common::Result<Assessment> {
         self.assess_full_with(None, None, operation, &())
             .map_err(CapturePathError::into_inner)
+    }
+
+    /// Fresh streams for every assessment: caller work between attempts must
+    /// never leave a reusable mmap queue overflowing while nobody drains it.
+    fn assess_with_fresh_pair(
+        &mut self,
+        rgb: &irlume_camera::RgbCamera,
+        ir: &irlume_camera::IrCamera,
+        mode: Option<&CaptureModeSelection>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> Result<Assessment, CapturePathError> {
+        let setup_error = |reason, error| {
+            irlume_common::dlog!("concurrent assessment setup failed ({reason:?}): {error}");
+            emit_capture_fallback(reason, diagnostics);
+            if let Some(selection) = mode {
+                if pair_rate_failure_is_degradation(selection) {
+                    if let Some(key) = selection.runtime_key.as_deref() {
+                        trip_runtime_capture_health(key, reason);
+                    }
+                }
+            }
+            CapturePathError::ConcurrentPair(error)
+        };
+        let progress = self.capture_progress();
+        let started = std::time::Instant::now();
+        let pair = arm_pair_transactionally(
+            || rgb.session_with_progress(&progress),
+            || ir.session_for_pair_with_progress(&progress),
+        );
+        diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::StreamArm,
+            elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        });
+        let pair = pair.map_err(|error| setup_error(RuntimeDegradation::PairArmFailure, error))?;
+        with_owned_pair(pair, |rgb, ir| {
+            let started = std::time::Instant::now();
+            let rate = irlume_camera::establish_pair_rate(rgb, ir);
+            diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+                stage: irlume_common::diagnostics::TraceStage::RateEstablishment,
+                elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            });
+            rate.map_err(|error| {
+                setup_error(RuntimeDegradation::PairRateEstablishmentFailure, error)
+            })?;
+            self.assess_full_with(Some((rgb, ir)), mode, operation, diagnostics)
+        })
     }
 
     fn assess_full_with_operation(
@@ -3998,38 +4026,44 @@ impl Engine {
                         )
                     }
                 } else {
-                    std::thread::scope(|s| {
-                        let ir_thread = s.spawn(move || {
+                    let (mut rgb_ms, mut ir_ms) = (0, 0);
+                    let (mut rgb_recovered, mut ir_recovered) = (false, false);
+                    let (rgb, ir) = irlume_camera::capture_pair_with(
+                        rgb_s,
+                        ir_s,
+                        |session| {
                             let t = std::time::Instant::now();
-                            let captured = Self::run_camera_operation(operation, || {
-                                let (capture, recovered) = held_ir_capture(ir_s);
-                                capture.map(|frame| (frame, recovered))
-                            });
-                            (captured, t.elapsed().as_millis())
-                        });
-                        let t = std::time::Instant::now();
-                        let (rgb, rgb_recovered) = held_rgb_capture(rgb_s);
-                        let rgb_ms = t.elapsed().as_millis();
-                        let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
-                            (
-                                Err(irlume_common::Error::Hardware(
-                                    "IR capture thread panicked".into(),
-                                )),
-                                0,
-                            )
-                        });
-                        let (ir, ir_recovered) = match ir {
-                            Ok((frame, recovered)) => (Ok(frame), recovered),
-                            Err(error) => (Err(error), false),
-                        };
-                        (
-                            rgb,
-                            rgb_ms,
-                            ir.map(Some),
-                            ir_ms,
-                            rgb_recovered || ir_recovered,
-                        )
-                    })
+                            let (capture, recovered) = held_rgb_capture(session);
+                            rgb_ms = t.elapsed().as_millis();
+                            rgb_recovered = recovered;
+                            capture
+                        },
+                        |session| {
+                            let t = std::time::Instant::now();
+                            let capture =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    Self::run_camera_operation(operation, || {
+                                        let (capture, recovered) = held_ir_capture(session);
+                                        ir_recovered = recovered;
+                                        capture
+                                    })
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(irlume_common::Error::Hardware(
+                                        "IR capture thread panicked".into(),
+                                    ))
+                                });
+                            ir_ms = t.elapsed().as_millis();
+                            capture
+                        },
+                    );
+                    (
+                        rgb,
+                        rgb_ms,
+                        ir.map(Some),
+                        ir_ms,
+                        rgb_recovered || ir_recovered,
+                    )
                 }
             } else if sequential {
                 let t = std::time::Instant::now();
@@ -5162,30 +5196,15 @@ impl Engine {
                 "face disabled (fingerprint mode)",
             ));
         }
-        // Load the enrollment once per authentication, not once per retry.
-        // Every retry in the loop below was re-reading the profile file and
-        // re-calling template_key::load_key → tpm::unseal. On a discrete TPM
-        // that unseal costs 2.7s quiet and 18.97s contended, and TPM and
-        // camera are independent devices, so it can leave the critical path
-        // entirely. The key is dropped inside load; only the decrypted
-        // Enrollment is held, which is already plaintext in memory during
-        // each authenticate_once today.
-        //
-        // It leaves the critical path HERE, for the case that has a critical
-        // path to leave: an ENCRYPTED store, whose unseal costs 2.7s quiet /
-        // 18.97s contended on a discrete TPM. A plaintext store loads with no
-        // TPM at all, so it stays synchronous and keeps the historical
-        // deny-before-camera precedence for every policy check below (tests
-        // and plaintext hosts see identical behavior to before). For an
-        // encrypted store the full load runs on a helper thread CONCURRENTLY
-        // with the camera lease, stream arming, delivered-rate establishment
-        // and the consent watch below (>=5s of camera-bound work in
-        // concurrent mode), joined before the first enrollment-dependent
-        // decision. The one precedence change: on an encrypted store whose
-        // camera path ALSO fails hard, the hardware error now precedes the
-        // empty-scans/binding deny lines — both end at the password, so the
-        // user-visible outcome is unchanged. A panic inside the loader maps
-        // to an error (password fallback), never a daemon crash.
+        // Load enrollment once per authentication, not once per retry. The key
+        // is dropped inside load; only the decrypted Enrollment stays in memory
+        // for this request. Encrypted stores load on a helper while the caller
+        // acquires the lease, handles pre-match consent and opens camera handles.
+        // Join before arming streams: an unseal wait must not idle their queues.
+        // Plaintext stores remain synchronous, preserving deny-before-camera
+        // precedence. For an encrypted store whose camera preflight also fails,
+        // that hardware error can precede enrollment-dependent denials. Both
+        // paths retain password fallback; a loader panic maps to an error.
         let load_started = std::time::Instant::now();
         let mut loader = match irlume_core::storage::store_is_encrypted(user)? {
             // No file at all: the instant deny, before anything else wakes.
@@ -5290,27 +5309,9 @@ impl Engine {
                 return Ok(Outcome::gesture_declined(false, 0.0));
             }
         }
-        // Hold the camera sessions across the grace window's retries. Every retry
-        // otherwise re-opens, re-negotiates, re-maps and re-warms both streams
-        // (~700ms of setup per attempt, 58% of a one-shot capture). The enrolment
-        // path already holds sessions for its whole capture loop; the auth path
-        // extends that to the retry loop. The shape matches capture_scans: open
-        // the devices, create sessions from them, fall back to per-capture when
-        // the session path cannot hold them (sequential mode, or a camera that
-        // cannot be opened).
-        //
-        // Declared in reverse drop order: the sessions borrow from `held_cams`, so
-        // Rust drops the sessions first and the cameras after.
-        //
-        // The sessions are passed to `authenticate_once` AS THE OWNING OPTIONS,
-        // not as borrows of them. That is the whole point: the match path
-        // releases the camera before the consent watch opens its own IR stream,
-        // and it can only do that by dropping the session itself. Handing down
-        // `&mut Option<(&mut RgbSession, &mut IrSession)>` made every release
-        // site drop a pair of REFERENCES while these two kept the buffer queue,
-        // so the watch's S_FMT and REQBUFS hit EBUSY against this very process:
-        // the self-collision #187 diagnosed, reintroduced by #346 and caught by
-        // the release audit before it shipped.
+        // Keep negotiated camera handles for this request. Each assessment
+        // creates and drops its own streams, so loader/inference/retry delays
+        // cannot overflow queues retained from an earlier capture.
         let camera_open_started = std::time::Instant::now();
         let resolved_cams = match (
             camera_operation.open_rgb(&rgb_dev),
@@ -5339,75 +5340,9 @@ impl Engine {
         }
         let sequential = capture_mode.is_sequential();
         let held_cams = cameras_for_held_pair(sequential, resolved_cams);
-        let mut held_rgb: Option<irlume_camera::RgbSession<'_>> = None;
-        let mut held_ir: Option<irlume_camera::IrSession<'_>> = None;
-        if let (Some((cam_r, cam_i)), true) = (&held_cams, !sequential && self.ir_available) {
-            let progress = self.capture_progress();
-            // The camera pair is declared before the sessions so it outlives them.
-            let arm_started = std::time::Instant::now();
-            let armed = arm_pair_transactionally(
-                || cam_r.session_with_progress(&progress),
-                || cam_i.session_with_progress(&progress),
-            );
-            diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
-                stage: irlume_common::diagnostics::TraceStage::StreamArm,
-                elapsed_us: u64::try_from(arm_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            });
-            match armed {
-                Ok((mut rs, mut is)) => {
-                    // Establish the delivered-rate windows for the HELD PAIR up
-                    // front, draining both streams concurrently. A failure drops
-                    // both streams and selects the one-at-a-time path below.
-                    let rate_started = std::time::Instant::now();
-                    let rate = irlume_camera::establish_pair_rate(&mut rs, &mut is);
-                    diagnostics.emit_trace(
-                        irlume_common::diagnostics::TraceEventKind::StageTiming {
-                            stage: irlume_common::diagnostics::TraceStage::RateEstablishment,
-                            elapsed_us: u64::try_from(rate_started.elapsed().as_micros())
-                                .unwrap_or(u64::MAX),
-                        },
-                    );
-                    match rate {
-                        Ok(()) => {
-                            held_rgb = Some(rs);
-                            held_ir = Some(is);
-                        }
-                        Err(error) => {
-                            irlume_common::dlog!(
-                                "auth: held pair could not establish delivered-rate evidence \
-                                 ({error}); dropping both streams and retrying one-at-a-time"
-                            );
-                            emit_capture_fallback(
-                                RuntimeDegradation::PairRateEstablishmentFailure,
-                                diagnostics,
-                            );
-                            demote_after_pair_rate_failure(&mut capture_mode);
-                        }
-                    }
-                }
-                Err(error) => {
-                    irlume_common::dlog!(
-                        "auth: held pair could not arm transactionally ({error}); \
-                         retrying one-at-a-time"
-                    );
-                    emit_capture_fallback(RuntimeDegradation::PairArmFailure, diagnostics);
-                    demote_after_pair_arm_failure(&mut capture_mode);
-                }
-            }
-        }
-        // Join the enrollment loader. Everything between the spawn and HERE —
-        // camera lease, consent watch, stream arming, delivered-rate
-        // establishment — is the overlap window the TPM unseal ran inside;
-        // on every measured host that window exceeds the unseal (2.7s quiet),
-        // so the load costs the auth path nothing. First enrollment-dependent
-        // decision happens after this join, before any capture is spent.
-        // The wait is bounded by the authentication deadline: a wedged unseal
-        // (stuck tpmrm, or a user-state flock held by a wedged sibling) must
-        // not pin the camera lease forever — on timeout the auth fails closed
-        // to the password and the detached loader releases its locks whenever
-        // it finishes. A ready result is returned even at zero remaining
-        // time, so a healthy load that already finished is never mistaken
-        // for a timeout. The arms live in [`resolve_loader`].
+        // Resolve enrollment before streaming. A loader wait can exceed a
+        // camera queue's capacity; no stream may be armed across this wait.
+        // The wait remains bounded by the authentication deadline.
         let enr = match loader.take() {
             Some(rx) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -5439,7 +5374,7 @@ impl Engine {
             "auth: enrollment load took {:?} ({})",
             load_started.elapsed(),
             if loader_was_async {
-                "overlapped with camera setup"
+                "overlapped with camera preflight"
             } else {
                 "plaintext, synchronous"
             }
@@ -5449,12 +5384,8 @@ impl Engine {
                 return Ok(outcome);
             }
         }
-        if held_rgb.is_none() || held_ir.is_none() {
-            drop(held_rgb);
-            drop(held_ir);
+        if held_cams.is_none() || !self.ir_available {
             drop(held_cams);
-            let mut no_rgb = None;
-            let mut no_ir = None;
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self
                 .authentication_attempt_loop(
@@ -5463,8 +5394,7 @@ impl Engine {
                     service,
                     deadline,
                     window,
-                    &mut no_rgb,
-                    &mut no_ir,
+                    None,
                     &capture_mode,
                     &camera_operation,
                     diagnostics,
@@ -5479,8 +5409,7 @@ impl Engine {
             service,
             deadline,
             window,
-            &mut held_rgb,
-            &mut held_ir,
+            held_cams.as_ref(),
             &capture_mode,
             &camera_operation,
             diagnostics,
@@ -5490,15 +5419,14 @@ impl Engine {
             return first_result;
         }
         let error = first_result.expect_err("held-pair failure must return an error");
-        // The sequential fallback re-opens both cameras: ~3.1 s of machinery
-        // per stream, ~7 s for the pair (the loop comment below derives it).
+        // The sequential fallback re-opens both cameras. Retain its existing
+        // conservative setup-cost floor when deciding whether it fits.
         // Bound its FIRST attempt the same way the loop bounds retries: when
         // the cost of that attempt cannot finish before the deadline, do not
         // start it — the camera is released and the password fallback answers
         // inside the window instead of the lease overrunning mid-capture
         // (ADR-0014). The estimator is the observed costliest attempt raised
-        // to that floor: the concurrent loop's own attempts (~1 s) would
-        // never bound a ~7 s sequential reopen.
+        // to that floor: a concurrent attempt need not bound a sequential reopen.
         let fallback_cost = costliest_attempt.max(SEQUENTIAL_PAIR_ATTEMPT_COST);
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining < fallback_cost {
@@ -5509,15 +5437,11 @@ impl Engine {
             );
             return Err(error);
         }
-        drop(held_rgb);
-        drop(held_ir);
         drop(held_cams);
         demote_after_concurrent_capture_failure(&mut capture_mode);
         irlume_common::dlog!(
             "auth: {error}; dropped both held streams and camera handles; retrying RGB then IR"
         );
-        let mut no_rgb = None;
-        let mut no_ir = None;
         // Seed with the first loop's costliest attempt so the fallback's own
         // retry decisions account for what this deadline has already spent.
         self.authentication_attempt_loop(
@@ -5526,8 +5450,7 @@ impl Engine {
             service,
             deadline,
             window,
-            &mut no_rgb,
-            &mut no_ir,
+            None,
             &capture_mode,
             &camera_operation,
             diagnostics,
@@ -5553,8 +5476,7 @@ impl Engine {
         service: Option<&str>,
         deadline: std::time::Instant,
         window: u64,
-        held_rgb: &mut Option<irlume_camera::RgbSession<'_>>,
-        held_ir: &mut Option<irlume_camera::IrSession<'_>>,
+        cameras: Option<&(irlume_camera::RgbCamera, irlume_camera::IrCamera)>,
         capture_mode: &CaptureModeSelection,
         camera_operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -5566,9 +5488,8 @@ impl Engine {
         // cannot FINISH before the deadline would overrun mid-capture —
         // holding the camera past the window for a result that can never be
         // used. The costliest (not latest) attempt is the estimator because a
-        // retry can be far slower than the attempt before it: the
-        // held-concurrent pair costs ~1s, and its sequential fallback re-opens
-        // both cameras at ~7s.
+        // retry can be slower than the attempt before it. Each concurrent
+        // attempt now includes fresh stream arming and rate establishment.
         loop {
             attempt += 1;
             let mut held_pair_failed = false;
@@ -5578,8 +5499,7 @@ impl Engine {
                     enr,
                     purpose,
                     service,
-                    held_rgb,
-                    held_ir,
+                    cameras,
                     AuthenticationCaptureContext {
                         mode: Some(capture_mode),
                         operation: Some(camera_operation),
@@ -5588,6 +5508,7 @@ impl Engine {
                     },
                 )
             });
+            *costliest_attempt = (*costliest_attempt).max(attempt_started.elapsed());
             let out = match attempt_result {
                 Ok(out) => out,
                 Err(error) => {
@@ -5595,7 +5516,6 @@ impl Engine {
                     return (Err(error), held_pair_failed);
                 }
             };
-            *costliest_attempt = (*costliest_attempt).max(attempt_started.elapsed());
             // One situation line per FAILED attempt (#616 step 2), including
             // attempts the grace window retries: the "why did it fail" a
             // person reads in `irlume logs`, from the facts this attempt
@@ -5652,11 +5572,7 @@ impl Engine {
         enr: &irlume_core::storage::Enrollment,
         purpose: AuthenticationPurpose,
         service: Option<&str>,
-        // The OWNING options, so a release site can actually drop the sessions
-        // and hand the camera back; see the declaration comment in
-        // `authenticate_for`.
-        held_rgb: &mut Option<irlume_camera::RgbSession<'_>>,
-        held_ir: &mut Option<irlume_camera::IrSession<'_>>,
+        cameras: Option<&(irlume_camera::RgbCamera, irlume_camera::IrCamera)>,
         capture: AuthenticationCaptureContext<'_>,
     ) -> irlume_common::Result<Outcome> {
         let AuthenticationCaptureContext {
@@ -5668,10 +5584,8 @@ impl Engine {
         let assessment = if !self.ir_available {
             self.assess_rgb_only_with_diagnostics(diagnostics)
                 .map_err(CapturePathError::from)
-        } else if let (Some(rs), Some(is), Some(operation)) =
-            (held_rgb.as_mut(), held_ir.as_mut(), operation)
-        {
-            self.assess_full_with(Some((rs, is)), mode, operation, diagnostics)
+        } else if let (Some((rgb, ir)), Some(operation)) = (cameras, operation) {
+            self.assess_with_fresh_pair(rgb, ir, mode, operation, diagnostics)
         } else if let Some(operation) = operation {
             self.assess_full_with(None, mode, operation, diagnostics)
         } else {
@@ -5786,7 +5700,6 @@ impl Engine {
                 score >= thr,
             );
             if rgb_primary_grant_admissible(score, thr, a.sequential_pair) {
-                release_held(held_rgb, held_ir);
                 return self.challenge_if_required(
                     purpose,
                     service,
@@ -5838,7 +5751,6 @@ impl Engine {
                     );
                     if f.grant && !a.sequential_pair {
                         let who = if ir_score >= score { ir_who } else { who };
-                        release_held(held_rgb, held_ir);
                         return self.challenge_if_required(
                     purpose,
                     service,
@@ -5874,7 +5786,6 @@ impl Engine {
                         ir_score >= ir_thr,
                     );
                     if ir_score >= ir_thr {
-                        release_held(held_rgb, held_ir);
                         return self.challenge_if_required(
                     purpose,
                     service,
@@ -5896,7 +5807,6 @@ impl Engine {
                             *cs >= cthr,
                         );
                         if *cs >= cthr {
-                            release_held(held_rgb, held_ir);
                             return self.challenge_if_required(
                     purpose,
                     service,
@@ -6066,7 +5976,6 @@ impl Engine {
             // calibrated centroid at the base threshold (no best-of-N FAR
             // inflation; the prototype-validated mean-template protocol).
             if score >= ir_thr {
-                release_held(held_rgb, held_ir);
                 return self.challenge_if_required(
                     purpose,
                     service,
@@ -6084,7 +5993,6 @@ impl Engine {
                     *cs >= cthr,
                 );
                 if *cs >= cthr {
-                    release_held(held_rgb, held_ir);
                     return self.challenge_if_required(
                         purpose,
                         service,
@@ -6095,7 +6003,6 @@ impl Engine {
                     );
                 }
             }
-            release_held(held_rgb, held_ir);
             return self.challenge_if_required(
                 purpose,
                 service,
@@ -6276,20 +6183,9 @@ impl Engine {
         // presentation (the enrollment), and a banner presented to enroll is
         // exactly the sustained presentation the vote exists to deny.
         self.vit_scores.clear();
-        // Hold the cameras open for the whole loop. This is the heaviest repeated
-        // capture in the codebase (the budget below is ten assessments per wanted
-        // scan), and every one of them otherwise re-opened, re-negotiated,
-        // re-mapped and re-warmed both streams, plus blinked the capture LED.
-        // Measured on the ASUS built-in with examples/session_bench.rs: an
-        // RGB+IR pair costs 1912ms per-call against 797ms on a held session,
-        // so 1115ms of every attempt was setup (58%). Safe to hold
-        // for a burst this long because the emitter does not go dark: measured at
-        // a flat lit level for 30s of continuous streaming on both modules we
-        // have (examples/ir_refire_probe.rs).
-        //
-        // A camera that cannot be opened is NOT fatal here: fall back to the
-        // per-capture path, which is exactly today's behaviour, so enrolment
-        // still works on hardware the session path cannot hold.
+        // Reuse negotiated camera handles when concurrency is selected, but
+        // arm fresh streams per assessment so inference cannot leave stale
+        // queues for the next scan. If opens fail, use per-capture fallback.
         // Asked to yield before the first frame: do not even open the device.
         // A queued enrolment that already knows an authentication is waiting has
         // no business claiming the camera for the moment it takes to notice.
@@ -6319,18 +6215,8 @@ impl Engine {
         } else {
             None
         };
-        // Fast path: hold both streams for the whole loop.
-        //
-        // NOT under sequential capture mode. A held session arms its stream
-        // at creation, so holding both means both stream at once and
-        // "sequential" only orders the reads. Measured on a Logitech Brio on
-        // a USB2 link (#187 hardware session, strace + dmesg): with the IR
-        // stream armed, the RGB stream gets no isochronous bandwidth at all;
-        // STREAMON succeeds, no frame ever arrives, and the queue dies with
-        // QBUF EINVAL ("Failed to resubmit video URB" in dmesg). Sequential
-        // mode exists for exactly the cameras that cannot sustain both
-        // streams, so on them this loop takes the per-frame path, which
-        // opens one stream at a time and releases it before the other.
+        // Retain camera handles only for concurrent operation. Streaming
+        // sessions are scoped to one assessment, including each enrollment scan.
         let mut capture_mode = if use_ir {
             cams.as_ref()
                 .map_or_else(unavailable_capture_mode_selection, |(rgb, ir)| {
@@ -6356,65 +6242,25 @@ impl Engine {
                 "enroll: sequential capture mode (from {mode_source}); not holding \
                  both streams, capturing per-frame"
             );
-        } else if let Some((r, i)) = &cams {
-            let progress = self.capture_progress();
-            match arm_pair_transactionally(
-                || r.session_with_progress(&progress),
-                || i.session_with_progress(&progress),
+        } else if let Some((rgb, ir)) = &cams {
+            match self.capture_scan_loop(
+                want,
+                pitch_neutral,
+                Some((rgb, ir)),
+                EnrollmentCapturePolicy {
+                    mode: &capture_mode,
+                    use_ir,
+                    diagnostics,
+                },
+                &operation,
+                observed,
             ) {
-                Ok((mut rs, mut is)) => {
-                    // Establish the delivered-rate windows for the HELD PAIR up
-                    // front, draining both streams concurrently so neither starves
-                    // the other's buffer queue. A failure drops both streams and
-                    // selects the one-at-a-time path below.
-                    match irlume_camera::establish_pair_rate(&mut rs, &mut is) {
-                        Ok(()) => {
-                            let held_result = self.capture_scan_loop(
-                                want,
-                                pitch_neutral,
-                                Some((&mut rs, &mut is)),
-                                EnrollmentCapturePolicy {
-                                    mode: &capture_mode,
-                                    use_ir,
-                                    diagnostics,
-                                },
-                                &operation,
-                                observed,
-                            );
-                            match held_result {
-                                Ok(scans) => return Ok(scans),
-                                Err(CapturePathError::ConcurrentPair(error)) => {
-                                    drop(rs);
-                                    drop(is);
-                                    demote_after_concurrent_capture_failure(&mut capture_mode);
-                                    irlume_common::dlog!(
-                                    "enroll: {error}; dropped both held streams and restarting RGB then IR"
-                                );
-                                }
-                                Err(error) => return Err(error.into_inner()),
-                            }
-                        }
-                        Err(error) => {
-                            irlume_common::dlog!(
-                                "enroll: held pair could not establish delivered-rate evidence \
-                             ({error}); dropping both streams and retrying one-at-a-time"
-                            );
-                            emit_capture_fallback(
-                                RuntimeDegradation::PairRateEstablishmentFailure,
-                                diagnostics,
-                            );
-                            demote_after_pair_rate_failure(&mut capture_mode);
-                        }
-                    }
+                Ok(scans) => return Ok(scans),
+                Err(CapturePathError::ConcurrentPair(error)) => {
+                    demote_after_concurrent_capture_failure(&mut capture_mode);
+                    irlume_common::dlog!("enroll: {error}; restarting RGB then IR");
                 }
-                Err(error) => {
-                    irlume_common::dlog!(
-                        "enroll: held pair could not arm transactionally ({error}); \
-                         retrying one-at-a-time"
-                    );
-                    emit_capture_fallback(RuntimeDegradation::PairArmFailure, diagnostics);
-                    demote_after_pair_arm_failure(&mut capture_mode);
-                }
+                Err(error) => return Err(error.into_inner()),
             }
         }
         // No held session. RELEASE THE DEVICES FIRST. The per-frame path below
@@ -6447,8 +6293,8 @@ impl Engine {
         .map_err(CapturePathError::into_inner)
     }
 
-    /// The enrolment capture loop, over held streams when `sessions` is given
-    /// and re-opening per frame when it is not.
+    /// The enrolment loop arms fresh paired streams per assessment when
+    /// `cameras` is given, otherwise it uses the per-capture strategy.
     ///
     /// Split out from [`Self::capture_scans`] so the per-frame path runs with
     /// the held cameras already dropped: the two capture strategies must never
@@ -6457,19 +6303,16 @@ impl Engine {
         &mut self,
         want: usize,
         pitch_neutral: Option<f32>,
-        mut sessions: Option<(
-            &mut irlume_camera::RgbSession<'_>,
-            &mut irlume_camera::IrSession<'_>,
-        )>,
+        cameras: Option<(&irlume_camera::RgbCamera, &irlume_camera::IrCamera)>,
         policy: EnrollmentCapturePolicy<'_>,
         operation: &irlume_camera::lease::CameraOperationSession,
         observed: &mut CaptureShape,
     ) -> Result<Vec<CapturedScan>, CapturePathError> {
         let mut out = Vec::new();
-        // Read once, before the loop: `sessions` is borrowed per iteration but
+        // Read once, before the loop: `cameras` is borrowed per iteration but
         // never taken, so this is the whole loop's answer (#389).
         let mut shape = CaptureShape {
-            held_sessions: sessions.is_some(),
+            held_sessions: cameras.is_some(),
             ..CaptureShape::default()
         };
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
@@ -6488,9 +6331,10 @@ impl Engine {
                 )));
             }
             let a = operation
-                .run(|| match &mut sessions {
-                    Some((rs, is)) => self.assess_full_with(
-                        Some((rs, is)),
+                .run(|| match cameras {
+                    Some((rgb, ir)) => self.assess_with_fresh_pair(
+                        rgb,
+                        ir,
                         Some(policy.mode),
                         operation,
                         policy.diagnostics,
@@ -6620,10 +6464,11 @@ impl Engine {
             _ => return false,
         };
         let progress = self.capture_progress();
-        let sessions = cams
-            .0
-            .session_with_progress(&progress)
-            .and_then(|rs| cams.1.session_with_progress(&progress).map(|is| (rs, is)));
+        let sessions = cams.0.session_with_progress(&progress).and_then(|rs| {
+            cams.1
+                .session_for_pair_with_progress(&progress)
+                .map(|is| (rs, is))
+        });
         let (mut rs, mut is) = match sessions {
             Ok(pair) => pair,
             Err(_) => return false,
@@ -6637,24 +6482,27 @@ impl Engine {
                  ({error}); the per-frame fill will retry"
             );
         }
-        let (rgb, ir) = std::thread::scope(|scope| {
-            let ir_thread = scope.spawn(|| {
+        let (rgb, ir) = irlume_camera::capture_pair_with(
+            &mut rs,
+            &mut is,
+            |session| {
                 operation
-                    .run(|| is.capture_with_stats())
+                    .run(|| session.denoised())
                     .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
-            });
-            let rgb = operation
-                .run(|| rs.denoised())
-                .map_err(|error| irlume_common::Error::Hardware(error.to_string()))
-                .and_then(|capture| capture);
-            let ir = match ir_thread.join() {
-                Ok(result) => result,
-                Err(_) => Err(irlume_common::Error::Hardware(
-                    "IR capture thread panicked".into(),
-                )),
-            };
-            (rgb, ir)
-        });
+            },
+            |session| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    operation
+                        .run(|| session.capture_with_stats())
+                        .map_err(|error| irlume_common::Error::Hardware(error.to_string()))?
+                }))
+                .unwrap_or_else(|_| {
+                    Err(irlume_common::Error::Hardware(
+                        "IR capture thread panicked".into(),
+                    ))
+                })
+            },
+        );
         let (Ok(rgb), Ok(_)) = (&rgb, &ir) else {
             return false;
         };
@@ -7493,7 +7341,7 @@ struct StarvationProbeResult {
 // is constructed literally rather than accumulated.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CaptureShape {
-    /// The loop ran over held streams, which is the clause that suppresses the
+    /// Each assessment held paired streams, which suppresses the
     /// cross-spectrum self-heal in [`self_heal_may_recapture`]. It matters to
     /// the message because on the OTHER path the self-heal recaptures RGB
     /// standalone and reassigns `rgb_top`, so an IR-only attempt there means
@@ -12150,23 +11998,70 @@ mod engine_tests {
         (var("IRLUME_TEST_RGB_DEVICE"), var("IRLUME_TEST_IR_DEVICE"))
     }
 
-    /// `release_held` must HAND THE CAMERA BACK, which is the whole reason the
-    /// grant paths call it before `challenge_if_required` opens its own IR
-    /// stream for the consent watch.
-    ///
-    /// The bug this pins: `held` used to be `&mut Option<(&mut RgbSession,
-    /// &mut IrSession)>`, so every release site dropped a pair of REFERENCES
-    /// while the sessions themselves stayed alive in `authenticate_for`. The
-    /// watch's `S_FMT` and `REQBUFS` then hit EBUSY against this same process,
-    /// the self-collision #187 diagnosed, and a successful match was thrown
-    /// away for a password prompt. Introduced by #346, so it never shipped.
-    ///
-    /// The CONTROL is the point: a second stream must FAIL while the session
-    /// is alive, or this test cannot tell a working release from a camera that
-    /// was never held in the first place.
+    struct AttemptStream<'a>(&'a std::cell::Cell<usize>);
+
+    impl<'a> AttemptStream<'a> {
+        fn open(active: &'a std::cell::Cell<usize>) -> Self {
+            active.set(active.get() + 1);
+            Self(active)
+        }
+    }
+
+    impl Drop for AttemptStream<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
+        }
+    }
+
+    #[test]
+    fn attempt_scope_releases_both_streams_before_an_idle_retry() {
+        let active = std::cell::Cell::new(0);
+        for attempt in 0..3 {
+            let output = with_owned_pair(
+                (AttemptStream::open(&active), AttemptStream::open(&active)),
+                |_, _| {
+                    assert_eq!(active.get(), 2);
+                    attempt
+                },
+            );
+            assert_eq!(output, attempt);
+            assert_eq!(
+                active.get(),
+                0,
+                "matching and the next attempt must not retain streaming queues"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_scope_releases_both_streams_on_assessment_error() {
+        let active = std::cell::Cell::new(0);
+        let result = with_owned_pair(
+            (AttemptStream::open(&active), AttemptStream::open(&active)),
+            |_, _| Err::<(), _>("assessment refused"),
+        );
+        assert_eq!(result, Err("assessment refused"));
+        assert_eq!(active.get(), 0);
+    }
+
+    #[test]
+    fn attempt_scope_releases_both_streams_on_panic() {
+        let active = std::cell::Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_owned_pair(
+                (AttemptStream::open(&active), AttemptStream::open(&active)),
+                |_, _| panic!("assessment panicked"),
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(active.get(), 0);
+    }
+
+    /// The attempt scope must release both actual stream owners before a
+    /// consent watch can open them. The busy control proves a real queue was held.
     #[test]
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
-    fn loopback_release_held_hands_the_camera_back() {
+    fn loopback_attempt_scope_hands_the_camera_back() {
         let (rgb, ir) = loopback_pair();
         let _g = env_guard();
         let operation = irlume_camera::lease::acquire_camera_operation(
@@ -12177,29 +12072,21 @@ mod engine_tests {
         .expect("acquire one RGB+IR operation");
         let cam = operation.open_ir(&ir).expect("open the IR node");
         let rgb_cam = operation.open_rgb(&rgb).expect("open the RGB node");
-        let mut held_ir = Some(cam.session().expect("hold an IR session"));
-        // BOTH halves must release: the review round noted the test proved
-        // only the IR side, and release_held drops two owners.
-        let mut held_rgb = Some(rgb_cam.session().expect("hold an RGB session"));
-
-        // Control: with the session alive, a second stream on the same node
-        // must be refused. If this passes, the rest proves nothing.
-        let busy_ir = cam.session();
-        let busy_rgb = rgb_cam.session();
-        assert!(
-            busy_ir.is_err() && busy_rgb.is_err(),
-            "control failed: live IR and RGB sessions must each block a second stream, or this \
-             test cannot distinguish a real release from a camera nobody held"
-        );
-
-        release_held(&mut held_rgb, &mut held_ir);
-        assert!(
-            held_ir.is_none() && held_rgb.is_none(),
-            "the release must clear BOTH session slots"
+        with_owned_pair(
+            (
+                rgb_cam.session().expect("hold RGB"),
+                cam.session().expect("hold IR"),
+            ),
+            |_, _| {
+                assert!(
+                    cam.session().is_err() && rgb_cam.session().is_err(),
+                    "control: both live sessions must block a second stream"
+                );
+            },
         );
 
         // The observation: the original cameras accept fresh sessions after
-        // release_held drops both owners and their per-camera slots reset.
+        // the attempt scope drops both owners and their per-camera slots reset.
         let mut after = cam.session().expect("open IR session after release");
         let after_capture = after.capture_with_stats();
         assert!(

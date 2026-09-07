@@ -9,6 +9,27 @@ fn function<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &source[start..end]
 }
 
+fn assert_scoped_pair_assessment(source: &str) {
+    let assessment = function(
+        source,
+        "    fn assess_with_fresh_pair(",
+        "\n    fn assess_full_with_operation(",
+    );
+    let owner = assessment
+        .find("with_owned_pair(pair,")
+        .expect("own both sessions");
+    let capture = assessment
+        .find("self.assess_full_with(Some((rgb, ir))")
+        .expect("paired assessment");
+    assert!(
+        owner < capture,
+        "capture must finish inside the session owner scope"
+    );
+    assert!(assessment.contains("Result<Assessment, CapturePathError>"));
+    assert!(assessment.contains("arm_pair_transactionally("));
+    assert!(assessment.contains("establish_pair_rate(rgb, ir)"));
+}
+
 #[test]
 fn held_concurrent_failure_is_returned_to_the_pair_owner() {
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
@@ -35,10 +56,31 @@ fn authentication_fallback_drops_the_entire_held_pair_before_retry() {
         "\n    fn authenticate_once(",
     );
 
-    for release in ["drop(held_rgb)", "drop(held_ir)", "drop(held_cams)"] {
-        assert!(authenticate.contains(release), "missing {release}");
-    }
-    assert!(authenticate.contains("demote_after_concurrent_capture_failure"));
+    // Streams belong to the assessment scope now, not the retry loop. The
+    // runtime owner tests cover Drop on success/error/panic; pin both callers
+    // to that scope so moving streams back outside the loop cannot pass.
+    assert_scoped_pair_assessment(&source);
+    let attempt = function(
+        &source,
+        "    fn authenticate_once(",
+        "\n    pub fn identify(",
+    );
+    assert!(attempt.contains("self.assess_with_fresh_pair(rgb, ir, mode, operation, diagnostics)"));
+    assert!(!authenticate.contains("RgbSession"));
+    assert!(!authenticate.contains("IrSession"));
+    let fallback = authenticate
+        .split("let error = first_result.expect_err")
+        .nth(1)
+        .expect("concurrent failure fallback");
+    let release = fallback.find("drop(held_cams)").expect("release handles");
+    let retry = fallback
+        .find("self.authentication_attempt_loop(")
+        .expect("sequential retry");
+    assert!(
+        release < retry,
+        "fallback must release handles before reopening"
+    );
+    assert!(fallback[..retry].contains("demote_after_concurrent_capture_failure"));
 }
 
 #[test]
@@ -53,8 +95,19 @@ fn enrollment_fallback_restarts_without_held_sessions() {
 
     assert!(capture.contains("CapturePathError::ConcurrentPair"));
     assert!(capture.contains("demote_after_concurrent_capture_failure"));
-    assert!(capture.contains("drop(rs)"));
-    assert!(capture.contains("drop(is)"));
+    assert_scoped_pair_assessment(&source);
+    assert!(!capture.contains("RgbSession"));
+    assert!(!capture.contains("IrSession"));
+    let release = capture.find("drop(cams)").expect("release handles");
+    let retry = capture
+        .rfind("self.capture_scan_loop(")
+        .expect("sequential retry");
+    assert!(
+        release < retry,
+        "fallback must release handles before reopening"
+    );
+    let scan_loop = function(&source, "    fn capture_scan_loop(", "\n    ///");
+    assert!(scan_loop.contains("self.assess_with_fresh_pair("));
 }
 
 #[test]

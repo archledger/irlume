@@ -226,8 +226,8 @@ fn help_exposes_no_eye_challenge_or_calibration() {
             "retired surface remains: {retired}"
         );
     }
-    assert!(help.contains("keep nodding to approve"));
-    assert!(help.contains("shake your head to decline"));
+    assert!(!help.contains("keep nodding to approve"));
+    assert!(!help.contains("shake your head to decline"));
 }
 
 #[test]
@@ -269,7 +269,6 @@ const DEV_CMDS: &[&str] = &[
     "irbench",
     "genuine",
     "calcapture",
-    "gesturecap",
     "normprobe",
     "liveness",
     "selftest",
@@ -312,11 +311,6 @@ fn dev_commands_with_env_reach_their_usage_errors() {
         (&["irbench"], 2, "usage: irlume irbench --dir"),
         (&["genuine"], 2, "usage: irlume genuine --det"),
         (&["calcapture"], 2, "--out <cal.jsonl>"),
-        (
-            &["gesturecap"],
-            2,
-            "usage: irlume gesturecap <capture|replay>",
-        ),
         (&["normprobe"], 2, "usage: irlume normprobe --dir"),
         (&["liveness"], 2, "usage: irlume liveness --det"),
         (&["verify"], 2, "usage: irlume verify --user U --det"),
@@ -2155,147 +2149,6 @@ esac"#,
     }
 }
 
-/// A pose recording exactly as `write_pose_jsonl` lays it out: a posecap
-/// header declaring `frames`, then one record per line with consecutive idx.
-fn write_pose_recording(path: &std::path::Path, label: &str, pitches: &[f32]) {
-    let mut s = format!(
-        "{{\"posecap\":true,\"label\":\"{label}\",\"frames\":{}}}\n",
-        pitches.len()
-    );
-    for (i, p) in pitches.iter().enumerate() {
-        s.push_str(&format!(
-            "{{\"idx\":{i},\"pitch_frac\":{p},\"yaw_signed\":0.0,\"bri\":100.0}}\n"
-        ));
-    }
-    std::fs::write(path, s).unwrap();
-}
-
-fn write_pose_recording_with_yaw(
-    path: &std::path::Path,
-    label: &str,
-    pitches: &[f32],
-    yaw: &[f32],
-) {
-    assert_eq!(pitches.len(), yaw.len());
-    let mut contents = format!(
-        "{{\"posecap\":true,\"label\":\"{label}\",\"frames\":{}}}\n",
-        pitches.len()
-    );
-    for (idx, (&pitch, &yaw)) in pitches.iter().zip(yaw).enumerate() {
-        contents.push_str(&format!(
-            "{{\"idx\":{idx},\"pitch_frac\":{pitch},\"yaw_signed\":{yaw},\"bri\":100.0}}\n"
-        ));
-    }
-    std::fs::write(path, contents).unwrap();
-}
-
-#[test]
-fn gesturecap_replays_pose_only_recordings() {
-    let sandbox = Sandbox::new("gesturecap-replay");
-    let file = sandbox.path("work/nod.jsonl");
-    write_pose_recording(
-        &file,
-        "nod",
-        &[
-            0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
-            0.50, 0.50, 0.50, 0.50, 0.60, 0.40,
-        ],
-    );
-    let mut command = sandbox.cmd(&["gesturecap", "replay", file.to_str().unwrap()]);
-    command.env("IRLUME_DEV", "1");
-    let (code, stdout, stderr) = run(&mut command);
-    assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains("Nod"), "{stdout}");
-    for field in [
-        "pitch_range",
-        "yaw_range",
-        "pitch_crossings",
-        "yaw_crossings",
-        "mean_step",
-        "verdict",
-        "production_window_frames",
-        "production_face_frames",
-        "production_pitch_range",
-        "production_yaw_range",
-        "production_pitch_crossings",
-        "production_yaw_crossings",
-        "production_mean_step",
-        "production_verdict",
-    ] {
-        assert!(stdout.contains(field), "missing {field}: {stdout}");
-    }
-
-    let directory = sandbox.path("work");
-    let (code, stdout, stderr) = run(sandbox
-        .cmd(&["gesturecap", "replay", directory.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains("nod.jsonl"), "{stdout}");
-}
-
-#[test]
-fn gesturecap_replay_keeps_rejection_evidence_in_csv_not_stderr() {
-    let sandbox = Sandbox::new("gesturecap-quiet-replay");
-    let file = sandbox.path("work/look-around.jsonl");
-    let pitch = [0.5; 24];
-    let yaw: Vec<f32> = (0..24)
-        .map(|idx| if idx % 2 == 0 { -2.05 } else { 2.05 })
-        .collect();
-    write_pose_recording_with_yaw(&file, "look-around", &pitch, &yaw);
-
-    let mut command = sandbox.cmd(&["gesturecap", "replay", file.to_str().unwrap()]);
-    command.env("IRLUME_DEV", "1");
-    let (code, stdout, stderr) = run(&mut command);
-
-    assert_eq!(code, 0, "{stderr}");
-    assert!(stderr.is_empty(), "{stderr}");
-    assert!(stdout.contains("look-around.jsonl"), "{stdout}");
-    assert!(stdout.contains("None"), "{stdout}");
-}
-
-#[test]
-fn gesturecap_hardware_subcommands_are_retired() {
-    let sandbox = Sandbox::new("gesturecap-retired-hardware");
-
-    for subcommand in ["identity", "attempt"] {
-        let mut command = sandbox.cmd(&["gesturecap", subcommand]);
-        command
-            .env("IRLUME_DEV", "1")
-            .env("IRLUME_RGB_DEVICE", "/dev/irlume-must-not-open-rgb")
-            .env("IRLUME_IR_DEVICE", "/dev/irlume-must-not-open-ir");
-        let (code, stdout, stderr) = run(&mut command);
-        assert_eq!(code, 2, "{subcommand}: {stderr}");
-        assert!(stdout.is_empty(), "{subcommand}: {stdout}");
-        assert!(
-            stderr.contains("usage: irlume gesturecap <capture|replay>"),
-            "{subcommand}: {stderr}"
-        );
-        assert!(
-            !stderr.contains("irlume-must-not-open"),
-            "retired {subcommand} inspected a camera path: {stderr}"
-        );
-    }
-}
-
-#[test]
-fn gesturecap_replays_explicit_null_pose_fields() {
-    let sandbox = Sandbox::new("gesturecap-null-pose");
-    let file = sandbox.path("work/no-face.jsonl");
-    std::fs::write(
-        &file,
-        "{\"posecap\":true,\"label\":\"no-face\",\"frames\":1}\n\
-         {\"idx\":0,\"pitch_frac\":null,\"yaw_signed\":null,\"bri\":100.0}\n",
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run(sandbox
-        .cmd(&["gesturecap", "replay", file.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-
-    assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains("NoFace"), "{stdout}");
-}
-
 #[test]
 fn retired_blinkcap_is_not_dispatchable() {
     let sandbox = Sandbox::new("blinkcap-retired");
@@ -2305,168 +2158,15 @@ fn retired_blinkcap_is_not_dispatchable() {
 }
 
 #[test]
-fn gesturecap_strictly_validates_pose_headers_records_counts_and_indices() {
-    let sandbox = Sandbox::new("gesturecap-strict");
-    let file = sandbox.path("work/attempt.jsonl");
-    let record = |idx: usize, fields: &str| {
-        format!("{{\"idx\":{idx},\"pitch_frac\":0.5,\"yaw_signed\":0.0,\"bri\":100.0{fields}}}\n")
-    };
-    let cases = [
-        (String::new(), "empty recording"),
-        ("not json\n".to_string(), "invalid posecap header"),
-        (
-            "{\"posecap\":false,\"label\":\"nod\",\"frames\":0}\n".to_string(),
-            "not a posecap recording",
-        ),
-        (
-            "{\"blinkcap\":true,\"label\":\"blink\",\"frames\":0}\n".to_string(),
-            "invalid posecap header",
-        ),
-        (
-            "{\"posecap\":true,\"label\":\"nod\",\"frames\":0,\"extra\":true}\n".to_string(),
-            "unknown field",
-        ),
-        (
-            "{\"posecap\":true,\"label\":7,\"frames\":0}\n".to_string(),
-            "invalid posecap header",
-        ),
-        (
-            format!(
-                "{{\"posecap\":true,\"label\":\"{}\",\"frames\":0}}\n",
-                "x".repeat(257)
-            ),
-            "label must be 1..=256 bytes",
-        ),
-        (
-            "{\"posecap\":true,\"label\":\"nod\",\"frames\":65537}\n".to_string(),
-            "frames must be 0..=65536",
-        ),
-        (
-            format!(
-                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":1}}\n{}",
-                record(0, ",\"extra\":true")
-            ),
-            "unknown field",
-        ),
-        (
-            "{\"posecap\":true,\"label\":\"nod\",\"frames\":1}\n\
-             {\"idx\":0,\"yaw_signed\":0.0,\"bri\":100.0}\n"
-                .to_string(),
-            "missing field `pitch_frac`",
-        ),
-        (
-            "{\"posecap\":true,\"label\":\"nod\",\"frames\":0}\nBROKEN\n".to_string(),
-            "contains more records than declared 0 frames",
-        ),
-        (
-            format!(
-                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":2}}\n{}{}",
-                record(0, ""),
-                record(0, "")
-            ),
-            "expected frame index 1",
-        ),
-        (
-            format!(
-                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":2}}\n{}{}",
-                record(0, ""),
-                record(2, "")
-            ),
-            "expected frame index 1",
-        ),
-        (
-            format!(
-                "{{\"posecap\":true,\"label\":\"nod\",\"frames\":2}}\n{}",
-                record(0, "")
-            ),
-            "declares 2 frames but 1 were read",
-        ),
-    ];
-
-    for (contents, expected) in cases {
-        std::fs::write(&file, contents).unwrap();
-        let (code, stdout, stderr) = run(sandbox
-            .cmd(&["gesturecap", "replay", file.to_str().unwrap()])
-            .env("IRLUME_DEV", "1"));
-        assert_eq!(code, 1, "expected {expected}; stderr: {stderr}");
-        assert!(stdout.is_empty(), "partial report leaked: {stdout}");
-        assert!(
-            stderr.contains(expected),
-            "expected {expected}; stderr: {stderr}"
-        );
+fn removed_gesture_commands_are_unknown() {
+    let sandbox = Sandbox::new("retired-gestures");
+    for args in [
+        vec!["credential-release-challenge", "on"],
+        vec!["gesturecap", "capture"],
+    ] {
+        let mut cmd = sandbox.cmd(&args);
+        cmd.env("IRLUME_DEV", "1");
+        let (code, _, _) = run(&mut cmd);
+        assert_eq!(code, 2);
     }
-}
-
-#[test]
-fn gesturecap_bounds_recording_size_count_and_file_type() {
-    let oversized = Sandbox::new("gesturecap-oversized");
-    let file = oversized.path("work/oversized.jsonl");
-    std::fs::File::create(&file)
-        .unwrap()
-        .set_len(8 * 1024 * 1024 + 1)
-        .unwrap();
-    let (code, _, stderr) = run(oversized
-        .cmd(&["gesturecap", "replay", file.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1, "{stderr}");
-    assert!(
-        stderr.contains("exceeds the 8388608-byte limit"),
-        "{stderr}"
-    );
-
-    let non_file = Sandbox::new("gesturecap-non-file");
-    let real_file = non_file.path("work/real.jsonl");
-    std::fs::write(
-        &real_file,
-        "{\"posecap\":true,\"label\":\"nod\",\"frames\":0}\n",
-    )
-    .unwrap();
-    let directory_entry = non_file.path("work/not-a-file.jsonl");
-    std::os::unix::fs::symlink(&real_file, &directory_entry).unwrap();
-    let (code, _, stderr) = run(non_file
-        .cmd(&["gesturecap", "replay", directory_entry.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("must be a regular file"), "{stderr}");
-
-    let too_many = Sandbox::new("gesturecap-too-many");
-    for index in 0..513 {
-        std::fs::write(
-            too_many.path(&format!("work/{index:03}.jsonl")),
-            "{\"posecap\":true,\"label\":\"nod\",\"frames\":0}\n",
-        )
-        .unwrap();
-    }
-    let directory = too_many.path("work");
-    let (code, _, stderr) = run(too_many
-        .cmd(&["gesturecap", "replay", directory.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1, "{stderr}");
-    assert!(
-        stderr.contains("expected 1..=512 JSONL recordings"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn gesturecap_emits_no_partial_report_when_a_later_recording_is_damaged() {
-    let sandbox = Sandbox::new("gesturecap-atomic-report");
-    let directory = sandbox.path("work");
-    write_pose_recording(&directory.join("a-valid.jsonl"), "nod", &[0.50, 0.52, 0.55]);
-    std::fs::write(
-        directory.join("z-damaged.jsonl"),
-        "{\"posecap\":true,\"label\":\"damaged\",\"frames\":2}\n\
-         {\"idx\":0,\"pitch_frac\":0.5,\"yaw_signed\":0.0,\"bri\":100.0}\n",
-    )
-    .unwrap();
-
-    let (code, stdout, stderr) = run(sandbox
-        .cmd(&["gesturecap", "replay", directory.to_str().unwrap()])
-        .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 1, "{stderr}");
-    assert!(stdout.is_empty(), "partial report leaked: {stdout}");
-    assert!(
-        stderr.contains("declares 2 frames but 1 were read"),
-        "{stderr}"
-    );
 }

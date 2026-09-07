@@ -316,7 +316,6 @@ impl Store {
                 OutcomeKind::NoFace
                 | OutcomeKind::Uncertain
                 | OutcomeKind::SpoofNoIrFace
-                | OutcomeKind::GestureDeclined
                 | OutcomeKind::SetupUnavailable => return Ok(()),
                 OutcomeKind::Granted
                 | OutcomeKind::Spoof

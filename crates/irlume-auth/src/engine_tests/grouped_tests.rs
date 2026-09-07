@@ -193,7 +193,6 @@ fn grouped_deadline_checks_before_and_after_inference() {
         assert!(!out.live);
         assert_eq!(out.score, 0.0);
         assert!(!presence_retryable(&out));
-        assert!(!is_gesture_decline(&out));
         assert_eq!(identities.get(), usize::from(expire_at == 6));
         if expire_at == 0 {
             assert_eq!(assessed.get(), 0);
@@ -666,12 +665,7 @@ fn grouped_eligibility_keeps_service_and_purpose_scope_despite_long_override() {
         for purpose in [
             AuthenticationPurpose::Verify,
             AuthenticationPurpose::AppConsent,
-            AuthenticationPurpose::CredentialRelease {
-                temporal_challenge: false,
-            },
-            AuthenticationPurpose::CredentialRelease {
-                temporal_challenge: true,
-            },
+            AuthenticationPurpose::CredentialRelease,
         ] {
             let actual = crate::grouped_auth::eligible_configuration(
                 &mode,

@@ -154,7 +154,7 @@ meantime, so nothing locks you out.
 </details>
 
 <details>
-<summary><b>How fast is face authentication, and when does it ask for confirmation or a gesture?</b></summary>
+<summary><b>How fast is face authentication, and when does it ask for confirmation?</b></summary>
 
 A normal face login takes about **2.5 seconds** on an integrated IR camera
 (measured on an ASUS Zenbook, CPU inference). Most of that is opening the
@@ -176,11 +176,4 @@ no per-attempt word. The trade is that
 every `sudo` then opens the camera, including one typed by someone else at the
 machine; passive PAD and the password fallback are unaffected.
 
-An experimental **head gesture** can be explicitly added as a second gate and
-defaults off everywhere. Repeated nodding approves and a head shake declines;
-on Plasma 6 the KDE polkit agent may re-prompt before closing its window
-([details](APP-INTEGRATION.md)). The gesture is not population-qualified and
-proves neither liveness nor privileged intent on its own. Automatic passive PAD
-is the anti-spoof boundary, and every miss preserves password/fingerprint
-fallback.
 </details>

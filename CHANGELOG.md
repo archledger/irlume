@@ -3,6 +3,33 @@
 All notable changes to irlume are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Collect complete sequential login PAD evidence in bounded RGB/IR groups and
+  defer identity inference to the final eligible sample.
+
+- Bound paired camera streaming to each assessment, coordinate paired startup,
+  and service companion queues through burst completion.
+
+### Fixed
+
+- Keep whole-image IR darkness in debug diagnostics without emitter-repair advice;
+  a bright face against a dark background no longer triggers that warning (#677).
+  Face-quality failures and direct shutter/saturation warnings remain visible.
+
+- Report required PAD/runtime failures as unavailable with password guidance,
+  without changing authentication admission or retry accounting.
+
+- Report grouped authentication deadlines as a timeout with password guidance,
+  while preserving retry accounting and captured diagnostic measurements.
+
+- Clear previous authentication hints when a new request is refused during setup,
+  so missing enrollment cannot prompt the user to look at the camera.
+
+- Require the complete RGB PAD vote before authentication and enrollment admission.
+
 ## [0.11.3] - 2026-08-29
 
 ### Added

@@ -850,23 +850,6 @@ pub fn status(args: &[String]) -> ExitCode {
         }
     );
 
-    // The credential-release gesture gate (DEFAULT OFF). Print it always: an
-    // opt-in step the user may want to know is available shows where they look
-    // for the current state. Off is the default, not a warning.
-    println!(
-        "  keyring gate  : {}",
-        // The EFFECTIVE rule (per-service override first, then the global
-        // gate), the same order the daemon applies; reading only the global
-        // key said "off (default)" to a user whose per-service key required
-        // the gesture.
-        match irlume_common::config::credential_release_gesture_required_visible() {
-            Some(true) => format!("gesture required {OK} (opt-in)"),
-            Some(false) =>
-                "off (default): the keyring releases after the face match with no nod".into(),
-            None => "root-only setting (re-run with sudo)".into(),
-        }
-    );
-
     // Cameras. Ask the DAEMON first: it already holds these nodes and reports
     // the pair it selected, and classifying a node locally means OPENING it.
     // On a UVC module that answers EBUSY to a second open, `irlume status` run
@@ -1569,242 +1552,6 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
     }
 }
 
-/// `irlume credential-release-challenge [<service>] <on|off|status>`: the
-/// per-service head-gesture toggle, plus the global credential-release gate on
-/// releasing the sealed login-keyring password (`credential_release_challenge` in
-/// settings.conf). The daemon reads all of it live per request, so no restart is
-/// needed.
-///
-/// The keyring gate DEFAULTS OFF: a greeter cold login and logout release the
-/// keyring after the face match with no nod, because the gesture is INTENT, not
-/// liveness (measured 2026-07-27, the gesture fired on a hand-held print 2 times
-/// in 24, so it never stood between a photograph and the credential; the
-/// cross-spectrum liveness and PAD cues do, and the typed password is always the
-/// fallback). Turning any gesture on adds an experimental additional step;
-/// disabling it cannot remove the mandatory keyboard confirmation on a
-/// high-privilege service.
-/// One service's effective head-gesture line, shared by the all-services
-/// `status` and the per-service `<svc> status` so the two can never disagree.
-fn print_service_gesture_status(tag: &str, svc: &str) {
-    let privileged = irlume_common::pam_service::classify(svc)
-        .is_some_and(irlume_common::pam_service::ServiceKind::requires_face_intent_confirmation);
-    if privileged {
-        println!("{tag} {svc}: Face confirmation: keyboard required");
-    }
-    let additional = if privileged {
-        "Additional head gesture: "
-    } else {
-        ""
-    };
-    let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
-    match irlume_common::config::observe_kv("settings.conf", &key) {
-        // Per-service keys use `!falsy` (the daemon's `service_gesture`
-        // reading), NOT the global `truthy`, so the display agrees with
-        // what the engine does for this key.
-        irlume_common::config::KvObservation::Value(v) => {
-            if !irlume_common::config::falsy(&v) {
-                if privileged {
-                    println!("{tag} {svc}: {additional}on (experimental, explicit)");
-                } else {
-                    println!("{tag} {svc}: REQUIRED {OK} (explicit)");
-                }
-            } else {
-                println!("{tag} {svc}: {additional}off (explicit)");
-            }
-        }
-        irlume_common::config::KvObservation::Absent => {
-            let required = match svc {
-                // The keyring release falls back to the global gate,
-                // which now defaults OFF.
-                "credential_release" => irlume_common::config::credential_release_challenge(),
-                // Every PAM service through the shared explicit-only helper.
-                _ => irlume_common::config::service_gesture_required(svc),
-            };
-            if required {
-                if privileged {
-                    println!("{tag} {svc}: {additional}on (experimental, configured)");
-                } else {
-                    println!("{tag} {svc}: REQUIRED {OK} (default)");
-                }
-            } else {
-                println!("{tag} {svc}: {additional}off (default)");
-            }
-        }
-        irlume_common::config::KvObservation::Unknown(_) => {
-            println!("{tag} {svc}: {additional}root-only setting, re-run with sudo");
-        }
-    }
-}
-
-pub fn credential_release_challenge(sub: Option<&str>, args: &[String]) -> ExitCode {
-    const TAG: &str = "[credential-release-challenge]";
-    match sub {
-        None | Some("status") => {
-            // The EFFECTIVE per-service policy, then the global credential-release
-            // setting. An absent key reports its effective default, not a guess; an
-            // unreadable root-only file says so rather than printing a state it
-            // could not read (settings.conf is 0600, so an unprivileged `status`
-            // sees Unknown, not the value).
-            let services = ["sudo", "su", "doas", "polkit-1", "credential_release"];
-            for svc in services {
-                print_service_gesture_status(TAG, svc);
-            }
-            // Global credential-release-challenge fallback (DEFAULT OFF).
-            match irlume_common::config::credential_release_challenge_visible() {
-                Some(true) => {
-                    println!("{TAG} global credential_release_challenge: REQUIRED {OK}")
-                }
-                Some(false) => {
-                    println!("{TAG} global credential_release_challenge: off (default)")
-                }
-                None => println!(
-                    "{TAG} global credential_release_challenge: root-only setting, re-run with sudo"
-                ),
-            }
-            let policy = irlume_common::config::head_consent_policy();
-            if matches!(
-                policy,
-                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
-            ) {
-                println!(
-                    "{TAG} WARNING: {}. Required gates fall back to the password.",
-                    policy.instruction("approve")
-                );
-            }
-            ExitCode::SUCCESS
-        }
-        // Service-specific toggle: irlume credential-release-challenge sudo on|off
-        // A flag mistyped before the verb is not a service: under root,
-        // `--yes off` used to write `service_gesture.--yes=0` into the
-        // root-only settings file, a junk key nothing reads. At 0.9.0 the
-        // same argv was a clean usage error; keep it one.
-        Some(svc) if svc.starts_with('-') => {
-            eprintln!(
-                "{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>"
-            );
-            ExitCode::from(2)
-        }
-        Some(svc) if svc != "on" && svc != "off" => {
-            // `args` is the whole argv minus the program name (main.rs skips 1
-            // and passes the full vector), so args[0] is the subcommand name,
-            // args[1] is `svc` (this arm's `sub`), and the on/off token is
-            // args[2]. Reading args[0] here matched the literal subcommand and
-            // sent every `<service> on|off` to the usage arm (exit 2).
-            let on_off = args.get(2).map(String::as_str);
-            match on_off {
-                Some(v @ ("on" | "off")) => {
-                    if !crate::is_root() {
-                        eprintln!(
-                            "{TAG} needs root: sudo irlume credential-release-challenge {svc} {v}"
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                    // A name irlume does not recognise still WRITES, because a
-                    // hand-wired PAM service is a real thing and the daemon looks
-                    // the key up by whatever name PAM passes. But a typo is far
-                    // likelier than a custom stack, and it used to report success
-                    // for a service that does not exist: `credential-release-
-                    // challenge sudp off` printed "sudp: consent gesture off" and
-                    // left a key nothing would ever read. Say which it is.
-                    if irlume_common::pam_service::classify(svc).is_none()
-                        && svc != "credential_release"
-                    {
-                        eprintln!(
-                            "{TAG} note: '{svc}' is not a PAM service irlume knows \
-                             (sudo, su, doas, sudo-i, su-l, runuser, polkit-1, or the \
-                             special token credential_release). Writing it anyway: it takes \
-                             effect only if a PAM stack really uses that service name."
-                        );
-                    }
-                    let high_priv = irlume_common::pam_service::classify(svc).is_some_and(
-                        irlume_common::pam_service::ServiceKind::requires_face_intent_confirmation,
-                    );
-                    let val = if v == "on" { "1" } else { "0" };
-                    let key = format!("{}.{svc}", irlume_common::config::SERVICE_GESTURE_KEY);
-                    match irlume_common::config::write_kv("settings.conf", &key, val) {
-                        Ok(()) => {
-                            if v == "on" && high_priv {
-                                println!("{TAG} {svc}: Additional head gesture on (experimental)");
-                                eprintln!(
-                                    "{TAG} WARNING: the head classifier is not population-qualified and may reject valid attempts. Face confirmation: keyboard required."
-                                );
-                            } else if v == "off" && high_priv {
-                                println!(
-                                    "{TAG} {svc}: Additional head gesture off; keyboard confirmation remains required"
-                                );
-                            } else if v == "on" {
-                                println!("{TAG} {svc}: head gesture REQUIRED {OK}");
-                            } else {
-                                println!("{TAG} {svc}: head gesture off");
-                            }
-                            ExitCode::SUCCESS
-                        }
-                        Err(e) => {
-                            eprintln!("{TAG} could not update settings.conf: {e}");
-                            ExitCode::FAILURE
-                        }
-                    }
-                }
-                // The usage line has always promised `[<service>] <on|off|
-                // status>`, and the TUI, setup and doctor all teach the
-                // per-service status form, but this arm accepted only on/off:
-                // the exact command four surfaces recommended exited 2.
-                Some("status") => {
-                    print_service_gesture_status(TAG, svc);
-                    ExitCode::SUCCESS
-                }
-                _ => {
-                    eprintln!("{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status>");
-                    ExitCode::from(2)
-                }
-            }
-        }
-        Some(v @ ("on" | "off")) => {
-            // Global keyring-release gate. DEFAULT OFF, so `on` is the notable
-            // action (it ADDS a deliberate step) and `off` just returns to the
-            // default; neither needs a confirmation.
-            if !crate::is_root() {
-                eprintln!("{TAG} needs root: sudo irlume credential-release-challenge {v}");
-                return ExitCode::FAILURE;
-            }
-            let val = if v == "on" { "1" } else { "0" };
-            match irlume_common::config::write_kv(
-                "settings.conf",
-                irlume_common::config::CREDENTIAL_RELEASE_CHALLENGE_KEY,
-                val,
-            ) {
-                Ok(()) => {
-                    if v == "on" {
-                        println!(
-                            "{TAG} head gesture REQUIRED {OK}: releasing your keyring \
-                             password now needs {} after the face match. Takes effect on the \
-                             next face auth.",
-                            irlume_common::config::head_consent_policy().instruction("approve")
-                        );
-                    } else {
-                        println!(
-                            "{TAG} temporal challenge off (the default): the keyring releases \
-                             after the face match with no nod. Your typed password still works."
-                        );
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("{TAG} could not update settings.conf: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some(other) => {
-            eprintln!(
-                "{TAG} usage: irlume credential-release-challenge [<service>] <on|off|status> (got '{other}')"
-            );
-            ExitCode::from(2)
-        }
-    }
-}
-
 pub fn reseal(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     // Only meaningful if already armed (we never auto-arm from here).
@@ -2139,14 +1886,6 @@ SYSTEM INTEGRATION
                         subcommands are removed (ADR-0015) and answer with a notice
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
-  credential-release-challenge [<service>] <on|off|status>
-                        optional experimental head gesture: keep nodding to approve;
-                        shake your head to decline. Named with a service (sudo, su,
-                        doas, polkit-1) it adds or removes that service's gesture;
-                        privileged face auth always keeps keyboard confirmation. Bare, it
-                        sets the gate on releasing your keyring password, which
-                        is OFF by default: a cold login and logout release it on
-                        the face match alone
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   uninstall [--keep-data] [--yes] un-wire PAM, stop the daemon, wipe enrolled
@@ -2509,6 +2248,7 @@ fn usable_scans_counts_only_the_loaded_recognizer() {
             scans: (0..scans).map(|i| format!("scan{i}")).collect(),
             scans_by_recognizer: counts.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
             live_recognizer: live.map(str::to_string),
+            ir: None,
         }
     };
 

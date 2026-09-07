@@ -59,6 +59,10 @@ pub(crate) mod test_support {
 
 mod arbiter;
 mod diagnostics;
+mod enrollment_session;
+mod operation_authorization;
+mod position_session;
+mod retry_throttle;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -695,86 +699,45 @@ fn main() {
             let (engine, rgb_pad_status, ir_pad_status) = engine;
             publish_engine_bits(&engine, rgb_pad_status, ir_pad_status);
 
-            // One-time inoculation: stamp legacy (untagged) IR scans with the current
-            // embedding space while it is still the space they were captured under.
-            // A later adapter swap/removal then degrades to a clear "re-enroll" for
-            // dark unlock instead of silently scoring across embedding spaces.
-            // Skip the whole sweep once it has completed for this embedding
-            // space. Asking a user whether they need a retag costs a TPM unseal,
-            // because the answer is inside the encrypted enrollment, and the TPM
-            // serializes: that startup work collided with the very login it was
-            // delaying, taking a keyring unseal from 2.70s to 18.97s on a
-            // discrete TPM (#249). The marker only skips work; a missing or
-            // stale one just runs the sweep as before.
-            let retag_space = engine.ir_space().to_string();
-            let sweep_needed = !irlume_core::storage::retag_done_for(&retag_space);
-            if !sweep_needed {
-                irlume_common::dlog!(
-                    "startup: IR retag already done for '{retag_space}'; skipping the sweep"
-                );
-            }
-            // A user whose load or save failed has NOT been swept, and marking
-            // the space done would retire the migration for them permanently:
-            // the marker is only written when every user was actually handled.
-            let mut all_swept = true;
-            for user in irlume_core::storage::list_users() {
-                if !sweep_needed {
-                    break;
-                }
-                let loaded = irlume_core::storage::load(&user);
-                if let Err(ref e) = loaded {
-                    eprintln!(
-                        "irlumed: could not read '{user}' during the IR retag sweep ({e}); \
-                         leaving the sweep owed"
-                    );
-                    all_swept = false;
-                }
-                if let Ok(Some(mut enr)) = loaded {
-                    let n = enr.retag_untagged_ir(engine.ir_space(), engine.ir_dim());
-                    if n > 0 {
-                        match irlume_core::storage::save(&enr) {
-                            Ok(()) => eprintln!(
-                                "irlumed: tagged {n} legacy IR scan(s) for '{user}' as '{}'",
-                                engine.ir_space()
-                            ),
-                            Err(e) => {
+            // Read-only compatibility notices. Historical untagged IR may be
+            // raw or adapted; the live pipeline cannot safely retag it. Keep
+            // the existing sweep marker to avoid repeated TPM unseals (#249).
+            // The marker only skips notices; matching always checks tags.
+            let ir_space = engine.ir_space();
+            let sweep_needed = !irlume_core::storage::retag_done_for(ir_space);
+            if sweep_needed {
+                let mut all_swept = true;
+                for user in irlume_core::storage::list_users() {
+                    match irlume_core::storage::load(&user) {
+                        Ok(Some(enr)) => {
+                            let stale = enr.stale_ir_scans(ir_space);
+                            if stale > 0 && enr.usable_ir_scans(ir_space) == 0 {
                                 eprintln!(
-                                    "irlumed: could not retag IR scans for '{user}': {e}"
+                                    "irlumed: NOTE for '{user}': {stale} IR template(s) have an \
+                                     unknown or different IR pipeline and cannot match. \
+                                     RGB templates are preserved; run `irlume enroll` to capture \
+                                     fresh scans into your existing profile for dark/dim login."
                                 );
-                                all_swept = false;
                             }
                         }
-                    }
-                    // Upgrade notice: IR scans enrolled under a now-absent adapter (e.g.
-                    // 0.1.x -> 0.2.0, where the research-only IR adapter was removed) are
-                    // in a foreign embedding space and cannot match. Bright-light RGB
-                    // login still works; dark/dim login needs a re-enroll. Surfaced here
-                    // (journal, and `irlume logs`) because the daemon restarts on upgrade.
-                    // Only an OUTAGE gets the notice: once the user re-enrolls, the fresh
-                    // usable scans coexist with the stale ones (whose RGB templates still
-                    // help), and nagging them to re-run the remedy they already ran is
-                    // noise on every restart.
-                    let stale = enr.stale_ir_scans(engine.ir_space());
-                    if stale > 0 && enr.usable_ir_scans(engine.ir_space()) == 0 {
-                        eprintln!(
-                            "irlumed: NOTE for '{user}': {stale} IR template(s) were enrolled under a \
-                             removed IR adapter and no longer match. Bright-light face login still works; \
-                             run `irlume enroll` to capture fresh scans into your existing profile and \
-                             restore dark/dim login."
-                        );
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "irlumed: could not read '{user}' during the IR compatibility \
+                                 sweep ({e}); leaving the sweep owed"
+                            );
+                            all_swept = false;
+                        }
                     }
                 }
-            }
-            // Recorded only after a sweep that actually reached every user, so a
-            // TPM error or an unwritable enrollment leaves the migration owed
-            // instead of silently retiring it for that user.
-            if sweep_needed && all_swept {
-                irlume_core::storage::mark_retag_done(&retag_space);
-            } else if sweep_needed {
-                eprintln!(
-                    "irlumed: the IR retag sweep did not complete for every user; \
-                     it will run again next start"
-                );
+                if all_swept {
+                    irlume_core::storage::mark_retag_done(ir_space);
+                } else {
+                    eprintln!(
+                        "irlumed: the IR compatibility sweep did not complete for every user; \
+                         it will run again next start"
+                    );
+                }
             }
 
             // SO_PEERCRED is the authorization boundary, and the socket mode must not
@@ -857,6 +820,9 @@ fn main() {
                         while let Some(job) = arbiter.take() {
                             note_worker_progress();
                             let Queued {
+                                authorization,
+                                session,
+                                position,
                                 req,
                                 peer,
                                 reply,
@@ -885,7 +851,7 @@ fn main() {
                             // unwind out of the worker and take down all face auth for
                             // every user.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                dispatch_scoped(req, &peer, &mut engine, &scope)
+                                dispatch_scoped_session(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref())
                             }));
                             // Release the slot before anything else can fail, so a
                             // panicking request cannot lock its uid out of the camera
@@ -1103,96 +1069,33 @@ fn main() {
     // The accept loop above only ends if the listener dies; nothing to join.
 }
 
-// ---------------------------------------------------------------------------
-// Consecutive-failure throttle (NIST SP 800-63B-4 s3.2.3 intent).
-//
-// After a run of failed face attempts, stop firing the camera on the gesture
-// for a short cooldown and let PAM fall straight to the password. Deliberately
-// a THROTTLE, not a hard biometric-disable: irlume's password is always the
-// fallback and there is no account lockout, so the standard's disable-and-
-// offer-another-factor tier would only add friction (the "other factor" that
-// re-enables face IS the password the throttled user is already typing). Every
-// platform (Face ID, Android, Windows Hello) also uses ~5 fails then falls to a
-// non-biometric factor. State is per-user and in-memory only; a daemon restart
-// clears it (there is nothing to protect on disk since the password is the
-// floor). Tunable/testable via env; 0 strikes disables the throttle.
-// ---------------------------------------------------------------------------
-#[derive(Default)]
-struct FailState {
-    strikes: u32,
-    cooldown_until: Option<std::time::Instant>,
+/// A retry-state error is an ordinary refusal, never a gesture abort. The same
+/// completion boundary guards both verification and sealed-password release.
+fn recorded_face_response(
+    record: impl FnOnce() -> Result<(), &'static str>,
+    refuse: fn(&str) -> Response,
+    complete: impl FnOnce() -> Response,
+) -> Response {
+    match record() {
+        Ok(()) => complete(),
+        Err(reason) => refuse(reason),
+    }
 }
 
-fn rate_state() -> &'static std::sync::Mutex<std::collections::HashMap<String, FailState>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, FailState>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn retry_verify_refusal(reason: &str) -> Response {
+    Response::AuthResult {
+        granted: false,
+        score: 0.0,
+        live: false,
+        reason: reason.into(),
+        declined_by_gesture: false,
+        refused_by_policy: true,
+        situation: String::new(),
+    }
 }
 
-fn rate_max_strikes() -> u32 {
-    env_or("IRLUME_RATE_LIMIT", "5").parse().unwrap_or(5)
-}
-
-fn rate_cooldown() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        env_or("IRLUME_RATE_COOLDOWN_SECS", "30")
-            .parse()
-            .unwrap_or(30),
-    )
-}
-
-/// True when `user` is in a cooldown window: skip the camera and fall to the
-/// password. Clears an expired window as a side effect.
-fn rate_limited(user: &str) -> bool {
-    if rate_max_strikes() == 0 {
-        return false;
-    }
-    let mut map = rate_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = map.get_mut(user) {
-        if let Some(until) = s.cooldown_until {
-            if std::time::Instant::now() < until {
-                return true;
-            }
-            s.cooldown_until = None;
-            s.strikes = 0;
-        }
-    }
-    false
-}
-
-/// Record a face attempt's outcome. A grant resets the user; a rejected real
-/// presentation is a strike, and `rate_max_strikes()` of them starts a cooldown.
-/// `faced` is the *strike-worthy* signal: it must be true for a genuine failed
-/// presentation, which includes a hard spoof rejection (those return
-/// `live=false, score=0`, so an earlier `live || score>0` test never struck on
-/// the actual attack it is meant to throttle). Callers pass
-/// `!presence_retryable(&outcome)`: false only for the retryable no-face /
-/// uncertain-liveness outcomes (nobody in frame, walk-away, transient
-/// uncertainty), which must never count against the user.
-fn rate_record(user: &str, granted: bool, faced: bool) {
-    if rate_max_strikes() == 0 {
-        return;
-    }
-    let mut map = rate_state().lock().unwrap_or_else(|e| e.into_inner());
-    let s = map.entry(user.to_string()).or_default();
-    if granted {
-        s.strikes = 0;
-        s.cooldown_until = None;
-        return;
-    }
-    if !faced {
-        return;
-    }
-    s.strikes += 1;
-    if s.strikes >= rate_max_strikes() {
-        s.cooldown_until = Some(std::time::Instant::now() + rate_cooldown());
-        s.strikes = 0;
-        eprintln!(
-            "irlumed: '{user}' hit {} consecutive face failures; face throttled for {}s (password still works)",
-            rate_max_strikes(),
-            rate_cooldown().as_secs()
-        );
-    }
+fn retry_unseal_refusal(reason: &str) -> Response {
+    Response::Error(reason.into())
 }
 
 /// Minimum interval in seconds between unprivileged camera probes. Two seconds
@@ -1433,6 +1336,9 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// the worker, so a client that stops reading stalls its own connection thread
 /// instead of the one thread every login needs.
 struct Queued {
+    authorization: Option<operation_authorization::Grant>,
+    session: Option<enrollment_session::Worker>,
+    position: Option<position_session::Worker>,
     req: Request,
     peer: Peer,
     reply: std::sync::mpsc::Sender<Response>,
@@ -2522,7 +2428,7 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
             return Response::Error(format!("keyring unseal not allowed for {class:?}"));
         }
     }
-    // A typed password already opens a password-keyed keyring, so touching the
+    // A typed password already opens a password-keyed keyring or KDE wallet, so touching the
     // TPM would spend an unseal (up to seconds on a discrete TPM) to release a
     // secret the caller then discards. For a token envelope the typed password
     // opens nothing, so the release must proceed. The kind read here is a
@@ -2530,8 +2436,13 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
     // atomically, so a concurrent re-arm at worst turns this into the old
     // always-unseal behaviour.
     if have_password
-        && irlume_core::keyring::sealed_kind(&user)
-            == Some(irlume_core::envelope::SecretKind::LoginPassword)
+        && matches!(
+            irlume_core::keyring::sealed_kind(&user),
+            Some(
+                irlume_core::envelope::SecretKind::LoginPassword
+                    | irlume_core::envelope::SecretKind::KdeWalletKey
+            )
+        )
     {
         return Response::KeyringUnlockNotNeeded;
     }
@@ -2650,6 +2561,10 @@ fn serve_peer(
                 scope.finish(categorical_outcome(&resp));
                 return respond(stream, &resp);
             }
+            let authorization = match operation_authorization::authorize(&req, &peer, &stream) {
+                Ok(grant) => grant,
+                Err(error) => return respond(stream, &Response::Error(error)),
+            };
             let class = arbiter::classify(&req);
             // Status is answered HERE, on the connection's own thread: it is
             // read-only, engine-free, and possibly slow (ListProfiles is a
@@ -2669,10 +2584,27 @@ fn serve_peer(
                     return respond(stream, &resp);
                 }
             }
+            let (session, mut session_connection) =
+                if matches!(req, Request::EnrollmentSession { .. }) {
+                    let (worker, connection) = enrollment_session::channel(arbiter.cancel_token());
+                    (Some(worker), Some(connection))
+                } else {
+                    (None, None)
+                };
+            let (position, mut position_connection) =
+                if matches!(req, Request::PositionSession { .. }) {
+                    let (worker, connection) = position_session::channel(arbiter.cancel_token());
+                    (Some(worker), Some(connection))
+                } else {
+                    (None, None)
+                };
             let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
             let (reply, answer) = std::sync::mpsc::channel();
             let link = std::sync::Arc::new(ClientLink::default());
             let queued = Queued {
+                authorization,
+                session,
+                position,
                 req,
                 peer: peer.clone(),
                 reply,
@@ -2695,10 +2627,39 @@ fn serve_peer(
             // the rest of the budget for an answer nobody will read.
             let deadline = std::time::Instant::now() + WORKER_REPLY_TIMEOUT;
             let resp = loop {
+                if let Some(connection) = &mut session_connection {
+                    if let Err(error) = connection.pump(&stream) {
+                        if link.abandon() {
+                            arbiter.cancel_token().request_stop();
+                        }
+                        return Err(error);
+                    }
+                }
+                if let Some(connection) = &mut position_connection {
+                    if let Err(error) = connection.pump(&stream) {
+                        if link.abandon() {
+                            arbiter.cancel_token().request_stop();
+                        }
+                        return Err(error);
+                    }
+                }
                 match answer.recv_timeout(CLIENT_ALIVE_POLL) {
-                    Ok(resp) => break resp,
+                    Ok(resp) => {
+                        if let Some(connection) = &mut session_connection {
+                            connection.pump(&stream)?;
+                        }
+                        if let Some(connection) = &mut position_connection {
+                            connection.pump(&stream)?;
+                        }
+                        break resp;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if std::time::Instant::now() >= deadline {
+                            if (session_connection.is_some() || position_connection.is_some())
+                                && link.abandon()
+                            {
+                                arbiter.cancel_token().request_stop();
+                            }
                             break Response::Error("request did not complete".into());
                         }
                         if peer_gone(&stream) {
@@ -2866,6 +2827,8 @@ enum EnrollmentEffect {
     /// Rewrites the enrollment, or the key material it is sealed under, so the
     /// summary must be dropped before the request runs.
     Mutates,
+    /// Adds trusted templates and requires a per-request OS authorization.
+    AddsTrust,
 }
 
 /// Everything the daemon must know about a request before it runs it.
@@ -2889,14 +2852,13 @@ struct RequestPosture<'a> {
 /// hand-maintained lists, and a `_ => None` arm meant neither the compiler nor
 /// the test that existed to catch exactly that could see the omission.
 fn posture(req: &Request) -> RequestPosture<'_> {
-    use EnrollmentEffect::{Mutates, Reads};
+    use EnrollmentEffect::{AddsTrust, Mutates, Reads};
     use Privilege::{AnyPeer, RootOnly, RootOrTarget};
     use Request::*;
     match req {
         // Storage-only management of one account's enrollment. Same refusal
         // wording ("modify") and same invalidation for all of them.
-        AddScan { user, .. }
-        | DeleteProfile { user, .. }
+        DeleteProfile { user, .. }
         | DeleteScan { user, .. }
         | ForgetRecognizer { user, .. }
         | RenameProfile { user, .. }
@@ -2906,10 +2868,15 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: Mutates,
         },
-        Enroll { user, .. } => RequestPosture {
+        AddScan { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "modify" },
+            user: Some(user.as_str()),
+            enrollment: AddsTrust,
+        },
+        Enroll { user, .. } | EnrollmentSession { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "enroll" },
             user: Some(user.as_str()),
-            enrollment: Mutates,
+            enrollment: AddsTrust,
         },
         // Recovery counts as a mutation: it changes the key material the
         // enrollment is sealed under.
@@ -3068,7 +3035,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         },
         // Framing guide: the optional user only tunes the pitch band, but it is
         // still interpolated into a state path, so it is screened like the rest.
-        PositionSample { user } => RequestPosture {
+        PositionSample { user } | PositionSession { user } => RequestPosture {
             privilege: AnyPeer,
             user: user.as_deref(),
             enrollment: Reads,
@@ -3161,9 +3128,19 @@ fn publish_engine_bits(
 #[derive(Clone)]
 struct EnrollmentSummary {
     profiles: Vec<irlume_common::ProfileSummary>,
-    require_eyes_open: bool,
-    closure_calibrated: bool,
     ir_ratio_calibrated: bool,
+}
+
+impl EnrollmentSummary {
+    fn into_response(self) -> Response {
+        Response::Enrollment {
+            profiles: self.profiles,
+            // Retired settings remain on the wire for older clients.
+            require_eyes_open: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: self.ir_ratio_calibrated,
+        }
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -3175,9 +3152,41 @@ fn enrollment_summaries(
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn summarize_profile_ir(
+    profile: &irlume_core::storage::FaceProfile,
+    recognizer: &str,
+    ir_space: &str,
+    dim: usize,
+) -> irlume_common::ProfileIrSummary {
+    use irlume_core::storage::{recognizer_space_matches, IR_RAW_SPACE, LEGACY_RECOGNIZER_SPACE};
+    let mut summary = irlume_common::ProfileIrSummary::default();
+    for scan in &profile.scans {
+        if !recognizer_space_matches(scan.embed_space.as_deref(), recognizer) {
+            continue;
+        }
+        match (&scan.ir, scan.ir_space.as_deref()) {
+            (None, _) => summary.missing_scans += 1,
+            (Some(_), None) => summary.unknown_scans += 1,
+            (Some(ir), Some(space)) if space == ir_space && ir.len() == dim => {
+                summary.compatible_scans += 1;
+            }
+            _ => summary.incompatible_scans += 1,
+        }
+    }
+    let stored_calibration = profile.ir_calibs.contains_key(recognizer)
+        || (recognizer == LEGACY_RECOGNIZER_SPACE && profile.ir_calib.is_some());
+    summary.calibration_withheld = ir_space == IR_RAW_SPACE
+        && stored_calibration
+        && summary.unknown_scans > 0
+        && profile.calib_for(recognizer).is_none();
+    summary
+}
+
 fn summarize_enrollment(
     enr: Option<&irlume_core::storage::Enrollment>,
     live_recognizer: &str,
+    live_ir_space: &str,
+    ir_dim: usize,
 ) -> EnrollmentSummary {
     match enr {
         Some(enr) => EnrollmentSummary {
@@ -3199,11 +3208,15 @@ fn summarize_enrollment(
                         scans: p.scans.iter().map(|s| s.name.clone()).collect(),
                         scans_by_recognizer,
                         live_recognizer: Some(live_recognizer.to_string()),
+                        ir: Some(summarize_profile_ir(
+                            p,
+                            live_recognizer,
+                            live_ir_space,
+                            ir_dim,
+                        )),
                     }
                 })
                 .collect(),
-            require_eyes_open: false,
-            closure_calibrated: false,
             ir_ratio_calibrated: enr.ir_center_edge_ratio_floor().is_some(),
         },
         // A successful load that found nothing IS an observation: publishing
@@ -3211,8 +3224,6 @@ fn summarize_enrollment(
         // the worker instead of missing on every tick.
         None => EnrollmentSummary {
             profiles: Vec::new(),
-            require_eyes_open: false,
-            closure_calibrated: false,
             ir_ratio_calibrated: false,
         },
     }
@@ -3269,7 +3280,7 @@ fn enrollment_mutating_user(req: &Request) -> Option<&str> {
         // A mutation that named no account has nothing to invalidate. The
         // table declares no such variant and a test walks every one of them to
         // keep it that way, so this is the shape of the miss, not a live case.
-        EnrollmentEffect::Mutates => posture.user,
+        EnrollmentEffect::Mutates | EnrollmentEffect::AddsTrust => posture.user,
     }
 }
 
@@ -3350,6 +3361,21 @@ fn intent_confirmation_gate(req: &Request, peer: &Peer) -> Option<Response> {
 /// Both checks read the same table, so a variant cannot pass one and skip the
 /// other the way `ReleaseTokenForDisarm` did (#344).
 fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
+    if let Request::EnrollmentSession {
+        scans,
+        improve,
+        profile,
+        ..
+    } = req
+    {
+        if !(1..=irlume_core::storage::MAX_SCANS_PER_PROFILE).contains(scans)
+            || (*improve && profile.as_ref().is_none_or(|name| name.is_empty()))
+        {
+            return Some(Response::Error(
+                "invalid guided enrollment scan count or target".into(),
+            ));
+        }
+    }
     let posture = posture(req);
     if let Some(u) = posture.user {
         if !valid_username(u) {
@@ -3514,12 +3540,7 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             match cached_enrollment_summary(user) {
-                Some(sum) => Response::Enrollment {
-                    profiles: sum.profiles,
-                    require_eyes_open: sum.require_eyes_open,
-                    closure_calibrated: sum.closure_calibrated,
-                    ir_ratio_calibrated: sum.ir_ratio_calibrated,
-                },
+                Some(sum) => sum.into_response(),
                 None => return None,
             }
         }
@@ -4012,7 +4033,11 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         Authenticate { .. } | UnsealPassword { .. } | UnsealKeyring { .. } => {
             OperationClass::Authentication
         }
-        Enroll { .. } | AddScan { .. } | PositionSample { .. } => OperationClass::Enrollment,
+        Enroll { .. }
+        | EnrollmentSession { .. }
+        | AddScan { .. }
+        | PositionSample { .. }
+        | PositionSession { .. } => OperationClass::Enrollment,
         Identify => OperationClass::Identification,
         TuneCaptureMode { .. } => OperationClass::CaptureQualification,
         SupportProbe { .. } => OperationClass::SupportProbe,
@@ -4075,16 +4100,30 @@ fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::Categ
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     let state = diagnostics::DiagnosticState::default();
     let scope = state.begin(diagnostic_operation_class(&req));
-    let response = dispatch_scoped(req, peer, engine, &scope);
+    let response = dispatch_scoped(req, peer, engine, &scope, None);
     scope.finish(categorical_outcome(&response));
     response
 }
 
+#[cfg(test)]
 fn dispatch_scoped(
     req: Request,
     peer: &Peer,
     engine: &mut irlume_auth::Engine,
     scope: &diagnostics::OperationScope,
+    authorization: Option<operation_authorization::Grant>,
+) -> Response {
+    dispatch_scoped_session(req, peer, engine, scope, authorization, None, None)
+}
+
+fn dispatch_scoped_session(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+    authorization: Option<operation_authorization::Grant>,
+    session: Option<&enrollment_session::Worker>,
+    position: Option<&position_session::Worker>,
 ) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
@@ -4098,6 +4137,45 @@ fn dispatch_scoped(
     if let Some(resp) = pregate(&req, peer) {
         return resp;
     }
+    if operation_authorization::required(&req, peer) {
+        let result = authorization
+            .ok_or_else(|| operation_authorization::REFUSED.to_owned())
+            .and_then(|grant| grant.consume(&req, peer));
+        if let Err(error) = result {
+            return Response::Error(error);
+        }
+    }
+    let req = match req {
+        Request::EnrollmentSession {
+            user,
+            profile,
+            scans,
+            improve,
+        } => {
+            let Some(observer) = session else {
+                return Response::Error("guided enrollment requires its live connection".into());
+            };
+            if let Err(error) = observer.started() {
+                return Response::Error(error.to_string());
+            }
+            if improve {
+                Request::AddScan {
+                    user,
+                    profile: profile.unwrap_or_default(),
+                    scans: Some(scans),
+                    report_enrollment: true,
+                }
+            } else {
+                Request::Enroll {
+                    user,
+                    profile,
+                    scans: Some(scans),
+                    reset: false,
+                }
+            }
+        }
+        other => other,
+    };
     // Eyes-open enforcement is retired (#386). Turning it OFF remains available
     // so a legacy enrollment carrying the flag is never trapped.
     //
@@ -4130,6 +4208,9 @@ fn dispatch_scoped(
         invalidate_enrollment_summary(user);
     }
     match req {
+        Request::EnrollmentSession { .. } => {
+            Response::Error("guided enrollment requires its live connection".into())
+        }
         // These four are answered by dispatch_status above; the arm is
         // unreachable and exists so the match stays exhaustive without a
         // second implementation to drift.
@@ -4203,19 +4284,34 @@ fn dispatch_scoped(
                     // re-sealed the template key, which is exactly why the
                     // load lives HERE on the worker and not on a connection
                     // thread.
-                    let sum = summarize_enrollment(enr.as_ref(), engine.embed_space());
+                    let sum = summarize_enrollment(
+                        enr.as_ref(),
+                        engine.embed_space(),
+                        engine.ir_space(),
+                        engine.ir_dim(),
+                    );
                     publish_enrollment_summary(&user, sum.clone());
-                    Response::Enrollment {
-                        profiles: sum.profiles,
-                        require_eyes_open: sum.require_eyes_open,
-                        closure_calibrated: sum.closure_calibrated,
-                        ir_ratio_calibrated: sum.ir_ratio_calibrated,
-                    }
+                    sum.into_response()
                 }
                 Err(e) => fail(
                     irlume_common::OperationErrorCode::OperationFailed,
                     e.to_string(),
                 ),
+            }
+        }
+        Request::PositionSession { user } => {
+            let Some(observer) = position else {
+                return Response::Error("framing requires its live connection".into());
+            };
+            if let Err(error) = observer.started() {
+                return Response::Error(error.to_string());
+            }
+            match engine.position_session(
+                user.as_deref().filter(|u| authorized_for(peer, u)),
+                observer,
+            ) {
+                Ok(()) => Response::PositionSessionEnded,
+                Err(error) => Response::Error(error.to_string()),
             }
         }
         Request::PositionSample { user } => {
@@ -4314,70 +4410,55 @@ fn dispatch_scoped(
                 }
             }
             // Too many recent failures: don't fire the camera, fall to password.
-            if rate_limited(&user) {
-                return Response::AuthResult {
-                    granted: false,
-                    score: 0.0,
-                    live: false,
-                    reason: "too many recent face attempts; use your password".into(),
-                    declined_by_gesture: false,
-                    refused_by_policy: true,
-                    situation: String::new(),
-                };
+            if let Err(reason) = retry_throttle::check(&user) {
+                return retry_verify_refusal(reason);
             }
             let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
             match engine.authenticate_with_diagnostics(&user, service.as_deref(), scope) {
-                Ok(o) => {
-                    rate_record(&user, o.granted, !irlume_auth::presence_retryable(&o));
-                    if convenience || irlume_common::dbglog::on() {
-                        // Denied score + reason measurements quantized/redacted
-                        // unless tracing (anti-oracle); grants log exact.
-                        let (score, reason) = if o.granted {
-                            (format!("{:.3}", o.score), o.reason.clone())
-                        } else {
-                            (deny_score(o.score), deny_reason(&o.reason))
-                        };
-                        eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
+                Ok(o) => recorded_face_response(
+                    || retry_throttle::record(&user, &o),
+                    retry_verify_refusal,
+                    || {
+                        if convenience || irlume_common::dbglog::on() {
+                            // Denied score + reason measurements quantized/redacted
+                            // unless tracing (anti-oracle); grants log exact.
+                            let (score, reason) = if o.granted {
+                                (format!("{:.3}", o.score), o.reason.clone())
+                            } else {
+                                (deny_score(o.score), deny_reason(&o.reason))
+                            };
+                            eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
                             o.granted, o.live);
-                    }
-                    irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
-                    Response::AuthResult {
-                        granted: o.granted,
-                        score: o.score,
-                        live: o.live,
-                        // The ONE site that carries the engine outcome onto the wire:
-                        // a deliberate head-shake becomes the flag pam_irlume aborts a
-                        // polkit dialog on, and only it. Every other outcome kind, and
-                        // every policy early-return above, is false. `is_gesture_decline`
-                        // and the shared `gesture_declined` constructor are unit-tested
-                        // (a revert of the shake kind to OtherDeny fails there), but this
-                        // call site itself, and the live detection path shake ->
-                        // gesture_declined, are covered ONLY by the hardware gesture test:
-                        // nothing camera-less forces a GestureDeclined outcome through
-                        // dispatch, so a `false` slip here would pass the suite (see the
-                        // handoff's coverage gap). Evaluated before the `reason` move: it
-                        // borrows `o`, the move does not.
-                        declined_by_gesture: irlume_auth::is_gesture_decline(&o),
-                        // This arm carries an ENGINE verdict: a face was looked
-                        // at (or looked for). The policy refusals return above,
-                        // before the camera.
-                        refused_by_policy: false,
-                        // #616 step 3: the final failed attempt's situation,
-                        // in the stable journal vocabulary, for pam's action
-                        // wording; empty on a grant and on every pre-camera
-                        // refusal (they send `situation: String::new()`).
-                        situation: if o.granted {
-                            String::new()
-                        } else {
-                            engine
-                                .last_attempt_situation_label()
-                                .unwrap_or_default()
-                                .to_string()
-                        },
-                        reason: o.reason,
-                    }
-                }
+                        }
+                        irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
+                        Response::AuthResult {
+                            granted: o.granted,
+                            score: o.score,
+                            live: o.live,
+                            // Reserved v1 response field; gestures are no longer produced.
+                            declined_by_gesture: false,
+                            // This arm carries an engine verdict, including setup
+                            // refusals before capture. Daemon policy refusals return
+                            // above with refused_by_policy set.
+                            refused_by_policy: false,
+                            // #616 step 3: the final failed attempt's situation,
+                            // in the stable journal vocabulary, for pam's action
+                            // wording. The engine resets it at request entry, so
+                            // early setup refusals cannot reuse an older hint;
+                            // grants and daemon policy refusals also send empty.
+                            situation: if o.granted {
+                                String::new()
+                            } else {
+                                engine
+                                    .last_attempt_situation_label()
+                                    .unwrap_or_default()
+                                    .to_string()
+                            },
+                            reason: o.reason.clone(),
+                        }
+                    },
+                ),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -4445,13 +4526,6 @@ fn dispatch_scoped(
             scans,
             reset,
         } => {
-            if reset {
-                // Clean slate: drop the old enrollment (and its stale camera
-                // binding) before enrolling fresh.
-                if let Err(e) = irlume_core::storage::delete(&user) {
-                    return Response::Error(format!("reset failed: {e}"));
-                }
-            }
             let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
             // Apply the known emitter control so dark-mode scans enroll cleanly.
             // Asking to enroll a face is not consent to probe camera firmware
@@ -4501,15 +4575,26 @@ fn dispatch_scoped(
                         ProbeStore::AutomaticIfAbsent,
                     )
                 },
-                || match engine.enroll_profile_with_ir_preflight_and_diagnostics(
-                    &user,
-                    profile,
-                    want,
-                    |det| prepare_enrollment_ir(&ir_dev, det),
-                    scope,
-                ) {
-                    Ok(outcome) => enroll_response(outcome),
-                    Err(e) => Response::Error(e.to_string()),
+                || {
+                    let preflight =
+                        |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+                    let result = if let Some(observer) = session {
+                        engine.enroll_profile_observed(
+                            &user, profile, want, preflight, scope, observer,
+                        )
+                    } else if reset {
+                        engine.replace_enrollment_with_ir_preflight_and_diagnostics(
+                            &user, profile, want, preflight, scope,
+                        )
+                    } else {
+                        engine.enroll_profile_with_ir_preflight_and_diagnostics(
+                            &user, profile, want, preflight, scope,
+                        )
+                    };
+                    match result {
+                        Ok(outcome) => enroll_response(outcome),
+                        Err(e) => Response::Error(e.to_string()),
+                    }
                 },
             )
         }
@@ -4572,9 +4657,13 @@ fn dispatch_scoped(
             report_enrollment,
         } => {
             let ir_dev = engine.ir_device().to_owned();
-            match engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), |det| {
-                prepare_enrollment_ir(&ir_dev, det)
-            }) {
+            let preflight = |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+            let result = if let Some(observer) = session {
+                engine.add_scan_observed(&user, &profile, scans.unwrap_or(1), preflight, observer)
+            } else {
+                engine.add_scan_with_ir_preflight(&user, &profile, scans.unwrap_or(1), preflight)
+            };
+            match result {
                 // The structured reply, opted into: the TUI needs the
                 // ambient-lit count of EVERY scan for the #312 completion
                 // note, and AddScan carries every scan after the first.
@@ -5087,9 +5176,12 @@ fn dispatch_scoped(
             s.name = new_name.clone();
             Ok(format!("renamed scan to '{new_name}'"))
         }),
-        Request::SetRequireEyesOpen { user, .. } => {
-            set_require_eyes_open_off(&user, engine.embed_space())
-        }
+        Request::SetRequireEyesOpen { user, .. } => set_require_eyes_open_off(
+            &user,
+            engine.embed_space(),
+            engine.ir_space(),
+            engine.ir_dim(),
+        ),
         Request::CaptureEarMedian { .. } => Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
         Request::SetClosureCalibration { .. } => {
             Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into())
@@ -5206,7 +5298,12 @@ fn mutate_enrollment(
     }
 }
 
-fn set_require_eyes_open_off(user: &str, embed_space: &str) -> Response {
+fn set_require_eyes_open_off(
+    user: &str,
+    embed_space: &str,
+    ir_space: &str,
+    ir_dim: usize,
+) -> Response {
     let mut enrollment = match irlume_core::storage::load(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
@@ -5215,7 +5312,7 @@ fn set_require_eyes_open_off(user: &str, embed_space: &str) -> Response {
     enrollment.require_eyes_open = false;
     match irlume_core::storage::save(&enrollment) {
         Ok(()) => {
-            let summary = summarize_enrollment(Some(&enrollment), embed_space);
+            let summary = summarize_enrollment(Some(&enrollment), embed_space, ir_space, ir_dim);
             publish_enrollment_summary(user, summary);
             Response::Ok("require-eyes-open disabled".into())
         }
@@ -5288,28 +5385,17 @@ fn deny_reason(r: &str) -> String {
     out
 }
 
-/// The purpose every credential release runs under. Releasing the sealed password
-/// hands over a REUSABLE secret rather than one session, so by default the face
-/// match must be followed by a deliberate gesture (a nod, or a calibrated eye
-/// closure).
-///
-/// The setting is read here, per request, so `irlume credential-release-challenge
-/// off` takes effect without a daemon restart; the engine receives the decision,
-/// not the policy lookup.
+/// Keep credential release distinct from session verification.
 fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
-    irlume_auth::AuthenticationPurpose::CredentialRelease {
-        temporal_challenge: irlume_common::config::credential_release_challenge(),
-    }
+    irlume_auth::AuthenticationPurpose::CredentialRelease
 }
 
 /// Face-verify `user` and, on a passing match, release the TPM-sealed password.
 /// The biometric check happens HERE (inside unseal), so a caller cannot get the
 /// password without a capture that clears the liveness gate and matches the
 /// enrolled templates. Clearing the gate is evidence, not proof, that a live
-/// person is present: the single-frame IR cues are defeatable by a good print
-/// (docs/PAD_SELFTEST.md), which is why this path additionally requires the
-/// temporal consent gesture by default. We log the decision + cosine score, but
-/// never the password or its length.
+/// person is present. Automatic PAD remains required; see docs/PAD_SELFTEST.md
+/// for the measured limits. Never log the password or its length.
 #[cfg(test)]
 fn do_unseal_password(
     user: &str,
@@ -5336,8 +5422,8 @@ fn do_unseal_password_scoped(
     }
     // Same failure throttle as the login/sudo path: after a run of failures,
     // skip the camera and let PAM fall to the password.
-    if rate_limited(user) {
-        return Response::Error("too many recent face attempts; use your password".into());
+    if let Err(reason) = retry_throttle::check(user) {
+        return retry_unseal_refusal(reason);
     }
     let outcome = match engine.authenticate_for_with_diagnostics(
         user,
@@ -5361,11 +5447,18 @@ fn do_unseal_password_scoped(
             return Response::Error(e.to_string());
         }
     };
-    rate_record(
-        user,
-        outcome.granted,
-        !irlume_auth::presence_retryable(&outcome),
-    );
+    recorded_face_response(
+        || retry_throttle::record(user, &outcome),
+        retry_unseal_refusal,
+        || finish_unseal_password(user, &outcome, t),
+    )
+}
+
+fn finish_unseal_password(
+    user: &str,
+    outcome: &irlume_auth::Outcome,
+    t: std::time::Instant,
+) -> Response {
     if !outcome.granted {
         // Denied-attempt scores are QUANTIZED to one decimal unless tracing is
         // on: a 4-decimal score after every try is a gradient a journal-reading
@@ -6078,7 +6171,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let sum = summarize_enrollment(Some(&enr), "embed:model-b");
+        let sum = summarize_enrollment(Some(&enr), "embed:model-b", "raw", 512);
         let p = &sum.profiles[0];
         assert_eq!(p.scans.len(), 4, "the flat list is unchanged");
         assert_eq!(p.scans_by_recognizer.get("embed:model-a"), Some(&2));
@@ -6090,6 +6183,90 @@ mod tests {
             "untagged scans count under the recognizer that predates tagging"
         );
         assert_eq!(p.live_recognizer.as_deref(), Some("embed:model-b"));
+    }
+
+    #[test]
+    fn profile_ir_summary_partitions_only_live_recognizer_scans_and_reports_cache() {
+        use irlume_core::storage::{Enrollment, FaceProfile, FaceScan, LEGACY_RECOGNIZER_SPACE};
+        let scan = |tag: Option<&str>, dim: usize| FaceScan {
+            name: "synthetic".into(),
+            rgb: vec![0.0; 4],
+            ir: Some(vec![0.0; dim]),
+            ir_space: tag.map(str::to_string),
+            embed_space: None,
+            ir_center_edge_ratio: 0.0,
+            ir_brightness: 0.0,
+            pitch: 0.0,
+        };
+        let mut p = FaceProfile {
+            name: "P".into(),
+            scans: vec![
+                scan(Some("raw"), 4),
+                FaceScan {
+                    ir: None,
+                    ..scan(None, 4)
+                },
+                scan(None, 4),
+                scan(Some("adapter:old"), 4),
+                scan(Some("raw"), 2),
+                FaceScan {
+                    embed_space: Some("embed:other".into()),
+                    ..scan(None, 4)
+                },
+            ],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        };
+        let c = irlume_core::calib::IrCalibration {
+            m: vec![],
+            n_rows: vec![],
+            lambda: 0.5,
+            fitted_pairs: 3,
+        };
+        let plain = summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "raw", 4);
+        assert_eq!(
+            plain,
+            irlume_common::ProfileIrSummary {
+                compatible_scans: 1,
+                missing_scans: 1,
+                unknown_scans: 1,
+                incompatible_scans: 2,
+                calibration_withheld: false
+            }
+        );
+        p.ir_calib = Some(c.clone());
+        assert!(summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "raw", 4).calibration_withheld);
+        p.ir_calib = None;
+        p.ir_calibs.insert(LEGACY_RECOGNIZER_SPACE.into(), c);
+        assert!(summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "raw", 4).calibration_withheld);
+        let adapted = summarize_profile_ir(&p, LEGACY_RECOGNIZER_SPACE, "adapter:old", 4);
+        assert_eq!(adapted.compatible_scans, 1);
+        assert!(!adapted.calibration_withheld);
+        assert_eq!(
+            summarize_profile_ir(&p, "embed:other", "raw", 4).unknown_scans,
+            1
+        );
+        assert_eq!(
+            summarize_profile_ir(&p, "embed:absent", "raw", 4),
+            Default::default()
+        );
+        let mut enr = Enrollment::new("u");
+        enr.profiles.push(p);
+        let before = serde_json::to_value(&enr).unwrap();
+        let summary = summarize_enrollment(Some(&enr), LEGACY_RECOGNIZER_SPACE, "raw", 4);
+        assert!(
+            summary.profiles[0]
+                .ir
+                .as_ref()
+                .unwrap()
+                .calibration_withheld
+        );
+        assert_eq!(serde_json::to_value(&enr).unwrap(), before);
+        assert!(
+            summarize_enrollment(None, LEGACY_RECOGNIZER_SPACE, "raw", 4)
+                .profiles
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6314,7 +6491,7 @@ mod tests {
     /// Shared. For a test that only reaches a passwd lookup, which reads
     /// `environ` rather than writing it. Several may be held at once, so this
     /// does not serialise the socket work the exclusive guard would.
-    fn passwd_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+    pub(super) fn passwd_lock() -> std::sync::RwLockReadGuard<'static, ()> {
         crate::test_support::env_read()
     }
 
@@ -6337,11 +6514,28 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 4] = [
+        let sources: [(&str, &str); 8] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
+            (
+                "retry_throttle.rs",
+                concat!(
+                    include_str!("retry_throttle.rs"),
+                    "\n",
+                    include_str!("retry_throttle/tests.rs")
+                ),
+            ),
             ("arbiter.rs", include_str!("arbiter.rs")),
+            ("position_session.rs", include_str!("position_session.rs")),
+            (
+                "enrollment_session.rs",
+                include_str!("enrollment_session.rs"),
+            ),
             ("diagnostics.rs", include_str!("diagnostics.rs")),
+            (
+                "operation_authorization.rs",
+                include_str!("operation_authorization.rs"),
+            ),
         ];
         // The calls that end in glibc's getpwnam_r/getpwuid_r. `serve(` is
         // here because it REACHES them: `dispatch_status`/`dispatch_before_engine`
@@ -6351,6 +6545,9 @@ mod tests {
             "pregate(",
             "authorized_for(",
             "uid_of(",
+            "retry_throttle::check(",
+            "retry_throttle::record(",
+            "account(",
             "uid_for_name(",
             "name_for_uid(",
             "identify_scope(",
@@ -6673,6 +6870,7 @@ mod tests {
             service: Some("kde".into()),
             intent_confirmation: None,
         },
+        EnrollmentSession => Request::EnrollmentSession { user: u(), profile: None, scans: 10, improve: false },
         Enroll => Request::Enroll {
             user: u(),
             profile: None,
@@ -6744,6 +6942,7 @@ mod tests {
         TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000 },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
+        PositionSession => Request::PositionSession { user: Some(u()) },
         SealPassword => Request::SealPassword {
             user: u(),
             password: secret(),
@@ -6841,7 +7040,7 @@ mod tests {
             }
             // A mutation with no account has no summary to invalidate, so the
             // status path would keep serving one that no longer matches disk.
-            if posture.enrollment == EnrollmentEffect::Mutates {
+            if posture.enrollment != EnrollmentEffect::Reads {
                 assert!(
                     posture.user.is_some(),
                     "{} mutates an enrollment but names no account",
@@ -7243,6 +7442,7 @@ mod tests {
                                 scans: vec!["s1".into()],
                                 scans_by_recognizer: Default::default(),
                                 live_recognizer: None,
+                                ir: None,
                             }],
                             require_eyes_open: false,
                             closure_calibrated: false,
@@ -7290,6 +7490,92 @@ mod tests {
 
         arbiter.close();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn operation_authorization_rejects_exited_owner_before_queue() {
+        // Removing the pre-queue authorization gate makes these requests
+        // reach the stand-in worker and return Ok. No engine or camera runs.
+        let _passwd = passwd_lock();
+        let user = "nobody";
+        let uid = uid_of(user).expect("test host has nobody account");
+        assert_ne!(uid, 0);
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || {
+                while let Some(job) = arbiter.take() {
+                    let _ = job.payload.reply.send(Response::Ok("queued".into()));
+                    arbiter.finish(job.class, job.uid);
+                }
+            })
+        };
+        let mut responses = Vec::new();
+        for req in [
+            Request::Enroll {
+                user: user.into(),
+                profile: None,
+                scans: None,
+                reset: false,
+            },
+            Request::Enroll {
+                user: user.into(),
+                profile: None,
+                scans: None,
+                reset: true,
+            },
+            Request::AddScan {
+                user: user.into(),
+                profile: "primary".into(),
+                scans: None,
+                report_enrollment: false,
+            },
+            Request::RecoverySetup {
+                user: user.into(),
+                passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+            },
+            Request::RecoveryForget { user: user.into() },
+            Request::DeleteProfile {
+                user: user.into(),
+                profile: "primary".into(),
+            },
+            Request::ForgetRecognizer {
+                user: user.into(),
+                space: "embed:synthetic".into(),
+            },
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let wire = serde_json::to_string(&req).unwrap() + "\n";
+            client.write_all(wire.as_bytes()).unwrap();
+            let ready = std::sync::atomic::AtomicBool::new(true);
+            let state = diagnostics::DiagnosticState::default();
+            serve_peer(
+                server,
+                &arbiter,
+                &ready,
+                &state,
+                Peer {
+                    uid,
+                    gid: uid,
+                    pid: i32::MAX,
+                },
+            )
+            .unwrap();
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            responses.push(serde_json::from_str::<Response>(&line).unwrap());
+        }
+        arbiter.close();
+        worker.join().unwrap();
+        for response in responses {
+            assert!(
+                matches!(response, Response::Error(_)),
+                "unauthorized request reached worker: {response:?}"
+            );
+        }
     }
 
     #[test]
@@ -7358,6 +7644,9 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    authorization: None,
+                    session: None,
+                    position: None,
                     req: Request::Ping,
                     peer: Peer {
                         uid: 0,
@@ -7667,6 +7956,9 @@ mod tests {
                 for _ in 0..2 {
                     let job = authorized.take().expect("authorized tombstone queued");
                     let Queued {
+                        authorization,
+                        session: _,
+                        position: _,
                         req,
                         peer,
                         reply,
@@ -7674,7 +7966,7 @@ mod tests {
                         scope,
                     } = job.payload;
                     assert!(link.claim());
-                    let response = dispatch_scoped(req, &peer, &mut engine, &scope);
+                    let response = dispatch_scoped(req, &peer, &mut engine, &scope, authorization);
                     scope.finish(categorical_outcome(&response));
                     link.released();
                     authorized.finish(job.class, job.uid);
@@ -7871,9 +8163,8 @@ mod tests {
                     scans: vec!["s1".into()],
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
+                    ir: None,
                 }],
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: true,
             },
         );
@@ -7910,6 +8201,7 @@ mod tests {
         // it changes the key material the enrollment is sealed under.
         let mutates = [
             "Enroll",
+            "EnrollmentSession",
             "AddScan",
             "DeleteProfile",
             "DeleteScan",
@@ -7948,6 +8240,100 @@ mod tests {
     /// charge that account's next listing a storage load and its TPM work
     /// (#349). The authorized mutation must still invalidate before it runs.
     #[test]
+    fn operation_authorization_worker_refuses_missing_grant_without_cache_mutation() {
+        let _g = enrollment_summary_test_lock();
+        let mut engine = engine();
+        let _sandbox = sandbox("enrollment-authorization");
+        let user = "nobody";
+        let owner = peer(uid_of(user).unwrap());
+        assert_ne!(owner.uid, 0);
+        for request in [
+            Request::Enroll {
+                user: user.into(),
+                profile: None,
+                scans: None,
+                reset: true,
+            },
+            Request::AddScan {
+                user: user.into(),
+                profile: "primary".into(),
+                scans: None,
+                report_enrollment: false,
+            },
+            Request::EnrollmentSession {
+                user: user.into(),
+                profile: None,
+                scans: 10,
+                improve: false,
+            },
+            Request::EnrollmentSession {
+                user: user.into(),
+                profile: Some("primary".into()),
+                scans: 5,
+                improve: true,
+            },
+            Request::RecoverySetup {
+                user: user.into(),
+                passphrase: irlume_common::SecretBytes::new(b"synthetic phrase".to_vec()),
+            },
+            Request::RecoveryForget { user: user.into() },
+            Request::DeleteProfile {
+                user: user.into(),
+                profile: "primary".into(),
+            },
+            Request::ForgetRecognizer {
+                user: user.into(),
+                space: "embed:synthetic".into(),
+            },
+        ] {
+            publish_enrollment_summary(
+                user,
+                EnrollmentSummary {
+                    profiles: Vec::new(),
+                    ir_ratio_calibrated: false,
+                },
+            );
+            let response = dispatch(request, &owner, &mut engine);
+            assert!(
+                matches!(response, Response::Error(ref message) if message == operation_authorization::REFUSED)
+            );
+            assert!(cached_enrollment_summary(user).is_some());
+        }
+        invalidate_enrollment_summary(user);
+    }
+
+    #[test]
+    fn guided_enrollment_rejects_invalid_budgets_and_missing_improvement_targets() {
+        let _passwd = passwd_lock();
+        let root = peer(0);
+        for (scans, profile, improve) in [
+            (0, None, false),
+            (irlume_core::storage::MAX_SCANS_PER_PROFILE + 1, None, false),
+            (5, None, true),
+            (5, Some(String::new()), true),
+        ] {
+            let request = Request::EnrollmentSession {
+                user: "root".into(),
+                scans,
+                profile,
+                improve,
+            };
+            assert!(matches!(pregate(&request, &root), Some(Response::Error(_))));
+        }
+        let request = Request::EnrollmentSession {
+            user: "root".into(),
+            scans: 10,
+            profile: None,
+            improve: false,
+        };
+        assert!(pregate(&request, &root).is_none());
+        let mut engine = engine();
+        assert!(
+            matches!(dispatch(request, &root, &mut engine), Response::Error(ref message) if message == "guided enrollment requires its live connection")
+        );
+    }
+
+    #[test]
     fn only_an_authorized_mutation_drops_the_cached_summary() {
         let _g = enrollment_summary_test_lock();
         let mut e = engine();
@@ -7961,8 +8347,6 @@ mod tests {
             SAMPLE_USER,
             EnrollmentSummary {
                 profiles: Vec::new(),
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
         );
@@ -8013,6 +8397,9 @@ mod tests {
 
     #[test]
     fn health_reports_the_published_engine_bits() {
+        // Health dispatch tests share this process-wide cache. Keep the
+        // synthetic model flags isolated until the default bits are restored.
+        let _g = env_lock();
         publish_engine_bits_raw(EngineBits {
             mesh: true,
             adapter: true,
@@ -8065,6 +8452,9 @@ mod tests {
                 arbiter::Class::Auth,
                 0,
                 Queued {
+                    authorization: None,
+                    session: None,
+                    position: None,
                     req: Request::Ping,
                     peer: Peer {
                         uid: 0,
@@ -8505,54 +8895,6 @@ mod tests {
     }
 
     #[test]
-    fn rate_throttle_trips_after_the_limit_and_resets_on_grant() {
-        let _g = env_lock();
-        std::env::set_var("IRLUME_RATE_LIMIT", "3");
-        std::env::set_var("IRLUME_RATE_COOLDOWN_SECS", "30");
-        // Unique user so the process-global map does not bleed across tests.
-        let u = format!("throttle-{}", std::process::id());
-
-        // Below the limit: strikes accumulate, not yet throttled.
-        assert!(!rate_limited(&u));
-        rate_record(&u, false, true); // strike 1
-        rate_record(&u, false, true); // strike 2
-        assert!(!rate_limited(&u), "under the limit must not throttle");
-        rate_record(&u, false, true); // strike 3 -> cooldown
-        assert!(rate_limited(&u), "at the limit the user is throttled");
-
-        // No-face outcomes (nobody in frame) never count: fresh user stays open
-        // even after many of them.
-        let u2 = format!("noface-{}", std::process::id());
-        for _ in 0..10 {
-            rate_record(&u2, false, false);
-        }
-        assert!(!rate_limited(&u2), "absence must not throttle");
-
-        // A grant clears the throttle immediately.
-        let u3 = format!("grant-{}", std::process::id());
-        rate_record(&u3, false, true);
-        rate_record(&u3, false, true);
-        rate_record(&u3, false, true);
-        assert!(rate_limited(&u3));
-        rate_record(&u3, true, true);
-        assert!(!rate_limited(&u3), "a grant resets the throttle");
-
-        // Limit of 0 disables the throttle entirely.
-        std::env::set_var("IRLUME_RATE_LIMIT", "0");
-        let u4 = format!("disabled-{}", std::process::id());
-        for _ in 0..20 {
-            rate_record(&u4, false, true);
-        }
-        assert!(
-            !rate_limited(&u4),
-            "IRLUME_RATE_LIMIT=0 disables the throttle"
-        );
-
-        std::env::remove_var("IRLUME_RATE_LIMIT");
-        std::env::remove_var("IRLUME_RATE_COOLDOWN_SECS");
-    }
-
-    #[test]
     fn env_or_prefers_the_env_var_over_the_default() {
         let _g = env_lock();
         std::env::remove_var("IRLUME_TEST_ENV_OR");
@@ -8604,78 +8946,6 @@ mod tests {
             assert!(!biopolicy_enforced(), "{falsy:?} must not enable");
         }
         std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY");
-        std::env::remove_var("IRLUME_CONFIG_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The POLICY read behind credential release: `temporal_challenge` tracks the
-    /// live setting so a toggle needs no daemon restart, and DEFAULT OFF means an
-    /// absent key releases the keyring with no nod (a greeter cold login / logout).
-    /// Only an explicit truthy opt-in adds the gesture.
-    ///
-    /// Scope, stated plainly: this covers the helper, not the dispatch. That
-    /// `UnsealPassword` runs under this purpose rests on
-    /// [`credential_release_purpose`] having exactly one caller,
-    /// [`do_unseal_password`], which is also the only path to
-    /// `keyring::unseal_password`. A camera-less test cannot observe the gesture
-    /// gate itself; the engine-side proof lives in irlume-auth
-    /// (`no_credential_release_failure_mode_ever_grants`) and the end-to-end proof
-    /// in irlume-pam (`pamwrap_refused_challenge_falls_through_to_the_password_module`).
-    #[test]
-    fn credential_release_purpose_defaults_to_no_challenge() {
-        use irlume_auth::AuthenticationPurpose::CredentialRelease;
-        let _g = env_lock();
-        let dir = std::env::temp_dir().join(format!("irlume-crp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
-
-        // No settings.conf at all: the challenge is OFF (the default).
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: false
-            },
-            "an absent key must release the keyring with no nod"
-        );
-        // An explicit opt-in, read live, is the only way to add it.
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=on\n",
-        )
-        .unwrap();
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: true
-            }
-        );
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=off\n",
-        )
-        .unwrap();
-        assert_eq!(
-            credential_release_purpose(),
-            CredentialRelease {
-                temporal_challenge: false
-            }
-        );
-        // Whatever the setting says, the purpose is never Verify or AppConsent:
-        // credential release can never be downgraded to a session-only gate.
-        for v in ["on", "off", "garbage"] {
-            std::fs::write(
-                dir.join("settings.conf"),
-                format!("credential_release_challenge={v}\n"),
-            )
-            .unwrap();
-            assert!(
-                matches!(credential_release_purpose(), CredentialRelease { .. }),
-                "'{v}' must stay a credential release"
-            );
-        }
-
         std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9026,6 +9296,7 @@ mod tests {
             &root,
             &mut engine,
             &scope,
+            None,
         );
 
         let Response::SupportProbe(result) = response else {
@@ -9329,6 +9600,7 @@ mod tests {
     #[test]
     fn authenticate_refuses_an_unenrolled_user_before_the_camera() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         let sb = sandbox("auth-ghost");
         let _ = &sb;
@@ -9337,7 +9609,7 @@ mod tests {
         // capture (the devices don't exist, so reaching the camera would error).
         match dispatch(
             Request::Authenticate {
-                user: "irlume-test-ghost".into(),
+                user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
             },
@@ -9351,7 +9623,7 @@ mod tests {
                 ..
             } => {
                 assert!(!granted && !live);
-                assert_eq!(reason, "'irlume-test-ghost' is not enrolled");
+                assert_eq!(reason, format!("'{user}' is not enrolled"));
                 // The reason must survive journal redaction unchanged (no
                 // numeric payload for a spoofer to tune against).
                 assert_eq!(deny_reason(&reason), reason);
@@ -9361,14 +9633,135 @@ mod tests {
     }
 
     #[test]
+    fn setup_refusals_preserve_verify_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(false, false);
+    }
+
+    #[test]
+    fn setup_refusals_preserve_unseal_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(true, false);
+    }
+
+    #[test]
+    fn recognizer_mismatch_preserves_verify_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(false, true);
+    }
+
+    #[test]
+    fn recognizer_mismatch_preserves_unseal_retry_history() {
+        let _g = env_lock();
+        setup_refusals_preserve_retry_history(true, true);
+    }
+
+    // Runs under the callers' environment lock, using the real engine and
+    // persistent store. Only camera devices and enrolled data are fixtures.
+    fn setup_refusals_preserve_retry_history(unseal: bool, foreign_model: bool) {
+        let user = users::name_for_uid(0).expect("root NSS account");
+        let mut e = engine();
+        for prior_rejection in [false, true] {
+            let sb = sandbox("setup-retry");
+            plant_fake_envelope(&user);
+            let expected = if foreign_model {
+                let mut enrollment = enrollment_with(&user, &["Legacy model scan"]);
+                enrollment.profiles[0].scans[0].embed_space = Some("embed:retired-fixture".into());
+                assert_ne!(e.embed_space(), "embed:retired-fixture");
+                write_enrollment(&sb.dir, &enrollment);
+                format!("'{user}' has no face scans for the current recognition model; add scans to an existing profile or enroll")
+            } else {
+                format!("'{user}' is not enrolled")
+            };
+            let record = sb.dir.join("retry/0.json");
+            if prior_rejection {
+                retry_throttle::record(
+                    &user,
+                    &irlume_auth::Outcome {
+                        granted: false,
+                        live: true,
+                        score: 0.1,
+                        reason: "synthetic rejected match".into(),
+                        kind: irlume_auth::OutcomeKind::BelowThreshold,
+                    },
+                )
+                .unwrap();
+            }
+            let read_history = || match std::fs::read(&record) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("retry history read failed: {error}"),
+            };
+            let before = read_history();
+            for _ in 0..6 {
+                let response = if unseal {
+                    do_unseal_password(&user, None, &mut e)
+                } else {
+                    dispatch(
+                        Request::Authenticate {
+                            user: user.clone(),
+                            service: Some("kde".into()),
+                            intent_confirmation: None,
+                        },
+                        &peer(0),
+                        &mut e,
+                    )
+                };
+                match response {
+                    Response::AuthResult {
+                        granted,
+                        live,
+                        declined_by_gesture,
+                        reason,
+                        ..
+                    } if !unseal => {
+                        assert!(!granted && !live && !declined_by_gesture);
+                        assert_eq!(reason, expected);
+                    }
+                    Response::Error(reason) if unseal => {
+                        assert_eq!(reason, format!("face not granted: {expected}"));
+                    }
+                    other => panic!("setup must remain a terminal refusal: {other:?}"),
+                }
+                assert_eq!(
+                    read_history(),
+                    before,
+                    "setup refusal must neither create nor change retry history"
+                );
+            }
+            // Repairing enrollment reaches the missing-camera boundary. It
+            // must not replenish the account's prior face retry budget.
+            write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
+            let response = if unseal {
+                do_unseal_password(&user, None, &mut e)
+            } else {
+                dispatch(
+                    Request::Authenticate {
+                        user: user.clone(),
+                        service: Some("kde".into()),
+                        intent_confirmation: None,
+                    },
+                    &peer(0),
+                    &mut e,
+                )
+            };
+            assert!(
+                matches!(response, Response::Error(ref reason) if reason.contains("no camera found"))
+            );
+            assert_eq!(read_history(), before);
+        }
+    }
+
+    #[test]
     fn authenticate_surfaces_a_capture_error_for_an_enrolled_user() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         let sb = sandbox("auth-cam");
-        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
         match dispatch(
             Request::Authenticate {
-                user: "carol".into(),
+                user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
             },
@@ -9489,9 +9882,8 @@ mod tests {
                     scans: vec!["Face Scan 9".into()],
                     scans_by_recognizer: Default::default(),
                     live_recognizer: None,
+                    ir: None,
                 }],
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
         );
@@ -9903,8 +10295,6 @@ mod tests {
                 "carol",
                 EnrollmentSummary {
                     profiles: Vec::new(),
-                    require_eyes_open: false,
-                    closure_calibrated: false,
                     ir_ratio_calibrated: false,
                 },
             );
@@ -10019,8 +10409,6 @@ mod tests {
             "carol",
             EnrollmentSummary {
                 profiles: Vec::new(),
-                require_eyes_open: false,
-                closure_calibrated: false,
                 ir_ratio_calibrated: false,
             },
         );
@@ -10086,7 +10474,7 @@ mod tests {
 
         publish_enrollment_summary(
             "carol",
-            summarize_enrollment(Some(&enrollment), e.embed_space()),
+            summarize_enrollment(Some(&enrollment), e.embed_space(), e.ir_space(), e.ir_dim()),
         );
 
         match dispatch(
@@ -10108,10 +10496,17 @@ mod tests {
             "a refused enable must leave the stored flag alone"
         );
         assert!(
-            !cached_enrollment_summary("carol")
-                .expect("refused ON must preserve the summary")
-                .require_eyes_open,
-            "the preserved summary must keep the retired field frozen false"
+            matches!(
+                cached_enrollment_summary("carol")
+                    .expect("refused ON must preserve the summary")
+                    .into_response(),
+                Response::Enrollment {
+                    require_eyes_open: false,
+                    closure_calibrated: false,
+                    ..
+                }
+            ),
+            "the preserved summary must report the retired fields as false"
         );
 
         for attempt in 1..=2 {
@@ -10131,10 +10526,17 @@ mod tests {
                 .expect("the enrollment exists");
             assert!(!enr.require_eyes_open, "OFF attempt {attempt} must persist");
             assert!(
-                !cached_enrollment_summary("carol")
-                    .expect("OFF must publish the saved summary")
-                    .require_eyes_open,
-                "OFF attempt {attempt} must publish the cleared flag"
+                matches!(
+                    cached_enrollment_summary("carol")
+                        .expect("OFF must publish the saved summary")
+                        .into_response(),
+                    Response::Enrollment {
+                        require_eyes_open: false,
+                        closure_calibrated: false,
+                        ..
+                    }
+                ),
+                "OFF attempt {attempt} must report the retired fields as false"
             );
         }
     }
@@ -10305,8 +10707,16 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
         }
-        // reset:true wipes the old enrollment even though the capture then
-        // fails: the reset half of the arm ran.
+        // A failed replacement must preserve the enrollment and recovery setup.
+        let previous = std::fs::read(sb.dir.join("carol.json")).unwrap();
+        for directory in ["template-keys", "recovery"] {
+            std::fs::create_dir_all(sb.dir.join(directory)).unwrap();
+            std::fs::write(
+                sb.dir.join(directory).join("carol.json"),
+                b"synthetic fixture",
+            )
+            .unwrap();
+        }
         match dispatch(
             Request::Enroll {
                 user: "carol".into(),
@@ -10320,10 +10730,13 @@ mod tests {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
         }
-        assert!(
-            !sb.dir.join("carol.json").exists(),
-            "Enroll{{reset:true}} must delete the previous enrollment first"
-        );
+        assert_eq!(std::fs::read(sb.dir.join("carol.json")).unwrap(), previous);
+        for directory in ["template-keys", "recovery"] {
+            assert_eq!(
+                std::fs::read(sb.dir.join(directory).join("carol.json")).unwrap(),
+                b"synthetic fixture"
+            );
+        }
     }
 
     #[test]
@@ -10488,33 +10901,77 @@ mod tests {
     #[test]
     fn do_unseal_password_requires_an_armed_seal_then_a_granted_face() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = engine();
         let sb = sandbox("do-unseal");
         // Nothing armed: refused before any capture or TPM traffic.
-        match do_unseal_password("carol", None, &mut e) {
+        match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => {
                 assert_eq!(
                     msg,
-                    "no sealed password for 'carol': run `irlume keyring arm`"
+                    format!("no sealed password for '{user}': run `irlume keyring arm`")
                 )
             }
             other => panic!("unarmed unseal must be refused, got {other:?}"),
         }
         // Armed (existence check only) but the user is not enrolled: the face
         // check denies before the camera and the envelope is never opened.
-        plant_fake_envelope("carol");
-        match do_unseal_password("carol", None, &mut e) {
+        plant_fake_envelope(&user);
+        match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => {
-                assert_eq!(msg, "face not granted: 'carol' is not enrolled")
+                assert_eq!(msg, format!("face not granted: '{user}' is not enrolled"))
             }
             other => panic!("unenrolled unseal must be refused, got {other:?}"),
         }
         // Enrolled: the capture itself fails on this hardware and maps to a
         // clean Error (the non-drift branch: no remedy hint appended).
-        write_enrollment(&sb.dir, &enrollment_with("carol", &["Face Scan 1"]));
-        match do_unseal_password("carol", None, &mut e) {
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
+        match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn password_present_skips_kde_key_release_before_tpm_access() {
+        let _g = env_lock();
+        let _sb = sandbox("password-present-kde");
+        let path = irlume_core::keyring::envelope_path("carol");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An invalid TCTI prevents every release arm from opening a real TPM.
+        // Metadata-only skip paths must still work when the TPM is unavailable.
+        let previous = std::env::var_os("IRLUME_TCTI");
+        std::env::set_var("IRLUME_TCTI", "invalid-irlume-test-tcti");
+        let mut outcomes = Vec::new();
+        for kind in ["LoginPassword", "KdeWalletKey", "GnomeKeyringToken"] {
+            let envelope = serde_json::json!({
+                "version": 1, "secret": kind, "pcrs": [], "public": "", "private": ""
+            });
+            std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+            outcomes.push((
+                kind,
+                unseal_keyring("carol", Some("plasmalogin"), true, &peer(0)),
+                unseal_keyring("carol", Some("plasmalogin"), false, &peer(0)),
+                unseal_keyring("carol", Some("sudo"), true, &peer(0)),
+                unseal_keyring("carol", Some("plasmalogin"), true, &peer(NOBODY)),
+            ));
+        }
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        for (kind, password_present, no_password, elevation, unprivileged) in outcomes {
+            if kind == "GnomeKeyringToken" {
+                assert!(matches!(password_present, Response::Error(_)));
+            } else {
+                assert!(
+                    matches!(password_present, Response::KeyringUnlockNotNeeded),
+                    "{kind}"
+                );
+            }
+            assert!(matches!(no_password, Response::Error(_)));
+            assert!(matches!(elevation, Response::Error(_)));
+            assert!(matches!(unprivileged, Response::Error(_)));
         }
     }
 
@@ -10722,6 +11179,142 @@ mod tests {
             }
             other => panic!("empty reseal must be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enrollment_removal_preserves_all_state_until_approved_then_retires_recovery() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("removal-authorization");
+        // Bind approvals to the live test process, as production does.
+        // SAFETY: credential getters have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let owner = Peer {
+            uid,
+            gid,
+            pid: std::process::id() as i32,
+        };
+        let user = users::name_for_uid(uid).unwrap();
+        for request in [
+            Request::DeleteProfile {
+                user: user.clone(),
+                profile: "Face Profile 1".into(),
+            },
+            Request::ForgetRecognizer {
+                user: user.clone(),
+                space: "embed:synthetic-removal".into(),
+            },
+        ] {
+            let mut enrollment = enrollment_with(&user, &["Face Scan 1"]);
+            enrollment.profiles[0].scans[0].embed_space = Some("embed:synthetic-removal".into());
+            write_enrollment(&sb.dir, &enrollment);
+            let paths = [
+                irlume_core::storage::profile_path(&user),
+                irlume_core::template_key::key_path(&user),
+                irlume_core::template_key::recovery_path(&user),
+            ];
+            // Deletion should unlink these files without trying to unseal.
+            // The plaintext enrollment and sentinels contain no real face data.
+            for path in &paths[1..] {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"synthetic teardown sentinel").unwrap();
+            }
+            let before: Vec<_> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+            let other = peer(if uid == NOBODY { 1 } else { NOBODY });
+            assert!(matches!(
+                dispatch(request.clone(), &other, &mut e),
+                Response::Error(_)
+            ));
+            if uid != 0 {
+                assert!(matches!(dispatch(request.clone(), &owner, &mut e),
+                    Response::Error(ref message) if message == operation_authorization::REFUSED));
+            }
+            for (path, bytes) in paths.iter().zip(&before) {
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            }
+            let (_client, server) = UnixStream::pair().unwrap();
+            let grant =
+                operation_authorization::authorize_for_test(&request, &owner, &server).unwrap();
+            let diagnostic = diagnostics::DiagnosticState::default();
+            let scope = diagnostic.begin(diagnostic_operation_class(&request));
+            assert!(matches!(
+                dispatch_scoped(request, &owner, &mut e, &scope, grant),
+                Response::Ok(_)
+            ));
+            assert!(
+                paths.iter().all(|p| !p.exists()),
+                "approved teardown must retire all three files"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_authorization_preserves_envelope_on_refusal_and_allows_approved_removal() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("recovery-authorization");
+        // Real process identity is required by the grant, including start time.
+        // SAFETY: these credential getters have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let owner = Peer {
+            uid,
+            gid,
+            pid: std::process::id() as i32,
+        };
+        let user = users::name_for_uid(uid).unwrap();
+        let envelope = irlume_core::recovery::wrap(b"synthetic old passphrase", &[7; 32]).unwrap();
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let path = sb.dir.join("recovery").join(format!("{user}.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let setup = Request::RecoverySetup {
+            user: user.clone(),
+            passphrase: irlume_common::SecretBytes::new(b"synthetic new passphrase".to_vec()),
+        };
+        let forget = Request::RecoveryForget { user: user.clone() };
+        let other = peer(if uid == NOBODY { 1 } else { NOBODY });
+        for req in [setup.clone(), forget.clone()] {
+            assert!(matches!(dispatch(req, &other, &mut e), Response::Error(_)));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        // Missing approval must also preserve a same-user envelope. Root is
+        // explicitly exempt; that branch is exercised below as administration.
+        if uid != 0 {
+            for req in [setup.clone(), forget.clone()] {
+                assert!(
+                    matches!(dispatch(req, &owner, &mut e), Response::Error(ref error) if error.contains("requires OS authorization"))
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+        let (client, server) = UnixStream::pair().unwrap();
+        let grant = operation_authorization::authorize_for_test(&setup, &owner, &server).unwrap();
+        let state = diagnostics::DiagnosticState::default();
+        let scope = state.begin(diagnostic_operation_class(&setup));
+        // Approval reaches the real setup operation; without a TPM-sealed key
+        // it must return the storage error and preserve the existing envelope.
+        assert!(
+            matches!(dispatch_scoped(setup, &owner, &mut e, &scope, grant), Response::Error(ref error) if error.contains("no template key sealed"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let restore = Request::RecoveryRestore {
+            user: user.clone(),
+            passphrase: irlume_common::SecretBytes::new(b"wrong synthetic passphrase".to_vec()),
+        };
+        assert!(
+            matches!(dispatch(restore, &owner, &mut e), Response::Error(ref error) if error.contains("wrong recovery passphrase"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let grant = operation_authorization::authorize_for_test(&forget, &owner, &server).unwrap();
+        assert!(matches!(
+            dispatch_scoped(forget, &owner, &mut e, &scope, grant),
+            Response::Ok(_)
+        ));
+        assert!(
+            !path.exists(),
+            "approved removal must reach the real filesystem mutation"
+        );
+        drop(client);
     }
 
     #[test]
@@ -10946,17 +11539,18 @@ mod tests {
     #[ignore = "needs v4l2loopback feeder nodes; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE (CI does this)"]
     fn loopback_authenticate_dispatches_to_a_no_face_denial() {
         let _g = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
         let mut e = loopback_engine();
         let sb = sandbox("lb-auth");
         // One-shot capture instead of a grace window: a no-face run finishes
         // in one camera round.
         std::env::set_var("IRLUME_GRACE_MS", "0");
-        write_enrollment(&sb.dir, &enrollment_with("lbuser", &["Face Scan 1"]));
+        write_enrollment(&sb.dir, &enrollment_with(&user, &["Face Scan 1"]));
         // "kde" is a ScreenUnlock in every tier, so the dispatch gates pass
         // whether or not the runner's loopback nodes register as an IR pair.
         let resp = dispatch(
             Request::Authenticate {
-                user: "lbuser".into(),
+                user: user.clone(),
                 service: Some("kde".into()),
                 intent_confirmation: None,
             },
@@ -10969,10 +11563,15 @@ mod tests {
                 granted,
                 live,
                 reason,
+                refused_by_policy,
                 ..
             } => {
                 assert!(!granted, "no face on the feed must never grant");
                 assert!(!live);
+                assert!(
+                    !refused_by_policy,
+                    "the loopback fixture must reach the engine"
+                );
                 assert!(
                     reason.to_lowercase().contains("face"),
                     "denial should name the missing face, got: {reason}"

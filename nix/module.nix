@@ -200,6 +200,8 @@ in
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
+    security.polkit.enable = true;
+    # polkit links /share/polkit-1 from environment.systemPackages.
 
     # Setgid root:video directory for the IR-emitter exclusion locks (#542).
     # The service below mirrors the packaged unit's bounding set (no

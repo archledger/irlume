@@ -211,8 +211,8 @@ infrared-absorbing patch that carries the centre/edge ratio into the genuine
 range while the built-in gate still returns `Live`. The passive-blink gate that
 once closed this breach in validation was retired for field non-response
 ([ADR-0002](adr/0002-challenge-response-liveness.md), superseded); the nod and
-head-shake gestures that replaced it prove intent, not liveness, and do not
-stand between a print and a grant. Measurements:
+head-shake gestures that replaced it have also been removed. They were intent
+steps, not the anti-spoof boundary. Measurements:
 [docs/pad-results/](pad-results/).
 
 PAD availability is fail closed for face grants. RGB-only grants require a ViT
@@ -291,31 +291,12 @@ with a fabricated print.
   queueing. Root or a compromised conversation provider can forge the
   assertion, so it is not cryptographic proof of physical input. Login, greeter,
   lock, and credential-release flows do not gain this extra prompt.
-- **Head gesture is an optional additional intent gate.** Every service defaults
-  off. Explicit opt-in adds repeated-nod approval and head-shake decline after
-  privileged keyboard confirmation; it can never replace or bypass that
-  confirmation. A nod never bypasses face matching or automatic passive PAD,
-  and a shake is not evidence that the presentation is live. On polkit a shake
-  retains `PAM_ABORT`; other services preserve password/fingerprint fallback.
-  The classifier is experimental and not population-qualified.
-- **Cold-keyring credential release can require head consent (default OFF,
-  opt-in).**
-  Releasing the TPM-sealed login-keyring password happens on a greeter cold login
-  (from reboot) and after logout. It defaults to releasing after the face match
-  with no gesture, because the gesture is intent, not liveness (it
-  fired on a hand-held print 2 times in 24 on 2026-07-27, so it never stood
-  between a photograph and the credential; the cross-spectrum liveness and PAD
-  cues do, and the typed password is always the fallback). A user who wants the
-  extra deliberate-intent step turns it on with
-  `sudo irlume credential-release-challenge on`: the `UnsealPassword` match is
-  then followed by repeated head nodding; a shake declines. Login, lock screen,
-  `sudo`, and polkit are decided by their own policy: privileged services always
-  require keyboard confirmation and optionally add a gesture. When the gesture
-  is on, every way it can fail to happen (no gesture in the window, no IR
-  camera, or a busy camera) ends in the typed-password path, never a lockout,
-  and the keyring then unlocks from the typed password exactly as it would have
-  from a released one. `irlume doctor` reports the state. This remains an intent
-  step, not proof of physical liveness.
+- **Head gestures have been removed.** Authentication retains identity matching
+  and passive PAD. Privileged PAM confirmation remains governed by its existing
+  policy. See [migration notes](HEAD-GESTURE-REMOVAL.md).
+
+  The following gesture measurements are historical evidence from the retired
+  implementation, not claims about a current authentication step.
 
   **What it was measured to do (2026-07-25, one camera, seated user, 17 attempts
   against the real greeter stack).** Nodding continuously released 4 times out of

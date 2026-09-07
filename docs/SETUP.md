@@ -16,6 +16,10 @@ you out.
 
 ## Guided setup (TUI)
 
+See [TUI workflows and CLI parity](TUI.md) for F2 More actions and the
+existing-person versus new-person enrollment flow.
+
+
 ```sh
 irlume tui
 ```
@@ -100,7 +104,13 @@ Look at the camera. It captures ten scans and saves a profile:
 ```
 
 Options: `--name "Alex"` names the profile, `--scans K` sets the scan count,
-`--reset` wipes existing profiles first. Name a separate profile for a
+`--reset` replaces existing profiles and the camera binding after a complete,
+validated capture. Failed or cancelled captures keep the saved enrollment. The
+template key and recovery setup are retained. If the key cannot be unsealed,
+use `irlume recovery restore`; `--reset` no longer discards an unusable key.
+Without recovery, deliberate removal of the old enrollment, sealed template
+key and recovery envelope is required before a fresh enrollment.
+Name a separate profile for a
 *different person* you trust (up to three); for your own glasses/lighting
 variants, add scans to your own profile instead. On a machine with a TPM, the
 templates are now
@@ -336,9 +346,7 @@ credential to it). PAM shows `Type yes to use face authentication` above the
 normal hidden field, unless `privileged_face_consent=0` waives it as described
 above. Type `yes` for one face attempt, or type the ordinary
 password once for the password/fingerprint path. Empty Enter and cancellation
-never open the camera. An experimental head gesture can be explicitly added as
-a second gate, but defaults off and never replaces keyboard confirmation.
-Automatic passive PAD remains mandatory and separate.
+never open the camera. Automatic passive PAD remains mandatory and separate.
 Full walkthrough, Bitwarden setup, and the security stance:
 [APP-INTEGRATION.md](APP-INTEGRATION.md).
 
@@ -467,7 +475,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `credential_release_challenge=1` opts IN to a head gesture before the login-keyring credential is released (default off); every `service_gesture.<service>` also defaults off, with `=1` adding an experimental gesture after mandatory privileged keyboard confirmation; the legacy `polkit_gesture=1` switch remains an explicit polkit opt-in. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). During the migration window, `consent_gesture=closure` or malformed values block only a gesture-gated request until removed or changed to `nod` | TUI Settings; `sudo irlume credential-release-challenge [<service>] on\|off` |
+| `/etc/irlume/settings.conf` | `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | TUI Settings |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
@@ -492,9 +500,6 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_PRIVILEGED_FACE_CONSENT` | same switch as `privileged_face_consent` in `settings.conf`; the env var wins. `0` waives the literal `yes` on privileged services | on |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |
-| `IRLUME_CREDENTIAL_RELEASE_CHALLENGE` | same switch as `credential_release_challenge` in `settings.conf`. Precedence: `service_gesture.credential_release` has highest priority; when that key is absent, this variable overrides the `settings.conf` key. Set `1` to add a gesture before the keyring password is released | off |
-| `IRLUME_POLKIT_GESTURE` | legacy explicit opt-in for an additional experimental polkit head gesture; `service_gesture.polkit-1` takes precedence. It cannot disable or replace mandatory PAM keyboard confirmation | off |
-| `IRLUME_CONSENT_GESTURE` | one-release migration input that overrides `consent_gesture` in `settings.conf`. Unset or `nod` permits an explicitly enabled head gesture; legacy `closure` and malformed values fail that gesture-gated request closed. Unset the variable or set it to `nod` to migrate | unset |
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` |
 | `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |
 | `IRLUME_RGB_DEVICE` / `IRLUME_IR_DEVICE` | camera-pair override; both must be set | auto |
@@ -551,3 +556,38 @@ Your password login is never touched. To remove just face-`sudo` while keeping
 the greeter, re-run `login enable --apply` *without* `--with-sudo`. For every
 off-switch in one place (per-surface tiers, standing face down without touching
 PAM, canceling a running scan, full uninstall), read [DISABLE.md](DISABLE.md).
+
+### Authorization before enrollment
+
+Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
+
+Removing a whole profile (`profiles delete --profile ...` without `--scan`) or
+a recognizer's face data (`profiles forget-model`) also requires the
+`org.irlume.enroll` approval, including the TUI and direct socket clients.
+Removing the final profile retires its template key and recovery passphrase.
+Denied or cancelled approval leaves the enrollment and recovery files unchanged.
+Deleting individual scans and renaming profiles/scans keep their existing behavior;
+a profile's final scan cannot be deleted individually. Root retains administrative
+access. These approval checks require the updated daemon; an older daemon does not
+enforce them even when called by a newer client.
+
+Setting, replacing or erasing a recovery passphrase (`recovery setup` and
+`recovery forget`) also requires OS authorization for non-root users, including
+TUI and direct socket requests. The dialog identifies the account and operation;
+no recovery passphrase is sent to polkit. Root retains administrative access.
+The separate `org.irlume.recovery-manage` action ships with the package. If the
+action is missing, repair the Irlume policy installation; terminal users can
+register a `pkttyagent` when no desktop agent is available. Administrator polkit
+rules can override the shipped authentication requirement.
+
+`recovery restore` still verifies the existing recovery passphrase and reseals
+the template key without a new OS approval requirement. It does not reset retry
+history or override other face-authentication checks. OS authorization for
+recovery management does not attest which authentication factor was used.
+Older clients can use the new daemon with an available authorization agent;
+older daemons, including after a binary rollback, do not enforce this new gate.
+Rollback leaves recovery envelopes and retry records intact.
+
+Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment or profile/model removal. Missing authority or agent, denial, cancellation and expired approval refuse the operation. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
+
+The daemon enforces this rule. Restart into the updated daemon after upgrading; a new client with an older running daemon does not provide this protection. Older clients can meet the new dialog but retain their shorter reply timeout.

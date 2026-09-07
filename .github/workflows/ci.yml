@@ -109,13 +109,13 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           # Pinned to a SHA, the action can't read the version from the tag, so
           # name the toolchain explicitly (it is a required input then).
@@ -359,7 +359,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
@@ -367,7 +367,7 @@ jobs:
       - name: Install stable Rust
         # @master (declares the `toolchain` input); the version tag branches
         # (e.g. @1.88.0) have no such input and ignore `with: toolchain:`.
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
 
@@ -608,7 +608,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libtss2-dev libudev-dev
+              build-essential pkg-config clang libclang-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
@@ -619,7 +619,7 @@ jobs:
       - name: Install nightly Rust (cargo-fuzz needs it)
         # @master so `toolchain: nightly-...` is honored (the version-branch pin
         # ignored it; nightly only worked via the RUSTUP_TOOLCHAIN env fallback).
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: nightly-2026-07-15
 

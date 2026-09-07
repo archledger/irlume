@@ -1,4 +1,4 @@
-//! Why an IR burst is not a usable scene, named from evidence, not guessed.
+//! IR capture diagnostics, with whole-image evidence kept distinct from face quality.
 //!
 //! `capture_with_stats` used to answer every dark burst with one hint: "no
 //! active emitter; run `sudo irlume ir-setup`". A dark IR frame has at least
@@ -17,7 +17,7 @@
 //! testable without a camera, and the renderer returns the full message so
 //! wording and advice stay in one place.
 
-/// The dark gate: below this mean a burst is dark and gets a diagnosis.
+/// The whole-image dark band; this does not determine face-region usability.
 /// Public so the call site's shortcut range and this module's real gate are
 /// one constant and cannot drift apart.
 pub const DARK_MEAN_MAX: f64 = 35.0;
@@ -198,9 +198,47 @@ fn saturated_flat(e: &DarkEvidence) -> bool {
     e.frame_mean >= SATURATED_MIN_MEAN && e.frame_stddev <= SATURATED_FLAT_MAX
 }
 
-/// The user-facing line for a cause, or `None` where silence is the right
-/// output (`EmitterDisabled`: the hint's own text has always promised that
-/// `off` silences it, and this is where the promise is kept).
+/// Output policy for capture, which has no detected face region yet.
+pub(crate) enum CaptureMessage {
+    /// Direct privacy evidence or the measured saturated-flat signature.
+    Warning(String),
+    /// Whole-image measurements; never a diagnosis of face usability.
+    Debug(String),
+}
+
+/// Render capture evidence without treating a dark background as a failed
+/// emitter (#677). Face-region failures are reported by the assessment layer.
+/// Keep the full diagnostic renderer available for explicit troubleshooting.
+pub(crate) fn capture_message(card: &str, evidence: &DarkEvidence) -> Option<CaptureMessage> {
+    let cause = diagnose(evidence)?;
+    match cause {
+        IrDarkCause::EmitterDisabled => None,
+        IrDarkCause::PrivacyEngaged | IrDarkCause::SaturatedFlat { .. } => {
+            render(card, evidence.frame_mean, &cause).map(CaptureMessage::Warning)
+        }
+        _ => Some(CaptureMessage::Debug(format!(
+            "[ir] {card:?}: selected IR frame whole-image mean {:.1}, stddev {:.1}; \
+             {}/{} burst frames marked illuminated, brightest marked-lit whole-image mean {}; \
+             emitter control active={}. Whole-image darkness does not determine face brightness; \
+             see the face-region assessment.",
+            evidence.frame_mean,
+            evidence.frame_stddev,
+            evidence.frames_lit,
+            evidence.frames_classified,
+            if evidence.frames_lit == 0 {
+                "unavailable".into()
+            } else {
+                format!("{:.1}", evidence.lit_max_mean)
+            },
+            evidence.emitter_active,
+        ))),
+    }
+}
+
+/// Detailed troubleshooting line for a cause, or `None` where silence is the right
+/// output. Automatic capture output uses `capture_message` instead: it cannot
+/// infer face usability from a whole-image mean. `EmitterDisabled` preserves
+/// the promise that `off` silences diagnostic output.
 pub fn render(card: &str, mean: f64, cause: &IrDarkCause) -> Option<String> {
     match cause {
         IrDarkCause::PrivacyEngaged => Some(format!(
@@ -294,6 +332,107 @@ pub fn frame_stddev(data: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A small bright region does not make the whole image bright. The capture
+    // layer has no face ROI, so it cannot turn that mean into hardware advice.
+    #[test]
+    fn bright_region_on_dark_background_does_not_suggest_emitter_repair() {
+        let mut pixels = vec![5u8; 100 * 100];
+        for y in 25..75 {
+            for x in 25..75 {
+                pixels[y * 100 + x] = 100;
+            }
+        }
+        let mean = pixels.iter().map(|&p| f64::from(p)).sum::<f64>() / pixels.len() as f64;
+        assert_eq!(mean, 28.75);
+        let evidence = DarkEvidence {
+            emitter_active: true,
+            frames_lit: 5,
+            frames_classified: 10,
+            frame_mean: mean,
+            frame_stddev: frame_stddev(&pixels),
+            lit_max_mean: mean,
+            ..textured_dark()
+        };
+        let Some(CaptureMessage::Debug(message)) = capture_message("synthetic camera", &evidence)
+        else {
+            panic!("a dark background must produce only debug evidence");
+        };
+        assert!(message.contains("whole-image"));
+        assert!(message.contains("face-region"));
+        assert!(!message.contains("ir-setup"), "{message}");
+        assert!(!message.contains("failed"), "{message}");
+    }
+
+    #[test]
+    fn capture_preserves_direct_warnings_and_does_not_guess_dark_frame_causes() {
+        for evidence in [
+            textured_dark(),
+            DarkEvidence {
+                emitter_active: true,
+                ..textured_dark()
+            },
+            DarkEvidence {
+                emitter_active: true,
+                frames_classified: 10,
+                ..textured_dark()
+            },
+            DarkEvidence {
+                frames_lit: 5,
+                frames_classified: 10,
+                ..textured_dark()
+            },
+            DarkEvidence {
+                frames_lit: 5,
+                frames_classified: 10,
+                lit_max_mean: 100.0,
+                ..textured_dark()
+            },
+        ] {
+            let Some(CaptureMessage::Debug(line)) = capture_message("cam", &evidence) else {
+                panic!("whole-image darkness alone is not actionable");
+            };
+            assert!(!line.contains("ir-setup"));
+            assert!(!line.contains("failed"));
+            assert_eq!(line.contains("unavailable"), evidence.frames_lit == 0);
+        }
+        for evidence in [
+            DarkEvidence {
+                privacy_engaged: true,
+                ..textured_dark()
+            },
+            DarkEvidence {
+                frame_mean: 255.0,
+                frame_stddev: 0.0,
+                ..textured_dark()
+            },
+        ] {
+            let Some(CaptureMessage::Warning(line)) = capture_message("cam", &evidence) else {
+                panic!("direct warnings must remain visible");
+            };
+            assert!(!line.is_empty());
+            assert!(capture_message(
+                "cam",
+                &DarkEvidence {
+                    emitter_disabled: true,
+                    ..evidence
+                }
+            )
+            .is_none());
+        }
+        for evidence in [
+            DarkEvidence {
+                frame_mean: 100.0,
+                ..textured_dark()
+            },
+            DarkEvidence {
+                emitter_disabled: true,
+                ..textured_dark()
+            },
+        ] {
+            assert!(capture_message("cam", &evidence).is_none());
+        }
+    }
 
     fn textured_dark() -> DarkEvidence {
         DarkEvidence {

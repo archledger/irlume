@@ -55,7 +55,8 @@ pub struct FaceScan {
     /// `"adapter:<sha256 prefix>"` of the adapter that produced it. Templates
     /// only match probes from the same space, so swapping or removing the
     /// adapter can never silently score against stale-space templates.
-    /// `None` = scan predates space tagging; grandfathered as compatible.
+    /// `None` = unknown IR pipeline; retained for loading old enrollments,
+    /// but excluded from IR matching and calibration.
     #[serde(default)]
     pub ir_space: Option<String>,
     /// The RECOGNIZER that produced `rgb` (and, before any adapter, `ir`),
@@ -74,9 +75,8 @@ pub struct FaceScan {
     /// `None` = scan predates this tagging, which means exactly one recognizer
     /// can have produced it: the historically shipped one. Compatibility is
     /// decided by [`recognizer_space_matches`], which accepts `None` only when
-    /// the running recognizer IS [`LEGACY_RECOGNIZER_SPACE`] — not the blanket
-    /// grandfathering `ir_space` applies, because a template handed to an
-    /// arbitrary future model is the hole this field closes.
+    /// the running recognizer IS [`LEGACY_RECOGNIZER_SPACE`]. IR adapter
+    /// provenance is independent: an absent `ir_space` remains unknown.
     #[serde(default)]
     pub embed_space: Option<String>,
     /// Per-scan IR liveness calibration: the center/edge brightness ratio of the
@@ -140,8 +140,20 @@ impl FaceProfile {
     /// This profile's calibration for `space`, or `None`.
     ///
     /// Falls back to the legacy single slot for the shipped recognizer, so a
-    /// profile written before per-model keying keeps its calibration.
+    /// profile written before per-model keying keeps its calibration. Withhold
+    /// both slots while this recognizer has untagged IR: older fits admitted
+    /// those scans and the cache does not record which pairs produced it.
+    /// Tagged templates can still match without calibration. This read never
+    /// changes stored scans or calibration; adding tagged scans alone does not
+    /// establish the provenance of a cache in a mixed legacy profile.
     pub fn calib_for(&self, space: &str) -> Option<&crate::calib::IrCalibration> {
+        if self.scans.iter().any(|s| {
+            s.ir.is_some()
+                && s.ir_space.is_none()
+                && recognizer_space_matches(s.embed_space.as_deref(), space)
+        }) {
+            return None;
+        }
         self.ir_calibs.get(space).or_else(|| {
             (space == LEGACY_RECOGNIZER_SPACE)
                 .then_some(self.ir_calib.as_ref())
@@ -222,8 +234,8 @@ pub fn recognizer_space_matches(have: Option<&str>, want: &str) -> bool {
     }
 }
 
-/// The IR embedding space of the shipped pipeline with no adapter loaded. The
-/// only space an untagged legacy scan can have come from.
+/// The IR embedding space of the shipped pipeline with no adapter loaded.
+/// Untagged legacy scans may instead predate the adapter removal (ADR-0004).
 pub const IR_RAW_SPACE: &str = "raw";
 
 impl Enrollment {
@@ -293,10 +305,10 @@ impl Enrollment {
             .collect()
     }
 
-    /// IR templates compatible with the live pipeline: same embedding space
-    /// (untagged legacy scans are grandfathered) and same dimensionality as
-    /// the probe. A v1 256-D or foreign-adapter template never reaches the
-    /// cosine matcher, where it would score garbage instead of failing loud.
+    /// IR templates with an explicit matching pipeline tag and the same
+    /// dimensionality as the probe. Recognizer filtering is the caller's job.
+    /// Wrong-dimension or foreign-adapter templates never reach this selector's
+    /// consumers for comparison.
     pub fn ir_scans_for(&self, space: &str, dim: usize) -> Vec<(&str, &str, &[f32])> {
         self.profiles
             .iter()
@@ -306,83 +318,48 @@ impl Enrollment {
                     if ir.len() != dim {
                         return None;
                     }
-                    match &s.ir_space {
-                        Some(sp) if sp != space => None,
-                        _ => Some((p.name.as_str(), s.name.as_str(), ir.as_slice())),
-                    }
+                    (s.ir_space.as_deref() == Some(space)).then_some((
+                        p.name.as_str(),
+                        s.name.as_str(),
+                        ir.as_slice(),
+                    ))
                 })
             })
             .collect()
     }
 
-    /// IR scans that were enrolled in a DIFFERENT embedding space than the live
-    /// pipeline (e.g. under an IR adapter that is no longer loaded). These are
-    /// skipped by [`Enrollment::ir_scans_for`], so dark/dim login cannot match
-    /// them: the user must re-enroll. Untagged legacy scans are grandfathered
-    /// (they are retagged to the live space by [`Enrollment::retag_untagged_ir`]),
-    /// so this counts only genuinely foreign-tagged scans. Call AFTER retagging.
+    /// IR scans with an unknown or different pipeline tag. These cannot be
+    /// selected by [`Enrollment::ir_scans_for`]; fresh captures are needed to
+    /// use this pipeline. Stored RGB data remains available.
     pub fn stale_ir_scans(&self, live_space: &str) -> usize {
         self.profiles
             .iter()
             .flat_map(|p| &p.scans)
             .filter(|s| s.ir.is_some())
-            .filter(|s| matches!(&s.ir_space, Some(sp) if sp != live_space))
+            .filter(|s| s.ir_space.as_deref() != Some(live_space))
             .count()
     }
 
-    /// IR scans matching that dark/dim login CAN score: tagged with the live
-    /// space, or untagged (grandfathered, see [`Enrollment::retag_untagged_ir`]).
-    /// The complement of [`Enrollment::stale_ir_scans`]. Used to decide whether
-    /// stale scans are an outage (none usable: dark login is broken, tell the
-    /// user to re-enroll) or leftovers (fresh scans exist alongside them, dark
-    /// login works, stay quiet).
+    /// IR scans explicitly tagged with the live pipeline. This is the
+    /// complement of [`Enrollment::stale_ir_scans`], for compatibility notices;
+    /// it does not check recognizer or dimension and is not an auth decision.
     pub fn usable_ir_scans(&self, live_space: &str) -> usize {
         self.profiles
             .iter()
             .flat_map(|p| &p.scans)
             .filter(|s| s.ir.is_some())
-            .filter(|s| s.ir_space.as_deref().is_none_or(|sp| sp == live_space))
+            .filter(|s| s.ir_space.as_deref() == Some(live_space))
             .count()
     }
 
-    /// Stamp untagged IR scans with the space of the pipeline they were
-    /// captured under (only scans matching the live pipeline's embedding
-    /// dimension). Called by the daemon at startup while the pipeline is
-    /// unchanged, so that a FUTURE adapter swap/removal finds every scan
-    /// explicitly tagged and can fail loud ("re-enroll") instead of scoring
-    /// across spaces. Idempotent; returns how many scans were stamped.
-    pub fn retag_untagged_ir(&mut self, space: &str, dim: usize) -> usize {
-        // Only ever stamp the RAW space, and never an adapter's.
-        //
-        // An untagged scan predates tagging, and no IR adapter has ever shipped
-        // (ADR-0004), so an untagged IR template is raw by construction. The
-        // caller passes the LIVE pipeline's space, which is taken after
-        // `with_ir_adapter` has run, so on a machine whose first tagging-aware
-        // start already has `IRLUME_IR_ADAPTER` set, every legacy raw template
-        // would be permanently relabelled adapter-space. `ir_match_in` would
-        // then compare an ADAPTED probe against RAW templates at the adapted
-        // threshold of 0.40, the lowest number in the codebase, on a
-        // grant-capable path: a genuine cross-space cosine, which is the one
-        // thing the space tag exists to prevent.
-        //
-        // Refusing here loses nothing. The scans stay untagged, which
-        // `recognizer_space_matches` already treats as legacy, and the next
-        // start without an adapter stamps them correctly.
-        if space != IR_RAW_SPACE {
-            return 0;
-        }
-        let mut n = 0;
-        for p in &mut self.profiles {
-            for s in &mut p.scans {
-                if let Some(ir) = &s.ir {
-                    if s.ir_space.is_none() && ir.len() == dim {
-                        s.ir_space = Some(space.into());
-                        n += 1;
-                    }
-                }
-            }
-        }
-        n
+    /// Retired migration, retained as a no-op for source compatibility.
+    ///
+    /// Old releases shipped raw and adapted IR before tags existed (ADR-0004).
+    /// Neither the live pipeline nor the vector dimension proves which one
+    /// produced an untagged scan. Never invent that provenance: preserve all
+    /// data and return zero. Fresh enrollment captures carry an explicit tag.
+    pub fn retag_untagged_ir(&mut self, _space: &str, _dim: usize) -> usize {
+        0
     }
 
     /// Per-user floor on the IR center/edge brightness ratio for the
@@ -644,17 +621,62 @@ fn save_key(user: &str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
 }
 
 fn persist_enrollment(path: &std::path::Path, bytes: &[u8]) -> irlume_common::Result<()> {
-    irlume_common::write_0600_atomic(path, bytes)
-        .map_err(|error| irlume_common::Error::Io(error.to_string()))
+    publication_result(irlume_common::write_atomic_reporting(path, bytes, 0o600))
+}
+
+fn publication_result(
+    result: std::io::Result<irlume_common::AtomicWrite>,
+) -> irlume_common::Result<()> {
+    match result {
+        Ok(irlume_common::AtomicWrite::Durable) => Ok(()),
+        Ok(irlume_common::AtomicWrite::VisibleNotDurable(error)) => Err(irlume_common::Error::Io(
+            format!("enrollment was published, but durability could not be confirmed: {error}; inspect profiles before retrying"),
+        )),
+        Err(error) => Err(irlume_common::Error::Io(error.to_string())),
+    }
 }
 
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn save(e: &Enrollment) -> irlume_common::Result<()> {
+    save_with_key(e, save_key)
+}
+
+/// Publish a replacement enrollment, preserving an existing template key and
+/// recovery envelope. An encrypted store cannot become plaintext if its key
+/// is missing or the TPM becomes unavailable.
+///
+/// # Errors
+/// Returns key, serialization, or filesystem errors. If publication succeeded
+/// but directory synchronization failed, the error explicitly says so.
+pub fn save_replacement(e: &Enrollment) -> irlume_common::Result<()> {
+    save_with_key(e, |user| {
+        replacement_key(user, template_key::load_key_unlocked, save_key)
+    })
+}
+
+fn replacement_key(
+    user: &str,
+    load_existing: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+    first_save: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
+    if template_key::has_key(user) || store_is_encrypted(user)? == Some(true) {
+        // Never mint a replacement key or fall back to plaintext on unseal
+        // failure. The user can restore recovery or explicitly delete state.
+        load_existing(user).map(Some)
+    } else {
+        first_save(user)
+    }
+}
+
+fn save_with_key(
+    e: &Enrollment,
+    resolve_key: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> irlume_common::Result<()> {
     let _state = template_key::UserStateLock::acquire(&e.user)?;
     let dir = state_dir();
     fs::create_dir_all(&dir).map_err(|er| irlume_common::Error::Io(er.to_string()))?;
     let path = profile_path(&e.user);
-    let key = save_key(&e.user)?;
+    let key = resolve_key(&e.user)?;
     let bytes = serialize_enrollment(e, key.as_ref().map(|k| k.as_slice()))?;
     persist_enrollment(&path, &bytes)
 }
@@ -728,9 +750,11 @@ pub fn delete(user: &str) -> irlume_common::Result<bool> {
     Ok(existed)
 }
 
-/// Has the one-time IR retag already run for this embedding space?
+/// Has the startup IR compatibility sweep already run for this space?
+/// The historical name and marker format are retained for compatibility;
+/// the daemon no longer retags enrollment data.
 ///
-/// The retag itself is cheap; ASKING is not. The answer lives inside the
+/// Reading scan metadata is not free. The answer lives inside the
 /// encrypted enrollment, so the daemon used to unseal every user's TPM-sealed
 /// template key at startup just to find nothing to do. On a discrete TPM that
 /// is seconds per user, it happens on every boot, and the TPM serializes, so it
@@ -783,48 +807,64 @@ pub fn list_users() -> Vec<String> {
 #[cfg(test)]
 mod tests {
 
-    /// An untagged IR scan predates tagging, and no adapter has ever shipped,
-    /// so it is raw by construction. The daemon passes the LIVE pipeline's
-    /// space, taken after any adapter loads, so a machine whose first
-    /// tagging-aware start already had IRLUME_IR_ADAPTER set would have had
-    /// every legacy raw template relabelled adapter-space. `ir_match_in` would
-    /// then score an ADAPTED probe against RAW templates at the adapted
-    /// threshold of 0.40, the lowest in the codebase, on a grant-capable path.
     #[test]
-    fn retag_refuses_to_stamp_legacy_ir_with_an_adapter_space() {
+    fn unknown_ir_retag_preserves_all_scan_data_in_every_live_space() {
         let mut enr = Enrollment::new("u");
         enr.profiles.push(FaceProfile {
+            name: "p".into(),
             ir_calib: None,
             ir_calibs: Default::default(),
-            name: "P".into(),
-            scans: vec![FaceScan {
-                name: "s1".into(),
-                rgb: vec![0.1; 4],
-                ir: Some(vec![0.2; 4]),
-                // Untagged: what a scan written before tagging existed looks like.
-                ir_space: None,
-                embed_space: None,
-                ir_center_edge_ratio: 0.0,
-                ir_brightness: 0.0,
-                pitch: 0.0,
-            }],
+            scans: vec![
+                scan_in_space("legacy", 4, None),
+                scan_in_space("tagged", 4, Some("raw")),
+                scan_in_space("adapter", 4, Some("adapter:old")),
+                scan_in_space("old-dimension", 2, None),
+            ],
         });
+        let before = serde_json::to_value(&enr).unwrap();
+        for space in ["adapter:new", IR_RAW_SPACE] {
+            for dim in [2, 4, 512] {
+                assert_eq!(enr.retag_untagged_ir(space, dim), 0);
+                assert_eq!(serde_json::to_value(&enr).unwrap(), before);
+            }
+        }
+    }
 
+    #[test]
+    fn unknown_ir_withholds_both_calibration_slots_only_for_its_recognizer() {
+        let c = crate::calib::IrCalibration {
+            m: vec![vec![1.0]],
+            n_rows: vec![vec![1.0]],
+            lambda: 0.1,
+            fitted_pairs: 5,
+        };
+        let mut p = FaceProfile {
+            name: "p".into(),
+            scans: vec![scan_in_space("legacy", 4, None)],
+            ir_calib: Some(c.clone()),
+            ir_calibs: Default::default(),
+        };
+        // Old calibration may have fitted this unknown IR, even though newly
+        // tagged templates are the only templates that matching will admit.
+        assert!(p.calib_for(LEGACY_RECOGNIZER_SPACE).is_none());
+        p.set_calib_for(LEGACY_RECOGNIZER_SPACE, Some(c.clone()));
+        assert!(p.calib_for(LEGACY_RECOGNIZER_SPACE).is_none());
+        p.set_calib_for("embed:other", Some(c));
+        assert!(p.calib_for("embed:other").is_some());
+        let before = serde_json::to_value(&p).unwrap();
+        assert!(p.calib_for(LEGACY_RECOGNIZER_SPACE).is_none());
         assert_eq!(
-            enr.retag_untagged_ir("adapter:deadbeef", 4),
-            0,
-            "an adapter space must never be stamped onto an untagged scan"
+            serde_json::to_value(&p).unwrap(),
+            before,
+            "read preserves stored data"
         );
+        p.scans[0].embed_space = Some("embed:other".into());
+        assert!(p.calib_for(LEGACY_RECOGNIZER_SPACE).is_some());
+        assert!(p.calib_for("embed:other").is_none());
+        p.scans[0].ir = None;
         assert!(
-            enr.profiles[0].scans[0].ir_space.is_none(),
-            "the scan must stay untagged, which already reads as legacy"
-        );
-
-        // The raw space is still stamped, which is the whole point of the sweep.
-        assert_eq!(enr.retag_untagged_ir(IR_RAW_SPACE, 4), 1);
-        assert_eq!(
-            enr.profiles[0].scans[0].ir_space.as_deref(),
-            Some(IR_RAW_SPACE)
+            p.calib_for("embed:other").is_some(),
+            "RGB-only is not unknown IR"
         );
     }
 
@@ -1268,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_scans_for_filters_space_and_dimension() {
+    fn unknown_ir_selection_requires_a_tag_and_matching_dimension() {
         let mut e = Enrollment::new("u");
         e.profiles.push(FaceProfile {
             ir_calib: None,
@@ -1278,50 +1318,31 @@ mod tests {
                 scan_in_space("legacy-untagged", 4, None),
                 scan_in_space("raw", 4, Some("raw")),
                 scan_in_space("v3", 4, Some("adapter:abc123")),
-                scan_in_space("v1-256", 2, None), // stale dim: never matches a 4-D probe
+                scan_in_space("v1-256", 2, None), // unknown regardless of width
+                scan_in_space("tagged-short", 2, Some("raw")),
             ],
         });
-        // Raw pipeline: legacy grandfathered + raw-tagged; v3-tagged excluded.
+        // Only the explicitly matching tag is admitted in either pipeline.
         let raw: Vec<_> = e.ir_scans_for("raw", 4).iter().map(|s| s.1).collect();
-        assert_eq!(raw, vec!["legacy-untagged", "raw"]);
-        // Adapter pipeline: legacy grandfathered + matching adapter; raw excluded.
+        assert_eq!(raw, vec!["raw"]);
+        // A matching adapter tag remains usable.
         let v3: Vec<_> = e
             .ir_scans_for("adapter:abc123", 4)
             .iter()
             .map(|s| s.1)
             .collect();
-        assert_eq!(v3, vec!["legacy-untagged", "v3"]);
-        // A different adapter build sees only the grandfathered scan.
-        assert_eq!(e.ir_scans_for("adapter:zzz999", 4).len(), 1);
+        assert_eq!(v3, vec!["v3"]);
+        // Unknown provenance cannot substitute for a different adapter build.
+        assert!(e.ir_scans_for("adapter:zzz999", 4).is_empty());
         // The unfiltered accessor still reports every IR-bearing scan.
-        assert_eq!(e.ir_scans().len(), 4);
-    }
-
-    #[test]
-    fn retag_untagged_ir_stamps_only_matching_legacy_scans() {
-        let mut e = Enrollment::new("u");
-        e.profiles.push(FaceProfile {
-            ir_calib: None,
-            ir_calibs: Default::default(),
-            name: "p".into(),
-            scans: vec![
-                scan_in_space("legacy", 4, None),          // stamped
-                scan_in_space("tagged", 4, Some("other")), // left alone
-                scan_in_space("stale-dim", 2, None),       // wrong dim: left alone
-            ],
-        });
-        // The space is the RAW one now: stamping an adapter space onto a scan
-        // that predates tagging would invent a provenance it never had, and the
-        // sibling test covers that refusal.
-        assert_eq!(e.retag_untagged_ir(IR_RAW_SPACE, 4), 1);
+        assert_eq!(e.ir_scans().len(), 5);
         assert_eq!(
-            e.profiles[0].scans[0].ir_space.as_deref(),
-            Some(IR_RAW_SPACE)
+            e.ir_scans_for("raw", 2)
+                .iter()
+                .map(|s| s.1)
+                .collect::<Vec<_>>(),
+            vec!["tagged-short"]
         );
-        assert_eq!(e.profiles[0].scans[1].ir_space.as_deref(), Some("other"));
-        assert!(e.profiles[0].scans[2].ir_space.is_none());
-        // Idempotent: nothing left to stamp.
-        assert_eq!(e.retag_untagged_ir(IR_RAW_SPACE, 4), 0);
     }
 
     #[test]
@@ -1412,6 +1433,122 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn publication_error_distinguishes_visible_replacement() {
+        use irlume_common::AtomicWrite;
+        let failure = || std::io::Error::other("injected storage failure");
+        assert!(publication_result(Ok(AtomicWrite::Durable)).is_ok());
+        let before = publication_result(Err(failure())).unwrap_err().to_string();
+        assert!(!before.contains("published"), "{before}");
+        let after = publication_result(Ok(AtomicWrite::VisibleNotDurable(failure())))
+            .unwrap_err()
+            .to_string();
+        assert!(after.contains("published"), "{after}");
+        assert!(after.contains("durability"), "{after}");
+    }
+
+    #[test]
+    fn replacement_reuses_key_and_preserves_state_on_key_failure() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("irlume-replacement-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("template-keys")).unwrap();
+        fs::create_dir_all(dir.join("recovery")).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let mut old = sample();
+        old.user = "replacement-test".into();
+        let key = vec![7u8; 32]; // Synthetic, never sealed against a real TPM.
+        let path = profile_path(&old.user);
+        let key_path = template_key::key_path(&old.user);
+        let recovery_path = dir.join("recovery/replacement-test.json");
+        let before = serialize_enrollment(&old, Some(&key)).unwrap();
+        fs::write(&path, &before).unwrap();
+        fs::write(&key_path, b"synthetic sealed key").unwrap();
+        fs::write(&recovery_path, b"synthetic recovery").unwrap();
+        let mut replacement = sample();
+        replacement.user = old.user.clone();
+        replacement.profiles[0].name = "Replacement".into();
+
+        // Exercise the same lock, key selection, encryption and publication as
+        // save_replacement; replace only the real TPM operation.
+        let err = save_with_key(&replacement, |user| {
+            replacement_key(
+                user,
+                |_| {
+                    Err(irlume_common::Error::Policy(
+                        "injected unseal failure".into(),
+                    ))
+                },
+                |_| panic!("an existing key must not be replaced"),
+            )
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("injected unseal failure"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        save_with_key(&replacement, |user| {
+            replacement_key(
+                user,
+                |_| Ok(Zeroizing::new(key.clone())),
+                |_| panic!("an existing key must not be replaced"),
+            )
+        })
+        .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap()
+            .get("enc")
+            .is_some());
+        assert_eq!(
+            deserialize_enrollment(&bytes, Some(&key)).unwrap().profiles[0].name,
+            "Replacement"
+        );
+        assert_eq!(fs::read(&key_path).unwrap(), b"synthetic sealed key");
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"synthetic recovery");
+
+        // Even with no key file, an encrypted enrollment cannot enter the
+        // first-save/plaintext fallback path. The real missing-key gate is
+        // safe to call: it refuses before touching the TPM.
+        fs::remove_file(&key_path).unwrap();
+        assert!(save_with_key(&old, |user| replacement_key(
+            user,
+            template_key::load_key_unlocked,
+            |_| panic!("an encrypted store must not generate a new key"),
+        ))
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!key_path.exists());
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"synthetic recovery");
+        // First enrollment and a plaintext store without a sealed key retain
+        // the existing first-save policy, represented here by a no-TPM result.
+        for plaintext_exists in [true, false] {
+            if plaintext_exists {
+                fs::write(&path, serialize_enrollment(&old, None).unwrap()).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            save_with_key(&replacement, |user| {
+                replacement_key(
+                    user,
+                    |_| panic!("there is no existing key to unseal"),
+                    |_| Ok(None),
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                deserialize_enrollment(&fs::read(&path).unwrap(), None)
+                    .unwrap()
+                    .profiles[0]
+                    .name,
+                "Replacement"
+            );
+        }
+        std::env::remove_var("IRLUME_STATE_DIR");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // Regression: 0be786b. save() used fs::write straight onto the profile
     // path: a crash mid-write left a truncated profile and the umask window
     // made it briefly world-readable. The fix writes a 0600 temp file and
@@ -1483,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_usable_ir_counts_partition_the_scans() {
+    fn unknown_ir_counts_as_stale_and_counts_partition_the_scans() {
         let ir_scan = |name: &str, space: Option<&str>| FaceScan {
             name: name.into(),
             rgb: vec![0.0; 4],
@@ -1506,9 +1643,9 @@ mod tests {
             ],
         });
         // The upgrade-outage notice keys off this split: stale>0 AND usable==0.
-        assert_eq!(e.stale_ir_scans("raw"), 1);
-        assert_eq!(e.usable_ir_scans("raw"), 2); // tagged-current + grandfathered
-                                                 // Post-0.2.0, pre-re-enroll: everything stale, nothing usable -> notice.
+        assert_eq!(e.stale_ir_scans("raw"), 2);
+        assert_eq!(e.usable_ir_scans("raw"), 1);
+        // Everything stale, nothing usable -> notice.
         e.profiles[0].scans.retain(|s| s.name == "adapter-era");
         assert_eq!(e.stale_ir_scans("raw"), 1);
         assert_eq!(e.usable_ir_scans("raw"), 0);

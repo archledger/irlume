@@ -435,7 +435,35 @@ pub enum IntentAttestation {
     PolicyWaived,
 }
 
-/// Request from an (untrusted) client to the (privileged) daemon.
+/// Public progress contains counts and a profile label, never biometric scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EnrollmentEvent {
+    Started,
+    Progress { captured: usize, target: usize },
+    Merge { profile: String, remaining: usize },
+}
+
+/// The sole continuation accepted on an enrollment session's own socket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentDecision {
+    pub accept: bool,
+}
+
+/// Control an accepted framing connection. Reports are never generated ahead
+/// of demand. Finish waits for camera release; disconnect cancels instead.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PositionSessionControl {
+    Sample,
+    Finish,
+}
+
+/// Hard protocol bounds for one interactive framing operation.
+pub const POSITION_SESSION_SECONDS: u64 = 60;
+/// Bounds an untrusted peer independently of the elapsed-time limit.
+pub const POSITION_SESSION_MAX_SAMPLES: usize = 256;
+
+/// Request from an untrusted client to the privileged daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     /// Attempt to authenticate `user` from a live capture. The default,
@@ -454,14 +482,22 @@ pub enum Request {
     },
     /// Enrol a (possibly named) profile for `user`. PRIVILEGED: the daemon must
     /// verify via SO_PEERCRED that the caller is root or `user` themselves.
-    /// `reset` (default false) wipes the user's existing enrollment first, a
-    /// clean re-enroll that also clears a stale camera binding.
+    /// `reset` (default false) replaces profiles and the camera binding only
+    /// after successful capture, preserving the template key and recovery setup.
     Enroll {
         user: String,
         profile: Option<String>,
         scans: Option<usize>,
         #[serde(default)]
         reset: bool,
+    },
+    /// One authorized guided operation. Only this opt-in request receives
+    /// streamed enrollment events and can answer a merge on the same socket.
+    EnrollmentSession {
+        user: String,
+        profile: Option<String>,
+        scans: usize,
+        improve: bool,
     },
     /// 1:N identify ("who is this?"): one live capture, no claimed identity.
     /// Unprivileged (no credential release), but NOT unscoped: a root peer is
@@ -602,6 +638,12 @@ pub enum Request {
     /// enrolled: it tunes the pitch band to that user's calibrated neutral (a
     /// read-only lookup) so the guide matches the capture gate. `None` = default band.
     PositionSample { user: Option<String> },
+    /// A bounded RGB framing session, with the same account-hint rules as
+    /// `PositionSample`. After `PositionSessionStarted`, each
+    /// `PositionSessionControl::Sample` receives one fresh `Position` report.
+    /// Finish receives `PositionSessionEnded` after camera release. Closing
+    /// the connection cancels. No enrollment or auth.
+    PositionSession { user: Option<String> },
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
@@ -644,8 +686,8 @@ pub enum Request {
         #[serde(default)]
         service: Option<String>,
         /// Whether the PAM stack already holds a typed password. For a
-        /// `LoginPassword` envelope that makes the unseal pointless (the keyring
-        /// self-unlocks from the typed password) and the daemon answers
+        /// `LoginPassword` or `KdeWalletKey` envelope that makes the unseal
+        /// pointless (the keyring/wallet opens from the typed password) and the daemon answers
         /// [`Response::KeyringUnlockNotNeeded`] without touching the TPM. For a
         /// `GnomeKeyringToken` envelope the typed password does NOT open the
         /// keyring, so the unseal proceeds regardless. The decision lives in
@@ -777,6 +819,26 @@ pub struct ProfileSummary {
     /// which of the above are live right now. `None` from an older daemon.
     #[serde(default)]
     pub live_recognizer: Option<String>,
+    /// Template compatibility for the daemon's loaded recognizer and IR
+    /// pipeline. Absent from older daemons; absence is not zero usable scans.
+    /// This is not a camera, liveness or authentication readiness verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir: Option<ProfileIrSummary>,
+}
+
+/// Aggregate IR scan compatibility for one profile and the loaded recognizer.
+/// The four counts partition that recognizer's scans. No templates, scores,
+/// camera identifiers or per-scan biometric measurements are exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProfileIrSummary {
+    pub compatible_scans: usize,
+    pub missing_scans: usize,
+    pub unknown_scans: usize,
+    pub incompatible_scans: usize,
+    /// A stored raw-IR calibration is withheld because this recognizer still
+    /// has unknown IR scans in this profile. Adding tagged scans alone does
+    /// not clear this restriction; tagged templates can still match raw.
+    pub calibration_withheld: bool,
 }
 
 /// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
@@ -816,6 +878,8 @@ pub enum PadModelStatus {
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    /// Progress for an explicitly requested guided enrollment operation.
+    EnrollmentSession(EnrollmentEvent),
     /// Authentication decision plus the evidence behind it.
     AuthResult {
         granted: bool,
@@ -834,18 +898,14 @@ pub enum Response {
         /// an older daemon decodes as false.
         #[serde(default)]
         refused_by_policy: bool,
-        /// True only when this refusal is a DELIBERATE head-shake decline (the
-        /// daemon's consent watch saw a shake and cancelled), never for a timeout,
-        /// a no-match, or a pre-camera policy denial. pam_irlume maps a polkit
-        /// shake-decline to `PAM_ABORT` so the agent closes its dialog; every other
-        /// non-grant stays a soft `IGNORE` that cascades to the password. Fail-safe:
-        /// a shake can only DENY, never grant. `#[serde(default)]` so an older
-        /// daemon that never sets it decodes as `false` (no abort).
+        /// Reserved compatibility field for an older daemon's explicit cancellation.
+        /// Current daemons always emit false; head gestures have been removed.
+        /// Readers may honor a legacy true value only as a denial, never a grant.
         #[serde(default)]
         declined_by_gesture: bool,
         /// The final FAILED attempt's situation, in the #616 step 2 stable
-        /// vocabulary ("no face", "too far", ...), carried so pam_irlume can
-        /// word its prompt (#616 step 3). Empty on a grant, on every
+        /// vocabulary ("timed out", "no face", "too far", ...), carried so
+        /// pam_irlume can word its prompt (#616 step 3). Empty on a grant, on every
         /// pre-camera policy refusal, and from an older daemon
         /// (`#[serde(default)]`); attack-shaped labels are carried too, but
         /// the PAM layer stays silent on them: no threshold value ever
@@ -990,6 +1050,11 @@ pub enum Response {
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),
+    /// Framing connection accepted. Errors after acceptance must not cause
+    /// a client to silently restart through the one-shot compatibility path.
+    PositionSessionStarted,
+    /// Framing finished and the camera worker released its operation slot.
+    PositionSessionEnded,
     /// Delivered-rate diagnostic report (`CameraDiagnostics`).
     CameraDiagnostics(Box<CameraDiagnosticsReport>),
     /// Retired `CaptureEarMedian` response tombstone. No current request
@@ -1033,8 +1098,8 @@ pub enum Response {
         #[serde(default)]
         minted: bool,
     },
-    /// `UnsealKeyring` with `have_password: true` against a `LoginPassword`
-    /// envelope: the typed password already opens the keyring, so nothing was
+    /// `UnsealKeyring` with `have_password: true` against a `LoginPassword` or
+    /// `KdeWalletKey` envelope: the password already opens it, so nothing was
     /// unsealed and nothing needs releasing.
     KeyringUnlockNotNeeded,
     /// Face matched and the TPM released the secret (`UnsealPassword` /
@@ -1251,6 +1316,44 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_ir_metadata_is_optional_in_both_wire_directions() {
+        let old = r#"{"name":"P","scans":["s"]}"#;
+        let mut p: super::ProfileSummary = serde_json::from_str(old).unwrap();
+        assert!(p.ir.is_none());
+        assert!(serde_json::to_value(&p).unwrap().get("ir").is_none());
+        p.ir = Some(super::ProfileIrSummary::default());
+        #[derive(serde::Deserialize)]
+        struct OldProfile {
+            name: String,
+            scans: Vec<String>,
+        }
+        let old: OldProfile = serde_json::from_value(serde_json::to_value(p).unwrap()).unwrap();
+        assert_eq!(old.name, "P");
+        assert_eq!(old.scans, ["s"]);
+    }
+
+    #[test]
+    fn profile_ir_summary_survives_wire_round_trip() {
+        let ir = serde_json::json!({"compatible_scans":2,"missing_scans":1,
+            "unknown_scans":1,"incompatible_scans":1,"calibration_withheld":true});
+        let p: super::ProfileSummary = serde_json::from_value(serde_json::json!({
+            "name":"P","scans":["s"],"ir":ir
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(p).unwrap()["ir"], ir);
+    }
+
+    #[test]
+    fn enrollment_session_is_an_explicit_bounded_request() {
+        let wire =
+            r#"{"EnrollmentSession":{"user":"alice","profile":null,"scans":10,"improve":false}}"#;
+        let parsed = serde_json::from_str::<super::Request>(wire);
+        assert!(
+            parsed.is_ok(),
+            "guided enrollment needs its own opt-in request: {parsed:?}"
+        );
+    }
 
     /// `AuthResult.situation` (#616 step 3) is `#[serde(default)]` so an
     /// OLDER daemon's reply, which predates the field, still decodes: the

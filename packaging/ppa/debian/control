@@ -11,6 +11,7 @@ Build-Depends: debhelper-compat (= 13),
                libpam0g-dev,
                libtss2-dev,
                libudev-dev,
+               libdbus-1-dev,
                linux-libc-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/archledger/irlume
@@ -20,7 +21,7 @@ Rules-Requires-Root: no
 
 Package: irlume
 Architecture: amd64
-Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g
+Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g, polkitd | policykit-1
 Recommends: fprintd
 Description: Windows Hello-style face login for Linux
  IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed

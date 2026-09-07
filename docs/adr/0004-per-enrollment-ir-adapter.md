@@ -91,3 +91,27 @@ Two more measurements close the case for removal:
 - The 2026-07-15 self-captured dataset (1,137 pairs and growing) becomes the
   validation bed for the calibration feature and for any future revisit of a
   global adapter, should a large consented cohort ever exist.
+
+## Compatibility correction (2026-09-06)
+
+Before tagging was introduced in `e6c23f5`, both raw and adapted IR scans
+existed. An absent `ir_space` therefore means unknown provenance, not raw.
+The original startup migration assumed the pipeline had not changed; later
+raw-only retagging still could not establish what produced those scans.
+
+Matching and new calibration fits now require an explicit matching IR tag.
+Startup no longer writes guessed tags. Untagged scans retain their RGB data
+and stored IR data, but cannot supply IR identity evidence. Capture fresh
+scans into the existing profile to restore compatible IR templates.
+
+A cached calibration does not record its source pairs. While a profile has
+untagged IR for the requested recognizer, its cached calibration is withheld;
+known IR templates still use raw matching. Adding known scans alone does not
+remove that conservative restriction while unknown scans remain. Other
+recognizers and other profiles retain their calibrations.
+
+This correction cannot identify scans already tagged by an older automatic
+migration, or attribute cached fits after their original scans were removed.
+It preserves the stored format and existing explicit tags; it does not claim
+to reconstruct missing historical provenance. The legacy retag API remains
+a no-op, and the old startup marker only caches compatibility notices.

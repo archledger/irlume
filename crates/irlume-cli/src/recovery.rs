@@ -86,6 +86,7 @@ fn setup(user: &str) -> ExitCode {
          firmware/dbx update, or disk move, WITHOUT re-enrolling. It is separate\n\
          from your login password; store it somewhere safe (like a BitLocker/LUKS key)."
     );
+    println!("[recovery] Setting or replacing recovery requires OS approval for a non-root user.");
     let Some(pass) = read_passphrase_confirmed() else {
         return ExitCode::from(2);
     };
@@ -131,7 +132,7 @@ fn restore(user: &str) -> ExitCode {
         Ok(Response::Ok(msg)) => {
             println!("[recovery] ✓ {msg}");
             println!(
-                "[recovery] Encrypted face templates are readable again; face unlock is restored."
+                "[recovery] Template-key restoration does not reset face retry limits or bypass other authentication checks."
             );
             ExitCode::SUCCESS
         }
@@ -151,6 +152,7 @@ fn restore(user: &str) -> ExitCode {
 }
 
 fn forget(user: &str) -> ExitCode {
+    println!("[recovery] Removing recovery requires OS approval for a non-root user.");
     match daemon_request(&Request::RecoveryForget { user: user.into() }) {
         Ok(Response::Ok(msg)) => {
             println!("[recovery] {msg}");

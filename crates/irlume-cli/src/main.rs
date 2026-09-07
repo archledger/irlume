@@ -22,13 +22,13 @@ mod bitwarden;
 mod commands;
 mod doctor_report;
 mod fingerprint;
-mod gesturecap;
 mod logintx;
 mod logs;
 mod machine;
 mod models;
 mod pad;
 mod pamwire;
+mod profile_ir;
 mod recovery;
 mod secrets;
 mod strays;
@@ -76,7 +76,6 @@ const DEV_CMDS: &[&str] = &[
     "irbench",
     "genuine",
     "calcapture",
-    "gesturecap",
     "normprobe",
     "liveness",
     "selftest",
@@ -151,7 +150,6 @@ fn main() -> std::process::ExitCode {
         (Some("irbench"), _) => irbench(&args),
         (Some("genuine"), _) => genuine(&args),
         (Some("calcapture"), _) => calcapture(&args),
-        (Some("gesturecap"), _) => gesturecap::run(&args),
         (Some("padcapture"), _) => pad::padcapture(&args),
         (Some("padreport"), _) => pad::padreport(&args),
         (Some("suncal"), _) => suncal::run(&args),
@@ -211,9 +209,6 @@ fn main() -> std::process::ExitCode {
         // for scripts and muscle memory, not silence.
         (Some("models"), _) => models::removed_notice(),
         (Some("biopolicy"), sub) => commands::biopolicy(sub, &args),
-        (Some("credential-release-challenge"), sub) => {
-            commands::credential_release_challenge(sub, &args)
-        }
         (Some("ir-setup"), _) => ir_setup(&args),
         (Some("camera-tune"), _) => camera_tune(&args),
         (Some("camera-mode"), _) => camera_mode(&args),
@@ -303,8 +298,9 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         Err(code) => return code,
     };
     let reset = args.iter().any(|a| a == "--reset");
+    eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
     if reset {
-        eprintln!("[enroll] --reset: wiping '{user}'s existing enrollment first (clears any stale camera binding)");
+        eprintln!("[enroll] --reset: replacing '{user}'s enrollment after successful capture (preserves the template key and recovery setup)");
     }
     eprintln!(
         "[enroll] '{user}': capturing a new face profile; stay in frame, look at the camera…"
@@ -478,6 +474,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                     Ok(s) => s,
                     Err(code) => return code,
                 };
+                eprintln!("[profiles] approve the system authentication dialog before capture");
                 match scans {
                     Some(n) if n > 1 => eprintln!(
                         "[profiles] adding {n} scans to '{p}'; stay in frame, vary your pose slightly…"
@@ -573,6 +570,13 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         },
         _ => return usage_profiles(),
     };
+    if matches!(
+        req,
+        Request::DeleteProfile { .. } | Request::ForgetRecognizer { .. }
+    ) {
+        println!("[profiles] Removing a profile or a recognizer's face data requires OS approval for a non-root user.");
+        println!("[profiles] If no profiles remain, the template key and recovery passphrase are also erased.");
+    }
     match daemon_request(&req) {
         Ok(Response::Enrollment {
             profiles,
@@ -612,10 +616,16 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                         if live_count == 0 {
                             println!(
                                 "      none of these match the loaded recognizer; add scans \
-                                 with `irlume profiles add-scan --profile {}`",
+                                 with `irlume profiles add-scan --profile {} --user {quoted_user}`",
                                 shell_single_quote(&p.name)
                             );
                         }
+                    }
+                    for line in profile_ir::lines(p) {
+                        println!("      {line}");
+                    }
+                    if profile_ir::needs_capture(p) {
+                        println!("      Add IR scans with an IR camera: irlume profiles add-scan --profile {} --user {quoted_user}", shell_single_quote(&p.name));
                     }
                     for s in &p.scans {
                         println!("      - {s}");
@@ -1294,10 +1304,23 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
 pub(crate) fn daemon_request(
     req: &irlume_common::Request,
 ) -> Result<irlume_common::Response, String> {
-    // Shared client: bounded connect timeout + zeroized wire buffers. The 120s
-    // read budget covers slow operations (guided enroll capture loops).
-    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(120)).map_err(
-        |e| {
+    // Trust changes allow OS approval, queue admission and the worker budget.
+    // Other operations keep their existing timeout, including authentication.
+    let seconds = if matches!(
+        req,
+        irlume_common::Request::Enroll { .. }
+            | irlume_common::Request::AddScan { .. }
+            | irlume_common::Request::RecoverySetup { .. }
+            | irlume_common::Request::RecoveryForget { .. }
+            | irlume_common::Request::DeleteProfile { .. }
+            | irlume_common::Request::ForgetRecognizer { .. }
+    ) {
+        380
+    } else {
+        120
+    };
+    irlume_common::client::request_with_timeout(req, std::time::Duration::from_secs(seconds))
+        .map_err(|e| {
             // The connect-failure message already names irlumed and the exact
             // fix (client.rs); only append the hint where it adds information.
             let m = e.to_string();
@@ -1306,8 +1329,7 @@ pub(crate) fn daemon_request(
             } else {
                 format!("{m} (is irlumed running?)")
             }
-        },
-    )
+        })
 }
 
 /// A short-budget status poll (TUI periodic refresh): a busy/wedged daemon fails
@@ -1364,7 +1386,7 @@ pub(crate) fn user_arg(args: &[String]) -> String {
     // retargeted the command at the person typing it. On the destructive verbs
     // that is total, unconfirmed data loss: `sudo irlume enroll --reset --user`
     // put `{"Enroll":{"user":"<you>","reset":true}}` on the wire, and the
-    // daemon's reset deletes the enrollment, the template key, and the recovery
+    // daemon's reset then deleted the enrollment, the template key, and the recovery
     // envelope together. `recovery forget --user` and `keyring forget --user`
     // did the same.
     //
@@ -3110,145 +3132,6 @@ pub(crate) fn tpm_device() -> Option<&'static str> {
         .find(|d| std::path::Path::new(d).exists())
 }
 
-/// Doctor's credential-release block: is the temporal gesture required before the
-/// TPM-sealed keyring password is released, and can that gesture actually run here?
-///
-/// Kept separate from the polkit block because the failure MEANING differs. A
-/// polkit prompt with the optional gesture enabled falls back to its password
-/// dialog when that gesture cannot run; a credential release failure leaves the
-/// keyring locked after an otherwise successful face login, which reads as "face
-/// login is broken" unless doctor names it.
-///
-/// Silent when the user has no sealed password: nothing is released, so there is no
-/// gate to explain.
-fn report_credential_release(
-    report: &mut crate::doctor_report::Report,
-    user: &str,
-    policy: irlume_common::config::HeadConsentPolicy,
-) {
-    use crate::doctor_report::State;
-    // Recorded from the same visibility the block below prints from, so the
-    // machine answer cannot disagree with the human one.
-    report.check(
-        "credential-release-challenge",
-        match irlume_common::config::credential_release_gesture_required_visible() {
-            // Off is the DEFAULT (the keyring releases with no nod); on is an
-            // opt-in extra. Neither is a problem, so neither warns.
-            Some(_) => State::Pass,
-            None => State::Unknown,
-        },
-    );
-    let armed = matches!(
-        daemon_request(&irlume_common::Request::HasSealedPassword {
-            user: user.to_string()
-        }),
-        Ok(irlume_common::Response::HasPassword(true))
-    );
-    if !armed {
-        return;
-    }
-    // The EFFECTIVE rule: the per-service `service_gesture.credential_release`
-    // override first, then the global gate, exactly as the daemon reads it.
-    // Reading only the global key told a user with the per-service key set
-    // that the gate was off, and asserted a gate the daemon does not apply
-    // when the per-service key disables it over a global on.
-    match irlume_common::config::credential_release_gesture_required_visible() {
-        // The opt-in gate is on: fall through and check it can actually run.
-        Some(true) => {}
-        Some(false) => {
-            dout!(
-                report,
-                "[doctor] credential-release challenge: off; the keyring releases \
-                 after the face match with no nod. Enable the extra step with: sudo \
-                 irlume credential-release-challenge credential_release on (the \
-                 per-service key, which outranks the global gate in either state)"
-            );
-            return;
-        }
-        None => {
-            dout!(
-                report,
-                "[doctor] credential-release challenge: root-only setting; re-run \
-                 `sudo irlume doctor` to read it"
-            );
-            return;
-        }
-    }
-    if matches!(
-        policy,
-        irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-            | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
-    ) {
-        dout!(
-            report,
-            "[doctor] credential-release challenge: required, but {}; the daemon \
-             refuses the release and your keyring falls back to the typed password",
-            policy.instruction("release your keyring password")
-        );
-        return;
-    }
-    // The gate is on. Running the head gesture needs the mesh model because every
-    // consent frame goes through FaceMesh.
-    let mesh = matches!(
-        daemon_request(&irlume_common::Request::Health),
-        Ok(irlume_common::Response::Health { mesh: true, .. })
-    );
-    if !mesh {
-        dout!(
-            report,
-            "[doctor] ⚠ credential-release challenge is required but cannot run: FaceMesh \
-             is not loaded\n     \
-             (face_landmarks_detector.tflite). Face login still works; your keyring will fall back to \
-             the typed\n     password. Fix: set IRLUME_MESH_MODEL in the irlumed unit, or \
-             reinstall the package."
-        );
-        return;
-    }
-    dout!(
-        report,
-        "[doctor] credential-release challenge: required ✓ (keep nodding your head to \
-         release your keyring password; shake your head to decline)"
-    );
-    // The gate is on AND working; the remaining failure is that the user may never
-    // be TOLD. pam_irlume sends the instruction, but a login manager that drops
-    // PAM_TEXT_INFO turns a required gesture into a silent one, which reads as
-    // "face login worked but my keyring asked for a password anyway". Saying it
-    // here moves the discovery from the login screen, where the greeter can show
-    // nothing, to a command the user runs while set up and unhurried.
-    if let Some(dm) = crate::pamwire::active_dm_hides_pam_instructions() {
-        dout!(
-            report,
-            "[doctor] ⚠ your login manager ({dm}) does not display the head-gesture \
-             instruction.\n     \
-             It is still REQUIRED at the login screen after a reboot or logout: keep \
-             nodding your head\n     \
-             while your face is being read. Nothing on screen will ask you to. Without \
-             it your\n     \
-             login still succeeds and only the keyring falls back to the typed password."
-        );
-    }
-}
-
-fn polkit_doctor_message(
-    gesture: Option<bool>,
-    policy: irlume_common::config::HeadConsentPolicy,
-) -> String {
-    match gesture {
-        Some(false) => "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required; additional head gesture: off)".into(),
-        Some(true)
-            if matches!(
-                policy,
-                irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-                    | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
-            ) => format!(
-                "[doctor] polkit app prompts: wired ✓; keyboard confirmation remains required; additional gesture blocked: {}",
-                policy.instruction("approve")
-            ),
-        Some(true) => "[doctor] polkit app prompts: wired ✓ (type yes, then KEEP NODDING to approve Bitwarden unlock, pkexec, …; shake your head to decline)".into(),
-        None => "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required; additional gesture state is root-only—re-run doctor with sudo)".into(),
-    }
-}
-
 /// What `doctor` observed about the active camera pair's capture mode. Kept as
 /// a value so the wording is decided by a pure function and tested, separately
 /// from the root check and config reads that produce it.
@@ -3972,9 +3855,7 @@ fn doctor_run(
             ),
             None => (
                 State::Warn,
-                format!(
-                    "{file} — not found; head gestures and detection-rescue alignment are disabled"
-                ),
+                format!("{file} — not found; detection-rescue alignment is disabled"),
             ),
         };
         dout!(report, "  {}: {line}", s.stage);
@@ -4106,34 +3987,8 @@ fn doctor_run(
     // installs for a snap; keying on only the former made doctor tell snap users
     // to run `bitwarden setup`, which then refuses (snapd owns that file).
     let bitwarden_action = bitwarden::action_present();
-    // Same policy the engine gates on and the PAM module instructs from, so
-    // doctor can never report a head gesture the daemon would refuse.
-    let head_policy = irlume_common::config::head_consent_policy();
-    //
-    // Reported as a human line and not as a new check id on purpose. The
-    // machine-API registry conformance test asserts BOTH directions (every id
-    // emitted has a row, and every row is emitted), so a conditionally-emitted
-    // id fails on every healthy machine. Giving it an always-emitted id is a
-    // public contract addition and belongs in its own change, not in a review
-    // fix.
-    if matches!(
-        head_policy,
-        irlume_common::config::HeadConsentPolicy::LegacyClosure(_)
-            | irlume_common::config::HeadConsentPolicy::Misconfigured(_)
-    ) {
-        dout!(
-            report,
-            "[doctor] head gesture: BLOCKED. {}. The daemon refuses gesture-gated \
-             requests until the configuration is migrated; password fallback remains.",
-            head_policy.instruction("approve")
-        );
-    }
-    // --- credential release (the keyring password) --------------------------
-    // Reported before the polkit block because it shares the gesture-readiness
-    // facts above: this is the same head gate, applied to the one operation
-    // where a spoof yields a REUSABLE secret instead of one session.
-    report_credential_release(report, &user, head_policy);
-
+    // Reserved v1 check id; the retired feature has no runtime/configuration path.
+    report.check("credential-release-challenge", State::Info);
     report.check(
         "polkit-app-prompts",
         match crate::pamwire::polkit_wired() {
@@ -4146,10 +4001,7 @@ fn doctor_run(
         Some(true) => dout!(
             report,
             "{}",
-            polkit_doctor_message(
-                irlume_common::config::service_gesture_required_visible("polkit-1"),
-                head_policy,
-            )
+            "[doctor] polkit app prompts: wired ✓ (keyboard confirmation required)"
         ),
         Some(false) if bitwarden_action => dout!(report,
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
@@ -4613,40 +4465,6 @@ mod tests {
                  step over it; a flags-first caller's value would become the subcommand"
             );
         }
-    }
-
-    #[test]
-    fn doctor_polkit_copy_keeps_keyboard_confirmation_primary() {
-        use irlume_common::config::{HeadConsentPolicy, HeadConsentSource};
-
-        let off = polkit_doctor_message(Some(false), HeadConsentPolicy::Ready);
-        assert!(off.contains("keyboard confirmation required"), "{off}");
-        assert!(off.contains("additional head gesture: off"), "{off}");
-        assert!(!off.contains("face alone approves"), "{off}");
-
-        let on = polkit_doctor_message(Some(true), HeadConsentPolicy::Ready);
-        assert!(on.contains("type yes, then KEEP NODDING"), "{on}");
-        assert!(on.contains("shake your head to decline"), "{on}");
-
-        let blocked = polkit_doctor_message(
-            Some(true),
-            HeadConsentPolicy::LegacyClosure(HeadConsentSource::Settings),
-        );
-        assert!(blocked.contains("additional gesture blocked"), "{blocked}");
-        assert!(
-            blocked.contains("keyboard confirmation remains required"),
-            "{blocked}"
-        );
-
-        let unknown = polkit_doctor_message(None, HeadConsentPolicy::Ready);
-        assert!(
-            unknown.contains("keyboard confirmation required"),
-            "{unknown}"
-        );
-        assert!(
-            unknown.contains("additional gesture state is root-only"),
-            "{unknown}"
-        );
     }
 
     #[test]

@@ -35,9 +35,9 @@ Conventions that apply everywhere:
 
 | Command | What it does |
 |---|---|
-| `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` starts the profile space over |
+| `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
-| `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded) |
+| `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded). If authentication reports no scans for the current recognition model, add scans to an existing profile; retained scans from other models are preserved |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user. `<model>` is `shipped` or an `embed:<sha256>` tag as `profiles list` prints it (used to clean scans left by the removed third-party lane, ADR-0015). A profile left with no scans is deleted with them |
@@ -67,7 +67,6 @@ Conventions that apply everywhere:
 | `irlume bitwarden <status\|setup> [--apply]` | for setup | install Bitwarden's biometric-unlock polkit action, flavor-aware (flatpak/native install it; snap is snapd's job; ostree gets the layering steps); see docs/APP-INTEGRATION.md |
 | `irlume selinux <status\|load>` | for load | SELinux module for the login greeter (Fedora) |
 | `sudo irlume biopolicy <on\|off\|status>` | for on/off | the operation-class gate: when ENFORCING, a face match is accepted only for the operations its camera tier is trusted for (login and sudo require the Secure IR tier; screen unlock and app prompts stay allowed); off by default, and the password is always available either way |
-| `sudo irlume credential-release-challenge [<service>] <on\|off\|status>` | for on/off | with a privileged service (`sudo`, `su`, `doas`, `polkit-1`), toggles an additional experimental head gesture (nod to approve, shake to decline). It defaults off and never replaces the mandatory hidden `yes` PAM confirmation; enabling warns about false rejects, while disabling needs no risk confirmation. Bare, it toggles the separate default-off gesture before releasing the login-keyring credential |
 | `irlume ir-setup [--dry-run]` | yes | configure the IR emitter; rarely needed, and only ever run when you ask. Writes to the camera, so read the warning in SETUP.md. `--dry-run` lists the camera's extension units and writes nothing |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
 | `irlume camera-tune [--rounds N]` | yes | qualify the daemon's exact RGB+IR pair, accepted stream contracts, USB connection, delivered rates, continuity, illumination provenance, and concurrent signal retention. The versioned record selects concurrent only for that exact context; missing or changed evidence stays sequential. A successful explicit tune also clears this daemon generation's runtime degradation breaker |
@@ -78,6 +77,12 @@ Conventions that apply everywhere:
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, then print the package-removal command |
 
+## TUI access
+
+Press **F2** in the TUI to search additional CLI tasks, fill their options, and
+review the account and effects before running them. See the [workflow and parity
+reference](TUI.md), including multi-person profiles and appearance scans.
+
 ## Developer and benchmark tools
 
 Hidden unless `IRLUME_DEV=1` is set, because they open the camera directly and
@@ -85,19 +90,12 @@ bypass the daemon. Not needed for normal use.
 
 `capture`, `eval`, `irbench`, `genuine`, `calcapture`, `normprobe`,
 `liveness`, `selftest align`, `padcapture`, `padreport`, `verify`,
-`enrolldev`, `suncal`, `gesturecap`
+`enrolldev`, `suncal`
 
 Each prints its own usage line when run without arguments. `padcapture` /
 `padreport` are the presentation-attack self-test pair documented in
 [PAD_SELFTEST.md](PAD_SELFTEST.md); `suncal` is the outdoor/sunlight
 calibration analyzer.
-
-`gesturecap` captures or replays head-pose evidence with the shipped classifier:
-
-```console
-IRLUME_DEV=1 irlume gesturecap capture --label nod --det models/face_detection_yunet_2023mar.onnx --model models/glintr100.onnx --out nod.jsonl
-IRLUME_DEV=1 irlume gesturecap replay nod.jsonl
-```
 
 ## Where to go next
 
@@ -105,3 +103,38 @@ IRLUME_DEV=1 irlume gesturecap replay nod.jsonl
 - Versioned JSON for desktop integrations: [MACHINE-API.md](MACHINE-API.md)
 - Reading scores, gate reasons, and PAM decisions: [DEBUGGING.md](DEBUGGING.md)
 - NixOS module instead of imperative wiring: [NIXOS.md](NIXOS.md)
+
+### Authorization before enrollment
+
+Adding or replacing trusted faces requires OS authorization for a non-root account owner. This covers `enroll`, `enroll --reset`, and `profiles add-scan`, including the guided TUI and direct socket clients. Each request needs its own authorization; root retains administrative access. A successful replacement preserves the existing template key and recovery setup, and failed capture preserves the old enrollment.
+
+Removing a whole profile (`profiles delete --profile ...` without `--scan`) or
+a recognizer's face data (`profiles forget-model`) also requires the
+`org.irlume.enroll` approval, including the TUI and direct socket clients.
+Removing the final profile retires its template key and recovery passphrase.
+Denied or cancelled approval leaves the enrollment and recovery files unchanged.
+Deleting individual scans and renaming profiles/scans keep their existing behavior;
+a profile's final scan cannot be deleted individually. Root retains administrative
+access. These approval checks require the updated daemon; an older daemon does not
+enforce them even when called by a newer client.
+
+Setting, replacing or erasing a recovery passphrase (`recovery setup` and
+`recovery forget`) also requires OS authorization for non-root users, including
+TUI and direct socket requests. The dialog identifies the account and operation;
+no recovery passphrase is sent to polkit. Root retains administrative access.
+The separate `org.irlume.recovery-manage` action ships with the package. If the
+action is missing, repair the Irlume policy installation; terminal users can
+register a `pkttyagent` when no desktop agent is available. Administrator polkit
+rules can override the shipped authentication requirement.
+
+`recovery restore` still verifies the existing recovery passphrase and reseals
+the template key without a new OS approval requirement. It does not reset retry
+history or override other face-authentication checks. OS authorization for
+recovery management does not attest which authentication factor was used.
+Older clients can use the new daemon with an available authorization agent;
+older daemons, including after a binary rollback, do not enforce this new gate.
+Rollback leaves recovery envelopes and retry records intact.
+
+Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment or profile/model removal. Missing authority or agent, denial, cancellation and expired approval refuse the operation. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
+
+The daemon enforces this rule. Restart into the updated daemon after upgrading; a new client with an older running daemon does not provide this protection. Older clients can meet the new dialog but retain their shorter reply timeout.

@@ -86,7 +86,7 @@ pub(super) const RESEAL_SESSION: &str =
 /// unlock, pkexec, systemd unit control): no `unseal` (the daemon refuses
 /// credential release for both classes anyway) and no mode arg (each surface runs
 /// the PAM conversation as soon as it prompts, which IS the face-first trigger;
-/// the daemon adds the forced consent gesture on top).
+/// PAM obtains confirmation before the daemon verifies the face).
 pub(super) const VERIFY_STANZA: &str = "auth       sufficient                   pam_irlume.so";
 
 /// The polkit consent-dialog verify stanza. Identical to [`VERIFY_STANZA`] EXCEPT

@@ -10,6 +10,8 @@
 //! and auto-capture, instead of a live video preview (which a terminal can't
 //! show). A thin client: all work happens in the daemon.
 
+mod actions;
+
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -135,12 +137,7 @@ const ACTIVITY_EXPANDED_ROWS: u16 = 7;
 /// (login greeters / TTYs / SSH at 80 columns).
 const SIDEBAR_MIN_COLS: u16 = 90;
 
-/// The services the Settings tab lets the user toggle the head gesture for,
-/// with arrow keys + `c`. All four are high-privilege (elevation or app-consent),
-/// so disabling any of them asks for confirmation first. The keyring-release path
-/// has its own `g` toggle, so it is not repeated here.
-const SETTINGS_GESTURE_SERVICES: &[&str] = &["sudo", "su", "doas", "polkit-1"];
-const MAX_PROFILES: usize = 3;
+const MAX_PROFILES: usize = irlume_core::storage::MAX_PROFILES;
 const ENROLL_SCANS: usize = irlume_core::storage::DEFAULT_ENROLL_SCANS;
 /// Scans captured per improve-recognition round (add to an existing profile).
 const ADD_SCANS: usize = irlume_core::storage::IMPROVE_SCANS;
@@ -203,6 +200,7 @@ enum Row {
 }
 
 enum Pending {
+    ActionField(actions::Invocation),
     EnrollName,
     RenameProfile(String),
     RenameScan(String, String),
@@ -236,6 +234,8 @@ impl Pending {
 /// instead (masked entry → socket), so they're not here.
 #[derive(Clone)]
 enum Suspend {
+    MoreAction(actions::Invocation),
+    TraceRecord,
     FingerprintAdd,
     LoginStatus,
     LoginEnable,
@@ -278,10 +278,6 @@ enum Suspend {
     FingerprintDisable,
     /// Wipe enrolled fingers; TUI y/n-confirmed first, root op.
     FingerprintReset,
-    /// Enable a third-party PAD model BY NAME. Deliberately runs the CLI's own
-    /// interactive flow under sudo (license text, name typed back, y/N): that
-    /// friction is the point of the models policy, so the TUI hosts it in the
-    /// cooked terminal instead of bypassing it.
     /// Origin-aware updater; runs unprivileged (it invokes sudo itself for
     /// the package-manager step when one is needed).
     Update,
@@ -302,16 +298,6 @@ enum Suspend {
     /// Toggle the opt-in biopolicy operation-class gate (the bool is the target
     /// state). Root op; the daemon reads it live, no restart.
     Biopolicy(bool),
-    /// Toggle the credential-release gesture gate (the bool is the target state).
-    /// Root op; the daemon reads it live, no restart.
-    CredentialReleaseChallenge(bool),
-    /// Toggle the head gesture for one PAM service (the bool is the target
-    /// state). Root op; runs `sudo irlume credential-release-challenge <service>
-    /// on|off`. Keyboard confirmation remains mandatory either way.
-    ServiceGesture {
-        service: String,
-        on: bool,
-    },
     /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
     /// root-gates it; the raw measurements are a spoof-tuning oracle).
     SelfTestLiveness,
@@ -476,6 +462,8 @@ enum WMsg {
     /// daemon merged it into `profile` instead. The worker ends here and hands
     /// off to the UI, which confirms with the user before adding the rest.
     /// `added_scans` are the scan(s) already appended (undo target on decline).
+    SessionMerge(SessionMerge),
+    Authorizing,
     MergePrompt {
         profile: String,
         /// Ambient-lit count of the scan(s) the merge already added, so the
@@ -501,7 +489,15 @@ struct MergeConfirm {
     ambient_lit: usize,
 }
 
+#[derive(Debug)]
+struct SessionMerge {
+    profile: String,
+    remaining: usize,
+    answer: mpsc::Sender<bool>,
+}
+
 struct EnrollUi {
+    session_merge: Option<SessionMerge>,
     rx: mpsc::Receiver<WMsg>,
     stop: Arc<AtomicBool>,
     profile: String,
@@ -530,9 +526,62 @@ struct Op {
     rx: mpsc::Receiver<(bool, String)>,
 }
 
-/// TUI state. Seven `Option` fields act as modal overlays; when several are
+/// Camera metadata gathered off the event thread; failed fields retain their previous values.
+#[derive(Default)]
+struct CameraListing {
+    pairs: Option<Vec<irlume_common::CameraPairInfo>>,
+    mode: Option<String>,
+}
+
+impl CameraListing {
+    fn gather() -> Self {
+        let mut listing = Self::default();
+        if let Ok(Response::Cameras(pairs)) = crate::daemon_poll(&Request::ListCameras) {
+            listing.pairs = Some(pairs);
+        }
+        // The same camera-class slot as the listing above: the arbiter
+        // serializes this against captures, and it is refreshed on screen
+        // entry (not per frame). A refusal or older daemon leaves the last
+        // answer in place — unknown is not "default".
+        if let Ok(Response::CaptureModeStatus {
+            mode,
+            source,
+            qualification_state,
+            qualification_reason,
+            runtime_degradation,
+            ..
+        }) = crate::daemon_poll(&Request::CaptureModeStatus)
+        {
+            // The qualification state tells the user WHY their camera is in
+            // this mode: "measured_sequential" (the camera cannot sustain
+            // concurrent) reads very differently from
+            // "unqualified_context_changed" (kernel or USB changed; re-tune).
+            // Both are actionable facts the bare mode string hides (#586
+            // audit: a user who never runs camera-mode or doctor has no way
+            // to learn their qualification is stale).
+            let mut text = format!("{mode} (source: {source})");
+            if !qualification_state.is_empty() {
+                text.push_str("; qualification: ");
+                text.push_str(&qualification_state);
+                if let Some(reason) = &qualification_reason {
+                    text.push_str(" (");
+                    text.push_str(reason);
+                    text.push(')');
+                }
+            }
+            if let Some(why) = runtime_degradation {
+                text.push_str("; degraded: ");
+                text.push_str(&why);
+            }
+            listing.mode = Some(text);
+        }
+        listing
+    }
+}
+
+/// TUI state. `Option` fields act as modal overlays; when several are
 /// `Some`, `on_key` consumes input in this order (first match wins):
-/// `error` (any key dismisses) > `enroll` (Esc only) > `op` (q/Esc only) >
+/// `error` (any key dismisses) > `more_actions` (search/navigation) > `enroll` (Esc only) > `op` (q/Esc only) >
 /// `input` (text entry) > `confirm` (y/n) > `enroll_merge` (y/n) > normal
 /// screen keys. `suspend` is not a key state: the main loop takes it after
 /// each key/tick, leaves the TUI, and runs the command. PageUp/PageDown
@@ -570,6 +619,7 @@ struct App {
     /// the Cameras info block — e.g. "sequential (source: measured; …)".
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
     capture_mode: Option<String>,
+    camera_load: Option<mpsc::Receiver<CameraListing>>,
     activity: Vec<(char, String)>,
     input: Option<(String, String, Pending)>,
     confirm: Option<Confirm>,
@@ -581,6 +631,7 @@ struct App {
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
+    more_actions: Option<(String, usize)>,
     /// Selected row of the Welcome hub (Enter jumps to its screen).
     hub_sel: usize,
     op: Option<Op>,
@@ -601,9 +652,6 @@ struct App {
     repair_sel: usize,
     /// Cameras-tab pair selection.
     cam_sel: usize,
-    /// Settings-tab per-service consent-gesture selection (index into
-    /// [`SETTINGS_GESTURE_SERVICES`]).
-    settings_svc_sel: usize,
     /// Cached Bitwarden state for the DRAW path, with the moment it was
     /// taken: `bitwarden::tui_state` forks `getent` to resolve the invoking
     /// user's home, measured at ~37ms a call and called twice in one draw of
@@ -943,8 +991,9 @@ impl LightState {
 pub fn run(args: &[String]) -> std::io::Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        eprintln!("irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.");
-        return Ok(());
+        return Err(std::io::Error::other(
+            "irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.",
+        ));
     }
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(
@@ -1027,12 +1076,14 @@ impl App {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            camera_load: None,
             activity: Vec::new(),
             input: None,
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
+            more_actions: None,
             hub_sel: 0,
             op: None,
             enroll: None,
@@ -1045,7 +1096,6 @@ impl App {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
-            settings_svc_sel: 0,
             heavy: crate::bitwarden::tui_state(),
             heavy_at: std::time::Instant::now(),
             error: None,
@@ -1096,8 +1146,7 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                // Settings holds user preferences (additional head gesture,
-                // keyring gesture, biopolicy,
+                // Settings holds user preferences (biopolicy,
                 // third-party models), not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
@@ -1234,50 +1283,14 @@ impl App {
     /// blanking it, because neither is an observation that the cameras are
     /// gone.
     fn refresh_camera_listing(&mut self) {
-        if let Ok(Response::Cameras(pairs)) = crate::daemon_poll(&Request::ListCameras) {
-            self.pairs = pairs;
-            self.pairs_known = true;
-            let n = self.pairs.len().max(1);
-            if self.cam_sel >= n {
-                self.cam_sel = n - 1;
-            }
+        if self.camera_load.is_some() {
+            return;
         }
-        // The same camera-class slot as the listing above: the arbiter
-        // serializes this against captures, and it is refreshed on screen
-        // entry (not per frame). A refusal or older daemon leaves the last
-        // answer in place — unknown is not "default".
-        if let Ok(Response::CaptureModeStatus {
-            mode,
-            source,
-            qualification_state,
-            qualification_reason,
-            runtime_degradation,
-            ..
-        }) = crate::daemon_poll(&Request::CaptureModeStatus)
-        {
-            // The qualification state tells the user WHY their camera is in
-            // this mode: "measured_sequential" (the camera cannot sustain
-            // concurrent) reads very differently from
-            // "unqualified_context_changed" (kernel or USB changed; re-tune).
-            // Both are actionable facts the bare mode string hides (#586
-            // audit: a user who never runs camera-mode or doctor has no way
-            // to learn their qualification is stale).
-            let mut text = format!("{mode} (source: {source})");
-            if !qualification_state.is_empty() {
-                text.push_str("; qualification: ");
-                text.push_str(&qualification_state);
-                if let Some(reason) = &qualification_reason {
-                    text.push_str(" (");
-                    text.push_str(reason);
-                    text.push(')');
-                }
-            }
-            if let Some(why) = runtime_degradation {
-                text.push_str("; degraded: ");
-                text.push_str(&why);
-            }
-            self.capture_mode = Some(text);
-        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(CameraListing::gather());
+        });
+        self.camera_load = Some(rx);
     }
 
     /// Capabilities as the DAEMON reports them, for use whenever it is
@@ -1320,7 +1333,8 @@ impl App {
             self.refresh_profiles();
         }
         let max = self.rows().len().max(1);
-        if self.sel >= max {
+        // One past the list is an intentionally cleared selection after a removal.
+        if self.sel > max {
             self.sel = max - 1;
         }
         let pairs = self.pairs.len().max(1);
@@ -1600,7 +1614,7 @@ impl App {
             // IRLUME_MESH_MODEL at it, so a running daemon reporting the mesh
             // is the ground truth that the TFLite runtime loaded, the same way
             // Health answers for ONNX. A daemon running WITHOUT the mesh loses
-            // BlazeFace rescue alignment; head consent uses the primary
+            // BlazeFace rescue alignment; authentication uses the primary
             // detector's five landmarks and remains available.
             v.push(mk(
                 "TFLite runtime",
@@ -2286,6 +2300,22 @@ impl App {
         v
     }
 
+    fn profile_row_name(&self, row: Row) -> (String, Option<String>) {
+        match row {
+            Row::Profile(pi) => (self.profiles[pi].name.clone(), None),
+            Row::Scan(pi, si) => (
+                self.profiles[pi].name.clone(),
+                Some(self.profiles[pi].scans[si].clone()),
+            ),
+        }
+    }
+
+    fn selected_profile_row(&self) -> Option<(String, Option<String>)> {
+        self.rows()
+            .get(self.sel)
+            .map(|row| self.profile_row_name(*row))
+    }
+
     fn next_profile_name(&self) -> String {
         for n in 1..=MAX_PROFILES {
             let c = format!("Face Profile {n}");
@@ -2361,6 +2391,7 @@ impl App {
             format!("guided enroll → '{profile}' ({target} scan(s))"),
         );
         self.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop,
             profile,
@@ -2396,6 +2427,7 @@ impl App {
         let ambient_base = mc.ambient_lit;
         std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
         self.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop,
             profile: mc.profile,
@@ -2454,6 +2486,25 @@ impl App {
     }
 
     fn poll(&mut self) {
+        if let Some(rx) = &self.camera_load {
+            match rx.try_recv() {
+                Ok(listing) => {
+                    self.camera_load = None;
+                    if let Some(pairs) = listing.pairs {
+                        self.pairs = pairs;
+                        self.pairs_known = true;
+                        self.cam_sel = self.cam_sel.min(self.pairs.len().saturating_sub(1));
+                    }
+                    if let Some(mode) = listing.mode {
+                        self.capture_mode = Some(mode);
+                    }
+                    self.run_checks();
+                    self.recompute_visible();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.camera_load = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self.heavy_at.elapsed() >= Self::HEAVY_TTL {
             self.refresh_heavy();
         }
@@ -2480,7 +2531,18 @@ impl App {
                 self.profiles_load = None;
                 match outcome {
                     ProfilesOutcome::Loaded { profiles } => {
+                        let selected = self.selected_profile_row();
+                        let selection_cleared = !self.profiles.is_empty() && selected.is_none();
                         self.profiles = profiles;
+                        if let Some(selected) = selected {
+                            self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
+                                self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
+                                self.rows().len()
+                            });
+                        }
+                        if selection_cleared {
+                            self.sel = self.rows().len();
+                        }
                         self.enroll_error = None;
                         self.profiles_loaded = true;
                     }
@@ -2529,6 +2591,22 @@ impl App {
             let mut merge: Option<MergeConfirm> = None;
             for m in msgs {
                 match m {
+                    WMsg::SessionMerge(prompt) => {
+                        if let Some(e) = &mut self.enroll {
+                            e.profile = prompt.profile.clone();
+                            e.session_merge = Some(prompt);
+                            e.count = None;
+                        }
+                    }
+                    WMsg::Authorizing => {
+                        self.log(
+                            '·',
+                            "approve the system authentication dialog for this enrollment",
+                        );
+                        if let Some(e) = &mut self.enroll {
+                            e.count = None;
+                        }
+                    }
                     WMsg::Cue(r) => {
                         if let Some(e) = &mut self.enroll {
                             e.last = Some(r);
@@ -2551,6 +2629,7 @@ impl App {
                         let base = self.enroll.as_ref().map(|e| e.base).unwrap_or(0);
                         if let Some(e) = &mut self.enroll {
                             e.captured = n;
+                            e.target = t;
                             e.count = None;
                         }
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
@@ -2773,16 +2852,6 @@ impl App {
         }
     }
 
-    /// Run a privileged sub-step via `sudo` and surface its ACTUAL outcome. A
-    /// cancelled or failed sudo (wrong password ×3, subcommand error) must not
-    /// look like success: `refresh()` re-probes what it can, but a one-shot like
-    /// `ir-setup` reports its own outcome and is not re-probed here, so we log ✓
-    /// on success and raise the error banner on failure.
-    ///
-    /// It DOES leave re-checkable state now: an interrupted run leaves an undo
-    /// record, which `irlume doctor` reports as `emitter-undo-pending`. This
-    /// step does not read it, because the record is about a camera control and
-    /// this is the sudo wrapper's own success or failure.
     /// Absolute path to the running binary, for re-invoking ourselves as root
     /// instead of whatever `irlume` PATH resolves to (a running TUI must not
     /// shell out to a different, older installed build for its privileged half).
@@ -2820,6 +2889,9 @@ impl App {
         }
     }
 
+    /// Run a privileged command and report its exit outcome. Failure does not
+    /// prove rollback: a command can change state before exiting unsuccessfully.
+    /// Suspend-return refreshes diagnostics; refresh the app cache here too.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
         // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
         // to. Resolve the first "irlume" arg to the current exe; leave
@@ -2864,31 +2936,27 @@ impl App {
         unsafe {
             libc::signal(libc::SIGINT, old_int)
         };
+        if status.is_ok() {
+            // A child can change app policy before failing. Refresh after any
+            // exit, since the exit status alone says nothing about rollback.
+            self.refresh_heavy();
+        }
         match status {
             Ok(st) if st.success() => {
-                // A step can enable a model or install the Bitwarden policy, and
-                // the draw path reads a cache: take it again now rather than let
-                // the screen show the pre-action state until the TTL expires.
-                self.refresh_heavy();
                 self.log('✓', format!("{what}: done"));
             }
             Ok(st) => {
-                // A failed/cancelled sudo can't have started the daemon; drop
-                // any parked enrollment so the resume path doesn't sit through
-                // its bounded daemon wait for nothing.
+                // Without confirmed success, do not automatically continue a
+                // parked enrollment, even if the daemon may have started.
                 self.resume_enroll = None;
-                match st.code() {
-                    Some(c) => self.set_error(format!(
-                        "{what}: sudo exited {c}; not applied (cancelled or failed)"
-                    )),
-                    None => {
-                        self.set_error(format!("{what}: sudo terminated by a signal; not applied"))
-                    }
-                }
+                self.set_error(format!(
+                    "{what}: command did not complete ({st}); some changes may already be applied; \
+                     review its output and current status before retrying"
+                ));
             }
             Err(e) => {
                 self.resume_enroll = None;
-                self.set_error(format!("{what}: could not launch sudo: {e}"));
+                self.set_error(format!("{what}: could not start command: {e}"));
             }
         }
     }
@@ -2908,6 +2976,41 @@ impl App {
         // so they cannot hold a borrow of `self.user` across the call.
         let target = self.user.clone();
         match s {
+            Suspend::TraceRecord => self.sudo_step(
+                "record a 60-second diagnostic trace",
+                &["irlume", "trace", "record", "--duration", "60s"],
+            ),
+            Suspend::MoreAction(invocation) => {
+                let args = invocation.args(&self.user);
+                if invocation.action.root {
+                    let mut command = vec!["irlume"];
+                    command.extend(args.iter().map(String::as_str));
+                    self.sudo_step(invocation.action.label, &command);
+                } else {
+                    // Exec our current build, with literal argument values. A
+                    // child gets normal Ctrl-C behavior while the TUI survives.
+                    let result = std::process::Command::new(Self::self_exe())
+                        .args(&args)
+                        .status();
+                    match result {
+                        Ok(status) if status.success() => self.log(
+                            '✓',
+                            format!(
+                                "{}: command completed; see the result above",
+                                invocation.action.label
+                            ),
+                        ),
+                        Ok(status) => self.set_error(format!(
+                            "{}: command failed or was cancelled ({status}); review its output",
+                            invocation.action.label
+                        )),
+                        Err(error) => self.set_error(format!(
+                            "{}: could not start: {error}",
+                            invocation.action.label
+                        )),
+                    }
+                }
+            }
             Suspend::FingerprintAdd => {
                 crate::fingerprint::run(Some("add"), &for_user);
             }
@@ -3018,31 +3121,6 @@ impl App {
                 },
                 &["irlume", "biopolicy", if on { "on" } else { "off" }],
             ),
-            Suspend::CredentialReleaseChallenge(on) => self.sudo_step(
-                if on {
-                    "require a gesture before releasing the keyring password"
-                } else {
-                    "stop requiring a gesture before releasing the keyring password"
-                },
-                &[
-                    "irlume",
-                    "credential-release-challenge",
-                    if on { "on" } else { "off" },
-                ],
-            ),
-            Suspend::ServiceGesture { service, on } => self.sudo_step(
-                &if on {
-                    format!("require a head gesture for '{service}'")
-                } else {
-                    format!("stop requiring a head gesture for '{service}'")
-                },
-                &[
-                    "irlume",
-                    "credential-release-challenge",
-                    service.as_str(),
-                    if on { "on" } else { "off" },
-                ],
-            ),
             Suspend::SelfTestLiveness => self.sudo_step(
                 "run the IR liveness self-test",
                 &["irlume", "selftest", "liveness"],
@@ -3114,6 +3192,35 @@ impl App {
             self.error = None;
             return;
         }
+        if let Some((query, selected)) = self.more_actions.as_mut() {
+            match code {
+                KeyCode::Esc | KeyCode::F(2) => self.more_actions = None,
+                KeyCode::Char(c) if !c.is_control() && query.len() < 128 => {
+                    query.push(c);
+                    *selected = 0;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                }
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    *selected =
+                        (*selected + 1).min(actions::matching(query).len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = actions::matching(query).get(*selected).copied() {
+                        self.more_actions = None;
+                        self.prepare_action(actions::Invocation {
+                            action,
+                            values: Vec::new(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         // Activity history scroll works in every state except text entry:
         // mid-enroll and mid-op, when lines stream fastest, is exactly when
         // the user wants to read back. Handled before the state gates below
@@ -3138,6 +3245,33 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if self
+            .enroll
+            .as_ref()
+            .is_some_and(|e| e.session_merge.is_some())
+        {
+            match code {
+                KeyCode::Char('y') => {
+                    if let Some(e) = &mut self.enroll {
+                        if let Some(prompt) = e.session_merge.take() {
+                            let _ = prompt.answer.send(true);
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    if let Some(e) = self.enroll.take() {
+                        if let Some(prompt) = e.session_merge {
+                            let _ = prompt.answer.send(false);
+                        }
+                        e.stop.store(true, Ordering::Relaxed);
+                    }
+                    self.log('·', "enrollment cancelled; pending scans were not saved");
+                    self.refresh_profiles();
+                }
+                _ => {}
+            }
+            return;
         }
         // Guided enroll: only Esc (cancel).
         if let Some(e) = &self.enroll {
@@ -3243,6 +3377,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc => self.go_home(),
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::F(2) => self.more_actions = Some((String::new(), 0)),
             // Home: jump back to the Welcome hub from any tab, so the "at a
             // glance" summary is one key away instead of a Tab walk. (Home the
             // KEY is taken by activity scroll; 'h' for home is unused globally.)
@@ -3321,13 +3456,6 @@ impl App {
     }
 
     fn move_sel(&mut self, d: i32) {
-        // The Settings tab has no profile/scan list; ↑/↓ pick the per-service
-        // consent-gesture row that [c] toggles.
-        if self.screen == SC_SETTINGS {
-            let n = SETTINGS_GESTURE_SERVICES.len() as i32;
-            self.settings_svc_sel = (((self.settings_svc_sel as i32 + d) % n + n) % n) as usize;
-            return;
-        }
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
@@ -3341,7 +3469,15 @@ impl App {
             SC_WELCOME => &mut self.hub_sel,
             _ => &mut self.sel,
         };
-        *cur = (((*cur as i32 + d) % n + n) % n) as usize;
+        *cur = if *cur >= len {
+            if d < 0 {
+                len.saturating_sub(1)
+            } else {
+                0
+            }
+        } else {
+            (((*cur as i32 + d) % n + n) % n) as usize
+        };
     }
 
     fn on_action(&mut self, code: KeyCode) {
@@ -3437,7 +3573,7 @@ impl App {
                     '→',
                     "sudo irlume logs: the daemon/PAM/keyring journal in one view",
                 );
-                self.log('·', "deeper: `sudo irlume logs debug on` traces each pipeline stage (turn off after)");
+                self.log('·', "For bounded diagnostics use [T] Record Trace; review sensitive measurements before sharing.");
                 self.suspend = Some(Suspend::Logs);
             }
             // Full `irlume doctor` readout: the complete authoritative dump,
@@ -3448,15 +3584,12 @@ impl App {
                 self.log('→', "irlume diag: TPM seal + PCR-drift readout (sudo adds envelope detail)");
                 self.suspend = Some(Suspend::Diag);
             }
-            (SC_REPAIR, KeyCode::Char('v')) => {
-                // Trace RECORD is root-only and lasts the full window, so it
-                // runs cooked under sudo; the command itself prints the
-                // output path and the `irlume trace explain` follow-up.
-                self.log('→', "irlume trace record: 60s privileged diagnostic (no frames or credentials recorded)");
-                self.sudo_step(
-                    "record a 60-second diagnostic trace",
-                    &["irlume", "trace", "record", "--duration", "60s"],
-                );
+            (SC_REPAIR, KeyCode::Char('T')) => {
+                self.confirm = Some((
+                    "Record a 60-second trace? Requires administrator access and records sensitive diagnostic measurements. No frames, embeddings or credentials. Review before sharing.".into(),
+                    "Record",
+                    ConfirmAct::Sus(Suspend::TraceRecord),
+                ));
             }
             (SC_REPAIR, KeyCode::Char('d')) => {
                 self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
@@ -3500,7 +3633,7 @@ impl App {
                     concat!(
                         "Tune capture mode? This holds the camera and fires the ",
                         "IR emitter for up to a minute, then stores the verdict ",
-                        "in /etc/irlume/cameras.conf. Your password will be ",
+                        "for this exact camera and connection context. Your password will be ",
                         "requested."
                     )
                         .into(),
@@ -3593,7 +3726,7 @@ impl App {
             // Recovery: masked in-TUI entry.
             (SC_RECOVERY, KeyCode::Char('s')) => {
                 self.input = Some((
-                    "New recovery passphrase (••):".into(),
+                    "New recovery passphrase (OS approval follows):".into(),
                     String::new(),
                     Pending::RecoveryPw(None),
                 ));
@@ -3607,7 +3740,7 @@ impl App {
             }
             (SC_RECOVERY, KeyCode::Char('f')) => {
                 self.confirm = Some((
-                    "Erase the recovery passphrase? (templates stay encrypted)".into(),
+                    "Erase the recovery passphrase? OS approval follows; templates stay encrypted.".into(),
                     "Erase",
                     ConfirmAct::Daemon(Request::RecoveryForget {
                         user: self.user.clone(),
@@ -3662,11 +3795,11 @@ impl App {
             // Opt-in wiring extras; each logs the exact command then suspends,
             // so nothing needs to be copied out of the TUI to be run.
             (SC_PAM, KeyCode::Char('u')) => {
-                self.log('→', "sudo irlume login enable --with-sudo --apply: type yes for one face attempt; an optional head gesture runs only if explicitly enabled (password still works)");
+                self.log('→', "sudo irlume login enable --with-sudo --apply: type yes for one face attempt (password still works)");
                 self.suspend = Some(Suspend::LoginEnableSudo);
             }
             (SC_PAM, KeyCode::Char('p')) => {
-                self.log('→', "sudo irlume login enable --with-polkit --apply: type yes for one face attempt at app prompts; head gesture is optional and experimental");
+                self.log('→', "sudo irlume login enable --with-polkit --apply: type yes for one face attempt at app prompts (password still works)");
                 self.suspend = Some(Suspend::LoginEnablePolkit);
             }
             // Un-wiring is destructive-ish (face login stops working until
@@ -3720,86 +3853,6 @@ impl App {
                     ));
                 }
             }
-            // Per-service experimental head gesture: ↑/↓ pick, [c] toggles.
-            // Keyboard confirmation remains mandatory in both directions, so
-            // disabling is not a security downgrade and needs no modal.
-            (SC_SETTINGS, KeyCode::Char('c')) => {
-                // Same clamp as the draw: a key must not panic on a stale index.
-                let svc = SETTINGS_GESTURE_SERVICES
-                    .get(self.settings_svc_sel)
-                    .copied()
-                    .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
-                // Same effective read as the badge, so [c] flips what the user
-                // sees. Reading the elevation-only default here meant the first
-                // press on polkit wrote `on` (already the behaviour) and skipped
-                // the confirmation that disabling is supposed to require.
-                //
-                // And it must be the read that can say "I do not know".
-                // settings.conf is 0600 root-owned, so an unprivileged TUI cannot
-                // see an override at all and every service defaulted to ON: the
-                // key could then only ever DISABLE, and pressing it again after a
-                // disable wrote `off` a second time while the row still claimed
-                // the gesture was required. Say so instead of guessing.
-                let Some(current) = irlume_common::config::service_gesture_required_visible(svc)
-                else {
-                    self.log(
-                        '·',
-                        format!(
-                            "the head gesture for '{svc}' is a root-only setting; \
-                             run the TUI with sudo, or check it with: \
-                             sudo irlume credential-release-challenge {svc} status"
-                        ),
-                    );
-                    return;
-                };
-                let target = !current;
-                let sus = Suspend::ServiceGesture {
-                    service: svc.to_string(),
-                    on: target,
-                };
-                if target {
-                    self.log(
-                        '→',
-                        format!(
-                            "sudo irlume credential-release-challenge {svc} on: \
-                             add an experimental head gesture for '{svc}' (may reject valid attempts; keyboard confirmation remains required)"
-                        ),
-                    );
-                } else {
-                    self.log(
-                        '→',
-                        format!(
-                            "sudo irlume credential-release-challenge {svc} off: remove the experimental head gesture; keyboard confirmation remains required"
-                        ),
-                    );
-                }
-                self.suspend = Some(sus);
-            }
-            // Credential-release gesture gate. DEFAULT OFF: the keyring releases
-            // after the face match with no nod. 'g' toggles the opt-in extra
-            // step; neither direction needs a confirm (off is the default, on only
-            // adds friction). settings.conf is root-only, so an unprivileged TUI
-            // cannot read the state; then offer to enable the opt-in.
-            (SC_SETTINGS, KeyCode::Char('g')) => {
-                match irlume_common::config::credential_release_challenge_visible() {
-                    Some(true) => {
-                        self.log(
-                            '→',
-                            "sudo irlume credential-release-challenge off: back to the default \
-                             (the keyring releases with no nod)",
-                        );
-                        self.suspend = Some(Suspend::CredentialReleaseChallenge(false));
-                    }
-                    Some(false) | None => {
-                        self.log(
-                            '→',
-                            "sudo irlume credential-release-challenge on: add a head gesture \
-                             (nod to approve; shake to decline) before keyring release",
-                        );
-                        self.suspend = Some(Suspend::CredentialReleaseChallenge(true));
-                    }
-                }
-            }
             // Daemon debug logging toggle; deny scores land in the journal
             // while on, so remind the user to turn it back off.
             (SC_REPAIR, KeyCode::Char('t')) => {
@@ -3849,22 +3902,17 @@ impl App {
             return;
         }
         if self.profiles.len() >= MAX_PROFILES {
-            // A new PERSON can't be added at the cap. Refreshing your OWN face
-            // (the merge path) is what [a] Improve Recognition does, so point
-            // there instead of only "delete one".
-            self.log(
-                '✗',
-                format!(
-                    "at the max {MAX_PROFILES} profiles (people). To refresh your own face, use [a] Improve Recognition; to add a different person, delete a profile first."
-                ),
-            );
-        } else {
-            self.input = Some((
-                "New profile name (blank = default):".into(),
-                String::new(),
-                Pending::EnrollName,
+            self.log('·', format!(
+                "All {MAX_PROFILES} person slots are used. A matching face can still Improve Recognition; a new person requires deleting a profile first."
             ));
         }
+        // Let the daemon recognize an existing person even at the profile cap.
+        // It remains authoritative for both merge eligibility and the cap.
+        self.input = Some((
+            "New profile name, for a new person only (blank = automatic). A matching face will use its saved profile:".into(),
+            String::new(),
+            Pending::EnrollName,
+        ));
     }
 
     fn sel_profile(&self) -> Option<String> {
@@ -3905,7 +3953,7 @@ impl App {
             Some(Row::Profile(pi)) => {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
-                    format!("Delete profile '{p}' and all its scans?"),
+                    format!("Delete profile '{p}' and all its scans? OS approval is required for non-root users. Removing the last profile also erases its recovery passphrase."),
                     "Delete",
                     ConfirmAct::Daemon(Request::DeleteProfile {
                         user: self.user.clone(),
@@ -3933,6 +3981,93 @@ impl App {
         }
     }
 
+    fn prepare_action(&mut self, invocation: actions::Invocation) {
+        if let Some(field) = invocation.action.fields.get(invocation.values.len()) {
+            self.input = Some((
+                field.label.into(),
+                String::new(),
+                Pending::ActionField(invocation),
+            ));
+        } else {
+            let scope = if invocation.action.per_user {
+                format!("Account: {}", self.user)
+            } else {
+                "Scope: this system or the specified file".into()
+            };
+            // Debug quoting makes spaces and punctuation unambiguous. This is
+            // only a preview: execution passes the vector directly, no shell.
+            let command = invocation
+                .args(&self.user)
+                .iter()
+                .map(|arg| format!("{arg:?}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.confirm = Some((
+                format!(
+                    "{}\n{scope}\n{}\nRun: {}irlume {command}",
+                    invocation.action.label,
+                    invocation.action.description,
+                    if invocation.action.root { "sudo " } else { "" }
+                ),
+                "Run",
+                ConfirmAct::Sus(Suspend::MoreAction(invocation)),
+            ));
+        }
+    }
+
+    fn draw_more_actions(&self, f: &mut Frame, query: &str, selected: usize) {
+        let area = f.area();
+        let width = area.width.saturating_sub(2).min(100);
+        let height = area.height.saturating_sub(2).min(24);
+        let rect = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, rect);
+        let block = Block::bordered()
+            .title(" More actions (F2 / Esc closes) ")
+            .border_style(Style::new().fg(th().accent));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let rows = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+        f.render_widget(
+            Paragraph::new(format!(
+                "Search: {query}▏\nType to filter; arrows select; Enter opens"
+            )),
+            rows[0],
+        );
+        let matches = actions::matching(query);
+        if matches.is_empty() {
+            f.render_widget(
+                Paragraph::new("No matching actions. Backspace to change the search."),
+                rows[1],
+            );
+            return;
+        }
+        let items: Vec<_> = matches.iter().map(|a| ListItem::new(a.label)).collect();
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_style(selected_style())
+                .highlight_symbol("› "),
+            rows[1],
+            &mut state,
+        );
+        if let Some(action) = matches.get(selected) {
+            f.render_widget(
+                Paragraph::new(action.description).wrap(Wrap { trim: true }),
+                rows[2],
+            );
+        }
+    }
+
     fn submit_input(&mut self) {
         let Some((_, buf, pending)) = self.input.take() else {
             return;
@@ -3942,6 +4077,20 @@ impl App {
         // in the non-secret arms so a password never leaves a plain-String copy.
         let buf = zeroize::Zeroizing::new(buf);
         match pending {
+            Pending::ActionField(mut invocation) => {
+                let field = invocation.action.fields[invocation.values.len()];
+                let value = buf.trim();
+                if let Err(message) = field.validate(value) {
+                    self.input = Some((
+                        format!("{}: {message}", field.label),
+                        value.into(),
+                        Pending::ActionField(invocation),
+                    ));
+                    return;
+                }
+                invocation.values.push(value.into());
+                self.prepare_action(invocation);
+            }
             // The uninstall challenge: only the exact word proceeds; anything
             // else (including empty / Esc, which submits nothing) cancels.
             Pending::UninstallConfirm => {
@@ -4086,6 +4235,7 @@ impl App {
             format!("guided enroll → '{name}' ({ENROLL_SCANS} scans)"),
         );
         self.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop,
             profile: name,
@@ -4155,18 +4305,23 @@ impl App {
                 "Confirm",
                 &format!("{what}\n[n]/Esc Cancel    [y] {verb}"),
             );
+        } else if let Some(prompt) = self.enroll.as_ref().and_then(|e| e.session_merge.as_ref()) {
+            self.modal(f, "Already enrolled", &format!(
+                "This capture matches '{}'. Improve Recognition for this person?\n\nNo scans have been saved. Continue with up to {} more scans, then save the completed capture.\n\n[y] Continue    [n]/Esc Cancel", prompt.profile, prompt.remaining));
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
             let body = format!(
-                "This face is already enrolled as '{}' (a face owns one profile). \
-                 Add these scans to it?   [y] add   ·   [n] cancel",
-                mc.profile
+                "This capture matches '{}' on this account. Improve Recognition for this person instead of creating another profile?\n\nOne scan has been added; [y] keeps it and captures up to {} more. [n]/Esc cancels and removes that scan.\n\n[y] add scans   [n]/Esc cancel",
+                mc.profile, mc.remaining
             );
             self.modal(f, "Already enrolled", &body);
         }
         // Tier two of the key-disclosure ladder; drawn last so it sits above
         // everything except nothing (help is always answerable).
+        if let Some((query, selected)) = &self.more_actions {
+            self.draw_more_actions(f, query, *selected);
+        }
         if self.show_help {
             self.modal(f, "Keys  ([?] or Esc to close)", &self.help_body());
         }
@@ -4414,6 +4569,7 @@ impl App {
         });
         if activity_hit
             && !self.show_help
+            && self.more_actions.is_none()
             && self.error.is_none()
             && self.input.is_none()
             && self.confirm.is_none()
@@ -4422,7 +4578,8 @@ impl App {
             self.on_key(KeyCode::Char('A'));
             return;
         }
-        if self.show_help
+        if self.more_actions.is_some()
+            || self.show_help
             || self.error.is_some()
             || self.input.is_some()
             || self.confirm.is_some()
@@ -4467,9 +4624,6 @@ impl App {
                         }
                     }
                     SC_PROFILES if i < self.rows().len() => self.sel = i,
-                    SC_SETTINGS if i < SETTINGS_GESTURE_SERVICES.len() => {
-                        self.settings_svc_sel = i;
-                    }
                     _ => {}
                 },
             }
@@ -4684,6 +4838,9 @@ impl App {
             ]),
             Line::raw(""),
         ];
+        lines.push(Line::raw(
+            "  Approve the system dialog when prompted to continue.",
+        ));
         if let Some(err) = &e.stalled {
             // Not a biometric verdict: the guide stopped answering, so EVERY
             // live reading (quality bar, checklist, guidance) is stale and
@@ -4779,37 +4936,6 @@ impl App {
             return;
         }
         let rows = self.rows();
-        // Profile rows can occupy two terminal lines when a recognizer warning
-        // is present. Register their actual rendered height so a pointer lands
-        // on the same row the user sees, including that warning line.
-        let mut row_y = area.y;
-        for (i, row) in rows.iter().enumerate() {
-            let height = match row {
-                Row::Profile(pi) => {
-                    let p = &self.profiles[*pi];
-                    let live_count = p
-                        .live_recognizer
-                        .as_deref()
-                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
-                        .unwrap_or(0);
-                    let misleading = p.scans_by_recognizer.len() > 1
-                        || (p.live_recognizer.is_some() && live_count != p.scans.len());
-                    if misleading && live_count == 0 {
-                        2
-                    } else {
-                        1
-                    }
-                }
-                Row::Scan(_, _) => 1,
-            };
-            if row_y < area.y.saturating_add(area.height) {
-                self.hit(
-                    Rect::new(area.x, row_y, area.width, height),
-                    Click::Select(i),
-                );
-            }
-            row_y = row_y.saturating_add(height);
-        }
         let items: Vec<ListItem> = rows
             .iter()
             .map(|r| match r {
@@ -4848,6 +4974,12 @@ impl App {
                             Style::new().fg(th().warn),
                         )));
                     }
+                    for line in crate::profile_ir::lines(p) {
+                        item.push(Line::from(Span::styled(format!("     {line}"), Style::new().dim())));
+                    }
+                    if crate::profile_ir::needs_capture(p) {
+                        item.push(Line::from("     [a] Improve Recognition with an IR camera."));
+                    }
                     ListItem::new(item)
                 }
                 Row::Scan(pi, si) => ListItem::new(Line::from(Span::raw(format!(
@@ -4860,6 +4992,15 @@ impl App {
         // these: `sel` is clamped to the real rows above).
         let mut items = items;
         items.push(ListItem::new(Line::raw("")));
+        items.push(ListItem::new(
+            "  One profile per person sharing this Linux account (up to 3).",
+        ));
+        items.push(ListItem::new(
+            "  [e] Add a person; [a] improve the selected person's recognition.",
+        ));
+        items.push(ListItem::new(
+            "  Each enrolled person can authenticate as this account.",
+        ));
         // Pre-split like the two lines below: ratatui Lists never wrap a
         // ListItem, so one long line here was clipped at the terminal edge
         // and the sentence ended mid-word at every width. 74 columns is the
@@ -4881,57 +5022,45 @@ impl App {
             Style::new().dim(),
         ))));
         let mut st =
-            ListState::default().with_selected(Some(self.sel.min(rows.len().saturating_sub(1))));
+            ListState::default().with_selected((self.sel < rows.len()).then_some(self.sel));
         f.render_stateful_widget(
             List::new(items).highlight_style(selected_style()),
             area,
             &mut st,
         );
-    }
-
-    /// The Settings tab's fixed confirmation and optional-gesture section: the
-    /// mandatory boundary, then one row of service names with the picked one
-    /// (`settings_svc_sel`) highlighted and its EFFECTIVE state. Arrow keys pick,
-    /// `c` toggles the picked one. settings.conf is root-only, so an unreadable
-    /// optional value is rendered unknown rather than guessed.
-    fn service_gesture_lines(&self) -> Vec<Line<'static>> {
-        // Clamped, not indexed. The arrow handler wraps this selection modulo the
-        // list length, so it is in range today, but a DRAW must never be able to
-        // panic: an index that survives a list shrinking (or any future writer
-        // that forgets the wrap) would take the whole interface down mid-setup
-        // instead of mis-highlighting one row.
-        let picked = SETTINGS_GESTURE_SERVICES
-            .get(self.settings_svc_sel)
-            .copied()
-            .unwrap_or(SETTINGS_GESTURE_SERVICES[0]);
-        // Tri-state, like the panels below it: an unprivileged TUI cannot read
-        // root-only settings.conf, so an explicit value can be unknown even
-        // though the optional default is off.
-        let required = irlume_common::config::service_gesture_required_visible(picked);
-        let mut row: Vec<Span> = vec![Span::raw("  ")];
-        for (i, &svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
-            let style = if i == self.settings_svc_sel {
-                Style::new().fg(th().accent).add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().dim()
+        // Hit targets must use the offset chosen by the rendered List. Long
+        // profiles scroll; row zero in the viewport is not row zero in storage.
+        let mut row_y = area.y;
+        for (i, row) in rows.iter().enumerate().skip(st.offset()) {
+            let height = match row {
+                Row::Profile(pi) => {
+                    let p = &self.profiles[*pi];
+                    let live_count = p
+                        .live_recognizer
+                        .as_deref()
+                        .and_then(|l| p.scans_by_recognizer.get(l).copied())
+                        .unwrap_or(0);
+                    let misleading = p.scans_by_recognizer.len() > 1
+                        || (p.live_recognizer.is_some() && live_count != p.scans.len());
+                    1 + u16::from(misleading && live_count == 0)
+                        + crate::profile_ir::lines(p).len() as u16
+                        + u16::from(crate::profile_ir::needs_capture(p))
+                }
+                Row::Scan(_, _) => 1,
             };
-            row.push(Span::styled(format!("{svc}   "), style));
+            if row_y < area.y.saturating_add(area.height) {
+                self.hit(
+                    Rect::new(
+                        area.x,
+                        row_y,
+                        area.width,
+                        height.min(area.y.saturating_add(area.height).saturating_sub(row_y)),
+                    ),
+                    Click::Select(i),
+                );
+            }
+            row_y = row_y.saturating_add(height);
         }
-        row.push(Span::raw(format!("   {picked}: ")));
-        row.push(onoff_opt(required));
-        vec![
-            section("Face confirmation: keyboard required"),
-            section("Additional head gesture (experimental)   ([↑/↓] pick  [c] toggle)"),
-            Line::from(row),
-            // The decline half, stated once where the gesture is configured. A
-            // user told only how to approve does not know a shake is a
-            // deliberate "no" the daemon acts on.
-            Line::from(Span::styled(
-                "  Keep nodding to approve; shake your head to decline.",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-        ]
     }
 
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
@@ -4940,68 +5069,11 @@ impl App {
         // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
         // drew "turn it on" while the daemon was already enforcing.
         let bio = irlume_common::config::enforce_biopolicy_visible();
-        // The service picker is the third row of `service_gesture_lines`.
-        // Make each label directly selectable; the click chooses only, while
-        // [c] remains the deliberate state-changing action.
-        let service_y = area.y.saturating_add(2);
-        let mut service_x = area.x.saturating_add(2);
-        for (i, svc) in SETTINGS_GESTURE_SERVICES.iter().enumerate() {
-            let width = svc.chars().count() as u16 + 3;
-            if service_y < area.y.saturating_add(area.height) {
-                self.hit(Rect::new(service_x, service_y, width, 1), Click::Select(i));
-            }
-            service_x = service_x.saturating_add(width);
-        }
         f.render_widget(
             Paragraph::new({
                 let mut v = Vec::new();
-                v.extend(self.service_gesture_lines());
+                v.push(section("Face confirmation: keyboard required"));
                 v.extend(vec![
-                    section("Head gesture before keyring release"),
-                    {
-                        // Tri-state, not a bool: settings.conf is root-only, so an
-                        // unprivileged TUI genuinely cannot read this. Off is the
-                        // DEFAULT (no nod on a cold login), so it shows neutrally, not
-                        // as a warning; on is the opt-in extra step.
-                        let (icon, icon_style, label) =
-                            match irlume_common::config::credential_release_challenge_visible() {
-                                Some(true) => (
-                                    "●",
-                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                    "required (opt-in)".to_string(),
-                                ),
-                                Some(false) => (
-                                    "○",
-                                    Style::new().dim(),
-                                    "off (default): the keyring releases with no nod".to_string(),
-                                ),
-                                None => (
-                                    "◐",
-                                    Style::new().fg(th().warn),
-                                    "on/off is root-only; run the TUI with sudo to see it"
-                                        .to_string(),
-                                ),
-                            };
-                        Line::from(vec![
-                            Span::raw("  state  "),
-                            Span::styled(format!("{icon} "), icon_style),
-                            Span::styled(label, Style::new().dim()),
-                        ])
-                    },
-                    // The gesture proves INTENT, not liveness (it fired on a hand-held
-                    // print 2 times in 24 on 2026-07-27), which is why it defaults OFF
-                    // for the greeter cold login and logout; the IR gate stops a print.
-                    // ONE line: this panel does not scroll and the per-service section
-                    // above needs the room. THREAT_MODEL.md carries the numbers.
-                    Line::from(Span::styled(
-                        "  Off by default (a cold login releases with no nod). On adds a nod.",
-                        Style::new().dim(),
-                    )),
-                    Line::from(vec![
-                        Span::styled("  [g]", Style::new().fg(th().accent)),
-                        Span::styled(" turn it on or off (sudo)", Style::new().dim()),
-                    ]),
-                    Line::raw(""),
                     section("Biopolicy operation-class gate"),
                     {
                         // The shared tri-state reader, not the raw config read the
@@ -6166,12 +6238,12 @@ impl App {
         lines.push(act(
             "[u]",
             "Wire face-sudo",
-            "opt-in; nod to approve and shake your head to decline sudo prompts",
+            "opt-in; type yes for one face attempt at sudo prompts",
         ));
         lines.push(act(
             "[p]",
             "Wire app prompts",
-            "opt-in; nod to approve and shake your head to decline app prompts",
+            "opt-in; type yes for one face attempt at app prompts",
         ));
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
@@ -6204,7 +6276,7 @@ impl App {
                     Span::raw("  Bitwarden   "),
                     Span::styled("● polkit action installed", Style::new().fg(th().ok)),
                     Span::styled(
-                        "  (turn on \"unlock with system authentication\"; nod to approve, shake to decline)",
+                        "  (turn on \"unlock with system authentication\"; type yes for one face attempt)",
                         Style::new().dim(),
                     ),
                 ]));
@@ -6256,14 +6328,6 @@ impl App {
                 onoff_opt(self.keyring_armed),
             ]),
             Line::from(vec![
-                Span::raw("  keyring gesture   "),
-                match irlume_common::config::credential_release_challenge_visible() {
-                    Some(v) => onoff(v),
-                    // Root-only setting: say unknown rather than claim either state.
-                    None => Span::styled("◐ root-only", Style::new().fg(th().warn)),
-                },
-            ]),
-            Line::from(vec![
                 Span::raw("  templates enc     "),
                 // Three states, not two. An encrypted store whose key is gone
                 // cannot be opened by anything, and `encrypted` alone drew it as
@@ -6285,7 +6349,7 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  biopolicy         "),
-                // Same tri-state as the gesture row above: the CLI half fixed
+                // Same tri-state as the policy rows: the CLI half fixed
                 // this in `status` (settings.conf is 0600 root-only, so an
                 // unreadable key must not print as off), and the two surfaces
                 // must agree on the daemon's truthy set and env override.
@@ -6447,7 +6511,7 @@ impl App {
                 ("r", "Recheck"),
                 ("d", "Full Diagnostics"),
                 ("a", "TPM Diagnostics"),
-                ("v", "Record Trace (60s)"),
+                ("T", "Record Trace (60s)"),
                 ("s", "Create Support Report"),
                 ("l", "Test Infrared Camera"),
                 ("g", "Show Logs"),
@@ -6506,12 +6570,7 @@ impl App {
                 ("x", "Disconnect…"),
                 ("s", "Show Status"),
             ],
-            SC_SETTINGS => &[
-                ("↑/↓", "Select Service"),
-                ("c", "Toggle Additional Head Gesture…"),
-                ("g", "Wallet Gesture…"),
-                ("b", "Biopolicy…"),
-            ],
+            SC_SETTINGS => &[("b", "Biopolicy…")],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
             // a needless `sudo irlume login enable --apply` re-run. Unknown
@@ -6609,6 +6668,15 @@ impl App {
                 );
             }
         }
+        let more_x = x;
+        let chip = key("F2");
+        x = x.saturating_add(chip.content.chars().count() as u16 + 10);
+        spans.push(chip);
+        spans.push(Span::styled(" actions  ", Style::new().dim()));
+        self.hit(
+            Rect::new(more_x, inner_y, x.saturating_sub(more_x), 1),
+            Click::Key(KeyCode::F(2)),
+        );
         let help_x = x;
         let s = key("?");
         let w = s.content.chars().count() as u16;
@@ -6631,7 +6699,7 @@ impl App {
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n         PgUp/Dn  scroll activity history\n               h  Overview              q  quit\n           click  rows and action chips\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n         PgUp/Dn  scroll activity history\n               h  Overview              q  quit\n           click  rows and action chips\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -7144,9 +7212,126 @@ fn merge_confirmation_required(first_new_profile_scan: bool, created: bool) -> b
     first_new_profile_scan && !created
 }
 
+/// One framing/countdown phase followed by one authorized batch connection.
+fn enroll_worker(
+    user: String,
+    profile: String,
+    add: Option<String>,
+    target: usize,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<WMsg>,
+) {
+    let send = |m| tx.send(m).is_ok();
+    let mut misses = 0;
+    let mut session = match irlume_common::client::PositionSession::connect(&user, &stop) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = send(WMsg::Err(format!("camera guide could not start: {error}")));
+            return;
+        }
+    };
+    loop {
+        let mut sample = |request: &Request| match session.as_mut() {
+            Some(session) => Ok(match session.sample(&stop) {
+                Ok(report) => Response::Position(report),
+                // An accepted session cannot safely resume through another
+                // connection after a framing, transport or deadline failure.
+                Err(error) => Response::Error(format!("camera guide stopped: {error}")),
+            }),
+            None => crate::daemon_sample(request),
+        };
+        match guide_until_capture(&user, &stop, &send, &mut sample, &mut misses) {
+            GuideOutcome::Ready => break,
+            GuideOutcome::Reframe => continue,
+            GuideOutcome::Halt => return,
+        }
+    }
+    // Await release, not just socket close: the daemon polls disconnects, so
+    // a second camera request could otherwise overtake release of this one.
+    if let Some(session) = session {
+        if let Err(error) = session.finish(&stop) {
+            let _ = send(WMsg::Err(format!("camera guide could not finish: {error}")));
+            return;
+        }
+    }
+    if !send(WMsg::Authorizing) {
+        return;
+    }
+    let request = Request::EnrollmentSession {
+        user: user.clone(),
+        profile: Some(profile.clone()),
+        scans: target,
+        improve: add.is_some(),
+    };
+    let mut started = false;
+    let result = irlume_common::client::enrollment_session(&request, &stop, |event| {
+        match event {
+            irlume_common::EnrollmentEvent::Started => {
+                started = true;
+            }
+            irlume_common::EnrollmentEvent::Progress { captured, target } => {
+                if !send(WMsg::Captured(captured, target)) {
+                    return Err(std::io::Error::other("enrollment UI closed"));
+                }
+            }
+            irlume_common::EnrollmentEvent::Merge { profile, remaining } => {
+                let (answer, reply) = mpsc::channel();
+                if !send(WMsg::SessionMerge(SessionMerge {
+                    profile,
+                    remaining,
+                    answer,
+                })) {
+                    return Err(std::io::Error::other("enrollment UI closed"));
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    if stop.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::other("enrollment cancelled"));
+                    }
+                    match reply.recv_timeout(Duration::from_millis(100)) {
+                        Ok(accept) => return Ok(Some(accept)),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(std::io::Error::other("enrollment UI closed"))
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }
+        }
+        Ok(None)
+    });
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    match result {
+        Ok(Response::Enrolled { ambient_lit, .. }) => {
+            let _ = send(WMsg::Done {
+                ambient_lit: ambient_lit.unwrap_or(0),
+            });
+        }
+        // The old daemon answers an unknown request with exactly "bad request".
+        // Only that pre-acceptance parse refusal permits the old path. Never repeat an accepted operation after a lost reply.
+        Ok(Response::Error(error)) if !started && error == "bad request" => {
+            let _ = send(WMsg::Stall("older daemon: using per-scan enrollment; update and restart irlumed for the faster flow".into()));
+            legacy_enroll_worker(user, profile, add, target, stop, tx);
+        }
+        Ok(Response::Error(error)) => {
+            let _ = send(WMsg::Err(error));
+        }
+        Ok(other) => {
+            let _ = send(WMsg::Err(format!("unexpected enrollment reply: {other:?}")));
+        }
+        Err(error) => {
+            let _ = send(WMsg::Err(format!(
+                "enrollment connection ended: {error}; refresh profiles before retrying"
+            )));
+        }
+    }
+}
+
 /// Guided-enroll worker: poll the framing guide, count down on a good streak,
 /// then capture, repeating until `target` scans. Streams cues to the UI.
-fn enroll_worker(
+fn legacy_enroll_worker(
     user: String,
     profile: String,
     add: Option<String>,
@@ -7199,7 +7384,13 @@ fn enroll_worker(
                     report_enrollment: true,
                 }
             };
-            match crate::daemon_request(&req) {
+            match irlume_common::client::request_cancellable(
+                &req,
+                std::time::Duration::from_secs(380),
+                &stop,
+            )
+            .map_err(|error| error.to_string())
+            {
                 // Scan 1 of a new-profile enroll matched an existing identity:
                 // the daemon merged it. Hand off to the UI to confirm before
                 // adding the rest; the worker ends here (the UI spawns a
@@ -7273,6 +7464,337 @@ mod tests {
     /// That meant an empty dashboard for a configured user, and `[a]`/`[e]`
     /// sealing a password and enrolling a face under the wrong account. The rule
     /// lives in `user_arg`; this pins the TUI to it.
+    #[test]
+    fn settings_has_no_gesture_controls_or_actions() {
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        assert!(text.contains("Face confirmation: keyboard required"));
+        for removed in [
+            "head gesture",
+            "keyring gesture",
+            "nodding",
+            "shake your head",
+        ] {
+            assert!(!text.contains(removed), "{text}");
+        }
+        for key in [KeyCode::Char('c'), KeyCode::Char('g'), KeyCode::Enter] {
+            app.on_key(key);
+            assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
+        }
+    }
+
+    #[test]
+    fn guided_merge_prompt_keeps_one_operation_and_cancel_never_deletes_a_saved_scan() {
+        let _guard = dead_socket();
+        for accept in [true, false] {
+            let mut app = test_app();
+            let (_tx, mut enrollment) = fake_enroll(0, 10);
+            let stop = enrollment.stop.clone();
+            let (answer, reply) = mpsc::channel();
+            enrollment.session_merge = Some(SessionMerge {
+                profile: "Existing".into(),
+                remaining: 9,
+                answer,
+            });
+            app.enroll = Some(enrollment);
+            let text = draw_text(&app);
+            assert!(text.contains("No scans have been saved"));
+            app.on_key(KeyCode::Char(if accept { 'y' } else { 'n' }));
+            assert_eq!(reply.try_recv().unwrap(), accept);
+            assert_eq!(app.enroll.is_some(), accept);
+            assert_eq!(stop.load(Ordering::Relaxed), !accept);
+            assert!(
+                app.op.is_none(),
+                "pending-session decline must not send a compensating DeleteScan"
+            );
+            // Decline refreshes light state and probes as well as profiles.
+            // Keep the dead socket installed until all three workers finish;
+            // otherwise a delayed Ping can enter the next test's fixture.
+            drain_loads(&mut app);
+            assert!(app.light_load.is_none());
+            assert!(app.profiles_load.is_none());
+            assert!(app.probes_load.is_none());
+        }
+    }
+
+    #[test]
+    fn guided_enrollment_uses_one_batch_after_one_countdown() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let path =
+            std::env::temp_dir().join(format!("irlume-guided-batch-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            // The compatibility daemon rejects the new request before any
+            // framing session is accepted, then serves the original API.
+            let (mut unsupported, _) = listener.accept().unwrap();
+            let mut initial = String::new();
+            std::io::BufReader::new(&unsupported)
+                .read_line(&mut initial)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&initial).unwrap(),
+                Request::PositionSession { .. }
+            ));
+            writeln!(
+                unsupported,
+                "{}",
+                serde_json::to_string(&Response::Error("bad request".into())).unwrap()
+            )
+            .unwrap();
+            drop(unsupported);
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&socket)
+                    .read_line(&mut line)
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Request>(&line).unwrap(),
+                    Request::PositionSample { .. }
+                ));
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&Response::Position(good_report("Ready"))).unwrap()
+                )
+                .unwrap();
+            }
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&socket)
+                .read_line(&mut line)
+                .unwrap();
+            let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
+            if !batch {
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&Response::Error("expected one batch".into())).unwrap()
+                )
+                .unwrap();
+                return false;
+            }
+            for response in [
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Started),
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Progress {
+                    captured: 10,
+                    target: 10,
+                }),
+                Response::Enrolled {
+                    profile: "New".into(),
+                    created: true,
+                    added: 10,
+                    total: 10,
+                    room: Some(20),
+                    added_scans: vec![],
+                    ambient_lit: Some(0),
+                },
+            ] {
+                writeln!(socket, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            true
+        });
+        let (tx, rx) = mpsc::channel();
+        enroll_worker(
+            "test-user".into(),
+            "New".into(),
+            None,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        let batch = server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            batch,
+            "guided enrollment must authorize and capture one bounded batch"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, WMsg::Count(_)))
+                .count(),
+            3
+        );
+        assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+    }
+
+    #[test]
+    fn guided_enrollment_reuses_framing_connection_and_releases_it_before_authorization() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let path =
+            std::env::temp_dir().join(format!("irlume-guided-framing-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut guide, _) = listener.accept().unwrap();
+            guide
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(guide.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if serde_json::from_str::<serde_json::Value>(&line).unwrap()
+                != serde_json::json!({"PositionSession":{"user":"test-user"}})
+            {
+                return false;
+            }
+            writeln!(guide, "\"PositionSessionStarted\"").unwrap();
+            for _ in 0..6 {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                    "Sample"
+                );
+                writeln!(
+                    guide,
+                    "{}",
+                    serde_json::to_string(&Response::Position(good_report("Ready"))).unwrap()
+                )
+                .unwrap();
+            }
+            line.clear();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "client must request and await camera release before enrollment"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                "Finish"
+            );
+            writeln!(guide, "\"PositionSessionEnded\"").unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "framing must close before enrollment authorization starts"
+            );
+            drop(reader);
+            drop(guide);
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&socket)
+                .read_line(&mut line)
+                .unwrap();
+            let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
+            if !batch {
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&Response::Error("expected one batch".into())).unwrap()
+                )
+                .unwrap();
+                return false;
+            }
+            for response in [
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Started),
+                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Progress {
+                    captured: 10,
+                    target: 10,
+                }),
+                Response::Enrolled {
+                    profile: "New".into(),
+                    created: true,
+                    added: 10,
+                    total: 10,
+                    room: Some(20),
+                    added_scans: vec![],
+                    ambient_lit: Some(0),
+                },
+            ] {
+                writeln!(socket, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            true
+        });
+        let (tx, rx) = mpsc::channel();
+        enroll_worker(
+            "test-user".into(),
+            "New".into(),
+            None,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        let batch = server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            batch,
+            "guided enrollment must authorize and capture one bounded batch"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, WMsg::Count(_)))
+                .count(),
+            3
+        );
+        assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+    }
+
+    #[test]
+    fn accepted_framing_failure_never_falls_back_or_starts_enrollment() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let path =
+            std::env::temp_dir().join(format!("irlume-guide-accepted-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::PositionSession { .. }
+            ));
+            writeln!(stream, "\"PositionSessionStarted\"").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "\"Sample\"\n");
+            // The compatibility phrase is only meaningful BEFORE acceptance.
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&Response::Error("bad request".into())).unwrap()
+            )
+            .unwrap();
+            line.clear();
+            assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let (tx, rx) = mpsc::channel();
+        enroll_worker(
+            "test-user".into(),
+            "New".into(),
+            None,
+            10,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(messages.iter().any(|m| matches!(m, WMsg::Err(_))));
+        assert!(!messages
+            .iter()
+            .any(|m| matches!(m, WMsg::Authorizing | WMsg::Done { .. })));
+    }
+
     #[test]
     fn the_tui_targets_the_invoking_user_not_the_sudo_environment() {
         // The rule itself: SUDO_USER wins over the root $USER that sudo sets.
@@ -7387,6 +7909,7 @@ mod tests {
 
     #[test]
     fn first_run_tab_exits_but_advanced_toggle_only_changes_future_navigation() {
+        let _guard = dead_socket();
         let mut advanced = test_app();
         advanced.caps = irlume_camera::Caps {
             ir_pair: true,
@@ -7408,6 +7931,7 @@ mod tests {
         tabbed.on_key(KeyCode::Tab);
         assert!(!tabbed.is_first_run());
         assert_ne!(tabbed.screen, SC_WELCOME);
+        drain_loads(&mut tabbed);
     }
 
     #[test]
@@ -7454,6 +7978,7 @@ mod tests {
 
     #[test]
     fn clicking_a_sidebar_row_navigates_to_it() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.caps = irlume_camera::Caps {
             ir_pair: true,
@@ -7478,6 +8003,7 @@ mod tests {
         let inner = Block::bordered().inner(app.body_split(body).0.unwrap());
         app.on_click(inner.x, inner.y + idx as u16, area);
         assert_eq!(app.screen, target, "clicking a row jumps to its screen");
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -7528,6 +8054,7 @@ mod tests {
 
     #[test]
     fn clicking_an_overview_status_row_opens_its_section() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.daemon_up = true;
         app.profiles_loaded = true;
@@ -7551,6 +8078,7 @@ mod tests {
             .expect("Overview status rows are clickable");
         app.on_click(row.x, row.y, area);
         assert_eq!(app.screen, target);
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -7584,6 +8112,46 @@ mod tests {
     }
 
     #[test]
+    fn profile_ir_guidance_renders_and_mouse_rows_follow_scrolled_heights() {
+        for (height, selected) in [(20, 0), (8, 3)] {
+            let mut app = test_app();
+            app.screen = SC_PROFILES;
+            app.profiles = vec![profile("one", &["scan-one"]), profile("two", &["scan-two"])];
+            app.profiles[0].ir = Some(irlume_common::ProfileIrSummary {
+                compatible_scans: 2,
+                unknown_scans: 1,
+                calibration_withheld: true,
+                ..Default::default()
+            });
+            app.sel = selected;
+            let area = Rect::new(0, 0, 80, height);
+            let mut term = Terminal::new(TestBackend::new(80, height)).unwrap();
+            term.draw(|f| app.draw_profiles(f, area)).unwrap();
+            let text = rendered(&term);
+            if selected == 0 {
+                for line in crate::profile_ir::lines(&app.profiles[0]) {
+                    assert!(text.contains(&line), "missing {line}: {text}");
+                }
+                assert!(text.contains("[a] Improve Recognition with an IR camera."));
+            }
+            let mut checked = 0;
+            for (rect, click) in app.click_targets.borrow().iter() {
+                if let Click::Select(i) = click {
+                    let label = ["● one", "↳ scan-one", "● two", "↳ scan-two"][*i];
+                    let row = text.lines().nth(rect.y as usize).unwrap();
+                    assert!(
+                        row.contains(label),
+                        "hit {i} points at {row:?}, expected {label}"
+                    );
+                    assert!(rect.y + rect.height <= height);
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0);
+        }
+    }
+
+    #[test]
     fn clicking_a_profile_or_diagnostic_row_selects_it() {
         let area = Rect::new(0, 0, 120, 40);
         let mut app = test_app();
@@ -7611,20 +8179,6 @@ mod tests {
             .expect("diagnostic rows are clickable");
         app.on_click(diagnostic_row.x, diagnostic_row.y, area);
         assert_eq!(app.repair_sel, 1, "diagnostic row click updates selection");
-
-        app.screen = SC_SETTINGS;
-        term.draw(|f| app.draw(f)).unwrap();
-        let service = app
-            .click_targets
-            .borrow()
-            .iter()
-            .find_map(|(rect, click)| matches!(click, Click::Select(2)).then_some(*rect))
-            .expect("preference service labels are clickable");
-        app.on_click(service.x, service.y, area);
-        assert_eq!(
-            app.settings_svc_sel, 2,
-            "service label click updates selection"
-        );
     }
 
     #[test]
@@ -7700,6 +8254,260 @@ mod tests {
         a
     }
 
+    #[test]
+    fn audit_trace_shortcut_requires_confirmation_and_defers_execution() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        let advanced = app.advanced;
+        app.on_key(KeyCode::Char('T'));
+        assert!(
+            app.confirm.is_some(),
+            "trace needs a visible confirmation before sudo"
+        );
+        assert!(app.suspend.is_none());
+        assert_eq!(app.advanced, advanced);
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none());
+        assert!(app.suspend.is_none());
+        app.on_key(KeyCode::Char('T'));
+        app.on_key(KeyCode::Char('y'));
+        assert!(
+            app.suspend.is_some(),
+            "run only after leaving the alternate screen"
+        );
+    }
+
+    #[test]
+    fn audit_more_actions_is_searchable_and_cannot_execute_behind_a_modal() {
+        let mut app = test_app();
+        app.on_key(KeyCode::F(2));
+        for c in "trace explain".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        assert!(draw_text(&app).contains("Explain a recorded trace"));
+        app.on_key(KeyCode::Enter);
+        assert!(
+            app.input.is_some(),
+            "ask for the trace file, not a shell command"
+        );
+        app.on_key(KeyCode::F(2));
+        assert!(
+            app.input.is_some(),
+            "F2 cannot replace an active input flow"
+        );
+        app.on_key(KeyCode::Esc);
+        assert!(app.suspend.is_none());
+    }
+
+    #[test]
+    fn audit_profile_refresh_preserves_the_selected_person_and_scan() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["b1"])];
+        app.sel = 3; // Bob's b1 scan
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["a1", "a2"]), profile("Bob", &["b1"])],
+        })
+        .unwrap();
+        app.poll();
+        app.begin_delete();
+        assert!(
+            matches!(app.confirm, Some((_, _, ConfirmAct::Daemon(Request::DeleteScan { ref profile, ref scan, .. }))) if profile == "Bob" && scan == "b1")
+        );
+    }
+
+    #[test]
+    fn audit_removed_selection_cannot_silently_target_another_person() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["b1"])];
+        app.sel = 2;
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["a1"]), profile("Carol", &["c1"])],
+        })
+        .unwrap();
+        app.poll();
+        app.begin_delete();
+        assert!(app.confirm.is_none(), "removed Bob must not become Carol");
+        let (tx, rx) = mpsc::channel();
+        app.profiles_load = Some(rx);
+        tx.send(ProfilesOutcome::Loaded {
+            profiles: vec![profile("Alice", &["a1", "a2"]), profile("Carol", &["c1"])],
+        })
+        .unwrap();
+        app.poll();
+        app.begin_delete();
+        assert!(
+            app.confirm.is_none(),
+            "another refresh must keep selection cleared"
+        );
+        app.move_sel(1);
+        assert!(
+            app.sel_profile().is_some(),
+            "arrow keys restore an explicit selection"
+        );
+    }
+
+    #[test]
+    fn audit_clicking_a_scrolled_profile_list_selects_the_visible_scan() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let scans: Vec<_> = (0..30).map(|n| format!("scan-{n:02}")).collect();
+        let names: Vec<_> = scans.iter().map(String::as_str).collect();
+        app.profiles = vec![profile("Alice", &names)];
+        app.sel = 25;
+        let area = Rect::new(0, 0, 70, 8);
+        let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| app.draw_profiles(f, area)).unwrap();
+        let text = rendered(&terminal);
+        let y = text
+            .lines()
+            .position(|line| line.contains("scan-20"))
+            .expect("scrolled scan must be visible");
+        app.on_click(5, y as u16, area);
+        app.begin_delete();
+        assert!(
+            matches!(app.confirm, Some((_, _, ConfirmAct::Daemon(Request::DeleteScan { ref scan, .. }))) if scan == "scan-20")
+        );
+    }
+
+    #[test]
+    fn audit_camera_refresh_does_not_block_navigation_on_daemon_latency() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        let sock = std::env::temp_dir().join(format!(
+            "irlume-tui-camera-audit-{}.sock",
+            std::process::id()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &sock);
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in [
+                Response::Cameras(vec![]),
+                Response::Error("old daemon".into()),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                requests.push(serde_json::from_str::<Request>(&line).unwrap());
+                std::thread::sleep(Duration::from_millis(150));
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            requests
+        });
+        let mut app = test_app();
+        let started = std::time::Instant::now();
+        app.refresh_camera_listing();
+        let blocked = started.elapsed();
+        let requests = server.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !app.pairs_known && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_file(sock).unwrap();
+        assert!(
+            app.pairs_known,
+            "the completed background result must land; requests={requests:?}"
+        );
+        assert!(
+            blocked < Duration::from_millis(100),
+            "camera metadata blocked navigation for {blocked:?}"
+        );
+    }
+
+    #[test]
+    fn audit_more_actions_preserves_literal_arguments_and_selected_account() {
+        let mut app = test_app();
+        app.user = "shared-account".into();
+        app.on_key(KeyCode::F(2));
+        for c in "profiles add-scan".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "Person with glasses; $(literal)".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "3".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(app.suspend.is_none(), "review before executing");
+        assert!(draw_text(&app).contains("shared-account"));
+        app.on_key(KeyCode::Char('y'));
+        let Some(Suspend::MoreAction(invocation)) = app.suspend else {
+            panic!("confirmed action missing");
+        };
+        assert_eq!(
+            invocation.args("shared-account"),
+            [
+                "profiles",
+                "add-scan",
+                "--profile",
+                "Person with glasses; $(literal)",
+                "--scans",
+                "3",
+                "--user",
+                "shared-account"
+            ]
+        );
+        assert!(
+            !invocation.action.root,
+            "account enrollment must retain the OS authorization gate"
+        );
+    }
+
+    #[test]
+    fn audit_more_action_fields_reject_options_and_zero_scan_count() {
+        let mut app = test_app();
+        app.on_key(KeyCode::F(2));
+        for c in "chosen scan count".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        for c in "--reset".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_some());
+        assert!(app.confirm.is_none());
+        for _ in 0..7 {
+            app.on_key(KeyCode::Backspace);
+        }
+        app.on_key(KeyCode::Enter); // omitted optional name
+        app.on_key(KeyCode::Char('0'));
+        app.on_key(KeyCode::Enter);
+        assert!(app.input.is_some());
+        assert!(app.confirm.is_none());
+        app.on_key(KeyCode::Esc);
+        assert!(app.suspend.is_none());
+    }
+
+    #[test]
+    fn audit_more_actions_renders_at_small_terminal_sizes() {
+        let mut app = test_app();
+        app.on_key(KeyCode::F(2));
+        for (w, h) in [(0, 0), (1, 1), (20, 6), (80, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            if w == 80 {
+                assert!(rendered(&terminal).contains("More actions"));
+            }
+        }
+    }
+
     fn test_app() -> App {
         let caps = irlume_camera::Caps {
             ir_pair: false,
@@ -7718,12 +8526,14 @@ mod tests {
             pairs: Vec::new(),
             pairs_known: false,
             capture_mode: None,
+            camera_load: None,
             activity: Vec::new(),
             input: None,
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
             show_help: false,
+            more_actions: None,
             hub_sel: 0,
             op: None,
             enroll: None,
@@ -7736,7 +8546,6 @@ mod tests {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
-            settings_svc_sel: 0,
             heavy: crate::bitwarden::tui_state(),
             heavy_at: std::time::Instant::now(),
             error: None,
@@ -7783,6 +8592,7 @@ mod tests {
         (
             tx,
             EnrollUi {
+                session_merge: None,
                 rx,
                 stop: Arc::new(AtomicBool::new(false)),
                 profile: "p".into(),
@@ -7846,6 +8656,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.op.is_none(), "async op never finished");
+        drain_loads(app);
     }
 
     /// Drive poll() until the guided-enroll worker ends (dead socket → Err).
@@ -7856,6 +8667,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.enroll.is_none(), "enroll worker never finished");
+        drain_loads(app);
     }
 
     /// Wait for every in-flight background load to land (or the budget to
@@ -7864,12 +8676,22 @@ mod tests {
     /// request time and connects to whatever socket that test set up.
     fn drain_loads(app: &mut App) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while (app.light_load.is_some() || app.probes_load.is_some() || app.profiles_load.is_some())
+        while (app.light_load.is_some()
+            || app.probes_load.is_some()
+            || app.profiles_load.is_some()
+            || app.camera_load.is_some())
             && std::time::Instant::now() < deadline
         {
             app.poll();
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(
+            app.light_load.is_none()
+                && app.probes_load.is_none()
+                && app.profiles_load.is_none()
+                && app.camera_load.is_none(),
+            "background loads must finish before releasing the test socket"
+        );
     }
 
     /// Render the full frame at 120x50 and return the flattened text.
@@ -7893,6 +8715,7 @@ mod tests {
             scans: scans.iter().map(|s| s.to_string()).collect(),
             scans_by_recognizer: Default::default(),
             live_recognizer: None,
+            ir: None,
         }
     }
 
@@ -7952,159 +8775,9 @@ mod tests {
         );
     }
 
-    // Regression: f00f316. The confirm question used to live in the border
-    // title, a single line clamped to the box width, so a long target name was
-    // cut off. It must render inside the wrapping body, with the deliberate
-    // [y] yes / [n] no hint from 093dc56.
-    /// The keyring-gesture toggle: DEFAULT OFF, so neither direction weakens a
-    /// default and [g] acts on the keypress with no y/n gate. The default renders
-    /// as off and [g] there enables the opt-in; an explicit on renders as opt-in
-    /// and [g] there returns to the default off. The rendered section reports the
-    /// state it actually read.
-    #[test]
-    fn keyring_gesture_toggle_needs_no_confirm() {
-        let _g = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("irlume-tui-crc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::var_os("IRLUME_CONFIG_DIR");
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-        std::env::remove_var("IRLUME_CREDENTIAL_RELEASE_CHALLENGE");
-
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-
-        // Default (no settings.conf): shown as off (default); [g] enables the
-        // opt-in with no confirm.
-        let text = draw_text(&app);
-        assert!(
-            text.contains("Head gesture before keyring release") && text.contains("off (default)"),
-            "the default must render as off:\n{text}"
-        );
-        app.on_key(KeyCode::Char('g'));
-        assert!(app.confirm.is_none(), "toggling needs no confirm");
-        assert!(
-            matches!(
-                app.suspend.take(),
-                Some(Suspend::CredentialReleaseChallenge(true))
-            ),
-            "from the default (off), [g] enables the opt-in"
-        );
-
-        // Explicitly on: rendered as opt-in; [g] returns to the default off with
-        // no gate.
-        std::fs::write(
-            dir.join("settings.conf"),
-            "credential_release_challenge=1\n",
-        )
-        .unwrap();
-        let text = draw_text(&app);
-        assert!(
-            text.contains("required (opt-in)"),
-            "an enabled gate must render as opt-in:\n{text}"
-        );
-        app.on_key(KeyCode::Char('g'));
-        assert!(
-            app.confirm.is_none(),
-            "returning to the default needs no confirm"
-        );
-        assert!(matches!(
-            app.suspend.take(),
-            Some(Suspend::CredentialReleaseChallenge(false))
-        ));
-
-        match old {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The per-service head-gesture toggle follows the effective shared policy:
-    /// absent is off, so the first press enables; an explicit on makes the next
-    /// press disable it directly because keyboard confirmation remains mandatory.
-    #[test]
-    fn settings_per_service_gesture_toggle_uses_the_effective_opt_in_state() {
-        let _g = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("irlume-tui-svc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::var_os("IRLUME_CONFIG_DIR");
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-
-        // The section renders with the service names.
-        let text = draw_text(&app);
-        assert!(
-            text.contains("Face confirmation: keyboard required"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Additional head gesture (experimental)"),
-            "{text}"
-        );
-        assert!(text.contains("sudo") && text.contains("polkit-1"), "{text}");
-
-        // Default (no key): sudo is off, so [c] enables it directly.
-        assert_eq!(app.settings_svc_sel, 0, "sudo is first");
-        app.on_key(KeyCode::Char('c'));
-        assert!(app.confirm.is_none(), "enabling needs no confirmation");
-        assert!(matches!(
-            app.suspend.take(),
-            Some(Suspend::ServiceGesture { ref service, on: true }) if service == "sudo"
-        ));
-
-        // ↑/↓ move the picked service.
-        app.on_key(KeyCode::Down);
-        assert_eq!(app.settings_svc_sel, 1, "Down picks the next service");
-        app.on_key(KeyCode::Up);
-        assert_eq!(app.settings_svc_sel, 0);
-
-        // polkit-1 also defaults off and the first press enables it.
-        std::fs::write(dir.join("settings.conf"), "").unwrap();
-        let polkit_i = SETTINGS_GESTURE_SERVICES
-            .iter()
-            .position(|&s| s == "polkit-1")
-            .expect("polkit-1 is in the list");
-        app.settings_svc_sel = polkit_i;
-        let text = draw_text(&app);
-        assert!(
-            text.contains("polkit-1: ○ no"),
-            "polkit must visibly default off: {text}"
-        );
-        app.on_key(KeyCode::Char('c'));
-        assert!(app.confirm.is_none());
-        assert!(matches!(
-            app.suspend.take(),
-            Some(Suspend::ServiceGesture { ref service, on: true }) if service == "polkit-1"
-        ));
-        app.settings_svc_sel = 0;
-
-        // A service explicitly ON disables directly: keyboard confirmation is
-        // mandatory and cannot be weakened by this toggle.
-        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=1\n").unwrap();
-        app.on_key(KeyCode::Char('c'));
-        assert!(app.confirm.is_none());
-        assert!(matches!(
-            app.suspend.take(),
-            Some(Suspend::ServiceGesture { ref service, on: false }) if service == "sudo"
-        ));
-
-        match old {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn hub_selection_and_enter_jump_to_the_picked_screen() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.screen = SC_WELCOME;
         app.visible = (0..SCREENS.len()).collect();
@@ -8124,6 +8797,7 @@ mod tests {
         app.hub_sel = 0;
         app.move_sel(-1);
         assert_eq!(app.hub_sel, app.hub_rows().len() - 1);
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -8250,7 +8924,7 @@ mod tests {
     // first"; refreshing your own face is what [a] Improve Recognition does,
     // so the at-cap message must point there.
     #[test]
-    fn enroll_at_cap_points_to_improve_recognition() {
+    fn audit_enroll_at_cap_points_to_improve_recognition() {
         let mut app = test_app();
         app.daemon_up = true; // skip the daemon gate; the cap check is next
         app.profiles = (0..MAX_PROFILES)
@@ -8259,10 +8933,14 @@ mod tests {
                 scans: Vec::new(),
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             })
             .collect();
         app.begin_enroll();
-        assert!(app.input.is_none(), "no name prompt at the profile cap");
+        assert!(
+            app.input.is_some(),
+            "an existing person must still reach matching at the profile cap"
+        );
         let (_, msg) = app.activity.last().expect("a cap message is logged");
         assert!(
             msg.contains("Improve Recognition"),
@@ -8671,7 +9349,8 @@ mod tests {
         std::env::set_var("PATH", &new_path);
         let mut app = test_app();
         app.resume_enroll = Some(ResumeEnroll::New);
-        app.sudo_step("start the daemon", &["systemctl", "start", "irlumed"]);
+        // A root test process bypasses sudo. Keep that path harmless too.
+        app.sudo_step("start the daemon", &[fake.to_str().unwrap()]);
         std::env::set_var("PATH", &old_path);
         assert!(
             app.resume_enroll.is_none(),
@@ -8681,6 +9360,86 @@ mod tests {
             app.error.is_some(),
             "the failure must raise the error banner"
         );
+    }
+
+    /// Exercise the real child-process path with a harmless partial write.
+    /// The fake sudo only execs our temporary script, without elevation.
+    fn privileged_command_outcome(script: Option<&str>) -> (App, bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-command-outcome-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let command = dir.join("command");
+        if let Some(script) = script {
+            let sudo = dir.join("sudo");
+            std::fs::write(&sudo, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                &command,
+                format!("#!/bin/sh\nprintf applied > \"$1\"\n{script}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let marker = dir.join("partial-change");
+        let old_path = std::env::var_os("PATH");
+        let mut app = test_app();
+        app.resume_enroll = Some(ResumeEnroll::New);
+        std::env::set_var("PATH", &dir);
+        app.sudo_step(
+            "test action",
+            &[command.to_str().unwrap(), marker.to_str().unwrap()],
+        );
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let changed = marker.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (app, changed)
+    }
+
+    #[test]
+    fn sudo_failure_does_not_claim_a_partial_change_was_rolled_back() {
+        for script in ["exit 7", "kill -TERM $$"] {
+            let (app, changed) = privileged_command_outcome(Some(script));
+            assert!(changed, "the command changed state before failing");
+            let error = app.error.as_ref().expect("failed action must be visible");
+            assert!(
+                !error.contains("not applied"),
+                "false rollback claim: {error}"
+            );
+            assert!(
+                error.contains("may"),
+                "partial completion is uncertain: {error}"
+            );
+            assert!(error.contains("review"), "show a recovery step: {error}");
+            assert!(app.resume_enroll.is_none());
+            assert!(!app.activity.iter().any(|(icon, _)| *icon == '✓'));
+        }
+    }
+
+    #[test]
+    fn sudo_launch_failure_never_claims_completion_or_resumes_enrollment() {
+        let (app, changed) = privileged_command_outcome(None);
+        assert!(!changed);
+        let error = app.error.as_ref().expect("launch failure must be visible");
+        assert!(error.contains("could not start"), "got: {error}");
+        assert!(app.resume_enroll.is_none());
+        assert!(!app.activity.iter().any(|(icon, _)| *icon == '✓'));
+    }
+
+    #[test]
+    fn sudo_success_preserves_parked_enrollment_and_reports_completion() {
+        let (app, changed) = privileged_command_outcome(Some("exit 0"));
+        assert!(changed);
+        assert!(app.error.is_none());
+        assert!(app.resume_enroll.is_some());
+        assert!(app.activity.iter().any(|(icon, _)| *icon == '✓'));
     }
 
     // ---- pure helpers -----------------------------------------------------
@@ -8892,6 +9651,7 @@ mod tests {
 
     #[test]
     fn tab_steps_wrap_and_walk_only_visible_screens() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.caps = irlume_camera::Caps {
             ir_pair: false,
@@ -8916,6 +9676,7 @@ mod tests {
         );
         app.on_key(KeyCode::Tab);
         assert_eq!(app.screen, SC_WELCOME, "Tab from the last step wraps");
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -9022,6 +9783,7 @@ mod tests {
             "[r] must announce the refresh in Activity"
         );
         assert!(!app.daemon_up, "the dead socket means daemon down");
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -9181,6 +9943,8 @@ mod tests {
         match &app.confirm {
             Some((q, _, ConfirmAct::Daemon(Request::DeleteProfile { user, profile }))) => {
                 assert!(q.contains("Delete profile 'p1'"), "got: {q}");
+                assert!(q.contains("OS approval"), "got: {q}");
+                assert!(q.contains("recovery"), "got: {q}");
                 assert_eq!((user.as_str(), profile.as_str()), ("testuser", "p1"));
             }
             _ => panic!("expected the delete-profile confirm"),
@@ -9361,7 +10125,7 @@ mod tests {
             .join(" ");
         assert!(
             flat.contains("fires the IR emitter for up to a minute")
-                && flat.contains("/etc/irlume/cameras.conf")
+                && flat.contains("stores the verdict for this exact camera and connection context")
                 && flat.contains("password will be requested"),
             "the pre-run confirmation must render every material effect:\n{text}"
         );
@@ -9780,6 +10544,7 @@ mod tests {
             app.enroll_merge.as_ref().unwrap().remaining,
             ENROLL_SCANS - 1
         );
+        drain_loads(&mut app);
     }
 
     /// The upgrade window: a 0.9.0 TUI talking to a still-running 0.8.1
@@ -9826,6 +10591,7 @@ mod tests {
             0,
             "an explicit zero is a real answer and must still cap"
         );
+        drain_loads(&mut app);
     }
 
     /// The mixed-recognizer state this release creates: a profile can hold more
@@ -9855,6 +10621,7 @@ mod tests {
             ENROLL_SCANS - 1,
             "a full profile-wide count must not zero out a recognizer with room"
         );
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -10001,6 +10768,7 @@ mod tests {
             "completion must be logged"
         );
         assert!(app.error.is_none());
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -10699,10 +11467,7 @@ mod tests {
         assert!(text.contains("[p]") && text.contains("Wire app prompts"));
         assert!(text.contains("[s]") && text.contains("Show full status"));
         assert!(text.contains("[x]") && text.contains("Un-wire everything"));
-        assert!(
-            text.contains("nod to approve and shake your head to decline"),
-            "{text}"
-        );
+        assert!(text.contains("type yes for one face attempt"), "{text}");
         for retired in [
             "Calibrate gesture",
             "Calibrate Gesture",
@@ -10927,7 +11692,7 @@ mod tests {
             (SC_RECOVERY, "Set Recovery", "Forget"),
             (SC_FINGERPRINT, "Enroll Finger", "Reset"),
             (SC_PAM, "Connect Login", "Disconnect"),
-            (SC_SETTINGS, "Toggle Additional Head Gesture", "Biopolicy"),
+            (SC_SETTINGS, "Biopolicy", "Biopolicy"),
             (SC_DONE, "Connect Login", "Refresh Status"),
         ];
         for (screen, primary, in_overlay) in cases {
@@ -11859,6 +12624,7 @@ mod tests {
                 app.screen = screen;
                 app.on_key(*key);
                 let _ = draw_text(&app);
+                wait_op_done(&mut app);
 
                 // Same key with a selection pushed past the end of every list,
                 // which is what an empty profile list plus a remembered index
@@ -11867,9 +12633,9 @@ mod tests {
                 app.screen = screen;
                 app.sel = 99;
                 app.hub_sel = 99;
-                app.settings_svc_sel = 99;
                 app.on_key(*key);
                 let _ = draw_text(&app);
+                wait_op_done(&mut app);
             }
         }
 
@@ -11943,6 +12709,7 @@ mod tests {
                     "screen {screen_name} ({screen}) advertises [{key}] {label}, \
                      and pressing it changed nothing"
                 );
+                wait_op_done(&mut app);
             }
         }
 
@@ -11960,6 +12727,7 @@ mod tests {
     /// Enter opens nothing at all.
     #[test]
     fn the_hub_selection_survives_the_list_shrinking() {
+        let _guard = dead_socket();
         let mut app = test_app();
         app.screen = SC_WELCOME;
         app.advanced = true;
@@ -11988,6 +12756,7 @@ mod tests {
         let target = app.hub_rows()[app.hub_sel].2;
         app.on_key(KeyCode::Enter);
         assert_eq!(app.screen, target, "Enter opens the highlighted section");
+        drain_loads(&mut app);
     }
 
     /// An encrypted enrollment whose template key is gone must not read as a
@@ -12068,6 +12837,7 @@ mod tests {
         let mut app = test_app();
         let (_tx, rx) = mpsc::channel();
         app.enroll = Some(EnrollUi {
+            session_merge: None,
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             profile: "BEN".into(),
@@ -12166,139 +12936,6 @@ mod tests {
                 "enforce_biopolicy={off:?} is OFF, so the row must offer ON: {text}"
             );
         }
-
-        match old {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// When settings.conf cannot be read, the gesture row must say so rather than
-    /// render a default as a fact, and [c] must refuse to pick a direction.
-    ///
-    /// The file ships 0600 root-owned, so this is what an ordinary `irlume tui`
-    /// sees. Guessing made the key one-way: every service read as required, so
-    /// the only move [c] offered was DISABLE, and pressing it after a disable
-    /// wrote `off` again while the row still claimed the gesture was in place.
-    #[test]
-    fn an_unreadable_settings_file_shows_unknown_and_refuses_to_toggle() {
-        let _g = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("irlume-tui-noread-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("settings.conf");
-        std::fs::write(&conf, "service_gesture.sudo=0\n").unwrap();
-        // Unreadable, the way the shipped file is to a non-root TUI.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let old = std::env::var_os("IRLUME_CONFIG_DIR");
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-
-        // Root can read a 0000 file, so this test only means anything unprivileged.
-        // SAFETY: geteuid reads our own credentials and cannot fail.
-        let is_root = unsafe { libc::geteuid() } == 0;
-        if !is_root {
-            let mut app = test_app();
-            app.screen = SC_SETTINGS;
-            let text = draw_text(&app);
-            assert!(
-                text.contains("◐ unknown"),
-                "an unreadable config must render as unknown, not as a default: {text}"
-            );
-
-            let before = app.suspend.is_none() && app.confirm.is_none();
-            assert!(before);
-            app.on_key(KeyCode::Char('c'));
-            assert!(
-                app.suspend.is_none() && app.confirm.is_none(),
-                "[c] must not pick a direction from a state it cannot read"
-            );
-            assert!(
-                app.activity.iter().any(|l| l.1.contains("root-only")),
-                "and it must say why: {:?}",
-                app.activity
-            );
-        }
-
-        let _ = std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600));
-        match old {
-            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
-            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The Settings tab must name BOTH halves of the gesture. A user told only
-    /// how to approve does not know a head shake is a deliberate decline the
-    /// daemon acts on (it cancels the request, and on a polkit prompt it ends the
-    /// attempt). Before this, no user-visible string in the CLI or TUI mentioned
-    /// the shake at all.
-    #[test]
-    fn settings_names_the_shake_decline() {
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        let text = draw_text(&app);
-        assert!(
-            text.contains("shake your head to decline"),
-            "the gesture section must name the decline: {text}"
-        );
-    }
-
-    #[test]
-    fn tui_contains_only_head_gesture_controls() {
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        let text = draw_text(&app);
-        assert!(text.contains("Face confirmation: keyboard required"));
-        assert!(text.contains("Additional head gesture (experimental)"));
-        assert!(text.contains("Keep nodding to approve; shake your head to decline."));
-        for retired in ["Require eyes open", "Calibrate gesture", "eye-closure"] {
-            assert!(
-                !text.contains(retired),
-                "retired TUI text remains: {retired}"
-            );
-        }
-    }
-
-    #[test]
-    fn retired_gesture_keys_do_not_dispatch_and_service_toggle_disables_directly() {
-        let _g = crate::testenv::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("irlume-tui-head-only-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.conf"), "service_gesture.sudo=1\n").unwrap();
-        let old = std::env::var_os("IRLUME_CONFIG_DIR");
-        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
-
-        let mut app = test_app();
-        app.screen = SC_PAM;
-        app.on_key(KeyCode::Char('c'));
-        assert!(
-            app.suspend.is_none(),
-            "PAM [c] must not dispatch calibration"
-        );
-
-        app.screen = SC_SETTINGS;
-        let activity_len = app.activity.len();
-        app.on_key(KeyCode::Enter);
-        assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
-        assert_eq!(
-            app.activity.len(),
-            activity_len,
-            "settings Enter must be inert"
-        );
-
-        app.on_key(KeyCode::Char('c'));
-        assert!(matches!(
-            app.suspend,
-            Some(Suspend::ServiceGesture { ref service, on: false }) if service == "sudo"
-        ));
-        assert!(app.confirm.is_none());
 
         match old {
             Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),

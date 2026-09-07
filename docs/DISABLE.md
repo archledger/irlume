@@ -110,6 +110,62 @@ repeated failures the camera itself rests while the password keeps working
 (5 strikes by default, then a 30-second camera cooldown; `IRLUME_RATE_LIMIT`
 and `IRLUME_RATE_COOLDOWN_SECS` adjust both).
 
+A deliberate head-shake cancellation ends the request without adding a failure
+or clearing previous failures. No-face and uncertain-evidence outcomes also do
+not consume strikes; hard spoof and below-threshold rejections do. Login face
+verification and face-gated password release share this per-user counter.
+Missing or empty enrollment, scans belonging only to a different recognition
+model, a retired eyes-open setting, and invalid or retired consent settings end
+the request without adding or clearing strikes. Fixing those
+settings does not erase earlier face rejections or cancel an active cooldown.
+Camera-binding refusals, PAD failures and grouped
+capture timeouts retain their existing strike behavior.
+
+A face grant or cooldown expiry resets it. Recorded failures and an active
+cooldown survive daemon restarts. Profiles and PAM services for the same Linux
+account share the budget. The counter does not receive password-success events
+and is not an overall cumulative attempt ceiling.
+
+### Persistent retry records
+
+The daemon stores version-1 records in `/var/lib/irlume/retry/<uid>.json`.
+The directory is root-owned mode 0700; files are root-owned mode 0600. A record
+contains the account UID/name, consecutive count, and an optional monotonic
+clock deadline, boot identifier and original cooldown duration. It contains no
+biometric data or credentials. The retry location is fixed; enrollment path
+overrides do not redirect it. No same-user command can reset these records.
+
+A daemon restart in the same boot keeps the original deadline. Civil-clock
+changes do not affect it. After reboot, partial failures remain and a recorded
+cooldown starts again for its original duration; this can extend the wait.
+`IRLUME_RATE_LIMIT=0` disables enforcement without deleting history. Re-enabling
+it restores that history; lowering the limit cannot replenish recorded strikes.
+
+Missing records start empty on adoption. Existing malformed, oversized,
+unreadable, wrongly owned or unsafe records refuse the face path with a password
+fallback message. UID/name mismatches also refuse: a reused UID or renamed
+account must be reconciled by an administrator. A successful face match cannot
+return a grant or release a sealed password until its reset is durably committed.
+If publication succeeds but its durability check fails, that request still
+refuses; the next operation re-reads and synchronizes the visible state before
+allowing face again.
+
+For repair, use password authentication and inspect `journalctl -u irlumed`.
+Stop `irlumed.socket` and `irlumed.service` while correcting the affected
+record's ownership, permissions,
+account binding or malformed content; preserve the count and deadline whenever
+they can be established. Inspect the exact UID with `id -u <account>` and do not
+follow symlinks or change other users' records. Removing the affected record is
+an explicit root reset of its history; do so only if the administrator intends
+that reset, then start the socket and daemon. Corrected state is re-read automatically.
+An older daemon ignores these records: downgrading loses persistence enforcement
+until the new daemon returns, even if the files remain. Do not delete them as
+part of a binary rollback.
+
+This protects recorded state across restarts, not root deletion, disk rollback,
+or a crash before a terminal outcome is committed. A crash-proof cumulative
+ceiling and independently verified recovery remain separate policy work.
+
 ## Remove everything
 
 ```sh

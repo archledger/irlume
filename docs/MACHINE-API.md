@@ -232,7 +232,7 @@ reused for a different meaning. The registry as of this contract:
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
 | `recovery-passphrase` | whether a recovery passphrase is set |
-| `credential-release-challenge` | the consent gesture required before the keyring password is released |
+| `credential-release-challenge` | reserved legacy check; always `info` after head-gesture removal |
 | `polkit-app-prompts` | whether polkit application prompts accept a face match |
 | `polkit-helper-sandbox` | whether the polkit helper's sandbox permits what irlume needs |
 | `ir-calibration` | whether this account's IR enrollment carries the per-user liveness floor |
@@ -334,8 +334,7 @@ needs root, so an ordinary caller gets `unknown`, which is not a synonym for
 Privileged face confirmation is fixed service policy, not mutable machine
 state. PAM and the daemon enforce it from the shared normalized service table;
 CLI/TUI render the same rule. Contract 1 therefore adds no confirmation or
-attestation field. Optional head-gesture configuration also remains outside the
-machine JSON contract. See
+attestation field. Head gestures have been removed. See
 [ADR-0010](adr/0010-conventional-face-intent-confirmation.md).
 
 ### `irlume profiles list --json [--user USER]`
@@ -370,6 +369,23 @@ between the package upgrade and the daemon restart. An empty array would mean
 list would be the unknown-as-zero mistake. Treat a missing `recognizers` as
 unknown and fall back to `scans`; do not treat it as a profile that needs
 re-enrolling.
+
+Profiles may also carry `ir`, reported by the daemon for its loaded
+recognizer and IR pipeline. Its `compatible_scans`, `missing_scans`,
+`unknown_scans`, and `incompatible_scans` partition that recognizer's scans.
+Missing means no IR template; unknown means no recorded IR pipeline tag;
+incompatible means a different pipeline tag or embedding dimension. Scans
+for other recognizers remain in the existing `recognizers` breakdown.
+
+`calibration_withheld` reports a stored raw-IR calibration that cannot be used
+while unknown IR scans for this recognizer remain in the profile. Compatible
+IR scans can still match without calibration. Adding fresh scans alone does
+not clear this restriction while the unknown scans remain.
+
+An absent `ir` means the daemon did not report compatibility; do not treat it
+as zero scans or prescribe re-enrollment. These are template counts, not a
+camera/liveness check or a guarantee that dark authentication will succeed.
+The field is additive within contract 1; older consumers ignore it.
 
 ### `irlume models list --json`
 
@@ -539,7 +555,7 @@ examined. `refusal` carries that distinction and is absent when granted:
 | `refusal` | what happened |
 | --- | --- |
 | `policy` | refused before any capture: the configured method, the tier, the biopolicy gate, or the rate limiter |
-| `declined` | a deliberate head shake during the consent watch |
+| `declined` | legacy daemon cancellation; current daemons do not emit this value |
 | `no-match` | a live face that did not match the enrolment |
 | `not-live` | the liveness gate refused the capture |
 

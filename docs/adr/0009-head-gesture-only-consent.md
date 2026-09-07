@@ -1,6 +1,6 @@
 # ADR-0009: Head-gesture-only consent
 
-**Status:** Accepted
+**Status:** Superseded for head gestures by [complete removal](../HEAD-GESTURE-REMOVAL.md). The eye-policy compatibility migration remains in effect.
 **Date:** 2026-08-19
 
 ## Context

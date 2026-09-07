@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+mod position_session;
+pub use position_session::PositionSession;
+
 /// Bounded wait for the initial connect (distinct from the read timeout, which
 /// must be long enough for a camera capture).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,6 +83,22 @@ pub fn request(req: &Request) -> io::Result<Response> {
     request_with_timeout(req, DEFAULT_RW_TIMEOUT)
 }
 
+/// Send a request while allowing a guided operation to cancel its reply wait.
+///
+/// Dropping the connection informs the daemon to cancel its pending approval
+/// or capture. The flag is checked at least once per 100 ms socket-read slice.
+///
+/// # Errors
+/// Returns transport/decoding errors, `ConnectionAborted` on cancellation, or
+/// `TimedOut` when the overall reply budget expires.
+pub fn request_cancellable(
+    req: &Request,
+    rw_timeout: Duration,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> io::Result<Response> {
+    request_with_timeouts_inner(req, CONNECT_TIMEOUT, rw_timeout, Some(cancelled))
+}
+
 /// A short-budget poll: used by the TUI's periodic status refresh so a busy or
 /// wedged daemon (mid-capture, not accepting) fails fast instead of stalling the
 /// UI thread for the full connect/read budget on every probe.
@@ -108,6 +127,83 @@ pub fn connect_stream(rw_timeout: Duration) -> io::Result<UnixStream> {
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
     Ok(stream)
+}
+
+/// Read progress and answer merge decisions on the one authorized connection.
+/// No automatic retry: a lost final reply must never duplicate enrollment.
+///
+/// # Errors
+/// Returns connection, framing, timeout, cancellation or callback errors.
+pub fn enrollment_session(
+    req: &Request,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut event: impl FnMut(crate::EnrollmentEvent) -> io::Result<Option<bool>>,
+) -> io::Result<Response> {
+    if !matches!(req, Request::EnrollmentSession { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected enrollment session",
+        ));
+    }
+    let stream = connect_stream(Duration::from_millis(100))?;
+    (&stream).write_all(&serialize_request(req)?)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(380);
+    let reader = CancellableReply {
+        stream: &stream,
+        cancelled,
+        deadline,
+    };
+    let mut reader = std::io::BufReader::new(reader);
+    // The scan cap is 30, with one probe/merge and occasional target updates.
+    // A fake endpoint cannot send an unbounded event stream.
+    for _ in 0..128 {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "enrollment cancelled",
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "enrollment timed out",
+            ));
+        }
+        let mut buf = Zeroizing::new(Vec::with_capacity(MAX_RESPONSE_BYTES as usize));
+        std::io::BufRead::read_until(&mut (&mut reader).take(MAX_RESPONSE_BYTES), b'\n', &mut buf)?;
+        if buf.len() as u64 >= MAX_RESPONSE_BYTES || !buf.ends_with(b"\n") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid enrollment response size",
+            ));
+        }
+        let response: Response = serde_json::from_slice(buf.trim_ascii())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        match response {
+            Response::EnrollmentSession(progress) => {
+                let merge = matches!(progress, crate::EnrollmentEvent::Merge { .. });
+                let answer = event(progress)?;
+                if merge {
+                    let accept = answer.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "merge needs a decision")
+                    })?;
+                    let mut line = serde_json::to_vec(&crate::EnrollmentDecision { accept })?;
+                    line.push(b'\n');
+                    (&stream).write_all(&line)?;
+                } else if answer.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unexpected enrollment decision",
+                    ));
+                }
+            }
+            terminal => return Ok(terminal),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "too many enrollment events",
+    ))
 }
 
 /// Whether this failure PROVES nobody is listening on the socket.
@@ -188,6 +284,15 @@ fn request_with_timeouts(
     connect_timeout: Duration,
     rw_timeout: Duration,
 ) -> io::Result<Response> {
+    request_with_timeouts_inner(req, connect_timeout, rw_timeout, None)
+}
+
+fn request_with_timeouts_inner(
+    req: &Request,
+    connect_timeout: Duration,
+    rw_timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<Response> {
     let stream =
         connect_with_timeout(&socket_path(), connect_timeout).map_err(map_connect_failure)?;
     stream.set_read_timeout(Some(rw_timeout))?;
@@ -213,8 +318,18 @@ fn request_with_timeouts(
     // buffer without bound. That caller can be `pam_irlume` inside a login.
     // The daemon is honest, but `IRLUME_SOCKET` redirects any non-setuid
     // invocation, so the peer is not always the daemon.
-    let buf =
-        read_response_line((&stream).take(MAX_RESPONSE_BYTES)).map_err(map_connect_failure)?;
+    let buf = if let Some(cancelled) = cancelled {
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let reader = CancellableReply {
+            stream: &stream,
+            cancelled,
+            deadline: std::time::Instant::now() + rw_timeout,
+        };
+        read_response_line(reader.take(MAX_RESPONSE_BYTES))
+    } else {
+        read_response_line((&stream).take(MAX_RESPONSE_BYTES))
+    }
+    .map_err(map_connect_failure)?;
     if buf.len() as u64 >= MAX_RESPONSE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -232,6 +347,41 @@ fn request_with_timeouts(
     // in the parsed value.
     serde_json::from_slice(buf.trim_ascii())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+struct CancellableReply<'a> {
+    stream: &'a UnixStream,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+    deadline: std::time::Instant,
+}
+
+impl Read for CancellableReply<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "enrollment cancelled",
+                ));
+            }
+            if std::time::Instant::now() >= self.deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "enrollment reply timed out",
+                ));
+            }
+            match self.stream.read(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
 }
 
 /// Read one newline-terminated response line into a buffer that wipes itself,
@@ -308,6 +458,126 @@ mod tests {
         let p = std::env::temp_dir().join(format!("irlume-cl-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn enrollment_cancellation_wins_over_already_buffered_success() {
+        let _g = testenv::lock();
+        let path = sock("enrollment-cancel");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream
+                .write_all(b"{\"EnrollmentSession\":\"Started\"}\n{\"Ok\":\"finished\"}\n")
+                .unwrap();
+        });
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let result = enrollment_session(
+            &Request::EnrollmentSession {
+                user: "alice".into(),
+                profile: None,
+                scans: 10,
+                improve: false,
+            },
+            &stop,
+            |_| {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            },
+        );
+        server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            matches!(result,Err(ref e) if e.kind()==io::ErrorKind::ConnectionAborted),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn enrollment_stream_preserves_coalesced_events_and_scopes_the_decision() {
+        let _g = testenv::lock();
+        let path = sock("enrollment-stream");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::EnrollmentSession {
+                    scans: 10,
+                    improve: false,
+                    ..
+                }
+            ));
+            let frames = [
+                Response::EnrollmentSession(crate::EnrollmentEvent::Started),
+                Response::EnrollmentSession(crate::EnrollmentEvent::Progress {
+                    captured: 1,
+                    target: 10,
+                }),
+                Response::EnrollmentSession(crate::EnrollmentEvent::Merge {
+                    profile: "Existing".into(),
+                    remaining: 9,
+                }),
+            ];
+            let payload = frames
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap() + "\n")
+                .collect::<String>();
+            (&stream).write_all(payload.as_bytes()).unwrap();
+            line.clear();
+            let received = reader.read_line(&mut line);
+            if received.is_err() {
+                return false;
+            }
+            let decision: crate::EnrollmentDecision = serde_json::from_str(&line).unwrap();
+            (&stream).write_all(b"{\"Ok\":\"finished\"}\n").unwrap();
+            decision.accept
+        });
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let result = enrollment_session(
+            &Request::EnrollmentSession {
+                user: "alice".into(),
+                profile: None,
+                scans: 10,
+                improve: false,
+            },
+            &stop,
+            |event| {
+                match event {
+                    crate::EnrollmentEvent::Started => {}
+                    crate::EnrollmentEvent::Progress { captured, target } => {
+                        progress.push((captured, target))
+                    }
+                    crate::EnrollmentEvent::Merge { profile, remaining } => {
+                        assert_eq!(profile, "Existing");
+                        assert_eq!(remaining, 9);
+                        return Ok(Some(true));
+                    }
+                }
+                Ok(None)
+            },
+        );
+        let accepted = server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            matches!(result, Ok(Response::Ok(ref s)) if s == "finished"),
+            "{result:?}"
+        );
+        assert_eq!(progress, vec![(1, 10)]);
+        assert!(accepted);
     }
 
     #[test]
@@ -691,5 +961,66 @@ mod tests {
             serde_json::from_slice::<Request>(&line[..line.len() - 1]).is_ok(),
             "the wiping buffer still carries parseable JSON"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    #[test]
+    fn cancellation_interrupts_a_partial_reply_without_waiting_for_newline() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        writer.write_all(b"{\"unfinished\":").unwrap();
+        let cancelled = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            let result = read_response_line(
+                CancellableReply {
+                    stream: &reader,
+                    cancelled: &cancelled,
+                    deadline: Instant::now() + Duration::from_secs(2),
+                }
+                .take(MAX_RESPONSE_BYTES),
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        });
+    }
+
+    #[test]
+    fn cancellable_reply_decodes_complete_lines_and_enforces_overall_deadline() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        writer.write_all(b"\"Pong\"\n").unwrap();
+        let result = read_response_line(
+            CancellableReply {
+                stream: &reader,
+                cancelled: &cancelled,
+                deadline: Instant::now() + Duration::from_secs(2),
+            }
+            .take(MAX_RESPONSE_BYTES),
+        )
+        .unwrap();
+        assert_eq!(&*result, b"\"Pong\"\n");
+        let expired = read_response_line(
+            CancellableReply {
+                stream: &reader,
+                cancelled: &cancelled,
+                deadline: Instant::now(),
+            }
+            .take(MAX_RESPONSE_BYTES),
+        );
+        assert_eq!(expired.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 }

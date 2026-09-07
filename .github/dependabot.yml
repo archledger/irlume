@@ -15,11 +15,9 @@
 # deps (dependabot-core#4388), so the rev pin is the only reliable guard.
 version: 2
 updates:
-  # GitHub Actions across all workflows. Deliberately NOT grouped: the header
-  # says every bump is worth seeing because a moved action is a supply-chain
-  # event, and a grouped PR would review a possibly-compromised action bump
-  # alongside benign ones. Actions are few and change rarely, so per-action
-  # PRs cost little noise for a clear per-bump audit trail.
+  # Keep different upstream actions separate for supply-chain review. CodeQL's
+  # sub-actions share one implementation and must move together: init/analyze
+  # reject each other's configuration when their versions differ.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -33,6 +31,10 @@ updates:
     # advisory job are unaffected.
     cooldown:
       default-days: 7
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
     commit-message:
       prefix: "ci"
 

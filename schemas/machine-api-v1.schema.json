@@ -553,6 +553,39 @@
                     }
                   }
                 }
+              },
+              "ir": {
+                "description": "Optional template compatibility for the loaded recognizer and IR pipeline; absent means not reported, not zero. Not an authentication readiness verdict.",
+                "type": "object",
+                "required": [
+                  "compatible_scans",
+                  "missing_scans",
+                  "unknown_scans",
+                  "incompatible_scans",
+                  "calibration_withheld"
+                ],
+                "properties": {
+                  "compatible_scans": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "missing_scans": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "unknown_scans": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "incompatible_scans": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "calibration_withheld": {
+                    "type": "boolean",
+                    "description": "Stored raw-IR calibration is withheld while unknown IR scans for this recognizer remain in this profile."
+                  }
+                }
               }
             }
           }

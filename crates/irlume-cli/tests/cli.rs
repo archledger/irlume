@@ -1599,6 +1599,7 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
                 scans: vec!["Scan 1".into(), "Glasses".into()],
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             }],
             require_eyes_open: true,
             closure_calibrated: false,
@@ -1622,6 +1623,92 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
     let (code, out, _) = run(&mut sb.cmd(&["profiles", "eyes-open", "off", "--user", "tester"]));
     assert_eq!(code, 0);
     assert!(out.contains("[profiles] eyes-open now off"), "{out}");
+}
+
+#[test]
+fn profile_ir_listing_text_and_json_keep_counts_and_targeted_refresh_command() {
+    let sb = Sandbox::new("profile-ir-guidance");
+    serve(&sock(&sb), |req| match req {
+        Request::ListProfiles { user, .. } => {
+            assert_eq!(user, "tester");
+            Response::Enrollment {
+                profiles: vec![ProfileSummary {
+                    name: "Person's glasses".into(),
+                    scans: vec!["s".into()],
+                    scans_by_recognizer: Default::default(),
+                    live_recognizer: None,
+                    ir: Some(irlume_common::ProfileIrSummary {
+                        compatible_scans: 2,
+                        missing_scans: 1,
+                        unknown_scans: 1,
+                        incompatible_scans: 1,
+                        calibration_withheld: true,
+                    }),
+                }],
+                require_eyes_open: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: false,
+            }
+        }
+        _ => panic!("listing must not mutate or capture"),
+    });
+    let (code, out, err) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("IR for loaded recognizer: 2 compatible scans."),
+        "{out}"
+    );
+    assert!(out.contains("IR: 1 missing, 1 unknown, 1 incompatible scans."));
+    assert!(out.contains("IR calibration is paused while unknown IR scans remain."));
+    assert!(out.contains("--user 'tester'"));
+    // Verify the advertised shell quoting preserves the exact display name.
+    let command = out
+        .lines()
+        .find(|l| l.contains("irlume profiles add-scan"))
+        .unwrap();
+    assert!(
+        command.contains(r#"--profile 'Person'"'"'s glasses' --user 'tester'"#),
+        "{command}"
+    );
+    let (code, out, err) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester", "--json"]));
+    assert_eq!(code, 0, "{err}");
+    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        doc["data"]["profiles"][0]["ir"],
+        serde_json::json!({
+        "compatible_scans":2,"missing_scans":1,"unknown_scans":1,
+        "incompatible_scans":1,"calibration_withheld":true })
+    );
+}
+
+#[test]
+fn profile_recognizer_refresh_hint_keeps_the_selected_account() {
+    let sb = Sandbox::new("profile-recognizer-target");
+    serve(&sock(&sb), |req| match req {
+        Request::ListProfiles { user, .. } => {
+            assert_eq!(user, "tester");
+            Response::Enrollment {
+                profiles: vec![ProfileSummary {
+                    name: "Other model".into(),
+                    scans: vec!["s".into()],
+                    scans_by_recognizer: [("embed:old".into(), 1)].into(),
+                    live_recognizer: Some("embed:current".into()),
+                    ir: None,
+                }],
+                require_eyes_open: false,
+                closure_calibrated: false,
+                ir_ratio_calibrated: false,
+            }
+        }
+        _ => panic!("listing must not mutate"),
+    });
+    let (code, out, err) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("irlume profiles add-scan --profile 'Other model' --user 'tester'"),
+        "{out}"
+    );
+    assert!(out.contains("IR compatibility: not reported by this daemon."));
 }
 
 #[test]
@@ -1769,6 +1856,7 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
                 scans: vec!["Scan 1".into(), "Scan 2".into()],
                 scans_by_recognizer: Default::default(),
                 live_recognizer: None,
+                ir: None,
             }],
             require_eyes_open: false,
             closure_calibrated: false,

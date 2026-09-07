@@ -205,6 +205,7 @@ fn one_profile() -> Vec<ProfileSummary> {
         scans: vec!["Scan 1".into(), "Scan 2".into()],
         scans_by_recognizer: Default::default(),
         live_recognizer: None,
+        ir: None,
     }]
 }
 

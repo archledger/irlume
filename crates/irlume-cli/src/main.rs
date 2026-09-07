@@ -29,6 +29,7 @@ mod machine;
 mod models;
 mod pad;
 mod pamwire;
+mod profile_ir;
 mod recovery;
 mod secrets;
 mod strays;
@@ -621,10 +622,16 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                         if live_count == 0 {
                             println!(
                                 "      none of these match the loaded recognizer; add scans \
-                                 with `irlume profiles add-scan --profile {}`",
+                                 with `irlume profiles add-scan --profile {} --user {quoted_user}`",
                                 shell_single_quote(&p.name)
                             );
                         }
+                    }
+                    for line in profile_ir::lines(p) {
+                        println!("      {line}");
+                    }
+                    if profile_ir::needs_capture(p) {
+                        println!("      Add IR scans with an IR camera: irlume profiles add-scan --profile {} --user {quoted_user}", shell_single_quote(&p.name));
                     }
                     for s in &p.scans {
                         println!("      - {s}");

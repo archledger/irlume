@@ -819,6 +819,26 @@ pub struct ProfileSummary {
     /// which of the above are live right now. `None` from an older daemon.
     #[serde(default)]
     pub live_recognizer: Option<String>,
+    /// Template compatibility for the daemon's loaded recognizer and IR
+    /// pipeline. Absent from older daemons; absence is not zero usable scans.
+    /// This is not a camera, liveness or authentication readiness verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir: Option<ProfileIrSummary>,
+}
+
+/// Aggregate IR scan compatibility for one profile and the loaded recognizer.
+/// The four counts partition that recognizer's scans. No templates, scores,
+/// camera identifiers or per-scan biometric measurements are exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProfileIrSummary {
+    pub compatible_scans: usize,
+    pub missing_scans: usize,
+    pub unknown_scans: usize,
+    pub incompatible_scans: usize,
+    /// A stored raw-IR calibration is withheld because this recognizer still
+    /// has unknown IR scans in this profile. Adding tagged scans alone does
+    /// not clear this restriction; tagged templates can still match raw.
+    pub calibration_withheld: bool,
 }
 
 /// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
@@ -1300,6 +1320,34 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_ir_metadata_is_optional_in_both_wire_directions() {
+        let old = r#"{"name":"P","scans":["s"]}"#;
+        let mut p: super::ProfileSummary = serde_json::from_str(old).unwrap();
+        assert!(p.ir.is_none());
+        assert!(serde_json::to_value(&p).unwrap().get("ir").is_none());
+        p.ir = Some(super::ProfileIrSummary::default());
+        #[derive(serde::Deserialize)]
+        struct OldProfile {
+            name: String,
+            scans: Vec<String>,
+        }
+        let old: OldProfile = serde_json::from_value(serde_json::to_value(p).unwrap()).unwrap();
+        assert_eq!(old.name, "P");
+        assert_eq!(old.scans, ["s"]);
+    }
+
+    #[test]
+    fn profile_ir_summary_survives_wire_round_trip() {
+        let ir = serde_json::json!({"compatible_scans":2,"missing_scans":1,
+            "unknown_scans":1,"incompatible_scans":1,"calibration_withheld":true});
+        let p: super::ProfileSummary = serde_json::from_value(serde_json::json!({
+            "name":"P","scans":["s"],"ir":ir
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(p).unwrap()["ir"], ir);
+    }
+
     #[test]
     fn enrollment_session_is_an_explicit_bounded_request() {
         let wire =

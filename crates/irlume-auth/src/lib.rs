@@ -4742,8 +4742,8 @@ impl Engine {
 
     /// [`Self::authenticate`] with the purpose stated explicitly, for callers that
     /// know something the service name does not say: the daemon's `UnsealPassword`
-    /// arm passes [`AuthenticationPurpose::CredentialRelease`] so releasing the
-    /// sealed keyring password cannot enter a verify-only capture optimization.
+    /// arm passes [`AuthenticationPurpose::CredentialRelease`] so grouped
+    /// capture requires a recognized local login or lock-screen service.
     ///
     /// The purpose stays explicit through capture selection; credential release
     /// must never be mistaken for plain session verification.

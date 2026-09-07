@@ -117,6 +117,8 @@ struct Document {
 struct MachineError {
     code: &'static str,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
 }
 
 fn success(command: &'static str, data: Value, contract: u32) -> Document {
@@ -139,7 +141,11 @@ fn failure(command: &'static str, code: &'static str, retryable: bool, contract:
         command,
         ok: false,
         data: None,
-        error: Some(MachineError { code, retryable }),
+        error: Some(MachineError {
+            code,
+            retryable,
+            message: (code == "camera-busy").then_some(CAMERA_BUSY_MESSAGE),
+        }),
     }
 }
 
@@ -148,6 +154,7 @@ fn failure(command: &'static str, code: &'static str, retryable: bool, contract:
 /// than inventing a meaning for it.
 fn error_code(code: OperationErrorCode) -> &'static str {
     match code {
+        OperationErrorCode::CameraBusy => "camera-busy",
         OperationErrorCode::NotAuthorized => "not-authorized",
         OperationErrorCode::OperationFailed | OperationErrorCode::Unknown => "operation-failed",
     }
@@ -255,7 +262,16 @@ impl EventStream {
 
     /// The single terminal line, as a failure.
     fn fail(mut self, code: &'static str, retryable: bool) -> ExitCode {
-        self.line("error", true, None, Some(MachineError { code, retryable }));
+        self.line(
+            "error",
+            true,
+            None,
+            Some(MachineError {
+                code,
+                retryable,
+                message: (code == "camera-busy").then_some(CAMERA_BUSY_MESSAGE),
+            }),
+        );
         ExitCode::FAILURE
     }
 }
@@ -1897,6 +1913,19 @@ impl SessionGuard {
     }
 }
 
+pub(crate) const CAMERA_BUSY_MESSAGE: &str =
+    "Camera busy. Close any app using the camera, then retry.";
+
+/// Verification only: no PAM surface or credential release.
+fn auth_test_request(user: String) -> Result<Response, String> {
+    crate::daemon_request(&Request::Authenticate {
+        user,
+        service: None,
+        intent_confirmation: None,
+        structured_errors: true,
+    })
+}
+
 /// `irlume auth test --events=jsonl`: does the claimed user's live face match
 /// their own enrolment?
 ///
@@ -1967,13 +1996,7 @@ pub fn auth_test(args: &[String]) -> ExitCode {
     stream.progress("started", json!({ "operation": "auth-test" }));
     stream.progress("capturing", json!({}));
 
-    match crate::daemon_request(&Request::Authenticate {
-        user,
-        // No PAM service: this is a diagnostic, not an authentication for a
-        // surface, so it must not inherit any surface's tier allowances.
-        service: None,
-        intent_confirmation: None,
-    }) {
+    match auth_test_request(user) {
         Ok(Response::AuthResult {
             granted,
             live,

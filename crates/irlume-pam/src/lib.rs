@@ -390,25 +390,26 @@ impl PamServiceModule for IrlumePam {
             // IGNOREs, so the password box still appears when the user did not shake).
             let deadline = Instant::now() + WAIT_BUDGET;
             loop {
-                let (mut attempt, mut delivered) = if unseal {
-                    try_unseal(&pamh, &user)
+                let (attempt, delivered) = if unseal {
+                    match try_unseal(&pamh, &user) {
+                        UnsealAttempt::Delivered(delivered) => (code_for(delivered), delivered),
+                        // Shared login/lock services may need identity only when
+                        // release was refused BEFORE any face attempt. A denial,
+                        // transport error or failed delivery must not buy a new
+                        // scan and deadline. Verify rechecks daemon policy.
+                        UnsealAttempt::Unavailable if facefirst || ondemand => {
+                            (try_verify(&pamh, &user, None), Released::Failed)
+                        }
+                        UnsealAttempt::Unavailable | UnsealAttempt::Failed => {
+                            (PamError::IGNORE, Released::Failed)
+                        }
+                    }
                 } else {
                     (
                         try_verify(&pamh, &user, intent_confirmation),
                         Released::Failed,
                     )
                 };
-                // GDM and cosmic-greeter each drive BOTH the cold greeter and the
-                // live lock screen through one service. Unsealing is refused on the
-                // convenience tier (and on an un-armed keyring); a warm screen unlock
-                // only needs identity, so fall back to a plain verify before giving up
-                // to the password. `try_verify` re-applies biopolicy in the daemon, so
-                // a cold login on a convenience tier still returns Deny here: the
-                // fallback only rescues the identity-only warm-unlock case.
-                if (facefirst || ondemand) && unseal && attempt != PamError::SUCCESS {
-                    attempt = try_verify(&pamh, &user, None);
-                    delivered = Released::Failed; // identity only, nothing released
-                }
                 // A polkit shake-decline is terminal: try_verify returned ABORT, so
                 // abort the whole PAM stack instead of cascading to the password. The
                 // attempt then fails with no password prompt, and the polkit agent
@@ -826,6 +827,7 @@ fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestat
         .and_then(irlume_common::pam_service::classify)
         .is_some_and(irlume_common::pam_service::ServiceKind::wants_consent_instruction);
     match request(&Request::Authenticate {
+        structured_errors: false,
         user: user.to_string(),
         service,
         intent_confirmation,
@@ -862,11 +864,18 @@ fn try_verify(pamh: &Pam, user: &str, intent_confirmation: Option<IntentAttestat
     }
 }
 
-/// One unseal attempt (login / cold-boot lock screen): release the sealed
-/// secret and deliver it by kind. `IGNORE` on decline/error so the password
-/// fallback runs. The second value reports HOW a success delivered, for the
-/// `kr` decision at the call site.
-fn try_unseal(pamh: &Pam, user: &str) -> (PamError, Released) {
+/// One unseal attempt: only an explicit pre-authentication refusal permits
+/// identity-only fallback.
+/// Unknown replies and legacy daemon errors fail closed to the password.
+enum UnsealAttempt {
+    Delivered(Released),
+    Unavailable,
+    Failed,
+}
+
+/// Release and deliver a secret by kind, preserving pre-auth refusal separately
+/// from failed authentication or delivery. Never log the secret.
+fn try_unseal(pamh: &Pam, user: &str) -> UnsealAttempt {
     // Pass the PAM service name so the daemon can apply opt-in biopolicy
     // operation-class gating (e.g. refuse credential release to a remote service).
     let service = pamh
@@ -879,10 +888,10 @@ fn try_unseal(pamh: &Pam, user: &str) -> (PamError, Released) {
         service,
     }) {
         Ok(Response::PasswordUnsealed { secret, kind }) => {
-            let delivered = release_secret(pamh, user, &secret, kind);
-            (code_for(delivered), delivered)
+            UnsealAttempt::Delivered(release_secret(pamh, user, &secret, kind))
         }
-        _ => (PamError::IGNORE, Released::Failed),
+        Ok(Response::UnsealUnavailable { .. }) => UnsealAttempt::Unavailable,
+        _ => UnsealAttempt::Failed,
     }
 }
 

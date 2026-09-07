@@ -2400,39 +2400,45 @@ const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
 /// classification treats these as IR too, and capture decodes them to 8-bit.
 const GREY16_FOURCCS: [&[u8; 4]; 3] = [b"Y16 ", b"Y10 ", b"Y12 "];
 
+// Only a driver EBUSY reaches this mapping. Preserve the observed-holder
+// distinction: an identified self-only conflict is an Irlume bug, not advice
+// to close another app. An incomplete scan does not identify an owner.
+fn camera_busy_error(device: &str, holders: Holders) -> Error {
+    let self_only = matches!(holders, Holders::SelfOnly);
+    let message = match holders {
+        Holders::Other(who) => format!(
+            "{device}: camera busy, in use by {who}. \
+                     Close that app (e.g. a camera/video/conferencing app) and retry."
+        ),
+        Holders::SelfOnly => format!(
+            "{device}: camera busy, and the only process holding it is irlume itself \
+                     (pid {}). That is an irlume bug, not an app you can close; please report \
+                     it with the output of `irlume doctor`.",
+            std::process::id()
+        ),
+        Holders::UnknownBlind => format!(
+            "{device}: camera busy. irlume could not identify the holder, because it \
+                     cannot read every process (see issue #207); `sudo fuser -v {device}` will \
+                     name it. Close that app and retry."
+        ),
+        Holders::None => format!(
+            "{device}: camera busy, another app is using it. \
+                     Close that app (e.g. a camera/video/conferencing app) and retry."
+        ),
+    };
+    if self_only {
+        Error::Hardware(message)
+    } else {
+        Error::CameraBusy(message)
+    }
+}
+
 /// Map common io errors to actionable messages (linhello lesson: EBUSY/privacy
 /// are routine and need a clear cause, not a raw errno).
 fn map_io(device: &str, e: std::io::Error) -> Error {
     use std::io::ErrorKind;
     match e.raw_os_error() {
-        Some(16) => {
-            // 16 == EBUSY. The advice has to match what the scan actually
-            // established: telling someone to close an app is useless when the
-            // holder is irlume itself, and worse when the scan could not see
-            // the holder at all (#187 restarted the daemon for days on the
-            // strength of a sentence naming irlumed).
-            Error::Hardware(match camera_holders(device) {
-                Holders::Other(who) => format!(
-                    "{device}: camera busy, in use by {who}. \
-                     Close that app (e.g. a camera/video/conferencing app) and retry."
-                ),
-                Holders::SelfOnly => format!(
-                    "{device}: camera busy, and the only process holding it is irlume itself \
-                     (pid {}). That is an irlume bug, not an app you can close; please report \
-                     it with the output of `irlume doctor`.",
-                    std::process::id()
-                ),
-                Holders::UnknownBlind => format!(
-                    "{device}: camera busy. irlume could not identify the holder, because it \
-                     cannot read every process (see issue #207); `sudo fuser -v {device}` will \
-                     name it. Close that app and retry."
-                ),
-                Holders::None => format!(
-                    "{device}: camera busy, another app is using it. \
-                     Close that app (e.g. a camera/video/conferencing app) and retry."
-                ),
-            })
-        }
+        Some(libc::EBUSY) => camera_busy_error(device, camera_holders(device)),
         _ if e.kind() == ErrorKind::PermissionDenied => Error::Hardware(format!(
             "{device}: permission denied; add your user to the 'video' group (camera) and re-login"
         )),
@@ -14571,6 +14577,43 @@ mod tests {
         assert_eq!(ir_frame_disposition(10.0), IrFrameDisposition::Deliver);
         assert_eq!(ir_frame_disposition(244.9), IrFrameDisposition::Deliver);
         assert_eq!(ir_frame_disposition(245.0), IrFrameDisposition::SkipBlown);
+    }
+
+    #[test]
+    fn camera_busy_type_preserves_self_contention_and_real_errno() {
+        for holder in [
+            Holders::Other("fixture app".into()),
+            Holders::UnknownBlind,
+            Holders::None,
+        ] {
+            assert!(matches!(
+                camera_busy_error("/dev/fixture", holder),
+                Error::CameraBusy(_)
+            ));
+        }
+        assert!(matches!(
+            camera_busy_error("/dev/fixture", Holders::SelfOnly),
+            Error::Hardware(_)
+        ));
+        assert!(matches!(
+            map_io(
+                "/dev/irlume-test-missing",
+                std::io::Error::from_raw_os_error(libc::EBUSY)
+            ),
+            Error::CameraBusy(_)
+        ));
+        // Similar prose cannot turn an unrelated failure into a retryable busy error.
+        assert!(matches!(
+            map_io("/dev/fixture", std::io::Error::other("camera busy")),
+            Error::Hardware(_)
+        ));
+        assert!(matches!(
+            map_io(
+                "/dev/fixture",
+                std::io::Error::from_raw_os_error(libc::EACCES)
+            ),
+            Error::Hardware(_)
+        ));
     }
 
     #[test]

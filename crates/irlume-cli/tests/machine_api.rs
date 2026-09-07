@@ -940,3 +940,80 @@ fn an_unconfirmed_record_needs_the_acknowledgement() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A busy camera is actionable, but arbitrary daemon prose must stay private.
+#[test]
+fn auth_camera_busy_is_typed_retryable_and_does_not_repeat_capture() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+    for (index, reply, code, retryable) in [
+        (
+            0,
+            serde_json::json!({"OperationError":{"code":"camera-busy","retryable":true}}),
+            "camera-busy",
+            true,
+        ),
+        (
+            1,
+            serde_json::json!({"Error":"camera busy: private fixture detail"}),
+            "operation-failed",
+            false,
+        ),
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-auth-busy-{}-{index}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            writeln!(stream, "{reply}").unwrap();
+            request
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+            .args(["auth", "test", "--events=jsonl", "--user", "root"])
+            .env("IRLUME_SOCKET", &socket)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let request: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            output.stderr.is_empty(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2]["event"], "error");
+        assert_eq!(events[2]["terminal"], true);
+        assert_eq!(events[2]["error"]["code"], code);
+        assert_eq!(events[2]["error"]["retryable"], retryable);
+        if code == "camera-busy" {
+            assert!(events[2]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Close any app"));
+        } else {
+            assert!(events[2]["error"].get("message").is_none());
+        }
+        assert!(!serde_json::to_string(&events)
+            .unwrap()
+            .contains("private fixture"));
+        assert_eq!(request["Authenticate"]["structured_errors"], true);
+        assert_eq!(request["Authenticate"]["user"], "root");
+        assert!(request["Authenticate"]["service"].is_null());
+    }
+}

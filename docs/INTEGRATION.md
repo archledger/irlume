@@ -193,3 +193,26 @@ at `/run/irlume.sock` is not.
 Include the output of `irlume doctor --json` and `irlume version --json`. Neither
 contains camera frames, embeddings, templates, passwords, TPM secrets, device
 paths, or usernames, so both are safe to attach to a public issue.
+
+## PAM credential-release retries
+
+Update the daemon and PAM module together. For `unseal ondemand` and
+`unseal facefirst`, an identity-only fallback is allowed only after the daemon
+returns `UnsealUnavailable`. This means credential release was refused before
+face authentication because the peer cannot unseal, the device is RGB-only,
+or no keyring secret is armed. The subsequent `Authenticate` request still
+enforces its own authorization and policy.
+
+A failed face attempt, incomplete PAD evidence, throttling, transport error,
+or failed secret delivery falls through to the password without starting a
+second verification. A new PAM module paired with an older daemon also falls
+back to the password on generic errors; it cannot safely infer permission to
+retry from old error text. An older module retains its old retry behavior
+until it is upgraded.
+
+Cold credential release can use grouped sequential evidence collection for a
+recognized local greeter or lock-screen service. It requires an exact measured
+camera contract, both PAD models, and the normal authentication budget. The
+five-sample evidence requirement, final identity and liveness checks, and
+deadline remain enforced. Unknown services and privileged application or
+elevation prompts do not gain access to this optimization for release.

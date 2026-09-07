@@ -472,6 +472,10 @@ pub enum Request {
     /// (convenience) device only a screen-unlock service is honoured. `None`
     /// from older callers (treated as unrestricted on IR hardware).
     Authenticate {
+        /// Opt in to typed hardware errors. Omitted/false preserves legacy
+        /// Error replies; older daemons ignore this additional request field.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        structured_errors: bool,
         user: String,
         #[serde(default)]
         service: Option<String>,
@@ -780,6 +784,8 @@ pub enum OperationErrorCode {
     /// The request was well-formed but the engine could not carry it out, for
     /// example the enrollment store could not be read.
     OperationFailed,
+    /// The camera driver reports contention. Retry once the camera is free.
+    CameraBusy,
     /// A code this build does not know. Present so a client compiled against an
     /// older contract can still decode a response from a newer daemon rather
     /// than failing the whole message.
@@ -1062,7 +1068,7 @@ pub enum Response {
     EarMedian(Option<f32>),
     Error(String),
     /// A failure the caller can act on, sent ONLY to a request that opted in
-    /// (see `ListProfiles::structured_errors`).
+    /// (see `ListProfiles::structured_errors` and `Authenticate::structured_errors`).
     ///
     /// `Error(String)` carries prose meant for a human, so the machine API had
     /// to flatten every failure into one opaque code: a request refused for
@@ -1102,6 +1108,14 @@ pub enum Response {
     /// `KdeWalletKey` envelope: the password already opens it, so nothing was
     /// unsealed and nothing needs releasing.
     KeyringUnlockNotNeeded,
+    /// `UnsealPassword` was refused before face authentication because credential
+    /// release is unavailable (peer privilege, device tier, or no armed secret).
+    /// An identity-only caller may request `Authenticate`, which independently
+    /// enforces authorization and policy. This is not a face grant, and must
+    /// never represent a failed capture, denial, throttle or secret delivery.
+    UnsealUnavailable {
+        reason: String,
+    },
     /// Face matched and the TPM released the secret (`UnsealPassword` /
     /// `UnsealKeyring`).
     PasswordUnsealed {
@@ -1279,6 +1293,11 @@ pub enum Error {
     NotAuthorized(String),
     #[error("hardware: {0}")]
     Hardware(String),
+    /// EBUSY from camera I/O, excluding an identified self-only holder bug.
+    /// Display preserves the legacy hardware error while the type survives
+    /// through the engine to clients that request structured errors.
+    #[error("hardware: {0}")]
+    CameraBusy(String),
     #[error("tpm: {0}")]
     Tpm(String),
     #[error("policy: {0}")]
@@ -1316,6 +1335,61 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_structured_errors_preserves_legacy_wire_and_unknown_codes() {
+        use super::{OperationErrorCode, Request, Response};
+        let old = serde_json::json!({"Authenticate":{"user":"alice","service":null}});
+        let request: Request = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            &request,
+            Request::Authenticate {
+                structured_errors: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&request).unwrap(), old);
+        let opted_in: Request = serde_json::from_value(serde_json::json!({"Authenticate":{
+            "user":"alice","service":null,"structured_errors":true
+        }}))
+        .unwrap();
+        assert!(matches!(
+            opted_in,
+            Request::Authenticate {
+                structured_errors: true,
+                ..
+            }
+        ));
+        #[derive(serde::Deserialize)]
+        enum LegacyRequest {
+            Authenticate { user: String },
+        }
+        let LegacyRequest::Authenticate { user } =
+            serde_json::from_value(serde_json::to_value(opted_in).unwrap()).unwrap();
+        assert_eq!(user, "alice");
+        let busy: Response = serde_json::from_value(
+            serde_json::json!({"OperationError":{"code":"camera-busy","retryable":true}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            busy,
+            Response::OperationError {
+                code: OperationErrorCode::CameraBusy,
+                retryable: true
+            }
+        ));
+        let future: Response = serde_json::from_value(
+            serde_json::json!({"OperationError":{"code":"future-code","retryable":false}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            future,
+            Response::OperationError {
+                code: OperationErrorCode::Unknown,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn profile_ir_metadata_is_optional_in_both_wire_directions() {
         let old = r#"{"name":"P","scans":["s"]}"#;
@@ -2048,6 +2122,7 @@ mod tests {
         assert!(matches!(
             old,
             Request::Authenticate {
+                structured_errors: false,
                 user,
                 service: Some(service),
                 intent_confirmation: None,
@@ -2055,6 +2130,7 @@ mod tests {
         ));
 
         let without_attestation = Request::Authenticate {
+            structured_errors: false,
             user: "alice".into(),
             service: Some("kde".into()),
             intent_confirmation: None,
@@ -2067,6 +2143,7 @@ mod tests {
         );
 
         let new = Request::Authenticate {
+            structured_errors: false,
             user: "alice".into(),
             service: Some("sudo".into()),
             intent_confirmation: Some(IntentAttestation::PamConversation),
@@ -2076,6 +2153,7 @@ mod tests {
         assert!(matches!(
             round_trip,
             Request::Authenticate {
+                structured_errors: false,
                 user,
                 service: Some(service),
                 intent_confirmation: Some(IntentAttestation::PamConversation),

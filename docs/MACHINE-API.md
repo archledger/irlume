@@ -494,6 +494,7 @@ observation rather than absent records.
 | `daemon-unavailable` | The daemon could not be reached. | yes |
 | `not-authorized` | The caller may not act on the named account. | no |
 | `operation-failed` | The engine could not carry out a well-formed request. | no |
+| `camera-busy` | The camera driver reported contention. Close apps using the camera, then retry. Auth tests include a fixed human-readable `message`. | yes |
 | `protocol-error` | The daemon replied with something this command did not expect. | no |
 
 `not-authorized` and `operation-failed` are distinct so a consumer can tell "you
@@ -506,12 +507,23 @@ so a real account and an invented one produce the identical answer, and this
 command cannot be used to discover which accounts exist or which are enrolled.
 
 `retryable` means an identical request could plausibly succeed later without the
-caller changing anything. Only `daemon-unavailable` sets it today. It is not a
+caller changing the request. A camera conflict or another Irlume operation may
+clear, so `camera-busy` and `session-busy` can also be retryable. It is not a
 promise that a retry will succeed, and it carries no suggested delay.
 
 ### `irlume auth test --events=jsonl`
 
 Capability: `auth-test-events`.
+
+Camera-busy authentication errors are typed at the camera I/O boundary; text
+containing "camera busy" is never treated as a code. The diagnostic client opts
+in to structured daemon errors. An older daemon may still return
+`operation-failed`; no automatic second capture is attempted. Older clients
+retain legacy daemon replies. An identified Irlume-only holder fault remains a
+generic hardware failure rather than advice to close another application.
+The TUI's authentication test uses the same request and renders actionable
+camera-busy guidance rather than raw JSON. `retryable` does not trigger an
+automatic retry: the camera must become available first.
 
 Does the claimed account's live face match its own enrolment? This is
 verification against one account, never identification, and it releases nothing:

@@ -796,8 +796,8 @@ struct Probes {
     tpm_present: bool,
     /// A distro PAM regeneration dropped the wiring (self-heal pending).
     reconcile_needed: bool,
-    /// The login keyring is locked right now (`None` = could not tell).
-    keyring_locked: Option<bool>,
+    /// A confirmed locked/missing default keyring (`None` = no confirmed problem).
+    keyring_problem: Option<crate::secrets::LoginKeyringProblem>,
     /// Secure Boot: (firmware supports it, currently enabled, setup mode).
     secureboot: (bool, bool, bool),
     /// Firmware boot mode label (UEFI/legacy), from efivars.
@@ -858,7 +858,7 @@ impl Probes {
             fp_keyring_wired: crate::pamwire::fp_keyring_wired(),
             tpm_present: crate::tpm_device().is_some(),
             reconcile_needed: crate::pamwire::reconcile_needed(),
-            keyring_locked: crate::secrets::login_keyring_locked(),
+            keyring_problem: crate::secrets::login_keyring_problem(),
             secureboot: (
                 secureboot::secure_boot_present(),
                 secureboot::is_secure_boot_enabled(),
@@ -2091,22 +2091,16 @@ impl App {
             }
         }
 
-        // Login keyring LOCKED: a Secret Service provider is up but its login
-        // collection is locked, so apps (Bitwarden, browsers) can't read their
-        // secrets even after a face login. Only flag it when the keyring is
-        // armed (else it's expected) and a provider actually answered. The TUI
-        // runs as the user, so unlike `sudo doctor` it can see the session bus.
+        // A running Secret Service can have a locked default wallet or none
+        // at all. Show the same reason/advice as doctor for an armed account.
+        // An unavailable bus/provider does not establish either problem.
         if self.keyring_armed == Some(true) {
-            if let Some(true) = self.probes.keyring_locked {
+            if let Some(problem) = self.probes.keyring_problem {
                 v.push(mk(
                     "Login keyring",
                     Sev::Warn,
-                    "the wallet is locked; apps (Bitwarden, browsers) can't read secrets yet"
-                        .into(),
-                    Fix::Manual(
-                        "unlock it by logging in with your face, or `sudo irlume keyring arm`"
-                            .into(),
-                    ),
+                    problem.description().into(),
+                    Fix::Manual(problem.advice().into()),
                 ));
             }
         }
@@ -2982,7 +2976,20 @@ impl App {
             ),
             Suspend::MoreAction(invocation) => {
                 let args = invocation.args(&self.user);
-                if invocation.action.root {
+                if invocation.action.args == ["auth", "test", "--events=jsonl"] {
+                    println!("Look at the camera for the authentication test.");
+                    match actions::auth_test_feedback(
+                        std::process::Command::new(Self::self_exe())
+                            .args(&args)
+                            .output(),
+                    ) {
+                        Ok(true) => self.log('✓', "Face authentication succeeded."),
+                        Ok(false) => self.set_error(
+                            "Face authentication did not succeed. You can retry the test.",
+                        ),
+                        Err(message) => self.set_error(message),
+                    }
+                } else if invocation.action.root {
                     let mut command = vec!["irlume"];
                     command.extend(args.iter().map(String::as_str));
                     self.sudo_step(invocation.action.label, &command);

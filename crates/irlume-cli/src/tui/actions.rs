@@ -103,7 +103,7 @@ const TRANSACTION: Field = Field {
 };
 
 pub(super) static ACTIONS: &[Action] = &[
-    Action { label: "Test authentication for this account", description: "Engages the camera. Verifies this account without releasing a password; the JSON result's granted field is the verdict. This does not test a system approval dialog.", args: &["auth", "test", "--events=jsonl"], root: false, per_user: true, fields: &[] },
+    Action { label: "Test authentication for this account", description: "Engages the camera. Verifies this account without releasing a password; Shows whether this account was recognized. This does not test a system approval dialog.", args: &["auth", "test", "--events=jsonl"], root: false, per_user: true, fields: &[] },
     Action { label: "Enroll with a chosen scan count", description: "Captures a face profile. Approve the OS authorization prompt when asked.", args: &["enroll"], root: false, per_user: true, fields: &[NAME, SCANS] },
     Action { label: "Replace face enrollment", description: "Captures a replacement, then replaces existing profiles and camera binding only after success. Keeps the template key and recovery setup. Requires OS authorization.", args: &["enroll", "--reset"], root: false, per_user: true, fields: &[NAME, SCANS] },
     Action { label: "Add a chosen number of scans", description: "Captures additional scans for an existing profile. Requires OS authorization.", args: &["profiles", "add-scan"], root: false, per_user: true, fields: &[PROFILE, SCANS] },
@@ -153,4 +153,95 @@ pub(super) fn matching(query: &str) -> Vec<&'static Action> {
             words.iter().all(|w| text.contains(w))
         })
         .collect()
+}
+
+/// Summarize the current CLI's terminal event. Keep its session lock, request
+/// validation and single-capture semantics; never display arbitrary error prose.
+pub(super) fn auth_test_feedback(
+    output: std::io::Result<std::process::Output>,
+) -> Result<bool, &'static str> {
+    let output = output.map_err(|_| "Could not start the authentication test.")?;
+    let last = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|text| text.lines().last());
+    let event: serde_json::Value = last
+        .and_then(|line| serde_json::from_str(line).ok())
+        .ok_or("Authentication test returned an unreadable result.")?;
+    if event["command"] != "auth.test" {
+        return Err("Authentication test returned an unexpected result.");
+    }
+    if output.status.success() && event["terminal"] == true && event["event"] == "result" {
+        return event["data"]["granted"]
+            .as_bool()
+            .ok_or("Authentication test returned an incomplete result.");
+    }
+    if !output.status.success() && (event["terminal"] == true || event["ok"] == false) {
+        return Err(match event["error"]["code"].as_str() {
+            Some("camera-busy") => crate::machine::CAMERA_BUSY_MESSAGE,
+            Some("session-busy") => {
+                "Another Irlume operation is running. Wait for it to finish, then retry."
+            }
+            Some("daemon-unavailable") => {
+                "Could not reach Irlume. Check the daemon status and retry."
+            }
+            _ => "Authentication test failed. Check Irlume diagnostics for details.",
+        });
+    }
+    Err("Authentication test ended without a final result.")
+}
+
+#[cfg(test)]
+mod auth_feedback_tests {
+    use super::auth_test_feedback;
+    use std::os::unix::process::ExitStatusExt;
+    fn output(code: i32, value: serde_json::Value) -> std::io::Result<std::process::Output> {
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: format!("{value}\n").into_bytes(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn camera_busy_feedback_is_actionable_without_rendering_daemon_prose() {
+        let event = |code| {
+            serde_json::json!({"command":"auth.test","terminal":true,"event":"error", "error":{
+                "code":code,"retryable":true,"message":"private fixture"
+            }})
+        };
+        let message = auth_test_feedback(output(1, event("camera-busy"))).unwrap_err();
+        assert!(message.contains("Close any app"));
+        assert!(message.contains("retry"));
+        let generic = auth_test_feedback(output(1, event("operation-failed"))).unwrap_err();
+        assert!(!generic.contains("private fixture"));
+        assert!(!generic.contains("Close any app"));
+        let session = serde_json::json!({"command":"auth.test","ok":false,"error":{"code":"session-busy","retryable":true}});
+        assert!(auth_test_feedback(output(2, session))
+            .unwrap_err()
+            .contains("Another Irlume operation"));
+        assert!(auth_test_feedback(output(1, event("daemon-unavailable")))
+            .unwrap_err()
+            .contains("daemon status"));
+    }
+
+    #[test]
+    fn auth_feedback_distinguishes_denial_and_grant_and_requires_completion() {
+        for granted in [true, false] {
+            let event = serde_json::json!({"command":"auth.test","terminal":true,"event":"result","data":{
+                "granted":granted,"live":true,"reason":"private fixture","refusal":null
+            }});
+            assert_eq!(auth_test_feedback(output(0, event.clone())), Ok(granted));
+            assert!(auth_test_feedback(output(1, event)).is_err());
+        }
+        assert!(auth_test_feedback(output(
+            0,
+            serde_json::json!({"command":"auth.test","event":"capturing","terminal":false})
+        ))
+        .is_err());
+        assert!(auth_test_feedback(output(
+            0,
+            serde_json::json!({"command":"auth.test","terminal":true,"event":"result","data":{}})
+        ))
+        .is_err());
+    }
 }

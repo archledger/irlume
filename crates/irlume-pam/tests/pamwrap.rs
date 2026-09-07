@@ -472,6 +472,7 @@ fn pamwrap_privileged_yes_prompts_once_and_attests_every_service() {
     for (request, expected_service) in reqs.iter().zip(services) {
         match request {
             Request::Authenticate {
+                structured_errors: false,
                 user,
                 service,
                 intent_confirmation,
@@ -1039,30 +1040,12 @@ fn pamwrap_refused_challenge_falls_through_to_the_password_module() {
     let (ok, out) = h.run("irlume-crc-sufficient", &["authenticate"], "\n", None);
     assert!(ok, "sufficient layout must also fall through: {out}");
 
-    // The daemon really was asked, so the fall-through is a REFUSED release and
-    // not "face never ran". Each layout opens with UnsealPassword; `ondemand` then
-    // adds its documented warm-unlock retry (a refused release still lets a live
-    // lock screen unlock on identity alone), which releases no token and so does
-    // not weaken the gate.
+    // Both layouts attempted release exactly once and reached the password.
     let reqs = log.lock().unwrap();
-    assert!(
-        matches!(reqs.first(), Some(Request::UnsealPassword { .. })),
-        "the jump layout must attempt a release first: {reqs:?}"
-    );
-    assert_eq!(
-        reqs.iter()
-            .filter(|r| matches!(r, Request::UnsealPassword { .. }))
-            .count(),
-        2,
-        "one release attempt per layout: {reqs:?}"
-    );
-    assert!(
-        reqs.iter().all(|r| matches!(
-            r,
-            Request::UnsealPassword { .. } | Request::Authenticate { .. }
-        )),
-        "no other request kind belongs on this path: {reqs:?}"
-    );
+    assert_eq!(reqs.len(), 2, "one request per layout: {reqs:?}");
+    assert!(reqs
+        .iter()
+        .all(|r| matches!(r, Request::UnsealPassword { .. })));
 }
 
 /// The documented privacy property: typing a password NEVER starts a scan.
@@ -1193,30 +1176,75 @@ fn pamwrap_nul_poisoned_secret_is_ignore_fail_closed() {
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_ondemand_unseal_falls_back_to_verify() {
-    let Some(h) = Harness::try_new("ondemand") else {
-        return;
-    };
-    h.write_service(
-        "irlume-cosmic",
-        &[h.auth_line("required", "unseal ondemand")],
-    );
-    let log = serve(&h.socket, |req| match req {
-        Request::UnsealPassword { .. } => Response::Error("keyring not armed".into()),
-        Request::Authenticate { .. } => grant(),
-        _ => Response::Error("unexpected request".into()),
-    });
+    for (index, flags) in ["unseal ondemand", "unseal facefirst"].iter().enumerate() {
+        let Some(h) = Harness::try_new(&format!("preflight-{index}")) else {
+            return;
+        };
+        h.write_service("irlume-cosmic", &[h.auth_line("required", flags)]);
+        let log = serve(&h.socket, |req| match req {
+            Request::UnsealPassword { .. } => Response::UnsealUnavailable {
+                reason: "keyring not armed".into(),
+            },
+            Request::Authenticate { .. } => grant(),
+            _ => Response::Error("unexpected request".into()),
+        });
 
-    let (ok, out) = h.run("irlume-cosmic", &["authenticate"], "\n", None);
-    assert!(ok, "verify fallback must rescue the warm unlock: {out}");
+        let (ok, out) = h.run("irlume-cosmic", &["authenticate"], "\n", None);
+        assert!(ok, "verify fallback must rescue the warm unlock: {out}");
 
-    let reqs = log.lock().unwrap();
-    assert_eq!(
-        reqs.len(),
-        2,
-        "unseal attempt then verify fallback: {reqs:?}"
-    );
-    assert!(matches!(reqs[0], Request::UnsealPassword { .. }));
-    assert!(matches!(reqs[1], Request::Authenticate { .. }));
+        let reqs = log.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "unseal attempt then verify fallback: {reqs:?}"
+        );
+        assert!(matches!(reqs[0], Request::UnsealPassword { .. }));
+        assert!(matches!(reqs[1], Request::Authenticate { .. }));
+    }
+}
+
+/// A completed release failure must not start another face request, even if
+/// a second verification would grant. Password fallback remains reachable.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_failed_unseal_never_starts_another_face_attempt() {
+    for (index, flags) in ["unseal ondemand", "unseal facefirst"].iter().enumerate() {
+        for (failure_index, failure) in [
+            Response::Error("face not granted: collecting RGB PAD evidence".into()),
+            Response::Error("camera failed".into()),
+            Response::Error("TPM unseal failed".into()),
+            Response::Pong, // Unexpected protocol reply is not permission to retry.
+            // Invalid secret delivery must not become identity-only admission.
+            unsealed("invalid\0password"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let Some(h) = Harness::try_new(&format!("no-repeat-{index}-{failure_index}")) else {
+                return;
+            };
+            h.write_service(
+                "plasmalogin",
+                &[
+                    h.auth_line("sufficient", flags),
+                    "auth required pam_deny.so".into(),
+                ],
+            );
+            let log = serve(&h.socket, move |req| match req {
+                Request::UnsealPassword { .. } => failure.clone(),
+                Request::Authenticate { .. } => grant(),
+                _ => Response::Error("unexpected request".into()),
+            });
+            let (ok, out) = h.run("plasmalogin", &["authenticate"], "\n", None);
+            assert!(
+                !ok,
+                "failed release must reach password fallback: {flags}: {out}"
+            );
+            let reqs = log.lock().unwrap();
+            assert_eq!(reqs.len(), 1, "no second capture request: {reqs:?}");
+            assert!(matches!(reqs[0], Request::UnsealPassword { .. }));
+        }
+    }
 }
 
 /// `keyring` mode (fingerprint path, post-auth landing): the module always

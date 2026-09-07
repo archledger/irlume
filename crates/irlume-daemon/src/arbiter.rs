@@ -549,6 +549,7 @@ mod tests {
         use irlume_common::SecretBytes;
         assert_eq!(
             classify(&Request::Authenticate {
+                structured_errors: false,
                 user: "u".into(),
                 service: None,
                 intent_confirmation: None,

@@ -249,6 +249,9 @@ pub enum OutcomeKind {
     Spoof,
     /// A real match verdict landed below the threshold.
     BelowThreshold,
+    /// Missing/empty enrollment or retired/invalid enrollment/consent settings.
+    /// Terminal (not presence-retryable), but preserves account retry history.
+    SetupUnavailable,
     /// Every other refusal: pre-camera policy/state denials, camera-binding
     /// mismatches, challenge-gate failures.
     OtherDeny,
@@ -5128,7 +5131,7 @@ impl Engine {
                 live: outcome.live,
                 score: outcome.score,
                 reason: policy.instruction("approve"),
-                kind: OutcomeKind::OtherDeny,
+                kind: OutcomeKind::SetupUnavailable,
             });
         }
         if purpose.demands_gesture(service) {
@@ -5303,7 +5306,7 @@ impl Engine {
             // No file at all: the instant deny, before anything else wakes.
             None => {
                 return Ok(Outcome::deny(
-                    OutcomeKind::OtherDeny,
+                    OutcomeKind::SetupUnavailable,
                     format!("'{user}' is not enrolled"),
                 ));
             }
@@ -5337,7 +5340,7 @@ impl Engine {
                 },
                 None => {
                     return Ok(Outcome::deny(
-                        OutcomeKind::OtherDeny,
+                        OutcomeKind::SetupUnavailable,
                         format!("'{user}' is not enrolled"),
                     ));
                 }
@@ -5348,7 +5351,7 @@ impl Engine {
         if let Some(policy) = blocking_head_consent_policy(purpose, service) {
             finish_loader(&mut loader);
             return Ok(Outcome::deny(
-                OutcomeKind::OtherDeny,
+                OutcomeKind::SetupUnavailable,
                 policy.instruction("approve"),
             ));
         }
@@ -5457,7 +5460,7 @@ impl Engine {
                     Ok(enr) => enr,
                     Err(LoaderExit::NotEnrolled) => {
                         return Ok(Outcome::deny(
-                            OutcomeKind::OtherDeny,
+                            OutcomeKind::SetupUnavailable,
                             format!("'{user}' is not enrolled"),
                         ));
                     }
@@ -5471,7 +5474,7 @@ impl Engine {
                 // a future edit cannot crash the daemon here.
                 None => {
                     return Ok(Outcome::deny(
-                        OutcomeKind::OtherDeny,
+                        OutcomeKind::SetupUnavailable,
                         format!("'{user}' is not enrolled"),
                     ));
                 }
@@ -7225,11 +7228,11 @@ impl Engine {
         enr: &irlume_core::storage::Enrollment,
     ) -> Option<Outcome> {
         if let Err(reason) = legacy_eye_policy(enr) {
-            return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
+            return Some(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
         }
         if enr.profiles.iter().all(|p| p.scans.is_empty()) {
             return Some(Outcome::deny(
-                OutcomeKind::OtherDeny,
+                OutcomeKind::SetupUnavailable,
                 format!("'{user}' has no face scans enrolled"),
             ));
         }
@@ -8749,6 +8752,7 @@ mod tests {
             OutcomeKind::Spoof,
             OutcomeKind::BelowThreshold,
             OutcomeKind::OtherDeny,
+            OutcomeKind::SetupUnavailable,
         ] {
             assert!(
                 !is_gesture_decline(&Outcome::deny(kind, "x")),
@@ -11133,7 +11137,11 @@ mod engine_tests {
         let e = &mut s.engine;
         let now = std::time::Instant::now();
         let deadline = now + std::time::Duration::from_secs(15);
-        for fails in [false, true] {
+        for (fails, kind) in [
+            (false, OutcomeKind::BelowThreshold),
+            (false, OutcomeKind::SetupUnavailable),
+            (true, OutcomeKind::OtherDeny),
+        ] {
             let mut calls = 0;
             let mut costliest = std::time::Duration::ZERO;
             e.head_consent_before_match = HeadConsentVerdict::Approve;
@@ -11152,13 +11160,7 @@ mod engine_tests {
                             true,
                         )
                     } else {
-                        (
-                            Ok(Outcome::deny(
-                                OutcomeKind::BelowThreshold,
-                                "scripted match denial",
-                            )),
-                            false,
-                        )
+                        (Ok(Outcome::deny(kind, "scripted terminal denial")), false)
                     }
                 },
                 || now,
@@ -11643,6 +11645,7 @@ mod engine_tests {
         let o = s.engine.authenticate("irlume-test-ghost", None).unwrap();
         assert!(!o.granted);
         assert_eq!(o.reason, "'irlume-test-ghost' is not enrolled");
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
 
         // Enrolled but with zero scans.
         let mut e = Enrollment::new("irlume-test-empty");
@@ -11656,6 +11659,7 @@ mod engine_tests {
         let o = s.engine.authenticate("irlume-test-empty", None).unwrap();
         assert!(!o.granted);
         assert_eq!(o.reason, "'irlume-test-empty' has no face scans enrolled");
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
 
         // Camera binding mismatch: anti-swap refusal before any capture.
         let mut e = Enrollment::new("irlume-test-bound");
@@ -11671,6 +11675,7 @@ mod engine_tests {
         });
         write_enrollment(&dir, &e);
         let o = s.engine.authenticate("irlume-test-bound", None).unwrap();
+        assert_eq!(o.kind, OutcomeKind::OtherDeny);
         assert!(!o.granted && !o.live);
         assert!(
             o.reason.contains("camera changed since enrollment"),
@@ -11703,7 +11708,7 @@ mod engine_tests {
             .authenticate("irlume-test-legacy-eyes-open", None)
             .expect("legacy eye policy must deny before the missing camera is opened");
         assert!(!o.granted && !o.live);
-        assert_eq!(o.kind, OutcomeKind::OtherDeny);
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
         assert!(o.reason.contains("profiles eyes-open off"), "{}", o.reason);
         assert!(o.reason.contains("password or fingerprint"), "{}", o.reason);
 
@@ -11758,8 +11763,18 @@ mod engine_tests {
                 .authenticate("irlume-test-legacy-gesture", Some("sudo"))
                 .expect("retired policy must deny before the missing camera is opened");
             assert!(!out.granted, "{configured} granted: {}", out.reason);
-            assert_eq!(out.kind, OutcomeKind::OtherDeny, "{configured}");
+            assert_eq!(out.kind, OutcomeKind::SetupUnavailable, "{configured}");
             assert_eq!(out.reason, expected, "{configured}");
+            let post_match = s.engine.challenge_if_required(
+                AuthenticationPurpose::Verify,
+                Some("sudo"),
+                Outcome::grant(0.9, "synthetic prior match"),
+            ).unwrap();
+            assert!(!post_match.granted && post_match.live);
+            assert_eq!(post_match.score, 0.9);
+            assert_eq!(post_match.kind, OutcomeKind::SetupUnavailable);
+            assert!(!presence_retryable(&post_match));
+            assert!(!is_gesture_decline(&post_match));
         }
 
         std::fs::write(
@@ -11783,8 +11798,18 @@ mod engine_tests {
                 .authenticate("irlume-test-legacy-gesture", Some("sudo"))
                 .expect("environment policy must deny before the missing camera is opened");
             assert!(!out.granted, "{configured} granted: {}", out.reason);
-            assert_eq!(out.kind, OutcomeKind::OtherDeny, "{configured}");
+            assert_eq!(out.kind, OutcomeKind::SetupUnavailable, "{configured}");
             assert_eq!(out.reason, expected, "{configured}");
+            let post_match = s.engine.challenge_if_required(
+                AuthenticationPurpose::Verify,
+                Some("sudo"),
+                Outcome::grant(0.9, "synthetic prior match"),
+            ).unwrap();
+            assert!(!post_match.granted && post_match.live);
+            assert_eq!(post_match.score, 0.9);
+            assert_eq!(post_match.kind, OutcomeKind::SetupUnavailable);
+            assert!(!presence_retryable(&post_match));
+            assert!(!is_gesture_decline(&post_match));
         }
 
         std::env::remove_var("IRLUME_CONSENT_GESTURE");
@@ -11941,6 +11966,8 @@ mod engine_tests {
             "the gesture gate must be the one that ran: {}",
             out.reason
         );
+
+        assert_eq!(out.kind, OutcomeKind::OtherDeny);
 
         // temporal_challenge OFF (the default): a grant, no gesture.
         let out = s

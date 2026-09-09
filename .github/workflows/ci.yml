@@ -109,10 +109,13 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
+
+      - name: Prepare and verify isolated CLI test namespaces
+        run: bash scripts/ci-bubblewrap.sh
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -376,10 +379,13 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon bubblewrap
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon bubblewrap apparmor
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
+
+      - name: Prepare and verify isolated CLI test namespaces
+        run: bash scripts/ci-bubblewrap.sh
 
       - name: Install stable Rust
         # @master (declares the `toolchain` input); the version tag branches

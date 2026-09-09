@@ -35,6 +35,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/asan.yml"
       - ".github/lsan-suppressions.txt"
+      - "scripts/ci-bubblewrap.sh"
   schedule:
     - cron: "40 4 * * 3" # Wednesdays 04:40 UTC, clear of the other scheduled jobs
   workflow_dispatch:
@@ -87,7 +88,10 @@ jobs:
           command -v apt-get >/dev/null || { echo "deps preinstalled on the self-hosted runner"; exit 0; }
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon llvm bubblewrap
+            build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon llvm bubblewrap apparmor
+
+      - name: Prepare and verify isolated CLI test namespaces
+        run: bash scripts/ci-bubblewrap.sh
 
       # A leak suppression matches the SYMBOL NAMES in an allocation stack, so
       # without a symbolizer it matches nothing and the deliberate test leak

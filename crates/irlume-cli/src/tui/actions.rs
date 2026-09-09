@@ -102,6 +102,19 @@ const TRANSACTION: Field = Field {
     optional: false,
 };
 
+pub(super) const FINGERPRINT_ONLY: Action = Action { label: "Enable fingerprint-only login", description: "Changes system login to fingerprint with password fallback, disabling face authentication. Existing CLI checks must pass.", args: &["fingerprint", "enable", "--fingerprint-only"], root: true, per_user: true, fields: &[] };
+pub(super) const SELINUX_STATUS: Action = Action {
+    label: "Show SELinux status",
+    description: "Shows the installed policy and labeling status; no change.",
+    args: &["selinux", "status"],
+    root: false,
+    per_user: false,
+    fields: &[],
+};
+pub(super) const SENSOR_PREFLIGHT: Action = Action { label: "Check IR-only readiness", description: "Checks this account's IR-only prerequisites without opening the camera or attempting authentication.", args: &["auth", "sensor", "preflight"], root: false, per_user: true, fields: &[] };
+pub(super) const WALLET_FORGET: Action = Action { label: "Forget wallet secret safely", description: "For a token-based wallet, asks for your password privately and rekeys the wallet before forgetting its sealed secret.", args: &["keyring", "forget"], root: false, per_user: true, fields: &[] };
+pub(super) const WALLET_RESEAL: Action = Action { label: "Reseal wallet secret", description: "Uses the existing seal type to choose the safe recovery path after boot measurements change; may ask for your password privately.", args: &["reseal"], root: false, per_user: true, fields: &[] };
+
 pub(super) static ACTIONS: &[Action] = &[
     Action { label: "Test authentication for this account", description: "Engages the camera. Verifies this account without releasing a password; Shows whether this account was recognized. This does not test a system approval dialog.", args: &["auth", "test", "--events=jsonl"], root: false, per_user: true, fields: &[] },
     Action { label: "Enroll with a chosen scan count", description: "Captures a face profile. Approve the OS authorization prompt when asked.", args: &["enroll"], root: false, per_user: true, fields: &[NAME, SCANS] },
@@ -119,7 +132,7 @@ pub(super) static ACTIONS: &[Action] = &[
     Action { label: "Create a support report with options", description: "Read-only report from share-safe facts. No camera capture. Output must end in .txt; existing files are preserved.", args: &["support-report"], root: false, per_user: false, fields: &[OUTPUT, SINCE] },
     Action { label: "Create a support report with camera probe", description: "Engages the camera for one bounded probe. Requires administrator access. Review the report before sharing.", args: &["support-report", "--probe"], root: true, per_user: false, fields: &[OUTPUT, SINCE] },
     Action { label: "Follow authentication logs", description: "Shows live system logs until Ctrl-C. Debug logs may contain sensitive measurements. Returns to the TUI afterward.", args: &["logs", "-f"], root: true, per_user: false, fields: &[Field { label: "Since, e.g. 10 min ago (blank uses the CLI default)", flag: Some("--since"), optional: true }] },
-    Action { label: "Enable fingerprint-only login", description: "Changes system login to fingerprint with password fallback, disabling face authentication. Existing CLI checks must pass.", args: &["fingerprint", "enable", "--fingerprint-only"], root: true, per_user: true, fields: &[] },
+    FINGERPRINT_ONLY,
     Action { label: "Reconcile login wiring", description: "Reapplies saved system login wiring after distribution PAM regeneration. Requires administrator access.", args: &["login", "reconcile"], root: true, per_user: false, fields: &[] },
     Action { label: "Preview login wiring", description: "Read-only preview of the default login integration, without applying it.", args: &["login", "enable"], root: true, per_user: false, fields: &[] },
     Action { label: "Verify a login transaction", description: "Checks whether a recorded login transaction still matches the system. Displays a JSON report.", args: &["login", "verify", "--json"], root: true, per_user: false, fields: &[TRANSACTION] },
@@ -133,7 +146,7 @@ pub(super) static ACTIONS: &[Action] = &[
     Action { label: "Connect login, sudo and app prompts", description: "Applies login wiring with both optional sudo and polkit integration. Requires administrator access; retains password fallback.", args: &["login", "enable", "--with-sudo", "--with-polkit", "--apply"], root: true, per_user: false, fields: &[] },
     Action { label: "Preview a login transaction", description: "Produces a machine-readable plan ID without applying a change.", args: &["login", "plan", "--json"], root: true, per_user: false, fields: &[Field { label: "Action: enable or disable", flag: Some("--action"), optional: false }] },
     Action { label: "Apply a prepared login transaction", description: "Applies a previously reviewed plan with the CLI's freshness and rollback checks. Requires administrator access.", args: &["login", "apply", "--json"], root: true, per_user: false, fields: &[Field { label: "Action: enable or disable", flag: Some("--action"), optional: false }, Field { label: "Plan ID from login plan", flag: Some("--plan-id"), optional: false }] },
-    Action { label: "Show SELinux status", description: "Shows the installed policy and labeling status; no change.", args: &["selinux", "status"], root: false, per_user: false, fields: &[] },
+    SELINUX_STATUS,
     Action { label: "Show recovery status", description: "Shows this account's template encryption and recovery state. Available even when a camera is disconnected.", args: &["recovery", "status"], root: false, per_user: true, fields: &[] },
     Action { label: "Set a recovery passphrase", description: "Asks for the passphrase privately in the terminal and creates a recovery wrap for this account.", args: &["recovery", "setup"], root: false, per_user: true, fields: &[] },
     Action { label: "Restore the enrollment key", description: "Asks for the recovery passphrase privately in the terminal and restores this account's template key.", args: &["recovery", "restore"], root: false, per_user: true, fields: &[] },
@@ -141,6 +154,15 @@ pub(super) static ACTIONS: &[Action] = &[
     Action { label: "Rename a profile or scan", description: "Renames the selected account's profile, or the named scan within it. No camera required.", args: &["profiles", "rename"], root: false, per_user: true, fields: &[PROFILE, Field { label: "Scan name (blank renames the whole profile)", flag: Some("--scan"), optional: true }, Field { label: "New name", flag: Some("--name"), optional: false }] },
     Action { label: "Delete a profile or scan", description: "Permanently deletes the specified profile or scan for this account. A blank scan field means the WHOLE profile and all its scans.", args: &["profiles", "delete"], root: false, per_user: true, fields: &[PROFILE, Field { label: "Scan name (blank deletes the WHOLE profile)", flag: Some("--scan"), optional: true }] },
     Action { label: "Forget wallet secret without rekeying", description: "Force-forgets the sealed wallet secret. For a token-based keyring this skips rekeying and may leave the wallet inaccessible. Use ordinary Forget Wallet when possible.", args: &["keyring", "forget", "--force"], root: false, per_user: true, fields: &[] },
+
+    SENSOR_PREFLIGHT,
+    WALLET_FORGET,
+    WALLET_RESEAL,
+    Action { label: "Face sensor policy status", description: "Show the sensor policy observed by the daemon. Does not open cameras.", args: &["auth", "sensor", "status"], root: false, per_user: false, fields: &[] },
+    Action { label: "Privileged face confirmation status", description: "Show whether configured privileged services require confirmation and whether an environment override applies.", args: &["auth", "consent", "status"], root: false, per_user: false, fields: &[] },
+    Action { label: "Face retry status", description: "Inspect the selected account's face retry budget and cooldown. Does not authenticate or reset state.", args: &["retry", "status"], root: false, per_user: true, fields: &[] },
+    Action { label: "Reset face retries with password", description: "Verifies the selected account's current local login password privately. An administrator running this TUI as root performs an administrator reset.", args: &["retry", "reset"], root: false, per_user: true, fields: &[] },
+    Action { label: "Administrator reset of face retries", description: "Requires administrator approval. Resets the selected account's retry state, including when password-verified recovery requires administrator repair. Does not change enrollment or the login password.", args: &["retry", "reset"], root: true, per_user: true, fields: &[] },
 
 ];
 

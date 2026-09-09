@@ -3,8 +3,8 @@
 irlume publishes its demographic error rates rather than hiding them. Face
 recognition has well-documented demographic differentials (NIST FRVT Part 3);
 irlume is not exempt. This document states the
-measured variance, the recognizer trade-off we accepted, and the policy that
-keeps the residual gap from becoming a security hole.
+measured variance, the recognizer trade-off we accepted, and the remaining
+evidence needed to assess the deployed acceptance rule.
 
 ## Measured demographic FAR with AuraFace
 
@@ -25,8 +25,8 @@ throughout this document):
 | Southeast Asian | 7.46×10⁻⁴ |
 | **East Asian** | **1.04×10⁻³** |
 
-**Spread ≈ 10×.** At the 0.50 measurement threshold, only the
-best-served group meets NIST FMR ≤ 1×10⁻⁴; the others exceed it within-group.
+**Spread ≈ 10×.** At the 0.50 measurement threshold, every reported
+group exceeds NIST FMR ≤ 1×10⁻⁴; the best-served group is close at 1.05×10⁻⁴.
 A single fixed threshold that holds FAR ≤ 1×10⁻⁴ for **every** group requires
 ≈ **0.69** (bound by the worst groups). A cross-check on real faces (LFW,
 13,233 images, 87M PAIRS, same YuNet→AuraFace pipeline) measured an all-pairs
@@ -42,9 +42,13 @@ is unconstrained web imagery (varied pose and lighting) which aligns less
 cleanly than FairFace's curated
 crops, so real-world faces are the harder test. The shipped RGB threshold is
 stricter than the 0.50 measurement point (0.55, with template-count scaling up
-to +0.10; the IR path uses 0.55 native / 0.40 adapted, and calibrated RGB+IR
-fusion grants at probability ≥ 0.50), and the mandatory password fallback
-bounds the residual either way.
+to +0.10). IR fallback, dark-path matching and weighted RGB+IR fusion are
+additional acceptance arms with distinct thresholds. Their combined deployed
+false-match rate is not established by the table above. In particular, the
+fusion score is not a validated current-pipeline probability. Password fallback
+provides recovery when face authentication refuses; it does not reduce false
+matches that already grant. See the
+[acceptance-rule evidence limits](THREAT_MODEL.md#acceptance-rule-evidence-limits).
 
 ## Against the Windows Hello bars
 
@@ -59,11 +63,12 @@ percent). Stated in exactly those terms, irlume's own measurements above:
 | FAR < 0.001% (1×10⁻⁵) | worst-group FAR 1.04×10⁻³ at the 0.50 measurement point (best group 1.05×10⁻⁴) | **No.** Only the best-served group approaches it; irlume does not claim Hello's FAR bar |
 | TAR > 95% (FRR < 5%) | FRR 4.65% at the matched-FAR (1×10⁻³) operating point (AuraFace) | Yes, at that operating point |
 
-The comparison is deliberately like-for-like and deliberately not a
-marketing table: irlume publishes its per-group variance (above) where a
-single certified bar cannot, and bounds the residual differently, with two
-presentation-attack-detection models on every capture and a mandatory
-password fallback rather than a certified-hardware program.
+These benchmark figures describe their recorded operating points; they are
+not a matched-protocol evaluation of the current deployed rule. irlume
+publishes the per-group variance above alongside the single Hello target. PAD
+and password fallback address presentation attacks and recovery; they do not establish a measured bound on the combined
+identity acceptance rule. The benchmark comparison is not certification of the
+current deployment.
 
 **Multiple enrolled users.** Hello raises its match threshold automatically
 when several users are enrolled on one machine (Microsoft's Windows Hello
@@ -137,32 +142,28 @@ generator AuraFace embeds well) or real consented diverse data, plus a
 commercial license (DigiFace is non-commercial). The ~30% result stands as proof
 the lever exists; this particular adapter is not the one to ship.
 
-## Policy: a single conservative threshold + uniform fallback
+## Policy: no demographic threshold selection, with recovery after refusal
 
-irlume does **not** classify a user's demographic group at authentication time to
-pick a threshold. Runtime demographic classification is privacy-invasive,
-unreliable, and self-defeating for a fairness goal, and it is unnecessary. The
-right direction is a **single fixed threshold chosen conservatively against the
-worst-performing group's curve**. The shipped 0.55 (vs the 0.50 measurement
-point) moves that way, though fully bounding every group at 1×10⁻⁴ would need
-≈0.69 and a real FRR cost; the residual gap is bounded by the mandatory
-password fallback, never by relaxing FAR. Users in better-served
-groups pay a slightly higher False Reject Rate than strictly necessary; that cost
-is absorbed **uniformly** by the mandatory non-biometric fallback.
+irlume does **not** classify a user's demographic group at authentication time
+to pick a threshold. The policy goal is to choose operating points against the
+worst-performing group's curve, while accounting for false non-matches. The
+shipped RGB base of 0.55 is stricter than the 0.50 measurement point. The
+reported approximately 0.69 benchmark threshold and its FRR cost do not by
+themselves calibrate every deployed acceptance arm.
 
-Because the biometric is **one MFA factor with a mandatory fallback** (see
-`docs/THREAT_MODEL.md`), residual demographic variance manifests as a *convenience*
-cost (an occasional password/PIN prompt), never as a security hole:
+Password fallback lets users recover from false non-matches without lowering
+the identity threshold for a demographic group:
 
-1. The PAM module captures and scores the frame.
-2. On a sub-threshold (or low-confidence) match it returns control to the stack
-   rather than hard-failing; the existing greeter/sudo/lockscreen fallback to
-   `pam_unix` (password) engages.
-3. The user authenticates with the secondary factor; FAR is never relaxed to
-   accommodate a harder-to-match face.
+1. The face path applies its capture, liveness, PAD and identity checks.
+2. If it refuses, the existing PAM stack can continue to the configured
+   non-biometric method, such as a password.
+3. A successful face grant is not retroactively checked by that fallback.
 
-This is the "MFA as equalizer" principle: tune the threshold for the worst case,
-let the fallback absorb the FRR, and never trade away the false-accept bound.
+Fallback is an alternative route, not evidence that two factors were verified
+on every successful face authentication. Residual false-match disparities remain
+an accuracy and security evaluation question; false non-matches create recovery
+burden that should also be measured across groups. Preserve recovery while
+validating the complete acceptance rule before claiming an error-rate bound.
 
 ## Roadmap to closing the gap cleanly
 

@@ -201,6 +201,46 @@ fn grouped_deadline_checks_before_and_after_inference() {
 }
 
 #[test]
+fn grouped_request_cancellation_checks_before_and_after_inference() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _guard = env_guard();
+    let mut s = shared();
+    for cancel_at in [0, 1, 5, 6] {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(cancel_at == 0));
+        let signal = std::sync::Arc::clone(&cancelled);
+        s.engine
+            .set_request_cancel_signal(std::sync::Arc::new(move || signal.load(Ordering::SeqCst)));
+        let identities = Cell::new(0);
+        let assessed = Cell::new(0);
+        let result = s.engine.evaluate_grouped_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, i| {
+                assessed.set(assessed.get() + 1);
+                let evidence = sample(e, i, 0.2);
+                if cancel_at == i + 1 {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+                Ok(evidence)
+            },
+            |_, evidence| {
+                identities.set(identities.get() + 1);
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(evidence.assessment)
+            },
+            Instant::now,
+        );
+        s.engine.request_cancelled = None;
+        let cleared = s.engine.vit_scores.is_empty();
+        s.engine.vit_scores.clear();
+        assert!(matches!(result, Err(irlume_common::Error::Preempted(_))));
+        assert_eq!(identities.get(), usize::from(cancel_at == 6));
+        assert_eq!(assessed.get(), cancel_at.min(5));
+        assert!(cleared, "cancelled group must discard pending evidence");
+    }
+}
+
+#[test]
 fn grouped_inference_errors_clear_all_evidence() {
     let _guard = env_guard();
     let mut s = shared();
@@ -848,4 +888,23 @@ fn grouped_missing_face_not_applicable_is_retryable_before_valid_dark_identity()
         s.engine.vit_scores.clear();
         assert!(out.granted, "{}", out.reason);
     }
+}
+
+#[test]
+fn grouped_deadline_classification_survives_the_real_engine_scope() {
+    let _guard = env_guard();
+    let mut state = shared();
+    let expired = Instant::now();
+    state.engine.authentication_deadline = Some(expired);
+    let result = state.engine.evaluate_grouped_samples_with(
+        (0..5).collect(),
+        expired,
+        |_, _| panic!("expired group must not assess evidence"),
+        |_, _: DeferredAssessment<()>| panic!("expired group must not materialize identity"),
+        Instant::now,
+    );
+    state.engine.authentication_deadline = None;
+    assert!(
+        matches!(result, Ok(PreparedGroup::Refused(ref outcome)) if outcome.kind == OutcomeKind::DeadlineExpired)
+    );
 }

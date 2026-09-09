@@ -368,6 +368,29 @@ pub fn flip_h(chip: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Normalize a finite, nonzero embedding without overflowing its norm.
+/// Returns `None` for empty, zero, or non-finite vectors. Dimensions and
+/// embedding-space compatibility remain the caller's responsibility.
+pub fn normalize_embedding(values: &[f32]) -> Option<Vec<f32>> {
+    let mut squared_norm = 0.0f64;
+    for &value in values {
+        if !value.is_finite() {
+            return None;
+        }
+        squared_norm += f64::from(value) * f64::from(value);
+    }
+    if squared_norm == 0.0 {
+        return None;
+    }
+    let norm = squared_norm.sqrt();
+    Some(
+        values
+            .iter()
+            .map(|&v| (f64::from(v) / norm) as f32)
+            .collect(),
+    )
+}
+
 /// Cosine similarity of two L2-normalized embeddings = dot product, clamped.
 /// Mismatched lengths return -1.0 (a definitive non-match) rather than
 /// panicking; see the guard below.
@@ -405,6 +428,30 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_embedding_preserves_direction_at_extreme_scales() {
+        for scale in [f32::MAX, f32::from_bits(1), 1.0] {
+            let normalized = normalize_embedding(&[scale, scale]).unwrap();
+            for value in &normalized {
+                assert!((value - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+            }
+            assert!((cosine(&normalized, &normalized) - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn normalize_embedding_rejects_invalid_vectors() {
+        for values in [
+            vec![],
+            vec![0.0, -0.0],
+            vec![1.0, f32::NAN],
+            vec![1.0, f32::INFINITY],
+            vec![1.0, f32::NEG_INFINITY],
+        ] {
+            assert!(normalize_embedding(&values).is_none());
+        }
+    }
 
     #[test]
     fn cosine_identity_is_one() {

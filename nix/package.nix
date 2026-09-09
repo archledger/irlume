@@ -120,6 +120,10 @@ rustPlatform.buildRustPackage {
   preBuild = ''
     export BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_EXTRA_CLANG_ARGS -isystem ${linuxHeaders}/include"
 
+    substituteInPlace crates/irlume-daemon/src/retry_recovery.rs \
+      --replace-fail '"/usr/libexec/irlume-password-verify"' \
+        "\"$out/libexec/irlume-password-verify\""
+
     # The compiled-in helper path is an FHS path that does not exist on NixOS,
     # so the PAM module would look for it, not find it, and decline. Nothing
     # sets IRLUME_KWALLET_INIT either, so a KDE-only NixOS user with a wallet-key
@@ -161,6 +165,11 @@ rustPlatform.buildRustPackage {
     install -Dm0755 "$out/bin/irlume-gkr-unlock" \
       "$out/libexec/irlume/irlume-gkr-unlock"
     rm "$out/bin/irlume-gkr-unlock"
+
+    test -x "$out/bin/irlume-password-verify"
+    install -Dm0755 "$out/bin/irlume-password-verify" "$out/libexec/irlume-password-verify"
+    rm "$out/bin/irlume-password-verify"
+    install -Dm0644 packaging/pam/irlume-retry-reset "$out/share/irlume/pam/irlume-retry-reset"
 
     install -d "$out/share/irlume/models"
     install -m0644 ${models}/*.onnx "$out/share/irlume/models/"

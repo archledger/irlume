@@ -380,3 +380,34 @@ fn batch_rejects_each_real_runtime_contract_failure() {
         }
     }
 }
+
+#[test]
+fn capture_cancellation_releases_rgb_and_never_opens_ir_batch() {
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+    let mut fixture = BatchFixture::new(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    let control = CaptureControl::new(no_progress(), Arc::new(move || signal.load(Ordering::SeqCst)));
+    let events = &fixture.events;
+    let now = &fixture.now;
+    let deadline = fixture.request.deadline;
+    let contract = runtime_gate_contract();
+    let result = crate::sequential_batch::capture_batch_controlled_with(
+        fixture.request,
+        &contract,
+        (|| {
+            events.borrow_mut().push("rgb open".into());
+            Ok(Owner { role: "rgb", events, now, expire_on_drop: false, deadline })
+        }, |_owner| {
+            cancelled.store(true, Ordering::SeqCst);
+            Ok(fixture.rgb.pop_front().unwrap())
+        }),
+        (|| -> irlume_common::Result<()> { panic!("IR must not open after cancellation") },
+         |_owner| -> irlume_common::Result<(Frame, IrCaptureStats)> { panic!("IR must not capture") }),
+        || now.get(),
+        &control,
+        || panic!("cancelled partial batch must not be validated"),
+    );
+    assert!(matches!(result, Err(Error::Preempted(_))));
+    assert_eq!(*events.borrow(), ["rgb open", "rgb close"]);
+}

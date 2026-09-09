@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+capture-timing = []
+
 [dependencies]
 irlume-common.workspace = true
 serde.workspace = true

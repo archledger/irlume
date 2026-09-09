@@ -67,7 +67,7 @@ fn request_binding(req: &Request) -> Result<SecretBytes, String> {
 
 /// An open proc directory keeps lookups on the original process even if its
 /// numeric PID is reused. Every read also checks for exit and UID changes.
-struct Subject {
+pub(super) struct Subject {
     directory: File,
     pid: u32,
     uid: u32,
@@ -75,7 +75,7 @@ struct Subject {
 }
 
 impl Subject {
-    fn capture(peer: &Peer) -> Result<Self, String> {
+    pub(super) fn capture(peer: &Peer) -> Result<Self, String> {
         let pid = u32::try_from(peer.pid)
             .ok()
             .filter(|pid| *pid != 0)
@@ -119,7 +119,7 @@ impl Subject {
         parse_start(&self.read(c"stat")?).ok_or_else(|| REFUSED.into())
     }
 
-    fn validate(&self, peer: &Peer) -> Result<(), String> {
+    pub(super) fn validate(&self, peer: &Peer) -> Result<(), String> {
         if peer.pid <= 0
             || peer.pid as u32 != self.pid
             || peer.uid != self.uid

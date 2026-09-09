@@ -464,11 +464,24 @@ pub(crate) struct IlluminationLog {
     /// changed for the next process to open this camera.
     restore_format: u32,
     streaming: bool,
+    timing: crate::capture_timing::Recorder,
     #[cfg(test)]
     sentinel_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetadataSelection<'a> {
+    Discover,
+    Exact(&'a str),
+    Absent,
+}
+
 impl IlluminationLog {
+    pub(crate) fn with_timing(mut self, timing: crate::capture_timing::Recorder) -> Self {
+        self.timing = timing;
+        self
+    }
+
     /// Set up and start the metadata queue for the IR node at `ir_device`.
     ///
     /// Must be called before the image stream's first dequeue: uvcvideo
@@ -477,34 +490,71 @@ impl IlluminationLog {
     /// `None` means this camera cannot report illumination, which is a normal
     /// outcome and not an error.
     pub(crate) fn open(ir_device: &str) -> Option<Self> {
-        let node = metadata_node_for(ir_device)?;
+        Self::open_selected(ir_device, MetadataSelection::Discover)
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) fn open_selected(
+        ir_device: &str,
+        selection: MetadataSelection<'_>,
+    ) -> Result<Option<Self>, String> {
+        Self::open_selected_with(ir_device, selection, metadata_node_for, Self::open_node)
+    }
+
+    fn open_selected_with<T>(
+        ir_device: &str,
+        selection: MetadataSelection<'_>,
+        discover: impl FnOnce(&str) -> Option<String>,
+        open: impl FnOnce(&str, &str) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        match selection {
+            MetadataSelection::Discover => {
+                let Some(node) = discover(ir_device) else {
+                    return Ok(None);
+                };
+                Ok(open(ir_device, &node).ok())
+            }
+            MetadataSelection::Absent => Ok(None),
+            MetadataSelection::Exact(node) => {
+                if std::env::var_os("IRLUME_NO_ILLUM_META").is_some_and(|v| v == "1") {
+                    return Err("required illumination metadata is disabled".into());
+                }
+                open(ir_device, node).map(Some)
+            }
+        }
+    }
+
+    fn open_node(ir_device: &str, node: &str) -> Result<Self, String> {
         // SAFETY: a NUL-terminated path built directly below.
-        let path = std::ffi::CString::new(node.as_bytes()).ok()?;
+        let path = std::ffi::CString::new(node.as_bytes())
+            .map_err(|_| "metadata node path contains NUL".to_string())?;
         #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
             irlume_common::dlog!(
                 "{ir_device}: metadata node {node} would not open; using brightness"
             );
-            return None;
+            return Err(format!("metadata node {node} would not open"));
         }
         let mut log = Self {
             fd,
-            device: node.clone(),
+            device: node.to_string(),
             buffers: Vec::new(),
             by_timestamp: std::collections::HashMap::new(),
             restore_format: UVCH,
             streaming: false,
+            timing: crate::capture_timing::Recorder::default(),
             #[cfg(test)]
             sentinel_events: None,
         };
         match log.start() {
-            Ok(()) => Some(log),
+            Ok(()) => Ok(log),
             Err(why) => {
                 irlume_common::dlog!(
                     "{ir_device}: no illumination metadata from {node} ({why}); using brightness"
                 );
-                None
+                Err(why)
             }
         }
     }
@@ -715,6 +765,7 @@ impl IlluminationLog {
             by_timestamp: std::collections::HashMap::new(),
             restore_format: 0,
             streaming: false,
+            timing: crate::capture_timing::Recorder::default(),
             sentinel_events: Some(events),
         }
     }
@@ -731,6 +782,9 @@ impl Drop for IlluminationLog {
             return;
         }
         if self.streaming {
+            let _timing = self
+                .timing
+                .stage(crate::capture_timing::Stage::MetadataStreamoff);
             let mut kind = META_CAPTURE as c_int;
             let _ = self.ioctl(
                 vidioc_streamoff(),
@@ -744,25 +798,36 @@ impl Drop for IlluminationLog {
         // skipping this silently left the node on UVCM for the next process
         // (measured: the format survived every capture until REQBUFS(0) was
         // added here).
-        self.buffers.clear();
-        let mut release = V4l2RequestBuffers {
-            count: 0,
-            kind: META_CAPTURE,
-            memory: MEMORY_MMAP,
-            capabilities: 0,
-            flags: 0,
-            _reserved: [0; 3],
-        };
-        let _ = self.ioctl(
-            vidioc_reqbufs(),
-            &mut release as *mut _ as *mut libc::c_void,
-            "REQBUFS(0)",
-        );
+        {
+            let _timing = self
+                .timing
+                .stage(crate::capture_timing::Stage::MetadataBuffers);
+            self.buffers.clear();
+            let mut release = V4l2RequestBuffers {
+                count: 0,
+                kind: META_CAPTURE,
+                memory: MEMORY_MMAP,
+                capabilities: 0,
+                flags: 0,
+                _reserved: [0; 3],
+            };
+            let _ = self.ioctl(
+                vidioc_reqbufs(),
+                &mut release as *mut _ as *mut libc::c_void,
+                "REQBUFS(0)",
+            );
+        }
         // The format outlives this process, so hand the node back as found.
         if self.restore_format != 0 && self.restore_format != UVCM {
+            let _timing = self
+                .timing
+                .stage(crate::capture_timing::Stage::MetadataFormat);
             let _ = self.set_format(self.restore_format);
         }
         if self.fd >= 0 {
+            let _timing = self
+                .timing
+                .stage(crate::capture_timing::Stage::MetadataClose);
             // SAFETY: fd was opened by this type and is closed exactly once.
             unsafe { libc::close(self.fd) };
         }
@@ -984,8 +1049,79 @@ fn offers_uvcm(node: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn teardown_timing_keeps_close_after_metadata_ioctl_failures() {
+        use std::{
+            io::Read,
+            os::{fd::IntoRawFd, unix::net::UnixStream},
+        };
+        let (mut peer, owned) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let timings = crate::CaptureTimings::default();
+        let control = crate::CaptureControl::with_progress(crate::no_progress())
+            .with_capture_timings(Some(timings.clone()));
+        // A socket rejects V4L2 ioctls. Exercise the real error cleanup and fd
+        // ownership without opening a camera or depending on fd-number reuse.
+        let mut log = super::IlluminationLog::test_sentinel(Default::default());
+        log.sentinel_events = None;
+        log.fd = owned.into_raw_fd();
+        log.streaming = true;
+        log.restore_format = super::UVCH;
+        drop(log.with_timing(crate::capture_timing::Recorder::from_control(&control)));
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
+        let snapshot = timings.snapshot();
+        for label in [
+            "metadata_streamoff",
+            "metadata_buffers",
+            "metadata_format",
+            "metadata_close",
+        ] {
+            assert!(snapshot[label].is_some(), "unrecorded {label}");
+        }
+        assert!(snapshot["image_stop"].is_none());
+        assert!(snapshot["emitter_restore"].is_none());
+    }
     use super::*;
     use crate::capture_qualification::IlluminationMetadataPresence;
+
+    #[test]
+    fn explicit_absence_and_exact_failure_never_fall_back_to_discovery() {
+        assert!(IlluminationLog::open_selected(
+            "/dev/a-configured-ir-node",
+            MetadataSelection::Absent
+        )
+        .unwrap()
+        .is_none());
+        let error = IlluminationLog::open_selected(
+            "/dev/a-configured-ir-node",
+            MetadataSelection::Exact("/definitely/missing/metadata"),
+        )
+        .err()
+        .expect("required exact metadata must fail");
+        assert!(error.contains("would not open"), "{error}");
+    }
+
+    #[test]
+    fn exact_metadata_selection_calls_only_the_permitted_open() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let selected = IlluminationLog::open_selected_with(
+            "/dev/video2",
+            MetadataSelection::Exact("/dev/video3"),
+            |_| {
+                events.borrow_mut().push("discover".to_string());
+                Some("/dev/video1".into())
+            },
+            |image, metadata| {
+                events.borrow_mut().push(format!("open:{image}:{metadata}"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, Some(()));
+        assert_eq!(events.into_inner(), ["open:/dev/video2:/dev/video3"]);
+    }
 
     #[test]
     fn a_discovered_node_maps_to_present_and_no_node_to_absent() {

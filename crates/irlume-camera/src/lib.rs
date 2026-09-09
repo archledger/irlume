@@ -31,6 +31,12 @@
 //! panic on some drivers. Probe, don't assume.
 
 mod backend;
+mod capture_control;
+mod capture_timing;
+pub use capture_control::CaptureControl;
+use capture_timing::Stage;
+#[cfg(feature = "capture-timing")]
+pub use capture_timing::{CaptureTimings, RateFillFailure};
 pub mod capture_qualification;
 pub mod census;
 /// Versioned, backend-neutral camera data contracts.
@@ -46,12 +52,17 @@ pub mod ir_emitter;
 /// (`fuzz/fuzz_targets/uvc_illumination.rs`, #568); the ioctls and the
 /// stream below it stay crate-internal.
 pub mod ir_metadata;
+mod ir_target;
+pub use ir_target::{configured_ir_target, IrCaptureTarget, IrTargetError};
 pub mod lease;
 mod lifecycle;
 mod media_graph;
 mod rate_gate;
 mod sequential_batch;
-pub use sequential_batch::{capture_sequential_batch_with_progress, SequentialBatchRequest};
+pub use sequential_batch::{
+    capture_sequential_batch_with_control, capture_sequential_batch_with_progress,
+    SequentialBatchRequest,
+};
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code
 // path grows a reader of these files.
@@ -660,18 +671,58 @@ enum PrivacyBoundary {
 }
 
 #[derive(Debug)]
-struct PrivacyBoundaryRefusal(String);
+struct PrivacyBoundaryRefusal {
+    why: String,
+    #[cfg(feature = "capture-timing")]
+    cause: Option<PrivacyBoundaryCause>,
+}
+
+#[cfg(feature = "capture-timing")]
+#[derive(Clone, Copy, Debug)]
+enum PrivacyBoundaryCause {
+    Engaged,
+    ReadFailure {
+        raw_errno: Option<i32>,
+        kind: std::io::ErrorKind,
+    },
+}
 
 impl std::fmt::Display for PrivacyBoundaryRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.why)
     }
 }
 
 impl std::error::Error for PrivacyBoundaryRefusal {}
 
+#[cfg(test)]
 fn privacy_boundary_error(why: String) -> std::io::Error {
-    std::io::Error::other(PrivacyBoundaryRefusal(why))
+    std::io::Error::other(PrivacyBoundaryRefusal {
+        why,
+        #[cfg(feature = "capture-timing")]
+        cause: None,
+    })
+}
+
+// Preserve the existing privacy decision and error text. Optional diagnostics
+// retain only the observation class before that decision formats its message.
+fn privacy_capture_boundary(observed: std::io::Result<Option<bool>>) -> std::io::Result<()> {
+    #[cfg(feature = "capture-timing")]
+    let cause = match &observed {
+        Ok(Some(true)) => Some(PrivacyBoundaryCause::Engaged),
+        Err(error) => Some(PrivacyBoundaryCause::ReadFailure {
+            raw_errno: error.raw_os_error(),
+            kind: error.kind(),
+        }),
+        _ => None,
+    };
+    privacy_permits_ir_capture(observed).map_err(|why| {
+        std::io::Error::other(PrivacyBoundaryRefusal {
+            why,
+            #[cfg(feature = "capture-timing")]
+            cause,
+        })
+    })
 }
 
 fn is_privacy_boundary_error(error: &std::io::Error) -> bool {
@@ -832,7 +883,7 @@ impl CameraState for V4l2CameraState {
                     ));
                 }
             }
-            privacy_permits_ir_capture(privacy_state(dev)).map_err(privacy_boundary_error)?;
+            privacy_capture_boundary(privacy_state(dev))?;
         }
         Ok(())
     }
@@ -1206,6 +1257,7 @@ struct CameraStateStream<'a, S: CameraState> {
     state_started: bool,
     stream_started_validated: bool,
     privacy_refused: bool,
+    timing: capture_timing::Recorder,
 }
 
 type SafeStream<'a> = CameraStateStream<'a, V4l2CameraState>;
@@ -1425,6 +1477,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
             state_started: false,
             stream_started_validated: false,
             privacy_refused: false,
+            timing: capture_timing::Recorder::default(),
         };
         verify_stream_state(
             &stream.state,
@@ -1459,9 +1512,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
             ..
         } = self;
         let inner = inner.as_mut().ok_or_else(|| {
-            ValidatedDequeueError::Io(std::io::Error::other(
-                "capture stream stopped after privacy refusal",
-            ))
+            ValidatedDequeueError::Io(std::io::Error::other(CaptureEvidenceError::StoppedStream))
         })?;
         let dequeued = match dequeue_validated_typed(inner, *layout, || {
             state.require_dequeue_boundary(dev)
@@ -1502,6 +1553,7 @@ impl<'a, S: CameraState> CameraStateStream<'a, S> {
         let Some(inner) = self.inner.take() else {
             return;
         };
+        let _timing = self.timing.stage(Stage::ImageStop);
         let device = self.device.clone();
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(inner))).is_err() {
             irlume_common::dlog!("{device}: stream teardown failed (STREAMOFF); frames unaffected");
@@ -1609,6 +1661,7 @@ const MAX_RATE_FILL_ATTEMPTS: usize = 64;
 
 struct TrackedStream<S> {
     stream: Option<S>,
+    control: CaptureControl,
     sequence: frame_provenance::SequenceTracker,
     timestamp: frame_provenance::TimestampTracker,
     rate_window: rate_gate::RateWindow,
@@ -1623,6 +1676,7 @@ impl<S> TrackedStream<S> {
     fn new(stream: S, rate_config: rate_gate::StreamRateConfig) -> Self {
         Self {
             stream: Some(stream),
+            control: CaptureControl::with_progress(no_progress()),
             sequence: frame_provenance::SequenceTracker::new(),
             timestamp: frame_provenance::TimestampTracker::new(),
             rate_window: rate_gate::RateWindow::with_capacity(rate_config.policy().window()),
@@ -1632,6 +1686,11 @@ impl<S> TrackedStream<S> {
             sequence_span_sum: 0,
             recovery_epoch_pending: false,
         }
+    }
+
+    fn with_control(mut self, control: &CaptureControl) -> Self {
+        self.control = control.clone();
+        self
     }
 
     #[cfg(test)]
@@ -1711,6 +1770,37 @@ impl TrackedStream<SafeStream<'_>> {
     }
 }
 
+// Keep internal capture failures typed until the public error boundary. The
+// existing I/O kind and Display text remain unchanged for ordinary callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureEvidenceError {
+    ContinuityAlignment,
+    ContinuityAccounting,
+    IncompleteWindow,
+    MissingStream,
+    StoppedStream,
+}
+
+impl std::fmt::Display for CaptureEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ContinuityAlignment => {
+                "sequence/timestamp continuity diverged; explicit stream recovery required"
+            }
+            Self::ContinuityAccounting => {
+                "continuity observation accounting overflowed; explicit recovery required"
+            }
+            Self::IncompleteWindow => {
+                "could not establish delivered-rate evidence within the bounded fill"
+            }
+            Self::MissingStream => "capture stream missing after recovery",
+            Self::StoppedStream => "capture stream stopped after privacy refusal",
+        })
+    }
+}
+
+impl std::error::Error for CaptureEvidenceError {}
+
 fn account_continuity_observation(
     observations: &mut u64,
     discarded_observations: &mut u64,
@@ -1731,7 +1821,7 @@ fn account_continuity_observation(
     else {
         timestamp_tracker.fail_current_epoch();
         return Err(std::io::Error::other(
-            "continuity observation accounting overflowed; explicit recovery required",
+            CaptureEvidenceError::ContinuityAccounting,
         ));
     };
     *observations = next_observations;
@@ -1750,7 +1840,7 @@ fn ensure_continuity_alignment(
     {
         timestamp_tracker.fail_current_epoch();
         return Err(std::io::Error::other(
-            "sequence/timestamp continuity diverged; explicit stream recovery required",
+            CaptureEvidenceError::ContinuityAlignment,
         ));
     }
     Ok(())
@@ -1842,7 +1932,9 @@ fn begin_recovered_continuity_epoch(
 
 impl<S: ValidatedStream> TrackedStream<S> {
     fn next_discarded(&mut self) -> std::io::Result<()> {
+        self.control.check_io()?;
         let Self {
+            control,
             stream,
             sequence,
             timestamp,
@@ -1855,8 +1947,9 @@ impl<S: ValidatedStream> TrackedStream<S> {
         } = self;
         let dequeued = stream
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))?
+            .ok_or_else(|| std::io::Error::other(CaptureEvidenceError::MissingStream))?
             .next_validated();
+        control.check_io()?;
         let (facts, delivered) = match dequeued {
             Ok((_, facts)) => {
                 begin_recovered_continuity_epoch(
@@ -1898,6 +1991,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
     }
 
     fn fill_rate_evidence_with_startup(&mut self, adaptive_ir: bool) -> std::io::Result<()> {
+        self.control.check_io()?;
         if self.rate_window.ready() {
             return Ok(());
         }
@@ -1922,7 +2016,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
         }
         if !self.rate_window.ready() {
             return Err(std::io::Error::other(
-                "could not establish delivered-rate evidence within the bounded fill",
+                CaptureEvidenceError::IncompleteWindow,
             ));
         }
         if adaptive_ir {
@@ -1960,6 +2054,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
         self.fill_rate_evidence().map_err(DeliveryError::Io)?;
 
         let Self {
+            control,
             stream,
             sequence,
             timestamp,
@@ -1969,12 +2064,14 @@ impl<S: ValidatedStream> TrackedStream<S> {
             discarded_observations,
             sequence_span_sum,
             recovery_epoch_pending,
+            ..
         } = self;
         let dequeued = stream
             .as_mut()
-            .ok_or_else(|| std::io::Error::other("capture stream missing after recovery"))
+            .ok_or_else(|| std::io::Error::other(CaptureEvidenceError::MissingStream))
             .map_err(DeliveryError::Io)?
             .next_validated();
+        control.check_io().map_err(DeliveryError::Io)?;
         let (payload, facts) = match dequeued {
             Ok(frame) => frame,
             Err(ValidatedDequeueError::Corrupt(facts)) => {
@@ -2076,13 +2173,19 @@ impl IrSessionStartup {
     }
 
     fn fill<S: ValidatedStream>(self, stream: &mut TrackedStream<S>) -> std::io::Result<()> {
-        match self {
+        let result = match self {
             // The joint fill resets both windows and measures simultaneous
             // delivery. A solo IR window would only be thrown away there.
             Self::Paired => Ok(()),
             Self::Fixed => stream.fill_rate_evidence(),
             Self::Adaptive => stream.fill_rate_evidence_with_startup(true),
+        };
+        // Preserve the typed cause before map_io converts it to production prose.
+        #[cfg(feature = "capture-timing")]
+        if let Err(error) = &result {
+            stream.control.record_rate_fill_failure(error);
         }
+        result
     }
 }
 
@@ -2436,6 +2539,12 @@ fn camera_busy_error(device: &str, holders: Holders) -> Error {
 /// Map common io errors to actionable messages (linhello lesson: EBUSY/privacy
 /// are routine and need a clear cause, not a raw errno).
 fn map_io(device: &str, e: std::io::Error) -> Error {
+    if capture_control::is_expired(&e) {
+        return Error::DeadlineExpired;
+    }
+    if capture_control::is_cancelled(&e) {
+        return Error::Preempted("camera capture cancelled".into());
+    }
     use std::io::ErrorKind;
     match e.raw_os_error() {
         Some(libc::EBUSY) => camera_busy_error(device, camera_holders(device)),
@@ -3986,6 +4095,18 @@ impl RgbCamera {
         &self,
         progress: &Progress,
     ) -> irlume_common::Result<RgbSession<'_>> {
+        self.session_with_control(&CaptureControl::with_progress(progress.clone()))
+    }
+
+    /// Start an RGB session with cooperative request cancellation.
+    ///
+    /// # Errors
+    /// Returns cancellation before setup or the camera/lease errors of [`Self::session`].
+    pub fn session_with_control(
+        &self,
+        control: &CaptureControl,
+    ) -> irlume_common::Result<RgbSession<'_>> {
+        control.check()?;
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -4029,9 +4150,10 @@ impl RgbCamera {
                     self.requested_interval,
                     self.accepted_interval,
                 ),
-            ),
+            )
+            .with_control(control),
             warmed: false,
-            progress: progress.clone(),
+            progress: control.progress.clone(),
             _blc_restore: blc_restore,
             _session_slot: session_slot,
         })
@@ -4301,6 +4423,7 @@ impl<'a> RgbSession<'a> {
     /// Same drop-then-reopen shape as explicit IR session recovery.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
+        self.stream.control.check()?;
         self.cam
             .lease
             .require_endpoint(&self.cam.device)
@@ -4497,11 +4620,24 @@ pub fn capture_rgb_burst_with_progress(
     n: usize,
     progress: &Progress,
 ) -> irlume_common::Result<Vec<Frame>> {
+    capture_rgb_burst_with_control(device, n, &CaptureControl::with_progress(progress.clone()))
+}
+
+/// Capture an RGB burst with cooperative request cancellation.
+///
+/// # Errors
+/// Returns cancellation or the errors of [`capture_rgb_burst_with_progress`].
+pub fn capture_rgb_burst_with_control(
+    device: &str,
+    n: usize,
+    control: &CaptureControl,
+) -> irlume_common::Result<Vec<Frame>> {
+    control.check()?;
     let opened = std::time::Instant::now();
     let cam = RgbCamera::open(device)?;
     let open_ms = opened.elapsed().as_millis();
     let armed = std::time::Instant::now();
-    let mut session = cam.session_with_progress(progress)?;
+    let mut session = cam.session_with_control(control)?;
     let arm_ms = armed.elapsed().as_millis();
     let captured = std::time::Instant::now();
     let frames = session.burst(n);
@@ -4512,6 +4648,7 @@ pub fn capture_rgb_burst_with_progress(
         "{}",
         capture_stage_summary("rgb", device, open_ms, arm_ms, capture_ms)
     );
+    control.check()?;
     frames
 }
 
@@ -5051,6 +5188,19 @@ pub fn capture_rgb_denoised_with_progress(
     )?)
 }
 
+/// Capture a denoised RGB frame with cooperative request cancellation.
+///
+/// # Errors
+/// Returns cancellation or the errors of [`capture_rgb_denoised_with_progress`].
+pub fn capture_rgb_denoised_with_control(
+    device: &str,
+    control: &CaptureControl,
+) -> irlume_common::Result<Frame> {
+    let frame = median_frame(capture_rgb_burst_with_control(device, RGB_BURST, control)?)?;
+    control.check()?;
+    Ok(frame)
+}
+
 /// Per-pixel temporal median across same-sized frames (sorts each byte position
 /// across the burst, keeps the middle value). Returns the lone frame unchanged
 /// for a degenerate burst. Private on purpose: callers must pass at least one
@@ -5163,26 +5313,71 @@ pub fn capture_ir_sequential_with_stats_and_progress(
     capture_ir_with_startup(device, progress, IrSessionStartup::Adaptive)
 }
 
+/// Capture IR with cooperative request cancellation.
+///
+/// # Errors
+/// Returns cancellation or the errors of [`capture_ir_with_stats_and_progress`].
+pub fn capture_ir_with_stats_and_control(
+    device: &str,
+    control: &CaptureControl,
+) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    capture_ir_with_control_and_startup(device, control, IrSessionStartup::Fixed)
+}
+
+/// Capture sequential IR with cooperative request cancellation.
+///
+/// # Errors
+/// Returns cancellation or the errors of [`capture_ir_sequential_with_stats_and_progress`].
+pub fn capture_ir_sequential_with_stats_and_control(
+    device: &str,
+    control: &CaptureControl,
+) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    capture_ir_with_control_and_startup(device, control, IrSessionStartup::Adaptive)
+}
+
 fn capture_ir_with_startup(
     device: &str,
     progress: &Progress,
     startup: IrSessionStartup,
 ) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    capture_ir_with_control_and_startup(
+        device,
+        &CaptureControl::with_progress(progress.clone()),
+        startup,
+    )
+}
+
+fn capture_ir_with_control_and_startup(
+    device: &str,
+    control: &CaptureControl,
+    startup: IrSessionStartup,
+) -> irlume_common::Result<(Frame, IrCaptureStats)> {
+    control.check()?;
     let opened = std::time::Instant::now();
-    let cam = IrCamera::open(device)?;
+    let cam = {
+        let _timing = control.stage(Stage::Open);
+        IrCamera::open(device)?
+    };
     let open_ms = opened.elapsed().as_millis();
     let armed = std::time::Instant::now();
-    let mut session = cam.session_with_startup(progress, startup)?;
+    let mut session = cam.session_with_control_and_startup(control, startup)?;
     let arm_ms = armed.elapsed().as_millis();
     let captured = std::time::Instant::now();
-    let shot = session.capture_with_stats();
+    let shot = {
+        let _timing = control.stage(Stage::Frames);
+        session.capture_with_stats()
+    };
     let capture_ms = captured.elapsed().as_millis();
     // Drop the stream before `cam`: the session borrows the device.
-    drop(session);
+    {
+        let _timing = control.stage(Stage::SessionRelease);
+        drop(session);
+    }
     irlume_common::dlog!(
         "{}",
         capture_stage_summary("ir", device, open_ms, arm_ms, capture_ms)
     );
+    control.check()?;
     shot
 }
 
@@ -5353,14 +5548,82 @@ impl IrCamera {
         self.session_with_startup(progress, IrSessionStartup::Paired)
     }
 
+    /// Arm a paired IR session with cooperative request cancellation.
+    ///
+    /// # Errors
+    /// Returns cancellation or the errors of [`Self::session_for_pair_with_progress`].
+    pub fn session_for_pair_with_control(
+        &self,
+        control: &CaptureControl,
+    ) -> irlume_common::Result<IrSession<'_>> {
+        self.session_with_control_and_startup(control, IrSessionStartup::Paired)
+    }
+
     fn session_with_startup(
         &self,
         progress: &Progress,
         startup: IrSessionStartup,
     ) -> irlume_common::Result<IrSession<'_>> {
+        self.session_with_control_and_startup(
+            &CaptureControl::with_progress(progress.clone()),
+            startup,
+        )
+    }
+
+    fn session_with_control_and_startup(
+        &self,
+        control: &CaptureControl,
+        startup: IrSessionStartup,
+    ) -> irlume_common::Result<IrSession<'_>> {
+        self.session_with_control_startup_metadata(
+            control,
+            startup,
+            ir_metadata::MetadataSelection::Discover,
+        )
+    }
+
+    /// Start a fixed-startup IR-only session bound to a previously validated
+    /// configured target. The target is revalidated before any stream or
+    /// metadata endpoint is opened; explicit metadata absence never discovers.
+    ///
+    /// # Errors
+    /// Returns target-change, camera, metadata, privacy, emitter, or capture errors.
+    pub fn session_for_target_with_control<'a>(
+        &'a self,
+        target: &IrCaptureTarget,
+        control: &CaptureControl,
+    ) -> irlume_common::Result<IrSession<'a>> {
+        if self.device != target.endpoint() {
+            return Err(Error::Hardware(
+                "opened IR camera does not match validated target".into(),
+            ));
+        }
+        target
+            .validate()
+            .map_err(|error| Error::Hardware(error.to_string()))?;
+        self.session_with_control_startup_metadata(
+            control,
+            IrSessionStartup::Fixed,
+            target.metadata_selection(),
+        )
+    }
+
+    fn session_with_control_startup_metadata<'a>(
+        &'a self,
+        control: &CaptureControl,
+        startup: IrSessionStartup,
+        metadata: ir_metadata::MetadataSelection<'_>,
+    ) -> irlume_common::Result<IrSession<'a>> {
+        let _setup_timing = control.stage(Stage::SessionSetup);
+        control.check()?;
         self.lease
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
+        if let ir_metadata::MetadataSelection::Exact(endpoint) = metadata {
+            self.lease
+                .require_endpoint(endpoint)
+                .map_err(|error| Error::Hardware(error.to_string()))?;
+        }
         let session_slot = SessionSlot::acquire(&self.session_active, &self.device)?;
         // DECLARED before the stream so it drops AFTER it. Locals drop in
         // reverse declaration order, and `warm_up_stream` below can fail: with
@@ -5369,23 +5632,30 @@ impl IrCamera {
         // this change removes. Assigned further down, once the stream exists.
         let mode;
         let arm_alloc_started = std::time::Instant::now();
-        let mut stream = TrackedStream::new(
-            SafeStream::open(
-                V4l2CameraState::with_ir_interval(
+        let mut stream = {
+            let _timing = control.stage(Stage::Buffers);
+            TrackedStream::new(
+                SafeStream::open(
+                    V4l2CameraState::with_ir_interval(
+                        &self.device,
+                        self.lease.clone(),
+                        self.accepted_interval,
+                    ),
                     &self.device,
-                    self.lease.clone(),
+                    &self.dev,
+                    &self.negotiated,
+                )?,
+                rate_gate::StreamRateConfig::new(
+                    contracts::StreamRole::Ir,
+                    self.requested_interval,
                     self.accepted_interval,
                 ),
-                &self.device,
-                &self.dev,
-                &self.negotiated,
-            )?,
-            rate_gate::StreamRateConfig::new(
-                contracts::StreamRole::Ir,
-                self.requested_interval,
-                self.accepted_interval,
-            ),
-        );
+            )
+        };
+        stream.control = control.clone();
+        if let Some(inner) = stream.stream.as_mut() {
+            inner.timing = capture_timing::Recorder::from_control(control);
+        }
         let alloc_ms = arm_alloc_started.elapsed().as_millis();
         // The metadata queue has to be streaming before the image queue starts,
         // or uvcvideo produces no metadata at all (measured: zero bytes over
@@ -5393,7 +5663,12 @@ impl IrCamera {
         // buffers; STREAMON happens on the first dequeue, inside ordinary
         // warm-up below or the paired joint fill. Metadata must start here.
         let meta_started = std::time::Instant::now();
-        let mut meta = ir_metadata::IlluminationLog::open(&self.device);
+        let mut meta = {
+            let _timing = control.stage(Stage::Metadata);
+            ir_metadata::IlluminationLog::open_selected(&self.device, metadata)
+                .map_err(|reason| Error::Hardware(format!("{}: {reason}", self.device)))?
+                .map(|log| log.with_timing(capture_timing::Recorder::from_control(control)))
+        };
         let metadata_ms = meta_started.elapsed().as_millis();
         // BEFORE any image dequeue, because the first dequeue is STREAMON.
         // Microsoft's sequence sets the property and THEN starts streaming, and
@@ -5420,31 +5695,42 @@ impl IrCamera {
             .require_endpoint(&self.device)
             .map_err(|error| Error::Hardware(error.to_string()))?;
         let emitter_started = std::time::Instant::now();
-        mode = enable_ir_emitter_privacy_bounded(
-            &self.device,
-            &self.dev,
-            &self.card,
-            self.lease.clone(),
-            "before Face Authentication D1",
-        )?;
+        control.check()?;
+        mode = {
+            let _timing = control.stage(Stage::Emitter);
+            enable_ir_emitter_privacy_bounded(
+                &self.device,
+                &self.dev,
+                &self.card,
+                self.lease.clone(),
+                "before Face Authentication D1",
+            )?
+            .with_timing(capture_timing::Recorder::from_control(control))
+        };
         let emitter_ms = emitter_started.elapsed().as_millis();
         // Survive the first-capture-after-resume race (uvcvideo still
         // re-initializing).
         let warmup_started = std::time::Instant::now();
-        startup.warm_up(&self.device, &mut stream, progress)?;
+        {
+            let _timing = control.stage(Stage::Warmup);
+            startup.warm_up(&self.device, &mut stream, &control.progress)?;
+        }
         let warmup_ms = warmup_started.elapsed().as_millis();
         // Rate establishment internally discards more frames than the metadata
         // ring can hold. Drain those records now, after the fill, so buffers are
         // requeued before the first frame a caller can observe.
         let fill_started = std::time::Instant::now();
-        let fill_result = fill_rate_then_drain_metadata(
-            || startup.fill(&mut stream),
-            || {
-                if let Some(log) = meta.as_mut() {
-                    log.drain();
-                }
-            },
-        );
+        let fill_result = {
+            let _timing = control.stage(Stage::RateFill);
+            fill_rate_then_drain_metadata(
+                || startup.fill(&mut stream),
+                || {
+                    if let Some(log) = meta.as_mut() {
+                        log.drain();
+                    }
+                },
+            )
+        };
         let fill_ms = fill_started.elapsed().as_millis();
         irlume_common::dlog!(
             "[capture-stage] ir-arm {}: alloc={alloc_ms}ms metadata={metadata_ms}ms \
@@ -5920,6 +6206,7 @@ impl IrSession<'_> {
     /// grace window returned dark IR frames.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn recover(&mut self) -> irlume_common::Result<()> {
+        self.stream.control.check()?;
         self.cam
             .lease
             .require_endpoint(&self.cam.device)
@@ -9366,6 +9653,9 @@ where
         match next() {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if capture_control::is_expired(&e) {
+                    return Err(Error::DeadlineExpired);
+                }
                 // The window COMPLETED: the driver call came back, the thread
                 // was never stuck, and the watchdog clock resets before the
                 // caller spends unbounded time (inference, a retry's reopen)
@@ -9395,6 +9685,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod capture_cancellation_tests {
+        include!("capture_cancellation_tests.rs");
+    }
     mod sequential_batch_tests {
         include!("sequential_batch_tests.rs");
     }
@@ -10311,6 +10604,26 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn teardown_timing_image_stop_preserves_cleanup_and_is_idempotent() {
+        let format = fake_format(b"GREY");
+        let (state, calls) = FakeCameraState::new(format);
+        let timings = CaptureTimings::default();
+        let control = CaptureControl::with_progress(no_progress())
+            .with_capture_timings(Some(timings.clone()));
+        let mut stream = CameraStateStream::open(state, "/dev/fake", &(), &format).unwrap();
+        stream.timing = capture_timing::Recorder::from_control(&control);
+        stream.stop();
+        let stopped = timings.snapshot();
+        assert!(stopped["image_stop"].is_some());
+        assert!(calls.borrow().ends_with(&["cleanup", "stop"]));
+        let count = calls.borrow().len();
+        drop(stream);
+        assert_eq!(calls.borrow().len(), count);
+        assert_eq!(timings.snapshot(), stopped);
+    }
+
     #[test]
     fn every_stream_endpoint_boundary_fails_closed_and_tears_down() {
         let format = fake_format(b"GREY");
@@ -10877,6 +11190,205 @@ mod tests {
             },
             rate_gate::StreamRateConfig::new(role, interval, interval),
         )
+    }
+
+    #[test]
+    fn capture_evidence_errors_keep_existing_io_contract() {
+        let cases = [
+            (
+                CaptureEvidenceError::ContinuityAlignment,
+                "sequence/timestamp continuity diverged; explicit stream recovery required",
+            ),
+            (
+                CaptureEvidenceError::ContinuityAccounting,
+                "continuity observation accounting overflowed; explicit recovery required",
+            ),
+            (
+                CaptureEvidenceError::IncompleteWindow,
+                "could not establish delivered-rate evidence within the bounded fill",
+            ),
+            (
+                CaptureEvidenceError::MissingStream,
+                "capture stream missing after recovery",
+            ),
+            (
+                CaptureEvidenceError::StoppedStream,
+                "capture stream stopped after privacy refusal",
+            ),
+        ];
+        for (site, expected) in cases {
+            let error = std::io::Error::other(site);
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), expected);
+            assert!(
+                matches!(map_io("synthetic", error), irlume_common::Error::Hardware(message) if message == format!("synthetic: {expected}"))
+            );
+        }
+    }
+
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn rate_fill_detail_preserves_accounting_and_missing_stream_guards() {
+        for missing in [false, true] {
+            let timings = CaptureTimings::default();
+            let control = CaptureControl::with_progress(no_progress())
+                .with_capture_timings(Some(timings.clone()));
+            let mut stream =
+                rate_fill_fixture(contracts::StreamRole::Ir, 120, 66_667).with_control(&control);
+            if missing {
+                stream.take();
+            } else {
+                stream.observations = u64::MAX;
+            }
+            let error = IrSessionStartup::Fixed.fill(&mut stream).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            let expected = if missing {
+                "camera_rate_fill_missing_stream"
+            } else {
+                "camera_rate_fill_continuity_accounting"
+            };
+            assert_eq!(timings.rate_fill_failure().unwrap().as_str(), expected);
+            if !missing {
+                assert_eq!(stream.observations, u64::MAX);
+                assert!(stream.timestamp.epoch_failed_for_test());
+            }
+            assert!(stream.next().is_err());
+        }
+    }
+
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn rate_fill_detail_preserves_failed_continuity_after_warmup() {
+        let timings = CaptureTimings::default();
+        let control = CaptureControl::with_progress(no_progress())
+            .with_capture_timings(Some(timings.clone()));
+        let mut stream =
+            rate_fill_fixture(contracts::StreamRole::Ir, 120, 66_667).with_control(&control);
+        IrSessionStartup::Fixed
+            .warm_up("synthetic", &mut stream, &no_progress())
+            .unwrap();
+        assert!(stream.observations > 0);
+        let frames = &mut stream.stream_mut().unwrap().metadata;
+        frames[2].sequence = frames[1].sequence;
+        let error = IrSessionStartup::Fixed.fill(&mut stream).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "sequence/timestamp continuity diverged; explicit stream recovery required"
+        );
+        assert_eq!(
+            timings.rate_fill_failure().unwrap().as_str(),
+            "camera_rate_fill_continuity_alignment"
+        );
+        assert!(stream.timestamp.epoch_failed_for_test());
+        assert!(
+            stream.next().is_err(),
+            "failed continuity must never heal implicitly"
+        );
+    }
+
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn rate_fill_detail_preserves_bounded_corrupt_window_failure() {
+        let timings = CaptureTimings::default();
+        let control = CaptureControl::with_progress(no_progress())
+            .with_capture_timings(Some(timings.clone()));
+        let mut stream =
+            rate_fill_fixture(contracts::StreamRole::Ir, 120, 66_667).with_control(&control);
+        for metadata in &mut stream.stream_mut().unwrap().metadata {
+            metadata.flags |= v4l::buffer::Flags::ERROR;
+        }
+        let error = IrSessionStartup::Fixed.fill(&mut stream).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "could not establish delivered-rate evidence within the bounded fill"
+        );
+        assert_eq!(
+            timings.rate_fill_failure().unwrap().as_str(),
+            "camera_rate_fill_incomplete_window"
+        );
+        assert_eq!(
+            stream.observations,
+            u64::try_from(
+                rate_gate::startup_flush(contracts::StreamRole::Ir) + MAX_RATE_FILL_ATTEMPTS
+            )
+            .unwrap()
+        );
+        assert!(!stream.rate_window.ready());
+    }
+
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn rate_fill_diagnostic_records_typed_failure_without_changing_failed_stream() {
+        let timings = CaptureTimings::default();
+        let untouched = CaptureTimings::default();
+        let control = CaptureControl::with_progress(no_progress())
+            .with_capture_timings(Some(timings.clone()));
+        let mut stream =
+            rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667).with_control(&control);
+        // The fifth dequeue repeats the previous timestamp during Fixed startup.
+        stream.stream_mut().unwrap().metadata[4].timestamp =
+            stream.stream_mut().unwrap().metadata[3].timestamp;
+        let mut drained = false;
+        let error = fill_rate_then_drain_metadata(
+            || IrSessionStartup::Fixed.fill(&mut stream),
+            || drained = true,
+        )
+        .unwrap_err();
+        assert!(!drained, "failed fill must not drain metadata");
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<frame_provenance::TimestampTrackerError>(),
+            Some(frame_provenance::TimestampTrackerError::NonIncreasing { .. })
+        ));
+        assert_eq!(
+            timings.rate_fill_failure(),
+            Some(RateFillFailure::TimestampNonIncreasing)
+        );
+        assert_eq!(untouched.rate_fill_failure(), None);
+        assert!(
+            stream.next().is_err(),
+            "instrumentation must not heal the failed epoch"
+        );
+    }
+
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn rate_fill_diagnostic_preserves_success_and_control_refusals() {
+        for cancel in [false, true] {
+            let timings = CaptureTimings::default();
+            let control = CaptureControl::new(no_progress(), std::sync::Arc::new(move || cancel))
+                .with_capture_timings(Some(timings.clone()));
+            let mut stream =
+                rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667).with_control(&control);
+            let result = IrSessionStartup::Fixed.fill(&mut stream);
+            if cancel {
+                assert!(matches!(
+                    result.map_err(|error| map_io("synthetic", error)),
+                    Err(irlume_common::Error::Preempted(_))
+                ));
+                assert_eq!(stream.observations, 0);
+            } else {
+                result.unwrap();
+                assert!(stream.next().is_ok());
+                assert_eq!(timings.rate_fill_failure(), None);
+            }
+        }
+        let control = CaptureControl::with_progress(no_progress())
+            .with_deadline(Some(std::time::Instant::now()))
+            .with_capture_timings(Some(CaptureTimings::default()));
+        let mut stream =
+            rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667).with_control(&control);
+        assert!(matches!(
+            IrSessionStartup::Fixed
+                .fill(&mut stream)
+                .map_err(|error| map_io("synthetic", error)),
+            Err(irlume_common::Error::DeadlineExpired)
+        ));
+        assert_eq!(stream.observations, 0);
     }
 
     #[test]
@@ -15099,6 +15611,22 @@ mod tests {
 
         assert!(privacy_permits_ir_capture(Ok(Some(false))).is_ok());
         assert!(privacy_permits_ir_capture(Ok(None)).is_ok());
+    }
+
+    #[test]
+    fn privacy_capture_boundary_preserves_legacy_messages_and_decisions() {
+        let expected = "the hardware privacy shutter is engaged (the `privacy` control reads 1); refusing IR capture and any forward emitter write";
+        let error = privacy_capture_boundary(Ok(Some(true))).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), expected);
+        assert!(is_privacy_boundary_error(&error));
+        let error =
+            privacy_capture_boundary(Err(std::io::Error::other("private fixture"))).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "could not read the hardware privacy control (private fixture); refusing IR capture and any forward emitter write while the shutter state is unknown");
+        assert!(is_privacy_boundary_error(&error));
+        assert!(privacy_capture_boundary(Ok(Some(false))).is_ok());
+        assert!(privacy_capture_boundary(Ok(None)).is_ok());
     }
 
     #[test]

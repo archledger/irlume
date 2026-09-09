@@ -97,7 +97,7 @@ jobs:
       - name: Install toolchain and system deps
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel git rust clang pam tpm2-tss curl ca-certificates
+            base-devel git rust clang pam tpm2-tss curl ca-certificates bubblewrap
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

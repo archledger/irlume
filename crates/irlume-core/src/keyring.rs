@@ -173,8 +173,8 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
 /// Derive the secret of `kind` that `user` should have sealed, from their
 /// VERIFIED login password.
 ///
-/// For [`SecretKind::KdeWalletKey`] this is PBKDF2 over the wallet salt in
-/// `home`, matching what `pam_kwallet5` computes. Note what that implies after
+/// For [`SecretKind::KdeWalletKey`] this is PBKDF2 over the caller-supplied
+/// wallet salt, matching what `pam_kwallet5` computes. Note what that implies after
 /// a password change: the wallet is still keyed to the OLD derived key until
 /// the user re-keys it in KWallet, so deriving from the new password yields a
 /// key that does not open it. That is not a regression we introduce; it is
@@ -184,17 +184,16 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
 pub fn derive_secret(
     kind: SecretKind,
     password: &[u8],
-    home: Option<&std::path::Path>,
+    wallet_salt: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     match kind {
         // A login password needs no home, and demanding one would strand any
         // account NSS cannot resolve a home directory for.
         SecretKind::LoginPassword => Ok(Zeroizing::new(password.to_vec())),
-        SecretKind::KdeWalletKey => match home {
-            Some(h) => crate::kwallet::derive_for_home(password, h),
+        SecretKind::KdeWalletKey => match wallet_salt {
+            Some(salt) => crate::kwallet::derive_key(password, salt),
             None => Err(Error::Policy(
-                "a KDE wallet key needs the user's home directory, and none could be resolved"
-                    .into(),
+                "a KDE wallet key needs the account-scoped wallet salt".into(),
             )),
         },
         // Random by construction. Every caller that wants "the secret this
@@ -340,11 +339,7 @@ pub enum Reseal {
 /// envelope's PCR7 policy no longer satisfies, so we rebind to today's PCRs
 /// using the password the user just proved (via a successful login) they know.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn reseal_password(
-    user: &str,
-    password: &[u8],
-    home: Option<&std::path::Path>,
-) -> Result<Reseal> {
+pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) -> Result<Reseal> {
     if password.is_empty() {
         return Err(Error::Protocol(
             "refusing to reseal an empty password".into(),
@@ -364,7 +359,7 @@ pub fn reseal_password(
     if kind == SecretKind::GnomeKeyringToken {
         return reseal_token(user, password, env);
     }
-    let secret = match derive_secret(kind, password, home) {
+    let secret = match derive_secret(kind, password, wallet_salt) {
         Ok(s) => s,
         // A KDE wallet key cannot be derived without the salt. Leaving the
         // existing envelope alone is the safe outcome: it may still be valid,
@@ -656,18 +651,12 @@ mod tests {
         std::env::set_var("IRLUME_KEYRING_DIR", &dir);
         let _ = std::fs::remove_dir_all(dir);
 
-        // A home with a real salt, so the wallet key can actually be derived.
-        let home = std::path::PathBuf::from(crate::test_tmp_dir("kr-kind-home"));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(crate::kwallet::salt_path(&home).parent().unwrap()).unwrap();
-        std::fs::write(
-            crate::kwallet::salt_path(&home),
-            [0x33u8; crate::kwallet::SALT_LEN],
-        )
-        .unwrap();
+        // A fixed synthetic salt, supplied through the same pure derivation
+        // boundary as the daemon request.
+        let salt = [0x33u8; crate::kwallet::SALT_LEN];
 
         let pw = b"a-login-password";
-        let key = crate::kwallet::derive_for_home(pw, &home).expect("derive");
+        let key = crate::kwallet::derive_key(pw, &salt).expect("derive");
 
         // Seed at the WEAKEST tier on purpose. Sealing normally lands on this
         // machine's best tier, so the reseal returns Unchanged and the tier-climb
@@ -680,7 +669,7 @@ mod tests {
         assert_eq!(sealed_kind("kindtest"), Some(SecretKind::KdeWalletKey));
 
         // Same password, weaker tier on disk -> the tier-climb rewrite.
-        let first = reseal_password("kindtest", pw, Some(&home)).expect("reseal");
+        let first = reseal_password("kindtest", pw, Some(&salt)).expect("reseal");
         assert_eq!(
             first,
             Reseal::Upgraded,
@@ -696,7 +685,7 @@ mod tests {
         // A changed password takes the Resealed path, which rebuilds the
         // envelope from scratch.
         assert_eq!(
-            reseal_password("kindtest", b"a-different-password", Some(&home)).unwrap(),
+            reseal_password("kindtest", b"a-different-password", Some(&salt)).unwrap(),
             Reseal::Resealed
         );
         assert_eq!(
@@ -705,11 +694,10 @@ mod tests {
             "the Resealed path dropped the secret kind"
         );
         // And it holds the key derived from the NEW password, not the password.
-        let expect = crate::kwallet::derive_for_home(b"a-different-password", &home).unwrap();
+        let expect = crate::kwallet::derive_key(b"a-different-password", &salt).unwrap();
         assert_eq!(&*unseal_password("kindtest").unwrap(), &*expect);
 
         forget_password("kindtest").unwrap();
-        let _ = std::fs::remove_dir_all(&home);
         std::env::remove_var("IRLUME_KEYRING_DIR");
     }
 

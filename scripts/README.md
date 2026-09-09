@@ -74,3 +74,11 @@ document in `docs/pad-results/` or `docs/recognition-results/`, not from here.
 | `compare-blaze-parity.py` | The fail-closed parity gate for the full-range BlazeFace decoder against Google's own runtime. |
 | `mp-face-detector-bench.py` | Runs Google's MediaPipe FaceDetector over the stage-3 corpus, so no hand-rolled decode can flatter itself. |
 | `capture-stage3-segment.sh` | Captures one stage-3 corpus segment: positioning lead-in, then paired RGB and IR frames. |
+
+## `ir-evaluation/`: attended, non-granting IR-only evaluation
+
+The [contributor harness](ir-evaluation/README.md) validates an explicit Linux host
+configuration, performs camera-free preflight and supervises one attended scan.
+It retains categorical outcomes, stage timings and descriptor-release evidence in
+a durable local ledger. It does not enable IR-only login or issue a qualification
+verdict. Its offline tests use synthetic records and harmless subprocesses.

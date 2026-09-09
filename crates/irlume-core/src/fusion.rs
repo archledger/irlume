@@ -1,50 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! Stage-2 lighting-adaptive RGB+IR score fusion.
+//! Stage-2 brightness-weighted RGB+IR score fusion.
 //!
-//! Each modality's cosine is mapped to a *calibrated* genuine-probability (Platt
-//! scaling), weighted by capture quality, then fused. This lets a marginal-RGB +
-//! marginal-IR capture JOINTLY grant in mixed light, while keeping the false-match
-//! rate bounded, because an impostor must fool BOTH modalities at once (the two
-//! score distributions are near-independent). Fusion only ADDS dim-light rescues on
-//! top of the existing single-modality thresholds; it never relaxes them.
+//! Fixed sigmoid mappings turn each modality's cosine into a score in `[0, 1]`.
+//! The caller weights these scores by capture brightness and takes an arithmetic
+//! mean. The legacy `prob` names do not establish calibrated genuine probabilities
+//! for the current pipeline, a joint posterior, or a false-match-rate bound.
 //!
-//! Constants fit offline, NOT by a script in this repo: `scripts/calibrate.py`
-//! was never committed, so do not go looking for it. RGB Platt on LFW
-//! genuine/impostor cosines; IR Platt on CBSR+Oulu NIR. Refitting means
-//! reproducing that offline fit; the caveat below says when that is needed.
+//! Historical comments attribute the RGB coefficients to LFW and the IR
+//! coefficients to CBSR+Oulu in the former v3 IR-adapter space. The fitting script
+//! and a reproducible fit report are not present in this repository. ADR-0004
+//! retired that shipped adapter; current raw/per-enrollment-calibrated IR scores
+//! have a different provenance. Retaining these constants does not validate them
+//! for that path or for a user-supplied adapter.
 //!
-//! CALIBRATION CAVEAT (ADR-0004): the IR Platt (`IR_PLATT_A/B`) was fit on IR
-//! cosines produced by the former v3 IR adapter, which no longer ships. The
-//! default IR path now scores raw-AuraFace (per-enrollment-calibrated) cosines,
-//! a different distribution, so these constants are retained as a CONSERVATIVE
-//! PRIOR pending a raw-space re-fit, not a validated fit. This is bounded, not
-//! dangerous: fusion only ADDS dim-light rescues on top of the single-modality
-//! thresholds (never relaxes them), the sigmoid midpoint (cos ≈ 0.405) still
-//! sits between raw genuine and impostor IR cosines, and a grant additionally
-//! requires the RGB side plus the conservative 0.50 fused bar. TODO: re-fit
-//! `IR_PLATT_A/B` against raw/calibrated-space IR captures and re-validate the
-//! dim-light rescue operating point.
+//! Fusion can accept scores below the standalone identity thresholds. It expands
+//! the acceptance rule even though those thresholds are unchanged. Assessing its
+//! false-match rate requires evaluating the full rule, including template/profile
+//! selection and other acceptance arms; neither modality independence nor an
+//! overall error bound follows from this arithmetic. The caller separately
+//! enforces liveness/PAD and disallows fusion grants for sequential pairs.
 
-/// RGB Platt: `p = sigmoid(a*cos + b)`. Fit on LFW (genuine cos μ0.565 / impostor μ0.062).
+/// Legacy RGB sigmoid coefficient, historically attributed to an offline LFW fit.
 pub const RGB_PLATT_A: f32 = 24.4708;
 pub const RGB_PLATT_B: f32 = -8.1873;
-/// IR Platt. Fit on CBSR+Oulu (former adapter space, genuine μ0.783 / impostor
-/// μ0.033); a conservative prior for the current raw path pending re-fit (see
-/// the module-level CALIBRATION CAVEAT).
+/// Legacy IR sigmoid coefficient from the retired adapter space.
+/// Its calibration for the current raw/per-enrollment path is unverified.
 pub const IR_PLATT_A: f32 = 40.0120;
 pub const IR_PLATT_B: f32 = -16.2221;
 
-/// Fused genuine-probability required to grant via fusion. CONSERVATIVE: the
-/// equal-weight independence model puts fused FAR≤1e-4 at ~0.31; 0.50 adds margin
-/// and is trivially cleared by a true user (deployment fused-prob ≈1.0). Raising
-/// this only tightens security.
+/// Minimum weighted score for the fusion arm, not a measured false-match bound.
 pub const FUSION_PROB_THRESHOLD: f32 = 0.50;
 
-/// Each modality must independently clear this genuine-probability for fusion to
-/// fire; blocks "one strong modality + pure noise" from granting (anti
-/// single-modality-spoof). Set just above chance.
+/// Per-modality sigmoid-score floor. This is not a standalone identity threshold
+/// or proof that both modalities independently verified the claimed identity.
 pub const FUSION_MIN_PER_MODALITY_PROB: f32 = 0.10;
 
 #[inline]
@@ -52,12 +42,11 @@ pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Calibrated genuine-probability for an RGB cosine.
+/// Legacy sigmoid score for an RGB cosine; current probability calibration is unverified.
 pub fn rgb_genuine_prob(cos: f32) -> f32 {
     sigmoid(RGB_PLATT_A * cos + RGB_PLATT_B)
 }
-/// Calibrated genuine-probability for an IR cosine (conservative prior; see the
-/// module-level CALIBRATION CAVEAT).
+/// Legacy sigmoid score for an IR cosine; see the module-level calibration limits.
 pub fn ir_genuine_prob(cos: f32) -> f32 {
     sigmoid(IR_PLATT_A * cos + IR_PLATT_B)
 }
@@ -98,17 +87,18 @@ pub fn ir_quality_weight(ir_present: bool, ir_brightness: f32) -> f32 {
 /// Outcome of a fusion attempt.
 #[derive(Debug, Clone, Copy)]
 pub struct Fusion {
-    /// Quality-weighted fused genuine-probability.
+    /// Brightness-weighted score; the legacy field name does not imply calibration.
     pub prob: f32,
     pub p_rgb: f32,
     pub p_ir: f32,
-    /// True iff the fused probability clears the bar AND each modality shows floor evidence.
+    /// True iff the weighted score and both floors pass with positive IR weight.
     pub grant: bool,
 }
 
-/// Quality-weighted fusion of the two calibrated genuine-probabilities. Grants only
-/// if the fused probability clears [`FUSION_PROB_THRESHOLD`], each modality clears
-/// [`FUSION_MIN_PER_MODALITY_PROB`], and a real IR capture was present (`w_ir > 0`).
+/// Brightness-weighted arithmetic mean of the supplied sigmoid scores. Grants only
+/// if the score clears [`FUSION_PROB_THRESHOLD`], each modality clears
+/// [`FUSION_MIN_PER_MODALITY_PROB`], and `w_ir > 0`. The caller is responsible for
+/// mapping absent IR to zero weight and enforcing capture/liveness policy.
 pub fn fuse(p_rgb: f32, w_rgb: f32, p_ir: f32, w_ir: f32) -> Fusion {
     let wsum = (w_rgb + w_ir).max(1e-6);
     let prob = (w_rgb * p_rgb + w_ir * p_ir) / wsum;
@@ -139,14 +129,14 @@ mod tests {
         ] {
             assert!((0.0..=1.0).contains(&p));
         }
-        // Deployment genuine cosines map to near-certain.
+        // Synthetic high-cosine examples approach the top of the sigmoid.
         assert!(rgb_genuine_prob(0.80) > 0.99);
         assert!(ir_genuine_prob(0.75) > 0.99);
     }
 
     #[test]
     fn genuine_both_modalities_grants() {
-        // True user, good light: both strong.
+        // Synthetic high-score pair with high brightness weights.
         let f = fuse(
             rgb_genuine_prob(0.78),
             rgb_quality_weight(120.0),
@@ -158,7 +148,7 @@ mod tests {
 
     #[test]
     fn genuine_dim_light_ir_rescues() {
-        // Dim RGB (marginal) + good IR -> fusion rescues.
+        // Synthetic low-brightness RGB and high-score IR exercise weighting.
         let f = fuse(
             rgb_genuine_prob(0.42),
             rgb_quality_weight(55.0),
@@ -170,7 +160,7 @@ mod tests {
 
     #[test]
     fn impostor_both_marginal_rejected() {
-        // Impostor near each modality's FAR-1e-3 cosine: must NOT grant.
+        // A synthetic low-score pair must not pass the configured fusion gate.
         let f = fuse(
             rgb_genuine_prob(0.29),
             rgb_quality_weight(120.0),
@@ -182,7 +172,7 @@ mod tests {
 
     #[test]
     fn one_strong_one_noise_rejected() {
-        // Strong RGB but IR is pure noise (cos ~0) -> per-modality floor blocks fusion.
+        // Synthetic high RGB and zero IR cosine: the IR score floor blocks fusion.
         let f = fuse(
             rgb_genuine_prob(0.85),
             rgb_quality_weight(120.0),

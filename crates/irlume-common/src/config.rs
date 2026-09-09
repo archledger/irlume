@@ -18,6 +18,81 @@ pub const CONFIG_ROOT: &str = "/etc/irlume";
 /// on which file holds the pin.
 pub const CAMERAS_CONF: &str = "cameras.conf";
 
+/// Machine-wide sensor selection, independent of two-camera scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FaceSensorPolicy {
+    Dual,
+    IrOnlyExperimental,
+}
+
+/// One observed policy snapshot. Errors never imply permission to use RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaceSensorPolicyObservation {
+    DefaultDual,
+    Explicit(FaceSensorPolicy),
+    Invalid,
+    Unreadable,
+}
+
+impl FaceSensorPolicyObservation {
+    /// Resolve the single observation without defaulting on malformed policy.
+    ///
+    /// # Errors
+    /// Invalid or unreadable policy requires password fallback.
+    pub fn resolve(self) -> crate::Result<FaceSensorPolicy> {
+        match self {
+            Self::DefaultDual => Ok(FaceSensorPolicy::Dual),
+            Self::Explicit(policy) => Ok(policy),
+            Self::Invalid | Self::Unreadable => Err(crate::Error::Policy(
+                "face sensor policy is invalid or unreadable; use your password".into(),
+            )),
+        }
+    }
+}
+
+/// Read the sensor setting once without probing cameras or loading enrollment.
+/// Empty, duplicate and malformed settings are invalid, not the dual default.
+pub fn observe_face_sensor_policy() -> FaceSensorPolicyObservation {
+    use FaceSensorPolicyObservation::{DefaultDual, Explicit, Invalid, Unreadable};
+    let text = match std::fs::read_to_string(config_path("settings.conf")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return DefaultDual,
+        Err(_) => return Unreadable,
+    };
+    let mut selected = None;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        // Recognize malformed attempts to set this exact key too. Otherwise
+        // a missing '=' or a ':' separator silently restores the dual default.
+        // Distinct keys sharing the prefix remain unrelated settings.
+        let is_policy = line.strip_prefix("face_sensor_policy").is_some_and(|tail| {
+            tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || c == '=' || c == ':')
+        });
+        if !is_policy {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Invalid;
+        };
+        if key.trim() != "face_sensor_policy" {
+            return Invalid;
+        }
+        if selected.is_some() {
+            return Invalid;
+        }
+        selected = Some(match value.trim() {
+            "dual" => FaceSensorPolicy::Dual,
+            "ir-only-experimental" => FaceSensorPolicy::IrOnlyExperimental,
+            _ => return Invalid,
+        });
+    }
+    selected.map_or(DefaultDual, Explicit)
+}
+
 fn config_root() -> PathBuf {
     std::env::var_os("IRLUME_CONFIG_DIR")
         .map(PathBuf::from)
@@ -466,11 +541,13 @@ pub fn forbid_external_cameras_visible() -> Option<bool> {
 /// it again before honouring [`crate::IntentAttestation::PolicyWaived`], so a client
 /// cannot waive a confirmation the machine's own policy still requires.
 pub fn privileged_face_consent_visible() -> Option<bool> {
-    if let Ok(v) = std::env::var("IRLUME_PRIVILEGED_FACE_CONSENT") {
-        return Some(truthy(&v));
+    // Waiving confirmation requires an explicit opt-out. A typo, empty or
+    // non-Unicode environment value cannot silently remove the intent gate.
+    if let Some(v) = std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT") {
+        return Some(!v.to_str().is_some_and(falsy));
     }
     match observe_kv("settings.conf", "privileged_face_consent") {
-        KvObservation::Value(v) => Some(truthy(&v)),
+        KvObservation::Value(v) => Some(!falsy(&v)),
         // Absent is unambiguous here too, but the default is ON.
         KvObservation::Absent => Some(true),
         KvObservation::Unknown(_) => None,
@@ -519,6 +596,58 @@ mod tests {
 
         std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn privileged_consent_requires_an_explicit_opt_out() {
+        let _g = testenv::lock();
+        let dir =
+            std::env::temp_dir().join(format!("irlume-consent-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        for (value, required) in [
+            ("0", false),
+            (" OFF ", false),
+            ("false", false),
+            ("no", false),
+            ("yes", true),
+            ("1", true),
+            ("on", true),
+            ("true", true),
+            ("typo", true),
+            ("2", true),
+            ("", true),
+        ] {
+            write_kv("settings.conf", "privileged_face_consent", value).unwrap();
+            assert_eq!(
+                privileged_face_consent_required(),
+                required,
+                "file value {value:?}"
+            );
+            std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", value);
+            assert_eq!(
+                privileged_face_consent_required(),
+                required,
+                "env value {value:?}"
+            );
+            std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        }
+        // A non-Unicode override must not fall through to a file waiver.
+        use std::os::unix::ffi::OsStringExt as _;
+        write_kv("settings.conf", "privileged_face_consent", "0").unwrap();
+        std::env::set_var(
+            "IRLUME_PRIVILEGED_FACE_CONSENT",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        );
+        assert!(privileged_face_consent_required());
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        std::fs::remove_file(dir.join("settings.conf")).unwrap();
+        std::fs::create_dir(dir.join("settings.conf")).unwrap();
+        assert_eq!(privileged_face_consent_visible(), None);
+        assert!(privileged_face_consent_required());
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The external-camera prohibition reads env-over-settings with Absent

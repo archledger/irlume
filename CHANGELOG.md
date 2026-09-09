@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Read KDE wallet salts through the packaged helper after it permanently enters
+  the target account, then pass the fixed-size value to the daemon's unchanged KDF.
+  The daemon no longer opens that user path as root or falls back to doing so;
+  envelopes and wallets need no migration. Upgrade the daemon, CLI, PAM module,
+  and helper together and restart the daemon: an old client gets a clear refusal
+  from a new daemon, while a new client alone cannot correct an old daemon.
+
 - Collect complete sequential login PAD evidence in bounded RGB/IR groups and
   defer identity inference to the final eligible sample.
 

@@ -89,6 +89,45 @@ irlume status for 'you'
 `irlume detect` is a script-friendly probe (exit 0 = ready, 10 = partial,
 20 = absent).
 
+### Optional experimental IR-only policy
+
+Dual RGB+IR authentication remains the default. Irlume also provides an explicit
+machine-owner IR-only policy. It remains experimental and is not a qualification
+claim.
+
+Inspect the installed policy and prerequisites without opening a camera:
+
+```sh
+irlume auth sensor status
+irlume auth sensor preflight
+```
+
+A successful preflight means only that the daemon found the configured IR target,
+its enrolled camera binding, compatible enrollment and recognizer models, and the
+mandatory IR PAD model. It does not prove that capture will finish, that login will
+succeed, or that the configuration is qualified. Older daemons, unknown readiness
+values and missing prerequisites fail closed to the password with an actionable
+message.
+
+The machine owner must opt in explicitly:
+
+```sh
+sudo irlume auth sensor ir-only --yes
+sudo irlume auth sensor dual       # restore the default
+```
+
+This writes the exact setting `face_sensor_policy=ir-only-experimental`. Missing
+settings select dual; malformed or unreadable settings make face authentication
+unavailable until repaired. IR-only opens only the configured, enrollment-bound IR
+image endpoint and its exact optional metadata companion. It does not probe RGB or
+fall back to RGB, and it adds no startup or background camera opens. The currently
+supported scope requires the enrolled isolated USB IR interface and fixed startup,
+with compatible IR templates and mandatory FLIR PAD.
+
+This sensor policy is independent of sequential/concurrent `CaptureMode`, the PAM
+`Method`, and privileged per-attempt consent. It changes none of those controls and
+does not reset retry history. Password fallback remains available.
+
 ### 2. Enroll your face
 
 ```sh
@@ -169,6 +208,14 @@ mistyped password can't be sealed and leave the wallet failing to unlock; the
 password is never stored in plaintext. Re-run it after you change your login
 password. On a fingerprint machine a fingerprint login unseals the wallet the
 same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
+
+For KDE, the CLI or PAM session asks the packaged `irlume-kwallet-init` helper
+to read the fixed-size wallet salt after permanently entering the target account.
+The daemon receives those bytes and performs the existing key derivation; it
+does not open the user's wallet path as root or fall back to doing so. The KDF,
+sealed-envelope format, and wallet files are unchanged, so this needs no wallet
+migration. A failed best-effort reseal after an already valid password login
+does not fail that login.
 
 #### KDE Plasma: what has to be in place for KWallet
 
@@ -332,6 +379,36 @@ word. Do it only if you accept what follows: every
 and one run from a script. Passive PAD still applies, and the password still
 works.
 
+### Choosing privileged face confirmation
+
+Use the same control from the CLI or **TUI Settings > Privileged consent [p]**:
+
+```sh
+irlume auth consent status
+sudo irlume auth consent hands-free --yes  # opt in for configured privileged prompts
+sudo irlume auth consent required         # restore the default confirmation
+```
+
+The TUI explains the scope before enabling hands-free mode. This is a
+machine-wide administrator setting, not a face-profile preference. It affects
+already-configured privileged services, including sudo and polkit; it does not
+wire those services or enable automatic desktop login/lock-screen scanning.
+An app, script or another person can raise a prompt while you are in view.
+Recognizing your face does not establish that you intended that approval.
+Face matching, passive PAD and password fallback remain unchanged.
+
+The commands preserve unrelated settings and apply to subsequent attempts;
+no daemon restart is needed. Status reports the policy visible to this
+process, or an unknown state when it cannot read the file. An environment
+override is shown explicitly and prevents editing through these controls.
+PAM and the daemon may have different environments; a service-level
+`IRLUME_PRIVILEGED_FACE_CONSENT` override still takes precedence there.
+
+Only `0`, `false`, `no` or `off` (case-insensitive, whitespace trimmed)
+waive confirmation. Missing, empty, unreadable or unrecognized values retain
+confirmation. Correct malformed legacy values explicitly instead of relying
+on them to enable hands-free mode.
+
 ## App prompts via polkit (optional)
 
 Desktop apps ask polkit to verify you; Bitwarden's biometric unlock and
@@ -345,7 +422,7 @@ The daemon treats polkit as verify-only (it never releases the TPM-sealed
 credential to it). PAM shows `Type yes to use face authentication` above the
 normal hidden field, unless `privileged_face_consent=0` waives it as described
 above. Type `yes` for one face attempt, or type the ordinary
-password once for the password/fingerprint path. Empty Enter and cancellation
+password once for the password/fingerprint path. With the default confirmation enabled, empty Enter and cancellation
 never open the camera. Automatic passive PAD remains mandatory and separate.
 Full walkthrough, Bitwarden setup, and the security stance:
 [APP-INTEGRATION.md](APP-INTEGRATION.md).
@@ -475,7 +552,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | TUI Settings |
+| `/etc/irlume/settings.conf` | `face_sensor_policy=ir-only-experimental` is the explicit experimental IR-only opt-in; absence selects dual, while malformed or unreadable policy fails closed. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | `sudo irlume auth sensor ...` for the sensor policy; TUI Settings for the other listed settings |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |
@@ -587,6 +664,32 @@ recovery management does not attest which authentication factor was used.
 Older clients can use the new daemon with an available authorization agent;
 older daemons, including after a binary rollback, do not enforce this new gate.
 Rollback leaves recovery envelopes and retry records intact.
+
+
+Face retry recovery uses a separate command: `irlume retry status` shows the
+short face cooldown, the separate 50-consecutive-unsuccessful-request ceiling,
+and the independent reset-password budget; `irlume retry reset`
+verifies your current local login password before clearing both. It checks daemon
+support and reset availability before prompting, and never changes your password
+or restores the template key. Root can explicitly override the retry state with
+`sudo irlume retry reset --user <account>`. Ordinary password login does not clear
+these counters and remains available when retry reset is refused.
+Only an admitted face grant that is successfully written and flushed clears the
+face budget. Cancellation, errors and no-face/setup results after reservation
+retain a charge; cooldowns do
+not refill it. Legacy records start a prospective epoch on their first reservation,
+and status labels earlier history unknown. See [retry policy](DISABLE.md#persistent-retry-records).
+
+The initial password verifier supports local Linux passwords through its dedicated
+`pam_unix` service; LDAP, SSSD and systemd-homed are not qualified. Self-service
+reset is unavailable under enforcing AppArmor. Upgrade/restart the daemon and
+install the packaged verifier/service before using this feature; otherwise use
+normal password login and administrator assistance. The reset-password budget
+allows five failed checks before requiring a 30-second delay for each further
+check; 50 failures require administrator reset. Interrupted verification can
+consume an attempt. Existing face cooldown behavior and the cumulative face
+ceiling described above remain enabled. See [retry recovery](DISABLE.md#password-verified-retry-reset)
+for persistence, repair and rollback details.
 
 Install polkit and run a desktop authentication agent. For terminal sessions, register `pkttyagent` for the requesting process/session before enrollment or profile/model removal. Missing authority or agent, denial, cancellation and expired approval refuse the operation. The dialog uses configured OS authentication, which may include an existing face or fingerprint. The shipped policy does not retain approvals; administrator policy overrides remain authoritative.
 

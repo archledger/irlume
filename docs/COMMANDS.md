@@ -30,6 +30,7 @@ Conventions that apply everywhere:
 | `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones); `doctor --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume deps` | verify runtime dependencies (onnxruntime, models, TPM) |
 | `irlume version` | print the installed version (`--version` / `-V` also work); `version --json` uses the public [machine API](MACHINE-API.md) |
+| `irlume auth sensor <status\|preflight [user]\|dual\|ir-only --yes>` | inspect or select the machine-wide face sensor policy. `ir-only --yes` is a root-only experimental opt-in; `dual` restores the default. `preflight` is camera-free and reports prerequisites only, never capture success, login readiness, or qualification |
 
 ## Enrollment and profiles
 

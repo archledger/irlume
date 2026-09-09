@@ -8,6 +8,12 @@
 //! and run the liveness gate on the cross-spectrum signals → on Live, match the
 //! embedding against the user's enrolled templates at the fixed threshold.
 
+mod ir_assessment;
+
+/// Non-granting developer IR evaluation; absent from normal builds.
+#[cfg(feature = "ir-only-evaluation")]
+pub mod ir_only_evaluation;
+
 use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Embedder, Landmarks5, EMBED_DIM};
 
@@ -28,6 +34,8 @@ pub use irlume_camera::{
 /// devices without depending on the camera crate directly. See
 /// [`irlume_camera::select_pair`].
 pub use irlume_camera::{capabilities, device_identity, select_pair, select_rgb};
+/// Resolve explicitly configured devices without camera discovery or image opens.
+pub use irlume_camera::{configured_ir_target, configured_pair_no_probe};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{
@@ -45,6 +53,7 @@ pub struct Engine {
     emb: Embedder,
     /// Optional IR domain-adaptation MLP (applied to IR embeddings in the dark).
     ir_adapter: Option<Adapter>,
+    ir_adapter_required: bool,
     /// Embedding space IR probes (and new IR scans) live in: `"raw"` without an
     /// adapter, else `"adapter:<sha256 prefix>"` of the loaded adapter file.
     /// Stored on every new scan and matched against at verify, so an adapter
@@ -109,6 +118,9 @@ pub struct Engine {
     /// never mid-inference: stopping an operation is a scheduling decision, not
     /// a way to abandon a device or a session.
     stop_requested: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// This request was abandoned, independently of higher-priority queued work.
+    request_cancelled: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    authentication_deadline: Option<std::time::Instant>,
 }
 
 /// The rescue-slot detector (cascade stage 2): the shipped short-range
@@ -180,6 +192,8 @@ pub struct Assessment {
 
 // An unfinished assessment cannot enter the public identity-admission boundary.
 // Its identity inputs carry actual detected faces, not placeholder embeddings.
+mod authentication_window;
+pub use authentication_window::AuthenticationWindow;
 mod grouped_auth;
 
 struct DeferredAssessment<I> {
@@ -376,11 +390,30 @@ struct AttemptFacts {
     glint: Option<f32>,
     ir_bright: f32,
     persistent_ir_source_overwhelms: bool,
+    ir_only: bool,
 }
 
 impl AttemptFacts {
+    fn from_ir_signals(signals: Option<&Signals>) -> Self {
+        signals.map_or(
+            Self {
+                ir_only: true,
+                ..Self::default()
+            },
+            |signals| Self {
+                ir_only: true,
+                face_frac: signals.face_frac,
+                glint: signals.ir_eye_glint,
+                ir_bright: signals.ir_face_brightness,
+                persistent_ir_source_overwhelms: signals.persistent_ir_source_overwhelms(),
+                ..Self::default()
+            },
+        )
+    }
+
     fn from_assessment(a: &Assessment) -> Self {
         Self {
+            ir_only: false,
             rgb_face: a.signals.rgb_face.map(|f| (f.cx, f.cy)),
             face_frac: a.signals.face_frac,
             yaw_asym: a.signals.head_yaw_asym,
@@ -448,16 +481,24 @@ fn auth_attempt_situation(kind: OutcomeKind, f: &AttemptFacts) -> AttemptSituati
 /// measure must not appear as one that was.
 fn attempt_situation_line(kind: OutcomeKind, score: f32, f: &AttemptFacts) -> String {
     format!(
-        "attempt: {}; face_frac={:.2} yaw={:.2} glint={} ir_bright={:.0} rgb_bright={:.0} \
+        "attempt: {}; face_frac={:.2} yaw={} glint={} ir_bright={:.0} rgb_bright={} \
          score={:.2}",
         attempt_situation_label(auth_attempt_situation(kind, f)),
         f.face_frac,
-        f.yaw_asym,
+        if f.ir_only {
+            "n/a".into()
+        } else {
+            format!("{:.2}", f.yaw_asym)
+        },
         f.glint
             .map(|g| format!("{g:.2}"))
             .unwrap_or_else(|| "n/a".into()),
         f.ir_bright,
-        f.rgb_face_brightness,
+        if f.ir_only {
+            "n/a".into()
+        } else {
+            format!("{:.0}", f.rgb_face_brightness)
+        },
         score,
     )
 }
@@ -692,8 +733,12 @@ pub const IR_PAD_THRESHOLD: f32 = 0.9;
 /// settling before it gives up to the password (~15s, roughly 10 capture
 /// attempts at ~1.1-1.5s each). It retries ONLY presence failures (no matcher
 /// ran), so a longer window costs no false-accept resistance. Override with
-/// `IRLUME_GRACE_MS` (0 = legacy one-shot).
+/// `IRLUME_GRACE_MS` (0 = legacy one-shot; maximum 60,000 ms).
 pub const GRACE_WINDOW_MS: u64 = 15000;
+// Bound development overrides so a typo cannot defer password fallback for
+// an effectively unlimited presence window. This is an operator policy bound,
+// not a latency target; ordinary service defaults remain substantially shorter.
+const MAX_GRACE_OVERRIDE_MS: u64 = 60_000;
 /// Shorter window for `sudo` (and `su`): at a terminal the user is already
 /// looking at the screen, so a match lands on the first attempt; if they look
 /// away they want a quick drop to the password prompt, not a long freeze.
@@ -855,7 +900,7 @@ fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
 }
 
 /// Grace window for a given PAM service. `IRLUME_GRACE_MS` overrides everything
-/// (testing); otherwise sudo/su and polkit get the short window (the user is
+/// (testing, 0..=60,000 ms); otherwise sudo/su and polkit get the short window (the user is
 /// already at the machine, and the KDE polkit agent re-runs the stack up to 3
 /// times on failure, so a long window would just hold its dialog busy) and
 /// every login/lock service (and an unknown/absent service) gets the full
@@ -863,7 +908,8 @@ fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
 fn grace_window_ms(service: Option<&str>) -> u64 {
     if let Some(v) = std::env::var("IRLUME_GRACE_MS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v <= MAX_GRACE_OVERRIDE_MS)
     {
         return v;
     }
@@ -897,7 +943,8 @@ pub enum AuthenticationPurpose {
 impl AuthenticationPurpose {
     /// The purpose a plain [`Engine::authenticate`] runs under: consent-class
     /// services (polkit) get [`Self::AppConsent`], everything else [`Self::Verify`].
-    fn for_service(service: Option<&str>) -> Self {
+    /// Use app consent for privileged services and verification otherwise.
+    pub fn for_service(service: Option<&str>) -> Self {
         if matches!(
             service.and_then(irlume_common::pam_service::classify),
             Some(irlume_common::pam_service::ServiceKind::AppConsent)
@@ -913,13 +960,25 @@ impl AuthenticationPurpose {
 /// [`Engine::authenticate_for_with_diagnostics`].
 type EnrollmentLoad = irlume_common::Result<Option<irlume_core::storage::Enrollment>>;
 
+/// Own an in-flight enrollment helper until setup consumes its result. Declared
+/// before camera owners so early exits drop those owners before draining it.
+struct PendingEnrollmentLoad {
+    receiver: Option<std::sync::mpsc::Receiver<EnrollmentLoad>>,
+}
+
+impl Drop for PendingEnrollmentLoad {
+    fn drop(&mut self) {
+        finish_loader(&mut self.receiver);
+    }
+}
+
 /// Wait out a still-running deferred enrollment load on an early exit, so the
 /// user-state flock and the TPM are free before this request returns. An
 /// immediate retry (decline, then a fallback attempt) would otherwise block
 /// on the orphaned loader's locks — the one way this overlap could make a
 /// retry SLOWER than the serial load it replaced. The exits that can still be
-/// waiting are rare deny/error paths (camera-lease
-/// failure); the post-watch exits arrive seconds after the spawn, by which
+/// waiting include cancellation during setup and camera-lease failure;
+/// the post-watch exits arrive seconds after the spawn, by which
 /// time the load has long finished.
 fn finish_loader(loader: &mut Option<std::sync::mpsc::Receiver<EnrollmentLoad>>) {
     if let Some(rx) = loader.take() {
@@ -1100,8 +1159,19 @@ fn ir_match_in(
         n_templates: 0,
         centroid: None,
     };
+    // Older custom adapters could store arbitrary vector magnitudes.
+    // Normalize both sides in memory; a corrected new probe alone
+    // would still let an oversized historical template inflate its dot product.
+    let adapted_probe = adapter_loaded
+        .then(|| align::normalize_embedding(probe))
+        .flatten();
+    let scoring_probe = if adapter_loaded {
+        adapted_probe.as_deref()
+    } else {
+        Some(probe)
+    };
     for p in &enr.profiles {
-        let tmpls: Vec<&[f32]> = p
+        let tmpls: Vec<std::borrow::Cow<'_, [f32]>> = p
             .scans
             .iter()
             .filter_map(|s| {
@@ -1122,13 +1192,25 @@ fn ir_match_in(
                 }
                 // Before tagging, both raw and adapted IR shipped. An absent
                 // tag cannot establish either space, even at the same width.
-                (s.ir_space.as_deref() == Some(space)).then_some(ir.as_slice())
+                if s.ir_space.as_deref() != Some(space) {
+                    return None;
+                }
+                if adapter_loaded {
+                    align::normalize_embedding(ir).map(std::borrow::Cow::Owned)
+                } else {
+                    Some(std::borrow::Cow::Borrowed(ir.as_slice()))
+                }
             })
             .collect();
         if tmpls.is_empty() {
             continue;
         }
         m.n_templates += tmpls.len();
+        // Diagnostic preflight uses a zero probe to count eligible templates.
+        // Retain that count, but invalid adapted probes never produce scores.
+        let Some(probe) = scoring_probe else {
+            continue;
+        };
         // The calibration for THIS recognizer: a profile can hold scans (and
         // calibrations) from several, and applying one model's calibration to
         // another's templates puts uninterpretable numbers into the matcher
@@ -1175,6 +1257,103 @@ fn ir_match_in(
         }
     }
     m
+}
+
+#[cfg(test)]
+mod adapter_match_tests {
+    use super::*;
+    use irlume_core::storage::{Enrollment, FaceProfile, FaceScan, LEGACY_RECOGNIZER_SPACE};
+
+    fn enrollment(template: Vec<f32>) -> Enrollment {
+        let mut enr = Enrollment::new("synthetic");
+        enr.profiles.push(FaceProfile {
+            name: "synthetic".into(),
+            scans: vec![FaceScan {
+                name: "synthetic".into(),
+                rgb: vec![],
+                ir: Some(template),
+                ir_space: Some("adapter-test".into()),
+                embed_space: None,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            }],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        enr
+    }
+
+    fn match_adapted(enr: &Enrollment, probe: &[f32]) -> IrMatch {
+        ir_match_in("adapter-test", LEGACY_RECOGNIZER_SPACE, true, enr, probe)
+    }
+
+    fn direction(cosine: f32, scale: f32) -> Vec<f32> {
+        let mut v = vec![0.0; EMBED_DIM];
+        v[0] = cosine * scale;
+        v[1] = (1.0 - cosine * cosine).sqrt() * scale;
+        v
+    }
+
+    #[test]
+    fn adapter_match_historical_scaling_cannot_inflate_similarity() {
+        for template_scale in [1.0, 10.0] {
+            for probe_scale in [1.0, 10.0] {
+                let enr = enrollment(direction(0.2, template_scale));
+                let result = match_adapted(&enr, &direction(1.0, probe_scale));
+                assert!((result.best - 0.2).abs() < 1e-6);
+                assert_eq!(result.n_templates, 1);
+                assert!(result.centroid.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_match_invalid_probe_retains_preflight_count_without_scores() {
+        let enr = enrollment(direction(1.0, 1.0));
+        for invalid in [0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = match_adapted(&enr, &vec![invalid; EMBED_DIM]);
+            assert_eq!(result.n_templates, 1);
+            assert_eq!(result.best, f32::NEG_INFINITY);
+            assert!(result.best_who.is_empty());
+            assert!(result.centroid.is_none());
+        }
+    }
+
+    #[test]
+    fn adapter_match_invalid_templates_are_not_eligible() {
+        let probe = direction(1.0, 1.0);
+        for invalid in [0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = match_adapted(&enrollment(vec![invalid; EMBED_DIM]), &probe);
+            assert_eq!(result.n_templates, 0);
+            assert_eq!(result.best, f32::NEG_INFINITY);
+        }
+    }
+
+    #[test]
+    fn adapter_match_unit_vectors_preserve_threshold_neighborhood() {
+        // Numerical compatibility near the policy boundary, not qualification.
+        let threshold = irlume_core::IR_ADAPTED_MATCH_THRESHOLD;
+        for expected in [threshold - 2e-5, threshold + 2e-5] {
+            let result = match_adapted(&enrollment(direction(expected, 1.0)), &direction(1.0, 1.0));
+            assert!((result.best - expected).abs() < 1e-6);
+            assert_eq!(result.best >= threshold, expected >= threshold);
+        }
+    }
+
+    #[test]
+    fn adapter_match_retains_dimension_and_space_filters() {
+        let probe = direction(1.0, 1.0);
+        let mut enr = enrollment(probe.clone());
+        enr.profiles[0].scans[0].ir_space = Some("different-adapter".into());
+        assert_eq!(match_adapted(&enr, &probe).n_templates, 0);
+        enr.profiles[0].scans[0].ir_space = Some("adapter-test".into());
+        enr.profiles[0].scans[0].embed_space = Some("different-recognizer".into());
+        assert_eq!(match_adapted(&enr, &probe).n_templates, 0);
+        enr.profiles[0].scans[0].embed_space = None;
+        enr.profiles[0].scans[0].ir.as_mut().unwrap().pop();
+        assert_eq!(match_adapted(&enr, &probe).n_templates, 0);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1471,6 +1650,30 @@ impl From<irlume_common::Error> for CapturePathError {
     fn from(error: irlume_common::Error) -> Self {
         Self::Other(error)
     }
+}
+
+fn concurrent_setup_error(
+    mode: Option<&CaptureModeSelection>,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    reason: RuntimeDegradation,
+    error: irlume_common::Error,
+) -> CapturePathError {
+    if matches!(
+        error,
+        irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired
+    ) {
+        return CapturePathError::Other(error);
+    }
+    irlume_common::dlog!("concurrent assessment setup failed ({reason:?}): {error}");
+    emit_capture_fallback(reason, diagnostics);
+    if let Some(selection) = mode {
+        if pair_rate_failure_is_degradation(selection) {
+            if let Some(key) = selection.runtime_key.as_deref() {
+                trip_runtime_capture_health(key, reason);
+            }
+        }
+    }
+    CapturePathError::ConcurrentPair(error)
 }
 
 fn unavailable_capture_mode_selection() -> CaptureModeSelection {
@@ -2400,6 +2603,53 @@ mod capture_mode_switch_tests {
     }
 
     #[test]
+    fn capture_cancellation_does_not_emit_or_record_camera_degradation() {
+        let sink = RecordingSink::default();
+        let mut mode = unavailable_capture_mode_selection();
+        mode.sequential = false;
+        mode.source = STORED_CAPTURE_MODE_SOURCE;
+        mode.runtime_key = Some("cancelled-setup-regression".into());
+        reset_runtime_capture_health("cancelled-setup-regression");
+        for reason in [
+            RuntimeDegradation::PairArmFailure,
+            RuntimeDegradation::PairRateEstablishmentFailure,
+        ] {
+            let error = concurrent_setup_error(
+                Some(&mode),
+                &sink,
+                reason,
+                irlume_common::Error::Preempted("cancelled".into()),
+            );
+            assert!(matches!(
+                error,
+                CapturePathError::Other(irlume_common::Error::Preempted(_))
+            ));
+            assert!(sink.events().is_empty());
+            assert!(with_runtime_capture_health(
+                |health| health.degradation("cancelled-setup-regression")
+            )
+            .is_none());
+            assert!(!mode.is_sequential());
+        }
+        let error = concurrent_setup_error(
+            Some(&mode),
+            &sink,
+            RuntimeDegradation::PairArmFailure,
+            irlume_common::Error::Hardware("genuine camera failure".into()),
+        );
+        assert!(matches!(error, CapturePathError::ConcurrentPair(_)));
+        assert!(
+            !sink.events().is_empty(),
+            "real hardware failures retain fallback reporting"
+        );
+        assert!(with_runtime_capture_health(
+            |health| health.degradation("cancelled-setup-regression")
+        )
+        .is_some());
+        reset_runtime_capture_health("cancelled-setup-regression");
+    }
+
+    #[test]
     fn runtime_degradation_is_process_local_and_exact_context_scoped() {
         let mut health = RuntimeCaptureHealth::default();
         let qualified = (false, STORED_CAPTURE_MODE_SOURCE);
@@ -2878,6 +3128,7 @@ impl Engine {
             det: Detector::load_from_file(det_path)?,
             emb: Embedder::load_from_memory(model.bytes())?,
             ir_adapter: None,
+            ir_adapter_required: false,
             ir_space: "raw".into(),
             embed_space,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
@@ -2899,6 +3150,8 @@ impl Engine {
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             stop_requested: None,
+            request_cancelled: None,
+            authentication_deadline: None,
             last_attempt_facts: AttemptFacts::default(),
             last_attempt_situation: None,
         })
@@ -2914,6 +3167,85 @@ impl Engine {
         self.stop_requested = Some(signal);
     }
 
+    /// Supply cancellation of the current request, separately from scheduler
+    /// preemption. Authentication ignores queued work but honors its own client
+    /// leaving at safe boundaries; no driver or inference call is interrupted.
+    pub fn set_request_cancel_signal(
+        &mut self,
+        signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        self.request_cancelled = Some(signal);
+    }
+
+    /// Check the retained authentication window and the current client's signal
+    /// after the engine has returned, including around credential preparation.
+    ///
+    /// # Errors
+    /// Returns cancellation or expiry without admitting a response.
+    pub fn check_authentication_completion(
+        &self,
+        window: AuthenticationWindow,
+    ) -> irlume_common::Result<()> {
+        if self
+            .request_cancelled
+            .as_ref()
+            .is_some_and(|signal| signal())
+        {
+            return Err(irlume_common::Error::Preempted(
+                "authentication cancelled".into(),
+            ));
+        }
+        window.check()
+    }
+
+    fn check_request_cancelled(&mut self) -> irlume_common::Result<()> {
+        if self
+            .request_cancelled
+            .as_ref()
+            .is_some_and(|signal| signal())
+        {
+            self.vit_scores.clear();
+            self.last_attempt_situation = None;
+            return Err(irlume_common::Error::Preempted(
+                "authentication cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_request_active(&mut self) -> irlume_common::Result<()> {
+        self.check_request_cancelled()?;
+        if self
+            .authentication_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.vit_scores.clear();
+            self.last_attempt_situation = Some(AttemptSituation::TimedOut);
+            return Err(irlume_common::Error::DeadlineExpired);
+        }
+        Ok(())
+    }
+
+    /// Completed refusals retain their established accounting classification.
+    /// Expiry prevents granting, not recording evidence already obtained.
+    fn check_completed_attempt(
+        &mut self,
+        result: &irlume_common::Result<Outcome>,
+    ) -> irlume_common::Result<()> {
+        if result.as_ref().is_ok_and(|outcome| !outcome.granted) {
+            self.check_request_cancelled()?;
+            if self
+                .authentication_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                self.vit_scores.clear();
+            }
+            Ok(())
+        } else {
+            self.check_request_active()
+        }
+    }
+
     /// True when something has asked this operation to stop.
     fn should_stop(&self) -> bool {
         self.stop_requested.as_ref().is_some_and(|f| f())
@@ -2927,10 +3259,11 @@ impl Engine {
     /// window arbitrarily, and a window of healthy no-face captures followed
     /// by one frameless capture chain summed past `WatchdogSec` with no
     /// progress reported anywhere between (#336). The answer itself is
-    /// deliberately dropped: only a queued authentication raises it, and
+    /// deliberately dropped: a queued authentication also raises it, and
     /// cutting a RUNNING authentication's grace window for a queued one would
     /// hand the first user a password prompt whenever a polkit verify races
     /// the lock screen. Enrolment keeps honoring it via [`Self::should_stop`].
+    /// Authentication checks its separate request-cancellation signal instead.
     fn note_capture_boundary(&self) {
         let _ = self.should_stop();
     }
@@ -2942,7 +3275,8 @@ impl Engine {
     /// frameless camera reporting each returned dequeue window never looks
     /// wedged, while a driver call that never returns still does. The yield
     /// answer is dropped for the boundary's reason too, and one more: this
-    /// fires INSIDE a capture, where nothing can safely stop anyway. Owned
+    /// fires inside a capture. Request cancellation is checked separately by
+    /// `CaptureControl` at returned-frame boundaries. Owned
     /// (`Arc`) so the concurrent capture pair can carry it across scoped
     /// threads without borrowing the engine.
     fn capture_progress(&self) -> irlume_camera::Progress {
@@ -2955,6 +3289,15 @@ impl Engine {
             }
             None => irlume_camera::no_progress(),
         }
+    }
+
+    fn capture_control(&self) -> irlume_camera::CaptureControl {
+        let progress = self.capture_progress();
+        let control = match &self.request_cancelled {
+            Some(cancelled) => irlume_camera::CaptureControl::new(progress, cancelled.clone()),
+            None => irlume_camera::CaptureControl::with_progress(progress),
+        };
+        control.with_deadline(self.authentication_deadline)
     }
 
     /// Assurance tier from the hardware: `Secure` with a real RGB+IR camera,
@@ -3527,10 +3870,11 @@ impl Engine {
         &mut self,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Assessment> {
+        self.check_request_active()?;
         let capture_started = std::time::Instant::now();
-        let rgb = irlume_camera::capture_rgb_denoised_with_progress(
+        let rgb = irlume_camera::capture_rgb_denoised_with_control(
             &self.rgb_dev,
-            &self.capture_progress(),
+            &self.capture_control(),
         )?;
         if let Some(event) = irlume_camera::diagnostic_stream_evidence(&rgb) {
             diagnostics.emit_trace(event);
@@ -3544,6 +3888,7 @@ impl Engine {
             width: rgb.width,
             height: rgb.height,
         };
+        self.check_request_active()?;
         let detection_started = std::time::Instant::now();
         let rgb_faces = self.det.detect(&rgb_view)?;
         let rgb_top = top_detection(&rgb_faces).cloned();
@@ -3614,6 +3959,7 @@ impl Engine {
         // the one measured defence against the life-size print (the 2026-06-30
         // breach species; IR face-presence does not exist here). Same deny-only
         // 5-median contract as the cross-spectrum path.
+        self.check_request_active()?;
         let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
             (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
             (Verdict::Live, Some(f), Some(pad)) => match pad.p_spoof(&rgb_view, &f.bbox) {
@@ -3626,6 +3972,7 @@ impl Engine {
             },
             _ => PadEvidence::NotApplicable,
         };
+        self.check_request_active()?;
         let (verdict, reason) = match rgb_pad {
             PadEvidence::Score(p) => {
                 irlume_common::dlog!("pad-vit(rgb-only): p_spoof {p:.3}");
@@ -3643,6 +3990,7 @@ impl Engine {
             }
             _ => (verdict, reason),
         };
+        self.check_request_active()?;
         let embedding = match &rgb_top {
             Some(f) => Some(
                 self.emb
@@ -3650,6 +3998,7 @@ impl Engine {
             ),
             None => None,
         };
+        self.check_request_active()?;
         Ok(Assessment {
             verdict,
             reason,
@@ -3686,23 +4035,12 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<Assessment, CapturePathError> {
-        let setup_error = |reason, error| {
-            irlume_common::dlog!("concurrent assessment setup failed ({reason:?}): {error}");
-            emit_capture_fallback(reason, diagnostics);
-            if let Some(selection) = mode {
-                if pair_rate_failure_is_degradation(selection) {
-                    if let Some(key) = selection.runtime_key.as_deref() {
-                        trip_runtime_capture_health(key, reason);
-                    }
-                }
-            }
-            CapturePathError::ConcurrentPair(error)
-        };
-        let progress = self.capture_progress();
+        let setup_error = |reason, error| concurrent_setup_error(mode, diagnostics, reason, error);
+        let control = self.capture_control();
         let started = std::time::Instant::now();
         let pair = arm_pair_transactionally(
-            || rgb.session_with_progress(&progress),
-            || ir.session_for_pair_with_progress(&progress),
+            || rgb.session_with_control(&control),
+            || ir.session_for_pair_with_control(&control),
         );
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::StreamArm,
@@ -3815,6 +4153,10 @@ impl Engine {
         ) -> (irlume_common::Result<irlume_camera::Frame>, bool) {
             match rgb_s.denoised() {
                 Ok(f) => (Ok(f), false),
+                Err(
+                    e
+                    @ (irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired),
+                ) => (Err(e), false),
                 Err(e) => {
                     irlume_common::dlog!(
                         "assess: held rgb stream broke ({e}); recovering it in place"
@@ -3836,6 +4178,10 @@ impl Engine {
         ) {
             match ir_s.capture_with_stats() {
                 Ok(f) => (Ok(f), false),
+                Err(
+                    e
+                    @ (irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired),
+                ) => (Err(e), false),
                 Err(e) => {
                     irlume_common::dlog!(
                         "assess: held ir stream broke ({e}); recovering it in place"
@@ -3848,7 +4194,7 @@ impl Engine {
         let held_sessions = held.is_some();
         // Every one-shot capture below carries the per-window heartbeat
         // (#336); held sessions already carry theirs from `capture_scans`.
-        let progress = self.capture_progress();
+        let control = self.capture_control();
         let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms, recovered_side) =
             if let Some((rgb_s, ir_s)) = held {
                 if sequential {
@@ -3910,8 +4256,7 @@ impl Engine {
                 }
             } else if sequential {
                 let t = std::time::Instant::now();
-                let rgb =
-                    irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress);
+                let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                 let rgb_ms = t.elapsed().as_millis();
                 // Match the old short-circuit: don't fire the IR emitter after an
                 // RGB fault (privacy switch, missing node); the shared retry below
@@ -3920,26 +4265,26 @@ impl Engine {
                     (rgb, rgb_ms, Ok(None), 0, false)
                 } else {
                     let t = std::time::Instant::now();
-                    let ir = irlume_camera::capture_ir_sequential_with_stats_and_progress(
+                    let ir = irlume_camera::capture_ir_sequential_with_stats_and_control(
                         &self.ir_dev,
-                        &progress,
+                        &control,
                     );
                     (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis(), false)
                 }
             } else {
                 std::thread::scope(|s| {
                     let ir_dev = self.ir_dev.clone();
-                    let ir_progress = progress.clone();
+                    let ir_control = control.clone();
                     let ir_thread = s.spawn(move || {
                         let t = std::time::Instant::now();
                         let captured = Self::run_camera_operation(operation, || {
-                            irlume_camera::capture_ir_with_stats_and_progress(&ir_dev, &ir_progress)
+                            irlume_camera::capture_ir_with_stats_and_control(&ir_dev, &ir_control)
                         });
                         (captured, t.elapsed().as_millis())
                     });
                     let t = std::time::Instant::now();
                     let rgb =
-                        irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress);
+                        irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                     let rgb_ms = t.elapsed().as_millis();
                     let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                         (
@@ -3952,6 +4297,25 @@ impl Engine {
                     (rgb, rgb_ms, ir.map(Some), ir_ms, false)
                 })
             };
+        self.check_request_active()?;
+        for error in [rgb_res.as_ref().err(), ir_res.as_ref().err()]
+            .into_iter()
+            .flatten()
+        {
+            if matches!(
+                error,
+                irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired
+            ) {
+                self.vit_scores.clear();
+                self.last_attempt_situation = None;
+                return Err(if matches!(error, irlume_common::Error::DeadlineExpired) {
+                    irlume_common::Error::DeadlineExpired
+                } else {
+                    irlume_common::Error::Preempted("camera capture cancelled".into())
+                }
+                .into());
+            }
+        }
         emit_trace_stage_ms(
             diagnostics,
             irlume_common::diagnostics::TraceStage::RgbCapture,
@@ -4040,17 +4404,15 @@ impl Engine {
             let (fresh_rgb, fresh_ir) = capture_pair_sequentially(
                 || {
                     let started = std::time::Instant::now();
-                    let frame = irlume_camera::capture_rgb_denoised_with_progress(
-                        &self.rgb_dev,
-                        &progress,
-                    )?;
+                    let frame =
+                        irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
                     Ok((frame, started.elapsed().as_millis()))
                 },
                 || {
                     let started = std::time::Instant::now();
-                    let frame = irlume_camera::capture_ir_sequential_with_stats_and_progress(
+                    let frame = irlume_camera::capture_ir_sequential_with_stats_and_control(
                         &self.ir_dev,
-                        &progress,
+                        &control,
                     )?;
                     Ok((frame, started.elapsed().as_millis()))
                 },
@@ -4142,7 +4504,7 @@ impl Engine {
                     }
                 );
                 rgb_hard_retried = true;
-                irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?
+                irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?
             }
             Err(e) => return Err(e.into()),
         };
@@ -4153,10 +4515,10 @@ impl Engine {
         // but capture alone rather than unwrap to stay panic-free.
         let (ir, ir_stats) = match ir_res {
             Ok(Some(f)) => f,
-            Ok(None) => irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?,
+            Ok(None) => irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control)?,
             Err(e) if !held_sessions && !pair_sequential_retried => {
                 irlume_common::dlog!("assess: ir capture retry (concurrent failed: {e})");
-                irlume_camera::capture_ir_with_stats_and_progress(&self.ir_dev, &progress)?
+                irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control)?
             }
             Err(e) => return Err(e.into()),
         };
@@ -4184,12 +4546,27 @@ impl Engine {
         rgb_ms: Option<u128>,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<(Vec<Detection>, Option<Detection>)> {
+        self.detect_rgb_assessment_view(
+            &align::RgbView {
+                data: &rgb.data,
+                width: rgb.width,
+                height: rgb.height,
+            },
+            rgb_ms,
+            diagnostics,
+        )
+    }
+
+    fn detect_rgb_assessment_view(
+        &mut self,
+        rgb: &align::RgbView<'_>,
+        rgb_ms: Option<u128>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<(Vec<Detection>, Option<Detection>)> {
+        self.check_request_active()?;
         let rgb_detection_started = std::time::Instant::now();
-        let rgb_faces = self.det.detect(&align::RgbView {
-            data: &rgb.data,
-            width: rgb.width,
-            height: rgb.height,
-        })?;
+        let rgb_faces = self.det.detect(rgb)?;
+        self.check_request_active()?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Detection,
             elapsed_us: u64::try_from(rgb_detection_started.elapsed().as_micros())
@@ -4206,16 +4583,10 @@ impl Engine {
             rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
         );
         if rgb_top.is_none() {
-            rgb_top = self.rescue_detect(
-                &align::RgbView {
-                    data: &rgb.data,
-                    width: rgb.width,
-                    height: rgb.height,
-                },
-                "rgb",
-            );
+            rgb_top = self.rescue_detect(rgb, "rgb");
         }
 
+        self.check_request_active()?;
         Ok((rgb_faces, rgb_top))
     }
 
@@ -4227,6 +4598,7 @@ impl Engine {
         (mut rgb_faces, mut rgb_top): (Vec<Detection>, Option<Detection>),
         context: PairAssessmentContext<'_>,
     ) -> Result<DeferredAssessment<PairIdentity>, CapturePathError> {
+        self.check_request_active()?;
         let PairAssessmentContext {
             sequential,
             pair_sequential_retried,
@@ -4235,7 +4607,7 @@ impl Engine {
             ir_ms,
             diagnostics,
         } = context;
-        let progress = self.capture_progress();
+        let control = self.capture_control();
         let ir_grey_rgb = irlume_camera::grey_to_rgb(&ir.data);
         let ir_view = align::RgbView {
             data: &ir_grey_rgb,
@@ -4244,6 +4616,7 @@ impl Engine {
         };
         let ir_detection_started = std::time::Instant::now();
         let ir_faces = self.det.detect(&ir_view)?;
+        self.check_request_active()?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Detection,
             elapsed_us: u64::try_from(ir_detection_started.elapsed().as_micros())
@@ -4269,6 +4642,7 @@ impl Engine {
             };
             ir_top = self.rescue_detect(&iv, "ir");
         }
+        self.check_request_active()?;
 
         // Cross-spectrum self-heal for overlapped-capture RGB dimming. Some
         // Hello modules (measured: NexiGo N930W) starve the RGB stream when
@@ -4288,7 +4662,7 @@ impl Engine {
             irlume_common::dlog!(
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
-            rgb = irlume_camera::capture_rgb_denoised_with_progress(&self.rgb_dev, &progress)?;
+            rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
             rgb_faces = self.det.detect(&align::RgbView {
                 data: &rgb.data,
                 width: rgb.width,
@@ -4521,6 +4895,7 @@ impl Engine {
         // Shipped IR PAD cue (ADR-0013, default-on), deny-only on the lit IR
         // frame. Scored even when the gate did not say Live so the dark path
         // can reuse it below.
+        self.check_request_active()?;
         let ir_pad = match (ir_top.as_ref(), self.pad_ir.as_mut()) {
             (Some(_), None) => PadEvidence::Unavailable,
             (Some(f), Some(pad)) => match pad.p_fake(&ir_view, &f.bbox) {
@@ -4533,6 +4908,7 @@ impl Engine {
             },
             (None, _) => PadEvidence::NotApplicable,
         };
+        self.check_request_active()?;
         let shipped_ir_fake = match ir_pad {
             PadEvidence::Score(p) => Some(p),
             _ => None,
@@ -4554,6 +4930,7 @@ impl Engine {
         // deny-only cues never need to run on frames that already deny, and
         // the 268ms N100 inference is not free (the plan: consent-watch-
         // pipelined, Live frames only).
+        self.check_request_active()?;
         let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
             (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
             (Verdict::Live, Some(f), Some(pad)) => {
@@ -4576,6 +4953,7 @@ impl Engine {
             }
             _ => PadEvidence::NotApplicable,
         };
+        self.check_request_active()?;
         let (verdict, reason) = match rgb_pad {
             PadEvidence::Score(p) => {
                 irlume_common::dlog!("pad-vit: p_spoof {p:.3}");
@@ -4652,6 +5030,7 @@ impl Engine {
             mut assessment,
             identity: (rgb, ir),
         } = evidence;
+        self.check_request_active()?;
         let started = std::time::Instant::now();
         assessment.embedding = match rgb {
             Some(image) => {
@@ -4665,6 +5044,7 @@ impl Engine {
             }
             None => None,
         };
+        self.check_request_active()?;
         let rgb_embedding_ms = started.elapsed().as_millis();
         let started = std::time::Instant::now();
         assessment.ir_embedding = match ir {
@@ -4683,6 +5063,7 @@ impl Engine {
             }
             None => None,
         };
+        self.check_request_active()?;
         irlume_common::dlog!(
             "[assessment-stage] embeddings: rgb={rgb_embedding_ms}ms ir={}ms",
             started.elapsed().as_millis()
@@ -4767,14 +5148,96 @@ impl Engine {
         purpose: AuthenticationPurpose,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
+        self.authenticate_for_in_window(
+            user,
+            service,
+            purpose,
+            AuthenticationWindow::for_service(service),
+            diagnostics,
+        )
+    }
+
+    /// Authenticate within a caller-owned window retained for final response admission.
+    ///
+    /// # Errors
+    /// Returns capture, model, cancellation or deadline errors without granting.
+    pub fn authenticate_for_in_window(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        window: AuthenticationWindow,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        self.last_attempt_situation = None;
+        if let Err(error) = self.check_authentication_completion(window) {
+            if matches!(error, irlume_common::Error::DeadlineExpired) {
+                self.last_attempt_situation = Some(AttemptSituation::TimedOut);
+            }
+            return Err(error);
+        }
+        let policy = irlume_common::config::observe_face_sensor_policy().resolve()?;
+        self.authenticate_for_in_window_with_policy(
+            user,
+            service,
+            purpose,
+            window,
+            policy,
+            diagnostics,
+        )
+    }
+
+    /// Authenticate using the caller's already resolved sensor policy snapshot.
+    ///
+    /// # Errors
+    /// Returns capture, model, cancellation or deadline errors without granting.
+    pub fn authenticate_for_in_window_with_policy(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        window: AuthenticationWindow,
+        policy: irlume_common::config::FaceSensorPolicy,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        let previous =
+            std::mem::replace(&mut self.authentication_deadline, window.capture_deadline());
+        let scope = authentication_window::Scope {
+            engine: self,
+            previous,
+        };
+        let result = scope.engine.authenticate_in_window_inner(
+            user,
+            service,
+            purpose,
+            window,
+            policy,
+            diagnostics,
+        );
+        // Covers setup and cleanup paths that return before the retry loop.
+        scope.engine.check_completed_attempt(&result)?;
+        result
+    }
+
+    fn authenticate_in_window_inner(
+        &mut self,
+        user: &str,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        window: AuthenticationWindow,
+        policy: irlume_common::config::FaceSensorPolicy,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
         // The daemon reuses this engine across requests. Setup refusals and
         // errors can return before the attempt loop publishes a new situation.
         self.last_attempt_situation = None;
         // Fresh ViT PAD vote ring per authentication: votes must not mix
         // presentations across requests (ADR-0013 protocol).
         self.vit_scores.clear();
-        let window = grace_window_ms(service);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window);
+        self.check_request_active()?;
+        let request_window = window;
+        let deadline = window.deadline;
+        let window = window.milliseconds;
         // Fingerprint mode: face is disabled so pam_fprintd drives; never engage
         // the camera, decline so the PAM stack cascades to fingerprint/password.
         if irlume_core::policy::method().face_disabled() {
@@ -4782,6 +5245,9 @@ impl Engine {
                 OutcomeKind::OtherDeny,
                 "face disabled (fingerprint mode)",
             ));
+        }
+        if policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental {
+            return self.authenticate_ir_in_window(user, request_window, diagnostics);
         }
         // Load enrollment once per authentication, not once per retry. The key
         // is dropped inside load; only the decrypted Enrollment stays in memory
@@ -4793,37 +5259,39 @@ impl Engine {
         // that hardware error can precede enrollment-dependent denials. Both
         // paths retain password fallback; a loader panic maps to an error.
         let load_started = std::time::Instant::now();
-        let mut loader = match irlume_core::storage::store_is_encrypted(user)? {
-            // No file at all: the instant deny, before anything else wakes.
-            None => {
-                return Ok(Outcome::deny(
-                    OutcomeKind::SetupUnavailable,
-                    format!("'{user}' is not enrolled"),
-                ));
-            }
-            // Plaintext: cheap JSON load, synchronous, old precedence.
-            Some(false) => None,
-            // Encrypted: the TPM unseal is the expensive part — defer it
-            // into the overlap window. A channel, not a JoinHandle: the
-            // receiver can wait with a timeout at the join (a wedged unseal
-            // must not pin the camera lease past the auth deadline), and a
-            // dropped sender reports a loader panic as a disconnect.
-            Some(true) => Some({
-                let loader_user = user.to_string();
-                let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
-                std::thread::Builder::new()
-                    .name("irlume-enrollment-load".into())
-                    .spawn(move || {
-                        let _ = tx.send(irlume_core::storage::load(&loader_user));
-                    })
-                    .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-                rx
-            }),
+        let mut loader = PendingEnrollmentLoad {
+            receiver: match irlume_core::storage::store_is_encrypted(user)? {
+                // No file at all: the instant deny, before anything else wakes.
+                None => {
+                    return Ok(Outcome::deny(
+                        OutcomeKind::SetupUnavailable,
+                        format!("'{user}' is not enrolled"),
+                    ));
+                }
+                // Plaintext: cheap JSON load, synchronous, old precedence.
+                Some(false) => None,
+                // Encrypted: the TPM unseal is the expensive part — defer it
+                // into the overlap window. A channel, not a JoinHandle: the
+                // receiver can wait with a timeout at the join (a wedged unseal
+                // must not pin the camera lease past the auth deadline), and a
+                // dropped sender reports a loader panic as a disconnect.
+                Some(true) => Some({
+                    let loader_user = user.to_string();
+                    let (tx, rx) = std::sync::mpsc::channel::<EnrollmentLoad>();
+                    std::thread::Builder::new()
+                        .name("irlume-enrollment-load".into())
+                        .spawn(move || {
+                            let _ = tx.send(irlume_core::storage::load(&loader_user));
+                        })
+                        .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+                    rx
+                }),
+            },
         };
         // The synchronous-path enrollment (plaintext stores). The encrypted
         // path resolves `enr` at the join below, after camera setup.
-        let loader_was_async = loader.is_some();
-        let sync_enr = if loader.is_none() {
+        let loader_was_async = loader.receiver.is_some();
+        let sync_enr = if loader.receiver.is_none() {
             match irlume_core::storage::load(user)? {
                 Some(enr) => match self.enrollment_policy_refusal(user, &enr) {
                     Some(outcome) => return Ok(outcome),
@@ -4849,14 +5317,20 @@ impl Engine {
         // capture frame through the final grace-window retry.  Keeping this
         // lease across sequential fallbacks is deliberate: otherwise another
         // operation can interleave between captures and matching.
+        self.check_request_active()?;
         let camera_operation = match irlume_camera::lease::acquire_camera_operation(
             &endpoints,
             irlume_camera::lease::CameraOperationKind::Authentication,
-            std::time::Duration::from_secs(2),
+            self.authentication_deadline
+                .map_or(std::time::Duration::from_secs(2), |deadline| {
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(std::time::Duration::from_secs(2))
+                }),
         ) {
             Ok(op) => op,
             Err(error) => {
-                finish_loader(&mut loader);
+                finish_loader(&mut loader.receiver);
                 return Err(irlume_common::Error::Hardware(error.to_string()));
             }
         };
@@ -4864,6 +5338,7 @@ impl Engine {
         // Keep negotiated camera handles for this request. Each assessment
         // creates and drops its own streams, so loader/inference/retry delays
         // cannot overflow queues retained from an earlier capture.
+        self.check_request_active()?;
         let camera_open_started = std::time::Instant::now();
         let resolved_cams = match (
             camera_operation.open_rgb(&rgb_dev),
@@ -4872,6 +5347,7 @@ impl Engine {
             (Ok(rgb), Ok(ir)) => Some((rgb, ir)),
             _ => None,
         };
+        self.check_request_active()?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::CameraOpen,
             elapsed_us: u64::try_from(camera_open_started.elapsed().as_micros())
@@ -4909,7 +5385,7 @@ impl Engine {
         // Resolve enrollment before streaming. A loader wait can exceed a
         // camera queue's capacity; no stream may be armed across this wait.
         // The wait remains bounded by the authentication deadline.
-        let enr = match loader.take() {
+        let enr = match loader.receiver.take() {
             Some(rx) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 match resolve_loader(rx.recv_timeout(remaining)) {
@@ -5121,9 +5597,20 @@ impl Engine {
         // retry can be slower than the attempt before it. Each concurrent
         // attempt now includes fresh stream arming and rate establishment.
         loop {
+            if let Err(error) = self.check_request_active() {
+                return (Err(error), false);
+            }
+            if window != 0 && now() >= deadline {
+                self.vit_scores.clear();
+                self.last_attempt_situation = Some(AttemptSituation::TimedOut);
+                return (Err(irlume_common::Error::DeadlineExpired), false);
+            }
             attempt += 1;
             let attempt_started = now();
             let (attempt_result, held_pair_failed) = capture_attempt(self);
+            if let Err(error) = self.check_completed_attempt(&attempt_result) {
+                return (Err(error), false);
+            }
             *costliest_attempt = (*costliest_attempt).max(now().duration_since(attempt_started));
             let out = match attempt_result {
                 Ok(out) => out,
@@ -5151,6 +5638,11 @@ impl Engine {
                 self.last_attempt_situation = None;
             }
             let expired = now() >= deadline;
+            if window != 0 && expired && out.granted {
+                self.vit_scores.clear();
+                self.last_attempt_situation = Some(AttemptSituation::TimedOut);
+                return (Err(irlume_common::Error::DeadlineExpired), false);
+            }
             let retry_wont_fit = !expired
                 && presence_retryable(&out)
                 && deadline.saturating_duration_since(now()) < *costliest_attempt;
@@ -5347,13 +5839,11 @@ impl Engine {
                      IR-identity arms only, ADR-0014)"
                 );
             }
-            // Stage-2 lighting-adaptive fusion: RGB recognition missed (poor ambient
-            // light or a marginal angle). If we also captured an IR face and the user
-            // enrolled IR templates, fuse the two CALIBRATED scores, each weighted by
-            // its modality's capture quality; a marginal RGB + marginal IR can jointly
-            // grant while FMR stays bounded (an impostor must fool BOTH at once). The
-            // cross-spectrum liveness gate + per-user IR floor already passed above.
-            // This is the bright→RGB / dark→IR / dim→FUSE story.
+            // Stage-2 brightness-weighted fusion adds an acceptance arm after the
+            // RGB-primary path did not grant. Its fixed sigmoid scores are not
+            // established as calibrated probabilities for the current pipeline;
+            // see irlume_core::fusion for provenance and full-rule FMR limits.
+            // The liveness/PAD gates and per-user IR ratio floor passed above.
             // SEQUENTIAL-SCHEDULE PAIRS DO NOT FUSE (ADR-0014): the fusion
             // floor only requires IR to clear FUSION_MIN_PER_MODALITY_PROB
             // (~0.35 Platt-equivalent cosine) — a presence bar, not an
@@ -5361,14 +5851,14 @@ impl Engine {
             // fused grant. On a temporally split capture that reopens the
             // swap window; such pairs grant only through the IR-fallback and
             // centroid arms below, which carry identity thresholds.
-            // With a third-party recognizer the whole IR side is unmeasured
-            // (thresholds AND the fusion Platt calibration are shipped-model
-            // measurements), so a marginal RGB miss ends here: password.
+            // IR score-space compatibility is checked by ir_match below. That
+            // compatibility does not establish probability calibration for these
+            // legacy sigmoid coefficients, including with a third-party recognizer.
             if let Some(ir_probe) = a.ir_embedding.as_ref() {
                 let m = self.ir_match(enr, ir_probe);
                 if m.n_templates > 0 {
                     let (ir_score, ir_who) = (m.best, m.best_who.clone());
-                    // (a) calibrated quality-weighted fusion: the dim/mixed-light path.
+                    // (a) brightness-weighted score fusion: the dim/mixed-light path.
                     let f = irlume_core::fusion::fuse(
                         irlume_core::fusion::rgb_genuine_prob(score),
                         irlume_core::fusion::rgb_quality_weight(a.signals.rgb_face_brightness),
@@ -5579,18 +6069,15 @@ impl Engine {
                     "dark liveness: IR PAD cue flags a spoof; use your password",
                 ));
             }
-            let ir_base = if self.ir_adapter.is_some() {
-                irlume_core::IR_ADAPTED_MATCH_THRESHOLD
-            } else {
-                // SecureDark stage 2 (ADR-0016): the pure-dark grant carries
-                // no RGB evidence at all, so its bar is the STRICTER dark
-                // constant (0.635: deployment-shaped OR-arm FAR 1.24e-4 on
-                // CBSR; live dark-session genuine min 0.884 vs the 0.685
-                // effective bar), never looser than the dim-light fallback
-                // that at least saw an RGB face.
-                irlume_core::IR_DARK_MATCH_THRESHOLD
-            };
-            let ir_thr = irlume_core::scaled_threshold(ir_base, m.n_templates);
+            // SecureDark's stricter raw base and adapter base are shared with
+            // explicit IR evidence; gates and scene routing remain independent.
+            let thresholds = ir_assessment::IdentityThresholds::new(
+                m.n_templates,
+                enr.profiles.len(),
+                self.ir_adapter.is_some(),
+            );
+            let (best_matches, centroid_matches) = thresholds.arms(&m);
+            let ir_thr = thresholds.best;
             let (score, who) = (m.best, m.best_who.clone());
             irlume_common::dlog!(
                 "match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={}, calib_centroid={:?})",
@@ -5603,25 +6090,25 @@ impl Engine {
                 irlume_common::diagnostics::TraceMetric::MatchCosine,
                 score,
                 ir_thr,
-                score >= ir_thr,
+                best_matches,
             );
             // Grant on best-of-N at the scaled threshold, or on the
             // calibrated centroid at the base threshold (no best-of-N FAR
             // inflation; the prototype-validated mean-template protocol).
-            if score >= ir_thr {
+            if best_matches {
                 return Ok(Outcome::grant(score, format!("match: {who} (ir/dark)")));
             }
             if let Some((cs, cwho)) = &m.centroid {
-                let cthr = irlume_core::scaled_threshold(ir_base, enr.profiles.len());
+                let cthr = thresholds.centroid;
                 irlume_common::dlog!("match(ir/dark centroid): {cs:.3} vs thr {cthr:.3}");
                 emit_trace_match(
                     diagnostics,
                     irlume_common::diagnostics::TraceMetric::MatchCosine,
                     *cs,
                     cthr,
-                    *cs >= cthr,
+                    centroid_matches,
                 );
-                if *cs >= cthr {
+                if centroid_matches {
                     return Ok(Outcome::grant(
                         *cs,
                         format!("match: {cwho} (ir/dark, calibrated centroid)"),
@@ -9326,6 +9813,15 @@ mod tests {
         // 0 = legacy one-shot.
         std::env::set_var("IRLUME_GRACE_MS", "0");
         assert_eq!(grace_window_ms(None), 0);
+        // The development window is bounded; excessive durations must not
+        // hold a password fallback indefinitely.
+        std::env::set_var("IRLUME_GRACE_MS", "60000");
+        assert_eq!(grace_window_ms(None), 60000);
+        for excessive in ["60001", "18446744073709551615"] {
+            std::env::set_var("IRLUME_GRACE_MS", excessive);
+            assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
+            assert_eq!(grace_window_ms(None), GRACE_WINDOW_MS);
+        }
         // Unparseable values fall back to the service table.
         std::env::set_var("IRLUME_GRACE_MS", "abc");
         assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
@@ -10381,12 +10877,16 @@ mod engine_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("IRLUME_STATE_DIR", &dir);
         std::env::set_var("IRLUME_METHOD_CONF", dir.join("no-method-conf"));
+        // Authentication now reads the sensor policy too. Keep tests independent
+        // of the host's protected settings and retain the default-dual fixture.
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
         dir
     }
 
     fn teardown_sandbox(dir: &std::path::Path) {
         std::env::remove_var("IRLUME_STATE_DIR");
         std::env::remove_var("IRLUME_METHOD_CONF");
+        std::env::remove_var("IRLUME_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -10630,6 +11130,251 @@ mod engine_tests {
     }
 
     #[test]
+    fn authentication_budget_discards_late_grants_and_skips_expired_work() {
+        let _guard = env_guard();
+        let mut state = shared();
+        for already_expired in [false, true] {
+            let start = std::time::Instant::now();
+            let deadline = start + std::time::Duration::from_secs(15);
+            let clock = std::cell::Cell::new(if already_expired { deadline } else { start });
+            let mut calls = 0;
+            let mut cost = std::time::Duration::ZERO;
+            let (result, fallback) = state.engine.authentication_attempt_loop_with(
+                deadline,
+                15_000,
+                &mut cost,
+                |_| {
+                    calls += 1;
+                    clock.set(deadline);
+                    (Ok(Outcome::grant(1.0, "synthetic late match")), false)
+                },
+                || clock.get(),
+            );
+            assert!(
+                !result.as_ref().is_ok_and(|out| out.granted),
+                "expired match must never grant"
+            );
+            assert_eq!(
+                calls,
+                usize::from(!already_expired),
+                "expired entry must not start capture"
+            );
+            assert!(!fallback, "expiry cannot spend another camera attempt");
+        }
+    }
+
+    #[test]
+    fn authentication_budget_scope_restores_reusable_engine_after_expiry() {
+        let _guard = env_guard();
+        let mut state = shared();
+        let expired = AuthenticationWindow {
+            deadline: std::time::Instant::now(),
+            milliseconds: 15_000,
+        };
+        let result = state.engine.authenticate_for_in_window(
+            "expired-before-setup",
+            Some("kde"),
+            AuthenticationPurpose::Verify,
+            expired,
+            &(),
+        );
+        assert!(matches!(result, Err(irlume_common::Error::DeadlineExpired)));
+        assert!(state.engine.authentication_deadline.is_none());
+        assert!(
+            state.engine.capture_control().check().is_ok(),
+            "next operation must not inherit expiry"
+        );
+        assert_eq!(
+            state.engine.last_attempt_situation_label(),
+            Some("timed out")
+        );
+    }
+
+    #[test]
+    fn invalid_sensor_policy_refuses_before_enrollment_or_camera_setup() {
+        let _guard = env_guard();
+        let mut state = shared();
+        let dir = state_sandbox("invalid-sensor-policy");
+        let old_config = std::env::var_os("IRLUME_CONFIG_DIR");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let mut refused = Vec::new();
+        for contents in [
+            b"face_sensor_policy=typo\n".as_slice(),
+            b"face_sensor_policy ir-only-experimental\n".as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            std::fs::write(dir.join("settings.conf"), contents).unwrap();
+            refused.push(matches!(
+                state.engine.authenticate_for_in_window(
+                    "not-enrolled-synthetic-account",
+                    Some("kde"),
+                    AuthenticationPurpose::Verify,
+                    AuthenticationWindow::new(15_000),
+                    &(),
+                ),
+                Err(irlume_common::Error::Policy(_))
+            ));
+        }
+        match old_config {
+            Some(value) => std::env::set_var("IRLUME_CONFIG_DIR", value),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        teardown_sandbox(&dir);
+        assert_eq!(refused, [true, true, true]);
+        assert!(state.engine.authentication_deadline.is_none());
+    }
+
+    #[test]
+    fn authentication_budget_reaches_capture_and_inference_boundaries() {
+        let _guard = env_guard();
+        let mut state = shared();
+        let previous = state
+            .engine
+            .authentication_deadline
+            .replace(std::time::Instant::now());
+        let scope = authentication_window::Scope {
+            engine: &mut state.engine,
+            previous,
+        };
+        let capture = scope.engine.capture_control().check();
+        let pixels = vec![0; 640 * 480 * 3];
+        let view = align::RgbView {
+            data: &pixels,
+            width: 640,
+            height: 480,
+        };
+        let inference = scope.engine.detect_rgb_assessment_view(&view, Some(0), &());
+        assert!(matches!(
+            capture,
+            Err(irlume_common::Error::DeadlineExpired)
+        ));
+        assert!(matches!(
+            inference,
+            Err(irlume_common::Error::DeadlineExpired)
+        ));
+        drop(scope);
+        assert!(state.engine.capture_control().check().is_ok());
+    }
+
+    #[test]
+    fn captured_ir_policy_ignores_later_config_changes_and_never_falls_back_to_rgb() {
+        let _guard = env_guard();
+        let mut state = shared();
+        let dir = state_sandbox("captured-ir-policy");
+        let old_config = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_rgb = std::env::var_os("IRLUME_RGB_DEVICE");
+        let old_ir = std::env::var_os("IRLUME_IR_DEVICE");
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::set_var("IRLUME_RGB_DEVICE", "/dev/irlume-test-none-rgb");
+        std::env::set_var("IRLUME_IR_DEVICE", "/dev/irlume-test-none-ir");
+        std::fs::write(
+            dir.join("settings.conf"),
+            "face_sensor_policy=ir-only-experimental\n",
+        )
+        .unwrap();
+        let captured = irlume_common::config::observe_face_sensor_policy()
+            .resolve()
+            .unwrap();
+        std::fs::write(
+            dir.join("settings.conf"),
+            "face_sensor_policy=invalid-after-capture\n",
+        )
+        .unwrap();
+        let mut outcomes = Vec::new();
+        for purpose in [
+            AuthenticationPurpose::Verify,
+            AuthenticationPurpose::CredentialRelease,
+        ] {
+            outcomes.push(state.engine.authenticate_for_in_window_with_policy(
+                "synthetic-unenrolled",
+                Some("kde"),
+                purpose,
+                AuthenticationWindow::new(0),
+                captured,
+                &(),
+            ));
+        }
+        for (key, old) in [
+            ("IRLUME_CONFIG_DIR", old_config),
+            ("IRLUME_RGB_DEVICE", old_rgb),
+            ("IRLUME_IR_DEVICE", old_ir),
+        ] {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        teardown_sandbox(&dir);
+        for outcome in outcomes {
+            let outcome = outcome.unwrap();
+            assert!(!outcome.granted);
+            assert_eq!(outcome.kind, OutcomeKind::SetupUnavailable);
+            assert!(outcome.reason.contains("configured IR target"));
+        }
+        assert!(state.engine.authentication_deadline.is_none());
+    }
+
+    #[test]
+    fn authentication_budget_preserves_completed_denials_with_live_scope() {
+        let _guard = env_guard();
+        let mut state = shared();
+        for kind in [
+            OutcomeKind::BelowThreshold,
+            OutcomeKind::Spoof,
+            OutcomeKind::Uncertain,
+            OutcomeKind::DeadlineExpired,
+        ] {
+            let start = std::time::Instant::now();
+            let deadline = start + std::time::Duration::from_secs(15);
+            let clock = std::cell::Cell::new(start);
+            let mut cost = std::time::Duration::ZERO;
+            let (result, fallback) = state.engine.authentication_attempt_loop_with(
+                deadline,
+                15_000,
+                &mut cost,
+                |engine| {
+                    // Model a blocking attempt that produced its final denial
+                    // just as the real engine's scoped deadline elapsed.
+                    engine.authentication_deadline = Some(std::time::Instant::now());
+                    clock.set(deadline);
+                    (Ok(Outcome::deny(kind, "completed synthetic denial")), false)
+                },
+                || clock.get(),
+            );
+            state.engine.authentication_deadline = None;
+            assert!(
+                matches!(result, Ok(ref outcome) if outcome.kind == kind),
+                "completed evidence must retain accounting: {kind:?}: {result:?}"
+            );
+            assert!(!fallback);
+        }
+    }
+
+    #[test]
+    fn authentication_budget_zero_preserves_one_shot_match() {
+        let _guard = env_guard();
+        let mut state = shared();
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let mut calls = 0;
+        let mut cost = std::time::Duration::ZERO;
+        let (result, fallback) = state.engine.authentication_attempt_loop_with(
+            start,
+            0,
+            &mut cost,
+            |_| {
+                calls += 1;
+                clock.set(start + std::time::Duration::from_secs(20));
+                (Ok(Outcome::grant(1.0, "synthetic one-shot match")), false)
+            },
+            || clock.get(),
+        );
+        assert!(result.unwrap().granted);
+        assert_eq!(calls, 1);
+        assert!(!fallback);
+    }
+
+    #[test]
     fn pending_pad_retry_loop_stops_when_second_slow_assessment_cannot_fit() {
         let _guard = env_guard();
         let mut s = shared();
@@ -10707,6 +11452,126 @@ mod engine_tests {
         assert_eq!(calls, 5);
         assert!(!out.granted);
         assert_eq!(out.kind, OutcomeKind::Spoof);
+    }
+
+    #[test]
+    fn request_cancellation_stops_auth_before_work_and_discards_late_outcomes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _guard = env_guard();
+        let mut s = shared();
+        for already_cancelled in [true, false] {
+            let cancelled = std::sync::Arc::new(AtomicBool::new(already_cancelled));
+            let signal = std::sync::Arc::clone(&cancelled);
+            s.engine
+                .set_request_cancel_signal(std::sync::Arc::new(move || {
+                    signal.load(Ordering::SeqCst)
+                }));
+            let now = std::time::Instant::now();
+            let mut calls = 0;
+            let mut costliest = std::time::Duration::ZERO;
+            let (result, fallback) = s.engine.authentication_attempt_loop_with(
+                now + std::time::Duration::from_secs(15),
+                15_000,
+                &mut costliest,
+                |_| {
+                    calls += 1;
+                    cancelled.store(true, Ordering::SeqCst);
+                    (
+                        Ok(Outcome::grant(1.0, "synthetic match after disconnect")),
+                        false,
+                    )
+                },
+                || now,
+            );
+            s.engine.request_cancelled = None;
+            assert!(matches!(result, Err(irlume_common::Error::Preempted(_))));
+            assert!(
+                !fallback,
+                "cancellation cannot retry on another camera path"
+            );
+            assert_eq!(calls, usize::from(!already_cancelled));
+        }
+    }
+
+    #[test]
+    fn queued_authentication_yield_does_not_cancel_a_running_authentication() {
+        let _guard = env_guard();
+        let mut s = shared();
+        s.engine.set_stop_signal(std::sync::Arc::new(|| true));
+        let (outcome, calls, _) =
+            scripted_pad_retry(&mut s.engine, 15_000, 0, &[1_000; 5], 0.20, 0);
+        s.engine.stop_requested = None;
+        assert!(outcome.granted);
+        assert_eq!(
+            calls, 5,
+            "queued work must preserve the active authentication's retries"
+        );
+    }
+
+    #[test]
+    fn capture_cancellation_skips_rgb_detection_after_late_ir_cancel() {
+        let _guard = env_guard();
+        let mut state = shared();
+        state
+            .engine
+            .set_request_cancel_signal(std::sync::Arc::new(|| true));
+        // Synthetic pixels avoid manufacturing a trusted camera Frame. This is
+        // the real detection boundary used after both ordinary/fallback captures.
+        let pixels = vec![0; 640 * 480 * 3];
+        let view = align::RgbView {
+            data: &pixels,
+            width: 640,
+            height: 480,
+        };
+        let result = state.engine.detect_rgb_assessment_view(&view, Some(0), &());
+        state.engine.request_cancelled = None;
+        assert!(
+            matches!(result, Err(irlume_common::Error::Preempted(_))),
+            "a cancelled IR companion must prevent subsequent RGB inference"
+        );
+    }
+
+    #[test]
+    fn capture_cancellation_control_uses_request_signal_not_scheduler_yield() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let _guard = env_guard();
+        let mut shared = shared();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        shared.engine.set_stop_signal(Arc::new(|| true));
+        shared
+            .engine
+            .set_request_cancel_signal(Arc::new(move || signal.load(Ordering::SeqCst)));
+        let control = shared.engine.capture_control();
+        let queued_only = control.check();
+        cancelled.store(true, Ordering::SeqCst);
+        let cancelled_capture = irlume_camera::capture_rgb_denoised_with_control(NO_RGB, &control);
+        shared.engine.stop_requested = None;
+        shared.engine.request_cancelled = None;
+        assert!(
+            queued_only.is_ok(),
+            "queued work must not cancel camera frames"
+        );
+        assert!(
+            matches!(cancelled_capture, Err(irlume_common::Error::Preempted(_))),
+            "request cancellation must win before camera setup"
+        );
+    }
+
+    #[test]
+    fn request_cancellation_precedes_enrollment_and_camera_setup() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("cancelled-before-setup");
+        s.engine
+            .set_request_cancel_signal(std::sync::Arc::new(|| true));
+        let result = s.engine.authenticate("cancelled-test", Some("kde"));
+        s.engine.request_cancelled = None;
+        teardown_sandbox(&dir);
+        assert!(matches!(result, Err(irlume_common::Error::Preempted(_))));
     }
 
     #[test]
@@ -11798,6 +12663,7 @@ mod engine_tests {
         // The #616 step 2 vocabulary: one stable label per failed-attempt
         // shape, the measured numbers alongside, never a threshold value.
         let frontal = AttemptFacts {
+            ir_only: false,
             rgb_face: Some((0.5, 0.5)),
             face_frac: 0.30,
             yaw_asym: 0.10,
@@ -11885,6 +12751,7 @@ mod engine_tests {
         // unmeasured glint (a railed peak measured nothing, #222), and no
         // threshold values anywhere in the line.
         let facts = AttemptFacts {
+            ir_only: false,
             rgb_face: None,
             face_frac: 0.0,
             yaw_asym: 0.10,
@@ -11905,6 +12772,7 @@ mod engine_tests {
         // The #617 lesson lives here too: a live person glancing sideways
         // produced a Spoof verdict; the situation names looking away.
         let turned = AttemptFacts {
+            ir_only: false,
             rgb_face: Some((0.5, 0.5)),
             face_frac: 0.30,
             yaw_asym: 0.52,
@@ -12642,6 +13510,49 @@ mod engine_tests {
         );
 
         teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn pending_enrollment_loader_is_drained_after_camera_owners_release() {
+        use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+        use std::time::Duration;
+        struct CameraOwner(Sender<&'static str>);
+        impl Drop for CameraOwner {
+            fn drop(&mut self) {
+                let _ = self.0.send("camera released");
+            }
+        }
+        let (loaded, loader) = channel::<EnrollmentLoad>();
+        let (events, observed) = channel();
+        let request = std::thread::spawn(move || {
+            {
+                let _pending = PendingEnrollmentLoad {
+                    receiver: Some(loader),
+                };
+                // Same ownership order as authentication setup. This models
+                // resource lifetime only; no camera or TPM is opened.
+                let _camera = CameraOwner(events.clone());
+            }
+            events.send("request returned").unwrap();
+        });
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "camera released"
+        );
+        let early_return = observed.recv_timeout(Duration::from_millis(100));
+        // Unblock and join even when the assertion will fail: no fixture helper
+        // may escape this test on a regression.
+        let delivered = loaded.send(Ok(None));
+        request.join().unwrap();
+        assert!(
+            matches!(early_return, Err(RecvTimeoutError::Timeout)),
+            "request returned while its loader still owned work: {early_return:?}"
+        );
+        assert!(delivered.is_ok(), "request abandoned its enrollment helper");
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "request returned"
+        );
     }
 
     #[test]

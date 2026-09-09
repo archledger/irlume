@@ -66,3 +66,19 @@ lockout.
 - `irlume support` and the settings table document the key and its
   default; the TUI does not expose it, matching the posture of the other
   advanced keys.
+
+## Operator controls, 2026-09-07
+
+The policy above remains the default-on, machine-owned privileged exception.
+It is now exposed by `irlume auth consent status|required|hands-free --yes`
+and TUI Settings > Privileged consent [p], superseding the earlier decision to
+leave it without a TUI control. Enabling requires explicit acknowledgment;
+restoring confirmation does not. Both interfaces use the common policy reader,
+display unreadable state honestly, and refuse writes when this process has an
+environment override. The daemon still independently validates every waiver.
+
+Only recognized false values waive confirmation. Previously the reader treated
+any present unrecognized value as false; that could turn a typo into a waiver.
+Unknown, empty and malformed values now retain confirmation. Existing valid
+false spellings and environment precedence remain compatible. The control
+changes neither PAM wiring nor desktop login/lock-screen arming behavior.

@@ -10,12 +10,56 @@ formal certification stays optional.
   the threshold from a genuine/impostor ROC; do not port a threshold measured
   on another stack (e.g. buffalo_l's customary 0.60).
   **Measured status:** AuraFace shows a ~10× per-group FAR spread; a single
-  threshold meeting FMR ≤ 1×10⁻⁴ for every group needs ≈0.69. The gap is bounded
-  by a conservative fixed threshold + mandatory fallback, never by relaxing FAR.
+  threshold meeting FMR ≤ 1×10⁻⁴ for every group needs ≈0.69 in that benchmark.
+  These recognizer results do not establish the FMR of the deployed acceptance
+  rule. Password fallback preserves recovery after refusal; it does not bound
+  false matches that already granted.
   See [`FAIRNESS.md`](FAIRNESS.md) for the per-group table and policy.
 - **PAD mandatory**; target **IAPAR < 0.07** (ISO/IEC 30107-3 Clause 13).
 - **Biometric is one MFA factor only**, with a mandatory non-biometric fallback.
 - No network calls in the auth loop; templates/secrets local, root-owned 0600.
+
+## Acceptance-rule evidence limits
+
+The current face matcher has several acceptance arms after the applicable
+capture, liveness, PAD and enrollment-floor checks:
+
+| Assessment path | Identity acceptance arms |
+|---|---|
+| RGB face, non-sequential pair | RGB-primary, then weighted RGB/IR fusion, IR fallback or calibrated IR centroid |
+| RGB face, sequential pair | IR fallback or calibrated IR centroid; RGB-primary and fusion cannot grant |
+| No RGB face, IR face in a scene not conclusively lit | Dark-path liveness/PAD and the stricter IR best-template or centroid threshold |
+
+Purpose-specific consent applies before returning a grant. A below-threshold
+identity result is not presence-retryable; separate requests still need their
+own attempt/rate-limit analysis.
+
+Fusion uses legacy fixed sigmoid coefficients and a brightness-weighted mean.
+Its IR coefficients came from the retired adapter space; current-pipeline
+probability calibration and a full-rule FMR bound have not been established.
+A `prob` value of 0.50 is a score threshold, not a demonstrated 50% probability
+of identity. Adding this arm expands possible acceptance even though the other
+thresholds are unchanged. See [`fusion.rs`](../crates/irlume-core/src/fusion.rs).
+
+An accuracy claim needs evaluation of the complete deployed rule with its actual
+model/calibration spaces, template and profile counts, capture conditions and
+request protocol. Marginal RGB/IR benchmarks or an assumption of independent
+modalities do not establish that combined result. FMR, PAD resistance and
+non-biometric fallback are separate requirements in
+[NIST SP 800-63B-4, section 3.2.3](https://pages.nist.gov/800-63-4/sp800-63b.html#biometric).
+This documents an evidence gap; it does not quantify a new false-accept rate or
+change the runtime decision rule.
+
+Irlume has a separate, explicit experimental IR-only policy. Dual
+remains the default, and malformed or unreadable policy fails closed. The IR-only
+route is limited to the configured canonical IR image endpoint and its exact
+optional metadata companion, requires the enrollment camera binding, compatible IR
+templates and mandatory FLIR PAD, and does not probe or fall back to RGB. The
+sensor policy does not change capture scheduling, PAM method, consent, service
+deadlines, or retry accounting. Its absence of RGB cross-spectrum evidence narrows
+the evidence available to the decision and remains subject to the separate
+[qualification protocol](IR_ONLY_QUALIFICATION.md); local development observations
+do not establish deployment assurance.
 
 ## Known Windows Hello bypass classes → our defenses
 
@@ -328,17 +372,21 @@ with a fabricated print.
   What this gate is for is deliberate INTENT on the credential-release path, and
   the honest limit is that a present, non-consenting user can still satisfy it by
   moving. Tracked in [#101](https://github.com/archledger/irlume/issues/101).
-- **Consecutive-failure throttle.** After a run of failed face attempts (5 by
-  default, `IRLUME_RATE_LIMIT`), the daemon stops starting face capture for a
-  cooldown (30s, `IRLUME_RATE_COOLDOWN_SECS`) and PAM falls
-  straight to the password; a grant resets it, and an empty frame (nobody
-  present) never counts. This satisfies the NIST SP 800-63B-4 §3.2.3 intent
-  (an attacker cannot cheaply grind presentation attacks against the gate)
-  deliberately as a *throttle*, not the standard's hard biometric-disable
-  tier: irlume's password is always the fallback and there is no account
-  lockout, so disabling face until "another factor" would only re-offer the
-  password the throttled user is already typing. State is per-user and
-  in-memory; a daemon restart clears it because the password, not a lockout,
-  is the security floor. Every mainstream authenticator (Face ID, Android,
-  Windows Hello) likewise uses ~5 failures then falls to a non-biometric
-  factor rather than locking the account.
+- **Consecutive unsuccessful request ceiling.** Each account shares a durable
+  50-request budget across face verification and credential release. Reservation
+  precedes engine work; errors, cancellation, no-face results and crashes retain
+  the charge. Internal retries share one request; several template/acceptance
+  arms can run within it. Only an admitted and successfully written face grant,
+  independently verified password reset, or explicit administrator reset clears
+  the budget. Cooldowns and reboot do not replenish it. Short strikes retain
+  their separate default 5/30-second policy; zero cannot disable enforcement.
+  Selecting dual or experimental IR-only never clears or bypasses this history.
+  Migration from legacy records starts a prospective epoch and cannot reconstruct
+  erased history. See [persistent retry records](DISABLE.md#persistent-retry-records).
+  This 50-request ceiling is an enforced operational policy. Its number is not a
+  biometric qualification target or a claim of desktop compliance with
+  [NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b/authenticators/).
+  A false acceptance already defeats the authentication boundary; resetting after
+  genuine success does not establish safety against that case. Root deletion,
+  disk rollback and the ambiguity between socket delivery and durable reset are
+  outside an exactly-once guarantee. Ordinary password login remains available.

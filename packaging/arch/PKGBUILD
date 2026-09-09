@@ -12,6 +12,7 @@ license=('GPL-3.0-or-later')
 # choose onnxruntime-cpu unless you want GPU execution providers.
 depends=('onnxruntime' 'tpm2-tss' 'pam' 'polkit' 'dbus')
 optdepends=('fprintd: fingerprint companion factor')
+backup=('etc/pam.d/irlume-retry-reset')
 # clang: v4l2-sys-mit generates its V4L2 bindings with bindgen, which needs
 # libclang at build time; without it makepkg fails on a clean system.
 makedepends=('rust' 'cargo' 'gcc' 'clang')
@@ -69,6 +70,8 @@ package() {
     # transaction.
     install -Dm0755 target/release/irlume-kwallet-init "$pkgdir/usr/libexec/irlume/irlume-kwallet-init"
     install -Dm0755 target/release/irlume-gkr-unlock "$pkgdir/usr/libexec/irlume/irlume-gkr-unlock"
+    install -Dm0755 target/release/irlume-password-verify "$pkgdir/usr/libexec/irlume-password-verify"
+    install -Dm0644 packaging/pam/irlume-retry-reset "$pkgdir/etc/pam.d/irlume-retry-reset"
     # One line per model, deliberately not a loop over basenames. The loop that
     # used to be here was keyed on ".onnx", so the mesh model could not join it
     # and was simply forgotten: the unit pointed IRLUME_MESH_MODEL at a file

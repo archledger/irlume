@@ -24,7 +24,7 @@ libc.workspace = true   # restore default SIGPIPE so `irlume … | head` doesn't
 rand.workspace = true   # session and operation identifiers for the machine event stream
 image = { workspace = true }
 rpassword = "7"   # no-echo password prompt for `keyring arm`
-ratatui = "0.30"  # TUI (MIT), bundles crossterm; powers `irlume tui`
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }  # TUI (MIT), bundles crossterm; powers `irlume tui`
 
 [lints]
 workspace = true

@@ -44,7 +44,9 @@ fi
 # population the self-heal exists for (issue #93). Arm it ONCE, recorded by a
 # marker, so a later deliberate `systemctl disable` is still respected.
 if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
-    mkdir -p /var/lib/irlume
+    # /var/lib is system-owned and already exists; only the leaf is ours.
+    # shellcheck disable=SC2174
+    mkdir -p -m 0700 /var/lib/irlume
     systemctl enable --now irlume-reconcile.timer 2>/dev/null || true
     : > /var/lib/irlume/.reconcile-timer-armed
 fi

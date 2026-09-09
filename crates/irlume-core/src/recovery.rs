@@ -40,6 +40,7 @@ const SALT_LEN: usize = 16;
 const M_COST: u32 = 19_456;
 const T_COST: u32 = 2;
 const P_COST: u32 = 1;
+const CURRENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryEnvelope {
@@ -80,7 +81,7 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
     let dk = derive_key(passphrase, &salt, M_COST, T_COST, P_COST)?;
     let wrapped = crypto::encrypt(&dk, template_key)?;
     Ok(RecoveryEnvelope {
-        version: 1,
+        version: CURRENT_VERSION,
         kdf: "argon2id".into(),
         salt: STANDARD.encode(salt),
         m_cost: M_COST,
@@ -95,6 +96,12 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
 /// from tampering, by design.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+    if env.version != CURRENT_VERSION {
+        return Err(Error::Protocol(format!(
+            "unsupported recovery envelope version: {}",
+            env.version
+        )));
+    }
     if env.kdf != "argon2id" {
         return Err(Error::Policy(format!(
             "unsupported recovery KDF: {}",
@@ -143,5 +150,24 @@ mod tests {
         let b = wrap(b"same-pass", &key).unwrap();
         assert_ne!(a.salt, b.salt, "each wrap must use a fresh salt");
         assert_ne!(a.wrapped, b.wrapped);
+    }
+
+    #[test]
+    fn unwrap_rejects_unknown_versions_before_payload_processing() {
+        for version in [0, 2] {
+            let env = RecoveryEnvelope {
+                version,
+                kdf: "argon2id".into(),
+                salt: "not base64".into(),
+                m_cost: M_COST,
+                t_cost: T_COST,
+                p_cost: P_COST,
+                wrapped: "not base64".into(),
+            };
+            assert!(matches!(
+                unwrap(b"passphrase", &env),
+                Err(Error::Protocol(message)) if message.contains("unsupported recovery envelope version")
+            ));
+        }
     }
 }

@@ -1,0 +1,4 @@
+# Local passwords only. Never include the ordinary biometric/login stack.
+# No password changes or sessions; password login remains independent.
+auth required pam_unix.so nodelay
+account required pam_unix.so

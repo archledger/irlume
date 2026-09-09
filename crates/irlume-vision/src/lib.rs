@@ -683,14 +683,71 @@ mod onnx {
             Self::load_from_memory(&bytes)
         }
 
-        /// Adapt one IR embedding -> adapted vector (already L2-normalized).
+        /// Adapt one finite, nonzero 512-D IR embedding into a normalized vector.
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn apply(&mut self, emb: &[f32]) -> irlume_common::Result<Vec<f32>> {
+            validate_adapter_embedding(emb)?;
             let tensor =
                 Tensor::from_array(([1i64, emb.len() as i64], emb.to_vec())).map_err(err)?;
             let outputs = self.session.run(ort::inputs![tensor]).map_err(err)?;
             let (_shape, raw) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
-            Ok(raw.to_vec())
+            adapter_output(raw)
+        }
+    }
+
+    fn adapter_output(raw: &[f32]) -> irlume_common::Result<Vec<f32>> {
+        validate_adapter_embedding(raw)?;
+        crate::align::normalize_embedding(raw).ok_or_else(|| err("invalid adapter embedding"))
+    }
+
+    fn validate_adapter_embedding(values: &[f32]) -> irlume_common::Result<()> {
+        if values.len() != EMBED_DIM
+            || values.iter().any(|v| !v.is_finite())
+            || values.iter().all(|&v| v == 0.0)
+        {
+            return Err(err("adapter requires a finite, nonzero 512-D embedding"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod adapter_contract_tests {
+        use super::*;
+
+        #[test]
+        fn adapter_output_is_normalized_without_changing_direction() {
+            let mut raw = vec![0.0; EMBED_DIM];
+            raw[0] = 3.0;
+            raw[1] = 4.0;
+            let output = adapter_output(&raw).unwrap();
+            assert_eq!(output.len(), EMBED_DIM);
+            assert!((output[0] - 0.6).abs() < 1e-6);
+            assert!((output[1] - 0.8).abs() < 1e-6);
+        }
+
+        #[test]
+        fn adapter_output_rejects_invalid_dimension_and_values() {
+            for raw in [
+                vec![],
+                vec![1.0; EMBED_DIM - 1],
+                vec![1.0; EMBED_DIM + 1],
+                vec![0.0; EMBED_DIM],
+                vec![f32::NAN; EMBED_DIM],
+                vec![f32::INFINITY; EMBED_DIM],
+                vec![f32::NEG_INFINITY; EMBED_DIM],
+            ] {
+                assert!(adapter_output(&raw).is_err());
+                assert!(validate_adapter_embedding(&raw).is_err());
+            }
+        }
+
+        #[test]
+        fn adapter_input_validation_preserves_valid_custom_input() {
+            let input = vec![2.0; EMBED_DIM];
+            assert!(validate_adapter_embedding(&input).is_ok());
+            let output = adapter_output(&input).unwrap();
+            let norm = output.iter().map(|v| v * v).sum::<f32>();
+            assert!((norm - 1.0).abs() < 1e-6);
         }
     }
 

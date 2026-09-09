@@ -20,6 +20,7 @@
 
 mod bitwarden;
 mod commands;
+mod consent;
 mod doctor_report;
 mod fingerprint;
 mod logintx;
@@ -28,9 +29,12 @@ mod machine;
 mod models;
 mod pad;
 mod pamwire;
+mod preferences;
 mod profile_ir;
 mod recovery;
+mod retry;
 mod secrets;
+mod sensor_policy;
 mod strays;
 mod suncal;
 mod support_report;
@@ -171,6 +175,7 @@ fn main() -> std::process::ExitCode {
         (Some("enrolldev"), _) => enrolldev(&args),
         (Some("keyring"), _) => keyring(keyring_sub(&args), &args),
         (Some("recovery"), _) => recovery::run(recovery_sub(&args), &args),
+        (Some("retry"), _) => retry::run(recovery_sub(&args), &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), _) => fingerprint::run(fingerprint_sub(&args), &args),
         (Some("login"), _)
@@ -193,6 +198,8 @@ fn main() -> std::process::ExitCode {
         // whatever flags follow and answers a bad invocation with a JSON
         // usage-error rather than prose. Bare `auth` still falls through to the
         // help, which is the useful answer to a typo.
+        (Some("auth"), Some("consent")) => consent::run(&args[2..]),
+        (Some("auth"), Some("sensor")) => sensor_policy::run(&args[2..]),
         (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test(&args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
@@ -1056,10 +1063,19 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 eprintln!("[keyring] empty password; aborted");
                 return std::process::ExitCode::from(2);
             }
+            let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
+                Ok(salt) => salt,
+                Err(e) => {
+                    eprintln!("[keyring] arm failed: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             let req = irlume_common::Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
                 password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+                wallet_salt,
+                wallet_salt_checked: true,
             };
             match daemon_request(&req) {
                 Ok(irlume_common::Response::PasswordSealed) => {
@@ -1198,11 +1214,18 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     // daemon, or an envelope it failed to parse. This is the
                     // dangerous reading, so refuse.
                     Ok(irlume_common::Response::KeyringInfo { kind: None, .. }) => (false, true),
-                    // No usable answer at all (daemon down, refused, older
-                    // protocol). Not "armed with something unknown": fall
-                    // through and let the erase attempt below report the real
-                    // failure, rather than blaming an envelope nobody saw.
-                    _ => (false, false),
+                    // A failed inspection is not permission to erase: a transient
+                    // failure can be followed by a successful destructive request.
+                    Ok(irlume_common::Response::Error(error)) | Err(error) => {
+                        eprintln!("[keyring] forget failed: {error} (sealed secret inspection)");
+                        (false, true)
+                    }
+                    _ => {
+                        eprintln!(
+                            "[keyring] unexpected response while inspecting the sealed secret"
+                        );
+                        (false, true)
+                    }
                 };
             if unknown && !force {
                 eprintln!(
@@ -3951,13 +3974,33 @@ fn doctor_run(
                 },
                 if recovery_set {
                     "SET ✓"
+                } else if encrypted && !key_present {
+                    "not set; no backup available"
                 } else {
                     "not set (run `irlume recovery setup`)"
                 },
             );
-            report.check(
+            if encrypted && !key_present {
+                dout!(
+                    report,
+                    "[doctor] {}",
+                    crate::recovery::missing_key_advice(recovery_set)
+                );
+            }
+            report.check_detail(
                 "templates",
-                if encrypted { State::Pass } else { State::Warn },
+                if encrypted && !key_present {
+                    State::Fail
+                } else if encrypted {
+                    State::Pass
+                } else {
+                    State::Warn
+                },
+                if encrypted && !key_present {
+                    crate::recovery::missing_key_advice(recovery_set)
+                } else {
+                    "template key observation complete"
+                },
             );
             report.check(
                 "recovery-passphrase",

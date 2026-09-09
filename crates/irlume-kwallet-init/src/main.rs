@@ -25,11 +25,13 @@
 //! Spawned from the daemon it would live in `irlumed.service`, and restarting
 //! irlume would take the user's wallet daemon down with it.
 
-use irlume_common::kwallet_wire::{KEY_LEN, LOGIN_ENV, SOCKET_NAME};
+use irlume_common::kwallet_wire::{KEY_LEN, LOGIN_ENV, SALT_ABSENT_EXIT, SALT_LEN, SOCKET_NAME};
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use zeroize::{Zeroize as _, Zeroizing};
 
 /// Binaries that understand `--pam-login`, most specific first.
 ///
@@ -49,6 +51,25 @@ fn main() -> std::process::ExitCode {
         eprintln!("usage: irlume-kwallet-init <username>  (key on stdin)");
         return std::process::ExitCode::from(2);
     };
+    if user == "--read-salt" {
+        let Some(user) = args.next() else {
+            return std::process::ExitCode::from(2);
+        };
+        if args.next().is_some() {
+            return std::process::ExitCode::from(2);
+        }
+        return match read_salt_mode(&user.to_string_lossy()) {
+            Ok(salt) => match write_salt(salt.expose()) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(_) => std::process::ExitCode::FAILURE,
+            },
+            Err(SaltReadError::Absent) => std::process::ExitCode::from(SALT_ABSENT_EXIT as u8),
+            Err(SaltReadError::Failed) => std::process::ExitCode::FAILURE,
+        };
+    }
+    if args.next().is_some() {
+        return std::process::ExitCode::from(2);
+    }
     let user = user.to_string_lossy().into_owned();
 
     match run(&user) {
@@ -66,18 +87,21 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn write_salt(salt: &[u8]) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    write_salt_to(stdout.lock(), salt)
+}
+
+fn write_salt_to(mut out: impl Write, salt: &[u8]) -> std::io::Result<()> {
+    out.write_all(salt)?;
+    out.flush()
+}
+
 fn run(user: &str) -> Result<PathBuf, String> {
     // Read the key first. If it is not exactly KEY_LEN bytes, stop before any
     // process is spawned: ksecretd blocks forever on a short key and silently
     // truncates a long one, so neither failure would be visible at a login.
-    let mut key = vec![0u8; KEY_LEN];
-    std::io::stdin()
-        .read_exact(&mut key)
-        .map_err(|e| format!("expected {KEY_LEN} bytes of wallet key on stdin: {e}"))?;
-    let mut extra = [0u8; 1];
-    if let Ok(1) = std::io::stdin().read(&mut extra) {
-        return Err(format!("more than {KEY_LEN} bytes on stdin; refusing"));
-    }
+    let mut key = read_wallet_key_from_stdin()?;
 
     let pw = lookup_user(user)?;
     let runtime_dir = PathBuf::from(format!("/run/user/{}", pw.uid));
@@ -131,6 +155,12 @@ fn run(user: &str) -> Result<PathBuf, String> {
         unsafe {
             libc::close(status_read);
             libc::close(write_fd);
+            // The parent alone writes the key to ksecretd. `fork` replicated
+            // the allocation into this child but did not inherit its mlock;
+            // wipe those bytes before either execve or the `_exit` failure
+            // branch. Slice zeroization is allocation-free and does not run a
+            // Vec destructor in the post-fork child.
+            wipe_fork_child_key(&mut key);
             child_exec(&exe, read_fd, listener, &plan);
             // Only reached when execve failed. The byte distinguishes that from
             // the EOF a successful exec produces.
@@ -169,6 +199,39 @@ fn run(user: &str) -> Result<PathBuf, String> {
         libc::close(write_fd)
     };
     Ok(sock_path)
+}
+
+fn read_wallet_key_from_stdin() -> Result<Zeroizing<Vec<u8>>, String> {
+    // Stdin's Read implementation retains a second copy in a global buffer.
+    // An unbuffered File reads directly into our protected allocation; cloning
+    // its descriptor preserves stdin ownership and closes the copy before fork.
+    let input = std::fs::File::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| format!("expected {KEY_LEN} bytes of wallet key on stdin: {e}"))?,
+    );
+    read_wallet_key(input)
+}
+
+fn read_wallet_key(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut key = Zeroizing::new(vec![0u8; KEY_LEN]);
+    // Protect the allocation before input can place even a partial key in it.
+    // The lock remains best effort so login behavior is unchanged when the
+    // process lacks sufficient RLIMIT_MEMLOCK.
+    irlume_common::memlock::lock_slice(&key);
+    input
+        .read_exact(&mut key)
+        .map_err(|e| format!("expected {KEY_LEN} bytes of wallet key on stdin: {e}"))?;
+    let mut extra = Zeroizing::new([0u8; 1]);
+    if let Ok(1) = input.read(&mut *extra) {
+        return Err(format!("more than {KEY_LEN} bytes on stdin; refusing"));
+    }
+    Ok(key)
+}
+
+fn wipe_fork_child_key(key: &mut [u8]) {
+    key.zeroize();
 }
 
 /// Become the target user, permanently.
@@ -254,6 +317,7 @@ struct User {
     uid: libc::uid_t,
     gid: libc::gid_t,
     name: CString,
+    home: PathBuf,
 }
 
 fn lookup_user(user: &str) -> Result<User, String> {
@@ -265,7 +329,13 @@ fn lookup_user(user: &str) -> Result<User, String> {
         return Err(format!("no such user: {user}"));
     }
     #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
-    let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+    let (uid, gid, home) = unsafe {
+        (
+            (*pw).pw_uid,
+            (*pw).pw_gid,
+            std::ffi::CStr::from_ptr((*pw).pw_dir).to_bytes().to_vec(),
+        )
+    };
     if uid == 0 {
         return Err("refusing to open a wallet for uid 0".to_string());
     }
@@ -273,7 +343,220 @@ fn lookup_user(user: &str) -> Result<User, String> {
         uid,
         gid,
         name: cname,
+        home: PathBuf::from(std::ffi::OsStr::from_bytes(&home)),
     })
+}
+
+const MAX_SALT_BYTES: u64 = 4096;
+const SALT_RELPATH: &str = ".local/share/kwalletd/kdewallet.salt";
+
+enum SaltReadError {
+    Absent,
+    Failed,
+}
+
+fn read_salt_mode(user: &str) -> Result<irlume_common::SecretBytes, SaltReadError> {
+    let pw = lookup_salt_user(user, lookup_user)?;
+    enter_user(&pw).map_err(|_| SaltReadError::Failed)?;
+    read_salt_at(&pw.home.join(SALT_RELPATH))
+}
+
+fn lookup_salt_user(
+    user: &str,
+    lookup: impl FnOnce(&str) -> Result<User, String>,
+) -> Result<User, SaltReadError> {
+    if user.is_empty()
+        || user.len() > 255
+        || user.starts_with('-')
+        || !user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
+    {
+        return Err(SaltReadError::Failed);
+    }
+    lookup(user).map_err(|_| SaltReadError::Failed)
+}
+
+fn read_salt_at(path: &std::path::Path) -> Result<irlume_common::SecretBytes, SaltReadError> {
+    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SaltReadError::Absent
+            } else {
+                SaltReadError::Failed
+            }
+        })?;
+    let meta = file.metadata().map_err(|_| SaltReadError::Failed)?;
+    if !meta.file_type().is_file() || meta.file_type().is_fifo() || meta.len() > MAX_SALT_BYTES {
+        return Err(SaltReadError::Failed);
+    }
+    let mut raw = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_SALT_BYTES)
+        .read_to_end(&mut raw)
+        .map_err(|_| SaltReadError::Failed)?;
+    if raw.len() < SALT_LEN {
+        return Err(SaltReadError::Failed);
+    }
+    raw.truncate(SALT_LEN);
+    Ok(irlume_common::SecretBytes::new(raw))
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "libc credential queries have no Rust wrapper"
+)]
+fn enter_user(pw: &User) -> Result<(), String> {
+    let (ruid, euid, rgid, egid) = unsafe {
+        (
+            libc::getuid(),
+            libc::geteuid(),
+            libc::getgid(),
+            libc::getegid(),
+        )
+    };
+    if ruid == 0 && euid == 0 && rgid == 0 && egid == 0 {
+        drop_privileges(pw)?;
+    } else if ruid != pw.uid || euid != pw.uid || rgid != pw.gid || egid != pw.gid {
+        return Err("mixed or wrong credentials".into());
+    }
+    clear_capabilities()?;
+    verify_credentials(pw)
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "Linux capability operations have no libc wrapper"
+)]
+fn clear_capabilities() -> Result<(), String> {
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0
+        || unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+    {
+        return Err("could not clear capabilities".into());
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "Linux credential and capability queries have no safe wrapper"
+)]
+fn verify_credentials(pw: &User) -> Result<(), String> {
+    let mut uids = [0; 3];
+    let mut gids = [0; 3];
+    if unsafe { libc::getresuid(&mut uids[0], &mut uids[1], &mut uids[2]) } != 0
+        || unsafe { libc::getresgid(&mut gids[0], &mut gids[1], &mut gids[2]) } != 0
+        || uids != [pw.uid; 3]
+        || gids != [pw.gid; 3]
+    {
+        return Err("saved credentials retained".into());
+    }
+    let fsuid = unsafe { libc::setfsuid(libc::uid_t::MAX) };
+    let fsgid = unsafe { libc::setfsgid(libc::gid_t::MAX) };
+    if fsuid as libc::uid_t != pw.uid || fsgid as libc::gid_t != pw.gid {
+        return Err("filesystem credentials differ".into());
+    }
+    verify_groups(pw)?;
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0
+        || data
+            .iter()
+            .any(|x| x.effective != 0 || x.permitted != 0 || x.inheritable != 0)
+    {
+        return Err("capabilities retained".into());
+    }
+    for capability in 0..64 {
+        let held = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_IS_SET,
+                capability,
+                0,
+                0,
+            )
+        };
+        if held > 0 {
+            return Err("ambient capability retained".into());
+        }
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "libc group-list queries have no Rust wrapper"
+)]
+fn verify_groups(pw: &User) -> Result<(), String> {
+    let mut count = 0;
+    unsafe { libc::getgrouplist(pw.name.as_ptr(), pw.gid, std::ptr::null_mut(), &mut count) };
+    if count <= 0 {
+        return Err("account groups unavailable".into());
+    }
+    let mut expected = vec![0; count as usize];
+    if unsafe { libc::getgrouplist(pw.name.as_ptr(), pw.gid, expected.as_mut_ptr(), &mut count) }
+        < 0
+    {
+        return Err("account groups changed".into());
+    }
+    expected.truncate(count as usize);
+    let actual_count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if actual_count < 0 {
+        return Err("process groups unavailable".into());
+    }
+    let mut actual = vec![0; actual_count as usize];
+    if unsafe { libc::getgroups(actual_count, actual.as_mut_ptr()) } < 0 {
+        return Err("process groups unavailable".into());
+    }
+    expected.sort_unstable();
+    expected.dedup();
+    actual.sort_unstable();
+    actual.dedup();
+    if actual != expected {
+        return Err("supplementary groups differ".into());
+    }
+    Ok(())
 }
 
 /// Whether this process holds privilege that the environment must not steer.
@@ -546,8 +829,229 @@ fn write_all(fd: libc::c_int, mut buf: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchPlan, LOGIN_ENV};
+    use super::{
+        enter_user, lookup_salt_user, read_salt_at, read_wallet_key, verify_credentials,
+        wipe_fork_child_key, write_salt_to, LaunchPlan, User, KEY_LEN, LOGIN_ENV, SALT_LEN,
+    };
     use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by wallet_stdin_does_not_buffer_key_bytes"]
+    fn wallet_stdin_child() {
+        let error = super::read_wallet_key_from_stdin().expect_err("oversized input must fail");
+        assert!(error.contains("more than 56 bytes"));
+        let mut remaining: libc::c_int = 0;
+        // SAFETY: stdin is the parent-provided pipe and FIONREAD writes one int
+        // through this valid pointer; it neither reads key bytes nor owns the fd.
+        let result = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut remaining) };
+        assert_eq!(result, 0);
+        assert_eq!(
+            remaining, 43,
+            "only the key and one-byte probe may leave the pipe"
+        );
+    }
+
+    #[test]
+    fn wallet_stdin_does_not_buffer_key_bytes() {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::wallet_stdin_child"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(&[0x5a; 100]).unwrap();
+        drop(input);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn wallet_key_input_is_exact_and_owned_by_a_wiping_buffer() {
+        let exact = vec![0x41; KEY_LEN];
+        let key: zeroize::Zeroizing<Vec<u8>> =
+            read_wallet_key(std::io::Cursor::new(exact.clone())).unwrap();
+        assert_eq!(&**key, &exact);
+
+        let short = read_wallet_key(std::io::Cursor::new(vec![0x42; KEY_LEN - 1]))
+            .expect_err("a partial key must fail");
+        assert!(short.contains("expected 56 bytes"));
+
+        let oversized = read_wallet_key(std::io::Cursor::new(vec![0x43; KEY_LEN + 1]))
+            .expect_err("a 57th byte must fail");
+        assert!(oversized.contains("more than 56 bytes"));
+
+        struct FailedRead;
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic input failure"))
+            }
+        }
+        let failed = read_wallet_key(FailedRead).expect_err("input errors must fail");
+        assert!(failed.contains("synthetic input failure"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::undocumented_unsafe_blocks,
+        reason = "fork/pipe verify child-only zeroization and parent copy-on-write isolation"
+    )]
+    fn fork_child_wipes_its_key_without_changing_the_parent() {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+
+        let mut key = vec![0x5a; KEY_LEN];
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::close(fds[0]) };
+            wipe_fork_child_key(&mut key);
+            unsafe {
+                libc::write(fds[1], key.as_ptr().cast(), key.len());
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut child_key = vec![0xff; KEY_LEN];
+        reader.read_exact(&mut child_key).unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(status, 0);
+        assert_eq!(child_key, vec![0; KEY_LEN]);
+        assert_eq!(key, vec![0x5a; KEY_LEN]);
+    }
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by salt_reader_boundaries"]
+    fn salt_reader_child() {
+        let path = std::env::var_os("IRLUME_TEST_SALT_PATH").expect("path");
+        let expected = std::env::var("IRLUME_TEST_SALT_EXPECT").expect("expectation");
+        match (read_salt_at(std::path::Path::new(&path)), expected.as_str()) {
+            (Ok(salt), "ok") => assert_eq!(salt.expose(), &[7; SALT_LEN]),
+            (Err(super::SaltReadError::Absent), "absent")
+            | (Err(super::SaltReadError::Failed), "fail") => {}
+            _ => panic!("unexpected salt-read result"),
+        }
+    }
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by broken_reader_is_reported"]
+    #[expect(
+        clippy::undocumented_unsafe_blocks,
+        reason = "pipe setup and ownership transfer require libc/raw-fd calls"
+    )]
+    fn salt_stdout_child() {
+        use std::os::fd::FromRawFd as _;
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        let writer = std::io::BufWriter::with_capacity(SALT_LEN * 2, unsafe {
+            std::fs::File::from_raw_fd(fds[1])
+        });
+        let error = write_salt_to(writer, &[7; SALT_LEN]).expect_err("reader is closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn broken_reader_is_reported() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::salt_stdout_child"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn salt_lookup_accepts_the_daemons_machine_account_grammar_only() {
+        let expected = User {
+            uid: 123,
+            gid: 456,
+            name: CString::new("host$").unwrap(),
+            home: "/synthetic/home".into(),
+        };
+        let found = lookup_salt_user("host$", |name| {
+            assert_eq!(name, "host$");
+            Ok(expected)
+        })
+        .unwrap_or_else(|_| panic!("a daemon-accepted machine account must reach NSS lookup"));
+        assert_eq!(found.name.as_bytes(), b"host$");
+
+        for invalid in ["bad/name", "bad\0name", "bad!name"] {
+            assert!(
+                lookup_salt_user(invalid, |_| panic!("invalid names must not reach NSS")).is_err()
+            );
+        }
+    }
+
+    fn child_result(path: &std::path::Path, expected: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::salt_reader_child"])
+            .env("IRLUME_TEST_SALT_PATH", path)
+            .env("IRLUME_TEST_SALT_EXPECT", expected)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[expect(
+        clippy::undocumented_unsafe_blocks,
+        reason = "mkfifo has no Rust standard-library wrapper"
+    )]
+    fn salt_reader_boundaries_run_in_fresh_processes() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        let root = std::env::temp_dir().join(format!("irlume-salt-reader-{}", std::process::id()));
+        let home = root.join("home");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(outside.join("share/kwalletd")).unwrap();
+        symlink(root.join("outside"), home.join(".local")).unwrap();
+        let salt = outside.join("share/kwalletd/kdewallet.salt");
+        let relocated_salt = home.join(".local/share/kwalletd/kdewallet.salt");
+        std::fs::write(&salt, vec![7; SALT_LEN]).unwrap();
+        child_result(&relocated_salt, "ok");
+        std::fs::set_permissions(root.join("outside"), std::fs::Permissions::from_mode(0o0))
+            .unwrap();
+        child_result(&salt, "fail");
+        std::fs::set_permissions(root.join("outside"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::write(&salt, vec![7; SALT_LEN - 1]).unwrap();
+        child_result(&salt, "fail");
+        std::fs::write(&salt, vec![7; 4097]).unwrap();
+        child_result(&salt, "fail");
+        std::fs::remove_file(&salt).unwrap();
+        child_result(&salt, "absent");
+        symlink("/dev/null", &salt).unwrap();
+        child_result(&salt, "fail");
+        std::fs::remove_file(&salt).unwrap();
+        let c = CString::new(salt.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        child_result(&salt, "fail");
+        std::fs::remove_file(&salt).unwrap();
+        std::fs::create_dir(&salt).unwrap();
+        child_result(&salt, "fail");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn credential_verifier_rejects_retained_or_wrong_identity() {
+        let name = std::env::var("USER").unwrap();
+        let current = super::lookup_user(&name).unwrap();
+        enter_user(&current).expect("self mode must permanently normalize credentials");
+        verify_credentials(&current).expect("ordinary login credentials are exact");
+        let wrong = User {
+            uid: current.uid.wrapping_add(1),
+            gid: current.gid,
+            name: current.name.clone(),
+            home: current.home.clone(),
+        };
+        assert!(enter_user(&wrong).is_err());
+    }
 
     /// Read back an argv/envp array the way `execve` would: pointers until NULL.
     ///

@@ -27,6 +27,14 @@ pub fn run(sub: Option<&str>, args: &[String]) -> ExitCode {
     }
 }
 
+pub(crate) fn missing_key_advice(recovery_set: bool) -> &'static str {
+    if recovery_set {
+        "restore the template key with the existing recovery passphrase: irlume recovery restore"
+    } else {
+        "Re-enroll to use face login again; no recovery backup is set"
+    }
+}
+
 fn status(user: &str) -> ExitCode {
     match daemon_request(&Request::RecoveryStatus { user: user.into() }) {
         Ok(Response::RecoveryStatus {
@@ -39,15 +47,12 @@ fn status(user: &str) -> ExitCode {
             println!(
                 "  templates encrypted : {}",
                 match (encrypted, key_present) {
-                    (true, true) => "yes ✓ (template key sealed in the TPM)",
-                    // The one state the old bool could not say. Naming it
-                    // matters more than any other line here: the templates are
-                    // safe from a stolen disk and unreadable by their owner, and
-                    // neither `recovery setup` nor a reseal brings them back.
-                    (true, false) =>
-                        "yes, but the TEMPLATE KEY IS GONE: this enrollment \
-                         cannot be opened. Re-enroll to use face login again.",
-                    (false, _) => "no (plaintext at rest)",
+                    (true, true) => "yes ✓ (template key sealed in the TPM)".into(),
+                    (true, false) => format!(
+                        "yes, but the TEMPLATE KEY IS GONE: {}",
+                        missing_key_advice(recovery_set)
+                    ),
+                    (false, _) => "no (plaintext at rest)".to_string(),
                 }
             );
             println!(
@@ -62,7 +67,7 @@ fn status(user: &str) -> ExitCode {
                     "no (templates stay plaintext on this host)"
                 }
             );
-            if encrypted && !recovery_set {
+            if encrypted && key_present && !recovery_set {
                 println!("  → no backstop: if the TPM seal breaks (dbx/firmware update, TPM clear, disk move),");
                 println!("    you'd have to re-enroll. Set one now:  irlume recovery setup");
             }

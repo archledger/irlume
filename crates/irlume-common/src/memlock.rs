@@ -8,6 +8,13 @@
 //!
 //! Best-effort: `RLIMIT_MEMLOCK` may reject the lock for unprivileged callers,
 //! in which case we warn and carry on (auth must still work).
+//!
+//! There is deliberately no matching slice-level `munlock`: ordinary `Vec`
+//! allocations can share allocator pages with other live secrets, while the
+//! kernel locks and unlocks whole pages. Unlocking when one slice is dropped
+//! could therefore make a neighbouring live secret swappable. The process
+//! releases the locks when its mappings exit; each owner still zeroizes its
+//! own bytes on drop.
 
 /// Lock the pages backing `buf` against swap and core dumps. Idempotent-ish;
 /// safe to call on any slice. No-op for empty input.

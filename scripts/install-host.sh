@@ -15,7 +15,7 @@ done
 [[ -n "$ORT" && -f "$ORT" ]] || { echo "need --ort <libonnxruntime.so> (found: '$ORT')" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-for b in irlumed irlume; do
+for b in irlumed irlume irlume-password-verify; do
     [[ -f "$REPO/target/release/$b" ]] || { echo "missing $REPO/target/release/$b; build first" >&2; exit 1; }
 done
 for m in face_detection_yunet_2023mar.onnx glintr100.onnx face_landmark.onnx blaze_face_short_range.onnx; do
@@ -59,6 +59,12 @@ install -Dm0644 "$REPO/packaging/polkit/org.irlume.recovery-manage.policy" \
   /usr/share/polkit-1/actions/org.irlume.recovery-manage.policy
 printf "%s\n" "Enrollment and recovery management require polkit and a desktop or registered terminal authentication agent."
 install -m 0755 "$REPO/target/release/irlumed" "$REPO/target/release/irlume" /usr/local/bin/
+
+install -Dm0755 "$REPO/target/release/irlume-password-verify" /usr/libexec/irlume-password-verify
+# Preserve administrator-owned recovery policy on subsequent development installs.
+if [[ ! -e /etc/pam.d/irlume-retry-reset ]]; then
+    install -Dm0644 "$REPO/packaging/pam/irlume-retry-reset" /etc/pam.d/irlume-retry-reset
+fi
 
 cat > /etc/systemd/system/irlumed.service <<EOF
 [Unit]

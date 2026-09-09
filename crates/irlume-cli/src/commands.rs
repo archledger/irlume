@@ -8,6 +8,7 @@
 //! the daemon stays the only component that touches the camera / TPM / store.
 
 use crate::{daemon_request, tpm_device, user_arg};
+use irlume_common::platform::SystemCommand;
 use irlume_common::{Request, Response};
 use std::process::ExitCode;
 
@@ -688,6 +689,7 @@ fn usable_scans(profiles: &[irlume_common::ProfileSummary]) -> Option<usize> {
 pub fn status(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     println!("irlume status for '{user}'");
+    println!("  face sensors  : {}", crate::sensor_policy::status_line());
 
     // Daemon + method.
     let reach = daemon_reach();
@@ -814,8 +816,8 @@ pub fn status(args: &[String]) -> ExitCode {
                 // Reporting this as plaintext both understates the posture and
                 // hides that the enrollment is gone.
                 (true, false) => format!(
-                    "encrypted, but the TEMPLATE KEY IS MISSING {WARN} \
-                     (unreadable; re-enroll)"
+                    "encrypted, but the TEMPLATE KEY IS MISSING {WARN} ({})",
+                    crate::recovery::missing_key_advice(recovery_set)
                 ),
                 (false, _) => format!("plaintext {WARN} (run `irlume recovery setup`)"),
             }
@@ -830,10 +832,21 @@ pub fn status(args: &[String]) -> ExitCode {
         );
     }
 
+    // The daemon can observe root-only preferences for ordinary CLI users.
+    let (preferences, preference_source) = crate::preferences::observed();
+    println!("  preferences   : {preference_source}");
+    println!(
+        "  hands-free    : {}",
+        crate::preferences::toggle_label(
+            preferences
+                .privileged_face_consent
+                .map(|required| !required)
+        )
+    );
     // Biopolicy enforcement (opt-in).
     println!(
         "  biopolicy     : {}",
-        match irlume_common::config::enforce_biopolicy_visible() {
+        match preferences.enforce_biopolicy {
             Some(true) => format!("ENFORCING {OK} (operation-class gate)"),
             Some(false) => "off (default)".into(),
             None => "unknown: root-only setting, re-run with sudo".into(),
@@ -1195,16 +1208,7 @@ fn selinux_present() -> bool {
     if std::path::Path::new("/sys/fs/selinux").exists() {
         return true;
     }
-    // Honor PATH (the integration tests inject a fake `semodule` there; a
-    // real SELinux box also may not have it in the fixed /usr slots).
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.join("semodule").exists() {
-                return true;
-            }
-        }
-    }
-    false
+    SystemCommand::Semodule.path().is_some()
 }
 
 /// `irlume selinux <status|load>`: manage the policy module that lets the
@@ -1234,7 +1238,12 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
             // `semodule -l` needs root; as a normal user it returns nothing, so
             // an empty list ≠ "not loaded". The live socket label is a reliable
             // positive signal either way (only our type_transition sets it).
-            let out = std::process::Command::new("semodule").args(["-l"]).output();
+            let out = SystemCommand::Semodule.path().and_then(|semodule| {
+                std::process::Command::new(semodule)
+                    .args(["-l"])
+                    .output()
+                    .ok()
+            });
             let listed = out
                 .as_ref()
                 .map(|o| o.status.success() && !o.stdout.is_empty())
@@ -1300,9 +1309,19 @@ pub fn selinux(sub: Option<&str>, _args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             };
             eprintln!("[selinux] semodule -i {pp} (needs root)…");
-            let st = std::process::Command::new("semodule")
-                .args(["-i", &pp])
-                .status();
+            let st = SystemCommand::Semodule
+                .path()
+                .map(|semodule| {
+                    std::process::Command::new(semodule)
+                        .args(["-i", &pp])
+                        .status()
+                })
+                .unwrap_or_else(|| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "trusted semodule executable not found",
+                    ))
+                });
             match st {
                 Ok(s) if s.success() => {
                     // Loading the module is half the job: the bound socket
@@ -1511,17 +1530,20 @@ pub fn deps(_args: &[String]) -> ExitCode {
 /// so enabling it can restrict which services a face may satisfy but never
 /// locks anyone out.
 pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
-    let visible = irlume_common::config::enforce_biopolicy_visible();
     match sub {
         None | Some("status") => {
+            let (state, source) = crate::preferences::observed();
             println!(
-                "[biopolicy] operation-class gate: {}",
-                match visible {
+                "[biopolicy] operation-class gate: {} ({source})",
+                match state.enforce_biopolicy {
                     Some(true) => "ENFORCING",
                     Some(false) => "off (default)",
-                    None => "unknown: root-only setting, re-run with sudo",
+                    None => "unknown: settings unavailable",
                 }
             );
+            if state.biopolicy_overridden {
+                println!("Observed policy includes an environment override; the saved setting may differ.");
+            }
             ExitCode::SUCCESS
         }
         Some(v @ ("on" | "off")) => {
@@ -1529,8 +1551,23 @@ pub fn biopolicy(sub: Option<&str>, _args: &[String]) -> ExitCode {
                 eprintln!("[biopolicy] needs root: sudo irlume biopolicy {v}");
                 return ExitCode::FAILURE;
             }
+            if std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some() {
+                eprintln!(
+                    "[biopolicy] remove the environment override before changing the saved setting"
+                );
+                return ExitCode::FAILURE;
+            }
             let val = if v == "on" { "1" } else { "0" };
-            match irlume_common::config::write_kv("settings.conf", "enforce_biopolicy", val) {
+            let update = || -> std::io::Result<()> {
+                let _lock = irlume_common::config::lock_exclusive("settings.conf")?;
+                if let irlume_common::config::KvObservation::Unknown(error) =
+                    irlume_common::config::observe_kv("settings.conf", "enforce_biopolicy")
+                {
+                    return Err(error);
+                }
+                irlume_common::config::write_kv("settings.conf", "enforce_biopolicy", val)
+            };
+            match update() {
                 Ok(()) => {
                     println!(
                         "[biopolicy] operation-class gate {} (takes effect on the next face auth; \
@@ -1588,12 +1625,21 @@ pub fn reseal(args: &[String]) -> ExitCode {
     let Some(pw) = prompt_login_password() else {
         return ExitCode::from(2);
     };
+    let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
+        Ok(salt) => salt,
+        Err(e) => {
+            eprintln!("[reseal] failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let req = Request::SealPassword {
         kind: None, // let the daemon judge from what the user has
         user,
         // Copy the bytes out rather than moving the `String`: `Zeroizing` owns
         // the buffer and wipes it on drop, and `SecretBytes` wipes the copy.
         password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+        wallet_salt,
+        wallet_salt_checked: true,
     };
     match daemon_request(&req) {
         Ok(Response::PasswordSealed) => {
@@ -1700,6 +1746,13 @@ pub fn setup(args: &[String]) -> ExitCode {
         /* default_yes: */ true,
     ) {
         if let Some(pw) = prompt_login_password() {
+            let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
+                Ok(salt) => salt,
+                Err(e) => {
+                    eprintln!("  arm failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             match daemon_request(&Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
@@ -1707,6 +1760,8 @@ pub fn setup(args: &[String]) -> ExitCode {
                 // so the bytes are copied rather than moved. The old `.clone()`
                 // here left a whole second password on the heap unwiped.
                 password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+                wallet_salt,
+                wallet_salt_checked: true,
             }) {
                 Ok(Response::PasswordSealed) => println!("  armed {OK}"),
                 // GNOME token arm: the wizard runs in the user's session, so
@@ -1853,6 +1908,8 @@ KEYRING / TPM
   reseal                re-bind the sealed secret to current PCRs (after a
                         firmware/kernel update); safe, re-enters the password
   recovery <status|setup|restore|forget>   recovery passphrase + encryption
+  retry <status|reset> [--user U]         inspect/reset face retry state
+                        reset verifies your local password; root is an admin override
   diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)
 
 SYSTEM INTEGRATION
@@ -1884,6 +1941,14 @@ SYSTEM INTEGRATION
                         keyed on (#575; the hardware-report attachment)
   models list --json           machine model listing; all other models
                         subcommands are removed (ADR-0015) and answer with a notice
+  auth consent [status]         show privileged face-confirmation policy
+  auth sensor status            show the saved/daemon-observed face sensor policy
+  auth sensor preflight [--user U]  camera-free experimental IR prerequisites
+  auth sensor dual              restore dual sensors (sudo; no PAM changes)
+  auth sensor ir-only --yes      select EXPERIMENTAL IR-only (sudo; not qualified)
+  auth consent required         require confirmation (default; sudo)
+  auth consent hands-free --yes skip the keyword at privileged prompts (sudo;
+                        machine-wide opt-in). Login/lock behavior is separate.
   biopolicy <on|off|status>       opt-in operation-class gate: restrict which
                         services a face may satisfy (advanced; password unaffected)
   update [--check]                update via the channel this was installed from

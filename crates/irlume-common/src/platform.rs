@@ -5,6 +5,77 @@
 //! the distro-family detection that the fingerprint (and, later, login) wiring
 //! needs to pick the right mechanism (authselect vs pam-auth-update vs direct).
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+/// System tools invoked from code that can run with elevated privilege.
+///
+/// Resolution deliberately ignores `PATH`: PAM and CLI apply/reconcile callers
+/// may be uid 0 while retaining an invoking process's environment. The fixed
+/// prefixes are an administrator-owned trust boundary, not inode attestation;
+/// symlinks remain valid for usr-merge and Nix system profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemCommand {
+    Loginctl,
+    GnomeShell,
+    Semodule,
+    Systemctl,
+    Restorecon,
+}
+
+impl SystemCommand {
+    const ALL: [Self; 5] = [
+        Self::Loginctl,
+        Self::GnomeShell,
+        Self::Semodule,
+        Self::Systemctl,
+        Self::Restorecon,
+    ];
+
+    const fn basename(self) -> &'static str {
+        match self {
+            Self::Loginctl => "loginctl",
+            Self::GnomeShell => "gnome-shell",
+            Self::Semodule => "semodule",
+            Self::Systemctl => "systemctl",
+            Self::Restorecon => "restorecon",
+        }
+    }
+
+    /// Locate this tool under a fixed system prefix, never through `PATH`.
+    #[must_use]
+    pub fn path(self) -> Option<PathBuf> {
+        self.path_in(Path::new("/"))
+    }
+
+    fn path_in(self, root: &Path) -> Option<PathBuf> {
+        system_command_path_in(root, self.basename())
+    }
+}
+
+fn system_command_path_in(root: &Path, basename: &str) -> Option<PathBuf> {
+    if !SystemCommand::ALL
+        .iter()
+        .any(|command| command.basename() == basename)
+    {
+        return None;
+    }
+    const PREFIXES: [&str; 7] = [
+        "usr/bin",
+        "usr/sbin",
+        "bin",
+        "sbin",
+        "usr/local/bin",
+        "usr/local/sbin",
+        "run/current-system/sw/bin",
+    ];
+    PREFIXES.iter().find_map(|prefix| {
+        let path = root.join(prefix).join(basename);
+        let metadata = std::fs::metadata(&path).ok()?;
+        (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(path)
+    })
+}
+
 /// Distro family, for choosing the PAM-wiring mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistroFamily {
@@ -112,7 +183,7 @@ pub fn user_has_live_session(user: &str) -> bool {
 /// session right now? `None` if `loginctl` is missing/unparsable (→ caller falls
 /// back to the runtime-dir heuristic).
 fn active_graphical_session(user: &str) -> Option<bool> {
-    let out = std::process::Command::new("loginctl")
+    let out = std::process::Command::new(SystemCommand::Loginctl.path()?)
         .args(["list-sessions", "--no-legend"])
         .output()
         .ok()?;
@@ -138,7 +209,10 @@ fn active_graphical_session(user: &str) -> Option<bool> {
 /// `Class=user`. A logout closes the user session (gone or `closing`), so only a
 /// live lock screen leaves an active/online user-class session.
 fn session_is_active_user(session: &str) -> bool {
-    let Ok(out) = std::process::Command::new("loginctl")
+    let Some(loginctl) = SystemCommand::Loginctl.path() else {
+        return false;
+    };
+    let Ok(out) = std::process::Command::new(loginctl)
         .args(["show-session", session, "-p", "Class", "-p", "State"])
         .output()
     else {
@@ -349,5 +423,58 @@ mod tests {
         // `loginctl show-session` on a bogus id prints nothing usable; the
         // parser must fail closed (false), never treat it as active.
         assert!(!session_is_active_user("irlume-test-no-such-session"));
+    }
+
+    #[test]
+    fn system_commands_resolve_only_from_fixed_executable_locations() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("irlume-system-command-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for command in SystemCommand::ALL {
+            let path = root.join("usr/bin").join(command.basename());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"fixture").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(command.path_in(&root), Some(path));
+        }
+
+        // A PATH-shaped writable directory is deliberately outside the fixed
+        // roots. Its executable must never participate in resolution.
+        let foreign = root.join("tmp/user-bin/loginctl");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, b"foreign").unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_ne!(SystemCommand::Loginctl.path_in(&root), Some(foreign));
+
+        for malformed in ["../loginctl", "/tmp/loginctl", "loginctl/other", ""] {
+            assert_eq!(system_command_path_in(&root, malformed), None);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn system_command_skips_non_executable_and_supports_nix_profile_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root =
+            std::env::temp_dir().join(format!("irlume-system-command-nix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let non_executable = root.join("usr/bin/systemctl");
+        std::fs::create_dir_all(non_executable.parent().unwrap()).unwrap();
+        std::fs::write(&non_executable, b"fixture").unwrap();
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = root.join("nix/store/test-systemd/bin/systemctl");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, b"fixture").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = root.join("run/current-system/sw/bin/systemctl");
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        symlink(&store, &profile).unwrap();
+
+        assert_eq!(SystemCommand::Systemctl.path_in(&root), Some(profile));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

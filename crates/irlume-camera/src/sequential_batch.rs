@@ -1,4 +1,6 @@
-use super::{Frame, IrCamera, IrCaptureStats, Progress, RgbCamera, RuntimePairContract};
+use super::{
+    CaptureControl, Frame, IrCamera, IrCaptureStats, Progress, RgbCamera, RuntimePairContract,
+};
 use irlume_common::{Error, Result};
 use std::time::{Duration, Instant};
 
@@ -30,18 +32,41 @@ pub fn capture_sequential_batch_with_progress(
     request: SequentialBatchRequest,
     progress: &Progress,
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
-    capture_batch_with(
+    capture_sequential_batch_with_control(
+        rgb,
+        ir,
+        contract,
+        request,
+        &CaptureControl::with_progress(progress.clone()),
+    )
+}
+
+/// Collect a sequential batch with cooperative request cancellation.
+///
+/// # Errors
+/// Returns cancellation without partial evidence, or any error documented by
+/// [`capture_sequential_batch_with_progress`]. Existing stream owners clean up
+/// before another phase or downstream inference can run.
+pub fn capture_sequential_batch_with_control(
+    rgb: &RgbCamera,
+    ir: &IrCamera,
+    contract: &RuntimePairContract,
+    request: SequentialBatchRequest,
+    control: &CaptureControl,
+) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+    capture_batch_controlled_with(
         request,
         contract,
         (
-            || rgb.session_with_progress(progress),
+            || rgb.session_with_control(control),
             |session| session.denoised(),
         ),
         (
-            || ir.session_with_startup(progress, super::IrSessionStartup::Adaptive),
+            || ir.session_with_control_and_startup(control, super::IrSessionStartup::Adaptive),
             |session| session.capture_with_stats(),
         ),
         Instant::now,
+        control,
         || {
             rgb.lease
                 .require_endpoint(&rgb.device)
@@ -51,6 +76,7 @@ pub fn capture_sequential_batch_with_progress(
     )
 }
 
+#[cfg(test)]
 pub(super) fn capture_batch_with<R, I>(
     request: SequentialBatchRequest,
     contract: &RuntimePairContract,
@@ -65,12 +91,39 @@ pub(super) fn capture_batch_with<R, I>(
     now: impl Fn() -> Instant,
     live: impl FnOnce() -> Result<()>,
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+    capture_batch_controlled_with(
+        request,
+        contract,
+        rgb,
+        ir,
+        now,
+        &CaptureControl::with_progress(super::no_progress()),
+        live,
+    )
+}
+
+pub(super) fn capture_batch_controlled_with<R, I>(
+    request: SequentialBatchRequest,
+    contract: &RuntimePairContract,
+    rgb: (
+        impl FnOnce() -> Result<R>,
+        impl FnMut(&mut R) -> Result<Frame>,
+    ),
+    ir: (
+        impl FnOnce() -> Result<I>,
+        impl FnMut(&mut I) -> Result<(Frame, IrCaptureStats)>,
+    ),
+    now: impl Fn() -> Instant,
+    control: &CaptureControl,
+    live: impl FnOnce() -> Result<()>,
+) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
     if !(1..=5).contains(&request.pairs) {
         return Err(Error::Hardware(
             "sequential batch requires one through five pairs".into(),
         ));
     }
     let checkpoint = || {
+        control.check()?;
         if now() >= request.deadline {
             Err(Error::Hardware("sequential batch deadline expired".into()))
         } else {

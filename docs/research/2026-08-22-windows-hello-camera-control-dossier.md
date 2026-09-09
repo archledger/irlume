@@ -6,30 +6,41 @@ this session (Microsoft Learn, USB-IF UVC 1.5, Linux kernel docs,
 linux-enable-ir-emitter). Evidence labels: [DOCUMENTED] stated at the cited
 source; [MEASURED] irlume fleet numbers; [INFERENCE] reasoned.
 
-## Headline numbers (Microsoft's own bar)
+## Correction after the ThinkPad study (2026-09-08)
+
+The original August interpretation confused an IR stream's control interface
+with the complete authentication pipeline. Microsoft explicitly documents RGB
+and IR input for Hello anti-spoofing; the September 4 ThinkPad/BRIO trace also
+observed both streams. An IR-specific control does not prove that RGB is unused.
+The corrected conclusions below supersede that interpretation. Irlume's optional
+IR-only proposal therefore needs its own qualification and is not Hello parity.
+[Current Microsoft privacy guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/camera-privacy-controls#shutters-with-multiple-cameras-on-a-panel).
+
+## Published hardware requirements, not local certification results
 
 - Average authentication duration **< 2 s**, re-auth **< 2 s** [FACE-AUTH].
 - Stream **startup < 500 ms** for the face-auth IR stream (HLK gate) [BRINGUP].
 - Sustained **15 fps minimum while strobing** (lit AND ambient), ≥320x320,
-  L8/NV12 [BRINGUP]. (The NexiGo N930W IR at 14.73-14.79 fps measured would
-  fail this outright — it is a below-certification-bar device, which reframes
-  its 0.4% rate-floor margin as a hardware qualification fact, not a tuning
-  nuisance.)
+  L8/NV12 [BRINGUP]. Local NexiGo measurements of 14.73-14.79 fps are
+  measurements on Irlume's Linux path. They do not establish a Windows HLK
+  result or the device's certification status.
 - FAR < 0.001%, TAR > 95% [BIOREQ].
 
-## The core mechanism: firmware-per-frame strobe
+## Documented face-authentication illumination modes
 
-Hello never times the emitter against frames from the host. The driver sets
-ONE mode; the camera alternates the IR strobe every frame at full rate and
-tags every frame lit/unlit in metadata [DDI, MSXU]:
+The documented face-authentication modes support device-controlled alternating
+illumination or background subtraction, with the metadata contract below
+[DDI, MSXU]. This describes the interface; it does not establish every control
+write made by a particular Windows driver during authentication:
 
 - `FACEAUTH_MODE_ALTERNATIVE_FRAME_ILLUMINATION`: "alternate IR strobe on/off
   for each frame captured", illumination flag mandatory on each sample.
 - `FACEAUTH_MODE_BACKGROUND_SUBTRACTION`: camera delivers
   ambient-subtracted frames, no metadata.
 
-No emitter write sits on the per-authentication hot path. This is the single
-biggest structural difference from irlume's D1-write-per-session model.
+The mode contract does not establish that Windows performs no per-attempt
+control writes. Compare actual device traces before attributing a performance
+difference to Irlume's session setup or restore behavior.
 
 ## The Microsoft extension unit (MSXU)
 
@@ -46,44 +57,45 @@ Linux exposure: `V4L2_META_FMT_UVC` ('UVCH') = host ts + USB SOF + payload
 header per frame; `V4L2_META_FMT_UVC_MSXU_1_5` ('UVCM') adds the Microsoft
 metadata including per-frame illumination [K-UVC, K-MSXU].
 
-**Action for irlume (cheap, read-only): probe the fleet for this XU.** If
-present on a camera: SET_CUR face-auth/torch mode moves the strobe into
-firmware (deleting D1 write/restore from the hot path), and the MSXU
-metadata node gives a deterministic per-frame lit bit (replacing
-brightest-of-burst heuristics). Selector 0x02 is a documented manual-exposure
-path. Absent → current path unchanged. Subject to the XU safety guardrails
-(docs/research/2026-08-22-camera-control-safety-dossier.md).
+A descriptor/capability read can establish whether the XU is advertised.
+`SET_CUR` changes device state; it is not a read-only probe. An advertised XU
+alone does not prove working illumination metadata, successful restore, or that
+capture selection can be removed. Validate those behaviors on the particular
+camera before changing Irlume's existing control and frame-selection path.
+See [camera-control safety](2026-08-22-camera-control-safety-dossier.md).
 
-## RGB is not part of Hello auth
+## RGB participates in Hello authentication
 
-The recognition pipeline is described entirely on IR input; the MSXU
-face-auth control cannot even address the RGB interface; illumination
-metadata must never appear on RGB samples [FACE-AUTH, MSXU, META]. Windows
-has no cross-spectrum skew problem because it never pairs spectra. Irlume's
-joint RGB PAD is a deliberate superset (print-species coverage); ADR-0014 is
-what keeps it reachable on sequential hardware.
+An IR face-authentication stream has IR-specific controls and illumination
+metadata. The complete Hello pipeline also uses RGB for anti-spoofing. Its
+proprietary fusion and synchronization rules are not established by these
+public interfaces. Irlume's cross-spectrum timing and PAD policies therefore
+need their own evidence; describing them as a proven superset of Hello was
+unsupported. [Microsoft privacy guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/camera-privacy-controls#shutters-with-multiple-cameras-on-a-panel).
 
-## Startup-latency techniques (documented)
+## Documented startup requirements and interfaces
 
-1. < 500 ms hard budget to first frame.
-2. IR sensor registered as `KSCATEGORY_SENSOR_CAMERA` + enumeration-hiding
-   (`SkipCameraEnumeration`): always-present node, no app contention.
-3. FrameServer-shareable auth pin: brokered, persistent pipeline.
-4. Static INF-declared capabilities (no runtime discovery).
-5. Torch defaults armed before streaming.
+1. Stream startup < 500 ms in the cited HLK test.
+2. IR sensor registration as `KSCATEGORY_SENSOR_CAMERA`; optional
+   `SkipCameraEnumeration` hides it from legacy camera-app enumeration.
+   This does not establish absence of contention.
+3. FrameServer architecture for brokered capture.
+4. INF-declared device capabilities.
+5. The IR Torch interface defines a pre-stream default mode. Actual control
+   writes and latency effects require device traces.
 6. ESS: hypervisor-isolated frame path (not portable).
 
-Linux analogs we can act on: held/pre-armed sessions (the broker model),
-autosuspend management, and MSXU probing. Pre-arm STREAMON-during-RGB-phase
-is the Windows-endorsed direction (broker holds the pipeline warm).
+Possible Linux experiments include session lifetime and startup-cost measurement.
+The cited Windows interfaces do not endorse Irlume keeping streams armed during
+other work. Queue freshness, ownership, cancellation and emitter restoration
+must remain tested requirements for any such optimization.
 
 ## Multi-camera synchronization
 
-No hardware sync, no documented skew tolerance. Pairing is software-only via
-camera profiles (CONCURRENCYINFO hints); geometric correspondence comes from
-MSXU extrinsics/intrinsics per rig [PROFILES, MSXU]. Our paired-window skew
-gate has no Microsoft counterpart to calibrate against; ADR-0014's
-derivation stands on our own measurements.
+The inspected public interfaces describe camera profiles and
+extrinsics/intrinsics [PROFILES, MSXU]; they do not establish the proprietary
+matcher's permitted skew or prove that every rig lacks hardware synchronization.
+Irlume's paired-window skew limit remains grounded in its own measurements.
 
 ## Sources
 

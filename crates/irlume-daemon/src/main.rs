@@ -62,6 +62,7 @@ mod diagnostics;
 mod enrollment_session;
 mod operation_authorization;
 mod position_session;
+mod retry_recovery;
 mod retry_throttle;
 mod users;
 
@@ -158,11 +159,10 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
             );
             if strict {
-                // Strict verification runs once in the startup thread. Only the
-                // recognizer's verified bytes are carried into the initial load;
-                // the detector, adapter, mesh and Blaze models are reopened by
-                // path, and a post-panic rebuild reopens every model path without
-                // repeating this manifest check (#346).
+                // Startup and post-panic rebuilds both run this verification.
+                // Only the recognizer's verified bytes are carried into its
+                // loader; the detector, adapter, mesh and Blaze still reopen
+                // paths after checking. Root controls those paths (#346).
                 //
                 // A changed recognizer fails closed for identity matching: its
                 // full digest changes the `embed:<sha256>` space tag, so
@@ -170,9 +170,8 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 // old space. That argument does not cover the other artifacts.
                 eprintln!(
                     "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models \
-                     (verification is a one-time startup path check; only the recognizer bytes \
-                     are carried from this check into the initial load, and a rebuild after a \
-                     worker panic reloads model paths without re-checking)"
+                     (verification runs before startup and post-panic rebuilds; only the recognizer \
+                     bytes are carried from this check into the loader)"
                 );
                 std::process::exit(1);
             }
@@ -198,10 +197,11 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
 /// tighter guarantee: [`irlume_auth::Engine::load`] re-opens the path, so a file
 /// swapped between the check and the load would reach the session unverified.
 ///
-/// `None` is the camera worker's post-panic rebuild, which pays the read as it
-/// always has. Keeping the 260MB buffer alive for the daemon's whole life to
-/// save that one re-read would cost more resident memory than the entire rest
-/// of the process, so startup drops it as soon as the session owns its copy.
+/// `None` is the fallback when verification could not retain readable bytes.
+/// Post-panic rebuilds repeat verification in [`rebuild_engine_from_config`]
+/// and pass retained bytes here when available. Each build drops that buffer
+/// as soon as the session owns its copy rather than retaining it for the
+/// daemon's lifetime.
 fn load_shipped_recognizer(
     det_path: &str,
     model_path: &str,
@@ -366,10 +366,81 @@ fn load_pad_models(
     (engine, rgb_status, ir_status)
 }
 
+#[derive(Debug, PartialEq, Eq, Default)]
+struct EngineDevices {
+    rgb: String,
+    ir: String,
+    rgb_available: bool,
+    ir_available: bool,
+}
+
+fn select_engine_devices_with(
+    policy: irlume_common::config::FaceSensorPolicyObservation,
+    discover: impl FnOnce() -> EngineDevices,
+    configured: impl FnOnce() -> EngineDevices,
+) -> EngineDevices {
+    match policy.resolve() {
+        Ok(irlume_common::config::FaceSensorPolicy::Dual) => discover(),
+        Ok(irlume_common::config::FaceSensorPolicy::IrOnlyExperimental) => configured(),
+        Err(_) => EngineDevices::default(),
+    }
+}
+
+fn select_engine_devices(
+    policy: irlume_common::config::FaceSensorPolicyObservation,
+) -> EngineDevices {
+    select_engine_devices_with(
+        policy,
+        || {
+            let caps = irlume_auth::capabilities();
+            let (rgb, ir) = irlume_auth::select_pair()
+                .unwrap_or_else(|| (irlume_auth::select_rgb().unwrap_or_default(), String::new()));
+            EngineDevices {
+                rgb_available: caps.rgb && std::path::Path::new(&rgb).exists(),
+                ir_available: caps.ir_pair && std::path::Path::new(&ir).exists(),
+                rgb,
+                ir,
+            }
+        },
+        || {
+            let (rgb, ir) = irlume_auth::configured_pair_no_probe().unwrap_or_default();
+            EngineDevices {
+                rgb_available: false,
+                ir_available: irlume_auth::configured_ir_target().is_ok(),
+                rgb,
+                ir,
+            }
+        },
+    )
+}
+
+fn permits_background_requalification(
+    policy: irlume_common::config::FaceSensorPolicyObservation,
+) -> bool {
+    matches!(
+        policy.resolve(),
+        Ok(irlume_common::config::FaceSensorPolicy::Dual)
+    )
+}
+
+fn sensor_preflight_with(
+    policy: irlume_common::config::FaceSensorPolicyObservation,
+    preflight: impl FnOnce() -> irlume_common::IrOnlyReadiness,
+) -> irlume_common::IrOnlyReadiness {
+    match policy.resolve() {
+        Ok(irlume_common::config::FaceSensorPolicy::IrOnlyExperimental) => preflight(),
+        Ok(irlume_common::config::FaceSensorPolicy::Dual) => {
+            irlume_common::IrOnlyReadiness::Unavailable
+        }
+        Err(_) => irlume_common::IrOnlyReadiness::InvalidPolicy,
+    }
+}
+
 struct EngineBuildConfig {
     det: String,
     model: String,
     adapter: String,
+    adapter_required: bool,
     mesh: String,
     blaze: String,
     vit_pad: String,
@@ -389,6 +460,7 @@ fn build_engine_from_config(
     load_shipped_recognizer(&config.det, &config.model, recognizer)
         .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
         .and_then(|engine| engine.with_ir_adapter(&config.adapter))
+        .map(|engine| engine.with_ir_adapter_required(config.adapter_required))
         // FaceMesh load failure disables rescue alignment but not head
         // consent, which uses detector landmarks. Outside strict mode the
         // daemon therefore stays available; strict mode retains the explicit
@@ -416,6 +488,25 @@ fn build_engine_from_config(
         .map(|engine| load_pad_models(engine, &config.vit_pad, &config.pad_ir))
 }
 
+fn rebuild_engine_from_config(
+    config: &EngineBuildConfig,
+) -> irlume_common::Result<(
+    irlume_auth::Engine,
+    irlume_common::PadModelStatus,
+    irlume_common::PadModelStatus,
+)> {
+    // Re-establish the same manifest policy as startup before rebuilding ONNX
+    // sessions. Carry the recognizer bytes we actually hashed into its loader.
+    let recognizer = verify_models(
+        &models_to_verify(
+            [&config.det, &config.model, &config.mesh, &config.blaze],
+            &config.adapter,
+        ),
+        Some(&config.model),
+    );
+    build_engine_from_config(config, recognizer.as_ref())
+}
+
 fn main() {
     // FIRST, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
@@ -428,6 +519,7 @@ fn main() {
     let det = env_or("IRLUME_DET_MODEL", "/etc/irlume/det.onnx");
     let model = env_or("IRLUME_MODEL", "/etc/irlume/face.onnx");
     let adapter = env_or("IRLUME_IR_ADAPTER", "/etc/irlume/ir_adapter.onnx");
+    let adapter_required = std::env::var_os("IRLUME_IR_ADAPTER").is_some();
     let mesh = env_or(
         "IRLUME_MESH_MODEL",
         "/etc/irlume/face_landmarks_detector.tflite",
@@ -518,13 +610,14 @@ fn main() {
             // discovered Hello camera (built-in or external Brio/NexiGo). No node-number
             // fallback: a camera-less or RGB-only machine has no pair, and the
             // convenience tier falls back to the first discoverable RGB node.
-            let caps = irlume_auth::capabilities();
-            let (rgb_dev, ir_dev) = irlume_auth::select_pair().unwrap_or_else(|| {
-                (irlume_auth::select_rgb().unwrap_or_default(), String::new())
-            });
-            if !ir_dev.is_empty() {
+            let startup_policy = irlume_common::config::observe_face_sensor_policy();
+            let devices = select_engine_devices(startup_policy);
+            let (rgb_dev, ir_dev) = (devices.rgb, devices.ir);
+            if !permits_background_requalification(startup_policy) {
+                eprintln!("irlumed: camera discovery disabled by sensor policy; IR readiness is checked on request");
+            } else if !ir_dev.is_empty() {
                 eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)");
-            } else if caps.rgb {
+            } else if devices.rgb_available {
                 eprintln!(
                     "irlumed: RGB-only camera, no IR pair (convenience tier: screen unlock only)"
                 );
@@ -563,13 +656,16 @@ fn main() {
             // the same measurement camera-tune runs, stored atomically,
             // and yields to any auth request via the camera lease. Cloned
             // because `build_engine` below moves the originals.
-            if !ir_dev.is_empty() {
+            if !ir_dev.is_empty() && permits_background_requalification(startup_policy) {
                 let rgb_for_requalify = rgb_dev.clone();
                 let ir_for_requalify = ir_dev.clone();
                 std::thread::Builder::new()
                     .name("irlume-requalify".into())
                     .spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(60));
+                        if !permits_background_requalification(irlume_common::config::observe_face_sensor_policy()) {
+                            return;
+                        }
                         match irlume_auth::stored_capture_qualification(
                             &rgb_for_requalify,
                             &ir_for_requalify,
@@ -630,13 +726,14 @@ fn main() {
             // worker thread, and it is Fn, so startup calls it before that move.
             //
             // `recognizer` is what startup already read, hashed and verified
-            // (#346); the worker's post-panic rebuild passes None and re-reads
-            // the path, which is why the closure takes it as an argument instead
-            // of capturing it and holding 260MB for the daemon's life.
+            // (#346); None requests a fresh manifest check for a post-panic
+            // rebuild. Verified bytes are released after each build instead of
+            // holding 260MB for the daemon's life.
             let engine_config = EngineBuildConfig {
                 det,
                 model,
                 adapter,
+                adapter_required,
                 mesh,
                 blaze,
                 vit_pad: vit_pad_path,
@@ -645,7 +742,10 @@ fn main() {
                 ir_dev,
             };
             let build_engine = move |recognizer: Option<&irlume_common::HashedModel>| {
-                build_engine_from_config(&engine_config, recognizer)
+                match recognizer {
+                    Some(recognizer) => build_engine_from_config(&engine_config, Some(recognizer)),
+                    None => rebuild_engine_from_config(&engine_config),
+                }
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
@@ -880,7 +980,8 @@ fn main() {
                                     // No bytes in hand here: the startup buffer
                                     // was released once the first session owned
                                     // its copy, so this rebuild re-reads the
-                                    // recognizer from disk (#346).
+                                    // recognizer from disk and repeats startup's
+                                    // manifest verification before loading (#346).
                                     //
                                     // Heartbeat around the rebuild: it re-reads
                                     // the 260MB recognizer and rebuilds five
@@ -909,10 +1010,10 @@ fn main() {
                                              with the existing engine"
                                         ),
                                     }
-                                    Response::Error("request failed".into())
+                                    Response::Error("request failed".into()).into()
                                 }
                             };
-                            scope.finish(categorical_outcome(&resp));
+                            scope.finish(categorical_outcome(&resp.response));
                             // The client may already be gone; its thread owns that.
                             let _ = reply.send(resp);
                             // Back to waiting for work: idle is healthy, and leaving the
@@ -1078,6 +1179,42 @@ fn recorded_face_response(
 ) -> Response {
     match record() {
         Ok(()) => complete(),
+        Err(reason) => refuse(reason),
+    }
+}
+
+/// Admit a prepared face response within its original request window.
+fn bounded_face_response(
+    granted: bool,
+    active: impl Fn() -> irlume_common::Result<()>,
+    prepare: impl FnOnce() -> Response,
+    record: impl FnOnce() -> Result<(), &'static str>,
+    refuse: fn(&str) -> Response,
+) -> Response {
+    if !granted {
+        return recorded_face_response(record, refuse, prepare);
+    }
+    if let Err(error) = active() {
+        return Response::Error(error.to_string());
+    }
+    let response = prepare();
+    if let Err(error) = active() {
+        return Response::Error(error.to_string());
+    }
+    // A failed TPM operation never publishes a credential or clears history.
+    // Prepared secret responses remain zeroizing owners on every refusal path.
+    if !matches!(
+        response,
+        Response::AuthResult { granted: true, .. } | Response::PasswordUnsealed { .. }
+    ) {
+        return response;
+    }
+    let recorded = record();
+    if let Err(error) = active() {
+        return Response::Error(error.to_string());
+    }
+    match recorded {
+        Ok(()) => response,
         Err(reason) => refuse(reason),
     }
 }
@@ -1335,13 +1472,82 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// answer. The reply travels back over a channel rather than being written by
 /// the worker, so a client that stops reading stalls its own connection thread
 /// instead of the one thread every login needs.
+struct FaceCompletion {
+    attempt: retry_throttle::FaceAttempt,
+    window: irlume_auth::AuthenticationWindow,
+}
+
+struct WorkerReply {
+    response: Response,
+    completion: Option<FaceCompletion>,
+}
+
+impl std::fmt::Debug for WorkerReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerReply")
+    }
+}
+
+impl From<Response> for WorkerReply {
+    fn from(response: Response) -> Self {
+        Self {
+            response,
+            completion: None,
+        }
+    }
+}
+
+fn is_face_grant(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::AuthResult { granted: true, .. } | Response::PasswordUnsealed { .. }
+    )
+}
+
+impl WorkerReply {
+    fn respond(self, stream: UnixStream) -> std::io::Result<()> {
+        let Some(completion) = self.completion.filter(|_| is_face_grant(&self.response)) else {
+            return respond(stream, &self.response);
+        };
+        let result = respond_admitted(stream, &self.response, |stream| {
+            let timeout = completion
+                .window
+                .remaining()
+                .unwrap_or(std::time::Duration::from_secs(15))
+                .min(std::time::Duration::from_secs(15));
+            if timeout.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "authentication window expired",
+                ));
+            }
+            stream.set_write_timeout(Some(timeout))?;
+            if peer_gone(stream) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "authentication client disconnected",
+                ));
+            }
+            // Last admission check, after serialization and before the first
+            // byte. A partial write cannot be retracted if expiry arrives later.
+            completion.window.check().map_err(std::io::Error::other)
+        });
+        if result.is_ok() && completion.attempt.delivered().is_err() {
+            // The admitted response cannot be retracted. Disk stays authoritative;
+            // retain conservative accounting and never send a second response.
+            eprintln!("irlumed: delivered face response; retry reset was not confirmed");
+        }
+        result
+    }
+}
+
 struct Queued {
     authorization: Option<operation_authorization::Grant>,
     session: Option<enrollment_session::Worker>,
     position: Option<position_session::Worker>,
     req: Request,
     peer: Peer,
-    reply: std::sync::mpsc::Sender<Response>,
+    reply: std::sync::mpsc::Sender<WorkerReply>,
     /// Lets the worker learn that this request's client has gone away.
     link: std::sync::Arc<ClientLink>,
     scope: diagnostics::OperationScope,
@@ -1359,46 +1565,55 @@ struct Queued {
 /// else's authentication.
 #[derive(Default)]
 struct ClientLink {
-    /// Set by the worker when this job starts and owns the camera.
-    running: std::sync::atomic::AtomicBool,
-    /// Set by the connection thread when its peer disconnects.
-    abandoned: std::sync::atomic::AtomicBool,
+    state: std::sync::Mutex<ClientState>,
+}
+
+#[derive(Default)]
+enum ClientState {
+    #[default]
+    Queued,
+    Running,
+    Abandoned,
+    Released,
 }
 
 impl ClientLink {
-    /// Worker side: take ownership of this job. `false` means the client already
-    /// left while the job sat in the queue, so the camera must never open for it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, ClientState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Worker side: take ownership only while the client is still waiting.
+    /// Claim and abandonment share one lock, so a disconnect cannot fall between
+    /// checking the client and marking the job as running.
     fn claim(&self) -> bool {
-        use std::sync::atomic::Ordering::{Acquire, Release};
-        if self.abandoned.load(Acquire) {
+        let mut state = self.lock();
+        if !matches!(*state, ClientState::Queued) {
             return false;
         }
-        self.running.store(true, Release);
+        *state = ClientState::Running;
         true
     }
 
-    /// Worker side: this job is done and no longer owns the camera. Keeps a late
-    /// disconnect on a finished job from cancelling whatever runs next.
+    /// Worker side: release this link before finishing the arbiter slot and
+    /// taking another job. No cancellation from this client can follow us past
+    /// this boundary into the next job's freshly reset shared token.
     fn released(&self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::Release);
+        *self.lock() = ClientState::Released;
     }
 
-    /// Connection side: the peer is gone. `true` means this job is RUNNING and the
-    /// capture should be cancelled; `false` means it is still queued and `claim`
-    /// will drop it, so nothing needs cancelling.
-    ///
-    /// Ordered abandoned-then-running against `claim`'s running-after-abandoned, so
-    /// the two cannot both decide to skip: whichever runs first, the job either
-    /// gets dropped by `claim` or cancelled here. The one interleaving that falls
-    /// through both (claim reads `abandoned` false, then this reads `running`
-    /// false, then claim stores `running`) lets the capture finish uncancelled,
-    /// which wastes the remaining budget but can never cancel a different job or
-    /// grant anything. Fail-safe by construction.
-    fn abandon(&self) -> bool {
-        use std::sync::atomic::Ordering::{Acquire, Release};
-        self.abandoned.store(true, Release);
-        self.running.load(Acquire)
+    /// Connection side: abandon this request and stop it if it owns the camera.
+    /// The stop signal MUST be written while holding the ownership lock. Returning
+    /// a decision for the caller to act on later lets the worker release this job
+    /// and start another before that caller writes the shared cancellation token.
+    /// The boolean is only for logging; cancellation is complete before return.
+    fn abandon(&self, stop: &arbiter::CancelToken) -> bool {
+        let mut state = self.lock();
+        let running = matches!(*state, ClientState::Running);
+        *state = ClientState::Abandoned;
+        if running {
+            stop.request_cancel();
+        }
+        running
     }
 }
 
@@ -1518,11 +1733,16 @@ mod worker_engine {
     /// attaching actually attaches.
     pub(super) trait StopSignalSink {
         fn accept_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+        fn accept_cancel_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
     }
 
     impl StopSignalSink for irlume_auth::Engine {
         fn accept_stop_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
             self.set_stop_signal(signal);
+        }
+
+        fn accept_cancel_signal(&mut self, signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) {
+            self.set_request_cancel_signal(signal);
         }
     }
 
@@ -1564,6 +1784,8 @@ mod worker_engine {
         /// observes the same signal the arbiter is already setting.
         pub(super) fn attach(mut engine: E, arbiter: &arbiter::Arbiter<Queued>) -> Self {
             engine.accept_stop_signal(stop_signal(arbiter.cancel_token()));
+            let cancel = arbiter.cancel_token();
+            engine.accept_cancel_signal(std::sync::Arc::new(move || cancel.cancel_requested()));
             Self(engine)
         }
     }
@@ -2068,7 +2290,10 @@ mod worker_engine {
         /// Stands in for an `Engine`, which a test cannot build without the
         /// model files.
         #[derive(Default)]
-        struct Sink(Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>);
+        struct Sink(
+            Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+            Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+        );
 
         impl StopSignalSink for Sink {
             fn accept_stop_signal(
@@ -2076,6 +2301,13 @@ mod worker_engine {
                 signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
             ) {
                 self.0 = Some(signal);
+            }
+
+            fn accept_cancel_signal(
+                &mut self,
+                signal: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+            ) {
+                self.1 = Some(signal);
             }
         }
 
@@ -2113,6 +2345,22 @@ mod worker_engine {
             assert!(
                 signal(),
                 "a requested stop must be visible through the signal"
+            );
+            let cancelled = engine.0 .1.as_ref().expect("request cancellation signal");
+            assert!(
+                !cancelled(),
+                "queued authentication must not cancel running auth"
+            );
+            arb.cancel_token().reset();
+            arb.cancel_token().request_cancel();
+            assert!(
+                signal() && cancelled(),
+                "disconnect must stop both work classes"
+            );
+            arb.cancel_token().reset();
+            assert!(
+                !signal() && !cancelled(),
+                "the next job starts with neither signal"
             );
             super::super::note_worker_idle();
         }
@@ -2490,6 +2738,13 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             have_password,
         } => unseal_keyring(&user, service.as_deref(), have_password, peer),
         Request::Ping => Response::Ok("starting".into()),
+        Request::PreferencesStatus => {
+            Response::PreferencesStatus(irlume_common::PreferencesState::observe())
+        }
+        Request::FaceSensorStatus { user } => Response::FaceSensorStatus {
+            policy: irlume_common::config::observe_face_sensor_policy(),
+            ir_readiness: user.map(|_| irlume_common::IrOnlyReadiness::Unavailable),
+        },
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
         ),
@@ -2536,11 +2791,15 @@ fn serve_peer(
                 }
                 return serve_trace(stream, diagnostic_state, peer.uid, *duration_ms);
             }
-            // The recent-event ring exists before model/camera startup and is
-            // intentionally independent of engine readiness. Keep this one
-            // status request useful during startup instead of replacing its
-            // evidence with the generic "still starting" response.
-            if matches!(req, Request::SupportSnapshot { .. }) {
+            // The recent-event ring and saved sensor policy exist independently
+            // of model/camera readiness. Keep those observations available during
+            // startup instead of replacing them with a generic starting reply.
+            if matches!(
+                req,
+                Request::SupportSnapshot { .. }
+                    | Request::FaceSensorStatus { .. }
+                    | Request::PreferencesStatus
+            ) {
                 if let Some(resp) = pregate(&req, &peer) {
                     return respond(stream, &resp);
                 }
@@ -2549,6 +2808,16 @@ fn serve_peer(
                 {
                     return respond(stream, &resp);
                 }
+            }
+            if matches!(
+                req,
+                Request::RetryStatus { .. } | Request::RetryReset { .. }
+            ) {
+                if let Some(response) = pregate(&req, &peer) {
+                    return respond(stream, &response);
+                }
+                let response = retry_recovery::dispatch(&req, &peer, &stream);
+                return respond(stream, &response);
             }
             // No engine yet means no worker to queue for.
             if !engine_ready.load(std::sync::atomic::Ordering::Acquire) {
@@ -2629,17 +2898,13 @@ fn serve_peer(
             let resp = loop {
                 if let Some(connection) = &mut session_connection {
                     if let Err(error) = connection.pump(&stream) {
-                        if link.abandon() {
-                            arbiter.cancel_token().request_stop();
-                        }
+                        link.abandon(&arbiter.cancel_token());
                         return Err(error);
                     }
                 }
                 if let Some(connection) = &mut position_connection {
                     if let Err(error) = connection.pump(&stream) {
-                        if link.abandon() {
-                            arbiter.cancel_token().request_stop();
-                        }
+                        link.abandon(&arbiter.cancel_token());
                         return Err(error);
                     }
                 }
@@ -2655,20 +2920,17 @@ fn serve_peer(
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if std::time::Instant::now() >= deadline {
-                            if (session_connection.is_some() || position_connection.is_some())
-                                && link.abandon()
-                            {
-                                arbiter.cancel_token().request_stop();
+                            if session_connection.is_some() || position_connection.is_some() {
+                                link.abandon(&arbiter.cancel_token());
                             }
-                            break Response::Error("request did not complete".into());
+                            break Response::Error("request did not complete".into()).into();
                         }
                         if peer_gone(&stream) {
                             // Cancel ONLY if this connection's own job holds the
                             // camera; a job still queued is dropped by `claim`
                             // instead, so another user's authentication is never
                             // cancelled by someone else hanging up.
-                            if link.abandon() {
-                                arbiter.cancel_token().request_stop();
+                            if link.abandon(&arbiter.cancel_token()) {
                                 irlume_common::dlog!(
                                     "client disconnected mid-request; asked the capture to stop"
                                 );
@@ -2681,11 +2943,11 @@ fn serve_peer(
                     // came). This request has no answer, and a client that gets an
                     // error falls back to the password.
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        break Response::Error("request did not complete".into())
+                        break Response::Error("request did not complete".into()).into()
                     }
                 }
             };
-            respond(stream, &resp)
+            resp.respond(stream)
         }
     }
 }
@@ -2922,6 +3184,13 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: Reads,
         },
+        RetryReset { user, .. } | RetryStatus { user } => RequestPosture {
+            user: Some(user),
+            privilege: RootOrTarget {
+                verb: "manage retry state for",
+            },
+            enrollment: Reads,
+        },
         HasSealedPassword { user } | KeyringInfo { user } | RecoveryStatus { user } => {
             RequestPosture {
                 privilege: RootOrTarget { verb: "query" },
@@ -3040,7 +3309,17 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: user.as_deref(),
             enrollment: Reads,
         },
+        FaceSensorStatus { user } => RequestPosture {
+            privilege: if user.is_some() {
+                RootOrTarget { verb: "query" }
+            } else {
+                AnyPeer
+            },
+            user: user.as_deref(),
+            enrollment: Reads,
+        },
         Ping
+        | PreferencesStatus
         | Health
         | Identify
         | ListCameras
@@ -3089,16 +3368,11 @@ fn publish_engine_bits(
     rgb_pad: irlume_common::PadModelStatus,
     ir_pad: irlume_common::PadModelStatus,
 ) {
-    // One probe, at load, on the thread that owns the engine. Every later
-    // Health answer reads this copy.
-    let caps = irlume_auth::capabilities();
-    // The Hello pair when one was selected. On a camera-less or RGB-only
-    // machine there is no pair, so the convenience tier falls back to the
-    // first discoverable RGB node (never a guessed `/dev/videoN`).
-    let (rgb, ir) = irlume_auth::select_pair()
-        .unwrap_or_else(|| (irlume_auth::select_rgb().unwrap_or_default(), String::new()));
-    let rgb_dev = (caps.rgb && std::path::Path::new(&rgb).exists()).then_some(rgb);
-    let ir_dev = (caps.ir_pair && std::path::Path::new(&ir).exists()).then_some(ir);
+    // Dual retains its discovery path. Experimental IR uses configured sysfs
+    // evidence only; status publication must not cause an RGB camera open.
+    let devices = select_engine_devices(irlume_common::config::observe_face_sensor_policy());
+    let rgb_dev = devices.rgb_available.then_some(devices.rgb);
+    let ir_dev = devices.ir_available.then_some(devices.ir);
     let tier = if ir_dev.is_some() {
         "secure"
     } else if rgb_dev.is_some() {
@@ -3502,6 +3776,14 @@ fn dispatch_status_with_diagnostics(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     Some(match req {
+        Request::PreferencesStatus => {
+            Response::PreferencesStatus(irlume_common::PreferencesState::observe())
+        }
+        Request::FaceSensorStatus { user: Some(_) } => return None,
+        Request::FaceSensorStatus { user: None } => Response::FaceSensorStatus {
+            policy: irlume_common::config::observe_face_sensor_policy(),
+            ir_readiness: None,
+        },
         Request::Ping => Response::Pong,
         Request::Health => {
             // MEMORY ONLY. The camera facts were probed once when the engine
@@ -4062,6 +4344,8 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | ListCameras
         | CameraDiagnostics => OperationClass::CameraDiagnostics,
         SetCameras { .. }
+        | FaceSensorStatus { .. }
+        | PreferencesStatus
         | ListProfiles { .. }
         | DeleteProfile { .. }
         | DeleteScan { .. }
@@ -4084,7 +4368,9 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | RecoverySetup { .. }
         | RecoveryRestore { .. }
         | RecoveryStatus { .. }
-        | RecoveryForget { .. } => OperationClass::Status,
+        | RecoveryForget { .. }
+        | RetryStatus { .. }
+        | RetryReset { .. } => OperationClass::Status,
     }
 }
 
@@ -4111,6 +4397,17 @@ fn categorical_outcome(response: &Response) -> irlume_common::diagnostics::Categ
     }
 }
 
+// Camera paths are persisted in a line-based configuration. Validate syntax
+// before changing the live engine so malformed input cannot inject another
+// setting or select a different path after restart. Empty selections retain
+// their existing meaning; device eligibility belongs to the capture layer.
+fn camera_path_is_serializable(path: &str) -> bool {
+    path.is_empty()
+        || (std::path::Path::new(path).is_absolute()
+            && path.trim() == path
+            && !path.chars().any(char::is_control))
+}
+
 #[cfg(test)]
 fn dispatch(req: Request, peer: &Peer, engine: &mut irlume_auth::Engine) -> Response {
     let state = diagnostics::DiagnosticState::default();
@@ -4128,7 +4425,9 @@ fn dispatch_scoped(
     scope: &diagnostics::OperationScope,
     authorization: Option<operation_authorization::Grant>,
 ) -> Response {
-    dispatch_scoped_session(req, peer, engine, scope, authorization, None, None)
+    // Returning a value is not delivery. An unacknowledged token is dropped
+    // conservatively; reset tests exercise the production socket responder.
+    dispatch_scoped_session(req, peer, engine, scope, authorization, None, None).response
 }
 
 fn dispatch_scoped_session(
@@ -4139,6 +4438,37 @@ fn dispatch_scoped_session(
     authorization: Option<operation_authorization::Grant>,
     session: Option<&enrollment_session::Worker>,
     position: Option<&position_session::Worker>,
+) -> WorkerReply {
+    let mut completion = None;
+    let response = dispatch_scoped_session_inner(
+        req,
+        peer,
+        engine,
+        scope,
+        authorization,
+        session,
+        position,
+        &mut completion,
+    );
+    if !is_face_grant(&response) {
+        completion = None;
+    }
+    WorkerReply {
+        response,
+        completion,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_scoped_session_inner(
+    req: Request,
+    peer: &Peer,
+    engine: &mut irlume_auth::Engine,
+    scope: &diagnostics::OperationScope,
+    authorization: Option<operation_authorization::Grant>,
+    session: Option<&enrollment_session::Worker>,
+    position: Option<&position_session::Worker>,
+    completion: &mut Option<FaceCompletion>,
 ) -> Response {
     // Status requests are normally answered on the connection thread and
     // never reach here; delegating keeps this dispatch total (and identical
@@ -4223,6 +4553,9 @@ fn dispatch_scoped_session(
         invalidate_enrollment_summary(user);
     }
     match req {
+        Request::RetryStatus { .. } | Request::RetryReset { .. } => {
+            Response::Error("retry recovery requires its live connection".into())
+        }
         Request::EnrollmentSession { .. } => {
             Response::Error("guided enrollment requires its live connection".into())
         }
@@ -4231,6 +4564,8 @@ fn dispatch_scoped_session(
         // second implementation to drift.
         Request::Ping
         | Request::Health
+        | Request::FaceSensorStatus { user: None }
+        | Request::PreferencesStatus
         | Request::HasSealedPassword { .. }
         | Request::RecoveryStatus { .. }
         | Request::SupportSnapshot { .. }
@@ -4247,6 +4582,14 @@ fn dispatch_scoped_session(
                 retryable: false,
             },
         },
+        Request::FaceSensorStatus { user: Some(user) } => {
+            let policy = irlume_common::config::observe_face_sensor_policy();
+            let readiness = sensor_preflight_with(policy, || engine.ir_only_preflight(&user));
+            Response::FaceSensorStatus {
+                policy,
+                ir_readiness: Some(readiness),
+            }
+        }
         Request::KeyringInfo { user } => {
             let armed = irlume_core::keyring::has_sealed_password(&user);
             let path = irlume_core::keyring::envelope_path(&user);
@@ -4361,11 +4704,17 @@ fn dispatch_scoped_session(
                     situation: String::new(),
                 };
             }
+            let sensor_policy = match irlume_common::config::observe_face_sensor_policy().resolve()
+            {
+                Ok(policy) => policy,
+                Err(error) => return retry_verify_refusal(&error.to_string()),
+            };
+            let tier = face_tier(sensor_policy, engine.tier());
             // Smart-Auto tier gate: on a CONVENIENCE (RGB-only) device, a face
             // match may ONLY satisfy a screen unlock; never login, elevation, or
             // a remote/unknown service (those keep the password). Always-on for
             // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
-            if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
+            if tier == irlume_core::biopolicy::Tier::Convenience {
                 use irlume_core::biopolicy::{classify, OperationClass, SessionState};
                 // Warm = the user already has a running session (their systemd
                 // runtime dir exists); then an ambiguous greeter service (GDM
@@ -4410,7 +4759,7 @@ fn dispatch_scoped_session(
             // hardware (mirrors the credential-release gate); else a face grant
             // for a Remote/Unknown service would bypass the "face never satisfies
             // remote" invariant. Off by default (behaviour unchanged).
-            if biopolicy_enforced() && engine.tier() != irlume_core::biopolicy::Tier::Convenience {
+            if biopolicy_enforced() && tier != irlume_core::biopolicy::Tier::Convenience {
                 use irlume_core::biopolicy::{classify, decide, Action, SessionState, Tier};
                 let svc = service.as_deref().unwrap_or("");
                 if decide(classify(svc, SessionState::Cold), Tier::Secure) == Action::Deny {
@@ -4429,16 +4778,24 @@ fn dispatch_scoped_session(
                     };
                 }
             }
-            // Too many recent failures: don't fire the camera, fall to password.
-            if let Err(reason) = retry_throttle::check(&user) {
-                return retry_verify_refusal(reason);
-            }
-            let convenience = engine.tier() == irlume_core::biopolicy::Tier::Convenience;
+            let window = irlume_auth::AuthenticationWindow::for_service(service.as_deref());
+            let retry_attempt = match retry_throttle::FaceAttempt::for_user(&user) {
+                Ok(attempt) => attempt,
+                Err(reason) => return retry_verify_refusal(reason),
+            };
+            let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            match engine.authenticate_with_diagnostics(&user, service.as_deref(), scope) {
-                Ok(o) => recorded_face_response(
-                    || retry_throttle::record(&user, &o),
-                    retry_verify_refusal,
+            match engine.authenticate_for_in_window_with_policy(
+                &user,
+                service.as_deref(),
+                irlume_auth::AuthenticationPurpose::for_service(service.as_deref()),
+                window,
+                sensor_policy,
+                scope,
+            ) {
+                Ok(o) => bounded_face_response(
+                    o.granted,
+                    || engine.check_authentication_completion(window),
                     || {
                         if convenience || irlume_common::dbglog::on() {
                             // Denied score + reason measurements quantized/redacted
@@ -4478,6 +4835,18 @@ fn dispatch_scoped_session(
                             reason: o.reason.clone(),
                         }
                     },
+                    || {
+                        if o.granted {
+                            *completion = Some(FaceCompletion {
+                                attempt: retry_attempt,
+                                window,
+                            });
+                            Ok(())
+                        } else {
+                            retry_attempt.denied(&o)
+                        }
+                    },
+                    retry_verify_refusal,
                 ),
                 Err(e) => authentication_error(e, structured_errors),
             }
@@ -4518,6 +4887,12 @@ fn dispatch_scoped_session(
             // camera the daemon trusts, and an attacker who could set it to a
             // v4l2loopback node feeds recorded video into the match path
             // (spoof) or bricks face auth (DoS).
+            if !camera_path_is_serializable(&rgb) || !camera_path_is_serializable(&ir) {
+                return Response::Error(
+                    "camera paths must be empty or absolute, without control characters or surrounding whitespace"
+                        .into(),
+                );
+            }
             engine.set_devices(&rgb, &ir);
             let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
             // Record each node's stable device identity (vid:pid:serial) next to
@@ -4713,6 +5088,8 @@ fn dispatch_scoped_session(
             user,
             password,
             kind,
+            wallet_salt,
+            wallet_salt_checked,
         } => {
             // Arming the keyring: root or the user themselves (posture table).
             // `password` zeroizes on drop, covering every return path.
@@ -4720,6 +5097,22 @@ fn dispatch_scoped_session(
             // Refuse to seal a password that is not the user's LOGIN password:
             // it would seal cleanly but fail later at wallet key-derive ("-9").
             // Only a POSITIVE mismatch blocks; an unverifiable hash proceeds.
+            if !wallet_salt_checked {
+                return Response::Error(
+                    "the client did not perform the required account-scoped wallet lookup; upgrade the irlume client and retry"
+                        .into(),
+                );
+            }
+            if let Some(forced) = kind {
+                if (forced == irlume_common::KeyringSecretKind::KdeWalletKey)
+                    != wallet_salt.is_some()
+                {
+                    return Response::Error(
+                        "a forced KDE wallet-key arm requires an account-scoped wallet salt, and other forced kinds forbid one"
+                            .into(),
+                    );
+                }
+            }
             if password_matches_login(&user, password.expose()) == Some(false) {
                 return Response::Error(format!(
                     "that is not '{user}'s current login password; the keyring is unlocked with \
@@ -4735,10 +5128,14 @@ fn dispatch_scoped_session(
             // did not force one, so a KDE-only machine gets the wallet key
             // without the client needing to know to ask.
             let home = crate::users::home_for_name(&user);
-            let core_kind = match kind {
+            let forced_kind = kind;
+            let core_kind = match forced_kind {
                 Some(k) => crate::users::wire_to_core_kind(k),
                 None => match home.as_deref() {
-                    Some(h) => irlume_core::kwallet::detect_kind(h),
+                    Some(h) => irlume_core::kwallet::detect_kind(h, wallet_salt.is_some()),
+                    None if wallet_salt.is_some() => {
+                        irlume_core::envelope::SecretKind::KdeWalletKey
+                    }
                     None => irlume_core::envelope::SecretKind::LoginPassword,
                 },
             };
@@ -4805,7 +5202,7 @@ fn dispatch_scoped_session(
                     irlume_core::keyring::derive_secret(
                         core_kind,
                         password.expose(),
-                        home.as_deref(),
+                        wallet_salt.as_ref().map(irlume_common::WalletSalt::expose),
                     )
                 }
             };
@@ -4837,6 +5234,12 @@ fn dispatch_scoped_session(
                     "face auth disabled: the configured method is fingerprint".into(),
                 );
             }
+            let sensor_policy = match irlume_common::config::observe_face_sensor_policy().resolve()
+            {
+                Ok(policy) => policy,
+                Err(error) => return Response::Error(error.to_string()),
+            };
+            let tier = face_tier(sensor_policy, engine.tier());
             // ALWAYS-ON: a polkit prompt never releases the sealed credential,
             // independent of the tier and the opt-in biopolicy below. The
             // A polkit agent can start PAM before conventional confirmation, so
@@ -4858,7 +5261,7 @@ fn dispatch_scoped_session(
             }
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
-            if engine.tier() == irlume_core::biopolicy::Tier::Convenience {
+            if tier == irlume_core::biopolicy::Tier::Convenience {
                 eprintln!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
                 return Response::UnsealUnavailable {
                     reason: "RGB-only convenience: face cannot release the login credential".into(),
@@ -4891,7 +5294,14 @@ fn dispatch_scoped_session(
                     ));
                 }
             }
-            do_unseal_password_scoped(&user, service.as_deref(), engine, scope)
+            do_unseal_password_scoped(
+                &user,
+                service.as_deref(),
+                engine,
+                scope,
+                completion,
+                sensor_policy,
+            )
         }
         Request::UnsealKeyring {
             user,
@@ -4921,18 +5331,32 @@ fn dispatch_scoped_session(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::ResealPassword { user, password } => {
+        Request::ResealPassword {
+            user,
+            password,
+            wallet_salt,
+            wallet_salt_checked,
+        } => {
             // Self-heal hook from the login SESSION phase (runs only after auth
             // succeeded, so `password` is verified-correct). Same authz as arming
             // (root or the user), but it can only ever *re-seal an already armed*
             // password against today's PCRs; it never arms a fresh user, so a
             // self-peer cannot use it to plant a sealed password they didn't set.
             //
-            // The home directory is where the KDE wallet salt lives; a
-            // login-password envelope ignores it, so an unresolvable home is
-            // only fatal for the wallet kind and reseal decides that itself.
-            let home = crate::users::home_for_name(&user);
-            match irlume_core::keyring::reseal_password(&user, password.expose(), home.as_deref()) {
+            // A KDE envelope can be re-derived only from the account-scoped
+            // salt supplied by this authenticated caller. Other envelope kinds
+            // ignore it; the daemon never opens the wallet path.
+            if !wallet_salt_checked {
+                return Response::Error(
+                    "the PAM client did not perform the required account-scoped wallet lookup; upgrade irlume before resealing"
+                        .into(),
+                );
+            }
+            match irlume_core::keyring::reseal_password(
+                &user,
+                password.expose(),
+                wallet_salt.as_ref().map(irlume_common::WalletSalt::expose),
+            ) {
                 Ok(outcome) => {
                     use irlume_core::keyring::Reseal;
                     if outcome == Reseal::Resealed {
@@ -5405,6 +5829,20 @@ fn deny_reason(r: &str) -> String {
     out
 }
 
+fn face_tier(
+    policy: irlume_common::config::FaceSensorPolicy,
+    detected: irlume_core::biopolicy::Tier,
+) -> irlume_core::biopolicy::Tier {
+    match policy {
+        irlume_common::config::FaceSensorPolicy::Dual => detected,
+        // Missing prerequisites still refuse in the IR pipeline. Selection
+        // must never route to convenience RGB when an IR target is absent.
+        irlume_common::config::FaceSensorPolicy::IrOnlyExperimental => {
+            irlume_core::biopolicy::Tier::Secure
+        }
+    }
+}
+
 /// Keep credential release distinct from session verification.
 fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
     irlume_auth::AuthenticationPurpose::CredentialRelease
@@ -5424,7 +5862,11 @@ fn do_unseal_password(
 ) -> Response {
     let state = diagnostics::DiagnosticState::default();
     let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
-    do_unseal_password_scoped(user, service, engine, &scope)
+    let policy = match irlume_common::config::observe_face_sensor_policy().resolve() {
+        Ok(policy) => policy,
+        Err(error) => return Response::Error(error.to_string()),
+    };
+    do_unseal_password_scoped(user, service, engine, &scope, &mut None, policy)
 }
 
 fn do_unseal_password_scoped(
@@ -5432,6 +5874,8 @@ fn do_unseal_password_scoped(
     service: Option<&str>,
     engine: &mut irlume_auth::Engine,
     diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    completion: &mut Option<FaceCompletion>,
+    sensor_policy: irlume_common::config::FaceSensorPolicy,
 ) -> Response {
     eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
@@ -5440,15 +5884,17 @@ fn do_unseal_password_scoped(
             reason: format!("no sealed password for '{user}': run `irlume keyring arm`"),
         };
     }
-    // Same failure throttle as the login/sudo path: after a run of failures,
-    // skip the camera and let PAM fall to the password.
-    if let Err(reason) = retry_throttle::check(user) {
-        return retry_unseal_refusal(reason);
-    }
-    let outcome = match engine.authenticate_for_with_diagnostics(
+    let window = irlume_auth::AuthenticationWindow::for_service(service);
+    let retry_attempt = match retry_throttle::FaceAttempt::for_user(user) {
+        Ok(attempt) => attempt,
+        Err(reason) => return retry_unseal_refusal(reason),
+    };
+    let outcome = match engine.authenticate_for_in_window_with_policy(
         user,
         service,
         credential_release_purpose(),
+        window,
+        sensor_policy,
         diagnostics,
     ) {
         Ok(o) => o,
@@ -5467,10 +5913,22 @@ fn do_unseal_password_scoped(
             return Response::Error(e.to_string());
         }
     };
-    recorded_face_response(
-        || retry_throttle::record(user, &outcome),
-        retry_unseal_refusal,
+    bounded_face_response(
+        outcome.granted,
+        || engine.check_authentication_completion(window),
         || finish_unseal_password(user, &outcome, t),
+        || {
+            if outcome.granted {
+                *completion = Some(FaceCompletion {
+                    attempt: retry_attempt,
+                    window,
+                });
+                Ok(())
+            } else {
+                retry_attempt.denied(&outcome)
+            }
+        },
+        retry_unseal_refusal,
     )
 }
 
@@ -5538,15 +5996,20 @@ fn is_pcr_drift(e: &irlume_common::Error) -> bool {
     irlume_core::tpm::is_pcr_mismatch(e)
 }
 
-fn respond(mut stream: UnixStream, resp: &Response) -> std::io::Result<()> {
-    let mut json = serde_json::to_vec(resp)?;
+fn respond(stream: UnixStream, resp: &Response) -> std::io::Result<()> {
+    respond_admitted(stream, resp, |_| Ok(()))
+}
+
+fn respond_admitted(
+    mut stream: UnixStream,
+    resp: &Response,
+    admit: impl FnOnce(&UnixStream) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut json = zeroize::Zeroizing::new(serde_json::to_vec(resp)?);
     json.push(b'\n');
+    admit(&stream)?;
     stream.write_all(&json)?;
-    let r = stream.flush();
-    // The response may carry an unsealed secret (PasswordUnsealed); wipe the
-    // serialized line, same hygiene as the request path and the client side.
-    json.zeroize();
-    r
+    stream.flush()
 }
 
 /// Mode for the control socket. Every local uid may connect; `SO_PEERCRED`
@@ -5587,6 +6050,51 @@ fn journal_safe(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_budget_finalization_refuses_late_engine_tpm_and_persistence() {
+        use std::cell::Cell;
+        for stop_at in [0, 1, 2, 3] {
+            let stage = Cell::new(0);
+            let records = Cell::new(0);
+            let preparations = Cell::new(0);
+            let response = bounded_face_response(
+                true,
+                || {
+                    if stage.get() == stop_at {
+                        Err(irlume_common::Error::DeadlineExpired)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    preparations.set(preparations.get() + 1);
+                    stage.set(1);
+                    Response::PasswordUnsealed {
+                        kind: irlume_common::KeyringSecretKind::LoginPassword,
+                        secret: irlume_common::SecretBytes::new(b"synthetic-secret".to_vec()),
+                    }
+                },
+                || {
+                    records.set(records.get() + 1);
+                    stage.set(2);
+                    Ok(())
+                },
+                retry_unseal_refusal,
+            );
+            assert_eq!(
+                matches!(response, Response::PasswordUnsealed { .. }),
+                stop_at == 3,
+                "late success at stage {stop_at} must not escape"
+            );
+            assert_eq!(preparations.get(), usize::from(stop_at != 0));
+            assert_eq!(
+                records.get(),
+                usize::from(stop_at >= 2),
+                "late engine/TPM results must not clear history"
+            );
+        }
+    }
 
     /// The #340 trigger rule: enrollment probes exactly the unmeasured pair.
     /// A stored verdict of either value suppresses the probe entirely, which
@@ -5982,6 +6490,52 @@ mod tests {
     }
 
     #[test]
+    fn panic_rebuild_rechecks_missing_and_tampered_models_before_loading() {
+        const CHILD: &str = "IRLUME_TEST_REBUILD_MODEL_CHILD";
+        if let Ok(path) = std::env::var(CHILD) {
+            let config = EngineBuildConfig {
+                det: path.clone(),
+                model: path.clone(),
+                adapter: format!("{path}.absent-adapter"),
+                adapter_required: false,
+                mesh: path.clone(),
+                blaze: path.clone(),
+                vit_pad: path.clone(),
+                pad_ir: path,
+                rgb_dev: "/dev/irlume-test-none-rgb".into(),
+                ir_dev: "/dev/irlume-test-none-ir".into(),
+            };
+            let _ = rebuild_engine_from_config(&config);
+            panic!("strict rebuild must reject before the model loader returns");
+        }
+        let dir = std::env::temp_dir().join(format!("irlume-rebuild-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tampered = dir.join("tampered.onnx");
+        std::fs::write(&tampered, b"unmanifested model bytes").unwrap();
+        for (path, expected) in [
+            (dir.join("missing.onnx"), "cannot read model"),
+            (tampered, "refusing to start with unverified models"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "tests::panic_rebuild_rechecks_missing_and_tampered_models_before_loading",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, path)
+                .env("IRLUME_MODELS_STRICT", "1")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(expected), "unexpected refusal: {stderr}");
+            assert!(!stderr.contains("strict rebuild must reject"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn strict_verification_rejects_damaged_pad_without_exiting() {
         let dir =
             std::env::temp_dir().join(format!("irlume-daemon-bad-pad-{}", std::process::id()));
@@ -6017,6 +6571,7 @@ mod tests {
                 .join("absent-adapter.onnx")
                 .to_string_lossy()
                 .into_owned(),
+            adapter_required: false,
             mesh: dir.join("absent-mesh.onnx").to_string_lossy().into_owned(),
             blaze: dir.join("absent-blaze.onnx").to_string_lossy().into_owned(),
             vit_pad: damaged_pad.to_string_lossy().into_owned(),
@@ -6534,7 +7089,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 8] = [
+        let sources: [(&str, &str); 10] = [
             ("main.rs", include_str!("main.rs")),
             ("users.rs", include_str!("users.rs")),
             (
@@ -6543,6 +7098,22 @@ mod tests {
                     include_str!("retry_throttle.rs"),
                     "\n",
                     include_str!("retry_throttle/tests.rs")
+                ),
+            ),
+            (
+                "recovery.rs",
+                concat!(
+                    include_str!("retry_throttle/recovery.rs"),
+                    "\n",
+                    include_str!("retry_throttle/recovery/tests.rs")
+                ),
+            ),
+            (
+                "retry_recovery.rs",
+                concat!(
+                    include_str!("retry_recovery.rs"),
+                    "\n",
+                    include_str!("retry_recovery/tests.rs")
                 ),
             ),
             ("arbiter.rs", include_str!("arbiter.rs")),
@@ -6565,8 +7136,11 @@ mod tests {
             "pregate(",
             "authorized_for(",
             "uid_of(",
-            "retry_throttle::check(",
+            "FaceAttempt::for_user(",
+            "Recovery::for_user(",
+            "dispatch_using(",
             "retry_throttle::record(",
+            "retry_throttle::record_if(",
             "account(",
             "uid_for_name(",
             "name_for_uid(",
@@ -6976,6 +7550,8 @@ mod tests {
         SetupIrEmitter => Request::SetupIrEmitter { dry_run: false },
         TuneCaptureMode => Request::TuneCaptureMode { rounds: None },
         CaptureModeStatus => Request::CaptureModeStatus,
+        FaceSensorStatus => Request::FaceSensorStatus { user: Some(u()) },
+        PreferencesStatus => Request::PreferencesStatus,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
         },
@@ -6993,6 +7569,8 @@ mod tests {
             user: u(),
             password: secret(),
             kind: None,
+            wallet_salt: None,
+            wallet_salt_checked: false,
         },
         UnsealPassword => Request::UnsealPassword {
             user: u(),
@@ -7013,6 +7591,8 @@ mod tests {
         ResealPassword => Request::ResealPassword {
             user: u(),
             password: secret(),
+            wallet_salt: None,
+            wallet_salt_checked: false,
         },
         RecoverySetup => Request::RecoverySetup {
             user: u(),
@@ -7024,6 +7604,8 @@ mod tests {
         },
         RecoveryStatus => Request::RecoveryStatus { user: u() },
         RecoveryForget => Request::RecoveryForget { user: u() },
+        RetryStatus => Request::RetryStatus { user: u() },
+        RetryReset => Request::RetryReset { user: u(), password: secret() },
     }
 
     /// Second shapes of variants the catalog already covers, where the posture
@@ -7035,6 +7617,7 @@ mod tests {
         vec![
             // No user to screen, and no band to tune to an account.
             Request::PositionSample { user: None },
+            Request::FaceSensorStatus { user: None },
             // The reading form, which any peer may send.
             Request::SetupIrEmitter { dry_run: true },
         ]
@@ -7506,7 +8089,7 @@ mod tests {
                         },
                         _ => Response::Pong,
                     };
-                    let _ = reply.send(resp);
+                    let _ = reply.send(resp.into());
                 }
             })
         };
@@ -7561,7 +8144,7 @@ mod tests {
             let arbiter = std::sync::Arc::clone(&arbiter);
             std::thread::spawn(move || {
                 while let Some(job) = arbiter.take() {
-                    let _ = job.payload.reply.send(Response::Ok("queued".into()));
+                    let _ = job.payload.reply.send(Response::Ok("queued".into()).into());
                     arbiter.finish(job.class, job.uid);
                 }
             })
@@ -7653,7 +8236,7 @@ mod tests {
                 while let Some(job) = arbiter.take() {
                     let Queued { reply, .. } = job.payload;
                     arbiter.finish(job.class, job.uid);
-                    let _ = reply.send(Response::Pong);
+                    let _ = reply.send(Response::Pong.into());
                 }
             })
         };
@@ -7899,7 +8482,7 @@ mod tests {
                 scope.finish(categorical_outcome(&response));
                 link.released();
                 authorized.finish(job.class, job.uid);
-                reply.send(response).unwrap();
+                reply.send(response.into()).unwrap();
             })
         };
         let request = Request::Authenticate {
@@ -8029,7 +8612,7 @@ mod tests {
                     scope.finish(categorical_outcome(&response));
                     link.released();
                     authorized.finish(job.class, job.uid);
-                    reply.send(response).unwrap();
+                    reply.send(response.into()).unwrap();
                 }
             })
         };
@@ -8099,6 +8682,7 @@ mod tests {
 
     #[test]
     fn a_departing_client_cancels_only_its_own_running_job() {
+        let stop = arbiter::CancelToken::new();
         // The cancellation token is shared by every job, so "the client left" may
         // only stop the capture when THIS connection's job is the one holding the
         // camera. Both orderings are pinned because the wrong one cancels a
@@ -8107,7 +8691,7 @@ mod tests {
         // Queued, then abandoned: nothing to cancel, and the worker must drop it.
         let queued = ClientLink::default();
         assert!(
-            !queued.abandon(),
+            !queued.abandon(&stop),
             "a job that never started must not cancel the running capture"
         );
         assert!(
@@ -8115,13 +8699,19 @@ mod tests {
             "the worker must skip a job whose client already left"
         );
 
+        assert!(!stop.stop_requested());
+
         // Running, then abandoned: this IS the camera holder, so cancel it.
         let running = ClientLink::default();
         assert!(running.claim(), "a fresh job is claimable");
         assert!(
-            running.abandon(),
+            running.abandon(&stop),
             "a running job's client leaving must cancel the capture"
         );
+
+        assert!(stop.stop_requested());
+        running.released();
+        stop.reset();
 
         // Finished, then a late disconnect: the job no longer owns the camera, so it
         // must not cancel whatever the worker started next.
@@ -8129,9 +8719,143 @@ mod tests {
         assert!(finished.claim());
         finished.released();
         assert!(
-            !finished.abandon(),
+            !finished.abandon(&stop),
             "a finished job must not cancel the job that followed it"
         );
+        assert!(!stop.stop_requested());
+    }
+
+    #[test]
+    fn cancellation_is_complete_before_the_connection_releases_ownership() {
+        let arbiter = arbiter::Arbiter::<()>::new();
+        let stop = arbiter.cancel_token();
+        let link = ClientLink::default();
+        arbiter.submit(arbiter::Class::Auth, 0, ()).unwrap();
+        let first = arbiter.take().unwrap();
+        assert!(link.claim());
+        assert!(link.abandon(&stop));
+        assert!(
+            stop.cancel_requested(),
+            "disconnect must signal under the same ownership guard, not later in its caller"
+        );
+        link.released();
+        arbiter.finish(first.class, first.uid);
+        arbiter.submit(arbiter::Class::Auth, 0, ()).unwrap();
+        let second = arbiter.take().unwrap();
+        assert!(!stop.stop_requested());
+        assert!(!link.abandon(&stop));
+        assert!(
+            !stop.stop_requested(),
+            "late disconnect cancelled the next job"
+        );
+        arbiter.finish(second.class, second.uid);
+    }
+
+    #[test]
+    fn racing_claim_and_disconnect_always_drop_or_stop_the_request() {
+        for _ in 0..256 {
+            let link = ClientLink::default();
+            let stop = arbiter::CancelToken::new();
+            let start = std::sync::Barrier::new(2);
+            let claimed = std::thread::scope(|threads| {
+                let worker = threads.spawn(|| {
+                    start.wait();
+                    link.claim()
+                });
+                start.wait();
+                link.abandon(&stop);
+                worker.join().unwrap()
+            });
+            assert_eq!(
+                claimed,
+                stop.stop_requested(),
+                "a disconnected request must either never start or receive a stop signal"
+            );
+            assert!(!link.claim(), "an abandoned request cannot restart");
+        }
+    }
+
+    #[test]
+    fn racing_disconnect_and_release_cannot_cancel_the_next_request() {
+        for _ in 0..256 {
+            let link = ClientLink::default();
+            let next = ClientLink::default();
+            let stop = arbiter::CancelToken::new();
+            let start = std::sync::Barrier::new(2);
+            assert!(link.claim());
+            std::thread::scope(|threads| {
+                let connection = threads.spawn(|| {
+                    start.wait();
+                    link.abandon(&stop);
+                });
+                start.wait();
+                // The single camera worker releases the old link before the
+                // arbiter resets the shared signal and starts the next job.
+                link.released();
+                stop.reset();
+                assert!(next.claim());
+                connection.join().unwrap();
+                assert!(!stop.stop_requested(), "cancel leaked into the next job");
+            });
+            next.released();
+            assert!(!next.claim(), "a completed request cannot restart");
+        }
+    }
+
+    #[test]
+    fn socket_disconnect_drops_queued_auth_and_stops_running_auth() {
+        // The real connection parser, peer gate, queue and disconnect poll run;
+        // a synthetic worker owns the job without opening a camera or TPM.
+        let _passwd = passwd_lock();
+        for running in [false, true] {
+            let arbiter = arbiter::Arbiter::<Queued>::new();
+            let ready = std::sync::atomic::AtomicBool::new(true);
+            let diagnostics = diagnostics::DiagnosticState::default();
+            let stop = arbiter.cancel_token();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let peer = peer_cred(&client).unwrap();
+            let user = users::name_for_uid(peer.uid).expect("test user exists");
+            let request = Request::Authenticate {
+                user,
+                service: Some("kde".into()),
+                intent_confirmation: None,
+                structured_errors: false,
+            };
+            let wire = serde_json::to_string(&request).unwrap() + "\n";
+            client.write_all(wire.as_bytes()).unwrap();
+            std::thread::scope(|threads| {
+                let arbiter = &arbiter;
+                let ready = &ready;
+                let diagnostics = &diagnostics;
+                let (completed, completion) = std::sync::mpsc::channel();
+                threads.spawn(move || {
+                    let result = serve(server, arbiter, ready, diagnostics);
+                    completed.send(result).unwrap();
+                });
+                let (taken, work) = std::sync::mpsc::channel();
+                threads.spawn(move || {
+                    let _ = taken.send(arbiter.take());
+                });
+                let job = work.recv_timeout(std::time::Duration::from_secs(5));
+                // Also wake the taker on a failing request, so a test failure
+                // cannot leave its scoped worker blocked in take().
+                arbiter.close();
+                let job = job.expect("request must queue").expect("queued job");
+                if running {
+                    assert!(job.payload.link.claim());
+                }
+                drop(client);
+                completion
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("disconnect must end the connection wait")
+                    .expect("closed clients need no reply");
+                assert_eq!(stop.stop_requested(), running);
+                assert_eq!(stop.cancel_requested(), running);
+                assert!(!job.payload.link.claim(), "departed client must not start");
+                job.payload.link.released();
+                arbiter.finish(job.class, job.uid);
+            });
+        }
     }
 
     #[test]
@@ -8429,6 +9153,266 @@ mod tests {
             cached_enrollment_summary(SAMPLE_USER).is_none(),
             "an authorized mutation must drop the summary before it runs"
         );
+    }
+
+    #[test]
+    fn preferences_status_is_non_secret_camera_free_and_available_during_startup() {
+        let _guard = env_lock();
+        let sb = sandbox("preferences-status");
+        let _ = sb;
+        let expected = irlume_common::PreferencesState::observe();
+        assert!(matches!(
+            arbiter::classify(&Request::PreferencesStatus),
+            arbiter::Class::Status
+        ));
+        let response = dispatch_status(&Request::PreferencesStatus, &peer(65534)).unwrap();
+        assert!(matches!(response, Response::PreferencesStatus(state) if state == expected));
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let response = with_serve(&arbiter, &ready, |ours| {
+            writeln!(
+                &*ours,
+                "{}",
+                serde_json::to_string(&Request::PreferencesStatus).unwrap()
+            )
+            .unwrap();
+            let mut line = String::new();
+            BufReader::new(ours).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(&line).unwrap()
+        });
+        assert!(matches!(response, Response::PreferencesStatus(state) if state == expected));
+        arbiter.close();
+        let value = serde_json::to_value(response).unwrap();
+        let object = value["PreferencesStatus"].as_object().unwrap();
+        assert_eq!(
+            object.len(),
+            5,
+            "only policy enums, optional bools and override flags"
+        );
+    }
+
+    #[test]
+    fn sensor_policy_status_is_camera_free_and_preflight_cannot_claim_ready() {
+        let _guard = env_lock();
+        let sandbox = sandbox("sensor-status");
+        let _ = sandbox;
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let early = with_serve(&arbiter, &ready, |ours| {
+            let bytes = serde_json::to_vec(&Request::FaceSensorStatus { user: None }).unwrap();
+            (&*ours).write_all(&bytes).unwrap();
+            (&*ours).write_all(b"\n").unwrap();
+            let mut line = String::new();
+            BufReader::new(ours).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(&line).unwrap()
+        });
+        assert!(matches!(
+            early,
+            Response::FaceSensorStatus {
+                ir_readiness: None,
+                ..
+            }
+        ));
+        arbiter.close();
+        let response =
+            dispatch_status(&Request::FaceSensorStatus { user: None }, &peer(65534)).unwrap();
+        assert!(matches!(
+            response,
+            Response::FaceSensorStatus {
+                ir_readiness: None,
+                ..
+            }
+        ));
+        let response = dispatch_status(
+            &Request::FaceSensorStatus {
+                user: Some("root".into()),
+            },
+            &peer(65534),
+        )
+        .unwrap();
+        assert!(matches!(response, Response::Error(_)));
+        let response = dispatch_status(
+            &Request::FaceSensorStatus {
+                user: Some("root".into()),
+            },
+            &peer(0),
+        );
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn sensor_preflight_queues_for_real_worker_and_refuses_missing_target() {
+        let _guard = env_lock();
+        let sb = sandbox("sensor-worker-preflight");
+        std::fs::write(
+            sb.dir.join("config/settings.conf"),
+            "face_sensor_policy=ir-only-experimental\n",
+        )
+        .unwrap();
+        let request = Request::FaceSensorStatus {
+            user: Some(users::name_for_uid(0).unwrap()),
+        };
+        assert!(
+            dispatch_status(&request, &peer(0)).is_none(),
+            "explicit preflight must reach the worker"
+        );
+        let mut engine = engine();
+        let old_rgb = std::env::var_os("IRLUME_RGB_DEVICE");
+        let old_ir = std::env::var_os("IRLUME_IR_DEVICE");
+        std::env::set_var("IRLUME_RGB_DEVICE", NO_RGB);
+        std::env::set_var("IRLUME_IR_DEVICE", NO_IR);
+        let response = dispatch(request, &peer(0), &mut engine);
+        for (key, old) in [("IRLUME_RGB_DEVICE", old_rgb), ("IRLUME_IR_DEVICE", old_ir)] {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(matches!(
+            response,
+            Response::FaceSensorStatus {
+                ir_readiness: Some(irlume_common::IrOnlyReadiness::TargetUnavailable),
+                ..
+            }
+        ));
+        let wire = serde_json::to_value(response).unwrap();
+        let body = wire.get("FaceSensorStatus").unwrap().as_object().unwrap();
+        assert_eq!(body.len(), 2);
+        assert!(body.contains_key("policy") && body.contains_key("ir_readiness"));
+    }
+
+    #[test]
+    fn sensor_policy_controls_startup_publication_and_background_discovery() {
+        use irlume_common::config::{
+            FaceSensorPolicy as Policy, FaceSensorPolicyObservation as Seen,
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        for policy in [
+            Seen::DefaultDual,
+            Seen::Explicit(Policy::Dual),
+            Seen::Explicit(Policy::IrOnlyExperimental),
+            Seen::Invalid,
+            Seen::Unreadable,
+        ] {
+            calls.borrow_mut().clear();
+            let devices = select_engine_devices_with(
+                policy,
+                || {
+                    calls.borrow_mut().push("discovery");
+                    EngineDevices {
+                        rgb: "dual-rgb".into(),
+                        ..EngineDevices::default()
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("configured");
+                    EngineDevices {
+                        ir: "configured-ir".into(),
+                        ..EngineDevices::default()
+                    }
+                },
+            );
+            match policy.resolve() {
+                Ok(Policy::Dual) => {
+                    assert_eq!(*calls.borrow(), ["discovery"]);
+                    assert_eq!(devices.rgb, "dual-rgb");
+                }
+                Ok(Policy::IrOnlyExperimental) => {
+                    assert_eq!(*calls.borrow(), ["configured"]);
+                    assert_eq!(devices.ir, "configured-ir");
+                }
+                Err(_) => {
+                    assert!(calls.borrow().is_empty());
+                    assert_eq!(devices, EngineDevices::default());
+                }
+            }
+            assert_eq!(
+                permits_background_requalification(policy),
+                matches!(policy.resolve(), Ok(Policy::Dual))
+            );
+        }
+    }
+
+    #[test]
+    fn sensor_preflight_requires_selected_ir_policy_before_user_access() {
+        use irlume_common::config::{
+            FaceSensorPolicy as Policy, FaceSensorPolicyObservation as Seen,
+        };
+        use irlume_common::IrOnlyReadiness as Ready;
+        for policy in [
+            Seen::DefaultDual,
+            Seen::Explicit(Policy::Dual),
+            Seen::Explicit(Policy::IrOnlyExperimental),
+            Seen::Invalid,
+            Seen::Unreadable,
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let readiness = sensor_preflight_with(policy, || {
+                calls.set(calls.get() + 1);
+                Ready::ReadyForExperimentalAttempt
+            });
+            let selected = policy == Seen::Explicit(Policy::IrOnlyExperimental);
+            assert_eq!(calls.get(), usize::from(selected));
+            assert_eq!(
+                readiness,
+                if selected {
+                    Ready::ReadyForExperimentalAttempt
+                } else if policy.resolve().is_err() {
+                    Ready::InvalidPolicy
+                } else {
+                    Ready::Unavailable
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn experimental_ir_refusals_charge_both_granting_routes_and_never_release_credentials() {
+        let _guard = env_lock();
+        let sb = sandbox("ir-granting-refusals");
+        let mut engine = engine();
+        let user = users::name_for_uid(0).unwrap();
+        plant_fake_envelope(&user);
+        let old_config = std::env::var_os("IRLUME_CONFIG_DIR");
+        let old_rgb = std::env::var_os("IRLUME_RGB_DEVICE");
+        let old_ir = std::env::var_os("IRLUME_IR_DEVICE");
+        std::env::set_var("IRLUME_CONFIG_DIR", &sb.dir);
+        std::env::set_var("IRLUME_RGB_DEVICE", "/dev/irlume-test-none-rgb");
+        std::env::set_var("IRLUME_IR_DEVICE", "/dev/irlume-test-none-ir");
+        std::fs::write(
+            sb.dir.join("settings.conf"),
+            "face_sensor_policy=ir-only-experimental\n",
+        )
+        .unwrap();
+        let verify = dispatch(
+            Request::Authenticate {
+                user: user.clone(),
+                service: Some("kde".into()),
+                intent_confirmation: None,
+                structured_errors: false,
+            },
+            &peer(0),
+            &mut engine,
+        );
+        let unseal = do_unseal_password(&user, None, &mut engine);
+        let record = std::fs::read(sb.dir.join("retry/0.json")).unwrap();
+        for (key, old) in [
+            ("IRLUME_CONFIG_DIR", old_config),
+            ("IRLUME_RGB_DEVICE", old_rgb),
+            ("IRLUME_IR_DEVICE", old_ir),
+        ] {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(
+            matches!(verify, Response::AuthResult { granted: false, reason, .. } if reason.contains("configured IR target"))
+        );
+        assert!(
+            matches!(unseal, Response::Error(reason) if reason.contains("configured IR target"))
+        );
+        assert_short_history_and_charge(&None, &record, 2, false);
     }
 
     #[test]
@@ -9084,7 +10068,7 @@ mod tests {
         );
         assert!(
             err.contains(
-                "verification is a one-time startup path check; only the recognizer bytes"
+                "verification runs before startup and post-panic rebuilds; only the recognizer"
             ),
             "the refusal must not claim every checked path stays verified through load: {err}"
         );
@@ -9260,6 +10244,18 @@ mod tests {
             .is_none(),
             "a real confirmation still passes"
         );
+
+        for invalid in ["", "typo", "2"] {
+            std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", invalid);
+            assert!(
+                intent_confirmation_gate(
+                    &sudo_with(Some(IntentAttestation::PolicyWaived)),
+                    &peer(0)
+                )
+                .is_some(),
+                "invalid policy {invalid:?} must not authorize a waiver"
+            );
+        }
 
         std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", "0");
         assert!(
@@ -9699,6 +10695,130 @@ mod tests {
     }
 
     #[test]
+    fn request_cancellation_charges_verify_and_unseal_before_engine_work() {
+        let _guard = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
+        let mut engine = engine();
+        for prior_rejection in [false, true] {
+            for unseal in [false, true] {
+                let sandbox = sandbox("cancelled-auth-retry");
+                plant_fake_envelope(&user);
+                if prior_rejection {
+                    retry_throttle::record(
+                        &user,
+                        &irlume_auth::Outcome {
+                            granted: false,
+                            live: true,
+                            score: 0.1,
+                            reason: "synthetic rejected match".into(),
+                            kind: irlume_auth::OutcomeKind::BelowThreshold,
+                        },
+                    )
+                    .unwrap();
+                }
+                let record = sandbox.dir.join("retry/0.json");
+                let read_history = || match std::fs::read(&record) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("retry history read failed: {error}"),
+                };
+                for n in 1..=6 {
+                    engine.set_request_cancel_signal(std::sync::Arc::new(|| true));
+                    let response = if unseal {
+                        do_unseal_password(&user, None, &mut engine)
+                    } else {
+                        dispatch(
+                            Request::Authenticate {
+                                structured_errors: false,
+                                user: user.clone(),
+                                service: Some("kde".into()),
+                                intent_confirmation: None,
+                            },
+                            &peer(0),
+                            &mut engine,
+                        )
+                    };
+                    engine.set_request_cancel_signal(std::sync::Arc::new(|| false));
+                    let allowance = 5 - u32::from(prior_rejection);
+                    if n <= allowance {
+                        assert!(
+                            matches!(&response, Response::Error(reason) if reason.contains("authentication cancelled")),
+                            "{response:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(&response, Response::Error(reason) if reason == retry_throttle::LIMITED)
+                                || matches!(&response, Response::AuthResult {granted: false, refused_by_policy: true, reason, ..} if reason == retry_throttle::LIMITED),
+                            "{response:?}"
+                        );
+                    }
+                    let state: serde_json::Value =
+                        serde_json::from_slice(&read_history().unwrap()).unwrap();
+                    assert_eq!(state["budget"]["unsuccessful_requests"], n.min(allowance));
+                    assert_eq!(state["budget"]["pending"], n <= allowance);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_face_budget_blocks_verify_and_unseal_before_engine_entry() {
+        let _guard = env_lock();
+        let user = users::name_for_uid(0).expect("root NSS account");
+        let mut engine = engine();
+        for unseal in [false, true] {
+            let sandbox = sandbox("exhausted-face-budget");
+            plant_fake_envelope(&user);
+            retry_throttle::record(
+                &user,
+                &irlume_auth::Outcome {
+                    granted: false,
+                    live: true,
+                    score: 0.1,
+                    reason: "synthetic rejection".into(),
+                    kind: irlume_auth::OutcomeKind::BelowThreshold,
+                },
+            )
+            .unwrap();
+            let path = sandbox.dir.join("retry/0.json");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record["version"] = 2.into();
+            record["strikes"] = 0.into();
+            record["budget"] = serde_json::json!({
+                "unsuccessful_requests": 50,
+                "pending": false
+            });
+            let before = serde_json::to_vec(&record).unwrap();
+            std::fs::write(&path, &before).unwrap();
+            // Engine entry would report cancellation. The durable ceiling must
+            // refuse first, without reaching that check or any engine setup.
+            engine.set_request_cancel_signal(std::sync::Arc::new(|| true));
+            let response = if unseal {
+                do_unseal_password(&user, None, &mut engine)
+            } else {
+                dispatch(
+                    Request::Authenticate {
+                        structured_errors: false,
+                        user: user.clone(),
+                        service: Some("kde".into()),
+                        intent_confirmation: None,
+                    },
+                    &peer(0),
+                    &mut engine,
+                )
+            };
+            engine.set_request_cancel_signal(std::sync::Arc::new(|| false));
+            assert!(
+                matches!(&response, Response::Error(reason) if reason == retry_throttle::LIMITED)
+                    || matches!(&response, Response::AuthResult {granted: false, refused_by_policy: true, reason, ..} if reason == retry_throttle::LIMITED),
+                "{response:?}"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn setup_refusals_preserve_verify_retry_history() {
         let _g = env_lock();
         setup_refusals_preserve_retry_history(false, false);
@@ -9759,7 +10879,7 @@ mod tests {
                 Err(error) => panic!("retry history read failed: {error}"),
             };
             let before = read_history();
-            for _ in 0..6 {
+            for count in 1..=6 {
                 let response = if unseal {
                     do_unseal_password(&user, None, &mut e)
                 } else {
@@ -9790,11 +10910,7 @@ mod tests {
                     }
                     other => panic!("setup must remain a terminal refusal: {other:?}"),
                 }
-                assert_eq!(
-                    read_history(),
-                    before,
-                    "setup refusal must neither create nor change retry history"
-                );
+                assert_short_history_and_charge(&before, &read_history().unwrap(), count, false);
             }
             // Repairing enrollment reaches the missing-camera boundary. It
             // must not replenish the account's prior face retry budget.
@@ -9816,8 +10932,31 @@ mod tests {
             assert!(
                 matches!(response, Response::Error(ref reason) if reason.contains("no camera found"))
             );
-            assert_eq!(read_history(), before);
+            assert_short_history_and_charge(&before, &read_history().unwrap(), 7, true);
         }
+    }
+
+    fn assert_short_history_and_charge(
+        before: &Option<Vec<u8>>,
+        after: &[u8],
+        count: u32,
+        pending: bool,
+    ) {
+        let before: serde_json::Value = before
+            .as_ref()
+            .map(|bytes| serde_json::from_slice(bytes).unwrap())
+            .unwrap_or_else(|| serde_json::json!({"strikes": 0, "cooldown": null}));
+        let after: serde_json::Value = serde_json::from_slice(after).unwrap();
+        assert_eq!(
+            after["strikes"], before["strikes"],
+            "neutral refusal preserves short strikes"
+        );
+        assert_eq!(
+            after["cooldown"], before["cooldown"],
+            "neutral refusal preserves short cooldown"
+        );
+        assert_eq!(after["budget"]["unsuccessful_requests"], count);
+        assert_eq!(after["budget"]["pending"], pending);
     }
 
     #[test]
@@ -10860,12 +11999,59 @@ mod tests {
                 kind: None,
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             },
             &peer(NOBODY),
             &mut e,
         ) {
             Response::Error(msg) => assert_eq!(msg, "not authorized to seal password for 'carol'"),
             other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+        match dispatch(
+            Request::SealPassword {
+                kind: None,
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+                wallet_salt: None,
+                wallet_salt_checked: false,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("upgrade"), "{msg}"),
+            other => panic!("an old client must fail closed, got {other:?}"),
+        }
+        match dispatch(
+            Request::SealPassword {
+                kind: Some(irlume_common::KeyringSecretKind::KdeWalletKey),
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+                wallet_salt: None,
+                wallet_salt_checked: true,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("requires"), "{msg}"),
+            other => panic!("forced KDE without salt must fail, got {other:?}"),
+        }
+        match dispatch(
+            Request::SealPassword {
+                kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
+                user: "carol".into(),
+                password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+                wallet_salt: irlume_common::WalletSalt::new(vec![
+                    0x5a;
+                    irlume_common::kwallet_wire::SALT_LEN
+                ]),
+                wallet_salt_checked: true,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(msg) => assert!(msg.contains("forbid"), "{msg}"),
+            other => panic!("forced login-password with salt must fail, got {other:?}"),
         }
         // The empty-password refusal fires before any TPM operation, so this
         // is safe (and deterministic) on every host.
@@ -10874,6 +12060,8 @@ mod tests {
                 kind: None,
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(Vec::new()),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             },
             &peer(0),
             &mut e,
@@ -10998,6 +12186,42 @@ mod tests {
         match do_unseal_password(&user, None, &mut e) {
             Response::Error(msg) => assert!(msg.contains("no camera found"), "{msg}"),
             other => panic!("missing camera must be an Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensor_policy_errors_refuse_both_granting_routes_before_convenience_or_capture() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("sensor-policy-grant-refusal");
+        let user = users::name_for_uid(0).unwrap();
+        plant_fake_envelope(&user);
+        for contents in [b"face_sensor_policy=typo\n".as_slice(), b"\xff".as_slice()] {
+            std::fs::write(sb.dir.join("config/settings.conf"), contents).unwrap();
+            let verify = dispatch(
+                Request::Authenticate {
+                    user: user.clone(),
+                    service: Some("plasmalogin".into()),
+                    structured_errors: false,
+                    intent_confirmation: None,
+                },
+                &peer(0),
+                &mut engine,
+            );
+            assert!(
+                matches!(verify, Response::AuthResult { granted: false, refused_by_policy: true, ref reason, .. } if reason.contains("sensor policy"))
+            );
+            let unseal = dispatch(
+                Request::UnsealPassword {
+                    user: user.clone(),
+                    service: Some("plasmalogin".into()),
+                },
+                &peer(0),
+                &mut engine,
+            );
+            assert!(
+                matches!(unseal, Response::Error(ref reason) if reason.contains("sensor policy"))
+            );
         }
     }
 
@@ -11223,6 +12447,8 @@ mod tests {
             Request::ResealPassword {
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(b"pw".to_vec()),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             },
             &peer(0),
             &mut e,
@@ -11236,6 +12462,8 @@ mod tests {
             Request::ResealPassword {
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(Vec::new()),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             },
             &peer(0),
             &mut e,
@@ -11459,6 +12687,27 @@ mod tests {
     }
 
     #[test]
+    fn set_cameras_syntax_preserves_empty_stable_and_custom_paths() {
+        for path in [
+            "",
+            "/dev/video0",
+            "/dev/v4l/by-id/usb-camera-video-index0",
+            "/custom/camera with spaces",
+            "/custom/camera=ir",
+        ] {
+            assert!(camera_path_is_serializable(path), "{path:?}");
+        }
+        for path in [
+            "video0",
+            " /dev/video0",
+            "/dev/video0\n",
+            "/dev/video0\u{85}",
+        ] {
+            assert!(!camera_path_is_serializable(path), "{path:?}");
+        }
+    }
+
+    #[test]
     fn set_cameras_requires_root_then_repoints_and_persists() {
         let _g = env_lock();
         let mut e = engine();
@@ -11504,6 +12753,30 @@ mod tests {
             irlume_common::config::read_kv("cameras.conf", "ir").as_deref(),
             Some(ir)
         );
+        let pin_path = irlume_common::config::config_path("cameras.conf");
+        let pin_before = std::fs::read(&pin_path).unwrap();
+        for invalid in [
+            "/dev/video0\ncapture_mode=concurrent",
+            "/dev/video0\r",
+            "/dev/video0\0",
+            " /dev/video0",
+            "/dev/video0 ",
+            "video0",
+        ] {
+            for (bad_rgb, bad_ir) in [(invalid, ir), (rgb, invalid)] {
+                let response = dispatch(
+                    Request::SetCameras {
+                        rgb: bad_rgb.into(),
+                        ir: bad_ir.into(),
+                    },
+                    &peer(0),
+                    &mut e,
+                );
+                assert!(matches!(response, Response::Error(_)));
+                assert_eq!((e.rgb_device(), e.ir_device()), (rgb, ir));
+                assert_eq!(std::fs::read(&pin_path).unwrap(), pin_before);
+            }
+        }
         // Restore the shared engine's baseline devices.
         e.set_devices(NO_RGB, NO_IR);
     }
@@ -11732,6 +13005,8 @@ mod tests {
                 kind: None,
                 user: "carol".into(),
                 password: irlume_common::SecretBytes::new(secret.clone()),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             },
             &root,
             &mut e,

@@ -305,7 +305,7 @@ pub(crate) fn open_ir(device: &str, lease: CameraLease) -> irlume_common::Result
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
 
     use super::*;
@@ -338,6 +338,25 @@ mod tests {
                 ),
             ])
             .unwrap();
+    }
+
+    pub(crate) fn with_test_camera_operation<R>(
+        endpoint: &str,
+        work: impl FnOnce(&CameraOperationSession) -> R,
+    ) -> R {
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }));
+        seed_test_endpoints(&supervisor, &[endpoint]);
+        let _installed = install_test_supervisor(supervisor.clone());
+        let operation = supervisor
+            .acquire_operation(
+                &[endpoint],
+                CameraOperationKind::Authentication,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        work(&operation)
     }
 
     #[derive(Clone)]

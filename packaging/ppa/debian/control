@@ -21,7 +21,7 @@ Rules-Requires-Root: no
 
 Package: irlume
 Architecture: amd64
-Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g, polkitd | policykit-1
+Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g, libpam-modules, polkitd | policykit-1
 Recommends: fprintd
 Description: Windows Hello-style face login for Linux
  IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed

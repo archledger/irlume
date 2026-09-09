@@ -81,6 +81,9 @@ is back to one; `git commit --amend -s --no-edit` fixes a missing one.
   `padreport` and
   include the per-species APCER/BPCER numbers. See
   [`docs/PAD_SELFTEST.md`](docs/PAD_SELFTEST.md) for the methodology and protocol.
+  Optional IR-only full-path evaluation additionally follows
+  [`docs/IR_ONLY_QUALIFICATION.md`](docs/IR_ONLY_QUALIFICATION.md); the component
+  self-test does not qualify the proposed login mode.
 - **A pull request from a fork is not CodeQL-scanned before merge.** GitHub's
   default setup for code scanning does not analyse fork pull requests, so an
   external contribution reaches review with the ordinary CI behind it (clippy as

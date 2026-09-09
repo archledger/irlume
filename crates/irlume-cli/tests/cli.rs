@@ -1281,6 +1281,59 @@ fn sock(sb: &Sandbox) -> PathBuf {
 }
 
 #[test]
+fn wallet_forget_refuses_failed_or_unexpected_inspection_unless_force_is_explicit() {
+    for (tag, response) in [
+        ("error", Response::Error("fixture kind query failed".into())),
+        ("unexpected", Response::Pong),
+    ] {
+        let sb = Sandbox::new(&format!("forget-inspection-{tag}"));
+        let log = serve(&sock(&sb), move |request| match request {
+            Request::KeyringInfo { .. } => response.clone(),
+            Request::ForgetPassword { .. } => Response::PasswordForgotten,
+            _ => panic!("unexpected request"),
+        });
+        let (code, _, err) = run(&mut sb.cmd(&["keyring", "forget", "--user", "tester"]));
+        assert_ne!(code, 0);
+        assert!(err.contains("refusing to erase"), "{err}");
+        assert!(
+            matches!(log.lock().unwrap().as_slice(), [Request::KeyringInfo { user }] if user == "tester")
+        );
+        let (code, out, err) =
+            run(&mut sb.cmd(&["keyring", "forget", "--force", "--user", "tester"]));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(
+            matches!(log.lock().unwrap().last(), Some(Request::ForgetPassword { user }) if user == "tester")
+        );
+    }
+}
+
+#[test]
+fn biopolicy_write_refuses_unknown_content_and_preserves_other_preferences() {
+    let sb = Sandbox::new("biopolicy-preserve");
+    let original = "face_sensor_policy=ir-only-experimental\nprivileged_face_consent=0\n";
+    std::fs::write(sb.path("cfg/settings.conf"), original).unwrap();
+    let (code, _, _) = run(sb
+        .cmd(&["biopolicy", "on"])
+        .env_remove("IRLUME_ENFORCE_BIOPOLICY"));
+    let saved = std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap();
+    if is_root() {
+        assert_eq!(code, 0);
+        assert!(
+            saved.contains(original) && saved.contains("enforce_biopolicy=1"),
+            "{saved}"
+        );
+    } else {
+        assert_ne!(code, 0);
+        assert_eq!(saved, original);
+    }
+    std::fs::remove_file(sb.path("cfg/settings.conf")).unwrap();
+    std::fs::create_dir(sb.path("cfg/settings.conf")).unwrap();
+    let (code, _, _) = run(&mut sb.cmd(&["biopolicy", "off"]));
+    assert_ne!(code, 0);
+    assert!(sb.path("cfg/settings.conf").is_dir());
+}
+
+#[test]
 fn keyring_success_paths_with_a_live_daemon() {
     let sb = Sandbox::new("keyringok");
     let log = serve(&sock(&sb), |req| match req {
@@ -2269,6 +2322,126 @@ fn auth_sensor_malformed_key_cannot_silently_select_dual() {
 }
 
 #[test]
+fn diagnostics_missing_key_guidance_agrees_across_cli_views() {
+    for recovery_set in [true, false] {
+        let sb = Sandbox::new(if recovery_set {
+            "missing-key-recoverable"
+        } else {
+            "missing-key-no-backup"
+        });
+        serve(&sock(&sb), move |request| match request {
+            Request::Ping => Response::Pong,
+            Request::RecoveryStatus { .. } => Response::RecoveryStatus {
+                encrypted: true,
+                key_present: false,
+                recovery_set,
+                tpm_present: true,
+            },
+            _ => Response::Error("fixture unavailable".into()),
+        });
+        for args in [vec!["recovery", "status"], vec!["status"]] {
+            let (code, out, err) = run(&mut sb.cmd(&args));
+            assert_eq!(code, 0, "{out} {err}");
+            assert!(
+                out.contains(if recovery_set {
+                    "irlume recovery restore"
+                } else {
+                    "Re-enroll"
+                }),
+                "{out}"
+            );
+            assert!(
+                !out.contains("Set one now"),
+                "cannot create a backup from a missing key: {out}"
+            );
+        }
+        let (_, out, err) = run(&mut sb.cmd(&["doctor", "--json"]));
+        let report: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out} {err}"));
+        let check = report["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "templates")
+            .unwrap();
+        assert_eq!(check["state"], "fail");
+        assert!(check["detail"].as_str().unwrap().contains(if recovery_set {
+            "recovery restore"
+        } else {
+            "Re-enroll"
+        }));
+    }
+}
+
+#[test]
+fn preference_status_reads_daemon_instead_of_unreadable_local_settings() {
+    let sb = Sandbox::new("preferences-daemon");
+    std::fs::create_dir(sb.path("cfg/settings.conf")).unwrap();
+    let requests = serve(&sock(&sb), |request| {
+        assert!(matches!(request, Request::PreferencesStatus));
+        Response::PreferencesStatus(irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+            privileged_face_consent: Some(false),
+            enforce_biopolicy: Some(true),
+            consent_overridden: true,
+            biopolicy_overridden: true,
+        })
+    });
+    for (args, expected) in [
+        (vec!["auth", "consent", "status"], "hands-free"),
+        (vec!["biopolicy", "status"], "ENFORCING"),
+    ] {
+        let (code, out, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(
+            out.contains(expected)
+                && out.contains("daemon observed")
+                && out.contains("environment override"),
+            "{out}"
+        );
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert!(sb.path("cfg/settings.conf").is_dir());
+}
+
+#[test]
+fn sensor_preflight_rejects_ambiguous_or_missing_users_before_daemon_contact() {
+    let sb = Sandbox::new("sensor-invalid-users");
+    let requests = serve(&sock(&sb), |_| {
+        panic!("invalid arguments must not contact daemon")
+    });
+    for tail in [
+        vec!["--user"],
+        vec!["--user", ""],
+        vec!["--user="],
+        vec!["alice", "--user", "bob"],
+        vec!["--user", "--yes"],
+        vec!["--user=alice", "--user=bob"],
+    ] {
+        let mut args = vec!["auth", "sensor", "preflight"];
+        args.extend(tail);
+        let (code, _, _) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 2, "{args:?}");
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn auth_sensor_preflight_accepts_selected_user_flag() {
+    let sb = Sandbox::new("sensor-user-flag");
+    let requests = serve(&sock(&sb), |_| Response::FaceSensorStatus {
+        policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
+        ir_readiness: Some(irlume_common::IrOnlyReadiness::Unavailable),
+    });
+    let (_, _, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "--user", "alice"]));
+    let requests = requests.lock().unwrap();
+    assert!(
+        matches!(requests.as_slice(), [Request::FaceSensorStatus { user: Some(user) }] if user == "alice"),
+        "{requests:?} {err}"
+    );
+}
+
+#[test]
 fn auth_sensor_status_uses_daemon_observation_and_preflight_is_explicit() {
     use irlume_common::config::{FaceSensorPolicy, FaceSensorPolicyObservation};
     let sb = Sandbox::new("sensor-daemon");
@@ -2506,7 +2679,7 @@ fn auth_sensor_and_consent_concurrent_writes_preserve_both_policies() {
 }
 
 #[test]
-fn auth_consent_status_reports_policy_without_contacting_daemon() {
+fn auth_consent_status_labels_local_fallback_when_daemon_is_unavailable() {
     let sb = Sandbox::new("consent-status");
     for (value, label) in [
         (None, "required"),

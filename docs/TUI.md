@@ -39,6 +39,60 @@ If a command fails or is interrupted, some changes may already have been
 applied. Review its terminal output and the refreshed status before retrying.
 An unsuccessful daemon-start command does not automatically resume enrollment.
 
+## Preferences
+
+Preferences shows **ON**, **OFF**, or **UNKNOWN** for experimental IR-only,
+hands-free privileged face authentication, and the biopolicy gate. State is
+read from the daemon in the background, so a normal user can inspect root-only
+settings without running the entire TUI as root. A disconnected or older daemon
+is explicitly labeled; any available local observation is not a confirmed
+daemon state. Environment overrides are identified and block misleading toggles.
+
+Click an action or use its key:
+
+- **i** switches IR-only on or restores dual-camera authentication. Enabling
+  experimental IR-only requires the displayed warning to be accepted.
+- **r** checks IR-only prerequisites for the account shown in the header,
+  without opening a camera. Enabled policy and readiness are separate facts.
+- **p** switches hands-free privileged authentication on or restores required
+  confirmation. Enabling hands-free explains its scope and asks first.
+- **b** switches the biopolicy operation-class gate on or off.
+
+Administrator approval is requested by the action itself. State refreshes after
+it returns, including after a failed command. An unknown observation never
+chooses a toggle direction. Login/app wiring and fingerprint enable/disable
+controls remain in their dedicated sections.
+
+F2 includes sensor status, readiness, privileged confirmation status, face retry
+status, password-verified retry reset, and a separately labeled administrator
+retry reset. Password Wallet's Reseal uses the same seal-type handling as the CLI.
+Forget uses the safe password-rekey flow for token or unknown seals; it refuses
+an unsuccessful inspection. Force-forget remains a separate, explicitly warned
+action. No command needs to be typed for these workflows.
+
+## Diagnostics
+
+Select a check with the mouse or arrow keys to read its full, wrapped diagnosis.
+The details panel adapts to terminal height and scrolls with the mouse wheel;
+changing the selection returns to the start of the explanation. Passed,
+warning, failed and unknown checks are counted separately. Pending system
+checks are labeled, and an unavailable automatic fix does not imply a pass.
+
+**Fix Selected Issue** (`f`) starts the appropriate existing workflow. A daemon
+that is loading models or denying this account access is not offered a restart
+from the Cameras row. Access-denied inspection opens the read-only SELinux
+status action. Fingerprint-only wiring repair preserves the selected method.
+Wallet connection and PCR resealing open Password Wallet's guided flows.
+Missing template keys offer Recovery Restore when a recovery backup is present;
+without a backup, the diagnosis explains the need to re-enroll. The CLI's
+status, recovery status and Doctor use the same recovery distinction, and
+Doctor reports a missing template key as a failed check.
+
+Physical actions such as opening a privacy shutter or changing firmware settings
+remain instructions. Recheck, Full Diagnostics, logs, support reports and explicit
+camera tests remain available. The default support report does not capture
+camera data; an IR test or camera probe still requires an explicit action.
+
 ## Several people on one account
 
 A profile represents one person. An account supports up to **three people**;
@@ -118,6 +172,10 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `profiles rename`, `profiles delete` | Faces: select profile/scan, then Rename/Delete; F2 also works without camera navigation |
 | `profiles forget-model`, `profiles eyes-open off` | F2: remove recognizer scans or clear the legacy blocker |
 | `identify` | Overview / Test Recognition |
+| `auth consent status/required/hands-free` | Preferences (`p`); F2 status |
+| `auth sensor status/dual/ir-only` | Preferences (`i`); F2 status |
+| `auth sensor preflight [--user U]` | Preferences (`r`); F2 readiness for the selected account |
+| `retry status/reset`, administrator `retry reset` | F2: status, password-verified reset or administrator reset |
 | `auth test` | F2: Test authentication for this account; JSON `granted` is the verdict |
 | `keyring arm/status/forget`, `reseal` | Password Wallet |
 | `keyring forget --force` | F2: Forget wallet secret without rekeying; review the consequence carefully |

@@ -29,6 +29,7 @@ mod machine;
 mod models;
 mod pad;
 mod pamwire;
+mod preferences;
 mod profile_ir;
 mod recovery;
 mod retry;
@@ -1213,11 +1214,18 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     // daemon, or an envelope it failed to parse. This is the
                     // dangerous reading, so refuse.
                     Ok(irlume_common::Response::KeyringInfo { kind: None, .. }) => (false, true),
-                    // No usable answer at all (daemon down, refused, older
-                    // protocol). Not "armed with something unknown": fall
-                    // through and let the erase attempt below report the real
-                    // failure, rather than blaming an envelope nobody saw.
-                    _ => (false, false),
+                    // A failed inspection is not permission to erase: a transient
+                    // failure can be followed by a successful destructive request.
+                    Ok(irlume_common::Response::Error(error)) | Err(error) => {
+                        eprintln!("[keyring] forget failed: {error} (sealed secret inspection)");
+                        (false, true)
+                    }
+                    _ => {
+                        eprintln!(
+                            "[keyring] unexpected response while inspecting the sealed secret"
+                        );
+                        (false, true)
+                    }
                 };
             if unknown && !force {
                 eprintln!(
@@ -3966,13 +3974,33 @@ fn doctor_run(
                 },
                 if recovery_set {
                     "SET ✓"
+                } else if encrypted && !key_present {
+                    "not set; no backup available"
                 } else {
                     "not set (run `irlume recovery setup`)"
                 },
             );
-            report.check(
+            if encrypted && !key_present {
+                dout!(
+                    report,
+                    "[doctor] {}",
+                    crate::recovery::missing_key_advice(recovery_set)
+                );
+            }
+            report.check_detail(
                 "templates",
-                if encrypted { State::Pass } else { State::Warn },
+                if encrypted && !key_present {
+                    State::Fail
+                } else if encrypted {
+                    State::Pass
+                } else {
+                    State::Warn
+                },
+                if encrypted && !key_present {
+                    crate::recovery::missing_key_advice(recovery_set)
+                } else {
+                    "template key observation complete"
+                },
             );
             report.check(
                 "recovery-passphrase",

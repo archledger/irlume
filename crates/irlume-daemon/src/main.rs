@@ -2738,6 +2738,9 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
             have_password,
         } => unseal_keyring(&user, service.as_deref(), have_password, peer),
         Request::Ping => Response::Ok("starting".into()),
+        Request::PreferencesStatus => {
+            Response::PreferencesStatus(irlume_common::PreferencesState::observe())
+        }
         Request::FaceSensorStatus { user } => Response::FaceSensorStatus {
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: user.map(|_| irlume_common::IrOnlyReadiness::Unavailable),
@@ -2793,7 +2796,9 @@ fn serve_peer(
             // startup instead of replacing them with a generic starting reply.
             if matches!(
                 req,
-                Request::SupportSnapshot { .. } | Request::FaceSensorStatus { .. }
+                Request::SupportSnapshot { .. }
+                    | Request::FaceSensorStatus { .. }
+                    | Request::PreferencesStatus
             ) {
                 if let Some(resp) = pregate(&req, &peer) {
                     return respond(stream, &resp);
@@ -3314,6 +3319,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
         },
         Ping
+        | PreferencesStatus
         | Health
         | Identify
         | ListCameras
@@ -3770,6 +3776,9 @@ fn dispatch_status_with_diagnostics(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     Some(match req {
+        Request::PreferencesStatus => {
+            Response::PreferencesStatus(irlume_common::PreferencesState::observe())
+        }
         Request::FaceSensorStatus { user: Some(_) } => return None,
         Request::FaceSensorStatus { user: None } => Response::FaceSensorStatus {
             policy: irlume_common::config::observe_face_sensor_policy(),
@@ -4336,6 +4345,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | CameraDiagnostics => OperationClass::CameraDiagnostics,
         SetCameras { .. }
         | FaceSensorStatus { .. }
+        | PreferencesStatus
         | ListProfiles { .. }
         | DeleteProfile { .. }
         | DeleteScan { .. }
@@ -4555,6 +4565,7 @@ fn dispatch_scoped_session_inner(
         Request::Ping
         | Request::Health
         | Request::FaceSensorStatus { user: None }
+        | Request::PreferencesStatus
         | Request::HasSealedPassword { .. }
         | Request::RecoveryStatus { .. }
         | Request::SupportSnapshot { .. }
@@ -7540,6 +7551,7 @@ mod tests {
         TuneCaptureMode => Request::TuneCaptureMode { rounds: None },
         CaptureModeStatus => Request::CaptureModeStatus,
         FaceSensorStatus => Request::FaceSensorStatus { user: Some(u()) },
+        PreferencesStatus => Request::PreferencesStatus,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
         },
@@ -9140,6 +9152,42 @@ mod tests {
         assert!(
             cached_enrollment_summary(SAMPLE_USER).is_none(),
             "an authorized mutation must drop the summary before it runs"
+        );
+    }
+
+    #[test]
+    fn preferences_status_is_non_secret_camera_free_and_available_during_startup() {
+        let _guard = env_lock();
+        let sb = sandbox("preferences-status");
+        let _ = sb;
+        let expected = irlume_common::PreferencesState::observe();
+        assert!(matches!(
+            arbiter::classify(&Request::PreferencesStatus),
+            arbiter::Class::Status
+        ));
+        let response = dispatch_status(&Request::PreferencesStatus, &peer(65534)).unwrap();
+        assert!(matches!(response, Response::PreferencesStatus(state) if state == expected));
+        let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let response = with_serve(&arbiter, &ready, |ours| {
+            writeln!(
+                &*ours,
+                "{}",
+                serde_json::to_string(&Request::PreferencesStatus).unwrap()
+            )
+            .unwrap();
+            let mut line = String::new();
+            BufReader::new(ours).read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(&line).unwrap()
+        });
+        assert!(matches!(response, Response::PreferencesStatus(state) if state == expected));
+        arbiter.close();
+        let value = serde_json::to_value(response).unwrap();
+        let object = value["PreferencesStatus"].as_object().unwrap();
+        assert_eq!(
+            object.len(),
+            5,
+            "only policy enums, optional bools and override flags"
         );
     }
 

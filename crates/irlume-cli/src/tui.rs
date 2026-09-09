@@ -301,6 +301,7 @@ enum Suspend {
     /// state). Root op; the daemon reads it live, no restart.
     Biopolicy(bool),
     PrivilegedConsent(bool),
+    FaceSensorPolicy(bool),
     /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
     /// root-gates it; the raw measurements are a spoof-tuning oracle).
     SelfTestLiveness,
@@ -325,6 +326,7 @@ enum Sev {
     Ok,
     Warn,
     Fail,
+    Unknown,
 }
 
 /// What can be done about a failing/■warning check.
@@ -340,6 +342,7 @@ enum Fix {
     /// and open it (`apply_fix` routes through the same key handlers the
     /// screen's own button uses, so every gate still applies).
     Goto(GotoFix),
+    Action(&'static actions::Action),
 }
 
 /// In-TUI fix destinations. Each pairs a screen with the key that opens the
@@ -351,6 +354,8 @@ enum GotoFix {
     Enroll,
     /// Recovery screen, \[s]: set the recovery passphrase.
     RecoveryPass,
+    RecoveryRestore,
+    KeyringReseal,
     /// Password Wallet screen, \[a\]: (re-)arm the keyring seal.
     KeyringArm,
 }
@@ -683,6 +688,7 @@ struct App {
     /// ground truth for the Repair rows (static path probes lie when the daemon
     /// runs with its own env, e.g. a packaged install).
     health: Option<HealthInfo>,
+    preferences: Option<irlume_common::PreferencesState>,
     /// Activity panel scroll offset (lines up from the bottom; 0 = follow newest).
     act_scroll: usize,
     /// Whether the activity history is expanded. The default is a one-line
@@ -889,6 +895,7 @@ struct LightState {
     /// seconds from ready) and EACCES must not read as "not reachable".
     reach: crate::commands::DaemonReach,
     health: Option<HealthInfo>,
+    preferences: Option<irlume_common::PreferencesState>,
     keyring_armed: Option<bool>,
     keyring_policy: Option<String>,
     keyring_drift: Option<bool>,
@@ -918,12 +925,16 @@ impl LightState {
             daemon_up,
             reach,
             health: None,
+            preferences: None,
             keyring_armed: prev_armed,
             keyring_policy: None,
             keyring_drift: None,
             keyring_kind: None,
             recovery: None,
         };
+        if daemon_up || reach == crate::commands::DaemonReach::Starting {
+            out.preferences = crate::preferences::daemon_state();
+        }
         if !daemon_up {
             return out;
         }
@@ -1114,6 +1125,7 @@ impl App {
             daemon_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
+            preferences: None,
             act_scroll: 0,
             activity_open: false,
             reduce_motion: std::env::var_os("IRLUME_REDUCE_MOTION")
@@ -1324,6 +1336,7 @@ impl App {
         // Daemon down/unresponsive: show the down state; the local probes
         // still land via the heavy sweep so Repair can diagnose.
         self.health = l.health;
+        self.preferences = l.preferences;
         // The daemon is the authority on cameras while it is reachable.
         if let Some(h) = self.health.as_ref() {
             self.caps = Self::caps_from_health(h);
@@ -1509,9 +1522,7 @@ impl App {
                         "running, but this user may not connect (EACCES on {})",
                         irlume_common::client::socket_path().display()
                     ),
-                    Fix::Manual(
-                        "see the SELinux policy row below; sudo irlume selinux status".into(),
-                    ),
+                    Fix::Action(&actions::SELINUX_STATUS),
                 ),
                 // Name the socket the ping actually used: with IRLUME_SOCKET
                 // set, "/run/irlume.sock" described a path nobody probed.
@@ -1727,25 +1738,15 @@ impl App {
                 .any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
             let priv_on = self.pairs.iter().any(|p| p.privacy);
             let (csev, cdetail, cfix) = if self.nodes.is_empty() {
-                // NOTHING was probed, which is not the same as nothing being
-                // there. `nodes` is only ever filled by a classifying scan, and
-                // this screen deliberately does not run one: classifying opens
-                // every node, which is the device contention #187 is about, so
-                // the daemon's Health is where camera facts normally come from
-                // and the daemon is what is down in this branch. The old text
-                // read the empty list as proof and told everyone with a working
-                // camera that face auth was unavailable, on the one screen they
-                // opened to find out what was wrong.
-                (
-                    Sev::Warn,
-                    "cannot check the cameras while the daemon is down (start it with: \
-                     sudo systemctl start irlumed)"
-                        .to_string(),
-                    // The RestartDaemon fix is exactly this command via sudo;
-                    // a Manual string made the row describe a fix the TUI
-                    // already knew how to run.
-                    Fix::Root(RootFix::RestartDaemon),
-                )
+                // No observation is not proof of missing cameras. In particular,
+                // restarting cannot fix a still-loading or inaccessible daemon.
+                use crate::commands::DaemonReach as R;
+                match self.daemon_reach {
+                    R::Starting => (Sev::Warn, "camera status pending while models load; wait or re-check".into(), Fix::None),
+                    R::AccessDenied => (Sev::Warn, "camera status unknown: this account cannot access the daemon; inspect the access-policy diagnosis".into(), Fix::None),
+                    R::Running => (Sev::Warn, "camera status not reported by the daemon; re-check or inspect Full Diagnostics".into(), Fix::None),
+                    R::Down => (Sev::Warn, "cannot check the cameras while the daemon is down; use Fix Selected Issue to start it".into(), Fix::Root(RootFix::RestartDaemon)),
+                }
             } else if !rgb && !ir {
                 (
                     Sev::Warn,
@@ -1824,7 +1825,7 @@ impl App {
             // state nobody has observed yet.
             v.push(mk(
                 "Enrollment",
-                Sev::Ok,
+                Sev::Unknown,
                 "loading profiles…".into(),
                 Fix::None,
             ));
@@ -1835,7 +1836,7 @@ impl App {
             // unanswered question renders as unknown, never as a negative.
             v.push(mk(
                 "Enrollment",
-                Sev::Warn,
+                Sev::Unknown,
                 "unknown (profile list not read yet)".into(),
                 Fix::None,
             ));
@@ -1931,7 +1932,7 @@ impl App {
                         "Method wiring",
                         Sev::Fail,
                         "method is fingerprint but pam_fprintd is not wired".into(),
-                        Fix::Manual("Fingerprint → [e] unlock with face OR fingerprint".into()),
+                        Fix::Action(&actions::FINGERPRINT_ONLY),
                     ));
                 } else if self.fp.enrolled.is_empty() {
                     v.push(mk(
@@ -1965,9 +1966,7 @@ impl App {
                             "FP keyring unlock",
                             Sev::Warn,
                             "wallet won't auto-unlock on fingerprint login; arm the keyring".into(),
-                            Fix::Manual(
-                                "Password Wallet → [a] connect (seal your login password)".into(),
-                            ),
+                            Fix::Goto(GotoFix::KeyringArm),
                         ));
                     } else if self.keyring_armed == Some(true) && !wired {
                         v.push(mk(
@@ -2125,7 +2124,7 @@ impl App {
                 "Keyring seal",
                 Sev::Warn,
                 "PCRs drifted since sealing; the wallet won't auto-unlock until re-bound".into(),
-                Fix::Manual("Password Wallet → [r] reseal (re-bind to current PCRs)".into()),
+                Fix::Goto(GotoFix::KeyringReseal),
             ));
         }
 
@@ -2153,25 +2152,29 @@ impl App {
             ));
         }
         if let Some(r) = self.recovery {
-            if r.encrypted && !r.recovery_set {
+            if r.encrypted && !r.key_present {
+                v.push(mk(
+                    "Recovery backstop",
+                    Sev::Fail,
+                    if r.recovery_set {
+                        "template key is MISSING; restore it using the existing recovery passphrase"
+                            .into()
+                    } else {
+                        "template key is MISSING and no recovery is set; re-enrollment is required"
+                            .into()
+                    },
+                    if r.recovery_set {
+                        Fix::Goto(GotoFix::RecoveryRestore)
+                    } else {
+                        Fix::Goto(GotoFix::Enroll)
+                    },
+                ));
+            } else if r.encrypted && !r.recovery_set {
                 v.push(mk(
                     "Recovery backstop",
                     Sev::Warn,
                     "templates encrypted but no recovery passphrase".into(),
                     Fix::Goto(GotoFix::RecoveryPass),
-                ));
-            } else if r.encrypted && !r.key_present {
-                // Encrypted with the key gone: no passphrase and no reseal opens
-                // it, so this is not a backstop question at all. The Cameras-side
-                // row already says this loudly; the check said "encrypted +
-                // recovery set" and passed.
-                v.push(mk(
-                    "Recovery backstop",
-                    Sev::Fail,
-                    "templates encrypted but the template key is MISSING: nothing can \
-                     open them"
-                        .into(),
-                    Fix::Goto(GotoFix::Enroll),
                 ));
             } else {
                 v.push(mk(
@@ -2197,7 +2200,9 @@ impl App {
             .recovery
             .map(|r| r.tpm_present)
             .unwrap_or(self.probes.tpm_present);
-        if !tpm {
+        if self.recovery.is_none() && !self.probes_landed {
+            v.push(mk("TPM", Sev::Unknown, "not checked yet".into(), Fix::None));
+        } else if !tpm {
             v.push(mk("TPM", Sev::Warn,
                 "no TPM: templates stored root-only plaintext; keyring auto-unlock unavailable (face login/sudo still work)".into(),
                 Fix::Manual("optional: enable the firmware TPM (fTPM/PTT) in BIOS, then re-enroll to encrypt at rest".into())));
@@ -2232,7 +2237,20 @@ impl App {
             }
         };
         match fix {
-            Fix::None => self.log('·', "nothing to fix on this row"),
+            Fix::None => self.log(
+                '·',
+                if self.repair[idx].sev == Sev::Ok {
+                    "nothing to fix on this row"
+                } else if self.repair[idx].sev == Sev::Unknown {
+                    "this check has not completed; wait or re-check"
+                } else {
+                    "no automatic repair; review the selected diagnosis and Full Diagnostics"
+                },
+            ),
+            Fix::Action(action) => self.prepare_action(actions::Invocation {
+                action,
+                values: Vec::new(),
+            }),
             Fix::Manual(cmd) => self.log('·', format!("manual fix → {cmd}")),
             // Navigate-and-open: the destination screen's own key handler runs
             // (with all of its gating), so the fix is the same flow the user
@@ -2240,6 +2258,10 @@ impl App {
             Fix::Goto(g) => {
                 let (screen, key, what) = match g {
                     GotoFix::Enroll => (SC_PROFILES, KeyCode::Char('e'), "enroll a face"),
+                    GotoFix::RecoveryRestore => {
+                        (SC_RECOVERY, KeyCode::Char('t'), "restore the template key")
+                    }
+                    GotoFix::KeyringReseal => (SC_KEYRING, KeyCode::Char('r'), "reseal the wallet"),
                     GotoFix::RecoveryPass => (
                         SC_RECOVERY,
                         KeyCode::Char('s'),
@@ -2947,6 +2969,8 @@ impl App {
         if status.is_ok() {
             // A child can change app policy before failing. Refresh after any
             // exit, since the exit status alone says nothing about rollback.
+            self.preferences = None;
+            self.light_load = None; // discard observations begun before the mutation
             self.refresh_heavy();
         }
         match status {
@@ -3133,6 +3157,18 @@ impl App {
             Suspend::PcrlockMakePolicy => self.sudo_step(
                 "refresh the pcrlock policy (re-predict the boot measurements)",
                 &["systemd-pcrlock", "make-policy"],
+            ),
+            Suspend::FaceSensorPolicy(ir_only) => self.sudo_step(
+                if ir_only {
+                    "enable experimental IR-only"
+                } else {
+                    "restore dual-camera authentication"
+                },
+                if ir_only {
+                    &["irlume", "auth", "sensor", "ir-only", "--yes"]
+                } else {
+                    &["irlume", "auth", "sensor", "dual"]
+                },
             ),
             Suspend::PrivilegedConsent(required) => self.sudo_step(
                 if required {
@@ -3490,6 +3526,9 @@ impl App {
     }
 
     fn move_sel(&mut self, d: i32) {
+        if self.screen == SC_REPAIR {
+            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+        }
         let len = match self.screen {
             SC_REPAIR => self.repair.len(),
             SC_CAMERAS => self.pairs.len(),
@@ -3716,37 +3755,15 @@ impl App {
                 self.log('→', "sudo systemd-pcrlock make-policy: refreshes the boot-measurement policy your seal is bound to");
                 self.suspend = Some(Suspend::PcrlockMakePolicy);
             }
-            // Reseal: re-bind the sealed password to the current PCRs (the CLI
-            // `irlume reseal`). Same masked-prompt + SealPassword path as arm;
-            // the distinct entry point and copy are the discoverability the
-            // drift-recovery workflow needs.
+            // The CLI owns seal-kind recovery (token seals must not be re-armed here).
             (SC_KEYRING, KeyCode::Char('r')) if self.keyring_armed == Some(true) => {
-                self.input = Some((
-                    "Login password to re-seal to current PCRs (••):".into(),
-                    String::new(),
-                    Pending::KeyringPw(None),
-                ));
+                self.prepare_action(actions::Invocation { action: &actions::WALLET_RESEAL, values: Vec::new() });
             }
             (SC_KEYRING, KeyCode::Char('f')) => {
-                // A token arm (#250) must re-key the login keyring back to the
-                // password before the envelope is erased; a bare forget here
-                // would delete the keyring's live credential. That flow needs
-                // a password prompt and the control socket, so route it to the
-                // CLI rather than duplicating it in TUI state.
-                // Anything other than a confirmed non-token refuses here.
-                // `None` means an older daemon or an envelope it could not
-                // parse, and erasing a token envelope on that reading leaves
-                // the login keyring encrypted under a secret nothing can
-                // reproduce. The CLI has the re-key flow and the --force
-                // escape; this screen has neither, so it defers.
-                if self.keyring_kind != Some(irlume_common::KeyringSecretKind::LoginPassword)
-                    && self.keyring_kind != Some(irlume_common::KeyringSecretKind::KdeWalletKey)
-                {
-                    self.log(
-                        '!',
-                        "cannot confirm this is safe to erase from here; run `irlume keyring \
-                         forget` in a terminal (it re-keys a token back to your password first)",
-                    );
+                // The CLI performs the password rekey before deleting token seals and
+                // refuses unknown formats; never offer its force option implicitly.
+                if !matches!(self.keyring_kind, Some(irlume_common::KeyringSecretKind::LoginPassword | irlume_common::KeyringSecretKind::KdeWalletKey)) {
+                    self.prepare_action(actions::Invocation { action: &actions::WALLET_FORGET, values: Vec::new() });
                     return;
                 }
                 self.confirm = Some((
@@ -3861,13 +3878,26 @@ impl App {
                 }
                 None => self.log('·', "Bitwarden is not installed on this system"),
             },
+            // Sensor selection is explicit; an unknown observation never guesses a toggle.
+            (SC_SETTINGS, KeyCode::Char('i')) => {
+                use irlume_common::config::FaceSensorPolicy;
+                match self.preference_state().face_sensor_policy.resolve() {
+                    Ok(FaceSensorPolicy::IrOnlyExperimental) => self.suspend = Some(Suspend::FaceSensorPolicy(false)),
+                    Ok(FaceSensorPolicy::Dual) => self.confirm = Some((
+                        format!("Enable experimental IR-only? {}", crate::sensor_policy::WARNING),
+                        "Enable", ConfirmAct::Sus(Suspend::FaceSensorPolicy(true)),
+                    )),
+                    Err(_) => self.log('·', "Sensor policy is unavailable or invalid. Open Repair and inspect the settings before changing it."),
+                }
+            }
+            (SC_SETTINGS, KeyCode::Char('r')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
             // Settings.
             (SC_SETTINGS, KeyCode::Char('p')) => {
-                if crate::consent::overridden() {
+                if crate::consent::overridden() || self.preference_state().consent_overridden {
                     self.log('·', "An environment override controls privileged consent; remove it before changing the saved setting.");
                     return;
                 }
-                match irlume_common::config::privileged_face_consent_visible() {
+                match self.preference_state().privileged_face_consent {
                     Some(true) => {
                         self.confirm = Some((
                             format!("Enable hands-free privileged face authentication? {} {}", crate::consent::SCOPE, crate::consent::WARNING),
@@ -3876,18 +3906,21 @@ impl App {
                         ));
                     }
                     Some(false) => self.suspend = Some(Suspend::PrivilegedConsent(true)),
-                    None => self.log('·', "Cannot read privileged consent settings. Run sudo irlume tui or sudo irlume auth consent status."),
+                    None => self.log('·', "Preferences are unavailable. Open Repair to check the daemon, then refresh; no setting was changed."),
                 }
             }
             // Biopolicy gate: enabling changes the security posture (restricts
             // which services a face may satisfy), so it is confirmed; disabling
             // just relaxes back to default and goes straight through.
             (SC_SETTINGS, KeyCode::Char('b')) => {
-                let Some(on) = irlume_common::config::enforce_biopolicy_visible() else {
+                if self.preference_state().biopolicy_overridden || std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some() {
+                    self.log('·', "An environment override controls biopolicy; remove it before changing the saved setting.");
+                    return;
+                }
+                let Some(on) = self.preference_state().enforce_biopolicy else {
                     self.log(
                         '·',
-                        "the biopolicy gate is a root-only setting; run the TUI with sudo, \
-                         or check it with: irlume biopolicy status",
+                        "Preferences are unavailable. Open Repair to check the daemon, then refresh; no setting was changed.",
                     );
                     return;
                 };
@@ -4721,12 +4754,16 @@ impl App {
             }
             _ => return,
         };
+        let previous = *selected;
         *selected = if direction < 0 {
             selected.saturating_sub(1)
         } else {
             selected.saturating_add(1)
         }
         .min(len.saturating_sub(1));
+        if self.screen == SC_REPAIR && *selected != previous {
+            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
+        }
     }
 
     /// Map a mouse click (or touchscreen tap, delivered as the same left-click)
@@ -4813,6 +4850,7 @@ impl App {
                             self.on_key(KeyCode::Enter);
                         } else {
                             self.repair_sel = i;
+                            self.page_view.set((usize::MAX, Rect::default(), 0, 0));
                         }
                     }
                     SC_CAMERAS if i < self.pairs.len() => {
@@ -5319,33 +5357,61 @@ impl App {
         }
     }
 
+    fn preference_state(&self) -> irlume_common::PreferencesState {
+        self.preferences
+            .unwrap_or_else(irlume_common::PreferencesState::observe)
+    }
+
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
         let mut page_actions = Vec::new();
         // The shared reader, which agrees with the daemon's truthy set (`yes` and
         // `on` count too) and admits when the root-only file cannot be read. The
         // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
         // drew "turn it on" while the daemon was already enforcing.
-        let bio = irlume_common::config::enforce_biopolicy_visible();
+        let bio = self.preference_state().enforce_biopolicy;
         let lines = {
             let mut v = Vec::new();
-            let consent = irlume_common::config::privileged_face_consent_visible();
+            let consent = self.preference_state().privileged_face_consent;
+            let state = self.preference_state();
+            v.push(Line::raw(if self.preferences.is_some() {
+                "  State: daemon observed (refreshes automatically)"
+            } else {
+                "  State: local observation; daemon preferences unavailable"
+            }));
+            v.push(Line::raw(""));
             v.push(section("Face sensor policy"));
+            let ir_only = state.face_sensor_policy.resolve().ok().map(|policy| {
+                policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental
+            });
             v.push(Line::raw(format!(
-                "  {}",
-                crate::sensor_policy::local_status_line()
+                "  IR-only: {} — {}",
+                crate::preferences::toggle_label(ir_only),
+                crate::sensor_policy::state_label(state.face_sensor_policy)
             )));
-            v.push(Line::raw("  Inspect the daemon: irlume auth sensor status"));
+            push_page_actions(
+                &mut v,
+                &mut page_actions,
+                &[
+                    (
+                        "i",
+                        match ir_only {
+                            Some(true) => "turn IR-only off (use dual cameras)",
+                            Some(false) => "turn IR-only on (experimental; asks first)",
+                            None => "IR-only unavailable (inspect settings)",
+                        },
+                    ),
+                    ("r", "check IR-only readiness for this account"),
+                ],
+            );
             v.push(Line::raw(
-                "  Change as root: irlume auth sensor dual / ir-only --yes",
-            ));
-            v.push(Line::raw(
-                "  IR-only is experimental, not qualified; consent and PAM wiring are separate.",
+                "  Enabled policy does not guarantee readiness or a successful login.",
             ));
             v.push(Line::raw(""));
             v.push(section("Face authentication at privileged prompts"));
             v.push(Line::raw(""));
             v.push(Line::raw(format!(
-                "  {}",
+                "  Hands-free: {} — {}",
+                crate::preferences::toggle_label(consent.map(|required| !required)),
                 crate::consent::state_label(consent)
             )));
             v.push(Line::raw(
@@ -5355,9 +5421,16 @@ impl App {
                 "  Login and lock-screen start behavior is separate.",
             ));
             v.push(Line::raw(""));
-            if crate::consent::overridden() {
+            if crate::consent::overridden() || self.preference_state().consent_overridden {
                 v.push(Line::raw(
-                    "  Local environment override; daemon policy may differ.",
+                    if self
+                        .preferences
+                        .is_some_and(|state| state.consent_overridden)
+                    {
+                        "  Daemon environment override controls this setting."
+                    } else {
+                        "  Local environment override; daemon policy may differ."
+                    },
                 ));
                 v.push(Line::raw(
                     "  Remove IRLUME_PRIVILEGED_FACE_CONSENT before changing this setting.",
@@ -5366,7 +5439,7 @@ impl App {
                 let action = match consent {
                     Some(true) => "enable hands-free (asks first)",
                     Some(false) => "restore required confirmation",
-                    None => "state unavailable; run sudo irlume tui to inspect settings",
+                    None => "state unavailable; open Repair to check the daemon",
                 };
                 push_page_actions(&mut v, &mut page_actions, &[("p", action)]);
             }
@@ -5379,20 +5452,20 @@ impl App {
                     // the raw read showed "off (default)" here while the Done
                     // dashboard said "◐ root-only" for the same key. Same
                     // truthy set and env override as the daemon.
-                    let (icon, icon_style, label) =
-                        match irlume_common::config::enforce_biopolicy_visible() {
-                            Some(true) => (
-                                "●",
-                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                "ENFORCING",
-                            ),
-                            Some(false) => ("○", Style::new().dim(), "off (default)"),
-                            None => (
-                                "◐",
-                                Style::new().fg(th().warn),
-                                "on/off is root-only; run the TUI with sudo to see it",
-                            ),
-                        };
+                    let (icon, icon_style, label) = match self.preference_state().enforce_biopolicy
+                    {
+                        Some(true) => (
+                            "●",
+                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                            "ON — ENFORCING",
+                        ),
+                        Some(false) => ("○", Style::new().dim(), "OFF — off (default)"),
+                        None => (
+                            "◐",
+                            Style::new().fg(th().warn),
+                            "UNKNOWN — settings unavailable",
+                        ),
+                    };
                     Line::from(vec![
                         Span::raw("  state  "),
                         Span::styled(format!("{icon} "), icon_style),
@@ -5412,6 +5485,10 @@ impl App {
                     Style::new().dim(),
                 )),
             ]);
+            if state.biopolicy_overridden || std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some()
+            {
+                v.push(Line::raw(if self.preferences.is_some_and(|state| state.biopolicy_overridden) { "  Daemon environment override controls biopolicy; the saved value has no effect." } else { "  Local environment override; daemon policy may differ. Remove it before changing this setting." }));
+            }
             push_page_actions(
                 &mut v,
                 &mut page_actions,
@@ -5420,7 +5497,7 @@ impl App {
                     match bio {
                         Some(true) => "turn it off (sudo)",
                         Some(false) => "turn it on (sudo; asks first)",
-                        None => "biopolicy state is root-only; run the TUI with sudo",
+                        None => "state unavailable; open Repair to check the daemon",
                     },
                 )],
             );
@@ -5748,11 +5825,12 @@ impl App {
                 "● encrypted",
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             ),
-            // Encrypted with the key gone: safe from a stolen disk and
-            // unreadable by its owner. Neither a reseal nor a recovery
-            // passphrase brings it back, so say re-enroll and say it loudly.
             Some(r) if r.encrypted => Span::styled(
-                "✗ encrypted, TEMPLATE KEY MISSING (re-enroll)",
+                if r.recovery_set {
+                    "✗ encrypted, TEMPLATE KEY MISSING (restore with passphrase)"
+                } else {
+                    "✗ encrypted, TEMPLATE KEY MISSING (re-enroll; no recovery set)"
+                },
                 Style::new().fg(th().err).add_modifier(Modifier::BOLD),
             ),
             Some(_) => Span::styled("○ plaintext at rest", Style::new().dim()),
@@ -5787,6 +5865,13 @@ impl App {
                     "  No TPM on this host: templates stay plaintext; recovery N/A.",
                     Style::new().fg(th().err),
                 )));
+            }
+            Some(r) if r.encrypted && !r.key_present => {
+                lines.push(Line::raw(if r.recovery_set {
+                    "  Restore the existing backup with [t]; the passphrase is entered privately."
+                } else {
+                    "  No template key or recovery backup remains. Open Faces to re-enroll."
+                }));
             }
             Some(r) if r.encrypted && !r.recovery_set => {
                 lines.push(Line::from(Span::styled(
@@ -6005,13 +6090,19 @@ impl App {
     /// sidebar instead of turning the summary into a second copy of navigation.
     fn hub_rows(&self) -> Vec<(&'static str, Option<bool>, usize)> {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
-        let diagnostics = (!self.repair.is_empty() || self.probes_landed).then_some(
-            self.daemon_up
-                && !self
-                    .repair
-                    .iter()
-                    .any(|c| c.sev == Sev::Fail || c.sev == Sev::Warn),
-        );
+        let diagnostics = if self
+            .repair
+            .iter()
+            .any(|c| matches!(c.sev, Sev::Fail | Sev::Warn))
+        {
+            Some(false)
+        } else if self.repair.iter().any(|c| c.sev == Sev::Unknown)
+            || (!self.probes_landed && self.repair.is_empty())
+        {
+            None
+        } else {
+            Some(self.daemon_up)
+        };
         // None means not observed yet, never "no". These rows express outcomes
         // in user language and follow the setup order in the sidebar.
         let all: [(&'static str, Option<bool>, usize); 6] = [
@@ -6188,13 +6279,17 @@ impl App {
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
         let mut page_actions = Vec::new();
-        let [list_area, info_area] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(26)]).areas(area);
+        let [list_area, info_area] = Layout::vertical([
+            Constraint::Min(4),
+            Constraint::Length((area.height.saturating_mul(3) / 5).clamp(8, 26)),
+        ])
+        .areas(area);
 
         // ---- checklist --------------------------------------------------
         let ok = self.repair.iter().filter(|c| c.sev == Sev::Ok).count();
         let fail = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
         let warn = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
+        let unknown = self.repair.iter().filter(|c| c.sev == Sev::Unknown).count();
         let items: Vec<ListItem> = self
             .repair
             .iter()
@@ -6203,12 +6298,14 @@ impl App {
                     Sev::Ok => ("✓", th().ok),
                     Sev::Warn => ("⚠", th().warn),
                     Sev::Fail => ("✗", th().err),
+                    Sev::Unknown => ("◐", th().warn),
                 };
                 let tag = match &c.fix {
                     Fix::None => "",
                     Fix::Manual(_) => " · manual",
                     Fix::Root(_) => " · [f] fix (sudo)",
                     Fix::Goto(_) => " · [f] fix",
+                    Fix::Action(_) => " · [f] review action",
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -6249,7 +6346,9 @@ impl App {
 
         // ---- info / platform / live test --------------------------------
         let (sb_present, sb_enabled, sb_setup) = self.probes.secureboot;
-        let sb = if sb_enabled {
+        let sb = if !self.probes_landed {
+            ("unknown", th().warn)
+        } else if sb_enabled {
             ("enabled", th().ok)
         } else if sb_setup {
             ("setup mode", th().warn)
@@ -6262,12 +6361,29 @@ impl App {
             Span::styled(format!("  {ok} ok"), Style::new().fg(th().ok)),
             Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
             Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
+            Span::styled(format!("   {unknown} unknown"), Style::new().fg(th().warn)),
         ])];
         lines.push(Line::raw(""));
+        if !self.probes_landed {
+            lines.push(Line::raw(
+                "  System checks pending; setup state is not fully established.",
+            ));
+        } else if self.probes_load.is_some() {
+            lines.push(Line::raw(
+                "  Refreshing; showing the last completed system checks.",
+            ));
+        }
         if let Some(c) = self.repair.get(self.repair_sel) {
+            lines.push(section(&c.label));
+            lines.push(Line::raw(format!("  {}", c.detail)));
             let hint = match &c.fix {
-                // "no action needed" next to a non-zero fail count reads as a
-                // contradiction; point at the failing rows instead.
+                Fix::None if c.sev == Sev::Unknown => {
+                    "This check has not completed; wait or re-check.".to_string()
+                }
+                Fix::None if c.sev != Sev::Ok => {
+                    "No automatic repair for this row; use its explanation and Full Diagnostics."
+                        .to_string()
+                }
                 Fix::None if fail > 0 => {
                     "this row is fine; ↑↓ select a failing row for its fix".to_string()
                 }
@@ -6275,6 +6391,7 @@ impl App {
                 Fix::Manual(cmd) => format!("manual: {cmd}"),
                 Fix::Root(_) => "press [f]: irlume runs the fix with sudo".to_string(),
                 Fix::Goto(_) => "press [f]: opens the fixing flow here in the TUI".to_string(),
+                Fix::Action(_) => "press [f]: review and run the guided action here".to_string(),
             };
             lines.push(Line::from(vec![
                 Span::styled("  → ", Style::new().fg(th().accent)),
@@ -6289,7 +6406,9 @@ impl App {
             Span::styled(
                 format!(
                     "TPM {} · ",
-                    if self.probes.tpm_present {
+                    if !self.probes_landed {
+                        "unknown"
+                    } else if self.probes.tpm_present {
                         "✓"
                     } else {
                         "✗"
@@ -6669,7 +6788,7 @@ impl App {
                 // this in `status` (settings.conf is 0600 root-only, so an
                 // unreadable key must not print as off), and the two surfaces
                 // must agree on the daemon's truthy set and env override.
-                match irlume_common::config::enforce_biopolicy_visible() {
+                match self.preference_state().enforce_biopolicy {
                     Some(v) => onoff(v),
                     None => Span::styled("◐ root-only", Style::new().fg(th().warn)),
                 },
@@ -6883,7 +7002,12 @@ impl App {
                 ("x", "Disconnect…"),
                 ("s", "Show Status"),
             ],
-            SC_SETTINGS => &[("p", "Privileged consent…"), ("b", "Biopolicy…")],
+            SC_SETTINGS => &[
+                ("i", "IR-only…"),
+                ("r", "Readiness…"),
+                ("p", "Privileged consent…"),
+                ("b", "Biopolicy…"),
+            ],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
             // a needless `sudo irlume login enable --apply` re-run. Unknown
@@ -8936,6 +9060,7 @@ mod tests {
             daemon_reach: crate::commands::DaemonReach::Down,
             enroll_error: None,
             health: None,
+            preferences: None,
             act_scroll: 0,
             activity_open: false,
             reduce_motion: false,
@@ -9169,7 +9294,13 @@ mod tests {
         assert!(matches!(app.input, Some((_, _, Pending::KeyringPw(_)))));
         app.on_key(KeyCode::Esc);
         click_text(&mut app, "[r] reseal");
-        assert!(matches!(app.input, Some((_, _, Pending::KeyringPw(_)))));
+        assert!(
+            matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.action.args == ["reseal"])
+        );
+        assert!(
+            app.input.is_none(),
+            "the CLI must select the correct seal recovery path first"
+        );
         app.on_key(KeyCode::Esc);
         click_text(&mut app, "[f] forget");
         assert!(app.confirm.is_some());
@@ -10776,31 +10907,32 @@ mod tests {
             _ => panic!("expected the keyring password prompt"),
         }
         app.input = None;
-        // [r] reseal opens the masked prompt ONLY when armed (re-bind needs an
-        // existing seal); the CLI `irlume reseal` reachable from the TUI.
+        // Reseal delegates credential handling to the shared CLI only when armed.
         app.keyring_armed = Some(false);
         app.on_key(KeyCode::Char('r'));
-        assert!(app.input.is_none(), "reseal is inert when not armed");
+        assert!(app.input.is_none() && app.confirm.is_none());
         app.keyring_armed = Some(true);
         app.on_key(KeyCode::Char('r'));
-        match &app.input {
-            Some((prompt, _, p @ Pending::KeyringPw(None))) => {
-                assert!(p.masked() && prompt.contains("re-seal"), "got: {prompt}");
-            }
-            _ => panic!("expected the reseal password prompt"),
-        }
-        app.input = None;
-
-        // An unidentified arm must NOT offer the plain erase: `None` is what an
-        // older daemon reports and what an unparseable envelope reports, and
-        // erasing a GNOME keyring token on that reading leaves the login
-        // keyring encrypted under a secret nothing can reproduce.
-        app.keyring_kind = None;
-        app.on_key(KeyCode::Char('f'));
         assert!(
-            app.confirm.is_none(),
-            "an unknown keyring kind must not reach the erase confirm"
+            matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["reseal", "--user", "bob"])
         );
+        assert!(app.input.is_none(), "must not re-arm a token seal");
+        app.on_key(KeyCode::Esc);
+        for kind in [
+            None,
+            Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+        ] {
+            app.keyring_kind = kind;
+            app.on_key(KeyCode::Char('f'));
+            assert!(
+                matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["keyring", "forget", "--user", "bob"])
+            );
+            assert!(
+                app.op.is_none(),
+                "no bare ForgetPassword or implicit force deletion"
+            );
+            app.on_key(KeyCode::Esc);
+        }
 
         // A confirmed password arm is safe to erase from here.
         app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
@@ -11924,6 +12056,7 @@ mod tests {
             daemon_up: true,
             reach: crate::commands::DaemonReach::Running,
             health: None,
+            preferences: None,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -12495,7 +12628,7 @@ mod tests {
             (SC_RECOVERY, "Set Recovery", "Forget"),
             (SC_FINGERPRINT, "Enroll Finger", "Reset"),
             (SC_PAM, "Connect Login", "Disconnect"),
-            (SC_SETTINGS, "Biopolicy", "Biopolicy"),
+            (SC_SETTINGS, "IR-only", "Biopolicy"),
             (SC_DONE, "Connect Login", "Refresh Status"),
         ];
         for (screen, primary, in_overlay) in cases {
@@ -12617,6 +12750,7 @@ mod tests {
             daemon_up: false,
             reach: crate::commands::DaemonReach::Down,
             health: None,
+            preferences: None,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -12818,6 +12952,120 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_wheel_selection_restarts_the_selected_explanation() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![
+            check_row("First", Sev::Warn, Fix::None),
+            check_row("Second", Sev::Warn, Fix::None),
+        ];
+        app.repair[0].detail = "Long first diagnosis. ".repeat(80);
+        let area = Rect::new(0, 0, 120, 50);
+        let text = draw_text(&app);
+        let y = text
+            .lines()
+            .position(|line| line.contains("First"))
+            .unwrap() as u16;
+        let (screen, bounds, _, max) = app.page_view.get();
+        assert!(
+            max > 0,
+            "the first diagnosis must have real scroll overflow"
+        );
+        app.page_view.set((screen, bounds, max.min(3), max));
+        app.on_scroll(30, y, area, 1);
+        assert_eq!(app.repair_sel, 1);
+        assert_eq!(app.page_view.get().2, 0);
+    }
+
+    #[test]
+    fn diagnostics_pending_checks_never_make_the_overview_healthy() {
+        let mut app = test_app();
+        app.daemon_up = true;
+        app.visible = (0..SCREENS.len()).collect();
+        app.repair = vec![check_row("Pending", Sev::Unknown, Fix::None)];
+        let health = |app: &App| {
+            app.hub_rows()
+                .into_iter()
+                .find(|(_, _, screen)| *screen == SC_REPAIR)
+                .unwrap()
+                .1
+        };
+        assert_eq!(health(&app), None);
+        app.repair.push(check_row("Failure", Sev::Fail, Fix::None));
+        assert_eq!(health(&app), Some(false));
+        app.repair = vec![check_row("Passed", Sev::Ok, Fix::None)];
+        assert_eq!(health(&app), Some(true));
+    }
+
+    #[test]
+    fn diagnostics_camera_row_never_restarts_a_starting_or_access_denied_daemon() {
+        let _guard = dead_socket();
+        for reach in [
+            crate::commands::DaemonReach::Starting,
+            crate::commands::DaemonReach::AccessDenied,
+        ] {
+            let mut app = test_app();
+            app.daemon_reach = reach;
+            app.daemon_up = false;
+            app.health = None;
+            app.run_checks();
+            let row = app.repair.iter().find(|c| c.label == "Cameras").unwrap();
+            assert!(
+                !matches!(row.fix, Fix::Root(RootFix::RestartDaemon)),
+                "{}",
+                row.detail
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_missing_template_key_offers_existing_recovery_before_reenrollment() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.recovery = Some(RecoveryInfo {
+            encrypted: true,
+            key_present: false,
+            recovery_set: true,
+            tpm_present: true,
+        });
+        app.run_checks();
+        let index = app
+            .repair
+            .iter()
+            .position(|c| c.label == "Recovery backstop")
+            .unwrap();
+        assert!(app.repair[index].sev == Sev::Fail);
+        app.apply_fix(index);
+        assert_eq!(app.screen, SC_RECOVERY);
+        assert!(matches!(
+            app.input,
+            Some((_, _, Pending::RecoveryRestorePw))
+        ));
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn diagnostics_selected_failure_explains_full_reason_without_claiming_it_is_fine() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![Check {
+            label: "Camera prerequisite".into(),
+            sev: Sev::Fail,
+            detail: format!(
+                "{} DIAGNOSTIC_TAIL_READABLE",
+                "Long diagnostic explanation. ".repeat(8)
+            ),
+            fix: Fix::None,
+        }];
+        let text = draw_text(&app);
+        assert!(text.contains("DIAGNOSTIC_TAIL_READABLE"), "{text}");
+        assert!(
+            !text.contains("this row is fine") && !text.contains("no action needed"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn repair_surfaces_keyring_drift_with_the_reseal_fix() {
         // A TUI-only user never runs `doctor`; PCR drift must show on Repair
         // and point at the reseal action (the newly-added parity fix).
@@ -12836,10 +13084,17 @@ mod tests {
             .find(|c| c.label == "Keyring seal")
             .expect("drift must surface on Repair");
         assert!(row.sev == Sev::Warn);
-        match &row.fix {
-            Fix::Manual(m) => assert!(m.contains("reseal"), "fix points at reseal: {m}"),
-            _ => panic!("expected a manual fix pointing at reseal"),
-        }
+        assert!(matches!(row.fix, Fix::Goto(GotoFix::KeyringReseal)));
+        app.keyring_armed = Some(true);
+        let index = app
+            .repair
+            .iter()
+            .position(|c| c.label == "Keyring seal")
+            .unwrap();
+        app.apply_fix(index);
+        assert!(
+            matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["reseal", "--user", "bob"])
+        );
     }
 
     // ---- an unanswered question renders as unknown, never as a negative ----
@@ -13143,7 +13398,11 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
-        assert!(text.contains("local saved: EXPERIMENTAL IR-only"), "{text}");
+        assert!(
+            text.contains("local observation; daemon preferences unavailable")
+                && text.contains("EXPERIMENTAL IR-only"),
+            "{text}"
+        );
         assert!(text.contains("not qualified"), "{text}");
         assert!(app.confirm.is_none() && app.suspend.is_none());
         assert_eq!(
@@ -13227,6 +13486,10 @@ mod tests {
                 "{text}"
             );
             assert!(text.contains("environment override"), "{text}");
+            assert!(
+                !text.contains("Daemon environment override"),
+                "local fallback must not claim a daemon observation: {text}"
+            );
             app.on_key(KeyCode::Char('p'));
             assert!(app.suspend.is_none() && app.confirm.is_none());
         }
@@ -13234,6 +13497,110 @@ mod tests {
             Some(v) => std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", v),
             None => std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT"),
         }
+    }
+
+    fn preference_fixture(ir_only: bool) -> irlume_common::PreferencesState {
+        irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::Explicit(
+                if ir_only {
+                    irlume_common::config::FaceSensorPolicy::IrOnlyExperimental
+                } else {
+                    irlume_common::config::FaceSensorPolicy::Dual
+                },
+            ),
+            privileged_face_consent: Some(false),
+            enforce_biopolicy: Some(true),
+            consent_overridden: false,
+            biopolicy_overridden: false,
+        }
+    }
+
+    #[test]
+    fn preferences_daemon_state_drives_rendering_and_keyboard_mouse_toggles() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for mouse in [false, true] {
+            let mut app = test_app();
+            app.screen = SC_SETTINGS;
+            app.preferences = Some(preference_fixture(true));
+            let text = draw_text(&app);
+            assert!(text.contains("daemon observed"), "{text}");
+            assert!(row_with(&text, "IR-only:").contains("ON"), "{text}");
+            assert!(row_with(&text, "Hands-free:").contains("ON"), "{text}");
+            assert!(text.contains("ON — ENFORCING"), "{text}");
+            if mouse {
+                click_text(&mut app, "[i] turn IR-only off");
+            } else {
+                app.on_key(KeyCode::Char('i'));
+            }
+            assert!(matches!(
+                app.suspend,
+                Some(Suspend::FaceSensorPolicy(false))
+            ));
+            assert!(app.confirm.is_none());
+            app.suspend = None;
+            app.preferences = Some(preference_fixture(false));
+            if mouse {
+                click_text(&mut app, "[i] turn IR-only on");
+            } else {
+                app.on_key(KeyCode::Char('i'));
+            }
+            assert!(app.suspend.is_none());
+            assert!(app.confirm.as_ref().unwrap().0.contains("not qualified"));
+            app.on_key(KeyCode::Esc);
+            assert!(app.suspend.is_none() && app.confirm.is_none());
+            app.on_key(KeyCode::Char('i'));
+            app.on_key(KeyCode::Char('y'));
+            assert!(matches!(app.suspend, Some(Suspend::FaceSensorPolicy(true))));
+        }
+    }
+
+    #[test]
+    fn preferences_unknown_and_daemon_overrides_never_guess_or_write() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let mut state = preference_fixture(true);
+        state.face_sensor_policy = irlume_common::config::FaceSensorPolicyObservation::Unreadable;
+        state.privileged_face_consent = None;
+        state.enforce_biopolicy = None;
+        app.preferences = Some(state);
+        let text = draw_text(&app);
+        assert!(row_with(&text, "IR-only:").contains("UNKNOWN"));
+        assert!(row_with(&text, "Hands-free:").contains("UNKNOWN"));
+        for key in ['i', 'p', 'b'] {
+            app.on_key(KeyCode::Char(key));
+            assert!(app.confirm.is_none() && app.suspend.is_none());
+        }
+        state = preference_fixture(true);
+        state.consent_overridden = true;
+        state.biopolicy_overridden = true;
+        app.preferences = Some(state);
+        for key in ['p', 'b'] {
+            app.on_key(KeyCode::Char(key));
+            assert!(app.confirm.is_none() && app.suspend.is_none());
+        }
+        assert!(draw_text(&app).contains("environment override"));
+        app.on_key(KeyCode::Char('r'));
+        assert!(
+            matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::MoreAction(invocation)))) if invocation.args("bob") == ["auth", "sensor", "preflight", "--user", "bob"])
+        );
+    }
+
+    #[test]
+    fn preferences_offer_sensor_controls_without_command_instructions() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        assert!(
+            text.contains("[i]"),
+            "IR-only needs an in-app control: {text}"
+        );
+        assert!(
+            text.contains("[r]"),
+            "readiness needs an in-app control: {text}"
+        );
+        assert!(!text.contains("Change as root:"), "{text}");
     }
 
     #[test]
@@ -13670,7 +14037,7 @@ mod tests {
     /// An encrypted enrollment whose template key is gone must not read as a
     /// completed step anywhere.
     ///
-    /// Nothing opens it: no recovery passphrase, no reseal, only a re-enrol. The
+    /// Recovery may restore it, but a missing key is still a failure. The
     /// Recovery tab said so loudly while the Repair check passed it as
     /// "encrypted + recovery set", the Done row drew a green yes, and the hub
     /// badge counted the step done.
@@ -13685,7 +14052,7 @@ mod tests {
         });
         app.run_checks();
 
-        // Repair: a failure with a re-enrol remedy, not an OK.
+        // Repair: a failure with a recovery remedy, not an OK.
         let backstop = app
             .repair
             .iter()

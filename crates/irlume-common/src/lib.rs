@@ -665,6 +665,8 @@ pub enum Request {
     CaptureModeStatus,
     /// Camera-free sensor policy; a user explicitly requests enrollment preflight.
     FaceSensorStatus { user: Option<String> },
+    /// Camera-free, non-secret machine preferences as observed by the daemon.
+    PreferencesStatus,
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Enumerate the Hello camera pairs for the picker. CAMERA-CLASS: it
@@ -1053,9 +1055,36 @@ mod retry_status_wire_tests {
     }
 }
 
+/// Non-secret preference observations, including daemon environment overrides.
+/// These describe policy, not hardware readiness or a successful authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferencesState {
+    pub face_sensor_policy: config::FaceSensorPolicyObservation,
+    pub privileged_face_consent: Option<bool>,
+    pub enforce_biopolicy: Option<bool>,
+    pub consent_overridden: bool,
+    pub biopolicy_overridden: bool,
+}
+
+impl PreferencesState {
+    /// Observe preferences in this process's configuration and environment.
+    #[must_use]
+    pub fn observe() -> Self {
+        Self {
+            face_sensor_policy: config::observe_face_sensor_policy(),
+            privileged_face_consent: config::privileged_face_consent_visible(),
+            enforce_biopolicy: config::enforce_biopolicy_visible(),
+            consent_overridden: std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT").is_some(),
+            biopolicy_overridden: std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some(),
+        }
+    }
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    /// Reply only to the explicit preferences request; older clients are unchanged.
+    PreferencesStatus(PreferencesState),
     /// Camera-free policy observation. Readiness is absent for ordinary status.
     FaceSensorStatus {
         policy: config::FaceSensorPolicyObservation,

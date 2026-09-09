@@ -16,7 +16,7 @@ pub(crate) fn state_label(required: Option<bool>) -> &'static str {
     match required {
         Some(true) => "confirmation required (default)",
         Some(false) => "hands-free (owner opt-in)",
-        None => "unknown: cannot read settings; confirmation remains required",
+        None => "unknown: cannot read settings",
     }
 }
 
@@ -40,10 +40,16 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         }
     };
     let Some(required) = required else {
+        let (state, source) = crate::preferences::observed();
         println!(
-            "[consent] privileged face authentication: {}",
-            state_label(config::privileged_face_consent_visible())
+            "[consent] privileged face authentication: {} ({source})",
+            state_label(state.privileged_face_consent)
         );
+        if state.consent_overridden {
+            println!(
+                "Observed policy includes an environment override; the saved setting may differ."
+            );
+        }
         println!("{SCOPE}");
         if overridden() {
             println!("Local environment override: {OVERRIDE}; the daemon may have a different environment.");

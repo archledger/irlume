@@ -91,6 +91,7 @@ pub fn classify(req: &Request) -> Class {
         // serves from the worker with the other TPM users.
         Ping
         | Health
+        | PreferencesStatus
         | FaceSensorStatus { user: None }
         | HasSealedPassword { .. }
         | RecoveryStatus { .. }

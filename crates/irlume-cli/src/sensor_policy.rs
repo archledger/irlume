@@ -9,7 +9,7 @@ use irlume_common::config::{
 use irlume_common::{Request, Response};
 use std::process::ExitCode;
 
-const WARNING: &str = "EXPERIMENTAL: IR-only omits RGB and cross-spectrum evidence. It is not qualified for authentication assurance. Missing prerequisites use password fallback; no silent RGB fallback is permitted.";
+pub(crate) const WARNING: &str = "EXPERIMENTAL: IR-only omits RGB and cross-spectrum evidence. It is not qualified for authentication assurance. Missing prerequisites use password fallback; no silent RGB fallback is permitted.";
 
 pub(crate) fn state_label(state: State) -> &'static str {
     match state {
@@ -50,12 +50,22 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         }
         [mode, yes] if mode == "ir-only" && yes == "--yes" => Some(Policy::IrOnlyExperimental),
         [preflight] if preflight == "preflight" => return preflight_for(crate::user_arg(&[])),
-        [preflight, user] if preflight == "preflight" && !user.starts_with('-') => {
+        [preflight, flag, user]
+            if preflight == "preflight" && flag == "--user" && valid_user(user) =>
+        {
+            return preflight_for(user.clone())
+        }
+        [preflight, flag]
+            if preflight == "preflight" && flag.strip_prefix("--user=").is_some_and(valid_user) =>
+        {
+            return preflight_for(flag[7..].into())
+        }
+        [preflight, user] if preflight == "preflight" && valid_user(user) => {
             return preflight_for(user.clone())
         }
         _ => {
             eprintln!(
-                "[sensor] usage: irlume auth sensor <status|preflight [user]|dual|ir-only --yes>"
+                "[sensor] usage: irlume auth sensor <status|preflight [--user U]|dual|ir-only --yes>"
             );
             return ExitCode::from(2);
         }
@@ -96,6 +106,10 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         println!("{WARNING}");
     }
     ExitCode::SUCCESS
+}
+
+fn valid_user(user: &str) -> bool {
+    !user.is_empty() && !user.starts_with('-') && !user.chars().any(char::is_control)
 }
 
 fn preflight_for(user: String) -> ExitCode {

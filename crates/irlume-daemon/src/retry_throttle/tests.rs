@@ -134,6 +134,32 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn cumulative_reservation_survives_abandoned_requests() {
+    let f = Fixture::new();
+    cumulative::TIME.set(100);
+    for _ in 0..50 {
+        let attempt = cumulative::start_attempt(&f)
+            .unwrap()
+            .expect("within budget");
+        drop(attempt);
+        f.store
+            .check(
+                &account_one(),
+                POLICY,
+                cumulative::clock,
+                write_atomic_reporting,
+            )
+            .unwrap();
+        cumulative::TIME.set(cumulative::TIME.get() + 31);
+    }
+    assert!(
+        cumulative::start_attempt(&f).unwrap().is_none(),
+        "51st abandoned request must not admit face work"
+    );
+    assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 50);
+}
+
 // Migrated original consent-throttle regressions: the real persistent store now
 // replaces direct inspection/deletion of a process-local map.
 #[test]
@@ -256,32 +282,338 @@ fn rate_throttle_trips_after_the_limit_and_resets_on_grant() {
     assert!(!absent.path().exists());
     f.record(Kind::Spoof);
     let before = f.bytes();
-    let disabled = Policy { limit: 0, ..POLICY };
-    for _ in 0..20 {
-        f.store
-            .record(
-                &account_one(),
-                disabled,
-                &outcome(Kind::Spoof),
-                bad_clock,
-                before_rename,
-            )
-            .unwrap();
-    }
+    // Zero no longer bypasses storage: configured policy falls back safely.
+    let (safe, invalid_setting) = Policy::parse("0", "30");
+    assert!(invalid_setting);
+    assert_eq!(safe.limit, 5);
     f.store
         .record(
             &account_one(),
-            disabled,
+            safe,
             &outcome(Kind::Granted),
             bad_clock,
             before_rename,
         )
-        .unwrap();
-    assert!(!f
+        .unwrap_err();
+    assert!(f
         .store
-        .check(&account_one(), disabled, bad_clock, before_rename)
-        .unwrap());
-    assert_eq!(f.bytes(), before, "disable must retain history");
+        .check(&account_one(), safe, bad_clock, before_rename)
+        .is_err());
+    assert_eq!(f.bytes(), before, "failed persistence must retain history");
+}
+
+mod cumulative {
+    use super::*;
+    thread_local! { pub(super) static TIME: std::cell::Cell<u64> = const { std::cell::Cell::new(100) }; }
+    pub(super) fn clock() -> io::Result<Tick> {
+        Ok(Tick {
+            boot: BOOT.into(),
+            nanos: TIME.get() * NANOS,
+        })
+    }
+    fn store(f: &Fixture) -> Store {
+        Store {
+            parent: f.store.parent.clone(),
+            owner: f.store.owner,
+        }
+    }
+    pub(super) fn start_attempt(f: &Fixture) -> io::Result<Option<FaceAttempt>> {
+        FaceAttempt::begin(
+            store(f),
+            account_one(),
+            POLICY,
+            clock,
+            write_atomic_reporting,
+        )
+    }
+
+    #[test]
+    fn neutral_requests_are_charged_and_fiftieth_success_resets() {
+        let f = Fixture::new();
+        for n in 1..50 {
+            start_attempt(&f)
+                .unwrap()
+                .unwrap()
+                .denied(&outcome(Kind::NoFace))
+                .unwrap();
+            assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, n);
+        }
+        let successful = start_attempt(&f).unwrap().unwrap();
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 50);
+        successful.delivered().unwrap();
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 0);
+        assert!(start_attempt(&f).unwrap().is_some());
+    }
+
+    #[test]
+    fn reservation_write_failures_never_admit_work() {
+        for writer in [before_rename as Writer, after_rename as Writer] {
+            let f = Fixture::new();
+            assert!(FaceAttempt::begin(store(&f), account_one(), POLICY, clock, writer).is_err());
+            if f.path().exists() {
+                assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn prospective_migration_preserves_short_history() {
+        let f = Fixture::new();
+        f.record(Kind::Spoof);
+        f.record(Kind::Spoof);
+        assert_eq!(f.saved().version, 1);
+        assert!(f.saved().budget.is_none());
+        let attempt = start_attempt(&f).unwrap().unwrap();
+        let saved = f.saved();
+        assert_eq!(saved.version, 2);
+        assert_eq!(saved.strikes, 2);
+        assert_eq!(saved.budget.unwrap().unsuccessful_requests, 1);
+        drop(attempt);
+    }
+
+    #[test]
+    fn owner_blocks_recovery_and_drop_releases_without_reset() {
+        let f = Fixture::new();
+        let attempt = start_attempt(&f).unwrap().unwrap();
+        assert!(f.store.operation(&account_one()).is_err());
+        drop(attempt);
+        assert!(f.store.operation(&account_one()).is_ok());
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+    }
+
+    #[test]
+    fn invalid_configuration_uses_safe_defaults_without_disable() {
+        for limit in ["0", "6", "-1", "wat", "4294967296"] {
+            let (p, invalid) = Policy::parse(limit, "30");
+            assert!(invalid);
+            assert_eq!(p.limit, 5);
+        }
+        for seconds in ["0", "29", "86401", "-1", "18446744073709551616"] {
+            let (p, invalid) = Policy::parse("5", seconds);
+            assert!(invalid);
+            assert_eq!(p.seconds, 30);
+        }
+        assert_eq!(
+            Policy::parse("1", "86400"),
+            (
+                Policy {
+                    limit: 1,
+                    seconds: 86400
+                },
+                false
+            )
+        );
+    }
+
+    fn grant_reply(f: &Fixture) -> crate::WorkerReply {
+        crate::WorkerReply {
+            response: crate::Response::AuthResult {
+                granted: true,
+                score: 1.0,
+                live: true,
+                reason: "synthetic".into(),
+                declined_by_gesture: false,
+                refused_by_policy: false,
+                situation: String::new(),
+            },
+            completion: Some(crate::FaceCompletion {
+                attempt: start_attempt(f).unwrap().unwrap(),
+                window: irlume_auth::AuthenticationWindow::for_service(None),
+            }),
+        }
+    }
+
+    #[test]
+    fn delivery_success_alone_resets_and_synchronous_return_does_not() {
+        let _env = crate::test_support::env_read();
+        let f = Fixture::new();
+        let reply = grant_reply(&f);
+        assert!(f.store.operation(&account_one()).is_err());
+        let _response = reply.response;
+        drop(reply.completion);
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        let reply = grant_reply(&f);
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        reply.respond(server).unwrap();
+        let mut text = String::new();
+        (&client).read_to_string(&mut text).unwrap();
+        assert!(text.contains("\"granted\":true"));
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 0);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
+    fn disconnected_delivery_and_dropped_channel_keep_charge() {
+        let _env = crate::test_support::env_read();
+        let f = Fixture::new();
+        let reply = grant_reply(&f);
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(client);
+        assert!(reply.respond(server).is_err());
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = grant_reply(&f);
+        drop(rx);
+        drop(tx.send(reply).unwrap_err());
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 2);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
+    fn peer_write_shutdown_cancels_before_first_response_byte() {
+        let _env = crate::test_support::env_read();
+        let f = Fixture::new();
+        let reply = grant_reply(&f);
+        let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(crate::peer_gone(&server));
+        assert!(reply.respond(server).is_err());
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
+    fn ordinary_ok_response_cannot_acknowledge_a_face_token() {
+        let _env = crate::test_support::env_read();
+        let f = Fixture::new();
+        let mut reply = grant_reply(&f);
+        reply.response = crate::Response::Ok("diagnostic completed".into());
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        reply.respond(server).unwrap();
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+    }
+
+    #[test]
+    fn expired_reply_sends_no_bytes_and_keeps_reservation() {
+        let _env = crate::test_support::env_write();
+        let previous = std::env::var_os("IRLUME_GRACE_MS");
+        std::env::set_var("IRLUME_GRACE_MS", "1");
+        let f = Fixture::new();
+        let reply = grant_reply(&f);
+        match previous {
+            Some(v) => std::env::set_var("IRLUME_GRACE_MS", v),
+            None => std::env::remove_var("IRLUME_GRACE_MS"),
+        }
+        let window = reply.completion.as_ref().unwrap().window;
+        while window.check().is_ok() {
+            std::thread::yield_now();
+        }
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(reply.respond(server).is_err());
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
+    fn malformed_v2_budget_never_becomes_new_epoch() {
+        for budget in [
+            r#"{"unsuccessful_requests":51,"pending":false}"#,
+            r#"{"unsuccessful_requests":0,"pending":true}"#,
+            r#"{"unsuccessful_requests":1}"#,
+            r#"{"unsuccessful_requests":1,"pending":false,"extra":0}"#,
+        ] {
+            let f = Fixture::new();
+            let value = format!(
+                r#"{{"version":2,"uid":1001,"account":"synthetic-one","strikes":0,"cooldown":null,"budget":{budget}}}"#
+            );
+            f.plant(value.as_bytes());
+            assert!(start_attempt(&f).is_err());
+            assert_eq!(f.bytes(), value.as_bytes());
+        }
+        let f = Fixture::new();
+        f.plant(br#"{"version":1,"uid":1001,"account":"synthetic-one","strikes":0,"cooldown":null,"budget":null}"#);
+        assert!(start_attempt(&f).is_err());
+    }
+
+    #[test]
+    fn stalled_partial_response_keeps_charge_and_releases_owner() {
+        use std::os::fd::AsRawFd;
+        let _env = crate::test_support::env_write();
+        let previous = std::env::var_os("IRLUME_GRACE_MS");
+        std::env::set_var("IRLUME_GRACE_MS", "500");
+        let f = Fixture::new();
+        let mut reply = grant_reply(&f);
+        match previous {
+            Some(v) => std::env::set_var("IRLUME_GRACE_MS", v),
+            None => std::env::remove_var("IRLUME_GRACE_MS"),
+        }
+        if let crate::Response::AuthResult { reason, .. } = &mut reply.response {
+            *reason = "synthetic".repeat(32768);
+        }
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            // SAFETY: server is live and size is a correctly sized integer option.
+            unsafe {
+                libc::setsockopt(
+                    server.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::from_ref(&size).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        assert!(reply.respond(server).is_err());
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        assert!(!bytes.ends_with(b"\n"), "no complete reply was written");
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
+    fn reboot_cannot_refill_exhausted_budget_and_other_accounts_stay_independent() {
+        let f = Fixture::new();
+        for _ in 0..50 {
+            start_attempt(&f)
+                .unwrap()
+                .unwrap()
+                .denied(&outcome(Kind::NoFace))
+                .unwrap();
+        }
+        assert!(f
+            .store
+            .check(&account_one(), POLICY, reboot, write_atomic_reporting)
+            .unwrap());
+        assert!(FaceAttempt::begin(
+            store(&f),
+            account_one(),
+            POLICY,
+            reboot,
+            write_atomic_reporting
+        )
+        .unwrap()
+        .is_none());
+        let other = Account {
+            uid: 1002,
+            name: "synthetic-two".into(),
+        };
+        let granted = FaceAttempt::begin(store(&f), other, POLICY, reboot, write_atomic_reporting)
+            .unwrap()
+            .unwrap();
+        granted.delivered().unwrap();
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 50);
+    }
+
+    #[test]
+    fn failed_success_reset_keeps_the_durable_reservation() {
+        let f = Fixture::new();
+        let mut attempt = start_attempt(&f).unwrap().unwrap();
+        attempt.writer = before_rename;
+        assert!(attempt.delivered().is_err());
+        let saved = f.saved().budget.unwrap();
+        assert_eq!(saved.unsuccessful_requests, 1);
+        assert!(saved.pending);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
 }
 
 #[test]
@@ -772,4 +1104,20 @@ fn record_owner_and_nested_cooldown_schema_are_checked() {
             .check(&account_one(), POLICY, now, write_atomic_reporting)
             .is_err());
     }
+}
+
+#[test]
+fn authentication_budget_expired_before_commit_preserves_retry_history() {
+    let fixture = Fixture::new();
+    fixture.record(Kind::Spoof);
+    let result = fixture.store.record_if(
+        &account_one(),
+        POLICY,
+        &outcome(Kind::Granted),
+        now,
+        write_atomic_reporting,
+        || false,
+    );
+    assert!(result.is_err(), "expired success must not commit");
+    assert_eq!(fixture.saved().strikes, 1);
 }

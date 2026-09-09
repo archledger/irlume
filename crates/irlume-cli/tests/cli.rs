@@ -7,13 +7,16 @@
 //! Every invocation runs inside a sandbox: `IRLUME_SOCKET` points at a path
 //! nothing listens on (so no request can ever reach a real `irlumed`),
 //! `IRLUME_CONFIG_DIR` / `IRLUME_STATE_DIR` / `IRLUME_KEYRING_DIR` point at a
-//! per-test temp tree, and system tools the CLI shells out to (journalctl,
-//! rpm, curl, semodule, ...) are PATH-shadowed with fake scripts. No test
-//! touches the network, a camera, the TPM, or the machine's package database.
+//! per-test temp tree, and system tools the CLI shells out to are fake scripts.
+//! Privileged fixed-path probes run in a Bubblewrap namespace with private
+//! `/usr/bin` and `/run`. No test touches the network, a camera, the TPM, or the
+//! machine's package database.
 
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");
 
@@ -36,6 +39,14 @@ impl Sandbox {
         for d in ["cfg", "state", "keyring", "bin", "work"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
+        let helper = root.join("wallet-salt-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n[ \"$1\" = --read-salt ] && [ \"$#\" -eq 2 ] || exit 1\nexit 3\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         Sandbox { root }
     }
 
@@ -60,6 +71,7 @@ impl Sandbox {
             .env("IRLUME_STATE_DIR", self.root.join("state"))
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
+            .env("IRLUME_KWALLET_INIT", self.root.join("wallet-salt-helper"))
             .env_remove("IRLUME_DEV")
             .env_remove("ORT_DYLIB_PATH")
             .env_remove("IRLUME_MODEL")
@@ -84,6 +96,10 @@ impl Sandbox {
             ),
         );
         c
+    }
+
+    fn isolated_root_cmd(&self, args: &[&str], tools: &[&str]) -> Command {
+        support::isolated_root_command(&self.root, BIN, args, tools)
     }
 }
 
@@ -188,6 +204,7 @@ fn help_lists_every_public_command_and_hides_dev_tools() {
             "keyring",
             "reseal",
             "recovery",
+            "retry",
             "diag",
             "login",
             "logs",
@@ -1005,20 +1022,24 @@ fn selinux_status_classifies_module_state_from_probe_output() {
         "ls",
         r#"printf 'system_u:object_r:irlume_runtime_t:s0 /run/irlume.sock\n'"#,
     );
-    let (code, out, _) = run(&mut sb.cmd_with_fakes(&["selinux", "status"]));
+    support::assert_system_command_isolation(&sb.root, &["semodule", "ls"]);
+    let (code, out, _) =
+        run(&mut sb.isolated_root_cmd(&["selinux", "status"], &["semodule", "ls"]));
     assert_eq!(code, 0);
     assert!(out.contains("module 'irlume': loaded"), "{out}");
 
     // Listed modules but ours absent, and no socket label: not loaded.
     sb.fake_tool("semodule", r#"printf 'somethingelse\n'"#);
     sb.fake_tool("ls", "exit 2");
-    let (code, out, _) = run(&mut sb.cmd_with_fakes(&["selinux", "status"]));
+    let (code, out, _) =
+        run(&mut sb.isolated_root_cmd(&["selinux", "status"], &["semodule", "ls"]));
     assert_eq!(code, 0);
     assert!(out.contains("not loaded"), "{out}");
 
     // semodule prints nothing (non-root): state is unknown, not "not loaded".
     sb.fake_tool("semodule", "exit 1");
-    let (code, out, _) = run(&mut sb.cmd_with_fakes(&["selinux", "status"]));
+    let (code, out, _) =
+        run(&mut sb.isolated_root_cmd(&["selinux", "status"], &["semodule", "ls"]));
     assert_eq!(code, 0);
     assert!(out.contains("unknown"), "{out}");
 
@@ -2169,4 +2190,897 @@ fn removed_gesture_commands_are_unknown() {
         let (code, _, _) = run(&mut cmd);
         assert_eq!(code, 2);
     }
+}
+
+// Consent control must use the same default and opt-out policy as PAM/daemon.
+#[test]
+fn auth_sensor_status_distinguishes_default_explicit_invalid_and_unreadable() {
+    let sb = Sandbox::new("sensor-status");
+    for (contents, expected) in [
+        (None, "dual (default)"),
+        (
+            Some(b"face_sensor_policy=ir-only-experimental\n".as_slice()),
+            "EXPERIMENTAL IR-only",
+        ),
+        (Some(b"face_sensor_policy=\n".as_slice()), "invalid"),
+        (Some(b"face_sensor_policy=typo\n".as_slice()), "invalid"),
+        (
+            Some(b"face_sensor_policy=dual\nface_sensor_policy=ir-only-experimental\n".as_slice()),
+            "invalid",
+        ),
+        (Some(b"\xff".as_slice()), "unreadable"),
+    ] {
+        if let Some(contents) = contents {
+            std::fs::write(sb.path("cfg/settings.conf"), contents).unwrap();
+        }
+        let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "status"]));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(out.contains(expected), "{out} {err}");
+        assert!(
+            out.contains("local saved"),
+            "offline state must not claim daemon observation: {out}"
+        );
+    }
+}
+
+#[test]
+fn auth_sensor_malformed_key_cannot_silently_select_dual() {
+    let sb = Sandbox::new("sensor-malformed-key");
+    for contents in [
+        "face_sensor_policy ir-only-experimental\n",
+        "face_sensor_policy: ir-only-experimental\n",
+        "face_sensor_policy\tir-only-experimental\n",
+        "face_sensor_policy : ir-only-experimental\n",
+        "face_sensor_policy:=ir-only-experimental\n",
+        "face_sensor_policy ir-only-experimental=1\n",
+        "face_sensor_policy=dual\nface_sensor_policy: ir-only-experimental\n",
+    ] {
+        std::fs::write(sb.path("cfg/settings.conf"), contents).unwrap();
+        let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "status"]));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(
+            out.contains("invalid sensor policy"),
+            "{contents:?}: {out} {err}"
+        );
+        assert!(!out.contains("dual (default)"), "{out}");
+        let (code, _, _) = run(&mut sb.isolated_root_cmd(&["auth", "sensor", "dual"], &[]));
+        assert_ne!(
+            code, 0,
+            "owner update must not silently retain malformed policy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap(),
+            contents
+        );
+    }
+    for contents in [
+        "face_sensor_policy_extra=ir-only-experimental\n",
+        "face_sensor_policy_extra ir-only-experimental\n",
+        "# face_sensor_policy: ir-only-experimental\n",
+    ] {
+        std::fs::write(sb.path("cfg/settings.conf"), contents).unwrap();
+        let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "status"]));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(
+            out.contains("dual (default)"),
+            "distinct key/comment: {out}"
+        );
+    }
+}
+
+#[test]
+fn auth_sensor_status_uses_daemon_observation_and_preflight_is_explicit() {
+    use irlume_common::config::{FaceSensorPolicy, FaceSensorPolicyObservation};
+    let sb = Sandbox::new("sensor-daemon");
+    std::fs::write(sb.path("cfg/settings.conf"), "face_sensor_policy=dual\n").unwrap();
+    let requests = serve(&sock(&sb), |req| match req {
+        Request::FaceSensorStatus { user } => Response::FaceSensorStatus {
+            policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
+            ir_readiness: user
+                .as_ref()
+                .map(|_| irlume_common::IrOnlyReadiness::Unavailable),
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "status"]));
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        out.contains("daemon observed: EXPERIMENTAL IR-only"),
+        "{out}"
+    );
+    assert!(out.contains("not qualified"), "{out}");
+    let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "alice"]));
+    assert_ne!(code, 0);
+    assert!(err.contains("preflight unavailable"), "{out} {err}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        &requests[0],
+        Request::FaceSensorStatus { user: None }
+    ));
+    assert!(
+        matches!(&requests[1], Request::FaceSensorStatus { user: Some(user) } if user == "alice")
+    );
+    assert_eq!(
+        std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap(),
+        "face_sensor_policy=dual\n"
+    );
+}
+
+#[test]
+fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
+    use irlume_common::config::{FaceSensorPolicy, FaceSensorPolicyObservation};
+    use irlume_common::IrOnlyReadiness;
+
+    let sb = Sandbox::new("sensor-preflight-readiness");
+    let requests = serve(&sock(&sb), |req| {
+        let Request::FaceSensorStatus { user: Some(user) } = req else {
+            return Response::Error("unexpected request".into());
+        };
+        let ir_readiness = match user.as_str() {
+            "ready-account" => IrOnlyReadiness::ReadyForExperimentalAttempt,
+            "unavailable-account" => IrOnlyReadiness::Unavailable,
+            "invalid-policy-account" => IrOnlyReadiness::InvalidPolicy,
+            "target-account" => IrOnlyReadiness::TargetUnavailable,
+            "binding-absent-account" => IrOnlyReadiness::BindingUnavailable,
+            "binding-mismatch-account" => IrOnlyReadiness::BindingMismatch,
+            "models-account" => IrOnlyReadiness::ModelsUnavailable,
+            "pad-account" => IrOnlyReadiness::PadUnavailable,
+            "enrollment-account" => IrOnlyReadiness::EnrollmentUnavailable,
+            "incompatible-account" => IrOnlyReadiness::IncompatibleEnrollment,
+            _ => return Response::Error("unknown fixture account".into()),
+        };
+        Response::FaceSensorStatus {
+            policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
+            ir_readiness: Some(ir_readiness),
+        }
+    });
+
+    for (account, success, expected) in [
+        ("ready-account", true, "prerequisites are ready"),
+        ("unavailable-account", false, "preflight unavailable"),
+        ("invalid-policy-account", false, "policy is invalid"),
+        (
+            "target-account",
+            false,
+            "configured IR target is unavailable",
+        ),
+        (
+            "binding-absent-account",
+            false,
+            "IR enrollment has no camera binding",
+        ),
+        ("binding-mismatch-account", false, "different IR camera"),
+        ("models-account", false, "face models are unavailable"),
+        ("pad-account", false, "IR anti-spoofing is unavailable"),
+        (
+            "enrollment-account",
+            false,
+            "face enrollment is unavailable",
+        ),
+        ("incompatible-account", false, "compatible IR scans"),
+    ] {
+        let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", account]));
+        assert_eq!(code == 0, success, "{account}: {out} {err}");
+        let rendered = format!("{out}{err}");
+        assert!(rendered.contains(expected), "{account}: {rendered}");
+        assert!(!rendered.contains(account), "{account}: {rendered}");
+        assert!(
+            rendered.contains("daemon observed: EXPERIMENTAL IR-only"),
+            "{account}: {rendered}"
+        );
+        if success {
+            assert!(rendered.contains("EXPERIMENTAL"), "{rendered}");
+            assert!(rendered.contains("does not prove capture"), "{rendered}");
+            assert!(rendered.contains("not qualified"), "{rendered}");
+        } else {
+            assert!(rendered.contains("password"), "{account}: {rendered}");
+        }
+    }
+    assert_eq!(requests.lock().unwrap().len(), 10);
+}
+
+#[test]
+fn auth_sensor_preflight_fails_closed_for_missing_or_future_readiness() {
+    use irlume_common::config::{FaceSensorPolicy, FaceSensorPolicyObservation};
+
+    let sb = Sandbox::new("sensor-preflight-unknown");
+    let requests = serve(&sock(&sb), |_| Response::FaceSensorStatus {
+        policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
+        ir_readiness: None,
+    });
+    let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "missing-account"]));
+    assert_ne!(code, 0, "{out} {err}");
+    assert!(err.contains("could not establish"), "{out} {err}");
+    assert!(!format!("{out}{err}").contains("missing-account"));
+    drop(requests);
+
+    use std::io::{BufRead, BufReader};
+    let socket = sock(&sb);
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let reply = serde_json::to_string(&Response::FaceSensorStatus {
+            policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
+            ir_readiness: Some(irlume_common::IrOnlyReadiness::Unavailable),
+        })
+        .unwrap()
+        .replace("unavailable", "future_readiness");
+        writeln!(stream, "{reply}").unwrap();
+    });
+    let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "future-account"]));
+    assert_ne!(code, 0, "{out} {err}");
+    assert!(err.contains("could not establish"), "{out} {err}");
+    let rendered = format!("{out}{err}");
+    assert!(!rendered.contains("future-account"), "{rendered}");
+    assert!(!rendered.contains("future_readiness"), "{rendered}");
+}
+
+#[test]
+fn auth_sensor_owner_change_requires_ack_and_preserves_unrelated_settings() {
+    let sb = Sandbox::new("sensor-owner");
+    let original = "# retained\nprivileged_face_consent=1\ncapture_mode=sequential\n";
+    std::fs::write(sb.path("cfg/settings.conf"), original).unwrap();
+    let (code, _, err) = run(&mut sb.isolated_root_cmd(&["auth", "sensor", "ir-only"], &[]));
+    assert_eq!(code, 2, "{err}");
+    assert_eq!(
+        std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap(),
+        original
+    );
+    for (args, expected) in [
+        (
+            vec!["auth", "sensor", "ir-only", "--yes"],
+            "ir-only-experimental",
+        ),
+        (vec!["auth", "sensor", "dual"], "dual"),
+    ] {
+        let (code, out, err) = run(&mut sb.isolated_root_cmd(&args, &[]));
+        assert_eq!(code, 0, "{out} {err}");
+        let saved = std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap();
+        assert_eq!(saved, format!("{original}face_sensor_policy={expected}\n"));
+        assert!(out.contains("Readiness is not established"), "{out}");
+        assert!(!sb.path("cfg/cameras.conf").exists());
+        assert!(!sb.path("state/retry").exists());
+    }
+}
+
+#[test]
+fn auth_sensor_refuses_nonroot_invalid_args_and_unreadable_updates() {
+    let sb = Sandbox::new("sensor-refusals");
+    if !is_root() {
+        let (code, _, err) = run(&mut sb.cmd(&["auth", "sensor", "ir-only", "--yes"]));
+        assert_ne!(code, 0);
+        assert!(err.contains("root"), "{err}");
+        assert!(!sb.path("cfg/settings.conf").exists());
+    }
+    for args in [
+        vec!["auth", "sensor", "unknown"],
+        vec!["auth", "sensor", "dual", "--yes"],
+        vec!["auth", "sensor", "preflight", "--yes"],
+        vec!["auth", "sensor", "ir-only", "--yes", "extra"],
+    ] {
+        assert_eq!(run(&mut sb.cmd(&args)).0, 2);
+        assert!(!sb.path("cfg/settings.conf").exists());
+    }
+    let original = [0xff, 0xfe];
+    std::fs::write(sb.path("cfg/settings.conf"), original).unwrap();
+    let (code, _, _) = run(&mut sb.isolated_root_cmd(&["auth", "sensor", "dual"], &[]));
+    assert_ne!(code, 0);
+    assert_eq!(
+        std::fs::read(sb.path("cfg/settings.conf")).unwrap(),
+        original
+    );
+    let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight"]));
+    assert_ne!(code, 0);
+    assert!(err.contains("could not establish"), "{out} {err}");
+}
+
+#[test]
+fn auth_sensor_and_consent_concurrent_writes_preserve_both_policies() {
+    let sb = Sandbox::new("sensor-concurrent");
+    let sensor = sb
+        .isolated_root_cmd(&["auth", "sensor", "ir-only", "--yes"], &[])
+        .spawn()
+        .unwrap();
+    let consent = sb
+        .isolated_root_cmd(&["auth", "consent", "hands-free", "--yes"], &[])
+        .spawn()
+        .unwrap();
+    for child in [sensor, consent] {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let saved = std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap();
+    assert!(
+        saved.contains("face_sensor_policy=ir-only-experimental\n"),
+        "{saved}"
+    );
+    assert!(saved.contains("privileged_face_consent=0\n"), "{saved}");
+}
+
+#[test]
+fn auth_consent_status_reports_policy_without_contacting_daemon() {
+    let sb = Sandbox::new("consent-status");
+    for (value, label) in [
+        (None, "required"),
+        (Some("0"), "hands-free"),
+        (Some("typo"), "required"),
+    ] {
+        if let Some(v) = value {
+            std::fs::write(
+                sb.path("cfg/settings.conf"),
+                format!("privileged_face_consent={v}\n"),
+            )
+            .unwrap();
+        }
+        let (code, out, err) = run(sb
+            .cmd(&["auth", "consent", "status"])
+            .env_remove("IRLUME_PRIVILEGED_FACE_CONSENT"));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(out.contains(label) && out.contains("privileged"), "{out}");
+    }
+}
+
+#[test]
+fn auth_consent_rejects_unknown_arguments_without_writing() {
+    let sb = Sandbox::new("consent-args");
+    for args in [
+        vec!["auth", "consent", "unknown"],
+        vec!["auth", "consent", "required", "--yes"],
+        vec!["auth", "consent", "hands-free", "--yes", "--user", "root"],
+    ] {
+        let (code, _, _) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 2);
+        assert!(!sb.path("cfg/settings.conf").exists());
+    }
+}
+
+#[test]
+fn auth_consent_updates_are_authorized_explicit_and_preserve_other_settings() {
+    let sb = Sandbox::new("consent-write");
+    let original = "# keep this\nenforce_biopolicy=1\nprivileged_face_consent=1\n";
+    std::fs::write(sb.path("cfg/settings.conf"), original).unwrap();
+    let (code, _, _) = run(sb
+        .cmd(&["auth", "consent", "hands-free"])
+        .env_remove("IRLUME_PRIVILEGED_FACE_CONSENT"));
+    assert_ne!(code, 0);
+    assert_eq!(
+        std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap(),
+        original
+    );
+    let (code, out, err) = run(sb
+        .cmd(&["auth", "consent", "hands-free", "--yes"])
+        .env_remove("IRLUME_PRIVILEGED_FACE_CONSENT"));
+    if !is_root() {
+        assert_ne!(code, 0);
+        assert!(err.contains("root"), "{out} {err}");
+        assert_eq!(
+            std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap(),
+            original
+        );
+        return;
+    }
+    assert_eq!(code, 0, "{out} {err}");
+    let saved = std::fs::read_to_string(sb.path("cfg/settings.conf")).unwrap();
+    assert!(
+        saved.contains("enforce_biopolicy=1")
+            && saved.contains("# keep this")
+            && saved.contains("privileged_face_consent=0"),
+        "{saved}"
+    );
+    let (code, out, err) = run(sb
+        .cmd(&["auth", "consent", "required"])
+        .env_remove("IRLUME_PRIVILEGED_FACE_CONSENT"));
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(std::fs::read_to_string(sb.path("cfg/settings.conf"))
+        .unwrap()
+        .contains("privileged_face_consent=1"));
+}
+
+#[test]
+fn auth_consent_override_is_visible_and_blocks_misleading_writes() {
+    let sb = Sandbox::new("consent-override");
+    let (code, out, err) = run(sb
+        .cmd(&["auth", "consent", "status"])
+        .env("IRLUME_PRIVILEGED_FACE_CONSENT", "0"));
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        out.contains("hands-free") && out.contains("environment override"),
+        "{out}"
+    );
+    let (code, _, err) = run(sb
+        .cmd(&["auth", "consent", "required"])
+        .env("IRLUME_PRIVILEGED_FACE_CONSENT", "0"));
+    assert_ne!(code, 0);
+    assert!(err.contains("override"), "{err}");
+    assert!(!sb.path("cfg/settings.conf").exists());
+}
+
+#[test]
+fn auth_consent_never_overwrites_unreadable_settings() {
+    let sb = Sandbox::new("consent-unreadable");
+    let original = [0xff, 0x00, 0xfe];
+    std::fs::write(sb.path("cfg/settings.conf"), original).unwrap();
+    let (code, out, err) = run(sb
+        .cmd(&["auth", "consent", "status"])
+        .env_remove("IRLUME_PRIVILEGED_FACE_CONSENT"));
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("unknown"), "{out}");
+    let (code, _, _) = run(sb
+        .cmd(&["auth", "consent", "hands-free", "--yes"])
+        .env_remove("IRLUME_PRIVILEGED_FACE_CONSENT"));
+    assert_ne!(code, 0);
+    assert_eq!(
+        std::fs::read(sb.path("cfg/settings.conf")).unwrap(),
+        original
+    );
+}
+
+// ------------------------------------------------------------- retry recovery
+
+fn retry_available() -> Response {
+    Response::RetryStatus {
+        face_budget: None, // Legacy daemon: cumulative enforcement is unknown.
+        failures: 4,
+        cooldown_seconds: 12,
+        recovery_failures: 2,
+        recovery_cooldown_seconds: 0,
+        recovery_required: false,
+        password_reset_available: true,
+    }
+}
+
+/// Execute the actual password prompt on a private controlling terminal. Input
+/// is synthetic and sent only after the prompt is visible AND ECHO is disabled.
+/// Waiting for ECHO avoids a race between rpassword's prompt write and tcsetattr.
+fn retry_terminal(cmd: &mut Command, input: Option<&str>) -> (i32, String) {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+
+    let (mut master_fd, mut slave_fd) = (-1, -1);
+    assert_eq!(
+        // SAFETY: both output pointers are valid; null optional arguments select
+        // default terminal settings and no requested slave pathname.
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    // SAFETY: successful openpty transfers two valid, distinct descriptors.
+    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    // SAFETY: slave_fd is owned here exactly once, independently of master_fd.
+    let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        assert_eq!(
+            // SAFETY: the descriptors remain open throughout this call.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    cmd.stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    // SAFETY: pre_exec uses only async-signal-safe libc operations. Descriptor
+    // zero has already been installed from the slave before this closure runs.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    drop(slave);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut transcript = Vec::new();
+    let mut sent = false;
+    let mut status = None;
+    loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("retry command exceeded private terminal fixture deadline");
+        }
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized entry and the fd remains open.
+        let ready = unsafe { libc::poll(&mut poll, 1, 25) };
+        assert!(ready >= 0);
+        if ready > 0 && poll.revents & libc::POLLIN != 0 {
+            let mut buffer = [0; 1024];
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => transcript.extend_from_slice(&buffer[..n]),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("private terminal read: {error}"),
+            }
+        }
+        if !sent && String::from_utf8_lossy(&transcript).contains("Current login password: ") {
+            let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(
+                // SAFETY: tcgetattr initializes the valid output buffer on success.
+                unsafe { libc::tcgetattr(master.as_raw_fd(), termios.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: the successful tcgetattr call initialized termios.
+            if unsafe { termios.assume_init() }.c_lflag & libc::ECHO == 0 {
+                if let Some(input) = input {
+                    master.write_all(input.as_bytes()).unwrap();
+                    sent = true;
+                }
+            }
+        }
+        status = status.or_else(|| child.try_wait().unwrap());
+        if status.is_some() && ready == 0 {
+            break;
+        }
+    }
+    let status = status.unwrap_or_else(|| child.wait().unwrap());
+    (
+        status.code().expect("fixture child terminated by signal"),
+        String::from_utf8(transcript).unwrap(),
+    )
+}
+
+#[test]
+fn retry_status_reports_daemon_state_without_camera_access() {
+    let sb = Sandbox::new("retry-status");
+    let requests = serve(&sock(&sb), |_| retry_available());
+    let (code, text, error) = run(&mut sb.cmd(&["retry", "--user", "alice", "status"]));
+    assert_eq!(code, 0, "{error}");
+    assert!(
+        text.contains("'alice': 4 recorded failures, 12s cooldown"),
+        "{text}"
+    );
+    assert!(text.contains("2 failed checks, 0s cooldown"), "{text}");
+    assert!(text.contains("Ordinary password login remains available"));
+    assert!(
+        text.contains("Cumulative face budget unavailable from this daemon; enforcement unknown.")
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(&requests[0], Request::RetryStatus { user } if user == "alice"));
+}
+
+#[test]
+fn retry_reset_old_daemon_does_not_prompt_or_send_a_password() {
+    let sb = Sandbox::new("retry-old-daemon");
+    let requests = serve(&sock(&sb), |_| Response::Error("bad request".into()));
+    let (code, transcript) =
+        retry_terminal(&mut sb.cmd(&["retry", "reset", "--user", "alice"]), None);
+    assert_eq!(code, 1);
+    assert!(transcript.contains("support"), "{transcript}");
+    assert!(!transcript.contains("Current login password:"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(&requests[0], Request::RetryStatus { .. }));
+}
+
+#[test]
+fn retry_status_distinguishes_prospective_and_exhausted_face_budget() {
+    for (tag, count, expected) in [
+        ("prospective", None, "earlier history unknown"),
+        (
+            "face-exhausted",
+            Some(50),
+            "50/50 consecutive unsuccessful; password-verified retry reset required",
+        ),
+    ] {
+        let sb = Sandbox::new(&format!("retry-{tag}"));
+        let _requests = serve(&sock(&sb), move |_| {
+            let Response::RetryStatus {
+                failures,
+                cooldown_seconds,
+                recovery_failures,
+                recovery_cooldown_seconds,
+                recovery_required,
+                password_reset_available,
+                ..
+            } = retry_available()
+            else {
+                unreachable!()
+            };
+            Response::RetryStatus {
+                failures,
+                cooldown_seconds,
+                recovery_failures,
+                recovery_cooldown_seconds,
+                recovery_required,
+                password_reset_available,
+                face_budget: Some(irlume_common::FaceRetryBudget {
+                    unsuccessful_requests: count,
+                    limit: 50,
+                    reset_required: count == Some(50),
+                }),
+            }
+        });
+        let (code, text, error) = run(&mut sb.cmd(&["retry", "status", "--user", "alice"]));
+        assert_eq!(code, 0, "{error}");
+        assert!(text.contains(expected), "{text}");
+        assert!(
+            text.contains("Password-verified retry reset: available"),
+            "{text}"
+        );
+        assert!(!text.contains("administrator reset required"), "{text}");
+    }
+}
+
+#[test]
+fn retry_reset_refuses_unavailable_limited_and_denied_status_before_prompting() {
+    if is_root() {
+        eprintln!("SKIP: non-root retry admission fixture; run default suite unprivileged");
+        return;
+    }
+    for (tag, response) in [
+        (
+            "unavailable",
+            Response::RetryStatus {
+                face_budget: None,
+                password_reset_available: false,
+                failures: 0,
+                cooldown_seconds: 0,
+                recovery_failures: 0,
+                recovery_cooldown_seconds: 0,
+                recovery_required: false,
+            },
+        ),
+        (
+            "cooldown",
+            Response::RetryStatus {
+                face_budget: None,
+                password_reset_available: true,
+                failures: 0,
+                cooldown_seconds: 0,
+                recovery_failures: 5,
+                recovery_cooldown_seconds: 30,
+                recovery_required: false,
+            },
+        ),
+        (
+            "exhausted",
+            Response::RetryStatus {
+                face_budget: None,
+                password_reset_available: true,
+                failures: 0,
+                cooldown_seconds: 0,
+                recovery_failures: 50,
+                recovery_cooldown_seconds: 0,
+                recovery_required: true,
+            },
+        ),
+        (
+            "denied",
+            Response::Error("permission denied: another account".into()),
+        ),
+    ] {
+        let sb = Sandbox::new(&format!("retry-{tag}"));
+        let requests = serve(&sock(&sb), move |_| response.clone());
+        let (code, transcript) =
+            retry_terminal(&mut sb.cmd(&["retry", "reset", "--user", "alice"]), None);
+        assert_eq!(code, 1, "{tag}: {transcript}");
+        assert!(!transcript.contains("Current login password:"), "{tag}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{tag}");
+    }
+}
+
+#[test]
+fn retry_reset_reads_password_without_echo_and_sends_exact_request() {
+    if is_root() {
+        eprintln!("SKIP: non-root password fixture; run default suite unprivileged");
+        return;
+    }
+    let sb = Sandbox::new("retry-password-pty");
+    let requests = serve(&sock(&sb), |request| match request {
+        Request::RetryStatus { .. } => retry_available(),
+        Request::RetryReset { .. } => Response::Ok("Retry state reset.".into()),
+        _ => Response::Error("unexpected".into()),
+    });
+    let (code, transcript) = retry_terminal(
+        &mut sb.cmd(&["retry", "reset", "--user", "alice"]),
+        Some("synthetic-retry-secret\n"),
+    );
+    assert_eq!(code, 0, "{transcript}");
+    assert!(transcript.contains("Current login password: "));
+    assert!(transcript.contains("Retry state reset."));
+    assert!(!transcript.contains("synthetic-retry-secret"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(&requests[0], Request::RetryStatus { user } if user == "alice"));
+    assert!(
+        matches!(&requests[1], Request::RetryReset { user, password } if user == "alice" && password.expose() == b"synthetic-retry-secret")
+    );
+}
+
+#[test]
+fn retry_reset_rejection_and_unexpected_reply_never_report_success() {
+    if is_root() {
+        eprintln!("SKIP: non-root password fixture; run default suite unprivileged");
+        return;
+    }
+    for (tag, response) in [
+        (
+            "rejected",
+            Response::Error("password verification failed".into()),
+        ),
+        ("unexpected", Response::HasPassword(true)),
+    ] {
+        let sb = Sandbox::new(&format!("retry-reset-{tag}"));
+        let requests = serve(&sock(&sb), move |request| match request {
+            Request::RetryStatus { .. } => retry_available(),
+            _ => response.clone(),
+        });
+        let (code, out, error) = run_stdin(
+            &mut sb.cmd(&["retry", "reset", "--user", "alice"]),
+            "synthetic-retry-secret\n",
+        );
+        assert_eq!(code, 1, "{out} {error}");
+        assert!(out.is_empty());
+        assert!(!error.contains("synthetic-retry-secret"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn retry_root_override_is_explicit_and_sends_no_password() {
+    if !is_root() {
+        eprintln!("SKIP: root-only synthetic fixture; rerun this exact test as root");
+        return;
+    }
+    let sb = Sandbox::new("retry-root");
+    let requests = serve(&sock(&sb), |request| match request {
+        Request::RetryStatus { .. } => Response::RetryStatus {
+            face_budget: None,
+            failures: 5,
+            cooldown_seconds: 30,
+            recovery_failures: 50,
+            recovery_cooldown_seconds: 30,
+            recovery_required: true,
+            password_reset_available: false,
+        },
+        Request::RetryReset { .. } => Response::Ok("Administrator retry reset.".into()),
+        _ => Response::Error("unexpected".into()),
+    });
+    let (code, transcript) =
+        retry_terminal(&mut sb.cmd(&["retry", "reset", "--user", "alice"]), None);
+    assert_eq!(code, 0, "{transcript}");
+    assert!(transcript.contains("Administrator reset for 'alice'"));
+    assert!(!transcript.contains("Current login password:"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        matches!(&requests[1], Request::RetryReset { user, password } if user == "alice" && password.is_empty())
+    );
+}
+
+#[test]
+fn retry_rejects_ambiguous_arguments_before_contacting_daemon() {
+    let sb = Sandbox::new("retry-invalid-args");
+    let requests = serve(&sock(&sb), |_| retry_available());
+    for args in [
+        vec!["retry", "reset", "--user", ""],
+        vec!["retry", "reset", "--user=alice", "--user=bob"],
+        vec!["retry", "reset", "status"],
+        vec!["retry", "reset", "--uesr", "alice"],
+        vec!["retry", "--user"],
+    ] {
+        let (code, _, _) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 2, "{args:?}");
+    }
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn retry_password_bounds_are_checked_before_reset_request() {
+    if is_root() {
+        eprintln!("SKIP: non-root password fixture; run default suite unprivileged");
+        return;
+    }
+    for (tag, input, valid) in [
+        ("empty", "\n".into(), false),
+        ("nul", "synthetic\0secret\n".into(), false),
+        ("long", format!("{}\n", "x".repeat(4097)), false),
+        ("maximum", format!("{}\n", "x".repeat(4096)), true),
+    ] {
+        let sb = Sandbox::new(&format!("retry-password-{tag}"));
+        let requests = serve(&sock(&sb), |request| match request {
+            Request::RetryStatus { .. } => retry_available(),
+            Request::RetryReset { .. } => Response::Ok("Retry state reset.".into()),
+            _ => Response::Error("unexpected".into()),
+        });
+        let (code, _, _) = run_stdin(&mut sb.cmd(&["retry", "reset", "--user=alice"]), &input);
+        assert_eq!(code, i32::from(!valid), "{tag}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), if valid { 2 } else { 1 }, "{tag}");
+        if valid {
+            assert!(
+                matches!(&requests[1], Request::RetryReset { password, .. } if password.len() == 4096)
+            );
+        }
+    }
+}
+
+#[test]
+fn retry_bare_status_reports_unavailable_and_exhausted_recovery() {
+    for (tag, required, label) in [
+        ("unavailable", false, "unavailable on this installation"),
+        ("exhausted", true, "administrator reset required"),
+    ] {
+        let sb = Sandbox::new(&format!("retry-bare-status-{tag}"));
+        let requests = serve(&sock(&sb), move |_| Response::RetryStatus {
+            face_budget: None,
+            failures: 0,
+            cooldown_seconds: 0,
+            recovery_failures: if required { 50 } else { 0 },
+            recovery_cooldown_seconds: 0,
+            recovery_required: required,
+            password_reset_available: false,
+        });
+        let (code, out, err) = run(sb
+            .cmd(&["retry"])
+            .env("USER", "alice")
+            .env_remove("SUDO_USER"));
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(out.contains(label), "{out}");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(&requests[0], Request::RetryStatus { user } if user == "alice"));
+    }
+}
+
+#[test]
+fn auth_sensor_preflight_requires_ir_policy_even_if_readiness_claims_ready() {
+    use irlume_common::config::{FaceSensorPolicy as Policy, FaceSensorPolicyObservation as State};
+    let sb = Sandbox::new("sensor-preflight-policy-consistency");
+    let requests = serve(&sock(&sb), |req| {
+        let Request::FaceSensorStatus { user: Some(user) } = req else {
+            return Response::Error("unexpected request".into());
+        };
+        let policy = match user.as_str() {
+            "default-account" => State::DefaultDual,
+            "dual-account" => State::Explicit(Policy::Dual),
+            "invalid-account" => State::Invalid,
+            "unreadable-account" => State::Unreadable,
+            _ => unreachable!("fixture account"),
+        };
+        Response::FaceSensorStatus {
+            policy,
+            ir_readiness: Some(irlume_common::IrOnlyReadiness::ReadyForExperimentalAttempt),
+        }
+    });
+    for (account, expected) in [
+        ("default-account", "IR-only is not selected"),
+        ("dual-account", "IR-only is not selected"),
+        ("invalid-account", "sensor policy is invalid or unreadable"),
+        (
+            "unreadable-account",
+            "sensor policy is invalid or unreadable",
+        ),
+    ] {
+        let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", account]));
+        assert_ne!(code, 0, "{out} {err}");
+        assert!(err.contains(expected), "{out} {err}");
+        assert!(err.contains("password"), "{out} {err}");
+        assert!(!out.contains("prerequisites are ready"), "{out}");
+        assert!(!format!("{out}{err}").contains(account));
+    }
+    assert_eq!(requests.lock().unwrap().len(), 4);
 }

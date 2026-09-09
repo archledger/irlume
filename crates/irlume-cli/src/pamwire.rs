@@ -18,7 +18,7 @@
 //! `/usr/lib/pam.d`) get an `/etc` override materialized from the vendor copy and
 //! marked (revert = delete the override).
 
-use irlume_common::platform::{distro_family, DistroFamily};
+use irlume_common::platform::{distro_family, DistroFamily, SystemCommand};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -754,7 +754,7 @@ const GDM_ONDEMAND_MIN_GNOME: u32 = 46;
 /// GNOME Shell major version via `gnome-shell --version` ("GNOME Shell 50.1" →
 /// 50). None when gnome-shell is absent/unparseable (→ conservative facefirst).
 fn gnome_shell_major() -> Option<u32> {
-    let out = std::process::Command::new("gnome-shell")
+    let out = std::process::Command::new(SystemCommand::GnomeShell.path()?)
         .arg("--version")
         .output()
         .ok()?;
@@ -1943,7 +1943,10 @@ fn wire_service(
 
 /// `Some(true/false)` when semodule could be queried (root), `None` otherwise.
 fn selinux_loaded() -> Option<bool> {
-    let out = Command::new("semodule").arg("-l").output().ok()?;
+    let out = Command::new(SystemCommand::Semodule.path()?)
+        .arg("-l")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None; // needs root to read the policy store
     }
@@ -2006,13 +2009,19 @@ pub(crate) fn relabel_daemon_socket() -> Result<(), String> {
         Ok(st) => Err(format!("{what} exited {st}")),
         Err(e) => Err(format!("could not run {what}: {e}")),
     };
+    let systemctl = SystemCommand::Systemctl
+        .path()
+        .ok_or_else(|| "could not run systemctl: trusted executable not found".to_string())?;
+    let restorecon = SystemCommand::Restorecon
+        .path()
+        .ok_or_else(|| "could not run restorecon: trusted executable not found".to_string())?;
     run(
         "systemctl try-restart irlumed.service",
-        Command::new("systemctl").args(["try-restart", "irlumed.service"]),
+        Command::new(systemctl).args(["try-restart", "irlumed.service"]),
     )?;
     run(
         "restorecon /run/irlume.sock",
-        Command::new("restorecon").arg("/run/irlume.sock"),
+        Command::new(restorecon).arg("/run/irlume.sock"),
     )
 }
 
@@ -2027,11 +2036,13 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             );
         };
         if apply {
-            let ok = Command::new("semodule")
-                .args(["-i", pp.as_str()])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let ok = SystemCommand::Semodule.path().is_some_and(|semodule| {
+                Command::new(semodule)
+                    .args(["-i", pp.as_str()])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            });
             if !ok {
                 return Err("semodule -i irlume.pp failed".into());
             }
@@ -2053,7 +2064,13 @@ fn selinux(enable: bool, apply: bool) -> Result<String, String> {
             // selinux-policy version that refuses, no semodule at all), and the
             // next `login status` would then disagree with the line they had
             // just been shown.
-            match Command::new("semodule").args(["-r", "irlume"]).status() {
+            let Some(semodule) = SystemCommand::Semodule.path() else {
+                return Err(
+                    "could not run semodule (trusted executable not found); the module is still loaded"
+                        .into(),
+                );
+            };
+            match Command::new(semodule).args(["-r", "irlume"]).status() {
                 Ok(st) if st.success() => Ok("✓ SELinux module removed".into()),
                 Ok(st) => Err(format!(
                     "semodule -r irlume failed ({st}); the module is still loaded"

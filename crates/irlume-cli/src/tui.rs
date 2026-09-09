@@ -186,6 +186,8 @@ enum SidebarRow {
 #[derive(Clone, Copy)]
 enum Click {
     Key(KeyCode),
+    DialogKey(KeyCode),
+    ActionRow(usize),
     Hub(usize),
     /// Select a row in the current screen's list. The screen is intentionally
     /// resolved when the click is handled: targets are cleared and rebuilt on
@@ -298,6 +300,7 @@ enum Suspend {
     /// Toggle the opt-in biopolicy operation-class gate (the bool is the target
     /// state). Root op; the daemon reads it live, no restart.
     Biopolicy(bool),
+    PrivilegedConsent(bool),
     /// IR liveness self-test via `sudo irlume selftest liveness` (the daemon
     /// root-gates it; the raw measurements are a spoof-tuning oracle).
     SelfTestLiveness,
@@ -629,6 +632,11 @@ struct App {
     /// Clickable content regions recorded each frame by `draw`, consulted by
     /// `on_click`. Interior mutability because `draw` takes `&self`.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    /// Last rendered dialog bounds and scroll limit; controls stay outside the body.
+    dialog_view: std::cell::Cell<(Rect, u16)>,
+    dialog_scroll: std::cell::Cell<u16>,
+    /// Screen, paragraph bounds, scroll offset and maximum, rebuilt during render.
+    page_view: std::cell::Cell<(usize, Rect, u16, u16)>,
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
     more_actions: Option<(String, usize)>,
@@ -1082,6 +1090,9 @@ impl App {
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
+            dialog_view: std::cell::Cell::new((Rect::default(), 0)),
+            dialog_scroll: std::cell::Cell::new(0),
+            page_view: std::cell::Cell::new((usize::MAX, Rect::default(), 0, 0)),
             show_help: false,
             more_actions: None,
             hub_sel: 0,
@@ -2712,16 +2723,19 @@ impl App {
                             self.on_key(k.code)
                         }
                     }
-                    // Wheel scrolls the Activity history; a left click (or a
-                    // touchscreen tap, delivered as the same event) on a sidebar
-                    // row jumps to that section.
                     Event::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            self.activity_open = true;
-                            self.act_scroll = (self.act_scroll + 1).min(self.act_max())
-                        }
-                        MouseEventKind::ScrollDown => {
-                            self.act_scroll = self.act_scroll.saturating_sub(1)
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            let size = terminal.size()?;
+                            self.on_scroll(
+                                m.column,
+                                m.row,
+                                Rect::new(0, 0, size.width, size.height),
+                                if m.kind == MouseEventKind::ScrollUp {
+                                    -1
+                                } else {
+                                    1
+                                },
+                            );
                         }
                         MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
                             let size = terminal.size()?;
@@ -3120,6 +3134,18 @@ impl App {
                 "refresh the pcrlock policy (re-predict the boot measurements)",
                 &["systemd-pcrlock", "make-policy"],
             ),
+            Suspend::PrivilegedConsent(required) => self.sudo_step(
+                if required {
+                    "require confirmation for privileged face authentication"
+                } else {
+                    "enable hands-free privileged face authentication"
+                },
+                if required {
+                    &["irlume", "auth", "consent", "required"]
+                } else {
+                    &["irlume", "auth", "consent", "hands-free", "--yes"]
+                },
+            ),
             Suspend::Biopolicy(on) => self.sudo_step(
                 if on {
                     "enable the biopolicy gate"
@@ -3193,6 +3219,7 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        self.dialog_scroll.set(0);
         // A raised error banner says "press any key to dismiss", so it takes the
         // next key BEFORE anything else (including the activity scroll below).
         if self.error.is_some() {
@@ -3835,6 +3862,23 @@ impl App {
                 None => self.log('·', "Bitwarden is not installed on this system"),
             },
             // Settings.
+            (SC_SETTINGS, KeyCode::Char('p')) => {
+                if crate::consent::overridden() {
+                    self.log('·', "An environment override controls privileged consent; remove it before changing the saved setting.");
+                    return;
+                }
+                match irlume_common::config::privileged_face_consent_visible() {
+                    Some(true) => {
+                        self.confirm = Some((
+                            format!("Enable hands-free privileged face authentication? {} {}", crate::consent::SCOPE, crate::consent::WARNING),
+                            "Enable",
+                            ConfirmAct::Sus(Suspend::PrivilegedConsent(false)),
+                        ));
+                    }
+                    Some(false) => self.suspend = Some(Suspend::PrivilegedConsent(true)),
+                    None => self.log('·', "Cannot read privileged consent settings. Run sudo irlume tui or sudo irlume auth consent status."),
+                }
+            }
             // Biopolicy gate: enabling changes the security posture (restricts
             // which services a face may satisfy), so it is confirmed; disabling
             // just relaxes back to default and goes straight through.
@@ -4011,7 +4055,7 @@ impl App {
                 .join(" ");
             self.confirm = Some((
                 format!(
-                    "{}\n{scope}\n{}\nRun: {}irlume {command}",
+                    "{}\n\n{scope}\n\n{}\n\nRun: {}irlume {command}",
                     invocation.action.label,
                     invocation.action.description,
                     if invocation.action.root { "sudo " } else { "" }
@@ -4022,35 +4066,60 @@ impl App {
         }
     }
 
-    fn draw_more_actions(&self, f: &mut Frame, query: &str, selected: usize) {
-        let area = f.area();
+    fn more_actions_rect(area: Rect) -> Rect {
         let width = area.width.saturating_sub(2).min(100);
         let height = area.height.saturating_sub(2).min(24);
-        let rect = Rect::new(
+        Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
             width,
             height,
-        );
+        )
+    }
+
+    fn draw_more_actions(&self, f: &mut Frame, query: &str, selected: usize) {
+        self.click_targets.borrow_mut().clear();
+        let rect = Self::more_actions_rect(f.area());
         f.render_widget(Clear, rect);
         let block = Block::bordered()
-            .title(" More actions (F2 / Esc closes) ")
+            .title(" More actions ")
+            .padding(ratatui::widgets::Padding::horizontal(1))
             .border_style(Style::new().fg(th().accent));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let rows = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(1),
             Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
         ])
         .split(inner);
         f.render_widget(
             Paragraph::new(format!(
-                "Search: {query}▏\nType to filter; arrows select; Enter opens"
+                "Search: {query}▏\nType to filter; click or arrows select; Open continues"
             )),
             rows[0],
         );
         let matches = actions::matching(query);
+        let [close, open] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(rows[3]);
+        for (cell, label, key) in [
+            (close, "[Esc] Close", KeyCode::Esc),
+            (open, "[Enter] Open", KeyCode::Enter),
+        ] {
+            if key == KeyCode::Enter && matches.is_empty() {
+                continue;
+            }
+            let button = Rect::new(
+                cell.x,
+                cell.y,
+                cell.width.min(label.len() as u16),
+                cell.height,
+            );
+            f.render_widget(Paragraph::new(label).style(selected_style()), button);
+            self.hit(button, Click::DialogKey(key));
+        }
         if matches.is_empty() {
             f.render_widget(
                 Paragraph::new("No matching actions. Backspace to change the search."),
@@ -4067,9 +4136,18 @@ impl App {
             rows[1],
             &mut state,
         );
+        for (row, index) in (state.offset()..matches.len())
+            .take(rows[1].height as usize)
+            .enumerate()
+        {
+            self.hit(
+                Rect::new(rows[1].x, rows[1].y + row as u16, rows[1].width, 1),
+                Click::ActionRow(index),
+            );
+        }
         if let Some(action) = matches.get(selected) {
             f.render_widget(
-                Paragraph::new(action.description).wrap(Wrap { trim: true }),
+                Paragraph::new(format!("\n{}", action.description)).wrap(Wrap { trim: true }),
                 rows[2],
             );
         }
@@ -4164,10 +4242,16 @@ impl App {
                     "SealPassword",
                     OpTag::Generic,
                     Box::new(move || {
+                        let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
+                            Ok(salt) => salt,
+                            Err(e) => return (false, format!("keyring arm failed: {e}")),
+                        };
                         let req = Request::SealPassword {
                             kind: None, // let the daemon judge from what the user has
                             user: user.clone(),
                             password: irlume_common::SecretBytes::new(pw.to_vec()),
+                            wallet_salt,
+                            wallet_salt_checked: true,
                         };
                         match crate::daemon_request(&req) {
                             Ok(Response::TokenSealed { token, minted }) => {
@@ -4302,7 +4386,15 @@ impl App {
             };
             // Prompt in the wrapping body (a long name/prompt would truncate as a
             // border title); the typed field on its own line below it.
-            self.modal(f, "Input", &format!("{prompt}\n{shown}▏"));
+            self.modal(
+                f,
+                "Input",
+                &format!("{prompt}\n\n{shown}▏"),
+                &[
+                    ("[Esc] Cancel", KeyCode::Esc),
+                    ("[Enter] Continue", KeyCode::Enter),
+                ],
+            );
         } else if let Some((what, _, _)) = &self.confirm {
             // Question in the body so a long target name isn't clipped by the
             // single-line border title.
@@ -4310,19 +4402,31 @@ impl App {
             self.modal(
                 f,
                 "Confirm",
-                &format!("{what}\n[n]/Esc Cancel    [y] {verb}"),
+                what,
+                &[
+                    ("[Esc] Cancel", KeyCode::Esc),
+                    (&format!("[y] {verb}"), KeyCode::Char('y')),
+                ],
             );
         } else if let Some(prompt) = self.enroll.as_ref().and_then(|e| e.session_merge.as_ref()) {
             self.modal(f, "Already enrolled", &format!(
-                "This capture matches '{}'. Improve Recognition for this person?\n\nNo scans have been saved. Continue with up to {} more scans, then save the completed capture.\n\n[y] Continue    [n]/Esc Cancel", prompt.profile, prompt.remaining));
+                "This capture matches '{}'. Improve Recognition for this person?\n\nNo scans have been saved. Continue with up to {} more scans, then save the completed capture.", prompt.profile, prompt.remaining), &[("[Esc] Cancel", KeyCode::Esc), ("[y] Continue", KeyCode::Char('y'))]);
         } else if let Some(mc) = &self.enroll_merge {
             // Keep the message in the wrapping body, not the border title (which
             // is a single line clamped to the box width and would truncate).
             let body = format!(
-                "This capture matches '{}' on this account. Improve Recognition for this person instead of creating another profile?\n\nOne scan has been added; [y] keeps it and captures up to {} more. [n]/Esc cancels and removes that scan.\n\n[y] add scans   [n]/Esc cancel",
+                "This capture matches '{}' on this account. Improve Recognition for this person instead of creating another profile?\n\nOne scan has been added; [y] keeps it and captures up to {} more. [n]/Esc cancels and removes that scan.",
                 mc.profile, mc.remaining
             );
-            self.modal(f, "Already enrolled", &body);
+            self.modal(
+                f,
+                "Already enrolled",
+                &body,
+                &[
+                    ("[Esc] Cancel", KeyCode::Esc),
+                    ("[y] add scans", KeyCode::Char('y')),
+                ],
+            );
         }
         // Tier two of the key-disclosure ladder; drawn last so it sits above
         // everything except nothing (help is always answerable).
@@ -4330,43 +4434,22 @@ impl App {
             self.draw_more_actions(f, query, *selected);
         }
         if self.show_help {
-            self.modal(f, "Keys  ([?] or Esc to close)", &self.help_body());
+            self.modal(
+                f,
+                "Keyboard and mouse",
+                &self.help_body(),
+                &[("[Esc] Close", KeyCode::Esc)],
+            );
         }
     }
 
     /// A red, dismissible error banner centred on screen.
     fn error_modal(&self, f: &mut Frame, msg: &str) {
-        let area = f.area();
-        // Both dimensions are capped by the frame: the 30-column floor and the
-        // fixed 7 rows are bigger than a small terminal, and a rect that reaches
-        // past the buffer is not something a draw may produce.
-        let w = area
-            .width
-            .saturating_sub(8)
-            .clamp(30, 78)
-            .min(area.width.max(1));
-        let h = 7u16.min(area.height.max(1));
-        let rect = Rect {
-            x: area.width.saturating_sub(w) / 2,
-            y: area.height.saturating_sub(h) / 2,
-            width: w,
-            height: h,
-        };
-        f.render_widget(Clear, rect);
-        let blk = Block::bordered()
-            .title(" ⚠ Problem ")
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(th().err).add_modifier(Modifier::BOLD))
-            .padding(ratatui::widgets::Padding::horizontal(1));
-        let body = vec![
-            Line::raw(""),
-            Line::from(Span::styled(msg.to_string(), Style::new().fg(th().err))),
-            Line::raw(""),
-            Line::from(Span::styled("[any key] dismiss", Style::new().dim())),
-        ];
-        f.render_widget(
-            Paragraph::new(body).block(blk).wrap(Wrap { trim: true }),
-            rect,
+        self.modal(
+            f,
+            "⚠ Problem",
+            &format!("{msg}\n\n[any key] dismiss"),
+            &[("[Esc] Dismiss", KeyCode::Esc)],
         );
     }
 
@@ -4559,11 +4642,119 @@ impl App {
         self.click_targets.borrow_mut().push((rect, c));
     }
 
+    fn dialog_open(&self) -> bool {
+        self.error.is_some()
+            || self.input.is_some()
+            || self.confirm.is_some()
+            || self.enroll_merge.is_some()
+            || self.show_help
+            || self
+                .enroll
+                .as_ref()
+                .is_some_and(|e| e.session_merge.is_some())
+    }
+
+    fn on_scroll(&mut self, col: u16, row: u16, area: Rect, direction: i32) {
+        if self.dialog_open() {
+            let (bounds, max) = self.dialog_view.get();
+            if bounds.contains((col, row).into()) {
+                let scroll = self.dialog_scroll.get();
+                self.dialog_scroll.set(
+                    if direction < 0 {
+                        scroll.saturating_sub(1)
+                    } else {
+                        scroll.saturating_add(1)
+                    }
+                    .min(max),
+                );
+            }
+            return;
+        }
+        if self.more_actions.is_some() {
+            if Self::more_actions_rect(area).contains((col, row).into()) {
+                self.on_key(if direction < 0 {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                });
+            }
+            return;
+        }
+        let [_, _, body, activity, _] = self.frame_rows(area);
+        if activity.contains((col, row).into()) {
+            if direction < 0 {
+                self.activity_open = true;
+                self.act_scroll = (self.act_scroll + 1).min(self.act_max());
+            } else {
+                self.act_scroll = self.act_scroll.saturating_sub(1);
+            }
+            return;
+        }
+        if self.op.is_some() || self.enroll.is_some() {
+            return;
+        }
+        let (_, content) = self.body_split(body);
+        if !content.contains((col, row).into()) {
+            return;
+        }
+        let (screen, bounds, scroll, max) = self.page_view.get();
+        if screen == self.screen && bounds.contains((col, row).into()) {
+            let next = if direction < 0 {
+                scroll.saturating_sub(1)
+            } else {
+                scroll.saturating_add(1)
+            }
+            .min(max);
+            self.page_view.set((screen, bounds, next, max));
+            return;
+        }
+        let (selected, len) = match self.screen {
+            SC_PROFILES => {
+                let len = self.rows().len();
+                (&mut self.sel, len)
+            }
+            SC_CAMERAS => (&mut self.cam_sel, self.pairs.len()),
+            SC_REPAIR => (&mut self.repair_sel, self.repair.len()),
+            SC_WELCOME => {
+                let len = self.hub_rows().len();
+                (&mut self.hub_sel, len)
+            }
+            _ => return,
+        };
+        *selected = if direction < 0 {
+            selected.saturating_sub(1)
+        } else {
+            selected.saturating_add(1)
+        }
+        .min(len.saturating_sub(1));
+    }
+
     /// Map a mouse click (or touchscreen tap, delivered as the same left-click)
     /// to an action: a sidebar row jumps to that screen, a footer chip or the
     /// first-run button replays its key. Clicks while a modal/flow owns the
     /// screen are ignored.
     fn on_click(&mut self, col: u16, row: u16, area: Rect) {
+        // Only the top overlay registers targets; background clicks never
+        // dismiss a warning, approve an action or navigate behind a dialog.
+        if self.dialog_open() || self.more_actions.is_some() {
+            let target = self
+                .click_targets
+                .borrow()
+                .iter()
+                .find_map(|(r, c)| r.contains((col, row).into()).then_some(*c));
+            match target {
+                Some(Click::DialogKey(key)) => self.on_key(key),
+                Some(Click::ActionRow(index)) => {
+                    if let Some((query, selected)) = self.more_actions.as_mut() {
+                        if index < actions::matching(query).len() {
+                            *selected = index;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         // Activity remains usable while a camera/daemon operation owns normal
         // input, matching PgUp and [A]. Resolve that one safe disclosure before
         // the flow gate; it never starts, cancels, or confirms an operation.
@@ -4607,6 +4798,7 @@ impl App {
         if let Some(c) = hit {
             match c {
                 Click::Key(kc) => self.on_key(kc),
+                Click::DialogKey(_) | Click::ActionRow(_) => {}
                 Click::Hub(i) => {
                     if let Some((_, _, target)) = self.hub_rows().get(i).copied() {
                         self.hub_sel = i;
@@ -4775,6 +4967,8 @@ impl App {
     }
 
     fn draw_content(&self, f: &mut Frame, area: Rect) {
+        let (screen, _, scroll, max) = self.page_view.get();
+        self.page_view.set((screen, Rect::default(), scroll, max));
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(th().accent))
@@ -4782,7 +4976,7 @@ impl App {
             // the frame.
             .padding(ratatui::widgets::Padding::new(2, 2, 1, 0));
         let inner = blk.inner(area);
-        f.render_widget(blk, area);
+        f.render_widget(blk.clone(), area);
         if self.enroll.is_some() {
             self.draw_enroll(f, inner);
             return;
@@ -4799,6 +4993,10 @@ impl App {
             SC_PAM => self.draw_pam(f, inner),
             SC_SETTINGS => self.draw_settings(f, inner),
             _ => self.draw_done(f, inner),
+        }
+        let (screen, _, _, max) = self.page_view.get();
+        if screen == self.screen && max > 0 {
+            f.render_widget(blk.title_bottom(" Scroll inside panel for more "), area);
         }
     }
 
@@ -5070,82 +5268,177 @@ impl App {
         }
     }
 
+    fn draw_action_paragraph(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        lines: Vec<Line<'_>>,
+        actions: &[(usize, KeyCode)],
+    ) {
+        let heights: Vec<u16> = lines
+            .iter()
+            .map(|line| {
+                Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(area.width)
+                    .min(u16::MAX as usize) as u16
+            })
+            .collect();
+        let total = heights.iter().fold(0u16, |sum, h| sum.saturating_add(*h));
+        let max = total.saturating_sub(area.height);
+        let (screen, _, old_scroll, _) = self.page_view.get();
+        let scroll = if screen == self.screen {
+            old_scroll.min(max)
+        } else {
+            0
+        };
+        self.page_view.set((self.screen, area, scroll, max));
+        let mut offset = 0u16;
+        for (index, (line, height)) in lines.into_iter().zip(heights).enumerate() {
+            let end = offset.saturating_add(height);
+            let skipped = scroll.saturating_sub(offset);
+            let y = area.y.saturating_add(offset.saturating_sub(scroll));
+            if end > scroll && y < area.bottom() {
+                let rect = Rect::new(
+                    area.x,
+                    y,
+                    area.width,
+                    height.saturating_sub(skipped).min(area.bottom() - y),
+                );
+                f.render_widget(
+                    Paragraph::new(line)
+                        .wrap(Wrap { trim: false })
+                        .scroll((skipped, 0)),
+                    rect,
+                );
+                if let Some((_, key)) = actions.iter().find(|(row, _)| *row == index) {
+                    self.hit(rect, Click::Key(*key));
+                }
+            }
+            offset = end;
+        }
+    }
+
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         // The shared reader, which agrees with the daemon's truthy set (`yes` and
         // `on` count too) and admits when the root-only file cannot be read. The
         // local `biopolicy_on` accepted only `1`/`true`, so `enforce_biopolicy=yes`
         // drew "turn it on" while the daemon was already enforcing.
         let bio = irlume_common::config::enforce_biopolicy_visible();
-        f.render_widget(
-            Paragraph::new({
-                let mut v = Vec::new();
-                v.push(section("Face confirmation: keyboard required"));
-                v.extend(vec![
-                    section("Biopolicy operation-class gate"),
-                    {
-                        // The shared tri-state reader, not the raw config read the
-                        // [b] direction uses: settings.conf is 0600 root-only, so
-                        // the raw read showed "off (default)" here while the Done
-                        // dashboard said "◐ root-only" for the same key. Same
-                        // truthy set and env override as the daemon.
-                        let (icon, icon_style, label) =
-                            match irlume_common::config::enforce_biopolicy_visible() {
-                                Some(true) => (
-                                    "●",
-                                    Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                                    "ENFORCING",
-                                ),
-                                Some(false) => ("○", Style::new().dim(), "off (default)"),
-                                None => (
-                                    "◐",
-                                    Style::new().fg(th().warn),
-                                    "on/off is root-only; run the TUI with sudo to see it",
-                                ),
-                            };
-                        Line::from(vec![
-                            Span::raw("  state  "),
-                            Span::styled(format!("{icon} "), icon_style),
-                            Span::styled(label, Style::new().dim()),
-                        ])
-                    },
-                    Line::from(Span::styled(
-                        "  When on: only Login/Elevation may release the keyring; lock-screen",
-                        Style::new().dim(),
-                    )),
-                    Line::from(Span::styled(
-                        "  is verify-only; remote/unknown services are denied. Advanced; the",
-                        Style::new().dim(),
-                    )),
-                    Line::from(Span::styled(
-                        "  password is always available, so this can restrict but never lock out.",
-                        Style::new().dim(),
-                    )),
+        let lines = {
+            let mut v = Vec::new();
+            let consent = irlume_common::config::privileged_face_consent_visible();
+            v.push(section("Face sensor policy"));
+            v.push(Line::raw(format!(
+                "  {}",
+                crate::sensor_policy::local_status_line()
+            )));
+            v.push(Line::raw("  Inspect the daemon: irlume auth sensor status"));
+            v.push(Line::raw(
+                "  Change as root: irlume auth sensor dual / ir-only --yes",
+            ));
+            v.push(Line::raw(
+                "  IR-only is experimental, not qualified; consent and PAM wiring are separate.",
+            ));
+            v.push(Line::raw(""));
+            v.push(section("Face authentication at privileged prompts"));
+            v.push(Line::raw(""));
+            v.push(Line::raw(format!(
+                "  {}",
+                crate::consent::state_label(consent)
+            )));
+            v.push(Line::raw(
+                "  Machine-wide for configured sudo/polkit and other privileged services.",
+            ));
+            v.push(Line::raw(
+                "  Login and lock-screen start behavior is separate.",
+            ));
+            v.push(Line::raw(""));
+            if crate::consent::overridden() {
+                v.push(Line::raw(
+                    "  Local environment override; daemon policy may differ.",
+                ));
+                v.push(Line::raw(
+                    "  Remove IRLUME_PRIVILEGED_FACE_CONSENT before changing this setting.",
+                ));
+            } else {
+                let action = match consent {
+                    Some(true) => "enable hands-free (asks first)",
+                    Some(false) => "restore required confirmation",
+                    None => "state unavailable; run sudo irlume tui to inspect settings",
+                };
+                push_page_actions(&mut v, &mut page_actions, &[("p", action)]);
+            }
+            v.push(Line::raw(""));
+            v.extend(vec![
+                section("Biopolicy operation-class gate"),
+                {
+                    // The shared tri-state reader, not the raw config read the
+                    // [b] direction uses: settings.conf is 0600 root-only, so
+                    // the raw read showed "off (default)" here while the Done
+                    // dashboard said "◐ root-only" for the same key. Same
+                    // truthy set and env override as the daemon.
+                    let (icon, icon_style, label) =
+                        match irlume_common::config::enforce_biopolicy_visible() {
+                            Some(true) => (
+                                "●",
+                                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
+                                "ENFORCING",
+                            ),
+                            Some(false) => ("○", Style::new().dim(), "off (default)"),
+                            None => (
+                                "◐",
+                                Style::new().fg(th().warn),
+                                "on/off is root-only; run the TUI with sudo to see it",
+                            ),
+                        };
                     Line::from(vec![
-                        Span::styled("  [b]", Style::new().fg(th().accent)),
-                        Span::styled(
-                            match bio {
-                                Some(true) => " turn it off (sudo)",
-                                Some(false) => " turn it on (sudo; asks first)",
-                                None => " on/off is root-only; run the TUI with sudo",
-                            },
-                            Style::new().dim(),
-                        ),
-                    ]),
-                    Line::raw(""),
-                    section("Match thresholds (read-only)"),
-                    Line::from(Span::styled(
-                        "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",
-                        Style::new().dim(),
-                    )),
-                ]);
-                v
-            })
-            .wrap(Wrap { trim: false }),
-            area,
-        );
+                        Span::raw("  state  "),
+                        Span::styled(format!("{icon} "), icon_style),
+                        Span::styled(label, Style::new().dim()),
+                    ])
+                },
+                Line::from(Span::styled(
+                    "  When on: only Login/Elevation may release the keyring; lock-screen",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  is verify-only; remote/unknown services are denied. Advanced; the",
+                    Style::new().dim(),
+                )),
+                Line::from(Span::styled(
+                    "  password is always available, so this can restrict but never lock out.",
+                    Style::new().dim(),
+                )),
+            ]);
+            push_page_actions(
+                &mut v,
+                &mut page_actions,
+                &[(
+                    "b",
+                    match bio {
+                        Some(true) => "turn it off (sudo)",
+                        Some(false) => "turn it on (sudo; asks first)",
+                        None => "biopolicy state is root-only; run the TUI with sudo",
+                    },
+                )],
+            );
+            v.extend([
+                Line::raw(""),
+                section("Match thresholds (read-only)"),
+                Line::from(Span::styled(
+                    "  Calibrated per modality (RGB/IR), auto-scaled by enrolled scan count.",
+                    Style::new().dim(),
+                )),
+            ]);
+            v
+        };
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_cameras(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         // The active pair comes from the daemon's Health, NOT from
         // select_pair(): that helper falls through to discovery when no
         // explicit pair is configured, and discovery opens every node. This
@@ -5169,8 +5462,7 @@ impl App {
         // space stays empty at the bottom (content near the top).
         let list_rows = self.nodes.len().max(pairs.len()).max(1) as u16 + 1;
         let [list_area, info_area] =
-            Layout::vertical([Constraint::Length(list_rows + 1), Constraint::Length(9)])
-                .areas(area);
+            Layout::vertical([Constraint::Length(list_rows + 1), Constraint::Min(9)]).areas(area);
 
         // ---- selectable list of trusted (physical) Hello camera pairs ----
         // No pair ≠ no camera: an RGB-only device still serves the convenience
@@ -5346,22 +5638,21 @@ impl App {
             "  your camera's USB descriptor documents, and never runs on its own.",
             Style::new().dim(),
         )));
-        lines.push(Line::from(vec![
-            Span::styled("  [s]", Style::new().fg(th().accent)),
-            Span::styled(" set up emitter   ", Style::new().dim()),
-            Span::styled("[t]", Style::new().fg(th().accent)),
-            Span::styled(
-                " tune capture (holds the camera ~1 min)   ",
-                Style::new().dim(),
-            ),
-            Span::styled("[p]", Style::new().fg(th().accent)),
-            Span::styled(" list units (writes nothing)", Style::new().dim()),
-        ]));
+        push_page_actions(
+            &mut lines,
+            &mut page_actions,
+            &[
+                ("s", "set up emitter"),
+                ("t", "tune capture (holds the camera ~1 min)"),
+                ("p", "list units (writes nothing)"),
+            ],
+        );
         // Borderless (no box-in-box); the content panel is the only frame.
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info_area);
+        self.draw_action_paragraph(f, info_area, lines, &page_actions);
     }
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         let reader = match (&self.fp.device, self.fp.available) {
             (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(th().ok)),
             (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
@@ -5420,25 +5711,34 @@ impl App {
                 }
             }
             lines.push(Line::raw(""));
-            lines.push(action_line(&[
-                ("a", "enroll a finger"),
-                ("t", "test a finger"),
-                ("x", "wipe all"),
-            ]));
-            lines.push(action_line(&[
-                ("e", "face OR fingerprint (sudo)"),
-                ("d", "remove from login"),
-            ]));
+            push_page_actions(
+                &mut lines,
+                &mut page_actions,
+                &[
+                    ("a", "enroll a finger"),
+                    ("t", "test a finger"),
+                    ("x", "wipe all"),
+                ],
+            );
+            push_page_actions(
+                &mut lines,
+                &mut page_actions,
+                &[
+                    ("e", "face OR fingerprint (sudo)"),
+                    ("d", "remove from login"),
+                ],
+            );
         } else {
             lines.push(Line::from(Span::styled(
                 "  No usable reader on this device; fingerprint unavailable.",
                 Style::new().dim(),
             )));
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_recovery(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         // None = RecoveryStatus never answered. The old default here claimed
         // "plaintext at rest" and "No TPM" about templates that are encrypted
         // on a TPM machine, one Tab away from the Keyring tab saying "TPM
@@ -5503,15 +5803,16 @@ impl App {
             }
         }
         lines.push(Line::raw(""));
-        lines.push(action_line(&[
-            ("s", "set passphrase"),
-            ("t", "restore"),
-            ("f", "forget"),
-        ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        push_page_actions(
+            &mut lines,
+            &mut page_actions,
+            &[("s", "set passphrase"), ("t", "restore"), ("f", "forget")],
+        );
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_keyring(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         let armed = self.keyring_armed.unwrap_or(false);
         let status = match self.keyring_armed {
             Some(true) => Span::styled(
@@ -5650,18 +5951,35 @@ impl App {
         // it re-enters the password and re-seals to the current PCRs, the CLI
         // `irlume reseal` a keyboard-only user would otherwise have no way to run.
         if armed {
-            lines.push(action_line(&[
-                ("a", "re-arm (new password)"),
-                ("r", "reseal (re-bind to current PCRs)"),
-                ("f", "forget"),
-            ]));
+            push_page_actions(
+                &mut lines,
+                &mut page_actions,
+                &[
+                    ("a", "re-arm (new password)"),
+                    ("r", "reseal (re-bind to current PCRs)"),
+                    ("f", "forget"),
+                ],
+            );
         } else {
-            lines.push(action_line(&[
-                ("a", "arm (enter your login password)"),
-                ("f", "forget"),
-            ]));
+            push_page_actions(
+                &mut lines,
+                &mut page_actions,
+                &[("a", "arm (enter your login password)"), ("f", "forget")],
+            );
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        if armed
+            && self
+                .keyring_policy
+                .as_deref()
+                .is_some_and(|p| p.contains("Tier 2"))
+        {
+            push_page_actions(
+                &mut lines,
+                &mut page_actions,
+                &[("p", "refresh pcrlock policy")],
+            );
+        }
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     /// How many enrolled scans the LOADED recognizer can match, or `None`
@@ -5869,8 +6187,9 @@ impl App {
     /// advisory-only doctor lines (fingerprint
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.
     fn draw_repair(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         let [list_area, info_area] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(12)]).areas(area);
+            Layout::vertical([Constraint::Min(4), Constraint::Length(26)]).areas(area);
 
         // ---- checklist --------------------------------------------------
         let ok = self.repair.iter().filter(|c| c.sev == Sev::Ok).count();
@@ -5913,11 +6232,14 @@ impl App {
             list_area,
             &mut st,
         );
-        for i in 0..self.repair.len().min(list_area.height as usize) {
+        for (row, i) in (st.offset()..self.repair.len())
+            .take(list_area.height as usize)
+            .enumerate()
+        {
             self.hit(
                 Rect::new(
                     list_area.x,
-                    list_area.y.saturating_add(i as u16),
+                    list_area.y.saturating_add(row as u16),
                     list_area.width,
                     1,
                 ),
@@ -5941,14 +6263,6 @@ impl App {
             Span::styled(format!("   {warn} warn"), Style::new().fg(th().warn)),
             Span::styled(format!("   {fail} fail"), Style::new().fg(th().err)),
         ])];
-        lines.push(action_line(&[
-            ("f", "fix selected"),
-            ("r", "re-check"),
-            ("l", "IR self-test"),
-            ("s", "support report"),
-            ("d", "doctor"),
-            ("g", "logs"),
-        ]));
         lines.push(Line::raw(""));
         if let Some(c) = self.repair.get(self.repair_sel) {
             let hint = match &c.fix {
@@ -6010,50 +6324,41 @@ impl App {
             ),
         ]));
         lines.push(Line::raw(""));
-        // The two action lines are click targets, not just text: register the
-        // rows they will occupy so a click fires the same key the hint names.
-        // Row math: each Line is one row, start at info_area.y + 1 (border).
-        let ir_line_row = info_area.y + 1 + (lines.len() as u16);
-        lines.push(Line::from(Span::styled(
-            "  IR test    press [l] to run the IR PAD self-test (sudo; look at the camera)",
-            Style::new().dim(),
-        )));
-        let support_line_row = info_area.y + 1 + (lines.len() as u16);
-        lines.push(Line::from(Span::styled(
-            "  Support    [s] Create Support Report (read-only; captures no camera data)",
-            Style::new().dim(),
-        )));
-        let mut reg = self.click_targets.borrow_mut();
-        reg.push((
-            Rect::new(
-                info_area.x + 1,
-                ir_line_row,
-                info_area.width.saturating_sub(2),
-                1,
-            ),
-            Click::Key(KeyCode::Char('l')),
-        ));
-        reg.push((
-            Rect::new(
-                info_area.x + 1,
-                support_line_row,
-                info_area.width.saturating_sub(2),
-                1,
-            ),
-            Click::Key(KeyCode::Char('s')),
-        ));
-        drop(reg);
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "l",
+            "IR test",
+            "press [l] to run the IR PAD self-test (sudo; look at the camera)",
+        );
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "s",
+            "Create Support Report",
+            "read-only; captures no camera data",
+        );
+        push_page_actions(
+            &mut lines,
+            &mut page_actions,
+            &[
+                ("f", "fix selected"),
+                ("r", "re-check"),
+                ("d", "doctor"),
+                ("g", "logs"),
+            ],
+        );
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim())
             .title(" diagnosis ");
-        f.render_widget(
-            Paragraph::new(lines).block(blk).wrap(Wrap { trim: false }),
-            info_area,
-        );
+        let inner = blk.inner(info_area);
+        f.render_widget(blk, info_area);
+        self.draw_action_paragraph(f, inner, lines, &page_actions);
     }
 
     fn draw_identify(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         let mut lines = vec![
             section("1:N identify (\"who is this?\")"),
             Line::from(Span::styled(
@@ -6094,14 +6399,12 @@ impl App {
             ))),
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("  [i]", Style::new().fg(th().accent)),
-            Span::styled(" identify now", Style::new().dim()),
-        ]));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        push_page_actions(&mut lines, &mut page_actions, &[("i", "identify now")]);
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         let mut lines = vec![section("PAM services (face auth wiring)")];
         // Everything below renders `self.pam_cache`, computed with the
         // diagnostics: draw used to re-read every PAM service file and probe
@@ -6230,50 +6533,55 @@ impl App {
         // verb-first label padded to a common width, then a dim detail column.
         // Scannable as a command list instead of a paragraph; the key never
         // wanders into the middle of a sentence.
-        let act = |key: &str, label: &str, detail: &str| {
-            Line::from(vec![
-                Span::styled(format!("  {key:<4}"), Style::new().fg(th().accent)),
-                Span::styled(format!("{label:<22}"), Style::new()),
-                Span::styled(detail.to_string(), Style::new().dim()),
-            ])
-        };
-        lines.push(act(
-            "[w]",
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "w",
             "Wire login + lock",
             "the core action; leave the password empty then Enter to use your face",
-        ));
-        lines.push(act(
-            "[u]",
+        );
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "u",
             "Wire face-sudo",
             "opt-in; type yes for one face attempt at sudo prompts",
-        ));
-        lines.push(act(
-            "[p]",
+        );
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "p",
             "Wire app prompts",
             "opt-in; type yes for one face attempt at app prompts",
-        ));
+        );
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
         if matches!(
             self.heavy.clone(),
             Some(crate::bitwarden::TuiState::NeedsSetup)
         ) {
-            lines.push(act(
-                "[b]",
+            push_page_action(
+                &mut lines,
+                &mut page_actions,
+                "b",
                 "Set up Bitwarden",
                 "installs its polkit action so your face unlocks the vault",
-            ));
+            );
         }
-        lines.push(act(
-            "[x]",
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "x",
             "Un-wire everything",
             "removes face auth from login/lock/sudo/apps; asks first",
-        ));
-        lines.push(act(
-            "[s]",
+        );
+        push_page_action(
+            &mut lines,
+            &mut page_actions,
+            "s",
             "Show full status",
             "opens the detailed console status view",
-        ));
+        );
         // Bitwarden status line (not an action): only when installed and the
         // action is present or snapd owns it. Set apart by a blank line.
         match &self.heavy {
@@ -6301,16 +6609,17 @@ impl App {
             }
             _ => {}
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_done(&self, f: &mut Frame, area: Rect) {
+        let mut page_actions = Vec::new();
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         // Tri-state, not the raw probe bool: before the first sweep lands the
         // bool is a default, and this screen must not read a default as "one
         // step left" (nor as done).
         let wired = self.login_wired_known();
-        let lines = vec![
+        let mut lines = vec![
             section("Setup dashboard"),
             Line::raw(""),
             Line::from(vec![
@@ -6387,19 +6696,16 @@ impl App {
                 },
                 Style::new().dim(),
             )),
-            if !self.profiles.is_empty() && wired == Some(false) {
-                Line::from(vec![
-                    Span::styled("  [w]", Style::new().fg(th().accent)),
-                    Span::styled(" wire login    [r] refresh    [q] quit", Style::new().dim()),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled("  [r]", Style::new().fg(th().accent)),
-                    Span::styled(" refresh    [q] quit", Style::new().dim()),
-                ])
-            },
         ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        if !self.profiles.is_empty() && wired == Some(false) {
+            push_page_actions(&mut lines, &mut page_actions, &[("w", "wire login")]);
+        }
+        push_page_actions(
+            &mut lines,
+            &mut page_actions,
+            &[("r", "refresh"), ("q", "quit")],
+        );
+        self.draw_action_paragraph(f, area, lines, &page_actions);
     }
 
     fn draw_activity(&self, f: &mut Frame, area: Rect) {
@@ -6577,7 +6883,7 @@ impl App {
                 ("x", "Disconnect…"),
                 ("s", "Show Status"),
             ],
-            SC_SETTINGS => &[("b", "Biopolicy…")],
+            SC_SETTINGS => &[("p", "Privileged consent…"), ("b", "Biopolicy…")],
             // [w] only while wiring is OBSERVED missing: the body hides its
             // [w] line on a wired box, and a footer still offering it invites
             // a needless `sudo irlume login enable --apply` re-run. Unknown
@@ -6714,7 +7020,8 @@ impl App {
         b
     }
 
-    fn modal(&self, f: &mut Frame, title: &str, body: &str) {
+    fn modal(&self, f: &mut Frame, title: &str, body: &str, buttons: &[(&str, KeyCode)]) {
+        self.click_targets.borrow_mut().clear();
         let area = f.area();
         let w = area.width.saturating_sub(4).clamp(20, 72).min(area.width);
         // Grow the box to fit the wrapped body so a long message never clips,
@@ -6727,7 +7034,10 @@ impl App {
         // Cap the floor by what the frame actually has, so a tiny frame gets a
         // cramped box instead of a crash.
         let max_h = area.height.max(1);
-        let h = (lines + 2).clamp(3.min(max_h), max_h);
+        let controls = if buttons.is_empty() { 0 } else { 2 };
+        let h = lines
+            .saturating_add(2 + controls)
+            .clamp(3.min(max_h), max_h);
         let rect = Rect {
             x: area.width.saturating_sub(w) / 2,
             y: area.height.saturating_sub(h) / 2,
@@ -6738,14 +7048,54 @@ impl App {
         let blk = Block::bordered()
             .title(format!(" {title} "))
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(th().accent))
+            .border_style(Style::new().fg(if title == "⚠ Problem" {
+                th().err
+            } else {
+                th().accent
+            }))
             .padding(ratatui::widgets::Padding::horizontal(1));
+        let inner = blk.inner(rect);
+        f.render_widget(blk, rect);
+        let [body_area, _, button_area] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(controls.saturating_sub(1)),
+            Constraint::Length(u16::from(!buttons.is_empty())),
+        ])
+        .areas(inner);
+        let max_scroll = lines.saturating_sub(body_area.height);
+        self.dialog_view.set((rect, max_scroll));
+        let scroll = self.dialog_scroll.get().min(max_scroll);
+        self.dialog_scroll.set(scroll);
         f.render_widget(
             Paragraph::new(body.to_string())
-                .block(blk)
-                .wrap(Wrap { trim: true }),
-            rect,
+                .wrap(Wrap { trim: true })
+                .scroll((scroll, 0)),
+            body_area,
         );
+        if max_scroll > 0 {
+            let hint = Rect::new(inner.x, button_area.y.saturating_sub(1), inner.width, 1)
+                .intersection(inner);
+            f.render_widget(
+                Paragraph::new("Scroll to read more").style(Style::new().dim()),
+                hint,
+            );
+        }
+        let cells = Layout::horizontal(
+            buttons
+                .iter()
+                .map(|_| Constraint::Ratio(1, buttons.len() as u32)),
+        )
+        .split(button_area);
+        for ((label, key), cell) in buttons.iter().zip(cells.iter()) {
+            let button = Rect::new(
+                cell.x,
+                cell.y,
+                cell.width.min(label.chars().count() as u16),
+                cell.height,
+            );
+            f.render_widget(Paragraph::new(*label).style(selected_style()), button);
+            self.hit(button, Click::DialogKey(*key));
+        }
     }
 }
 
@@ -6849,19 +7199,42 @@ fn state_row(label: &str, w: usize, value: Span<'static>) -> Line<'static> {
     Line::from(vec![Span::raw(format!("  {label:<w$}")), value])
 }
 
-/// An action line: accent `[key]` chips with dim labels, 2-space indent, a
-/// gap between actions. THE way action keys render, so a key is never a dim
-/// mid-sentence token or a whole dim line.
-fn action_line(items: &[(&str, &str)]) -> Line<'static> {
-    let mut spans = vec![Span::raw("  ")];
-    for (i, (k, d)) in items.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("   "));
-        }
-        spans.push(Span::styled(format!("[{k}]"), Style::new().fg(th().accent)));
-        spans.push(Span::styled(format!(" {d}"), Style::new().dim()));
+/// Explicit authored actions: one separated row per action. The row metadata
+/// travels with the text so labels and wrapped continuations share one target.
+fn push_page_actions(
+    lines: &mut Vec<Line<'_>>,
+    actions: &mut Vec<(usize, KeyCode)>,
+    items: &[(&str, &str)],
+) {
+    for (key, label) in items {
+        push_page_action(lines, actions, key, label, "");
     }
-    Line::from(spans)
+}
+
+fn push_page_action(
+    lines: &mut Vec<Line<'_>>,
+    actions: &mut Vec<(usize, KeyCode)>,
+    key: &str,
+    label: &str,
+    detail: &str,
+) {
+    if actions
+        .last()
+        .is_some_and(|(row, _)| *row + 1 == lines.len())
+    {
+        lines.push(Line::raw(""));
+    }
+    if let Some(code) = footer_keycode(key) {
+        actions.push((lines.len(), code));
+    }
+    let mut spans = vec![Span::styled(
+        format!("  [{key}] {label}"),
+        Style::new().fg(th().accent),
+    )];
+    if !detail.is_empty() {
+        spans.push(Span::styled(format!("  {detail}"), Style::new().dim()));
+    }
+    lines.push(Line::from(spans));
 }
 
 /// Human label for the stored auth method string (`Method::as_str()`): the raw
@@ -7476,7 +7849,7 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
-        assert!(text.contains("Face confirmation: keyboard required"));
+        assert!(text.contains("Face authentication at privileged prompts"));
         for removed in [
             "head gesture",
             "keyring gesture",
@@ -8539,6 +8912,9 @@ mod tests {
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
+            dialog_view: std::cell::Cell::new((Rect::default(), 0)),
+            dialog_scroll: std::cell::Cell::new(0),
+            page_view: std::cell::Cell::new((usize::MAX, Rect::default(), 0, 0)),
             show_help: false,
             more_actions: None,
             hub_sel: 0,
@@ -8767,6 +9143,426 @@ mod tests {
     // Regression: f00f316. A long modal body must be fully visible: the box
     // grows to the wrapped line count instead of clipping at the old fixed
     // height of 5 (three body rows).
+    /// Click text as displayed, independently of the registered hit targets.
+    fn click_text(app: &mut App, text: &str) {
+        let mut term = Terminal::new(TestBackend::new(120, 50)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = rendered(&term);
+        let (y, x) = screen
+            .lines()
+            .enumerate()
+            .find_map(|(y, line)| {
+                line.find(text)
+                    .map(|byte| (y, line[..byte].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("missing {text:?}:\n{screen}"));
+        app.on_click(x as u16, y as u16, Rect::new(0, 0, 120, 50));
+    }
+
+    #[test]
+    fn page_actions_wallet_and_recovery_click_existing_safe_flows() {
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.keyring_armed = Some(true);
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        click_text(&mut app, "[a] re-arm");
+        assert!(matches!(app.input, Some((_, _, Pending::KeyringPw(_)))));
+        app.on_key(KeyCode::Esc);
+        click_text(&mut app, "[r] reseal");
+        assert!(matches!(app.input, Some((_, _, Pending::KeyringPw(_)))));
+        app.on_key(KeyCode::Esc);
+        click_text(&mut app, "[f] forget");
+        assert!(app.confirm.is_some());
+        assert!(app.op.is_none(), "forget must wait for confirmation");
+        app.on_key(KeyCode::Esc);
+        app.screen = SC_RECOVERY;
+        click_text(&mut app, "[s] set passphrase");
+        assert!(app.input.is_some());
+        app.on_key(KeyCode::Esc);
+        click_text(&mut app, "[t] restore");
+        assert!(app.input.is_some());
+        app.on_key(KeyCode::Esc);
+        click_text(&mut app, "[f] forget");
+        assert!(app.confirm.is_some());
+        assert!(app.op.is_none());
+    }
+
+    #[test]
+    fn page_actions_explicit_rows_cover_other_pages_without_launching_operations() {
+        let _guard = dead_socket();
+        for (screen, labels) in [
+            (
+                SC_FINGERPRINT,
+                vec![
+                    ("[a] enroll", 'a'),
+                    ("[t] test", 't'),
+                    ("[x] wipe", 'x'),
+                    ("[e] face", 'e'),
+                    ("[d] remove", 'd'),
+                ],
+            ),
+            (
+                SC_CAMERAS,
+                vec![
+                    ("[s] set up", 's'),
+                    ("[t] tune", 't'),
+                    ("[p] list units", 'p'),
+                ],
+            ),
+            (
+                SC_REPAIR,
+                vec![
+                    ("[f] fix selected", 'f'),
+                    ("[r] re-check", 'r'),
+                    ("[d] doctor", 'd'),
+                    ("[g] logs", 'g'),
+                ],
+            ),
+            (SC_IDENTIFY, vec![("[i] identify now", 'i')]),
+            (SC_SETTINGS, vec![("[p]", 'p'), ("[b]", 'b')]),
+            (SC_DONE, vec![("[r] refresh", 'r'), ("[q] quit", 'q')]),
+            (SC_KEYRING, vec![("[p] refresh pcrlock", 'p')]),
+        ] {
+            let mut app = test_app();
+            app.screen = screen;
+            app.fp.available = true;
+            app.keyring_armed = Some(true);
+            app.keyring_policy = Some("Tier 2".into());
+            let mut term = Terminal::new(TestBackend::new(160, 90)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            for (label, key) in labels {
+                for _ in 0..200 {
+                    if rendered(&term).contains(label) {
+                        break;
+                    }
+                    let (_, bounds, _, _) = app.page_view.get();
+                    app.on_scroll(bounds.x, bounds.y, Rect::new(0, 0, 160, 90), 1);
+                    term.draw(|f| app.draw(f)).unwrap();
+                }
+                let text = rendered(&term);
+                let (y, x) = text
+                    .lines()
+                    .enumerate()
+                    .find_map(|(y, line)| {
+                        line.find(label).map(|at| (y, line[..at].chars().count()))
+                    })
+                    .unwrap_or_else(|| panic!("missing {label} on {screen}"));
+                assert!(
+                    app.click_targets
+                        .borrow()
+                        .iter()
+                        .any(|(r, c)| r.contains((x as u16, y as u16).into())
+                            && matches!(c, Click::Key(KeyCode::Char(k)) if *k == key)),
+                    "{label} on {screen} must be clickable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_actions_wrapped_scrolled_rows_and_blank_space_have_correct_targets() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        let area = Rect::new(0, 0, 40, 16);
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        for _ in 0..200 {
+            if rendered(&term).contains("Show full status") {
+                break;
+            }
+            app.on_scroll(20, 5, area, 1);
+            term.draw(|f| app.draw(f)).unwrap();
+        }
+        let text = rendered(&term);
+        let (y, x) = text
+            .lines()
+            .enumerate()
+            .find_map(|(y, line)| {
+                line.find("Show full status")
+                    .map(|at| (y, line[..at].chars().count()))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "last action reachable by scrolling: {:?}\n{text}",
+                    app.page_view.get()
+                )
+            });
+        app.on_click(x as u16, y as u16, area);
+        assert!(matches!(app.suspend, Some(Suspend::LoginStatus)));
+        assert!(!app.activity_open);
+        assert!(app.confirm.is_none());
+    }
+
+    #[test]
+    fn page_actions_blank_rows_and_unmarked_text_never_become_commands() {
+        let app = test_app();
+        let mut lines = vec![Line::raw("界界界界界界 [f] plain information")];
+        let mut actions = Vec::new();
+        push_page_action(
+            &mut lines,
+            &mut actions,
+            "w",
+            "Wire login",
+            "wrapped explanation continued below",
+        );
+        push_page_action(&mut lines, &mut actions, "s", "Show full status", "");
+        let mut term = Terminal::new(TestBackend::new(24, 16)).unwrap();
+        term.draw(|f| app.draw_action_paragraph(f, f.area(), lines.clone(), &actions))
+            .unwrap();
+        let text = rendered(&term);
+        for (y, line) in text.lines().enumerate() {
+            if line.trim().is_empty() || line.contains("plain information") || line.contains("[f]")
+            {
+                assert!(
+                    !app.click_targets
+                        .borrow()
+                        .iter()
+                        .any(|(r, _)| r.contains((0, y as u16).into())),
+                    "unmarked text/spacing must stay inert"
+                );
+            }
+        }
+        let y = text
+            .lines()
+            .position(|line| line.contains("continued below"))
+            .unwrap();
+        assert!(app
+            .click_targets
+            .borrow()
+            .iter()
+            .any(|(r, c)| r.contains((0, y as u16).into())
+                && matches!(c, Click::Key(KeyCode::Char('w')))));
+    }
+
+    #[test]
+    fn page_actions_scrolled_diagnostic_row_selects_the_visible_check() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = (0..30)
+            .map(|i| check_row(&format!("check-{i:02}"), Sev::Ok, Fix::None))
+            .collect();
+        app.repair_sel = 29;
+        let text = draw_text(&app);
+        let y = text
+            .lines()
+            .position(|line| line.contains("check-29"))
+            .unwrap();
+        assert!(
+            app.click_targets
+                .borrow()
+                .iter()
+                .any(|(r, c)| r.contains((26, y as u16).into()) && matches!(c, Click::Select(29))),
+            "scrolled list must select the displayed check, not the same row number from the top"
+        );
+    }
+
+    #[test]
+    fn page_actions_login_clicks_reuse_wiring_and_unwire_confirmation() {
+        for (label, key) in [
+            ("Wire login + lock", 'w'),
+            ("Wire face-sudo", 'u'),
+            ("Wire app prompts", 'p'),
+            ("Un-wire everything", 'x'),
+            ("Show full status", 's'),
+        ] {
+            let mut app = test_app();
+            app.screen = SC_PAM;
+            click_text(&mut app, label);
+            if key == 'x' {
+                assert!(app.confirm.is_some(), "unwire asks first");
+                assert!(app.suspend.is_none());
+            } else {
+                assert!(
+                    app.suspend.is_some(),
+                    "{label} must schedule the existing CLI flow"
+                );
+            }
+            assert!(app.op.is_none());
+        }
+    }
+
+    #[test]
+    fn mouse_dialog_confirmation_and_cancel_use_the_same_actions() {
+        let mut app = test_app();
+        for accept in [false, true] {
+            app.confirm = Some((
+                "Change policy?".into(),
+                "Enable",
+                ConfirmAct::Sus(Suspend::PrivilegedConsent(false)),
+            ));
+            click_text(&mut app, if accept { "[y] Enable" } else { "Cancel" });
+            assert!(app.confirm.is_none(), "click must resolve the confirmation");
+            assert_eq!(app.suspend.is_some(), accept);
+        }
+    }
+
+    #[test]
+    fn mouse_input_cancel_and_submit_preserve_typed_confirmation() {
+        let mut app = test_app();
+        app.input = Some((
+            "Type uninstall".into(),
+            "uninstall".into(),
+            Pending::UninstallConfirm,
+        ));
+        click_text(&mut app, "Cancel");
+        assert!(app.input.is_none());
+        assert!(app.suspend.is_none());
+        app.input = Some((
+            "Type uninstall".into(),
+            "wrong".into(),
+            Pending::UninstallConfirm,
+        ));
+        click_text(&mut app, "Continue");
+        assert!(app.input.is_none());
+        assert!(
+            app.suspend.is_none(),
+            "click must not bypass typed confirmation"
+        );
+        app.input = Some((
+            "Type uninstall".into(),
+            "uninstall".into(),
+            Pending::UninstallConfirm,
+        ));
+        click_text(&mut app, "Continue");
+        assert!(matches!(app.suspend, Some(Suspend::Uninstall)));
+    }
+
+    #[test]
+    fn mouse_help_and_error_have_explicit_close_controls() {
+        let mut app = test_app();
+        app.show_help = true;
+        click_text(&mut app, "Close");
+        assert!(!app.show_help);
+        app.error = Some("Something failed".into());
+        click_text(&mut app, "Dismiss");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn mouse_action_menu_selects_before_opening_and_can_close_without_keyboard() {
+        let mut app = test_app();
+        app.more_actions = Some((String::new(), 0));
+        click_text(&mut app, "Enroll with a chosen scan count");
+        assert_eq!(app.more_actions.as_ref().unwrap().1, 1);
+        assert!(app.input.is_none(), "first click selects and explains");
+        click_text(&mut app, "[Enter] Open");
+        assert!(app.more_actions.is_none());
+        assert!(app.input.is_some(), "open uses the guided argument flow");
+        click_text(&mut app, "Cancel");
+        app.more_actions = Some(("no such action xyz".into(), 0));
+        click_text(&mut app, "Close");
+        assert!(
+            app.more_actions.is_none(),
+            "empty search still has a close control"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_targets_content_and_does_not_wrap_or_activate() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("one", &["a"]), profile("two", &["b"])];
+        let area = Rect::new(0, 0, 120, 50);
+        let [_, _, body, activity, _] = app.frame_rows(area);
+        let (_, content) = app.body_split(body);
+        app.on_scroll(content.x, content.y, area, 1);
+        assert_eq!(app.sel, 1);
+        assert!(!app.activity_open);
+        app.on_scroll(content.x, content.y, area, -1);
+        app.on_scroll(content.x, content.y, area, -1);
+        assert_eq!(app.sel, 0, "wheel stops at top rather than wrapping");
+        app.on_scroll(0, 0, area, -1);
+        assert!(
+            !app.activity_open,
+            "header scrolling must not affect Activity"
+        );
+        app.on_scroll(activity.x, activity.y, area, -1);
+        assert!(app.activity_open);
+        assert!(app.op.is_none());
+        assert!(app.suspend.is_none());
+    }
+
+    #[test]
+    fn mouse_modal_blocks_background_clicks_and_wheel() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.profiles = vec![profile("one", &["a"])];
+        app.confirm = Some((
+            "Confirm?".into(),
+            "Enable",
+            ConfirmAct::Sus(Suspend::PrivilegedConsent(false)),
+        ));
+        draw_text(&app);
+        let area = Rect::new(0, 0, 120, 50);
+        app.on_click(1, 49, area);
+        app.on_scroll(1, 46, area, -1);
+        assert!(app.confirm.is_some());
+        assert!(app.suspend.is_none());
+        assert!(!app.activity_open);
+    }
+
+    #[test]
+    fn mouse_long_dialog_scroll_keeps_close_control_visible() {
+        let mut app = test_app();
+        app.error = Some(format!(
+            "{}\nEND OF MESSAGE",
+            "Read this explanation.\n".repeat(30)
+        ));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(!rendered(&term).contains("END OF MESSAGE"));
+        for _ in 0..50 {
+            app.on_scroll(20, 5, Rect::new(0, 0, 40, 12), 1);
+        }
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("END OF MESSAGE"),
+            "message must be readable by scrolling"
+        );
+        assert!(
+            text.contains("Dismiss"),
+            "close remains visible at the bottom"
+        );
+        assert!(app.error.is_some(), "scrolling does not dismiss the error");
+        assert!(!app.activity_open);
+    }
+
+    #[test]
+    fn mouse_action_rows_follow_scrolled_and_filtered_menu() {
+        let mut app = test_app();
+        let last = actions::ACTIONS.len() - 1;
+        app.more_actions = Some((String::new(), last));
+        click_text(&mut app, actions::ACTIONS[last - 1].label);
+        assert_eq!(app.more_actions.as_ref().unwrap().1, last - 1);
+        app.on_key(KeyCode::Char('z'));
+        assert_eq!(app.more_actions.as_ref().unwrap().1, 0);
+        app.more_actions = Some(("chosen scan count".into(), 0));
+        click_text(&mut app, "Enroll with a chosen scan count");
+        click_text(&mut app, "[Enter] Open");
+        assert!(matches!(app.input, Some((_, _, Pending::ActionField(_)))));
+        assert!(app.op.is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_in_action_menu_is_bounded_and_ignores_background() {
+        let mut app = test_app();
+        app.more_actions = Some((String::new(), 0));
+        let area = Rect::new(0, 0, 120, 50);
+        app.on_scroll(0, 0, area, 1);
+        assert_eq!(app.more_actions.as_ref().unwrap().1, 0);
+        for _ in 0..100 {
+            app.on_scroll(60, 25, area, 1);
+        }
+        assert_eq!(
+            app.more_actions.as_ref().unwrap().1,
+            actions::ACTIONS.len() - 1
+        );
+        assert!(!app.activity_open);
+        assert!(app.input.is_none());
+        assert!(app.confirm.is_none());
+    }
+
     #[test]
     fn modal_grows_to_fit_long_body() {
         let app = test_app();
@@ -8774,7 +9570,7 @@ mod tests {
         // ~8 wrapped lines at the modal's inner width; the last word is the
         // sentinel that the fixed-height modal used to clip away.
         let body = format!("{} ENDBODY", ["lorem"; 40].join(" "));
-        term.draw(|f| app.modal(f, "Confirm", &body)).unwrap();
+        term.draw(|f| app.modal(f, "Confirm", &body, &[])).unwrap();
         let text = rendered(&term);
         assert!(
             text.contains("ENDBODY"),
@@ -12333,6 +13129,111 @@ mod tests {
             None => std::env::remove_var("IRLUME_ENFORCE_BIOPOLICY"),
         }
         assert!(row_with(&text, "biopolicy").contains("● yes"), "{text}");
+    }
+
+    #[test]
+    fn settings_sensor_policy_is_explicitly_local_experimental_and_read_only() {
+        let _guard = dead_socket();
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let dir = std::env::temp_dir().join(format!("irlume-tui-sensor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        let original = "face_sensor_policy=ir-only-experimental\n";
+        std::fs::write(dir.join("settings.conf"), original).unwrap();
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        assert!(text.contains("local saved: EXPERIMENTAL IR-only"), "{text}");
+        assert!(text.contains("not qualified"), "{text}");
+        assert!(app.confirm.is_none() && app.suspend.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.conf")).unwrap(),
+            original
+        );
+        match old_cfg {
+            Some(value) => std::env::set_var("IRLUME_CONFIG_DIR", value),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_consent_enable_requires_confirmation_and_cancel_keeps_policy() {
+        let _guard = dead_socket();
+        let old_env = std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT");
+        let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
+        let dir = std::env::temp_dir().join(format!("irlume-tui-consent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        std::fs::write(dir.join("settings.conf"), "privileged_face_consent=1\n").unwrap();
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.on_key(KeyCode::Char('p'));
+        assert!(
+            app.confirm.is_some() && app.suspend.is_none(),
+            "enabling must first explain the change"
+        );
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none() && app.suspend.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.conf")).unwrap(),
+            "privileged_face_consent=1\n"
+        );
+        app.on_key(KeyCode::Char('p'));
+        app.on_key(KeyCode::Char('y'));
+        assert!(
+            matches!(app.suspend, Some(Suspend::PrivilegedConsent(false))),
+            "acceptance schedules the privileged CLI operation"
+        );
+        app.suspend = None;
+        std::fs::write(dir.join("settings.conf"), "privileged_face_consent=0\n").unwrap();
+        app.on_key(KeyCode::Char('p'));
+        assert!(
+            app.confirm.is_none() && matches!(app.suspend, Some(Suspend::PrivilegedConsent(true))),
+            "restoring confirmation is direct"
+        );
+        app.suspend = None;
+        std::fs::remove_file(dir.join("settings.conf")).unwrap();
+        std::fs::create_dir(dir.join("settings.conf")).unwrap();
+        app.on_key(KeyCode::Char('p'));
+        assert!(
+            app.confirm.is_none() && app.suspend.is_none(),
+            "unknown state must not guess a toggle direction"
+        );
+        drain_loads(&mut app);
+        match old_env {
+            Some(v) => std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", v),
+            None => std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT"),
+        }
+        match old_cfg {
+            Some(v) => std::env::set_var("IRLUME_CONFIG_DIR", v),
+            None => std::env::remove_var("IRLUME_CONFIG_DIR"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_consent_reflects_policy_and_cannot_hide_an_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("IRLUME_PRIVILEGED_FACE_CONSENT");
+        for (v, expected) in [("0", "hands-free"), ("1", "required"), ("typo", "required")] {
+            std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", v);
+            let mut app = test_app();
+            app.screen = SC_SETTINGS;
+            let text = draw_text(&app);
+            assert!(
+                text.contains(expected) && text.contains("privileged"),
+                "{text}"
+            );
+            assert!(text.contains("environment override"), "{text}");
+            app.on_key(KeyCode::Char('p'));
+            assert!(app.suspend.is_none() && app.confirm.is_none());
+        }
+        match old {
+            Some(v) => std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", v),
+            None => std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT"),
+        }
     }
 
     #[test]

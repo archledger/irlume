@@ -165,6 +165,7 @@ impl Engine {
         self.begin_grouped_attempt();
         // The closure makes all errors and refusals share the evidence reset.
         let result = (|| {
+            self.check_request_cancelled()?;
             if samples.len() != VIT_PAD_VOTE_N {
                 return Err(irlume_common::Error::Hardware(
                     "incomplete grouped evidence".into(),
@@ -172,10 +173,12 @@ impl Engine {
             }
             for (index, sample) in samples.into_iter().enumerate() {
                 self.note_capture_boundary();
+                self.check_request_cancelled()?;
                 if now() >= deadline {
                     return Ok(PreparedGroup::Refused(expired()));
                 }
                 let mut evidence = assess(self, sample)?;
+                self.check_request_cancelled()?;
                 self.last_attempt_facts = AttemptFacts::from_assessment(&evidence.assessment);
                 if now() >= deadline {
                     return Ok(PreparedGroup::Refused(expired()));
@@ -195,10 +198,12 @@ impl Engine {
                     continue;
                 }
                 if final_sample {
+                    self.check_request_cancelled()?;
                     if now() >= deadline {
                         return Ok(PreparedGroup::Refused(expired()));
                     }
                     let assessment = materialize(self, evidence)?;
+                    self.check_request_cancelled()?;
                     if now() >= deadline {
                         return Ok(PreparedGroup::Refused(expired()));
                     }
@@ -239,9 +244,9 @@ impl Engine {
                 "grouped capture requires an exact runtime contract".into(),
             )
         })?;
-        let progress = self.capture_progress();
+        let control = self.capture_control();
         let started = Instant::now();
-        let samples = irlume_camera::capture_sequential_batch_with_progress(
+        let samples = irlume_camera::capture_sequential_batch_with_control(
             &cameras.0,
             &cameras.1,
             contract,
@@ -250,7 +255,7 @@ impl Engine {
                 pair_gap_limit: SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW,
                 deadline,
             },
-            &progress,
+            &control,
         )?;
         irlume_common::dlog!(
             "[assessment-stage] grouped-capture: pairs={} elapsed={}ms",

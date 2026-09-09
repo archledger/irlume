@@ -26,7 +26,7 @@ cargo build --release --locked
 # fail the build instead of shipping that.
 declared="$(sed -n 's/^  - libc6 (>= \(.*\))$/\1/p' "$REPO/packaging/debian/nfpm.yaml")"
 [ -n "$declared" ] || { echo "nfpm.yaml no longer declares a libc6 floor"; exit 1; }
-actual="$(objdump -T target/release/irlume target/release/irlumed target/release/libpam_irlume.so \
+actual="$(objdump -T target/release/irlume target/release/irlumed target/release/libpam_irlume.so target/release/irlume-password-verify \
   | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)"
 if [ "$(printf '%s\n%s\n' "$actual" "$declared" | sort -V | tail -n1)" != "$declared" ]; then
   echo "binaries need glibc $actual but nfpm.yaml declares libc6 (>= $declared);"

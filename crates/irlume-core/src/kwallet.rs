@@ -26,117 +26,13 @@
 //! cites its source.
 
 use irlume_common::{Error, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zeroize::Zeroizing;
 
 // The wire constants live in irlume-common so the handoff helper can use them
 // without this crate's TPM and inference dependencies, and so both sides of the
 // handoff read one definition.
 pub use irlume_common::kwallet_wire::{ITERATIONS, KEY_LEN, SALT_LEN};
-
-/// Path of the salt `pam_kwallet5` derives against, relative to `$HOME`.
-///
-/// Still `kwalletd` on disk even though the daemon that reads it is now
-/// `ksecretd`; KWallet became a compatibility shim over the Secret Service and
-/// the storage location did not move.
-const SALT_RELPATH: &str = ".local/share/kwalletd/kdewallet.salt";
-
-/// Absolute path of `home`'s wallet salt file.
-pub fn salt_path(home: &Path) -> PathBuf {
-    home.join(SALT_RELPATH)
-}
-
-/// The most this file can be and still be a wallet salt. A real one is
-/// [`SALT_LEN`] bytes; the headroom is for a future format, not for a payload.
-const MAX_SALT_BYTES: u64 = 4096;
-
-/// Read a REGULAR file of at most `max` bytes, without blocking and without
-/// following a symlink at the final component.
-///
-/// This path lives inside the user's own home, so its contents and its type are
-/// theirs to choose, and the daemon reads it as root on the worker thread. A
-/// plain `fs::read` here was a wedge: `mkfifo`ing the salt path blocks in
-/// `open(2)` until a writer appears, which stalls the camera worker forever
-/// while the connection threads keep answering Ping, so the daemon looks
-/// healthy while every capture and mutation is dead. The systemd watchdog then
-/// kills and restarts it, and the file is still a FIFO, so it happens again.
-/// Pointing it at /dev/zero gives unbounded allocation instead.
-///
-/// `O_NONBLOCK` makes opening a FIFO return instead of waiting, `O_NOFOLLOW`
-/// stops a symlink redirecting the final component elsewhere, and the fstat
-/// rejects anything that is not a regular file, which covers FIFOs, devices,
-/// and directories together. The size cap bounds the allocation.
-fn read_regular_file_capped(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)?;
-    let meta = file.metadata()?;
-    let ft = meta.file_type();
-    if !ft.is_file() {
-        let what = if ft.is_fifo() {
-            "a FIFO"
-        } else if ft.is_char_device() || ft.is_block_device() {
-            "a device"
-        } else if ft.is_dir() {
-            "a directory"
-        } else if ft.is_socket() {
-            "a socket"
-        } else {
-            "not a regular file"
-        };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is {what}, not a regular file", path.display()),
-        ));
-    }
-    if meta.len() > max {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} is {} bytes, over the {max}-byte limit",
-                path.display(),
-                meta.len()
-            ),
-        ));
-    }
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    // Cap the read as well as the stat: the file can grow between the two.
-    file.take(max).read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-/// Read `home`'s wallet salt.
-///
-/// Deliberately does NOT create a missing salt, unlike `pam_kwallet5`, which
-/// creates one on first login. Absent salt means this user has no KDE wallet
-/// yet, and inventing one here would derive a key that opens nothing while
-/// looking like a successful arm.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn read_salt(home: &Path) -> Result<Zeroizing<Vec<u8>>> {
-    let path = salt_path(home);
-    let raw = read_regular_file_capped(&path, MAX_SALT_BYTES).map_err(|e| {
-        Error::Policy(format!(
-            "no KDE wallet salt at {}: {e}. Log into a Plasma session once so \
-             the wallet exists, then arm again",
-            path.display()
-        ))
-    })?;
-    if raw.len() < SALT_LEN {
-        return Err(Error::Policy(format!(
-            "wallet salt at {} is {} bytes, expected at least {SALT_LEN}",
-            path.display(),
-            raw.len()
-        )));
-    }
-    // pam_kwallet5 reads SALT_LEN and derives over exactly that, so a longer
-    // file must be truncated rather than passed through, or we derive a
-    // different key from the same file it used.
-    Ok(Zeroizing::new(raw[..SALT_LEN].to_vec()))
-}
 
 /// Derive the wallet key `ksecretd` expects from `secret` and `salt`.
 ///
@@ -152,18 +48,15 @@ pub fn derive_key(secret: &[u8], salt: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         )));
     }
     let mut out = Zeroizing::new(vec![0u8; KEY_LEN]);
+    // Protect the allocation before PBKDF2 writes the derived secret into it;
+    // locking only after the KDF would leave the most sensitive window open.
+    irlume_common::memlock::lock_slice(&out);
     pbkdf2::pbkdf2_hmac::<sha2::Sha512>(secret, salt, ITERATIONS, &mut out);
     Ok(out)
 }
 
-/// Derive `home`'s wallet key from the login password.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
-pub fn derive_for_home(password: &[u8], home: &Path) -> Result<Zeroizing<Vec<u8>>> {
-    let salt = read_salt(home)?;
-    derive_key(password, &salt)
-}
-
-/// Which secret to seal for a user, judged by what they actually have.
+/// Which secret to seal for a user, combining the caller's account-scoped KDE
+/// salt result with the GNOME keyring visible below `home`.
 ///
 /// A KDE wallet key only makes sense where there is a KDE wallet. A GNOME
 /// keyring token only makes sense where there is a GNOME login keyring to
@@ -176,13 +69,12 @@ pub fn derive_for_home(password: &[u8], home: &Path) -> Result<Zeroizing<Vec<u8>
 /// resolves to it. A home with neither also lands there deliberately: a token
 /// arm on a fresh account would have no keyring to re-key, and the envelope it
 /// wrote would unlock nothing.
-pub fn detect_kind(home: &Path) -> crate::envelope::SecretKind {
+pub fn detect_kind(home: &Path, has_kde_salt: bool) -> crate::envelope::SecretKind {
     use crate::envelope::SecretKind;
-    let has_kde = salt_path(home).exists();
     // gnome-keyring's login keyring: what a token re-keys, and what a wallet
     // key arm would break.
     let has_gnome = home.join(".local/share/keyrings/login.keyring").exists();
-    match (has_kde, has_gnome) {
+    match (has_kde_salt, has_gnome) {
         (true, false) => SecretKind::KdeWalletKey,
         (false, true) => SecretKind::GnomeKeyringToken,
         _ => SecretKind::LoginPassword,
@@ -192,48 +84,28 @@ pub fn detect_kind(home: &Path) -> crate::envelope::SecretKind {
 #[cfg(test)]
 mod tests {
 
-    /// The salt path lives in the user's own home, so its TYPE is theirs to
-    /// choose. `fs::read` on a FIFO blocks in `open(2)` until a writer appears,
-    /// which stalls the daemon's camera worker forever while the connection
-    /// threads keep answering Ping: the daemon looks healthy while every capture
-    /// is dead, the watchdog kills it, and the FIFO is still there on restart.
-    #[test]
-    fn a_non_regular_salt_is_refused_instead_of_blocking() {
-        let dir = std::path::PathBuf::from(crate::test_tmp_dir("kwallet-fifo"))
-            .join(".local/share/kwalletd");
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("kdewallet.salt");
-        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            // SAFETY: `c` is a live CString that outlives this call, so the pointer is
-            // a valid NUL-terminated path for the duration of mkfifo.
-            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
-            0,
-            "mkfifo failed"
-        );
-
-        let home = dir.parent().unwrap().parent().unwrap().parent().unwrap();
-        // Must RETURN. Before the fix this call never came back.
-        let err = read_salt(home).expect_err("a FIFO must not be read as a salt");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("FIFO"),
-            "the refusal must name what it found: {msg}"
-        );
-
-        // A real salt still reads.
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, vec![7u8; SALT_LEN]).unwrap();
-        assert_eq!(read_salt(home).unwrap().len(), SALT_LEN);
-
-        // And an implausibly large one is refused rather than allocated.
-        std::fs::write(&path, vec![0u8; (MAX_SALT_BYTES + 1) as usize]).unwrap();
-        assert!(
-            read_salt(home).is_err(),
-            "an oversized salt must be refused"
-        );
-        let _ = std::fs::remove_dir_all(home);
+    fn locked_kb_of(addr: usize) -> Option<u64> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+        let mut in_range = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ') {
+                if let Some((start, end)) = range.split_once('-') {
+                    if let (Ok(start), Ok(end)) = (
+                        usize::from_str_radix(start, 16),
+                        usize::from_str_radix(end, 16),
+                    ) {
+                        in_range = start <= addr && addr < end;
+                        continue;
+                    }
+                }
+            }
+            if in_range {
+                if let Some(rest) = line.strip_prefix("Locked:") {
+                    return rest.trim().trim_end_matches("kB").trim().parse().ok();
+                }
+            }
+        }
+        None
     }
 
     use super::*;
@@ -247,6 +119,29 @@ mod tests {
             KEY_LEN,
             "ksecretd's waitForHash() reads exactly {KEY_LEN} bytes; a shorter \
              key leaves it blocking and a longer one silently truncates"
+        );
+    }
+
+    #[test]
+    fn derived_wallet_key_is_memlocked() {
+        let key = derive_key(b"synthetic password", &[0x5a; SALT_LEN]).expect("derive");
+        let key_locked = locked_kb_of(key.as_ptr() as usize).unwrap_or(0);
+
+        // Control: stand down when best-effort mlock is unavailable in this
+        // environment, rather than changing the authentication contract.
+        let control = irlume_common::SecretBytes::new(vec![0x71; 16 * 1024]);
+        let control_mid = control.expose().as_ptr() as usize + 8 * 1024;
+        match locked_kb_of(control_mid) {
+            Some(kb) if kb > 0 => {}
+            _ => {
+                eprintln!("skipping: environment cannot mlock (RLIMIT_MEMLOCK?)");
+                return;
+            }
+        }
+
+        assert!(
+            key_locked > 0,
+            "PBKDF2 output must be protected while and after it is derived"
         );
     }
 
@@ -310,12 +205,8 @@ mod tests {
         let base = std::env::temp_dir().join(format!("irlume-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
 
-        let mk = |name: &str, kde: bool, gnome: bool| {
+        let mk = |name: &str, gnome: bool| {
             let h = base.join(name);
-            if kde {
-                std::fs::create_dir_all(salt_path(&h).parent().unwrap()).unwrap();
-                std::fs::write(salt_path(&h), [0u8; SALT_LEN]).unwrap();
-            }
             if gnome {
                 let g = h.join(".local/share/keyrings");
                 std::fs::create_dir_all(&g).unwrap();
@@ -326,60 +217,21 @@ mod tests {
         };
 
         assert_eq!(
-            detect_kind(&mk("neither", false, false)),
+            detect_kind(&mk("neither", false), false),
             SecretKind::LoginPassword
         );
         assert_eq!(
-            detect_kind(&mk("gnome", false, true)),
+            detect_kind(&mk("gnome", true), false),
             SecretKind::GnomeKeyringToken
         );
         assert_eq!(
-            detect_kind(&mk("both", true, true)),
+            detect_kind(&mk("both", true), true),
             SecretKind::LoginPassword
         );
         assert_eq!(
-            detect_kind(&mk("kde", true, false)),
+            detect_kind(&mk("kde", false), true),
             SecretKind::KdeWalletKey
         );
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_missing_salt_is_an_error_rather_than_a_freshly_invented_one() {
-        // pam_kwallet5 creates a missing salt; we must not. No salt means no
-        // wallet, and a key derived against an invented salt opens nothing
-        // while `keyring arm` reports success.
-        let dir = std::env::temp_dir().join(format!("irlume-kwallet-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let err = read_salt(&dir).expect_err("a missing salt must not be invented");
-        assert!(
-            !salt_path(&dir).exists(),
-            "read_salt created {} instead of failing",
-            salt_path(&dir).display()
-        );
-        assert!(
-            format!("{err}").contains("Plasma"),
-            "the error should tell the user how to get a wallet, got: {err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_salt_file_longer_than_the_derivation_uses_is_truncated_not_hashed_whole() {
-        // pam_kwallet5 reads SALT_LEN bytes and derives over exactly those. If we
-        // hashed a longer file whole we would get a different key from the same
-        // file it used, and the wallet would never open.
-        let dir = std::env::temp_dir().join(format!("irlume-kwallet-long-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(salt_path(&dir).parent().unwrap()).expect("mkdir");
-        let mut long = vec![0x7u8; SALT_LEN];
-        long.extend_from_slice(b"trailing bytes pam_kwallet5 never reads");
-        std::fs::write(salt_path(&dir), &long).expect("write salt");
-
-        let via_file = derive_for_home(b"pw", &dir).expect("derive");
-        let via_prefix = derive_key(b"pw", &long[..SALT_LEN]).expect("derive");
-        assert_eq!(via_file.to_vec(), via_prefix.to_vec());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

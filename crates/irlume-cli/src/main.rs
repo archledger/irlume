@@ -20,6 +20,7 @@
 
 mod bitwarden;
 mod commands;
+mod consent;
 mod doctor_report;
 mod fingerprint;
 mod logintx;
@@ -30,7 +31,9 @@ mod pad;
 mod pamwire;
 mod profile_ir;
 mod recovery;
+mod retry;
 mod secrets;
+mod sensor_policy;
 mod strays;
 mod suncal;
 mod support_report;
@@ -171,6 +174,7 @@ fn main() -> std::process::ExitCode {
         (Some("enrolldev"), _) => enrolldev(&args),
         (Some("keyring"), _) => keyring(keyring_sub(&args), &args),
         (Some("recovery"), _) => recovery::run(recovery_sub(&args), &args),
+        (Some("retry"), _) => retry::run(recovery_sub(&args), &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), _) => fingerprint::run(fingerprint_sub(&args), &args),
         (Some("login"), _)
@@ -193,6 +197,8 @@ fn main() -> std::process::ExitCode {
         // whatever flags follow and answers a bad invocation with a JSON
         // usage-error rather than prose. Bare `auth` still falls through to the
         // help, which is the useful answer to a typo.
+        (Some("auth"), Some("consent")) => consent::run(&args[2..]),
+        (Some("auth"), Some("sensor")) => sensor_policy::run(&args[2..]),
         (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test(&args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
@@ -1056,10 +1062,19 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 eprintln!("[keyring] empty password; aborted");
                 return std::process::ExitCode::from(2);
             }
+            let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
+                Ok(salt) => salt,
+                Err(e) => {
+                    eprintln!("[keyring] arm failed: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             let req = irlume_common::Request::SealPassword {
                 kind: None, // let the daemon judge from what the user has
                 user: user.clone(),
                 password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
+                wallet_salt,
+                wallet_salt_checked: true,
             };
             match daemon_request(&req) {
                 Ok(irlume_common::Response::PasswordSealed) => {

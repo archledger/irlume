@@ -10,6 +10,7 @@ members = [
     "crates/irlume-core",
     "crates/irlume-kwallet-init",
     "crates/irlume-gkr-unlock",
+    "crates/irlume-password-verify",
     "crates/irlume-auth",
     "crates/irlume-fingerprint",
     "crates/irlume-daemon",

@@ -14,12 +14,11 @@
 //! speaking the real line-JSON `Request`/`Response` protocol) that returns the
 //! exact canned answer the arm expects.
 //!
-//! Isolation is identical to `cli.rs`: `IRLUME_SOCKET` / `IRLUME_CONFIG_DIR` /
-//! `IRLUME_STATE_DIR` / `IRLUME_KEYRING_DIR` / `IRLUME_METHOD_CONF` all point
-//! into a per-test temp tree, shelled-out tools are PATH-shadowed with fakes,
-//! and nothing touches the network, a camera, the TPM, root, or the machine's
-//! package database. Every spawn is watchdogged: a child that has not exited
-//! after 30s is killed and the test fails, naming the command.
+//! Isolation is identical to `cli.rs`: state paths point into a per-test temp
+//! tree and shelled-out tools are fakes. Privileged fixed-path command tests add
+//! a Bubblewrap user/mount namespace with a private `/usr/bin` and `/run`, so
+//! they cannot reach host services. Every spawn is watchdogged: a child that
+//! has not exited after 30s is killed and the test fails, naming the command.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -27,6 +26,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use irlume_common::{ProfileSummary, Request, Response};
+
+mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -54,6 +55,14 @@ impl Sandbox {
         for d in ["cfg", "state", "keyring", "bin", "work"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
+        let helper = root.join("wallet-salt-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n[ \"$1\" = --read-salt ] && [ \"$#\" -eq 2 ] || exit 1\nexit 3\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         Sandbox { root }
     }
 
@@ -82,6 +91,7 @@ impl Sandbox {
             .env("IRLUME_STATE_DIR", self.root.join("state"))
             .env("IRLUME_KEYRING_DIR", self.root.join("keyring"))
             .env("IRLUME_METHOD_CONF", self.root.join("cfg").join("method"))
+            .env("IRLUME_KWALLET_INIT", self.root.join("wallet-salt-helper"))
             .env_remove("IRLUME_DEV")
             .env_remove("IRLUME_CONSENT_GESTURE")
             .env_remove("ORT_DYLIB_PATH")
@@ -94,19 +104,8 @@ impl Sandbox {
         c
     }
 
-    /// Like `cmd`, but with the sandbox bin dir prepended to PATH so fake tools
-    /// shadow the real ones.
-    fn cmd_with_fakes(&self, args: &[&str]) -> Command {
-        let mut c = self.cmd(args);
-        c.env(
-            "PATH",
-            format!(
-                "{}:{}",
-                self.root.join("bin").display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        );
-        c
+    fn isolated_root_cmd(&self, args: &[&str], tools: &[&str]) -> Command {
+        support::isolated_root_command(&self.root, BIN, args, tools)
     }
 }
 
@@ -114,6 +113,35 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn privileged_command_namespace_masks_every_resolver_prefix() {
+    let sb = Sandbox::new("command-path-namespace");
+    support::assert_system_command_isolation(&sb.root, &[]);
+    let commands = [
+        "loginctl",
+        "gnome-shell",
+        "semodule",
+        "systemctl",
+        "restorecon",
+    ];
+    for command in commands {
+        sb.fake_tool(command, "exit 0");
+    }
+    support::assert_system_command_isolation(&sb.root, &commands);
+}
+
+#[test]
+fn privileged_command_namespace_restores_split_bin_script_interpreter() {
+    assert_eq!(
+        support::shell_bind_destinations(Path::new("/usr/bin"), Path::new("/usr/bin")),
+        &["/usr/bin/sh"]
+    );
+    assert_eq!(
+        support::shell_bind_destinations(Path::new("/usr/bin"), Path::new("/bin")),
+        &["/usr/bin/sh", "/bin/sh"]
+    );
 }
 
 /// Drain a spawned child under a 30s watchdog. stdout/stderr are read on their
@@ -608,7 +636,8 @@ fn diag_does_not_call_a_reachable_daemon_unreachable_when_its_reply_is_unexpecte
 // cwd-relative lookup is GONE (running `sudo irlume selinux load` from a
 // directory holding a packaging/selinux/irlume.pp used to install the
 // caller's file as system policy), and every tool the sequence runs is a
-// fake on PATH. The first version of this test faked only semodule, so on a
+// fake at its fixed resolver path inside a private mount namespace. The
+// first version of this test faked only semodule on PATH, so on a
 // host with the packaged .pp installed it found the REAL module and drove
 // the REAL systemctl through a try-restart of the host's daemon: a test
 // that touches the machine it runs on is the bug, not the coverage.
@@ -622,7 +651,7 @@ fn selinux_load_handles_missing_module_and_semodule_outcomes() {
     // short-circuits `load` on hosts without SELinux) out of the way, so
     // this still tests the .pp lookup path it was written for.
     sb.fake_tool("semodule", "exit 0");
-    let mut miss = sb.cmd_with_fakes(&["selinux", "load"]);
+    let mut miss = sb.isolated_root_cmd(&["selinux", "load"], &["semodule"]);
     miss.env("IRLUME_SELINUX_PP", sb.path("does-not-exist.pp"));
     let (code, _, err) = run(&mut miss, "selinux load");
     assert_eq!(code, 1);
@@ -631,7 +660,10 @@ fn selinux_load_handles_missing_module_and_semodule_outcomes() {
     let pp = sb.path("irlume.pp");
     std::fs::write(&pp, b"\x00").unwrap();
     let with_pp = |sb: &Sandbox| {
-        let mut c = sb.cmd_with_fakes(&["selinux", "load"]);
+        let mut c = sb.isolated_root_cmd(
+            &["selinux", "load"],
+            &["semodule", "systemctl", "restorecon"],
+        );
         c.env("IRLUME_SELINUX_PP", &pp);
         c
     };

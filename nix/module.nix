@@ -211,6 +211,9 @@ in
     # the package is documentation here; THIS line is the operative one on
     # NixOS (nothing scans $out/lib/tmpfiles.d).
     systemd.tmpfiles.rules = [
+      # Private persistent machine state. The mode mask tightens a loose
+      # existing directory without widening one whose owner bits are stricter.
+      "d /var/lib/irlume ~0700 root root -"
       "d /run/lock/irlume 2751 root video -"
     ];
 
@@ -318,6 +321,10 @@ in
 
     # Splice pam_irlume into each opted-in service with its resolved control.
     security.pam.services = lib.mkMerge [
+      # A dedicated fixed local-password stack; defaults must not add biometrics.
+      {
+        irlume-retry-reset.text = lib.mkForce (builtins.readFile ../packaging/pam/irlume-retry-reset);
+      }
       (lib.mapAttrs (_: svc: { rules.auth.irlume = mkAuthRule svc; }) cfg.pam.services)
       # Text-mode greeters are not a graphical session, so pam_kwallet skips
       # itself unless forced. Only meaningful when the service actually enables

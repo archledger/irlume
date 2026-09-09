@@ -123,6 +123,8 @@ install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/
 # PAM transaction.
 install -Dm0755 target/release/irlume-kwallet-init %{buildroot}%{_libexecdir}/%{name}/irlume-kwallet-init
 install -Dm0755 target/release/irlume-gkr-unlock %{buildroot}%{_libexecdir}/%{name}/irlume-gkr-unlock
+install -Dm0755 target/release/irlume-password-verify %{buildroot}%{_libexecdir}/irlume-password-verify
+install -Dm0644 packaging/pam/irlume-retry-reset %{buildroot}%{_sysconfdir}/pam.d/irlume-retry-reset
 # Bundled models (release assets, verified in %prep) → /usr/share/irlume/models
 install -Dm0644 %{SOURCE2} %{buildroot}%{_datadir}/%{name}/models/glintr100.onnx
 install -Dm0644 %{SOURCE3} %{buildroot}%{_datadir}/%{name}/models/face_detection_yunet_2023mar.onnx
@@ -196,11 +198,13 @@ systemctl start irlume-reconcile.timer &>/dev/null || :
 # the entire /bin/sh scriptlet, which `|| :` cannot catch.
 # The marker simply stays unwritten on ostree, so this block re-runs on
 # every upgrade (the sandboxed `systemctl enable` is inert there);
-# /var/lib/irlume itself is created on demand by the daemon and the
-# reconcile service, so nothing needs it from this scriptlet.
+# The shared tmpfiles rule creates /var/lib/irlume privately on ordinary
+# installs; the mkdir below is the same-mode fallback and stays inert on
+# rpm-ostree's read-only /var.
 if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
     systemctl enable --now irlume-reconcile.timer &>/dev/null || :
-    mkdir -p /var/lib/irlume 2>/dev/null || :
+    # /var/lib is system-owned and already exists; only the leaf is ours.
+    mkdir -p -m 0700 /var/lib/irlume 2>/dev/null || :
     touch /var/lib/irlume/.reconcile-timer-armed 2>/dev/null || :
 fi
 systemctl start irlume-reconcile.service &>/dev/null || :
@@ -254,6 +258,8 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/irlume-kwallet-init
 %{_libexecdir}/%{name}/irlume-gkr-unlock
+%{_libexecdir}/irlume-password-verify
+%config(noreplace) %{_sysconfdir}/pam.d/irlume-retry-reset
 # Own the directories the globs populate (rpmlint: "directory not owned by a
 # package"; also leaves them behind on erase otherwise).
 %dir %{_datadir}/%{name}

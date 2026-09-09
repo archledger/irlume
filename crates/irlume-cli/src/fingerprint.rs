@@ -635,12 +635,16 @@ fn omarchy_wire_stack(content: &str) -> Option<String> {
 /// lines sit. Idempotent; returns the content to write (possibly unchanged).
 fn omarchy_unwire_stack(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
-    for line in content.lines() {
-        if line.contains("pam_fprintd.so") || line.contains("omarchy-hw-laptop-closed") {
-            continue;
+    let mut continued = false;
+    for physical_line in content.split_inclusive('\n') {
+        let line = physical_line.strip_suffix('\n').unwrap_or(physical_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let owned = !continued && matches!(line, OMARCHY_GATE | OMARCHY_FPRINTD);
+        let continues = crate::pamwire::has_line_continuation(physical_line);
+        if !owned {
+            out.push_str(physical_line);
         }
-        out.push_str(line);
-        out.push('\n');
+        continued = continues;
     }
     out
 }
@@ -1236,6 +1240,34 @@ auth     include  system-auth
         // Already bare stays byte-identical.
         let clean = "#%PAM-1.0\nauth     include  system-auth\n";
         assert_eq!(omarchy_unwire_stack(clean), clean);
+    }
+
+    #[test]
+    fn omarchy_unwire_preserves_foreign_token_lines_and_original_line_endings() {
+        let foreign = concat!(
+            "# administrator note: pam_fprintd.so stays here\r\n",
+            "auth optional pam_fprintd.so debug\r\n",
+            "auth optional pam_exec.so /usr/local/bin/omarchy-hw-laptop-closed\r\n",
+            "auth include system-auth",
+        );
+        assert_eq!(omarchy_unwire_stack(foreign), foreign);
+
+        let owned_without_final_newline = format!("#%PAM-1.0\n{OMARCHY_GATE}\n{OMARCHY_FPRINTD}");
+        assert_eq!(
+            omarchy_unwire_stack(&owned_without_final_newline),
+            "#%PAM-1.0\n"
+        );
+    }
+
+    #[test]
+    fn omarchy_unwire_preserves_owned_looking_text_in_a_continued_directive() {
+        let continued = format!(
+            "auth optional pam_exec.so /usr/local/bin/check \\\n{OMARCHY_GATE}\n{OMARCHY_FPRINTD}\nauth include system-auth\n"
+        );
+        let expected = format!(
+            "auth optional pam_exec.so /usr/local/bin/check \\\n{OMARCHY_GATE}\nauth include system-auth\n"
+        );
+        assert_eq!(omarchy_unwire_stack(&continued), expected);
     }
 
     #[test]

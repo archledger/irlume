@@ -5,6 +5,11 @@ IR liveness gate (`irlume_liveness::LivenessGate`). The shipped deny-only PAD
 models (ViT RGB + FLIR IR, ADR-0013) run alongside this gate on the credential
 path and are out of scope here; see `docs/pad-results/`.
 
+> For the optional IR-only **full diagnostic path**, use
+> [IR-only qualification](IR_ONLY_QUALIFICATION.md). The gate-only measurements
+> below do not include its mandatory model PAD and complete identity decision,
+> and cannot qualify that proposed login mode.
+
 This document defines how irlume's presentation-attack-detection (PAD) gate is
 self-tested against the methodology of **ISO/IEC 30107-3** (*Biometric presentation
 attack detection, Part 3: Testing and reporting*). It is the reference the

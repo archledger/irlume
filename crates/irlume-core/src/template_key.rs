@@ -55,16 +55,26 @@ fn recovery_dir() -> PathBuf {
 pub(crate) struct UserStateLock(std::fs::File);
 
 impl UserStateLock {
+    pub(crate) fn acquire_read_only(user: &str) -> Result<Self> {
+        Self::acquire_with_creation(user, false)
+    }
+
     pub(crate) fn acquire(user: &str) -> Result<Self> {
+        Self::acquire_with_creation(user, true)
+    }
+
+    fn acquire_with_creation(user: &str, create: bool) -> Result<Self> {
         let dir = key_dir().join(".locks");
-        let dir_existed = dir.try_exists().unwrap_or(false);
-        std::fs::create_dir_all(&dir).map_err(|error| Error::Io(error.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if !dir_existed {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|error| Error::Io(error.to_string()))?;
+        if create {
+            let dir_existed = dir.try_exists().unwrap_or(false);
+            std::fs::create_dir_all(&dir).map_err(|error| Error::Io(error.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if !dir_existed {
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|error| Error::Io(error.to_string()))?;
+                }
             }
         }
         let path = dir.join(format!(
@@ -72,7 +82,11 @@ impl UserStateLock {
             irlume_common::sha256_hex(user.as_bytes())
         ));
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(create)
+            .create(create)
+            .truncate(false);
         #[cfg(unix)]
         options
             .mode(0o600)
@@ -170,7 +184,41 @@ pub fn load_key(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     load_key_unlocked(user)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyLoadPolicy {
+    Upgrade,
+    ReadOnly,
+}
+
 pub(crate) fn load_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+    load_key_with(
+        user,
+        KeyLoadPolicy::Upgrade,
+        tpm::unseal,
+        tpm::stronger_tier_available_than,
+        tpm::seal,
+    )
+}
+
+/// Caller holds the existing user state lock. Never upgrades the envelope or
+/// initializes a persistent TPM storage root key.
+pub(crate) fn load_key_read_only_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
+    load_key_with(
+        user,
+        KeyLoadPolicy::ReadOnly,
+        tpm::unseal_read_only,
+        tpm::stronger_tier_available_than,
+        tpm::seal,
+    )
+}
+
+fn load_key_with(
+    user: &str,
+    policy: KeyLoadPolicy,
+    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
+    stronger_tier_available: impl FnOnce(&crate::envelope::PolicyKind) -> bool,
+    seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
+) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
     if !path.exists() {
         return Err(Error::Policy(format!(
@@ -178,7 +226,7 @@ pub(crate) fn load_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
         )));
     }
     let env = SealedEnvelope::load(&path)?;
-    let key = tpm::unseal(&env)?;
+    let key = unseal(&env)?;
     // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
     // strictly stronger sealing tier became available since this key was sealed
     // (e.g. signed-PCR started working), re-seal the key to it so an existing
@@ -186,8 +234,8 @@ pub(crate) fn load_key_unlocked(user: &str) -> Result<Zeroizing<Vec<u8>>> {
     // no-op once the envelope is already at the best tier, so there is no steady
     // per-match cost. Never fail the load on it: the key unsealed fine and the
     // weaker envelope stays usable.
-    if tpm::stronger_tier_available_than(&env.policy) {
-        if let Ok(candidate) = tpm::seal(&key) {
+    if policy == KeyLoadPolicy::Upgrade && stronger_tier_available(&env.policy) {
+        if let Ok(candidate) = seal(&key) {
             if candidate.policy.strength_rank() > env.policy.strength_rank()
                 && candidate.save(&path).is_ok()
             {
@@ -365,6 +413,72 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn read_only_key_load_preserves_envelope_while_normal_load_upgrades() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("readonly-key"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let weak: SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        weak.save(&key_path("alice")).unwrap();
+        let before = std::fs::read(key_path("alice")).unwrap();
+        let unseal = |_: &SealedEnvelope| Ok(Zeroizing::new(vec![42; 32]));
+        let key = load_key_with(
+            "alice",
+            KeyLoadPolicy::ReadOnly,
+            unseal,
+            |_| panic!("read-only load must not probe upgrades"),
+            |_| panic!("read-only load must not seal"),
+        )
+        .unwrap();
+        assert_eq!(key.as_slice(), &[42; 32]);
+        assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
+        let key = load_key_with(
+            "alice",
+            KeyLoadPolicy::Upgrade,
+            unseal,
+            |_| true,
+            |key| {
+                assert_eq!(key, &[42; 32]);
+                let mut stronger: SealedEnvelope = serde_json::from_slice(&before).unwrap();
+                stronger.policy = crate::envelope::PolicyKind::PcrlockNv { nv_index: 1 };
+                Ok(stronger)
+            },
+        )
+        .unwrap();
+        assert_eq!(key.as_slice(), &[42; 32]);
+        assert_eq!(
+            SealedEnvelope::load(&key_path("alice"))
+                .unwrap()
+                .policy
+                .strength_rank(),
+            2
+        );
+        assert_ne!(std::fs::read(key_path("alice")).unwrap(), before);
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_lock_requires_existing_lock_without_creating_state() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("readonly-lock"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        assert!(UserStateLock::acquire_read_only("alice").is_err());
+        assert!(!dir.exists());
+        drop(UserStateLock::acquire("alice").unwrap());
+        drop(UserStateLock::acquire_read_only("alice").unwrap());
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn independent_user_state_locks_serialize_threads() {

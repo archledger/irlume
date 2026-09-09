@@ -330,19 +330,33 @@ impl PamServiceModule for IrlumePam {
             //
             //  * Passive peek (everything else: sudo verify, lock screen `wait`): just
             //    read PAM_AUTHTOK if some earlier module/greeter already set it. We must
-            //    NOT actively prompt here: in `wait` mode KDE runs us as a PARALLEL
-            //    biometric device (kde-fingerprint) and cancels us natively the moment
-            //    a key is pressed, so an echo-off password probe here would hijack the
-            //    password field. A privileged one-shot service offers its explicit
+            //    NOT actively prompt here: a dedicated biometric transaction must
+            //    leave password input to the frontend's password transaction.
+            //    Cancellation depends on that frontend's worker lifecycle; a queued
+            //    PAM conversation cancellation may not interrupt our synchronous
+            //    daemon request (see docs/DESKTOP-AUTH.md).
+            //    A privileged one-shot service offers its explicit
             //    face-intent choice only after this password-first check, then obtains
             //    the ordinary PAM token so a non-`yes` password is not asked twice.
             let typed = if unseal && !wait && !facefirst {
-                pamh.get_authtok(Some("Password: "))
+                match pamh.get_authtok(Some("Password: ")) {
+                    Ok(Some(token)) => Some(token),
+                    // Only an explicitly returned empty token chooses face.
+                    // Cancellation/EOF or a missing token is not empty input:
+                    // leave the stack before any daemon or credential request.
+                    Ok(None) | Err(_) => return PamError::IGNORE,
+                }
             } else {
-                pamh.get_cached_authtok()
+                pamh.get_cached_authtok().ok().flatten()
             };
-            if let Ok(Some(tok)) = typed {
+            if let Some(tok) = typed {
                 if !tok.to_bytes().is_empty() {
+                    return PamError::IGNORE;
+                }
+                // The active probe caches even an empty answer. It selected
+                // face, not an empty Unix password: consume it so a timeout or
+                // refusal lets the next provider ask for a fresh password.
+                if unseal && !wait && !facefirst && pamh.clear_authtok().is_err() {
                     return PamError::IGNORE;
                 }
             }
@@ -509,9 +523,15 @@ fn try_reseal_session(pamh: &Pam, user: &str) {
         // took a path that never set a token); nothing to heal.
         _ => return,
     };
+    let wallet_salt = match irlume_common::client::read_wallet_salt(user) {
+        Ok(salt) => salt,
+        Err(_) => return,
+    };
     let _ = request(&Request::ResealPassword {
         user: user.to_string(),
         password: pw,
+        wallet_salt,
+        wallet_salt_checked: true,
     });
 }
 

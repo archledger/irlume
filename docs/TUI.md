@@ -9,6 +9,24 @@ this screen's shortcuts. `v` reveals technical sections. **F2 opens More actions
 from any idle screen. Type a task or CLI command to filter the list, use Up/Down
 to select, and Enter to open it. Esc closes the list or cancels a field.
 
+Mouse users can click the sidebar, status rows and action buttons, including
+in-page Wallet, Recovery, Login, Fingerprint, Cameras, Diagnostics, Identify,
+Preferences and completion actions. Each action has a separated row; its label
+and wrapped explanation activate the same keyboard command. Blank space and
+ordinary explanatory text do not activate commands. In More
+actions, click a row to select it and read its description, then click **Open**.
+Dialogs have separate **Continue**, **Confirm**, **Cancel** or **Close** buttons;
+clicking outside a dialog does nothing. Typed confirmations still require the
+exact requested text.
+
+The mouse wheel moves through the list under the pointer (Faces, Cameras,
+Diagnostics or More actions). Over Activity it scrolls the activity history.
+The wheel also scrolls longer information/action panels, including Wallet,
+Recovery and Login. Long dialogs scroll within their own body while the buttons
+remain visible.
+Press `M` to release mouse capture for the terminal's text selection and copy
+controls; press it again to resume mouse navigation.
+
 More actions supplies guided fields for less frequent tasks and shows the
 account, effects, and literal command arguments before asking you to run it.
 Blank optional fields use the CLI default; required fields cannot be blank.

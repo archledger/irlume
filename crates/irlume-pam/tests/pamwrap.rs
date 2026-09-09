@@ -63,6 +63,8 @@ struct Harness {
     config_dir: PathBuf,
     /// Where this test's fake daemon listens (IRLUME_SOCKET).
     socket: PathBuf,
+    /// Closed machine-protocol salt helper; absent is the default fixture.
+    salt_helper: PathBuf,
     root: PathBuf,
 }
 
@@ -107,6 +109,14 @@ impl Harness {
         std::fs::create_dir_all(&service_dir).unwrap();
         let config_dir = root.join("cfg");
         std::fs::create_dir_all(&config_dir).unwrap();
+        let salt_helper = root.join("wallet-salt-helper");
+        std::fs::write(
+            &salt_helper,
+            "#!/bin/sh\n[ \"$1\" = --read-salt ] && [ \"$2\" = tester ] && [ \"$#\" -eq 2 ] || exit 1\nexit 3\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&salt_helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         Some(Harness {
             wrapper,
             set_items,
@@ -115,6 +125,7 @@ impl Harness {
             service_dir,
             config_dir,
             root,
+            salt_helper,
         })
     }
 
@@ -168,6 +179,7 @@ impl Harness {
             .env("PAM_WRAPPER_SERVICE_DIR", &self.service_dir)
             .env("IRLUME_SOCKET", &self.socket)
             .env("IRLUME_CONFIG_DIR", &self.config_dir)
+            .env("IRLUME_KWALLET_INIT", &self.salt_helper)
             .env_remove("IRLUME_CREDENTIAL_RELEASE_CHALLENGE")
             .env_remove("IRLUME_CONSENT_GESTURE")
             .stdin(Stdio::piped())
@@ -428,6 +440,7 @@ fn pamwrap_granting_daemon_face_path() {
 }
 
 const FACE_INTENT_INFO: &str = "Type yes to use face authentication";
+
 const FIXED_TEST_TOKEN: &str = "fixed-test-token";
 const WRONG_TEST_TOKEN: &str = "wrong-fixed-token";
 
@@ -1090,6 +1103,44 @@ fn pamwrap_typed_password_never_fires_the_camera() {
     );
 }
 
+/// EOF fails the active PAM conversation; it is not an explicit empty reply.
+/// A failed/cancelled password probe must never start a face or release request.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_failed_password_probe_never_contacts_daemon() {
+    for (index, flags) in ["unseal", "unseal ondemand", "unseal ondemand kr"]
+        .iter()
+        .enumerate()
+    {
+        let Some(h) = Harness::try_new(&format!("failed-probe-{index}")) else {
+            return;
+        };
+        h.write_service(
+            "kde",
+            &[
+                h.auth_line("sufficient", flags),
+                "auth required pam_deny.so".into(),
+            ],
+        );
+        let log = serve(&h.socket, |req| match req {
+            Request::UnsealPassword { .. } => Response::UnsealUnavailable {
+                reason: "synthetic warm screen unlock".into(),
+            },
+            Request::Authenticate { .. } => grant(),
+            _ => Response::Error("unexpected request".into()),
+        });
+        // Closed stdin makes pamtester's conversation fail instead of returning
+        // the explicit empty token supplied by "\n" in the positive tests.
+        let (ok, out) = h.run("kde", &["authenticate"], "", None);
+        let reqs = log.lock().unwrap();
+        assert!(
+            reqs.is_empty(),
+            "failed password probe must not contact daemon ({flags}): {reqs:?}; {out}"
+        );
+        assert!(!ok, "cancelled probe must not grant ({flags}): {out}");
+    }
+}
+
 /// A daemon that answers with a line that is not JSON: the reply fails to
 /// parse, the module IGNOREs, and the stack fails closed.
 #[test]
@@ -1430,8 +1481,15 @@ fn pamwrap_reseal_stashes_on_auth_and_reseals_on_session() {
         other => panic!("expected the delivery query second, got {other:?}"),
     }
     match &reqs[0] {
-        Request::ResealPassword { user, password } => {
+        Request::ResealPassword {
+            user,
+            password,
+            wallet_salt,
+            wallet_salt_checked,
+        } => {
             assert_eq!(user, "tester");
+            assert!(*wallet_salt_checked);
+            assert!(wallet_salt.is_none());
             assert_eq!(
                 password.expose(),
                 b"hunter2",
@@ -1667,5 +1725,47 @@ fn pamwrap_removed_gesture_settings_do_not_change_privileged_confirmation() {
                 assert!(!out.contains(removed), "{out}");
             }
         }
+    }
+}
+
+/// A bounded face attempt must return to a fresh password prompt without
+/// granting or starting a second scan, on both desktop and privileged paths.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_authentication_deadline_keeps_fresh_password_fallback() {
+    for (service, flags, consent) in [("kde", "unseal ondemand", "\n"), ("sudo", "", "yes\n")] {
+        let Some(h) = Harness::try_new(&format!("deadline-{service}")) else {
+            return;
+        };
+        let checker = h.token_checker("deadline", FIXED_TEST_TOKEN);
+        h.write_service(
+            service,
+            &[
+                h.auth_line("sufficient", flags),
+                format!(
+                    "auth required pam_exec.so expose_authtok {}",
+                    checker.display()
+                ),
+            ],
+        );
+        let log = serve(&h.socket, |_| {
+            Response::Error(irlume_common::Error::DeadlineExpired.to_string())
+        });
+        let (ok, out) = h.run(
+            service,
+            &["authenticate"],
+            &format!("{consent}{FIXED_TEST_TOKEN}\n"),
+            None,
+        );
+        assert!(
+            ok,
+            "expiry must reach a fresh password prompt: {service}: {out}"
+        );
+        assert!(!out.contains(FIXED_TEST_TOKEN));
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "expiry cannot trigger another face request"
+        );
     }
 }

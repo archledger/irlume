@@ -129,6 +129,26 @@ pub fn decide(class: OperationClass, tier: Tier) -> Action {
 mod tests {
     use super::*;
 
+    /// The retired experimental desktop service and its lookalikes have no
+    /// supported policy. Existing on-demand `kde` remains a screen unlock.
+    #[test]
+    fn retired_experimental_face_service_is_unknown() {
+        for service in [
+            "kde-face",
+            "kde-face-other",
+            "kde-face-login",
+            "kde-face/other",
+        ] {
+            for session in [SessionState::Warm, SessionState::Cold] {
+                assert_eq!(classify(service, session), OperationClass::Unknown);
+                for tier in [Tier::Secure, Tier::Convenience] {
+                    assert_eq!(decide(classify(service, session), tier), Action::Deny);
+                    assert_eq!(decide(classify("kde", session), tier), Action::Verify);
+                }
+            }
+        }
+    }
+
     #[test]
     fn screen_unlock_never_unseals() {
         assert_eq!(

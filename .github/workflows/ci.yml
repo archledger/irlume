@@ -109,7 +109,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
@@ -140,11 +140,23 @@ jobs:
       - name: Action pins (SHA-pinned; SLSA generator excepted)
         run: bash scripts/check-action-pins.sh
 
+      - name: Non-granting IR harness offline tests (no camera)
+        run: python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'
+
       - name: rustfmt
         run: cargo fmt --all --check
 
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets -- -D warnings
+
+      # Required-feature examples and cfg-gated library code are skipped by the
+      # default workspace checks. Exercise the non-granting diagnostic explicitly.
+      - name: Optional IR diagnostic checks (no camera)
+        run: |
+          cargo clippy --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --all-targets -- -D warnings
+          cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples
+          cargo test --locked -p irlume-camera --features capture-timing --lib
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --no-deps
 
       # Optional ONNX Runtime execution providers are compile-time APIs. The
       # default CPU build cannot catch an upstream rename in one of these paths
@@ -329,6 +341,11 @@ jobs:
       - name: test (PAM FFI, against pam_wrapper)
         run: ./scripts/run-tests-guarded.sh --min 16 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
 
+      - name: test (root-only password helper, private synthetic PAM)
+        run: |
+          sudo apt-get install -y --no-install-recommends libpam-wrapper libpam0g-dev gcc util-linux
+          ./scripts/test-password-helper.sh
+
   # Build + test on current stable, because that is what the packaging lanes
   # and most from-source users compile with. fmt/clippy stay on the MSRV job
   # only, so new-stable lint churn never blocks a PR. REQUIRED (see the seven-check list in the header).
@@ -359,7 +376,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon bubblewrap
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi

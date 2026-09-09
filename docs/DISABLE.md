@@ -105,15 +105,20 @@ sudo irlume fingerprint disable
   after about 5 seconds, then the password takes over. `IRLUME_GRACE_MS`
   overrides this if you want shorter.
 
-There is no failed-scan lockout class: any miss falls to the password. After
-repeated failures the camera itself rests while the password keeps working
-(5 strikes by default, then a 30-second camera cooldown; `IRLUME_RATE_LIMIT`
-and `IRLUME_RATE_COOLDOWN_SECS` adjust both).
+Face verification and face-gated credential release share a durable limit of
+50 consecutive unsuccessful requests per account. Each request reserves one
+charge before engine work; its internal presence retries, grouped capture and
+fallbacks share that reservation. At 50, face stands down until independently
+verified password recovery or an explicit administrator reset. Ordinary password
+login remains available. A successfully admitted and completely written face
+grant resets the count, so successful everyday unlocks do not exhaust it.
 
-A deliberate head-shake cancellation ends the request without adding a failure
-or clearing previous failures. No-face and uncertain-evidence outcomes also do
-not consume strikes; hard spoof and below-threshold rejections do. Login face
-verification and face-gated password release share this per-user counter.
+Cancellation, errors, interrupted requests and completed no-face/setup outcomes
+retain their cumulative charge. No cumulative neutral refund is made. Separately,
+the short throttle defaults to five strikes followed by a 30-second camera rest.
+No-face and uncertain-evidence outcomes do not consume short strikes; hard spoof
+and below-threshold rejections do. An abandoned reservation conservatively adds
+one short strike when it is next observed.
 Missing or empty enrollment, scans belonging only to a different recognition
 model, a retired eyes-open setting, and invalid or retired consent settings end
 the request without adding or clearing strikes. Fixing those
@@ -121,34 +126,46 @@ settings does not erase earlier face rejections or cancel an active cooldown.
 Camera-binding refusals, PAD failures and grouped
 capture timeouts retain their existing strike behavior.
 
-A face grant or cooldown expiry resets it. Recorded failures and an active
-cooldown survive daemon restarts. Profiles and PAM services for the same Linux
-account share the budget. The counter does not receive password-success events
-and is not an overall cumulative attempt ceiling.
+A cooldown expiry clears only the short throttle, never the cumulative budget.
+Both survive daemon restarts; profiles, modes and PAM services for one Linux
+account share them. Ordinary password login does not send a reset event; use
+`irlume retry reset` when face is blocked.
 
 ### Persistent retry records
 
-The daemon stores version-1 records in `/var/lib/irlume/retry/<uid>.json`.
+The daemon stores version-2 records in `/var/lib/irlume/retry/<uid>.json`.
 The directory is root-owned mode 0700; files are root-owned mode 0600. A record
-contains the account UID/name, consecutive count, and an optional monotonic
+contains the account UID/name, short strikes, cumulative count, pending request
+flag, and an optional monotonic
 clock deadline, boot identifier and original cooldown duration. It contains no
 biometric data or credentials. The retry location is fixed; enrollment path
-overrides do not redirect it. No same-user command can reset these records.
+overrides do not redirect it. The explicit `irlume retry reset` command can reset
+these records after independently verifying the account password, as described
+below; ordinary password login does not notify the counter.
 
 A daemon restart in the same boot keeps the original deadline. Civil-clock
 changes do not affect it. After reboot, partial failures remain and a recorded
 cooldown starts again for its original duration; this can extend the wait.
-`IRLUME_RATE_LIMIT=0` disables enforcement without deleting history. Re-enabling
-it restores that history; lowering the limit cannot replenish recorded strikes.
+`IRLUME_RATE_LIMIT` accepts 1–5; `IRLUME_RATE_COOLDOWN_SECS` accepts 30–86400.
+Invalid values, including zero, use safe defaults (5 and 30 respectively) with a
+fixed diagnostic. These settings cannot disable or increase the cumulative limit.
 
-Missing records start empty on adoption. Existing malformed, oversized,
+The first reservation starts an explicitly prospective epoch for a missing or
+strictly valid version-1 record, preserving its short strikes/cooldown. Earlier
+cycles cannot be reconstructed and are not counted or presented as known.
+Status does not migrate records; it distinguishes unknown legacy history from a
+known zero count. Existing malformed, oversized,
 unreadable, wrongly owned or unsafe records refuse the face path with a password
 fallback message. UID/name mismatches also refuse: a reused UID or renamed
-account must be reconciled by an administrator. A successful face match cannot
-return a grant or release a sealed password until its reset is durably committed.
-If publication succeeds but its durability check fails, that request still
-refuses; the next operation re-reads and synchronizes the visible state before
-allowing face again.
+account must be reconciled by an administrator. No engine work starts until its
+reservation is durably committed. The daemon holds the account lock through
+response delivery and clears a successful request only after final admission and
+successful write/flush. A crash after delivery but before reset can conservatively
+retain a charge. A failed reset after delivery cannot retract the grant; the next
+operation re-reads and synchronizes authoritative disk state. Admission checks
+the original window immediately before the first byte and bounds the write
+timeout to remaining time where possible; partially written bytes cannot be
+retracted if cancellation or expiry arrives during the write.
 
 For repair, use password authentication and inspect `journalctl -u irlumed`.
 Stop `irlumed.socket` and `irlumed.service` while correcting the affected
@@ -158,13 +175,60 @@ they can be established. Inspect the exact UID with `id -u <account>` and do not
 follow symlinks or change other users' records. Removing the affected record is
 an explicit root reset of its history; do so only if the administrator intends
 that reset, then start the socket and daemon. Corrected state is re-read automatically.
-An older daemon ignores these records: downgrading loses persistence enforcement
-until the new daemon returns, even if the files remain. Do not delete them as
-part of a binary rollback.
+Version-1-only daemons refuse version-2 records; older daemons without persistent
+retry support do not enforce this limit. Do not delete records or restore older,
+smaller counts as part of a binary rollback.
 
-This protects recorded state across restarts, not root deletion, disk rollback,
-or a crash before a terminal outcome is committed. A crash-proof cumulative
-ceiling and independently verified recovery remain separate policy work.
+Write-ahead charges survive crashes and reboot, but cannot resist root deletion
+or disk rollback. Fifty bounds requested composite authentication decisions, not
+individual frames/comparisons or a qualified false-accept probability. The
+independent reset-password budget below also reserves before verification.
+
+### Password-verified retry reset
+
+```sh
+irlume retry status
+irlume retry reset
+sudo irlume retry reset --user <account>   # explicit administrator override
+```
+
+`status` inspects face and reset-password counters without requesting a camera
+or password. `reset` probes daemon support and the recovery gate before asking
+for the current login password without terminal echo. Non-root requests are
+limited to the caller's own account. Successful independent password verification
+clears the face retry record and the reset-password budget; it does not change
+the login password, enrollment, template key, or consent settings. A root reset
+is an explicit administrative action and does not ask for the account password.
+Malformed or unsafe records still require the repair procedure above.
+
+A reset commits the face state first, then clears the reset-password budget.
+Interruption or a storage failure between these writes can clear face history
+while retaining a conservative password-check charge. If the command cannot
+confirm the reset, run `irlume retry status` before trying again.
+
+This path requires an updated daemon and the packaged root-only password verifier
+with its fixed `irlume-retry-reset` PAM service. The initial backend is local
+Linux passwords through `pam_unix`; LDAP, SSSD and systemd-homed accounts are not
+qualified. Self-service reset is unavailable under enforcing AppArmor in this
+release. Keep normal password login available and ask an administrator when
+status reports reset unavailable. An older daemon is refused before prompting;
+updating the client alone does not add recovery support.
+
+Reset-password guessing has its own persistent record at
+`/var/lib/irlume/retry/<uid>.reset.json`, with the same private ownership and
+permissions as face records. After five failed checks, each further check needs
+a 30-second wait; the wait never erases failures. At 50 failed checks, an
+administrator must reset the budget. A verification attempt is charged durably
+before the helper runs, so interruption or unknown completion also consumes an
+attempt. This budget survives daemon restarts; reboot can restart its recorded
+cooldown. None of these limits block ordinary password login or introduce a
+cumulative ceiling for face authentication.
+
+`irlume recovery restore` is separate: it uses the recovery passphrase to restore
+the template key and never clears retry counters. A desktop/polkit approval or
+an already open keyring also does not satisfy password verification for retry
+reset. Keep both face and reset-password records when rolling back binaries;
+older daemons do not offer this reset path or enforce the reset-password budget.
 
 ## Remove everything
 

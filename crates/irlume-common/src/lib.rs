@@ -32,9 +32,18 @@ pub const SOCKET_PATH: &str = "/run/irlume.sock";
 /// `Debug` is redacted, so it never lingers on the daemon/PAM heap longer than
 /// needed nor leaks into a log line. `#[serde(transparent)]` so it ships as a
 /// plain byte array over the IPC channel.
-#[derive(Clone, Serialize, Default)]
+#[derive(Serialize, Default)]
 #[serde(transparent)]
 pub struct SecretBytes(Vec<u8>);
+
+// Manual so every copied allocation receives the same protection as a newly
+// constructed or deserialized secret. Deriving Clone copies the Vec directly
+// and bypasses new().
+impl Clone for SecretBytes {
+    fn clone(&self) -> Self {
+        Self::new(self.0.clone())
+    }
+}
 
 // Manual impl (not derived) so deserialization routes through `new()`: a
 // secret received over IPC gets the same memlock treatment as one built
@@ -82,6 +91,45 @@ impl std::fmt::Debug for SecretBytes {
     }
 }
 
+/// The fixed-size KDE wallet salt carried by authorized callers.
+///
+/// The wrapper makes the 56-byte wire invariant part of deserialization, so a
+/// malformed or mixed-version client is rejected before daemon dispatch. Its
+/// debug representation never includes salt bytes.
+#[derive(Clone, Serialize)]
+#[serde(transparent)]
+pub struct WalletSalt(SecretBytes);
+
+impl WalletSalt {
+    /// Construct a wallet salt only when it has KDE's exact wire length.
+    pub fn new(bytes: Vec<u8>) -> Option<Self> {
+        (bytes.len() == kwallet_wire::SALT_LEN).then(|| Self(SecretBytes::new(bytes)))
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        self.0.expose()
+    }
+}
+
+impl<'de> Deserialize<'de> for WalletSalt {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let bytes = SecretBytes::deserialize(d)?;
+        if bytes.len() != kwallet_wire::SALT_LEN {
+            return Err(serde::de::Error::invalid_length(
+                bytes.len(),
+                &"exactly 56 wallet-salt bytes",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl std::fmt::Debug for WalletSalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WalletSalt([{} bytes redacted])", self.0.len())
+    }
+}
+
 /// Where the irlume packages install onnxruntime: Fedora/Copr first, then the
 /// Debian/Ubuntu universal .deb and PPA layout (packaging/README.md records
 /// both). Their systemd drop-in hands `ORT_DYLIB_PATH` to the DAEMON only, so
@@ -98,6 +146,10 @@ pub const PACKAGED_ORT_PATHS: &[&str] = &[
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Per-user enrolled templates + TPM-sealed release secrets.
@@ -611,6 +663,8 @@ pub enum Request {
     /// Resolve the daemon's active capture schedule from the exact camera pair
     /// it owns, including process-local safety degradation. CAMERA-CLASS.
     CaptureModeStatus,
+    /// Camera-free sensor policy; a user explicitly requests enrollment preflight.
+    FaceSensorStatus { user: Option<String> },
     /// Liveness/alignment self-test (no auth side effects). See PAD self-testing.
     SelfTest { kind: SelfTestKind },
     /// Enumerate the Hello camera pairs for the picker. CAMERA-CLASS: it
@@ -665,6 +719,16 @@ pub enum Request {
         /// wallet key without the client having to know to ask.
         #[serde(default)]
         kind: Option<KeyringSecretKind>,
+        /// Account-scoped KDE wallet salt read by the authorized caller. The
+        /// daemon never opens the user's wallet path. Absent for non-KDE
+        /// operations and older clients; redacted by the [`WalletSalt`] debug implementation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wallet_salt: Option<WalletSalt>,
+        /// True only when this caller ran the account-scoped helper. This
+        /// distinguishes a proven-absent salt from an older client that omitted
+        /// the field; the daemon fails the latter closed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        wallet_salt_checked: bool,
     },
     /// Face-verify `user` and, on a live match, release the TPM-sealed password
     /// so the caller can set it as `PAM_AUTHTOK` (login keyring unlock).
@@ -731,7 +795,15 @@ pub enum Request {
     /// **session** phase, which runs only after authentication SUCCEEDED, so
     /// `password` is always one `pam_unix` accepted (never a typo). PRIVILEGED:
     /// root or `user`.
-    ResealPassword { user: String, password: SecretBytes },
+    ResealPassword {
+        user: String,
+        password: SecretBytes,
+        /// Account-scoped KDE wallet salt, when resealing a KDE envelope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wallet_salt: Option<WalletSalt>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        wallet_salt_checked: bool,
+    },
 
     // --- template-key recovery passphrase -----------------------------------
     /// Wrap `user`'s template key under a recovery `passphrase` (the manual
@@ -754,6 +826,11 @@ pub enum Request {
     /// Erase `user`'s recovery envelope (keeps the template key). PRIVILEGED:
     /// root or `user`.
     RecoveryForget { user: String },
+    /// Inspect this account's face and password-reset retry state; root or self.
+    RetryStatus { user: String },
+    /// Reset retry state after independent password verification. Root is an
+    /// explicit administrator override and may supply an empty password.
+    RetryReset { user: String, password: SecretBytes },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -871,6 +948,23 @@ pub struct PositionReport {
     pub guidance: String,
 }
 
+/// Camera-free prerequisites; never qualification or login permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrOnlyReadiness {
+    /// The daemon cannot establish the prerequisites for an experimental attempt.
+    Unavailable,
+    ReadyForExperimentalAttempt,
+    InvalidPolicy,
+    TargetUnavailable,
+    BindingUnavailable,
+    BindingMismatch,
+    ModelsUnavailable,
+    PadUnavailable,
+    EnrollmentUnavailable,
+    IncompatibleEnrollment,
+}
+
 /// Runtime state of one shipped presentation-attack-detection model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -881,9 +975,104 @@ pub enum PadModelStatus {
     LoadFailed,
 }
 
+/// Prospective cumulative face-request budget, independent of password recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaceRetryBudget {
+    /// Absent until the first reservation or verified reset creates an epoch.
+    pub unsuccessful_requests: Option<u32>,
+    pub limit: u32,
+    pub reset_required: bool,
+}
+
+#[cfg(test)]
+mod retry_status_wire_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    enum LegacyResponse {
+        RetryStatus {
+            failures: u32,
+            cooldown_seconds: u64,
+            recovery_failures: u32,
+            recovery_cooldown_seconds: u64,
+            recovery_required: bool,
+            password_reset_available: bool,
+        },
+    }
+
+    #[test]
+    fn retry_status_old_and_new_clients_keep_distinct_budget_meanings() {
+        let old = serde_json::json!({"RetryStatus": {
+            "failures": 2, "cooldown_seconds": 0, "recovery_failures": 3,
+            "recovery_cooldown_seconds": 0, "recovery_required": false,
+            "password_reset_available": true
+        }});
+        let decoded: Response = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            Response::RetryStatus {
+                face_budget: None,
+                ..
+            }
+        ));
+        let mut new = old;
+        new["RetryStatus"]["face_budget"] =
+            serde_json::json!({"unsuccessful_requests": 50, "limit": 50, "reset_required": true});
+        let LegacyResponse::RetryStatus {
+            failures,
+            cooldown_seconds,
+            recovery_failures,
+            recovery_cooldown_seconds,
+            recovery_required,
+            password_reset_available,
+        } = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(
+            (
+                failures,
+                cooldown_seconds,
+                recovery_failures,
+                recovery_cooldown_seconds,
+                recovery_required,
+                password_reset_available
+            ),
+            (2, 0, 3, 0, false, true)
+        );
+        let decoded: Response = serde_json::from_value(new).unwrap();
+        assert!(matches!(
+            decoded,
+            Response::RetryStatus {
+                recovery_required: false,
+                face_budget: Some(FaceRetryBudget {
+                    unsuccessful_requests: Some(50),
+                    reset_required: true,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    /// Camera-free policy observation. Readiness is absent for ordinary status.
+    FaceSensorStatus {
+        policy: config::FaceSensorPolicyObservation,
+        ir_readiness: Option<IrOnlyReadiness>,
+    },
+    /// Retry recovery capability and current per-account state.
+    RetryStatus {
+        failures: u32,
+        cooldown_seconds: u64,
+        recovery_failures: u32,
+        recovery_cooldown_seconds: u64,
+        recovery_required: bool,
+        password_reset_available: bool,
+        /// Older daemons omit this field; absence never means a zero count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        face_budget: Option<FaceRetryBudget>,
+    },
     /// Progress for an explicitly requested guided enrollment operation.
     EnrollmentSession(EnrollmentEvent),
     /// Authentication decision plus the evidence behind it.
@@ -1312,6 +1501,10 @@ pub enum Error {
     /// written, so the caller should say "retry", not "it broke".
     #[error("preempted: {0}")]
     Preempted(String),
+    /// The authentication budget ended; this is neither biometric evidence nor
+    /// a camera fault. Callers must fall back without retrying or recording a match.
+    #[error("authentication window expired; use your password")]
+    DeadlineExpired,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -1335,6 +1528,51 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wallet_salt_wire_is_optional_fixed_length_and_redacted() {
+        use super::{kwallet_wire::SALT_LEN, Request, WalletSalt};
+
+        let legacy = serde_json::json!({"SealPassword": {
+            "user": "alice", "password": [1, 2, 3], "kind": null
+        }});
+        let decoded: Request = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::SealPassword {
+                wallet_salt: None,
+                wallet_salt_checked: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+
+        let salt = WalletSalt::new(vec![0x5a; SALT_LEN]).unwrap();
+        assert_eq!(format!("{salt:?}"), "WalletSalt([56 bytes redacted])");
+        let request = Request::SealPassword {
+            user: "alice".into(),
+            password: super::SecretBytes::new(vec![1, 2, 3]),
+            kind: Some(super::KeyringSecretKind::KdeWalletKey),
+            wallet_salt: Some(salt),
+            wallet_salt_checked: true,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            encoded["SealPassword"]["wallet_salt"]
+                .as_array()
+                .unwrap()
+                .len(),
+            SALT_LEN
+        );
+        assert!(serde_json::from_value::<Request>(encoded).is_ok());
+
+        for len in [SALT_LEN - 1, SALT_LEN + 1] {
+            let malformed = serde_json::json!({"ResealPassword": {
+                "user": "alice", "password": [1], "wallet_salt": vec![0; len]
+            }});
+            assert!(serde_json::from_value::<Request>(malformed).is_err());
+        }
+    }
+
     #[test]
     fn auth_structured_errors_preserves_legacy_wire_and_unknown_codes() {
         use super::{OperationErrorCode, Request, Response};
@@ -1946,6 +2184,49 @@ mod tests {
         None
     }
 
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    fn drop_and_verify_ipc_lock_capability() {
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+        const CAP_IPC_LOCK_BIT: u32 = 1 << 14;
+        let mut header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapabilityData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: header/data use Linux's v3 capability ABI and point to
+        // initialized writable storage for the calling process (pid 0).
+        let rc = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+        assert_eq!(rc, 0, "capget failed: {}", std::io::Error::last_os_error());
+        data[0].effective &= !CAP_IPC_LOCK_BIT;
+        data[0].permitted &= !CAP_IPC_LOCK_BIT;
+        data[0].inheritable &= !CAP_IPC_LOCK_BIT;
+        // SAFETY: the same valid v3 buffers now request only removal of one
+        // capability from this process; dropping one's own capability is allowed.
+        let rc = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
+        assert_eq!(rc, 0, "capset failed: {}", std::io::Error::last_os_error());
+        // SAFETY: refresh the initialized data through the same v3 ABI.
+        let rc = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+        assert_eq!(rc, 0, "capget failed: {}", std::io::Error::last_os_error());
+        assert_eq!(data[0].effective & CAP_IPC_LOCK_BIT, 0);
+    }
+
     // Regression: e8e59c2. SecretBytes derived Deserialize, constructing the
     // inner Vec directly and skipping new()'s mlock: a secret received over
     // IPC was swappable/dumpable. Deserialization must route through new(),
@@ -1984,6 +2265,112 @@ mod tests {
             locked > 0,
             "a deserialized SecretBytes must be memlocked like a new()-built one"
         );
+    }
+
+    // Regression: deriving Clone copied the inner Vec directly, bypassing
+    // SecretBytes::new() and leaving the copied plaintext swappable/dumpable.
+    #[test]
+    fn cloned_secret_bytes_are_memlocked_like_new() {
+        if let Ok(case) = std::env::var("IRLUME_TEST_SECRET_CLONE_MEMLOCK") {
+            drop_and_verify_ipc_lock_capability();
+            let (limit, source_must_lock, clone_must_lock) = match case.as_str() {
+                "zero" => (0, false, false),
+                "constrained" => (384 * 1024, true, false),
+                "adequate" => (2 * 1024 * 1024, true, true),
+                other => panic!("unknown clone memlock test case: {other}"),
+            };
+            let rlimit = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            // SAFETY: `rlimit` is fully initialized and this fresh child only
+            // lowers its own RLIMIT_MEMLOCK before allocating either secret.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) }, 0);
+
+            // Large, distinct allocations make page ownership and aggregate
+            // accounting unambiguous at the three selected limits.
+            if case == "adequate" {
+                let first = SecretBytes::new(vec![0x61; 256 * 1024]);
+                let second = SecretBytes::new(vec![0x62; 256 * 1024]);
+                let first_locked =
+                    locked_kb_of(first.expose().as_ptr() as usize + 128 * 1024).unwrap_or(0) > 0;
+                let second_locked =
+                    locked_kb_of(second.expose().as_ptr() as usize + 128 * 1024).unwrap_or(0) > 0;
+                if !first_locked || !second_locked {
+                    eprintln!("unsupported: two live adequate-budget controls did not lock");
+                    println!("clone-memlock-case-{case}-unsupported");
+                    return;
+                }
+                drop((first, second));
+            }
+            let source = SecretBytes::new(vec![0x31; 256 * 1024]);
+            let clone = source.clone();
+            assert_eq!(clone.expose(), source.expose());
+            assert_ne!(clone.expose().as_ptr(), source.expose().as_ptr());
+            let source_locked =
+                locked_kb_of(source.expose().as_ptr() as usize + 128 * 1024).unwrap_or(0) > 0;
+            let clone_locked =
+                locked_kb_of(clone.expose().as_ptr() as usize + 128 * 1024).unwrap_or(0) > 0;
+            if case == "zero" && (source_locked || clone_locked) {
+                eprintln!("unsupported: zero-budget locks appear effective after capability drop");
+                println!("clone-memlock-case-{case}-unsupported");
+                return;
+            }
+            if case == "constrained" && !source_locked {
+                eprintln!("unsupported: constrained-budget source control did not lock");
+                println!("clone-memlock-case-{case}-unsupported");
+                return;
+            }
+            assert_eq!(source_locked, source_must_lock, "case {case}: source");
+            assert_eq!(clone_locked, clone_must_lock, "case {case}: clone");
+            println!("clone-memlock-case-{case}-passed");
+            return;
+        }
+
+        let mut inherited = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `inherited` is initialized storage for getrlimit's output.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut inherited) };
+        assert_eq!(rc, 0);
+        if inherited.rlim_max < 2 * 1024 * 1024 {
+            eprintln!(
+                "skipping clone memlock cases: inherited hard limit {} cannot establish the \
+                 required 2 MiB adequate-budget control",
+                inherited.rlim_max
+            );
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        for case in ["zero", "constrained", "adequate"] {
+            let out = std::process::Command::new(&exe)
+                .args([
+                    "tests::cloned_secret_bytes_are_memlocked_like_new",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("IRLUME_TEST_SECRET_CLONE_MEMLOCK", case)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "clone memlock case {case} failed; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                [
+                    format!("clone-memlock-case-{case}-passed"),
+                    format!("clone-memlock-case-{case}-unsupported"),
+                ]
+                .iter()
+                .any(|marker| String::from_utf8_lossy(&out.stdout).contains(marker)),
+                "clone memlock case {case} did not run"
+            );
+        }
     }
 
     #[test]
@@ -2275,6 +2662,10 @@ pub mod kwallet_wire {
 
     /// PBKDF2 iteration count. `KWALLET_PAM_ITERATIONS`.
     pub const ITERATIONS: u32 = 50_000;
+
+    /// Helper exit status meaning the salt path is absent. Every other
+    /// nonzero status is a read or policy failure.
+    pub const SALT_ABSENT_EXIT: i32 = 3;
 
     /// Basename of the handoff socket inside `XDG_RUNTIME_DIR`.
     ///

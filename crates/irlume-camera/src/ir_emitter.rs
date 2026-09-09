@@ -2296,11 +2296,20 @@ impl EmitterBackend for SentinelBackend {
 #[must_use = "dropping this immediately puts the control back and leaves the stream unlit"]
 pub struct StreamMode {
     backend: Box<dyn EmitterBackend + Send>,
+    timing: crate::capture_timing::Recorder,
 }
 
 impl StreamMode {
+    pub(crate) fn with_timing(mut self, timing: crate::capture_timing::Recorder) -> Self {
+        self.timing = timing;
+        self
+    }
+
     fn new(backend: Box<dyn EmitterBackend + Send>) -> Self {
-        StreamMode { backend }
+        StreamMode {
+            backend,
+            timing: crate::capture_timing::Recorder::default(),
+        }
     }
 
     /// A guard over nothing: no control was applied, so `Drop` writes nothing.
@@ -2346,6 +2355,9 @@ impl StreamMode {
     /// Put the control back now, rather than waiting for the drop.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        let _timing = self
+            .timing
+            .stage(crate::capture_timing::Stage::EmitterRestore);
         self.backend.restore()
     }
 
@@ -2356,6 +2368,9 @@ impl StreamMode {
 
 impl Drop for StreamMode {
     fn drop(&mut self) {
+        let _timing = self
+            .timing
+            .stage(crate::capture_timing::Stage::EmitterRestore);
         if let Err(e) = self.backend.restore() {
             // Not fatal, and not silent. The camera keeps a mode irlume chose,
             // which is exactly the state this type exists to prevent.
@@ -5063,6 +5078,23 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "capture-timing")]
+    #[test]
+    fn teardown_timing_records_failed_restore_without_error_payload() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let timings = crate::CaptureTimings::default();
+        let control = crate::CaptureControl::with_progress(crate::no_progress())
+            .with_capture_timings(Some(timings.clone()));
+        let mut mode = super::StreamMode::test_failing_sentinel(events.clone())
+            .with_timing(crate::capture_timing::Recorder::from_control(&control));
+        assert!(mode.restore().is_err());
+        assert!(timings.snapshot()["emitter_restore"].is_some());
+        drop(mode);
+        assert_eq!(*events.lock().unwrap(), ["emitter-restore"]);
+        let output = serde_json::to_string(&timings.snapshot()).unwrap();
+        assert!(!output.contains("sentinel"));
+        assert!(!output.contains("failure"));
+    }
     #[test]
     fn set_cur_refuses_without_a_current_descriptor_bound_lease() {
         use std::os::fd::AsRawFd;

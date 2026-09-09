@@ -217,4 +217,18 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # and proceeds. An explicit deny also stops AppArmor auditing the refusal,
   # which was filling the audit log with about 30 entries per boot.
   deny capability sys_ptrace,
+  # Fixed recovery helper. Shadow access belongs only to this child profile.
+  # With NoNewPrivileges, AppArmor may prevent this privilege transition;
+  # recovery availability therefore refuses enforcing AppArmor pending runtime
+  # qualification. Never grant shadow to the daemon to bypass that refusal.
+  /etc/pam.d/irlume-retry-reset r,
+  /usr/libexec/irlume-password-verify rCx -> password-verify,
+  profile password-verify {
+    include <abstractions/base>
+    /usr/libexec/irlume-password-verify mr,
+    /etc/pam.d/irlume-retry-reset r,
+    /etc/{passwd,group,shadow,nsswitch.conf,login.defs} r,
+    /usr/lib{,64,/*}/security/pam_unix.so mr,
+    capability dac_override,
+  }
 }

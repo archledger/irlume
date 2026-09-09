@@ -411,6 +411,33 @@ for marker in "${TMPFILES_APPLY_MARKERS[@]}"; do
   fi
 done
 
+echo
+echo "== private state root in every packaging lane =="
+STATE_TMPFILES_RULE="d /var/lib/irlume ~0700 root root -"
+for lane in packaging/tmpfiles.d/irlume.conf nix/module.nix; do
+  if uncommented "$lane" | grep -F -- "$STATE_TMPFILES_RULE" >/dev/null; then
+    printf '  ok    %-34s %s\n' "private state tmpfiles rule" "$lane"
+  else
+    printf '  MISS  %-34s %s\n' "private state tmpfiles rule" "$lane"
+    fail=1
+  fi
+done
+PRIVATE_STATE_MKDIR_MARKERS=(
+  "packaging/arch/irlume.install|mkdir -p -m 0700 /var/lib/irlume"
+  "packaging/debian/postinstall.sh|mkdir -p -m 0700 /var/lib/irlume"
+  "packaging/fedora/irlume.spec|mkdir -p -m 0700 /var/lib/irlume"
+)
+for marker in "${PRIVATE_STATE_MKDIR_MARKERS[@]}"; do
+  lane="${marker%%|*}"
+  needle="${marker#*|}"
+  if uncommented "$lane" | grep -F -- "$needle" >/dev/null; then
+    printf '  ok    %-34s %s\n' "private marker mkdir" "$lane"
+  else
+    printf '  MISS  %-34s %s\n' "private marker mkdir" "$lane"
+    fail=1
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "packaging parity: FAILED"
   exit 1

@@ -36,6 +36,9 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Default read/write timeout for management requests.
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
+/// Operator-selected ceiling that also covers a stalled NSS lookup or
+/// filesystem without hanging a login session.
+const WALLET_SALT_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Read an environment override that must NEVER be honoured in a
 /// secure-execution context. `pam_irlume` is linked into setuid-root PAM stacks
@@ -75,6 +78,147 @@ pub fn socket_path() -> PathBuf {
     secure_env("IRLUME_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(SOCKET_PATH))
+}
+
+/// Read the KDE wallet salt through the account-scoped helper.
+///
+/// `Ok(None)` has one narrow meaning: the helper proved the salt path absent.
+/// Permission, type, credential, timeout, malformed-output and execution
+/// failures remain errors, so automatic kind selection cannot silently fall
+/// back to a login password after a denied KDE lookup.
+///
+/// # Errors
+/// Returns a generic error without the target path or helper output.
+pub fn read_wallet_salt(user: &str) -> io::Result<Option<crate::WalletSalt>> {
+    read_wallet_salt_with_timeout(user, WALLET_SALT_HELPER_TIMEOUT)
+}
+
+fn read_wallet_salt_with_timeout(
+    user: &str,
+    timeout: Duration,
+) -> io::Result<Option<crate::WalletSalt>> {
+    read_wallet_salt_with_timeout_and_clock(user, timeout, |_| {}, std::time::Instant::now)
+}
+
+fn read_wallet_salt_with_timeout_and_clock(
+    user: &str,
+    timeout: Duration,
+    mut after_poll: impl FnMut(bool),
+    mut now: impl FnMut() -> std::time::Instant,
+) -> io::Result<Option<crate::WalletSalt>> {
+    use std::os::fd::AsRawFd as _;
+    use std::process::{Command, Stdio};
+
+    let helper = secure_env("IRLUME_KWALLET_INIT")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| std::ffi::OsString::from(crate::KWALLET_INIT_PATH));
+    let mut child = Command::new(helper)
+        .args(["--read-salt", user])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| wallet_salt_error(io::ErrorKind::Other))?;
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_wallet_salt_helper(&mut child);
+        return Err(wallet_salt_error(io::ErrorKind::Other));
+    };
+    let fd = stdout.as_raw_fd();
+    // SAFETY: both fcntl calls operate on the live stdout fd owned above and
+    // do not retain pointers or references.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: same owned fd; the only change is adding nonblocking mode.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        kill_wallet_salt_helper(&mut child);
+        return Err(wallet_salt_error(io::ErrorKind::Other));
+    }
+
+    let deadline = now() + timeout;
+    let mut output = Zeroizing::new(Vec::with_capacity(crate::kwallet_wire::SALT_LEN));
+    let mut chunk = Zeroizing::new([0u8; 64]);
+    let status = loop {
+        if now() >= deadline {
+            kill_wallet_salt_helper(&mut child);
+            return Err(wallet_salt_error(io::ErrorKind::TimedOut));
+        }
+        let read = stdout.read(&mut chunk[..]);
+        after_poll(matches!(read, Ok(n) if n > 0));
+        if now() >= deadline {
+            kill_wallet_salt_helper(&mut child);
+            return Err(wallet_salt_error(io::ErrorKind::TimedOut));
+        }
+        match read {
+            Ok(0) => {
+                let waited = child.try_wait();
+                after_poll(false);
+                if now() >= deadline {
+                    kill_wallet_salt_helper(&mut child);
+                    return Err(wallet_salt_error(io::ErrorKind::TimedOut));
+                }
+                match waited {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {
+                        kill_wallet_salt_helper(&mut child);
+                        return Err(wallet_salt_error(io::ErrorKind::Other));
+                    }
+                }
+            }
+            Ok(n) => {
+                if output.len() + n > crate::kwallet_wire::SALT_LEN {
+                    kill_wallet_salt_helper(&mut child);
+                    return Err(wallet_salt_error(io::ErrorKind::InvalidData));
+                }
+                output.extend_from_slice(&chunk[..n]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if now() >= deadline {
+                    kill_wallet_salt_helper(&mut child);
+                    return Err(wallet_salt_error(io::ErrorKind::TimedOut));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                kill_wallet_salt_helper(&mut child);
+                return Err(wallet_salt_error(io::ErrorKind::Other));
+            }
+        }
+    };
+    if now() >= deadline {
+        kill_wallet_salt_helper(&mut child);
+        return Err(wallet_salt_error(io::ErrorKind::TimedOut));
+    }
+    if status.success() && output.len() == crate::kwallet_wire::SALT_LEN {
+        return crate::WalletSalt::new(std::mem::take(&mut *output))
+            .map(Some)
+            .ok_or_else(|| wallet_salt_error(io::ErrorKind::InvalidData));
+    }
+    if status.code() == Some(crate::kwallet_wire::SALT_ABSENT_EXIT) && output.is_empty() {
+        return Ok(None);
+    }
+    Err(wallet_salt_error(io::ErrorKind::InvalidData))
+}
+
+fn wallet_salt_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "account-scoped wallet salt lookup failed")
+}
+
+fn kill_wallet_salt_helper(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    // As in the PAM helper path, an uninterruptible kernel sleep can outlive
+    // this bound. The caller must not trade a hung login for an unbounded reap;
+    // init reaps the process after the caller exits.
 }
 
 /// Send `req` with the default read/write timeout.
@@ -312,24 +456,17 @@ fn request_with_timeouts_inner(
     (&stream).write_all(&line).map_err(map_connect_failure)?;
     (&stream).flush().map_err(map_connect_failure)?;
 
-    // Capped, like the daemon caps requests. `SO_RCVTIMEO` restarts on every
-    // read, so the rw budget bounds one read and not the exchange: a peer that
-    // dribbles bytes with no newline holds the caller forever and grows the
-    // buffer without bound. That caller can be `pam_irlume` inside a login.
-    // The daemon is honest, but `IRLUME_SOCKET` redirects any non-setuid
-    // invocation, so the peer is not always the daemon.
-    let buf = if let Some(cancelled) = cancelled {
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        let reader = CancellableReply {
-            stream: &stream,
-            cancelled,
-            deadline: std::time::Instant::now() + rw_timeout,
-        };
-        read_response_line(reader.take(MAX_RESPONSE_BYTES))
-    } else {
-        read_response_line((&stream).take(MAX_RESPONSE_BYTES))
-    }
-    .map_err(map_connect_failure)?;
+    // SO_RCVTIMEO restarts on each read. One monotonic reply deadline must
+    // cover every partial read, including ordinary PAM requests. Keep the
+    // existing wiping framing buffer; an unseal reply can contain a secret.
+    let never_cancelled = std::sync::atomic::AtomicBool::new(false);
+    let mut reader = CancellableReply {
+        stream: &stream,
+        cancelled: cancelled.unwrap_or(&never_cancelled),
+        deadline: std::time::Instant::now() + rw_timeout,
+    };
+    let buf = read_response_line(reader.by_ref().take(MAX_RESPONSE_BYTES))
+        .map_err(map_connect_failure)?;
     if buf.len() as u64 >= MAX_RESPONSE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -345,8 +482,10 @@ fn request_with_timeouts_inner(
     // The response may carry an unsealed secret. `buf` wipes itself when this
     // frame ends, and by then the bytes live inside a zeroizing `SecretBytes`
     // in the parsed value.
-    serde_json::from_slice(buf.trim_ascii())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let response = serde_json::from_slice(buf.trim_ascii())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    reader.check()?;
+    Ok(response)
 }
 
 struct CancellableReply<'a> {
@@ -355,22 +494,42 @@ struct CancellableReply<'a> {
     deadline: std::time::Instant,
 }
 
+impl CancellableReply<'_> {
+    fn check(&self) -> io::Result<()> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "request cancelled",
+            ));
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon reply timed out",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Read for CancellableReply<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "enrollment cancelled",
-                ));
+            self.check()?;
+            // Never spend a full cancellation poll after the remaining budget.
+            let remaining = self
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                continue;
             }
-            if std::time::Instant::now() >= self.deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "enrollment reply timed out",
-                ));
-            }
-            match self.stream.read(buf) {
+            self.stream
+                .set_read_timeout(Some(remaining.min(Duration::from_millis(100))))?;
+            let result = self.stream.read(buf);
+            // A successful blocking read can itself finish after expiry or
+            // cancellation. Do not admit those bytes merely because it succeeded.
+            self.check()?;
+            match result {
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -458,6 +617,35 @@ mod tests {
         let p = std::env::temp_dir().join(format!("irlume-cl-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn ordinary_reply_trickle_cannot_extend_overall_read_budget() {
+        let _guard = testenv::lock();
+        let path = sock("deadline-trickle");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            // Every individual pause fits the 100ms SO_RCVTIMEO, but the
+            // complete valid reply exceeds the single request budget.
+            for byte in b"\"Pong\"\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(35));
+            }
+        });
+        let result = request_with_timeout(&Request::Ping, Duration::from_millis(100));
+        server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == io::ErrorKind::TimedOut),
+            "trickled reply must expire, got {result:?}"
+        );
     }
 
     #[test]
@@ -961,6 +1149,114 @@ mod tests {
             serde_json::from_slice::<Request>(&line[..line.len() - 1]).is_ok(),
             "the wiping buffer still carries parseable JSON"
         );
+    }
+
+    fn salt_helper_script() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path =
+            std::env::temp_dir().join(format!("irlume-wallet-salt-helper-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+test "$1" = --read-salt && test "$#" -eq 2 || exit 9
+case "$2" in
+  present) printf '%056d' 0 ;;
+  absent) exit 3 ;;
+  denied) exit 1 ;;
+  partial) printf x; exit 1 ;;
+  oversized) printf '%057d' 0 ;;
+  envcheck) test -z "$IRLUME_WALLET_LEAK" && printf '%056d' 0 ;;
+  stalled) printf '%s\n' "$$" > "$0.pid"; exec /usr/bin/sleep 30 ;;
+  *) exit 9 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[test]
+    fn wallet_salt_helper_contract_is_bounded_and_unambiguous() {
+        let _guard = testenv::lock();
+        let helper = salt_helper_script();
+        std::env::set_var("IRLUME_KWALLET_INIT", &helper);
+
+        let salt = read_wallet_salt_with_timeout("present", Duration::from_secs(2))
+            .unwrap()
+            .expect("present salt");
+        assert_eq!(salt.expose(), &[b'0'; crate::kwallet_wire::SALT_LEN]);
+        std::env::set_var("IRLUME_WALLET_LEAK", "must-not-reach-helper");
+        assert!(
+            read_wallet_salt_with_timeout("envcheck", Duration::from_secs(2))
+                .unwrap()
+                .is_some()
+        );
+        std::env::remove_var("IRLUME_WALLET_LEAK");
+        assert!(
+            read_wallet_salt_with_timeout("absent", Duration::from_secs(2))
+                .unwrap()
+                .is_none()
+        );
+        for user in ["denied", "partial", "oversized"] {
+            let error = read_wallet_salt_with_timeout(user, Duration::from_secs(2))
+                .expect_err("only clean exit 3 with zero output means absent");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!error.to_string().contains(user));
+        }
+        let started = std::time::Instant::now();
+        let error = read_wallet_salt_with_timeout("stalled", Duration::from_millis(150))
+            .expect_err("stalled helper must be killed");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid: u32 = std::fs::read_to_string(helper.with_extension("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "ordinary timeout child must be killed and reaped"
+        );
+
+        std::env::remove_var("IRLUME_KWALLET_INIT");
+        std::fs::remove_file(helper.with_extension("pid")).unwrap();
+        std::fs::remove_file(helper).unwrap();
+    }
+
+    #[test]
+    fn wallet_salt_result_is_not_accepted_after_the_deadline() {
+        let _guard = testenv::lock();
+        let helper = salt_helper_script();
+        std::env::set_var("IRLUME_KWALLET_INIT", &helper);
+        let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mark_expired = std::rc::Rc::clone(&expired);
+        let clock_expired = std::rc::Rc::clone(&expired);
+        let start = std::time::Instant::now();
+        let error = read_wallet_salt_with_timeout_and_clock(
+            "present",
+            Duration::from_millis(10),
+            |received_bytes| {
+                if received_bytes {
+                    mark_expired.set(true);
+                }
+            },
+            || {
+                if clock_expired.get() {
+                    start + Duration::from_millis(50)
+                } else {
+                    start
+                }
+            },
+        )
+        .expect_err("a complete helper result arriving after the budget must be refused");
+        assert!(
+            expired.get(),
+            "the seam must expire only after reading bytes"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        std::env::remove_var("IRLUME_KWALLET_INIT");
+        std::fs::remove_file(helper).unwrap();
     }
 }
 

@@ -102,7 +102,7 @@ for _ in $(seq 12); do sleep 1; [ "$(stat -c %s "$KWL" 2>/dev/null || echo 0)" -
 reap_daemon
 
 # --- 1. the key irlume derives opens it -------------------------------------
-"$DERIVE" "$HOMEDIR" "$PASSWORD" > "$WORK/right.key" || { echo "derive failed"; exit 2; }
+IRLUME_KWALLET_INIT="$HELPER" "$DERIVE" "$TESTUSER" "$PASSWORD" > "$WORK/right.key" || { echo "derive failed"; exit 2; }
 [ "$(stat -c %s "$WORK/right.key")" -eq 56 ] || bad "derived key is not 56 bytes"
 handoff "$WORK/right.key" >/dev/null
 got=$(asuser timeout 20 secret-tool lookup svc handoffcheck 2>/dev/null)
@@ -112,7 +112,7 @@ reap_daemon
 
 # --- 2. a key from the wrong password does not ------------------------------
 # Without this the check above could be passing for some other reason.
-"$DERIVE" "$HOMEDIR" "$WRONG" > "$WORK/wrong.key"
+IRLUME_KWALLET_INIT="$HELPER" "$DERIVE" "$TESTUSER" "$WRONG" > "$WORK/wrong.key"
 handoff "$WORK/wrong.key" >/dev/null
 got=$(asuser timeout 20 secret-tool lookup svc handoffcheck 2>/dev/null)
 if [ -z "$got" ]; then note "PASS: a key from the wrong password was refused"

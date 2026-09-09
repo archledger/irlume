@@ -156,10 +156,23 @@ pub struct SealedEnvelope {
 }
 
 impl SealedEnvelope {
+    pub(crate) fn validate_version(&self) -> Result<()> {
+        if self.version != CURRENT_VERSION {
+            return Err(Error::Protocol(format!(
+                "unsupported TPM envelope version: {}",
+                self.version
+            )));
+        }
+        Ok(())
+    }
+
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn load(path: &Path) -> Result<Self> {
         let s = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
-        serde_json::from_str(&s).map_err(|e| Error::Protocol(e.to_string()))
+        let envelope: Self =
+            serde_json::from_str(&s).map_err(|e| Error::Protocol(e.to_string()))?;
+        envelope.validate_version()?;
+        Ok(envelope)
     }
 
     /// Write the envelope as a root-only (0600) file: it contains the wrapped
@@ -379,6 +392,28 @@ mod tests {
             SealedEnvelope::load(&bad),
             Err(Error::Protocol(_))
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_unknown_versions() {
+        let dir = std::env::temp_dir().join(format!("irlume-env-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sealed.json");
+
+        for version in [0, CURRENT_VERSION + 1] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"version":{version},"pcrs":[7],"public":"AQID","private":"BAUG"}}"#),
+            )
+            .unwrap();
+            assert!(matches!(
+                SealedEnvelope::load(&path),
+                Err(Error::Protocol(message)) if message.contains("unsupported TPM envelope version")
+            ));
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

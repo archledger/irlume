@@ -309,10 +309,10 @@ fn remove_source_files() -> Result<String, String> {
     Ok(format!("removed {removed} source-installed file(s)"))
 }
 
-/// Remove irlume artifacts a package `remove` leaves behind, so "uninstall"
-/// leaves nothing: the admin-created `logs debug on` systemd drop-in (not
-/// package-owned), empty share dirs a package manager can leave, and the
-/// install channel (repo) the installer added. Runs for every install method.
+/// Remove irlume artifacts a package `remove` leaves behind: the admin-created
+/// `logs debug on` systemd drop-in (not package-owned), empty share dirs a
+/// package manager can leave, and the install channel the installer added.
+/// Runs for every install method.
 fn clean_residuals(origin: &InstallOrigin) {
     // `irlume logs debug on` drops this in; it survives a package remove.
     let _ = std::fs::remove_dir_all("/etc/systemd/system/irlumed.service.d");
@@ -321,40 +321,45 @@ fn clean_residuals(origin: &InstallOrigin) {
     for d in ["/usr/share/irlume", "/usr/local/share/irlume"] {
         let _ = std::fs::remove_dir_all(d);
     }
-    // The install channel the installer added, so nothing on the box still
-    // points at irlume. (A source install and an AUR/pacman install add no
-    // repo; the Fedora Copr repo and the Ubuntu PPA do.)
-    match origin {
-        InstallOrigin::Copr => remove_repo_files("/etc/yum.repos.d"),
-        InstallOrigin::Ppa => {
-            // The PPA leaves both a sources file and a signing key.
-            remove_repo_files("/etc/apt/sources.list.d");
-            for d in [
-                "/etc/apt/trusted.gpg.d",
-                "/etc/apt/keyrings",
-                "/usr/share/keyrings",
-            ] {
-                remove_repo_files(d);
-            }
-        }
-        _ => {}
+    // Ask the same channel manager that created the repository to remove its
+    // exact identity. Generated filenames vary by distro/release, and keyrings
+    // are shared ownership domains, so neither is safe to infer and unlink.
+    if let Err(e) = remove_install_channel(origin) {
+        eprintln!("[uninstall] warning: install channel may remain: {e}");
     }
 }
 
-/// Delete files under `dir` whose name mentions irlume: the Copr `.repo` or the
-/// PPA `.list` the installer added.
-fn remove_repo_files(dir: &str) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            if e.file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .contains("irlume")
-            {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
+fn install_channel_command(
+    origin: &InstallOrigin,
+) -> Option<(&'static str, &'static [&'static str])> {
+    match origin {
+        InstallOrigin::Copr => Some(("dnf", &["-y", "copr", "remove", "archledger/irlume"])),
+        InstallOrigin::Ppa => Some((
+            "add-apt-repository",
+            &["-y", "--remove", "--ppa", "ppa:archledger/irlume"],
+        )),
+        _ => None,
     }
+}
+
+fn remove_install_channel_with(
+    origin: &InstallOrigin,
+    mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some((bin, args)) = install_channel_command(origin) else {
+        return Ok(());
+    };
+    run(bin, args)
+}
+
+fn remove_install_channel(origin: &InstallOrigin) -> Result<(), String> {
+    remove_install_channel_with(origin, |bin, args| {
+        match Command::new(bin).args(args).status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("{bin} exited with {status}")),
+            Err(e) => Err(format!("could not run {bin} ({e})")),
+        }
+    })
 }
 
 /// Where systemd records each timer's last-trigger stamp.
@@ -469,29 +474,33 @@ fn dir_has_entry_named(dir: &Path, needle: &str) -> bool {
 }
 
 /// The closing line of a successful removal, pure over the teardown report and
-/// the snapshot evidence so every arm is unit tested. The old "no repo,
-/// drop-in, or data left behind" claim is retired for a wipe on purpose (#335,
-/// PR #337 review): this process cannot see inside snapshots or backups, so
-/// after a wipe it always says they may retain the deleted data, and positive
-/// tool evidence only appends the matching listing command. A failed wipe never
-/// borrows the deleted phrasing; it names the paths that still hold data.
+/// the snapshot evidence so every arm is unit tested. Repository-manager
+/// removal is reported before this line, and shared signing keys may remain, so
+/// no branch claims complete channel cleanup. After a wipe, this process also
+/// cannot see inside snapshots or backups. A failed wipe never borrows the
+/// deleted phrasing; it names the paths that still hold data.
 fn closing_line(report: &TeardownReport, snapshots: &SnapshotEvidence) -> String {
+    const CHANNEL_RESIDUAL_NOTE: &str =
+        "The install-channel removal is reported separately; shared signing keys may remain.";
     if !report.data_wipe_requested {
-        return "irlume is removed, with no repo or drop-in left behind; your enrolled \
-                faces, sealed secrets, models, and config were kept (--keep-data)."
-            .into();
+        return format!(
+            "irlume is removed; your enrolled faces, sealed secrets, models, and config \
+             were kept (--keep-data). {CHANNEL_RESIDUAL_NOTE}"
+        );
     }
     if !report.data_wiped {
         return format!(
             "irlume is removed, but the requested data wipe was incomplete: data \
-             remains at {}; filesystem snapshots and backups may also retain copies.",
-            report.data_left.join(", ")
+             remains at {}; filesystem snapshots and backups may also retain copies. \
+             {CHANNEL_RESIDUAL_NOTE}",
+            report.data_left.join(", "),
         );
     }
-    let mut line = "irlume is removed, with no repo or drop-in left behind. Live irlume \
-                    data was deleted, but filesystem snapshots and backups may still \
-                    contain the deleted templates and sealed secrets."
-        .to_string();
+    let mut line = format!(
+        "irlume is removed. Live irlume data was deleted, but filesystem snapshots and \
+         backups may still contain the deleted templates and sealed secrets. \
+         {CHANNEL_RESIDUAL_NOTE}"
+    );
     let mut list_cmds: Vec<&str> = Vec::new();
     if snapshots.snapper {
         list_cmds.push("`snapper list`");
@@ -784,53 +793,78 @@ mod tests {
         assert!(removal_hint(&InstallOrigin::Source).contains("source install"));
     }
 
-    // The repo-residual cleaner backs both the Copr and the PPA teardown; it
-    // must take everything the installers drop (repo file, sources file,
-    // signing keys, any capitalisation) and nothing else in the directory.
+    // Repository/key directories are shared ownership domains. A filename is
+    // not proof that irlume or either channel manager owns an entry.
     #[test]
-    fn remove_repo_files_deletes_only_irlume_named_entries() {
+    fn channel_cleanup_preserves_unknown_entries_with_irlume_in_their_names() {
         let dir = std::env::temp_dir().join(format!("irlume-repo-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let ours = [
+        let files = [
             "_copr:copr.fedorainfracloud.org:archledger:irlume.repo",
             "archledger-ubuntu-irlume-resolute.sources",
             "IRLUME-2026.gpg",
+            "administrator-irlume-notes.repo",
+            "shared-irlume-signing-key.gpg",
+            "other-product.repo",
         ];
-        let theirs = ["fedora.repo", "docker.list", "archledger-other.gpg"];
-        for f in ours.iter().chain(theirs.iter()) {
-            std::fs::write(dir.join(f), b"x").unwrap();
+        for (index, f) in files.iter().enumerate() {
+            std::fs::write(dir.join(f), format!("foreign bytes {index}\n")).unwrap();
         }
-        remove_repo_files(dir.to_str().unwrap());
-        for f in ours {
-            assert!(!dir.join(f).exists(), "{f} should have been removed");
-        }
-        for f in theirs {
-            assert!(dir.join(f).exists(), "{f} must be left alone");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        std::os::unix::fs::symlink("other-product.repo", dir.join("irlume-current.repo")).unwrap();
+        std::fs::create_dir(dir.join("irlume-repository.d")).unwrap();
 
-    #[test]
-    fn remove_repo_files_tolerates_a_missing_directory() {
-        remove_repo_files("/nonexistent/irlume-repo-dir");
-    }
-
-    // remove_repo_files also backs the PPA teardown, which sweeps several key
-    // dirs; a nested subdir must be ignored (it only deletes files it names).
-    #[test]
-    fn remove_repo_files_ignores_subdirectories() {
-        let dir = std::env::temp_dir().join(format!("irlume-repo-sub-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("irlume-subdir")).unwrap();
-        std::fs::write(dir.join("irlume.list"), b"x").unwrap();
-        remove_repo_files(dir.to_str().unwrap());
-        assert!(!dir.join("irlume.list").exists(), "file should be removed");
-        assert!(
-            dir.join("irlume-subdir").is_dir(),
-            "a same-named subdir must be left in place"
+        let mut invoked = None;
+        remove_install_channel_with(&InstallOrigin::Ppa, |bin, args| {
+            invoked = Some((
+                bin.to_owned(),
+                args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            invoked,
+            Some((
+                "add-apt-repository".to_owned(),
+                vec![
+                    "-y".to_owned(),
+                    "--remove".to_owned(),
+                    "--ppa".to_owned(),
+                    "ppa:archledger/irlume".to_owned()
+                ]
+            ))
         );
+        for (index, f) in files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(dir.join(f)).unwrap(),
+                format!("foreign bytes {index}\n").as_bytes(),
+                "unknown entry {f} must remain byte-identical"
+            );
+        }
+        assert!(std::fs::symlink_metadata(dir.join("irlume-current.repo"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(dir.join("irlume-repository.d").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_channel_cleanup_uses_the_installer_repository_identity() {
+        assert_eq!(
+            install_channel_command(&InstallOrigin::Copr),
+            Some(("dnf", &["-y", "copr", "remove", "archledger/irlume"][..]))
+        );
+        assert_eq!(
+            install_channel_command(&InstallOrigin::Ppa),
+            Some((
+                "add-apt-repository",
+                &["-y", "--remove", "--ppa", "ppa:archledger/irlume"][..]
+            ))
+        );
+        assert_eq!(install_channel_command(&InstallOrigin::Source), None);
+        assert_eq!(install_channel_command(&InstallOrigin::LocalDeb), None);
     }
 
     #[test]
@@ -903,6 +937,15 @@ mod tests {
             "the retired all-gone claim must not come back: {line}"
         );
         assert!(
+            !line.contains("no repo or drop-in left behind"),
+            "channel cleanup can fail and shared key material may remain: {line}"
+        );
+        assert!(
+            line.contains("install-channel removal is reported separately")
+                && line.contains("shared signing keys may remain"),
+            "the closing copy must preserve the channel/key uncertainty: {line}"
+        );
+        assert!(
             !line.contains("snapper") && !line.contains("timeshift"),
             "no tool advice without evidence: {line}"
         );
@@ -951,6 +994,12 @@ mod tests {
         assert!(
             !line.contains("may still contain") && !line.contains("deleted"),
             "kept data needs no deletion talk: {line}"
+        );
+        assert!(
+            !line.contains("no repo or drop-in left behind")
+                && line.contains("install-channel removal is reported separately")
+                && line.contains("shared signing keys may remain"),
+            "a channel-manager failure must not be contradicted by the closing copy: {line}"
         );
     }
 
@@ -1071,6 +1120,11 @@ mod tests {
     // real package manager, which would touch the system).
     #[test]
     fn run_pkg_maps_exit_status_to_a_result() {
+        // Even read-only PATH consumers must share the lock: the TUI child-
+        // process fixtures temporarily replace PATH with a private tool tree.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             run_pkg("true", &["remove", "irlume"]).unwrap(),
             "removed the true package"

@@ -319,7 +319,7 @@ fn is_irlume_srk(public: &Public) -> Result<bool> {
 ///
 /// Returns the handle and whether it is persistent (a persistent handle must NOT
 /// be flushed by the caller).
-fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
+fn load_or_create_srk(ctx: &mut Context, mode: SrkMode) -> Result<(KeyHandle, bool)> {
     let persistent = persistent_srk_handle()?;
     let wanted = TpmHandle::Persistent(persistent);
 
@@ -344,32 +344,34 @@ fn load_or_create_srk(ctx: &mut Context) -> Result<(KeyHandle, bool)> {
             }
             // Persistent handle occupied by a foreign key: leave it untouched and
             // use a transient SRK this run (correct, just slower).
-            let transient = create_srk(ctx)?;
+            let transient = mode.initialize(|| create_srk(ctx))?;
             return Ok((transient, false));
         }
     }
 
-    // First run: derive the primary (one-time slow step) and persist it.
-    // Said in our words, because the library's logging for the expected
-    // handle miss this path replaces is three ERROR lines (#601).
-    irlume_common::dlog!(
-        "irlume: first TPM use on this machine: deriving and persisting the \
+    mode.initialize(|| {
+        // First run: derive the primary (one-time slow step) and persist it.
+        // Said in our words, because the library's logging for the expected
+        // handle miss this path replaces is three ERROR lines (#601).
+        irlume_common::dlog!(
+            "irlume: first TPM use on this machine: deriving and persisting the \
          storage root key (a few seconds on slow TPMs)"
-    );
-    let transient = create_srk(ctx)?;
-    let persisted = ctx
-        .execute_with_nullauth_session(|ctx| {
-            ctx.evict_control(
-                Provision::Owner,
-                transient.into(),
-                Persistent::Persistent(persistent),
-            )
-        })
-        .map_err(tpm_err)?;
-    let _ = ctx.flush_context(transient.into());
-    ctx.tr_set_auth(persisted, Auth::default())
-        .map_err(tpm_err)?;
-    Ok((KeyHandle::from(ESYS_TR::from(persisted)), true))
+        );
+        let transient = create_srk(ctx)?;
+        let persisted = ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    transient.into(),
+                    Persistent::Persistent(persistent),
+                )
+            })
+            .map_err(tpm_err)?;
+        let _ = ctx.flush_context(transient.into());
+        ctx.tr_set_auth(persisted, Auth::default())
+            .map_err(tpm_err)?;
+        Ok((KeyHandle::from(ESYS_TR::from(persisted)), true))
+    })
 }
 
 /// Run `body` with irlume's persistent SRK as parent. Never flushes the SRK when
@@ -379,7 +381,32 @@ fn with_srk<T>(
     ctx: &mut Context,
     body: impl FnOnce(&mut Context, &KeyHandle) -> Result<T>,
 ) -> Result<T> {
-    let (srk, persistent) = load_or_create_srk(ctx)?;
+    with_srk_mode(ctx, SrkMode::Initialize, body)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SrkMode {
+    Initialize,
+    ReadOnly,
+}
+
+impl SrkMode {
+    fn initialize<T>(self, initialize: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self == Self::ReadOnly {
+            return Err(Error::Policy(
+                "read-only unseal requires the existing irlume storage root key".into(),
+            ));
+        }
+        initialize()
+    }
+}
+
+fn with_srk_mode<T>(
+    ctx: &mut Context,
+    mode: SrkMode,
+    body: impl FnOnce(&mut Context, &KeyHandle) -> Result<T>,
+) -> Result<T> {
+    let (srk, persistent) = load_or_create_srk(ctx, mode)?;
     let result = body(ctx, &srk);
     if !persistent {
         let _ = ctx.flush_context(srk.into());
@@ -580,22 +607,81 @@ pub fn is_pcr_changed_race(e: &Error) -> bool {
 /// leg did not.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+    unseal_with_mode(env, SrkMode::Initialize)
+}
+
+/// Unseal without creating or persisting a storage root key.
+///
+/// # Errors
+/// Returns an error if the existing SRK is unavailable, or policy unsealing fails.
+pub(crate) fn unseal_read_only(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+    unseal_with_mode(env, SrkMode::ReadOnly)
+}
+
+fn unseal_with_mode(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u8>>> {
+    env.validate_version()?;
     let out = retry_on_pcr_race(
         PCR_CHANGED_RETRIES,
         PCR_CHANGED_RETRY_BUDGET,
         || match &env.policy {
-            PolicyKind::PcrLiteral => unseal_literal(env),
+            PolicyKind::PcrLiteral => unseal_literal(env, mode),
             PolicyKind::Authorized {
                 pubkey_pem,
                 policy_ref,
-            } => unseal_authorized(env, pubkey_pem, policy_ref),
-            PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index),
+            } => unseal_authorized(env, pubkey_pem, policy_ref, mode),
+            PolicyKind::PcrlockNv { nv_index } => unseal_pcrlock(env, *nv_index, mode),
         },
     )?;
     // Lock the unsealed secret (login password / template key) against swap and
     // core dumps for as long as it lives.
     irlume_common::memlock::lock_slice(&out);
     Ok(out)
+}
+
+#[cfg(test)]
+mod envelope_version_tests {
+    use super::*;
+
+    fn unknown_envelope(version: u32, pcr_values: Vec<PcrValue>) -> SealedEnvelope {
+        SealedEnvelope {
+            version,
+            policy: PolicyKind::PcrLiteral,
+            secret: crate::envelope::SecretKind::LoginPassword,
+            pcrs: vec![7],
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values,
+            password_wrap: None,
+        }
+    }
+
+    #[test]
+    fn unseal_rejects_unknown_envelope_version_before_opening_tpm() {
+        for version in [0, crate::envelope::CURRENT_VERSION + 1] {
+            let envelope = unknown_envelope(version, Vec::new());
+            assert!(matches!(
+                unseal(&envelope),
+                Err(Error::Protocol(message)) if message.contains("unsupported TPM envelope version")
+            ));
+        }
+    }
+
+    #[test]
+    fn diagnose_rejects_unknown_envelope_version_before_empty_return_or_tpm() {
+        for pcr_values in [
+            Vec::new(),
+            vec![PcrValue {
+                pcr: 7,
+                value: vec![0; 32],
+            }],
+        ] {
+            let envelope = unknown_envelope(crate::envelope::CURRENT_VERSION + 1, pcr_values);
+            assert!(matches!(
+                diagnose_pcrs(&envelope),
+                Err(Error::Protocol(message)) if message.contains("unsupported TPM envelope version")
+            ));
+        }
+    }
 }
 
 /// Run `attempt` until it stops losing to the PCR-counter race, at most
@@ -638,10 +724,10 @@ where
 /// Unseal a literal-`PolicyPCR` envelope: replay the bound PCRs into a policy
 /// session and unseal.
 #[allow(clippy::redundant_closure_call)]
-fn unseal_literal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u8>>> {
     let mut ctx = open_context()?;
 
-    with_srk(&mut ctx, |ctx, srk| {
+    with_srk_mode(&mut ctx, mode, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
 
@@ -734,10 +820,11 @@ fn unseal_authorized(
     env: &SealedEnvelope,
     pubkey_pem: &str,
     policy_ref: &[u8],
+    mode: SrkMode,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let mut ctx = open_context()?;
 
-    with_srk(&mut ctx, |ctx, srk| {
+    with_srk_mode(&mut ctx, mode, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
         let sealed_handle = ctx
@@ -1315,13 +1402,17 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
 /// Unseal a `PolicyAuthorizeNV`-bound object against `nv_index`: replay the live
 /// super-PCR policy, run PolicyAuthorizeNV, and unseal.
 #[allow(clippy::redundant_closure_call)]
-fn unseal_pcrlock(env: &SealedEnvelope, nv_index: u32) -> Result<Zeroizing<Vec<u8>>> {
+fn unseal_pcrlock(
+    env: &SealedEnvelope,
+    nv_index: u32,
+    mode: SrkMode,
+) -> Result<Zeroizing<Vec<u8>>> {
     let plock = read_pcrlock_json()?;
     let mut ctx = open_context()?;
     let nv = nv_index_handle(&mut ctx, nv_index)?;
     let super_pcr = build_super_pcr(&plock)?;
 
-    with_srk(&mut ctx, |ctx, srk| {
+    with_srk_mode(&mut ctx, mode, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
         let sealed_handle = ctx
@@ -1421,6 +1512,7 @@ pub fn is_pcr_mismatch(e: &Error) -> bool {
 /// PCRs whose SHA-256 differs (empty ⇒ no drift, or no values captured at seal).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
+    env.validate_version()?;
     if env.pcr_values.is_empty() {
         return Ok(Vec::new());
     }
@@ -1437,6 +1529,17 @@ pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn read_only_srk_refuses_initialization() {
+        let result = super::SrkMode::ReadOnly.initialize(|| -> irlume_common::Result<()> {
+            panic!("read-only unseal must not create or persist an SRK")
+        });
+        assert!(matches!(result, Err(irlume_common::Error::Policy(_))));
+        assert_eq!(
+            super::SrkMode::Initialize.initialize(|| Ok(17)).unwrap(),
+            17
+        );
+    }
     use super::*;
 
     #[test]

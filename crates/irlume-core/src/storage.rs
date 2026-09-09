@@ -526,8 +526,9 @@ pub fn profile_path(user: &str) -> PathBuf {
     state_dir().join(format!("{user}.json"))
 }
 
-/// On-disk wrapper for an encrypted enrollment (version 2). The plaintext under
-/// `enc` is the same JSON an unencrypted `Enrollment` serializes to.
+/// On-disk wrapper for an encrypted enrollment (historical version 2 or current
+/// version 3). The plaintext under `enc` is the same JSON an unencrypted
+/// `Enrollment` serializes to.
 #[derive(Serialize, Deserialize)]
 struct EncEnvelope {
     version: u32,
@@ -540,10 +541,24 @@ struct EncEnvelope {
     enc: String,
 }
 
-/// Version written into new [`EncEnvelope`]s. Informational only: the load
-/// path detects the encrypted format by the `enc` field and never checks this
-/// number.
+/// Version written into new [`EncEnvelope`]s.
 const ENC_ENVELOPE_VERSION: u32 = 3;
+const LEGACY_ENC_ENVELOPE_VERSION: u32 = 2;
+
+fn is_encrypted_enrollment(v: &serde_json::Value) -> irlume_common::Result<bool> {
+    if v.get("enc").is_none() {
+        return Ok(false);
+    }
+    let version = v.get("version").and_then(serde_json::Value::as_u64);
+    if matches!(version, Some(version) if version == u64::from(LEGACY_ENC_ENVELOPE_VERSION) || version == u64::from(ENC_ENVELOPE_VERSION))
+    {
+        return Ok(true);
+    }
+    let version = version.map_or_else(|| "missing or invalid".to_string(), |v| v.to_string());
+    Err(irlume_common::Error::Protocol(format!(
+        "unsupported encrypted enrollment version: {version}"
+    )))
+}
 
 /// Serialize an enrollment, encrypting under `key` when one is supplied (TPM
 /// host) or emitting pretty plaintext when not (dev / no-TPM). Pure; tested
@@ -572,12 +587,12 @@ fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common::Re
 }
 
 /// Parse on-disk bytes into an `Enrollment`, handling all three formats:
-/// encrypted (v2, needs `key`), plaintext multi-profile, and the legacy
+/// encrypted (v2/v3, needs `key`), plaintext multi-profile, and the legacy
 /// single-profile layout (migrated). Pure; tested without a TPM.
 fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Result<Enrollment> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
-    if v.get("enc").is_some() {
+    if is_encrypted_enrollment(&v)? {
         let env: EncEnvelope =
             serde_json::from_value(v).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
         let key = key.ok_or_else(|| {
@@ -659,7 +674,10 @@ fn replacement_key(
     load_existing: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
     first_save: impl FnOnce(&str) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>>,
 ) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
-    if template_key::has_key(user) || store_is_encrypted(user)? == Some(true) {
+    // Probe first even when a key exists: the probe admits the stored format,
+    // and short-circuiting it would let replacement overwrite a future schema.
+    let encrypted_store = store_is_encrypted(user)? == Some(true);
+    if template_key::has_key(user) || encrypted_store {
         // Never mint a replacement key or fall back to plaintext on unseal
         // failure. The user can restore recovery or explicitly delete state.
         load_existing(user).map(Some)
@@ -681,27 +699,52 @@ fn save_with_key(
     persist_enrollment(&path, &bytes)
 }
 
-/// Load an enrollment, transparently decrypting (v2) and migrating the legacy
+/// Load an enrollment, transparently decrypting v2/v3 and migrating the legacy
 /// single-profile format. A plaintext file loads without touching the TPM; an
 /// encrypted file unseals the template key (and fails cleanly, with face auth
 /// falling back to the password, if the seal can no longer be satisfied).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
-    let _state = template_key::UserStateLock::acquire(user)?;
+    load_with(
+        user,
+        template_key::UserStateLock::acquire,
+        template_key::load_key_unlocked,
+    )
+}
+
+/// Load an enrollment without writing enrollment, key, recovery, or lock files
+/// or initializing a persistent TPM storage root key. Legacy migration happens
+/// only in memory; encrypted stores still require successful TPM unsealing.
+///
+/// # Errors
+/// Returns an error if the existing user lock is absent, or on a read, unseal,
+/// or decryption failure. This diagnostic path does not initialize state.
+pub fn load_read_only(user: &str) -> irlume_common::Result<Option<Enrollment>> {
+    load_with(
+        user,
+        template_key::UserStateLock::acquire_read_only,
+        template_key::load_key_read_only_unlocked,
+    )
+}
+
+fn load_with(
+    user: &str,
+    acquire_lock: impl FnOnce(&str) -> irlume_common::Result<template_key::UserStateLock>,
+    load_key: impl FnOnce(&str) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+) -> irlume_common::Result<Option<Enrollment>> {
+    let _state = acquire_lock(user)?;
     let path = profile_path(user);
     if !path.exists() {
         return Ok(None);
     }
     let data = fs::read(&path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
-    // Only unseal the key when the file is actually encrypted.
-    let is_enc = serde_json::from_slice::<serde_json::Value>(&data)
-        .map(|v| v.get("enc").is_some())
-        .unwrap_or(false);
-    let key = if is_enc {
-        Some(template_key::load_key_unlocked(user)?)
-    } else {
-        None
+    // Validate the encrypted format before resolving a key: on TPM hosts,
+    // key resolution can open a TPM context and attempt an unseal.
+    let is_enc = match serde_json::from_slice::<serde_json::Value>(&data) {
+        Ok(value) => is_encrypted_enrollment(&value)?,
+        Err(_) => false,
     };
+    let key = if is_enc { Some(load_key(user)?) } else { None };
     deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
 }
 
@@ -725,11 +768,10 @@ pub fn load(user: &str) -> irlume_common::Result<Option<Enrollment>> {
 pub fn store_is_encrypted(user: &str) -> irlume_common::Result<Option<bool>> {
     let path = profile_path(user);
     match fs::read(&path) {
-        Ok(data) => Ok(Some(
-            serde_json::from_slice::<serde_json::Value>(&data)
-                .map(|v| v.get("enc").is_some())
-                .unwrap_or(false),
-        )),
+        Ok(data) => match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(value) => is_encrypted_enrollment(&value).map(Some),
+            Err(_) => Ok(Some(false)),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(irlume_common::Error::Io(e.to_string())),
     }
@@ -806,6 +848,68 @@ pub fn list_users() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_only_plaintext_load_preserves_enrollment_and_missing_state() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("readonly-store"));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        assert!(load_read_only("u").is_err());
+        assert!(!dir.exists());
+        drop(template_key::UserStateLock::acquire("u").unwrap());
+        assert!(load_read_only("u").unwrap().is_none());
+        let path = profile_path("u");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serialize_enrollment(&sample(), None).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(load_read_only("u").unwrap().unwrap().user, "u");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        std::env::remove_var("IRLUME_STATE_DIR");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn protected_load_decrypts_without_rewriting_enrollment() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("readonly-encrypted-store"));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        drop(template_key::UserStateLock::acquire("u").unwrap());
+        let path = profile_path("u");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serialize_enrollment(&sample(), Some(&[42; 32])).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let loaded = load_with(
+            "u",
+            template_key::UserStateLock::acquire_read_only,
+            |user| {
+                assert_eq!(user, "u");
+                Ok(Zeroizing::new(vec![42; 32]))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            loaded.profiles[0].scans[0].ir.as_deref(),
+            Some(&[0.5, 0.6][..])
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(
+            load_with("u", template_key::UserStateLock::acquire_read_only, |_| {
+                Err(irlume_common::Error::Policy(
+                    "synthetic unseal refusal".into(),
+                ))
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        std::env::remove_var("IRLUME_STATE_DIR");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn unknown_ir_retag_preserves_all_scan_data_in_every_live_space() {
@@ -1208,6 +1312,61 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_enrollment_accepts_historical_and_current_versions() {
+        let key = crypto::generate_key();
+        let plain = serde_json::to_vec(&sample()).unwrap();
+        for version in [2, ENC_ENVELOPE_VERSION] {
+            let envelope = EncEnvelope {
+                version,
+                key_id: (version == ENC_ENVELOPE_VERSION).then(|| irlume_common::sha256_hex(&key)),
+                enc: STANDARD.encode(crypto::encrypt(&key, &plain).unwrap()),
+            };
+            let bytes = serde_json::to_vec(&envelope).unwrap();
+            let loaded = deserialize_enrollment(&bytes, Some(&key)).unwrap();
+            assert_eq!(loaded.user, "u");
+            assert_eq!(loaded.total_scans(), 1);
+        }
+    }
+
+    #[test]
+    fn encrypted_enrollment_rejects_unknown_versions_before_payload_processing() {
+        for version in [0, 1, ENC_ENVELOPE_VERSION + 1] {
+            let bytes = format!(r#"{{"version":{version},"enc":"not base64"}}"#);
+            assert!(matches!(
+                deserialize_enrollment(bytes.as_bytes(), Some(&[42; 32])),
+                Err(irlume_common::Error::Protocol(message))
+                    if message.contains("unsupported encrypted enrollment version")
+            ));
+        }
+    }
+
+    #[test]
+    fn load_rejects_unknown_encrypted_version_before_loading_key_and_preserves_file() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("unknown-encrypted-version"));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        drop(template_key::UserStateLock::acquire("u").unwrap());
+        let path = profile_path("u");
+        let bytes = br#"{"version":4,"enc":"not base64"}"#;
+        fs::write(&path, bytes).unwrap();
+
+        assert!(matches!(
+            load_with("u", template_key::UserStateLock::acquire_read_only, |_| {
+                panic!("unknown versions must be rejected before key loading")
+            }),
+            Err(irlume_common::Error::Protocol(message))
+                if message.contains("unsupported encrypted enrollment version")
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        std::env::remove_var("IRLUME_STATE_DIR");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn plaintext_round_trip_without_key() {
         let e = sample();
         let bytes = serialize_enrollment(&e, None).unwrap();
@@ -1549,6 +1708,49 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn replacement_rejects_unknown_version_before_key_selection_and_preserves_state() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("irlume-replacement-version-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let before = br#"{"version":4,"enc":"future ciphertext"}"#;
+
+        for (user, has_key) in [("with-key", true), ("without-key", false)] {
+            let path = profile_path(user);
+            fs::write(&path, before).unwrap();
+            if has_key {
+                let key_path = template_key::key_path(user);
+                fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+                fs::write(key_path, b"synthetic sealed key").unwrap();
+            }
+            let mut replacement = sample();
+            replacement.user = user.into();
+
+            let error = save_with_key(&replacement, |user| {
+                replacement_key(
+                    user,
+                    |_| panic!("unknown versions must be rejected before loading a key"),
+                    |_| panic!("unknown versions must be rejected before creating a key"),
+                )
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                irlume_common::Error::Protocol(message)
+                    if message.contains("unsupported encrypted enrollment version")
+            ));
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+
+        std::env::remove_var("IRLUME_STATE_DIR");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // Regression: 0be786b. save() used fs::write straight onto the profile
     // path: a crash mid-write left a truncated profile and the umask window
     // made it briefly world-readable. The fix writes a 0600 temp file and
@@ -1679,6 +1881,19 @@ mod tests {
         // Encrypted envelope: Ok(Some(true)) — detection is the `enc` field.
         fs::write(dir.join("sealed.json"), br#"{"version":3,"enc":"AAAA"}"#).unwrap();
         assert_eq!(store_is_encrypted("sealed").unwrap(), Some(true));
+
+        for (user, version) in [("zero", 0), ("future", ENC_ENVELOPE_VERSION + 1)] {
+            fs::write(
+                dir.join(format!("{user}.json")),
+                format!(r#"{{"version":{version},"enc":"AAAA"}}"#),
+            )
+            .unwrap();
+            assert!(matches!(
+                store_is_encrypted(user),
+                Err(irlume_common::Error::Protocol(message))
+                    if message.contains("unsupported encrypted enrollment version")
+            ));
+        }
 
         // Unparseable bytes read as plaintext so the FULL load reports the
         // real parse error instead of this probe.

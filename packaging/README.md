@@ -20,6 +20,14 @@ lane fetches and sha256-verifies them at build time (`scripts/fetch-models.sh`,
 or the Source URLs in the spec / PKGBUILD / flake). An installed package bundles
 the weights, so a running system needs no download.
 
+Wallet-salt routing is one package-level compatibility unit: upgrade the daemon,
+CLI, PAM module, and `irlume-kwallet-init` helper together, then restart the
+running daemon. A new daemon clearly refuses an older client that did not perform
+the account-scoped lookup. A new client talking to an old daemon is not protected
+by the client change alone because the old daemon ignores the additive request
+fields and retains its former path read. Existing sealed envelopes and wallet
+files need no migration.
+
 ## Per-family
 
 - **Fedora** (`fedora/irlume.spec` + `../.packit.yaml`): Packit builds in Copr

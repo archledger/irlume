@@ -169,11 +169,14 @@ password/fingerprint without opening the camera; `yes` authorizes one face
 attempt. Login, logout, lock-screen, and credential-release flows do not gain
 this extra irlume prompt.
 
-That prompt is on by default and can be turned off per machine with
+That prompt is on by default. Use TUI Settings > Privileged consent [p], or
+`sudo irlume auth consent hands-free --yes`, to opt out per machine. This saves
 `privileged_face_consent=0` in `/etc/irlume/settings.conf`, the machine owner's
 waiver: a privileged face attempt then starts when the PAM prompt appears, with
 no per-attempt word. The trade is that
 every `sudo` then opens the camera, including one typed by someone else at the
-machine; passive PAD and the password fallback are unaffected.
+machine; passive PAD and the password fallback are unaffected. Restore confirmation with
+`sudo irlume auth consent required`; inspect it with `irlume auth consent status`.
+This setting does not change how desktop login or lock screens start a scan.
 
 </details>

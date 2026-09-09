@@ -19,15 +19,20 @@ pieces:
 2. Your desktop's polkit agent (KDE or GNOME) opens its dialog, which names
    the app and the action being approved, and starts a PAM conversation on the
    `polkit-1` service.
-3. `pam_irlume` asks for hidden literal `yes`. Enter, cancellation, or any other
+3. By default, `pam_irlume` asks for hidden literal `yes`. Enter, cancellation, or any other
    response selects password/fingerprint without opening the camera. `yes`
    authorizes exactly one face attempt.
 4. `irlumed` verifies the face and automatic passive PAD. The app learns only
    the final verdict.
 
 Both the KDE and GNOME agents start the PAM conversation the moment the dialog
-appears, but irlume does not open the camera until it receives the hidden `yes`.
-This conventional response is mandatory and cannot be disabled.
+appears, but the default Irlume policy waits for the hidden `yes` before opening the
+camera. The machine owner can opt into hands-free privileged prompts using
+`sudo irlume auth consent hands-free --yes` or TUI Settings > Privileged
+consent [p]. A prompt raised by an app, script or another person can then
+authenticate while you are in view. Restore the default with
+`sudo irlume auth consent required`. See [the scope and override
+rules](SETUP.md#choosing-privileged-face-confirmation).
 
 ## Enabling
 
@@ -42,7 +47,7 @@ This adds one verify-only line to the `polkit-1` PAM stack (Fedora gets an
 edit-in-place with a `.pre-irlume` backup). `sudo irlume login disable --apply`
 removes it along with everything else, flag or no flag.
 
-Privileged intent is fixed: type hidden literal `yes` for one face attempt.
+With the default policy, type hidden literal `yes` for one face attempt.
 Automatic PAD remains mandatory before a face grant. Head gestures have been
 removed; old settings no longer add a challenge. Stored legacy eyes-open policy
 still blocks authentication until `irlume profiles eyes-open off` clears it.

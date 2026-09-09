@@ -112,6 +112,8 @@ fn one_camera_operation_spans_camera_open_and_every_authentication_retry() {
         "authenticate_for must acquire exactly one operation"
     );
     assert!(acquire < open && open < retries);
+    let acquisition = &body[acquire..open];
+    assert!(acquisition.contains("self.authentication_deadline") && acquisition.contains("saturating_duration_since"), "the actual authentication lease must use its remaining window, not only a diagnostics/assessment helper");
     assert!(body.contains("&camera_operation"));
 
     let loop_start = text[end..]

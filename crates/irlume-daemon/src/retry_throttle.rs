@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! Recorded account failures survive daemon restarts. Terminal recording is not
-//! a write-ahead reservation of every matcher opportunity or an overall ceiling.
+//! Account requests are charged durably before face work. Ambiguous completion
+//! keeps its charge; only an admitted response or verified recovery resets it.
 //! Disk is authoritative: no cached counter can disagree with a visible rename.
 
 use irlume_common::{write_atomic_reporting, AtomicWrite};
@@ -13,8 +13,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod recovery;
+
 const MAX_RECORD: u64 = 4096;
 const NANOS: u64 = 1_000_000_000;
+const FACE_LIMIT: u32 = 50;
 pub(crate) const UNAVAILABLE: &str =
     "face retry state unavailable; use your password and ask an administrator to check /var/lib/irlume/retry";
 pub(crate) const LIMITED: &str = "too many recent face attempts; use your password";
@@ -29,7 +32,7 @@ struct Account {
     name: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Policy {
     limit: u32,
     seconds: u64,
@@ -37,12 +40,29 @@ struct Policy {
 
 impl Policy {
     fn configured() -> Self {
-        Self {
-            limit: crate::env_or("IRLUME_RATE_LIMIT", "5").parse().unwrap_or(5),
-            seconds: crate::env_or("IRLUME_RATE_COOLDOWN_SECS", "30")
-                .parse()
-                .unwrap_or(30),
+        let (policy, invalid) = Self::parse(
+            &crate::env_or("IRLUME_RATE_LIMIT", "5"),
+            &crate::env_or("IRLUME_RATE_COOLDOWN_SECS", "30"),
+        );
+        if invalid {
+            eprintln!("irlumed: invalid face retry configuration; using safe defaults for invalid settings");
         }
+        policy
+    }
+
+    fn parse(limit: &str, seconds: &str) -> (Self, bool) {
+        let limit = limit.parse::<u32>().ok().filter(|n| (1..=5).contains(n));
+        let seconds = seconds
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (30..=86400).contains(n));
+        (
+            Self {
+                limit: limit.unwrap_or(5),
+                seconds: seconds.unwrap_or(30),
+            },
+            limit.is_none() || seconds.is_none(),
+        )
     }
 }
 
@@ -106,6 +126,15 @@ struct Record {
     strikes: u32,
     #[serde(deserialize_with = "Option::deserialize")]
     cooldown: Option<Cooldown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget: Option<FaceBudget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FaceBudget {
+    unsuccessful_requests: u32,
+    pending: bool,
 }
 
 impl Record {
@@ -116,11 +145,29 @@ impl Record {
             account: account.name.clone(),
             strikes: 0,
             cooldown: None,
+            budget: None,
         }
     }
 
+    fn initialize_budget(&mut self) {
+        self.version = 2;
+        self.budget = Some(FaceBudget {
+            unsuccessful_requests: 0,
+            pending: false,
+        });
+    }
+
+    fn reset(account: &Account) -> Self {
+        let mut record = Self::empty(account);
+        record.initialize_budget();
+        record
+    }
+
     fn validate(&self, account: &Account) -> io::Result<()> {
-        if self.version != 1
+        if !matches!((self.version, &self.budget), (1, None) | (2, Some(_)))
+            || self.budget.as_ref().is_some_and(|b| {
+                b.unsuccessful_requests > FACE_LIMIT || (b.pending && b.unsuccessful_requests == 0)
+            })
             || self.uid != account.uid
             || self.account != account.name
             || self.account.is_empty()
@@ -142,6 +189,26 @@ impl Record {
             duration_nanos: duration,
         });
         self.strikes = 0;
+        Ok(())
+    }
+
+    fn strike(&mut self, policy: Policy, now: &Tick) -> io::Result<()> {
+        if self.cooldown.is_none() {
+            self.strikes = self.strikes.checked_add(1).ok_or_else(invalid)?;
+            if self.strikes >= policy.limit {
+                self.arm(now, policy.seconds.checked_mul(NANOS).ok_or_else(invalid)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_abandoned(&mut self, policy: Policy, now: &Tick) -> io::Result<()> {
+        if let Some(budget) = &mut self.budget {
+            if budget.pending {
+                budget.pending = false;
+                self.strike(policy, now)?;
+            }
+        }
         Ok(())
     }
 }
@@ -173,11 +240,54 @@ fn open_dir(path: &Path, owner: u32, private: bool) -> io::Result<File> {
     Ok(file)
 }
 
+/// Own the flock lifetime separately from duplicate File descriptors.
+/// Kept inside retry accounting; callers retain it for the complete operation.
+pub(crate) struct RetryLock {
+    file: File,
+    owner_pid: libc::pid_t,
+}
+
+impl RetryLock {
+    fn acquire(file: File, flags: libc::c_int) -> io::Result<Self> {
+        // SAFETY: file owns a live descriptor throughout acquisition.
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: getpid has no preconditions and identifies this acquisition's owner.
+        let owner_pid = unsafe { libc::getpid() };
+        Ok(Self { file, owner_pid })
+    }
+}
+
+impl std::ops::Deref for RetryLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Drop for RetryLock {
+    fn drop(&mut self) {
+        // flock belongs to the open file description shared by dup/fork. Closing
+        // our fd alone can leave the lock held by a child until exec. Conversely,
+        // a copied guard in that child must not unlock a still-active parent.
+        // SAFETY: getpid has no preconditions (including in a post-fork child).
+        if unsafe { libc::getpid() } == self.owner_pid {
+            // SAFETY: self.file remains live until after this destructor. Unlock
+            // explicitly before File closes; no other owner can clone this guard.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 impl Store {
     /// Open and exclusively lock the directory inode. All subsequent accesses are
     /// pinned through its fd, including the existing atomic writer, so a renamed
-    /// parent cannot redirect publication. Closing the fd releases flock even on error.
-    fn lock(&self) -> io::Result<File> {
+    /// parent cannot redirect publication. The owning guard releases flock on error.
+    fn lock(&self) -> io::Result<RetryLock> {
         let parent = open_dir(&self.parent, self.owner, false)?;
         let path = PathBuf::from(format!("/proc/self/fd/{}/retry", parent.as_raw_fd()));
         match std::fs::DirBuilder::new().mode(0o700).create(&path) {
@@ -188,11 +298,7 @@ impl Store {
         let dir = open_dir(&path, self.owner, true)?;
         // Also retries directory-creation durability following an earlier error.
         parent.sync_all()?;
-        // SAFETY: dir owns a valid fd throughout the lock lifetime.
-        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(dir)
+        RetryLock::acquire(dir, libc::LOCK_EX)
     }
 
     fn path(dir: &File, account: &Account) -> PathBuf {
@@ -204,14 +310,30 @@ impl Store {
     }
 
     fn read(&self, dir: &File, account: &Account) -> io::Result<Record> {
-        let path = Self::path(dir, account);
+        let Some(bytes) = self.read_bytes(dir, &Self::path(dir, account))? else {
+            return Ok(Record::empty(account));
+        };
+        // Version 1's original strict schema had no budget field, including
+        // null. Do not turn a malformed legacy record into a fresh epoch.
+        let shape: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if shape.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+            && shape.get("budget").is_some()
+        {
+            return Err(invalid());
+        }
+        let record: Record = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        record.validate(account)?;
+        Ok(record)
+    }
+
+    fn read_bytes(&self, dir: &File, path: &Path) -> io::Result<Option<Vec<u8>>> {
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
         {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Record::empty(account)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
         let meta = file.metadata()?;
@@ -228,14 +350,42 @@ impl Store {
         if bytes.len() > MAX_RECORD as usize {
             return Err(invalid());
         }
-        let record: Record = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        record.validate(account)?;
         // A previous rename may have been visible but not durable. Re-read and
         // establish durability before permitting face again, including after a
         // process restart. There is no stale in-memory copy to restore on error.
         file.sync_all()?;
         dir.sync_all()?;
-        Ok(record)
+        Ok(Some(bytes))
+    }
+
+    fn operation(&self, account: &Account) -> io::Result<RetryLock> {
+        let dir = self.lock()?;
+        let path = format!(
+            "/proc/self/fd/{}/{}.operation",
+            dir.as_raw_fd(),
+            account.uid
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        let m = file.metadata()?;
+        if !m.is_file()
+            || m.uid() != self.owner
+            || m.mode() & 0o7777 != 0o600
+            || m.nlink() != 1
+            || m.len() != 0
+        {
+            return Err(invalid());
+        }
+        let file = RetryLock::acquire(file, libc::LOCK_EX | libc::LOCK_NB)?;
+        file.sync_all()?;
+        dir.sync_all()?;
+        Ok(file)
     }
 
     fn commit(&self, dir: &File, record: &Record, writer: Writer) -> io::Result<()> {
@@ -264,9 +414,6 @@ impl Store {
         clock: Clock,
         writer: Writer,
     ) -> io::Result<bool> {
-        if policy.limit == 0 {
-            return Ok(false);
-        }
         let now = clock()?;
         if !valid_boot(&now.boot) {
             return Err(invalid());
@@ -274,6 +421,7 @@ impl Store {
         let dir = self.lock()?;
         let mut record = self.read(&dir, account)?;
         let before = record.clone();
+        record.settle_abandoned(policy, &now)?;
         if let Some(c) = &record.cooldown {
             if c.boot_id != now.boot {
                 record.arm(&now, c.duration_nanos)?;
@@ -291,11 +439,16 @@ impl Store {
             self.commit(&dir, &record, writer)?;
         }
         Ok(record
-            .cooldown
+            .budget
             .as_ref()
-            .is_some_and(|c| now.nanos < c.deadline_nanos))
+            .is_some_and(|b| b.unsuccessful_requests >= FACE_LIMIT)
+            || record
+                .cooldown
+                .as_ref()
+                .is_some_and(|c| now.nanos < c.deadline_nanos))
     }
 
+    #[cfg(test)]
     fn record(
         &self,
         account: &Account,
@@ -304,9 +457,20 @@ impl Store {
         clock: Clock,
         writer: Writer,
     ) -> io::Result<()> {
-        if policy.limit == 0 {
-            return Ok(());
-        }
+        self.record_if(account, policy, outcome, clock, writer, || true)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn record_if(
+        &self,
+        account: &Account,
+        policy: Policy,
+        outcome: &irlume_auth::Outcome,
+        clock: Clock,
+        writer: Writer,
+        active: impl Fn() -> bool,
+    ) -> io::Result<()> {
         // Capture retryability and account strikes are separate decisions:
         // setup failures are terminal but must not spend or replenish history.
         // Keep this exhaustive so every new outcome needs an accounting choice.
@@ -334,6 +498,15 @@ impl Store {
         let dir = self.lock()?;
         let mut record = self.read(&dir, account)?;
         if outcome.granted {
+            // Lock acquisition and durable read may block. Revalidate after
+            // them and before replenishing history. Atomic persistence can
+            // itself cross expiry; callers must still gate response admission.
+            if !active() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "authentication no longer eligible",
+                ));
+            }
             record.strikes = 0;
             record.cooldown = None;
         } else if record.cooldown.is_none() {
@@ -343,6 +516,124 @@ impl Store {
             }
         }
         self.commit(&dir, &record, writer)
+    }
+}
+
+/// A durable account-exclusive reservation. Drop retains an ambiguous charge.
+pub(crate) struct FaceAttempt {
+    store: Store,
+    account: Account,
+    policy: Policy,
+    clock: Clock,
+    writer: Writer,
+    _operation: RetryLock,
+}
+
+impl FaceAttempt {
+    pub(crate) fn for_user(user: &str) -> Result<Self, &'static str> {
+        let result = account(user).and_then(|a| {
+            Self::begin(
+                production_store()?,
+                a,
+                Policy::configured(),
+                linux_clock,
+                write_atomic_reporting,
+            )
+        });
+        match result {
+            Ok(Some(attempt)) => Ok(attempt),
+            Ok(None) => Err(LIMITED),
+            Err(_) => Err(UNAVAILABLE),
+        }
+    }
+
+    fn begin(
+        store: Store,
+        account: Account,
+        policy: Policy,
+        clock: Clock,
+        writer: Writer,
+    ) -> io::Result<Option<Self>> {
+        let operation = store.operation(&account)?;
+        if store.check(&account, policy, clock, writer)? {
+            return Ok(None);
+        }
+        let dir = store.lock()?;
+        let mut record = store.read(&dir, &account)?;
+        if record.budget.is_none() {
+            // Prospective epoch only; v1 cannot reconstruct erased history.
+            record.initialize_budget();
+        }
+        let budget = record.budget.as_mut().ok_or_else(invalid)?;
+        if budget.unsuccessful_requests >= FACE_LIMIT {
+            return Ok(None);
+        }
+        budget.unsuccessful_requests = budget
+            .unsuccessful_requests
+            .checked_add(1)
+            .ok_or_else(invalid)?;
+        budget.pending = true;
+        store.commit(&dir, &record, writer)?;
+        drop(dir);
+        Ok(Some(Self {
+            store,
+            account,
+            policy,
+            clock,
+            writer,
+            _operation: operation,
+        }))
+    }
+
+    pub(crate) fn denied(self, outcome: &irlume_auth::Outcome) -> Result<(), &'static str> {
+        self.denied_inner(outcome).map_err(|_| UNAVAILABLE)
+    }
+
+    fn denied_inner(&self, outcome: &irlume_auth::Outcome) -> io::Result<()> {
+        if outcome.granted {
+            return Err(invalid());
+        }
+        let dir = self.store.lock()?;
+        let mut record = self.store.read(&dir, &self.account)?;
+        let budget = record.budget.as_mut().ok_or_else(invalid)?;
+        if !budget.pending {
+            return Err(invalid());
+        }
+        budget.pending = false;
+        use irlume_auth::OutcomeKind;
+        match outcome.kind {
+            OutcomeKind::NoFace
+            | OutcomeKind::Uncertain
+            | OutcomeKind::SpoofNoIrFace
+            | OutcomeKind::SetupUnavailable => (),
+            OutcomeKind::Granted
+            | OutcomeKind::Spoof
+            | OutcomeKind::BelowThreshold
+            | OutcomeKind::DeadlineExpired
+            | OutcomeKind::RuntimeUnavailable
+            | OutcomeKind::OtherDeny => {
+                let now = (self.clock)()?;
+                if !valid_boot(&now.boot) {
+                    return Err(invalid());
+                }
+                record.strike(self.policy, &now)?;
+            }
+        }
+        self.store.commit(&dir, &record, self.writer)
+    }
+
+    /// Called only after the daemon admitted and wrote the complete grant.
+    pub(crate) fn delivered(self) -> Result<(), &'static str> {
+        let reset = || -> io::Result<()> {
+            let dir = self.store.lock()?;
+            let record = self.store.read(&dir, &self.account)?;
+            if !record.budget.as_ref().is_some_and(|b| b.pending) {
+                return Err(invalid());
+            }
+            self.store
+                .commit(&dir, &Record::reset(&self.account), self.writer)
+        };
+        reset().map_err(|_| UNAVAILABLE)
     }
 }
 
@@ -390,30 +681,27 @@ fn production_store() -> io::Result<Store> {
     })
 }
 
-pub(crate) fn check(user: &str) -> Result<(), &'static str> {
-    let policy = Policy::configured();
-    if policy.limit == 0 {
-        return Ok(());
-    }
-    let result = account(user)
-        .and_then(|a| production_store()?.check(&a, policy, linux_clock, write_atomic_reporting));
-    match result {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(LIMITED),
-        Err(e) => {
-            eprintln!("irlumed: face retry preflight failed: {e}");
-            Err(UNAVAILABLE)
-        }
-    }
+#[cfg(test)]
+pub(crate) fn record(user: &str, outcome: &irlume_auth::Outcome) -> Result<(), &'static str> {
+    record_if(user, outcome, || true)
 }
 
-pub(crate) fn record(user: &str, outcome: &irlume_auth::Outcome) -> Result<(), &'static str> {
+#[cfg(test)]
+pub(crate) fn record_if(
+    user: &str,
+    outcome: &irlume_auth::Outcome,
+    active: impl Fn() -> bool,
+) -> Result<(), &'static str> {
     let policy = Policy::configured();
-    if policy.limit == 0 {
-        return Ok(());
-    }
     let result = account(user).and_then(|a| {
-        production_store()?.record(&a, policy, outcome, linux_clock, write_atomic_reporting)
+        production_store()?.record_if(
+            &a,
+            policy,
+            outcome,
+            linux_clock,
+            write_atomic_reporting,
+            active,
+        )
     });
     result.map_err(|e| {
         eprintln!("irlumed: face retry recording failed: {e}");

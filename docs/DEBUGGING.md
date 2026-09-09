@@ -103,8 +103,10 @@ walking up), ~5 seconds for `sudo`/`su` (you're already at the terminal, so it
 drops to the password prompt quickly). Only presence-class failures retry (no
 face, off-angle, or the transient "RGB face / no IR face" a user makes while
 settling); a below-threshold match or a real spoof verdict settles immediately.
-`IRLUME_GRACE_MS` on the daemon overrides both windows; `0` restores the old
-one-shot behavior.
+`IRLUME_GRACE_MS` on the daemon accepts 0–60,000 milliseconds and overrides
+both windows; `0` restores the old one-shot behavior. Malformed or out-of-range
+values use the normal service window, so an accidental excessive value cannot
+indefinitely postpone password fallback.
 
 When grouped authentication expires before complete evidence is accepted, its
 final situation is `timed out`. PAM says "authentication timed out; use your

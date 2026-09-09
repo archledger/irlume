@@ -91,8 +91,11 @@ pub fn classify(req: &Request) -> Class {
         // serves from the worker with the other TPM users.
         Ping
         | Health
+        | FaceSensorStatus { user: None }
         | HasSealedPassword { .. }
         | RecoveryStatus { .. }
+        | RetryStatus { .. }
+        | RetryReset { .. } // connection-only operation; never a camera job
         | ListProfiles { .. }
         | SupportSnapshot { .. }
         // Served directly by its connection thread before this classification
@@ -143,7 +146,8 @@ pub fn classify(req: &Request) -> Class {
         // `Class::Status` gives: the TPM executes one command at a time, so
         // anything that issues one serves from the worker with the other TPM
         // users instead of racing them from a connection thread.
-        SealPassword { .. }
+        FaceSensorStatus { user: Some(_) }
+        | SealPassword { .. }
         | KeyringInfo { .. }
         | ForgetPassword { .. }
         | ReleaseTokenForDisarm { .. }
@@ -203,11 +207,18 @@ impl Refusal {
 ///
 /// Enrolment captures many scans and may retry each one. The boundary between
 /// two whole captures is where stopping is safe, and it is the only place this
-/// is read. The token says "an authentication is waiting"; what it never does is
-/// interrupt a capture already inside V4L2 or an inference session, or fire
-/// while a profile is half-written.
+/// is honored. A scheduling yield is separate from the current client leaving:
+/// queued authentication must not interrupt running authentication, while a
+/// departed client's own request must stop. Neither interrupts a capture inside
+/// V4L2 or an inference session, or fires while a profile is half-written.
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken(Arc<StopRequests>);
+
+#[derive(Default)]
+struct StopRequests {
+    yield_requested: AtomicBool,
+    cancel_requested: AtomicBool,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -216,18 +227,29 @@ impl CancelToken {
 
     /// Ask the running long operation to stop at its next safe boundary.
     pub fn request_stop(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.yield_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// The current client has left. Unlike scheduling preemption, this also
+    /// stops authentication. The caller must hold that job's ownership guard.
+    pub fn request_cancel(&self) {
+        self.0.cancel_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.0.cancel_requested.load(Ordering::SeqCst)
     }
 
     /// True once a stop has been asked for.
     pub fn stop_requested(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.yield_requested.load(Ordering::SeqCst) || self.cancel_requested()
     }
 
     /// Clear the signal before the worker starts its next operation, so the one
     /// that yielded does not hand its cancellation to the one that follows.
     pub fn reset(&self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.yield_requested.store(false, Ordering::SeqCst);
+        self.0.cancel_requested.store(false, Ordering::SeqCst);
     }
 }
 
@@ -482,6 +504,10 @@ mod tests {
             token.stop_requested(),
             "the enrolment must learn an authentication is waiting"
         );
+        assert!(
+            !token.cancel_requested(),
+            "queued auth is not client cancellation"
+        );
         a.finish(job.class, job.uid);
         let next = a.take().unwrap();
         assert_eq!(next.payload, "login");
@@ -597,6 +623,8 @@ mod tests {
                 kind: None,
                 user: "u".into(),
                 password: SecretBytes::new(vec![1u8]),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             }),
             Class::Plain
         );
@@ -627,6 +655,8 @@ mod tests {
             classify(&Request::ResealPassword {
                 user: "u".into(),
                 password: irlume_common::SecretBytes::new(vec![1u8]),
+                wallet_salt: None,
+                wallet_salt_checked: true,
             }),
             Class::Plain
         );

@@ -8,7 +8,16 @@ license.workspace = true
 # embed + liveness gate -> match. Used by both the CLI and the irlumed daemon so
 # the security-critical pipeline lives in exactly one place.
 
+[features]
+default = []
+ir-only-evaluation = ["dep:libc", "irlume-camera/capture-timing"]
+
+[[example]]
+name = "ir_only_evaluation"
+required-features = ["ir-only-evaluation"]
+
 [dependencies]
+libc = { workspace = true, optional = true }
 sha2.workspace = true
 irlume-common.workspace = true
 irlume-camera.workspace = true
@@ -19,3 +28,7 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "ir_recorded_pad"
+required-features = ["ir-only-evaluation"]

@@ -240,6 +240,12 @@ jobs:
           python3 scripts/test-package-upgrade-harness.py
           python3 scripts/test-check-upgrade-auth.py
 
+      - name: Package service hook and state preservation regressions
+        run: |
+          sudo apt-get install -y --no-install-recommends pacman-package-manager
+          python3 scripts/test-package-service-hooks.py
+          python3 scripts/test-check-upgrade-service-state.py
+
       - name: test (TPM-gated, against swtpm)
         env:
           IRLUME_TCTI: swtpm:host=127.0.0.1,port=2321

@@ -136,6 +136,9 @@ profile irlumed /usr/local/bin/irlumed {
   /var/lib/ r,
   /proc/sys/kernel/random/boot_id r,
   /var/lib/irlume/retry/ rwk,
+  # Per-account operation locks serialize face requests and retry recovery;
+  # the directory lock above does not grant flock on these regular files.
+  /var/lib/irlume/retry/*.operation rwk,
   /var/lib/irlume/ rw,
   /var/lib/irlume/** rw,
 

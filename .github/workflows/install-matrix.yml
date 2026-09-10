@@ -122,13 +122,18 @@ jobs:
             --env CARGO_TARGET_DIR=/tmp/irlume-arch-target \
             docker.io/library/archlinux@sha256:592e11bd99ab579f933a0cb77a8f66e2f3ae57f5eafacf13aea44a6e98ef21ae \
             bash -euc '
+              pacman-key --init
               pacman -Syu --noconfirm --needed \
                 base-devel git rust clang pam tpm2-tss curl ca-certificates bubblewrap
-              git config --global --add safe.directory /src
+              # Permission and permanent-credential-drop tests model a login
+              # account. UID 0 bypasses DAC and is deliberately refused as a
+              # wallet target. Namespace-root CLI fixtures still run via bwrap.
+              useradd --create-home --uid 1000 irlume-test
+              runuser -u irlume-test -- git config --global --add safe.directory /src
               cat /proc/self/uid_map
               grep -E "^(CapEff|CapBnd|Seccomp):" /proc/self/status
               if [ -r /proc/self/attr/current ]; then cat /proc/self/attr/current; fi
-              bash scripts/ci-bubblewrap.sh --check
+              runuser -u irlume-test -- bash scripts/ci-bubblewrap.sh --check
 
               ver=1.28.1
               cd /tmp
@@ -136,8 +141,8 @@ jobs:
               tar xzf "onnxruntime-linux-x64-${ver}.tgz"
               export ORT_DYLIB_PATH="/tmp/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so"
               cd /src
-              cargo build --workspace --locked
-              ./scripts/run-tests-guarded.sh --min 650 \
-                --require auth_sensor_and_consent_concurrent_writes_preserve_both_policies,auth_sensor_owner_change_requires_ack_and_preserves_unrelated_settings,selinux_status_classifies_module_state_from_probe_output \
+              runuser -u irlume-test -- cargo build --workspace --locked
+              runuser -u irlume-test -- ./scripts/run-tests-guarded.sh --min 650 \
+                --require auth_sensor_and_consent_concurrent_writes_preserve_both_policies,auth_sensor_owner_change_requires_ack_and_preserves_unrelated_settings,selinux_status_classifies_module_state_from_probe_output,credential_verifier_rejects_retained_or_wrong_identity,salt_reader_boundaries_run_in_fresh_processes \
                 -- cargo test --workspace --locked
             '

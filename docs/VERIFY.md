@@ -23,8 +23,9 @@ sudo head -c 200 /var/lib/irlume/*.json
 sudo stat -c '%a %U:%G' /var/lib/irlume/*.json
 ```
 
-You will see `{"version":2,"enc":"<base64 ciphertext>"...}` and mode `600
-root:root`. The biometric data is an encrypted blob, not readable embeddings,
+New encrypted writes use version `3`, with a public `key_id` and an `enc`
+ciphertext field; legacy encrypted version `2` remains readable. Expect mode
+`600 root:root`. The biometric data is an encrypted blob, not readable embeddings,
 and no image is ever written.
 
 On a machine **without** a TPM the daemon stores the same embeddings root-only

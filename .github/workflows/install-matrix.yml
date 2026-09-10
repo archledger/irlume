@@ -84,24 +84,15 @@ jobs:
     name: build + test on Arch (rolling toolchain)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    container:
-      # Pinned by digest, not `:latest`: a mutable tag means the image can change
-      # under us between runs, and a compromised push would execute here. This
-      # does NOT weaken the "rolling toolchain" purpose of the job, because the
-      # first step runs a full `pacman -Syu`, so the packages under test are
-      # current regardless of how old the base layer is. Refresh the digest when
-      # the base drifts far enough that a full upgrade gets unwieldy.
-      # archlinux:latest as of 2026-07-20.
-      image: archlinux@sha256:592e11bd99ab579f933a0cb77a8f66e2f3ae57f5eafacf13aea44a6e98ef21ae
+    # The CLI fixtures need nested user/network/mount namespaces. Docker's
+    # job-container defaults prohibit those operations. Use rootless Podman,
+    # as the Debian builder does, with its default security settings: no added
+    # host capabilities, privileged container or security-opt overrides.
+    # Rootless Podman is a different boundary from Docker's AppArmor profile;
+    # the full in-container probe below must pass before compiling anything.
     steps:
-      - name: Install toolchain and system deps
-        run: |
-          pacman -Syu --noconfirm --needed \
-            base-devel git rust clang pam tpm2-tss curl ca-certificates bubblewrap
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
       - name: Cache model weights
@@ -111,27 +102,38 @@ jobs:
           key: models-${{ hashFiles('models/SHA256SUMS') }}
 
       - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
+
+      - name: Build and test in rootless Arch
         run: |
-          # Container job: checkout writes safe.directory into a temporary
-          # HOME, so later steps' git sees "dubious ownership" and git
-          # operations report "Not in a Git repository" (first dispatch failed
-          # exactly here). Re-assert it in this step's real HOME.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          bash scripts/fetch-models.sh
+          set -euo pipefail
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+          podman version
+          podman info --format '{{json .Host.Security}}'
+          # Source is read-only. Build/cache/test state stays in the disposable
+          # container; no host devices, credentials or runtime sockets are bound.
+          # The digest is the same reviewed Arch base as the previous lane.
+          podman run --rm \
+            --volume "$GITHUB_WORKSPACE:/src:ro" --workdir /src \
+            --env CARGO_TARGET_DIR=/tmp/irlume-arch-target \
+            docker.io/library/archlinux@sha256:592e11bd99ab579f933a0cb77a8f66e2f3ae57f5eafacf13aea44a6e98ef21ae \
+            bash -euc '
+              pacman -Syu --noconfirm --needed \
+                base-devel git rust clang pam tpm2-tss curl ca-certificates bubblewrap
+              git config --global --add safe.directory /src
+              cat /proc/self/uid_map
+              grep -E "^(CapEff|CapBnd|Seccomp):" /proc/self/status
+              if [ -r /proc/self/attr/current ]; then cat /proc/self/attr/current; fi
+              bash scripts/ci-bubblewrap.sh --check
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
-        run: |
-          ver=1.28.1
-          curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
-          tar xzf "onnxruntime-linux-x64-${ver}.tgz"
-          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
-
-      - name: build
-        run: cargo build --workspace --locked
-
-      # Guarded because `cargo test` exits 0 even when it discovers no tests at
-      # all. The floor sits well below the real count (707 at 0.7.0).
-      - name: test
-        run: ./scripts/run-tests-guarded.sh --min 650 -- cargo test --workspace --locked
+              ver=1.28.1
+              cd /tmp
+              curl -fsSLO "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/onnxruntime-linux-x64-${ver}.tgz"
+              tar xzf "onnxruntime-linux-x64-${ver}.tgz"
+              export ORT_DYLIB_PATH="/tmp/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so"
+              cd /src
+              cargo build --workspace --locked
+              ./scripts/run-tests-guarded.sh --min 650 \
+                --require auth_sensor_and_consent_concurrent_writes_preserve_both_policies,auth_sensor_owner_change_requires_ack_and_preserves_unrelated_settings,selinux_status_classifies_module_state_from_probe_output \
+                -- cargo test --workspace --locked
+            '

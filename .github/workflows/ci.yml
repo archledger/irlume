@@ -523,7 +523,9 @@ jobs:
         run: ./scripts/ir-node-from-doctor.sh --self-test
 
       - name: nightly IR capture guards (fixtures only, no hardware or sudo)
-        run: python3 scripts/test-nightly-ir-capture.py
+        run: |
+          python3 scripts/test-nightly-ir-capture.py
+          python3 scripts/ci/test-irlume-ci-capture.py
 
       - name: systemd-analyze verify (unit syntax)
         run: |

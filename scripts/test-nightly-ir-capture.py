@@ -38,6 +38,7 @@ class NightlyCaptureTests(unittest.TestCase):
         (self.root / 'scripts').mkdir()
         shutil.copy(ROOT / 'scripts/ir-node-from-doctor.sh', self.root / 'scripts')
         self.write(self.bin / 'cargo', '#!/bin/bash\nexit 0\n')
+        self.write(self.bin / 'git', '#!/bin/bash\nprintf \"%s\\n\" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')
         self.write(self.bin / 'sudo', '''#!/bin/bash
 set -eu
 [ "$1" = -n ] || exit 90
@@ -77,7 +78,7 @@ fi
                         CARGO_TARGET_DIR=str(self.target), TMPDIR=str(self.root),
                         CALLS=str(self.root / 'calls'))
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
-                    'SPREAD', 'NO_MARKER']:
+                    'SPREAD', 'NO_MARKER', 'HELPER_EXIT', 'REJECT_BUILD']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -85,9 +86,52 @@ fi
         path.chmod(0o755)
 
     def run_step(self, **env):
-        return subprocess.run(['/bin/bash', '-e', '-c', camera_step()],
+        body = camera_step().replace('/usr/local/libexec/irlume-ci-capture', str(self.root / 'capture-helper'))
+        return subprocess.run(['/bin/bash', '-e', '-c', body],
                               cwd=self.root, env=dict(self.env, **env),
                               capture_output=True, text=True, timeout=10)
+
+    def install_helper(self):
+        self.write(self.root / 'capture-helper', '''#!/bin/bash
+set -eu
+[ "${FIXTURE_PRIVILEGED:-0}" = 1 ] || exit 93
+export IRLUME_LOG_EMITTER_WRITES=1
+[ "$1" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ] || exit 94
+if [ "${REJECT_BUILD:-0}" = 1 ]; then
+  echo 'fixture: build is not approved' >&2
+  exit 1
+fi
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+"$CARGO_TARGET_DIR/debug/examples/burst_dump" "$out" "$2" 6 >/dev/null
+tar -C "$out" -cf - .
+exit "${HELPER_EXIT:-0}"
+''')
+
+    def test_installed_helper_preserves_all_capture_gates(self):
+        self.install_helper()
+        result = self.run_step()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'calls').read_text(), '1\n')
+        self.assertIn('captured 6 frames', result.stdout)
+        self.assertIn('mean spread: 50.0', result.stdout)
+        for env in [dict(NO_MARKER='1'), dict(FRAMES='3'), dict(SPREAD='0')]:
+            with self.subTest(env=env):
+                result = self.run_step(**env)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_helper_failure_cannot_hide_behind_successful_archive_extraction(self):
+        self.install_helper()
+        result = self.run_step(HELPER_EXIT='23')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('privileged IR burst failed', result.stdout)
+
+    def test_unapproved_helper_build_never_captures(self):
+        self.install_helper()
+        result = self.run_step(REJECT_BUILD='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'calls').exists())
+        self.assertIn('build is not approved', result.stdout + result.stderr)
 
     def test_privileged_hardware_job_is_restricted_to_main(self):
         workflow = (ROOT / '.github/workflows/hardware-suite.yml').read_text()

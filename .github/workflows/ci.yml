@@ -527,6 +527,9 @@ jobs:
           python3 scripts/test-nightly-ir-capture.py
           python3 scripts/ci/test-irlume-ci-capture.py
 
+      - name: nightly coverage setup (fixtures only, no install or hardware)
+        run: python3 scripts/ci/test-setup-coverage-tools.py
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

@@ -115,3 +115,31 @@ and helper/artifact paths after identity checks, or restores the previous
 approved pair. It does not change product packages, enrollment, PAM, runner
 services or runner labels. Keep failed qualification evidence and report the
 remaining hardware gate accurately.
+
+
+## Nightly coverage prerequisites
+
+The coverage job prepares its own `cargo-llvm-cov` **0.9.1** using
+`setup-coverage-tools.sh` before model fetch or loopback-camera producers start.
+It builds with `cargo install --locked` into a unique directory under
+`RUNNER_TEMP`, verifies the installed version, and exports its absolute path as
+`IRLUME_COVERAGE_BIN`. Every coverage lane invokes that program directly so a
+missing or older runner-user installation cannot change the tool used. The
+runner cleans the temporary directory after the job; setup requires no sudo and
+does not replace tools in the runner's Cargo home.
+
+Both eligible runners use distribution Rust. Setup locates system `llvm-cov`
+and `llvm-profdata`, checks that their LLVM major versions match `rustc -vV`,
+and exports `LLVM_COV` and `LLVM_PROFDATA`. Missing tools, an incompatible LLVM,
+a failed install, or an unexpected coverage-tool version fails setup before
+any test capture. The version check is a prerequisite check; actual profile
+compatibility and the existing 75% line floor are still verified by coverage.
+See the [pinned tool's upstream environment contract](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.9.1#environment-variables).
+
+`python3 scripts/ci/test-setup-coverage-tools.py` exercises fresh and previously
+provisioned runners, incompatible/missing LLVM, failed installation and wrong
+tool versions using executable fixtures. It neither installs real tools nor
+opens hardware. For a version update, also run a real tiny instrumented Rust
+test and `report --summary-only --fail-under-lines 75` as each runner account
+with the exact new setup, before qualifying the full nightly again. Keep the
+shared capability selectors, named-test guards and coverage threshold intact.

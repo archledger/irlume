@@ -308,6 +308,9 @@ in
         # native default.
         IRLUME_MESH_MODEL = "${models}/face_landmark.onnx";
         IRLUME_BLAZE_MODEL = "${models}/blaze_face_short_range.onnx";
+        # PAD cues are shipped in the package, not the daemon's /etc defaults.
+        IRLUME_VIT_PAD_MODEL = "${models}/liveness_vit.onnx";
+        IRLUME_PAD_IR_MODEL = "${models}/flir.onnx";
         IRLUME_SOCKET = "/run/irlume.sock";
         IRLUME_RGB_DEVICE = cfg.rgbDevice;
         IRLUME_IR_DEVICE = cfg.irDevice;

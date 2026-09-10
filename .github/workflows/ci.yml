@@ -235,6 +235,11 @@ jobs:
       - name: Disposable TPM wrapper lifecycle (no hardware)
         run: python3 scripts/test-with-swtpm.py
 
+      - name: Upgrade harness regressions (no package or authentication changes)
+        run: |
+          python3 scripts/test-package-upgrade-harness.py
+          python3 scripts/test-check-upgrade-auth.py
+
       - name: test (TPM-gated, against swtpm)
         env:
           IRLUME_TCTI: swtpm:host=127.0.0.1,port=2321

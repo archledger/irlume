@@ -14,6 +14,12 @@ upstream_tag_template: "v{version}"
 # Anchored with re.match, so a tag not starting with vN.N.N is not a candidate.
 upstream_tag_include: 'v\d+\.\d+\.\d+$'
 
+# Read the checked-out spec version for PR candidates; git describe otherwise
+# keeps the latest published version even after the workspace version changes.
+actions:
+  get-current-version:
+    - grep -oP '^Version:\s+\K\S+' packaging/fedora/irlume.spec
+
 jobs:
   - job: copr_build
     trigger: release

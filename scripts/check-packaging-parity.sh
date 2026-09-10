@@ -240,6 +240,13 @@ for v in "$spec_v" "$arch_v" "$nfpm_v"; do
     fail=1
   fi
 done
+# Packit otherwise uses the latest release tag and silently relabels a newer
+# candidate as that old version. Require the documented spec-version action;
+# the spec/Cargo comparison above then covers the value Packit consumes.
+if ! grep -Fq "    - grep -oP '^Version:\\s+\\K\\S+' packaging/fedora/irlume.spec" .packit.yaml; then
+  echo "  ERROR: Packit must obtain its candidate version from the specfile"
+  fail=1
+fi
 # The PPA and Nix derive their version from Cargo.toml rather than repeating it,
 # which is why they are not compared here. Assert that, so a future edit that
 # hardcodes one starts being checked instead of silently drifting.
@@ -395,6 +402,8 @@ APPARMOR_RUNTIME_RULES=(
   "/var/lib/irlume/ir-emitter-stream/*.lock rwk,"
   "/etc/irlume/*.lock rwk,"
   "/var/lib/irlume/capture-qualifications/*.lock rwk,"
+  "/var/lib/irlume/retry/ rwk,"
+  "/var/lib/irlume/retry/*.operation rwk,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   for rule in "${APPARMOR_RUNTIME_RULES[@]}"; do

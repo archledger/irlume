@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.11.3
+Version:        0.12.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 

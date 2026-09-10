@@ -71,14 +71,20 @@ if [ "${FIXTURE_PRIVILEGED:-0}" != 1 ]; then
   # The actual failure: successful raw capture, but no managed emitter write.
   echo 'irlume: could not check interrupted emitter setup: lock: Permission denied' >&2
 elif [ "${NO_MARKER:-0}" != 1 ]; then
-  echo 'irlume: capture emitter write completed' >&2
+  case "${PROOF:-write}" in
+    write) echo 'irlume: capture emitter write completed' >&2 ;;
+    default) echo 'irlume: capture emitter device default verified' >&2 ;;
+    held) echo 'irlume: capture emitter already held the requested value' >&2 ;;
+    both) printf '%s\\n' 'irlume: capture emitter write completed' 'irlume: capture emitter device default verified' >&2 ;;
+    partial) echo 'prefix irlume: capture emitter device default verified' >&2 ;;
+  esac
 fi
 ''')
         self.env = dict(os.environ, PATH=f'{self.bin}:/usr/bin:/bin',
                         CARGO_TARGET_DIR=str(self.target), TMPDIR=str(self.root),
                         CALLS=str(self.root / 'calls'))
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
-                    'SPREAD', 'NO_MARKER', 'HELPER_EXIT', 'REJECT_BUILD']:
+                    'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -132,6 +138,23 @@ exit "${HELPER_EXIT:-0}"
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / 'calls').exists())
         self.assertIn('build is not approved', result.stdout + result.stderr)
+
+    def test_verified_default_keeps_frame_and_spread_gates(self):
+        for helper in [False, True]:
+            if helper:
+                self.install_helper()
+            with self.subTest(helper=helper):
+                result = self.run_step(PROOF='default')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('device default verified', result.stdout)
+                for env in [dict(FRAMES='3'), dict(SPREAD='0')]:
+                    result = self.run_step(PROOF='default', **env)
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_held_partial_or_ambiguous_proof_is_rejected(self):
+        for proof in ['held', 'both', 'partial']:
+            with self.subTest(proof=proof):
+                self.assertNotEqual(self.run_step(PROOF=proof).returncode, 0)
 
     def test_privileged_hardware_job_is_restricted_to_main(self):
         workflow = (ROOT / '.github/workflows/hardware-suite.yml').read_text()

@@ -86,8 +86,9 @@ jobs:
     timeout-minutes: 60
     # The CLI fixtures need nested user/network/mount namespaces. Docker's
     # job-container defaults prohibit those operations. Use rootless Podman,
-    # as the Debian builder does, with its default security settings: no added
-    # host capabilities, privileged container or security-opt overrides.
+    # as the Debian builder does, retaining its default capabilities and seccomp.
+    # Only /proc masks are removed so the kernel permits a nested proc mount;
+    # /sys masks remain. No host capabilities or privileged container.
     # Rootless Podman is a different boundary from Docker's AppArmor profile;
     # the full in-container probe below must pass before compiling anything.
     steps:
@@ -113,7 +114,10 @@ jobs:
           # Source is read-only. Build/cache/test state stays in the disposable
           # container; no host devices, credentials or runtime sockets are bound.
           # The digest is the same reviewed Arch base as the previous lane.
-          podman run --rm \
+          # Kernel mount_too_revealing rejects a fresh proc mount when the
+          # parent proc has masked children, even inside a new PID namespace.
+          # This affects only the rootless container, not the host proc mount.
+          podman run --rm --security-opt 'unmask=/proc/*' \
             --volume "$GITHUB_WORKSPACE:/src:ro" --workdir /src \
             --env CARGO_TARGET_DIR=/tmp/irlume-arch-target \
             docker.io/library/archlinux@sha256:592e11bd99ab579f933a0cb77a8f66e2f3ae57f5eafacf13aea44a6e98ef21ae \

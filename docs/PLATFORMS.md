@@ -21,6 +21,14 @@ Every lane is x86_64 only today (Copr chroots, PPA, `.deb`, and the AUR
 `arch=` line all say so). No aarch64 build exists yet; the blocker is an
 arm64 onnxruntime + rebuild validation, not anything in the code.
 
+## Release upgrade validation
+
+Package builds and clean-install checks do not establish upgrade or rollback
+behavior. Follow [Package upgrade and rollback validation](UPGRADE-VALIDATION.md)
+for the disposable Debian/Ubuntu, Arch, and Fedora guest procedure, authentication
+checks, recovery steps, and evidence limits. A passing package transaction does
+not extend the hardware or login-manager qualification described below.
+
 ## Validated on real hardware
 
 | Platform | Machine / camera | Tier | What was actually exercised |

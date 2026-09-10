@@ -11613,6 +11613,9 @@ mod tests {
                 .any(|(_, m)| m.contains("scan added to 'Alice'")),
             "the kept scan must be acknowledged"
         );
+        // The terminal path refreshes daemon state. Finish those workers
+        // before releasing the socket guard to the next test.
+        drain_loads(&mut app);
     }
 
     #[test]
@@ -11655,6 +11658,9 @@ mod tests {
         app.on_key(KeyCode::Esc);
         assert!(app.enroll_merge.is_none(), "Esc declines");
         assert!(app.op.is_none());
+        // The terminal path refreshes daemon state. Finish those workers
+        // before releasing the socket guard to the next test.
+        drain_loads(&mut app);
     }
 
     // ---- enroll worker messages & the enroll key gate ----------------------
@@ -11717,6 +11723,9 @@ mod tests {
         assert!(app.enroll.is_none());
         let err = app.error.as_ref().expect("a failed scan must surface");
         assert_eq!(err, "Enrollment failed: camera busy");
+        // The terminal path refreshes daemon state. Finish those workers
+        // before releasing the socket guard to the next test.
+        drain_loads(&mut app);
     }
 
     /// Regression for #309: a framing guide that stops answering must not
@@ -11834,6 +11843,7 @@ mod tests {
 
     #[test]
     fn enroll_esc_cancels_and_signals_the_worker_to_stop() {
+        let _sock = dead_socket();
         let mut app = test_app();
         let (_tx, enroll) = fake_enroll(0, 4);
         let stop = enroll.stop.clone();
@@ -11853,6 +11863,7 @@ mod tests {
                 .any(|(_, m)| m.contains("enrollment cancelled")),
             "the cancel must be logged"
         );
+        drain_loads(&mut app);
     }
 
     // ---- rendering ---------------------------------------------------------
@@ -14109,6 +14120,7 @@ mod tests {
     /// natural next move.
     #[test]
     fn cancelling_an_enrolment_re_reads_the_profiles() {
+        let _sock = dead_socket();
         let mut app = test_app();
         let (_tx, rx) = mpsc::channel();
         app.enroll = Some(EnrollUi {
@@ -14131,6 +14143,7 @@ mod tests {
             app.profiles_load.is_some(),
             "and asks the daemon what the profile list is now"
         );
+        drain_loads(&mut app);
     }
 
     /// With the daemon down and nothing probed, the Repair tab must say it cannot

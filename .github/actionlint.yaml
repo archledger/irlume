@@ -1,4 +1,4 @@
-# Custom labels of the self-hosted runner fleet (archhost), so actionlint can
+# Custom labels of the self-hosted runner fleet (minihost and archhost), so actionlint can
 # validate runs-on lines instead of flagging them as unknown.
 self-hosted-runner:
   labels:

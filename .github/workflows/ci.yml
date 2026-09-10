@@ -34,14 +34,15 @@ concurrency:
 
 # Runner routing. irlume is a PUBLIC repo, so GitHub-hosted runners are free
 # and unmetered, and hosted jobs run in PARALLEL rather than queueing behind
-# each other on two machines. The rule is capability, not availability: a job
-# touches the maintainer's hardware only when it needs something that
-# hardware has. Every job in THIS file is hosted, which is what lets it stay
-# pull_request-triggered so fork PRs get the full required gate.
+# each other on two machines. Capability selects eligible runners; an available
+# eligible runner accepts each job. A job touches the maintainer's hardware
+# only when it needs something that hardware has. Every job in THIS file is
+# hosted, which lets it stay pull_request-triggered so fork PRs get the full
+# required gate.
 #
 # The hardware lanes live elsewhere and are push-triggered on purpose:
 #   hardware-checks.yml   real TPM + the pinned TFLite runtime, either machine
-#   hardware-suite.yml    the real IR camera, archhost only
+#   hardware-suite.yml    real IR camera + TPM, either capable machine
 #
 # Self-hosted runners are NOT an outage hedge: they still need the Actions
 # control plane to receive a job, and archhost's lane failed at "Set up job"
@@ -226,6 +227,9 @@ jobs:
 
       # --require names the set rather than counting it: renaming one of these
       # while adding another would leave the total intact and hide the loss.
+      - name: Disposable TPM wrapper lifecycle (no hardware)
+        run: python3 scripts/test-with-swtpm.py
+
       - name: test (TPM-gated, against swtpm)
         env:
           IRLUME_TCTI: swtpm:host=127.0.0.1,port=2321

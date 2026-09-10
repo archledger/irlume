@@ -143,3 +143,13 @@ opens hardware. For a version update, also run a real tiny instrumented Rust
 test and `report --summary-only --fail-under-lines 75` as each runner account
 with the exact new setup, before qualifying the full nightly again. Keep the
 shared capability selectors, named-test guards and coverage threshold intact.
+
+
+The CLI capture coverage lane requires all six supported command scenarios by
+name. The former seventh scenario exercised `meshprobe`, intentionally removed
+with eye challenges in PR #502; its stale numeric minimum survived that removal.
+`python3 scripts/ci/test-nightly-coverage-contract.py` executes the actual
+workflow guard: all supported scenarios must pass, and seven unrelated or
+substituted successes cannot hide any missing required scenario. It also checks
+zero selection and propagation of a failed test command. Retiring a supported
+command requires an explicit review of this named contract and its fixtures.

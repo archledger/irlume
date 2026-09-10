@@ -522,6 +522,9 @@ jobs:
       - name: doctor IR-node parser (the nightly hardware suite depends on it)
         run: ./scripts/ir-node-from-doctor.sh --self-test
 
+      - name: nightly IR capture guards (fixtures only, no hardware or sudo)
+        run: python3 scripts/test-nightly-ir-capture.py
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

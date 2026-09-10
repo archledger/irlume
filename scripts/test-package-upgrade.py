@@ -64,7 +64,9 @@ def no_symlinks(path):
 
 def admit_guest():
     require(os.geteuid() == 0, "root-required")
-    kind = read_command(["systemd-detect-virt", "--vm"])
+    # Unfiltered detection reports the innermost environment. --vm would hide
+    # a container inside QEMU and incorrectly admit its shared-kernel boundary.
+    kind = read_command(["systemd-detect-virt"])
     require(kind in {"qemu", "kvm"}, "qemu-kvm-required")
     no_symlinks(MARKER)
     require(MARKER.is_file(), "marker-missing")

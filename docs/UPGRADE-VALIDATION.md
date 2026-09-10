@@ -23,8 +23,9 @@ credential directories, or an SSH agent. Use an emulated TPM only if needed.
 Transfer public packages and reviewed scripts over the guest's dedicated access
 channel; keep host private keys outside the guest.
 
-The guard requires effective UID 0, `systemd-detect-virt --vm` reporting `qemu`
-or `kvm`, and an exact root-controlled marker. **The marker is the operator's
+The guard requires effective UID 0, unfiltered `systemd-detect-virt` reporting
+`qemu` or `kvm` as the innermost environment, and an exact root-controlled marker.
+**The marker is the operator's
 attestation; it cannot prove isolation or detect device passthrough.** Inspect
 the VM configuration before creating it. Containers and ordinary host execution
 are refused.

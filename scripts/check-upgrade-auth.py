@@ -70,7 +70,9 @@ def command(argv, *, input_text=None, capture=True, account=None):
 
 def admit_guest():
     require(os.geteuid() == 0, "root-required")
-    code, kind = command(["systemd-detect-virt", "--vm"])
+    # Unfiltered detection reports the innermost environment. --vm would hide
+    # a container inside QEMU and incorrectly admit its shared-kernel boundary.
+    code, kind = command(["systemd-detect-virt"])
     kind = kind.strip()
     require(code == 0 and kind in ("qemu", "kvm"), "qemu-kvm-required")
     try:

@@ -35,11 +35,30 @@ class AuthCheckerTests(unittest.TestCase):
         for kind in ("none", "docker", "lxc", "vmware", ""):
             with self.subTest(kind=kind), \
                     patch.object(auth.os, "geteuid", return_value=0), \
-                    patch.object(auth, "command", return_value=(0, kind)), \
+                    patch.object(auth, "command", return_value=(0, kind)) as command, \
                     patch.object(auth.os, "open") as read:
                 with self.assertRaisesRegex(auth.Failure, "qemu-kvm-required"):
                     auth.admit_guest()
                 read.assert_not_called()
+                command.assert_called_once_with(["systemd-detect-virt"])
+
+    def test_container_inside_qemu_refused_before_marker_or_mutation(self):
+        # Match real systemd behavior: --vm selects the outer VM even when
+        # unfiltered detection identifies the innermost container.
+        def detect(argv):
+            return 0, "qemu" if "--vm" in argv else "docker"
+
+        with patch.object(auth.os, "geteuid", return_value=0), \
+                patch.object(auth, "command", side_effect=detect) as command, \
+                patch.object(auth.os, "open") as marker_open, \
+                patch.object(auth, "run_stage") as run_stage:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(auth.main(["old-install"]), 1)
+            self.assertEqual(json.loads(output.getvalue())["error"], "qemu-kvm-required")
+            command.assert_called_once_with(["systemd-detect-virt"])
+            marker_open.assert_not_called()
+            run_stage.assert_not_called()
 
     def test_marker_must_be_exact_and_cannot_be_symlink(self):
         with tempfile.TemporaryDirectory() as temp:

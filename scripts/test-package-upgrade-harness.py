@@ -181,11 +181,32 @@ class HarnessTests(unittest.TestCase):
         for kind in ("none", "docker", "lxc", "vmware", ""):
             with self.subTest(kind=kind), \
                  patch.object(upgrade.os, "geteuid", return_value=0), \
-                 patch.object(upgrade, "read_command", return_value=kind), \
+                 patch.object(upgrade, "read_command", return_value=kind) as command, \
                  patch.object(Path, "read_bytes") as read:
                 with self.assertRaisesRegex(upgrade.Failure, "qemu-kvm-required"):
                     upgrade.admit_guest()
                 read.assert_not_called()
+                command.assert_called_once_with(["systemd-detect-virt"])
+
+    def test_container_inside_qemu_refused_before_marker_or_mutation(self):
+        # --vm hides this container and reports the outer QEMU machine.
+        def detect(argv):
+            return "qemu" if "--vm" in argv else "docker"
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(upgrade.os, "geteuid", return_value=0), \
+             patch.object(upgrade, "read_command", side_effect=detect) as command, \
+             patch.object(upgrade, "no_symlinks") as marker_check, \
+             patch.object(upgrade, "execute") as execute, \
+             patch.object(upgrade.sys, "stderr", io.StringIO()) as stderr:
+            output = Path(temp) / "result.json"
+            self.assertEqual(upgrade.main(["--old", "/old.deb", "--candidate", "/candidate.deb",
+                                           "--output", str(output)]), 2)
+            self.assertIn("qemu-kvm-required", stderr.getvalue())
+            command.assert_called_once_with(["systemd-detect-virt"])
+            marker_check.assert_not_called()
+            execute.assert_not_called()
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
     def test_marker_is_exact_and_not_a_symlink(self):
         with tempfile.TemporaryDirectory() as temp:

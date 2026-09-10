@@ -338,7 +338,11 @@ jobs:
             -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
             seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
           ./scripts/run-tests-guarded.sh --min 15 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
-          ./scripts/run-tests-guarded.sh --min 7 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          # meshprobe and its test were intentionally retired in #502. Require
+          # every remaining command scenario by name; unrelated passes cannot
+          # substitute for a missing one, as a numeric minimum would allow.
+          ./scripts/run-tests-guarded.sh --require loopback_capture_runs_detection_and_reports_no_face,loopback_liveness_probe_gates_a_faceless_feed_as_not_live,loopback_calcapture_writes_header_and_faceless_samples,loopback_padcapture_ir_only_records_faceless_attack_presentations,loopback_genuine_declines_stats_without_two_face_frames,loopback_suncal_analyzes_a_faceless_burst_dataset \
+            -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 5 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
           ./scripts/run-tests-guarded.sh --min 1 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
           ./scripts/run-tests-guarded.sh --min 16 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1

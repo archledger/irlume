@@ -84,20 +84,24 @@ sudo irlume fingerprint disable
 
 ## Canceling a scan that already started
 
-- **Type instead of confirming face.** Where irlume asks, typing picks the
+- **Type instead of confirming face.** With privileged confirmation enabled,
+  where irlume asks, typing picks the
   password path before the camera powers up: probing greeters (SDDM,
   plasmalogin style, COSMIC's on-demand mode) treat any typed characters as
   "password", and privileged prompts (`sudo`, polkit) treat anything other
   than the literal `yes` as "password". GNOME wires its greeter face-first
   (the camera checks once your account is selected), so there the way out is
   canceling or escaping the dialog; a typed password still wins afterwards.
-- **Press a key at the KDE lock screen.** KDE runs face as a parallel
-  biometric device there and cancels it natively the moment you type.
-- **Close or cancel whatever asked.** Escape on a greeter dialog, cancel on
-  a polkit prompt, Ctrl+C at a terminal `sudo`: when the asking process hangs
-  up its connection, the daemon notices within about a quarter second and
-  stops the capture cooperatively. The camera does not keep scanning for a
-  departed client.
+- **Desktop cancellation depends on the frontend.** Stock KDE installations do
+  not automatically provide a parallel face lane that stops on typing. The
+  development frontend integration is not enabled by this package; see
+  [desktop authentication boundaries](DESKTOP-AUTH.md).
+- **Close or cancel whatever asked.** Escape, a dialog's Cancel button, or
+  Ctrl+C can end the request when the frontend closes its PAM worker or socket.
+  Merely returning a cancellation error from a synchronous PAM conversation
+  does not interrupt a daemon request already in progress. The daemon checks
+  disconnects cooperatively; physical camera release also depends on the active
+  capture operation. There is no universal quarter-second stop guarantee.
 - **In `irlume tui`:** Esc cancels guided enrollment immediately; q or Esc
   backs out of a stalled identify or self-test instead of trapping you.
 - **If you just wait:** every scan window is bounded. The login/lock screen

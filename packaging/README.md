@@ -11,7 +11,7 @@ own recipe. Everything the daemon does at *runtime* stays capability-detected.
 |---|---|
 | `irlumed`, `irlume` | `/usr/bin/` |
 | `pam_irlume.so` | Fedora `/usr/lib64/security/` · Debian `/usr/lib/x86_64-linux-gnu/security/` · Arch `/usr/lib/security/` |
-| models (LFS, bundled) | `/usr/share/irlume/models/*.onnx` |
+| models (bundled) | `/usr/share/irlume/models/*.onnx` |
 | systemd units | `/usr/lib/systemd/system/irlumed.service` + `irlume-reconcile.path`/`.service` (self-heal watcher; all families incl. PPA enable the `.path`) |
 | LSM policy | Fedora SELinux module · Debian `apparmor/usr.bin.irlumed` (path-adjusted) · Arch none |
 
@@ -28,10 +28,16 @@ by the client change alone because the old daemon ignores the additive request
 fields and retains its former path read. Existing sealed envelopes and wallet
 files need no migration.
 
+The package also includes `/usr/libexec/irlume-password-verify`, the dedicated
+`/etc/pam.d/irlume-retry-reset` service, and enrollment/recovery polkit policies.
+Keep these matched to the daemon. Nix uses store paths and its module installs
+the PAM service. Before a release, follow the [candidate upgrade and rollback
+checklist](../docs/RELEASING.md); recipe parity alone does not validate installation.
+
 ## Per-family
 
 - **Fedora** (`fedora/irlume.spec` + `../.packit.yaml`): Packit builds in Copr
-  from signed GitHub tags. Bundles onnxruntime 1.24.4 (Source1 →
+  from signed GitHub tags. Bundles onnxruntime 1.28.1 (Source1 →
   `/usr/share/irlume/onnxruntime` + `ORT_DYLIB_PATH` drop-in); PAM to
   `/usr/lib64/security`; SELinux subpackage. Update path: `dnf upgrade` / Copr,
   driven by `irlume update`.

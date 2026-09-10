@@ -6599,7 +6599,7 @@ mod tests {
     /// re-lights the emitter from a config with no undo data behind it.
     #[test]
     fn a_visible_config_after_a_failed_save_keeps_the_record() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::fd::AsRawFd as _;
         let _lock = crate::testenv::env_lock();
         let dir = std::env::temp_dir().join("irlume-conf-half-published");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6608,7 +6608,6 @@ mod tests {
         let conf = confdir.join("ir_emitter.conf");
         let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
-        let _confenv = EnvGuard::set("IRLUME_IR_EMITTER_CONF", &conf);
 
         let id = identity(0x3277, 0x0059);
         let ms = id.microsoft_xu().expect("fixture has a Microsoft XU");
@@ -6621,13 +6620,16 @@ mod tests {
         .expect("fixture advertises an emitter selector");
 
         // The state the finding describes: the configuration naming this control
-        // is READABLE, and the save nevertheless reports failure. Provoked by
-        // taking write permission off the directory, so the temp file cannot be
-        // created, with the published file already there.
+        // is READABLE, and the save nevertheless reports failure. A procfs fd
+        // path reads the published file but cannot accept an atomic replacement,
+        // including when the suite runs as root in the Arch install container.
+        // chmod alone cannot provoke this failure under CAP_DAC_OVERRIDE.
         std::fs::write(&conf, format!("{} {}:{selector}", id.usb_id(), ms.unit_id))
             .expect("publish a config");
-        std::fs::set_permissions(&confdir, std::fs::Permissions::from_mode(0o500))
-            .expect("make the directory unwritable");
+        let published = std::fs::File::open(&conf).expect("hold the visible config");
+        let visible = PathBuf::from(format!("/proc/self/fd/{}", published.as_raw_fd()));
+        let _confenv = EnvGuard::set("IRLUME_IR_EMITTER_CONF", &visible);
+        assert_eq!(load_conf(&id), Some((ms.unit_id, selector)));
 
         let _fake = fake_camera::install(a_working_camera());
         let mut pending =
@@ -6655,9 +6657,8 @@ mod tests {
         let err = found.finish(&id).expect_err("the save must fail");
         assert!(err.contains("save the emitter config"), "{err}");
 
-        std::fs::set_permissions(&confdir, std::fs::Permissions::from_mode(0o700))
-            .expect("restore");
         assert!(conf.exists(), "the premise: the config is still visible");
+        assert_eq!(load_conf(&id), Some((ms.unit_id, selector)));
         assert_eq!(
             std::fs::read_dir(dir.join("ir-emitter-journal"))
                 .map(|d| d.filter_map(|e| e.ok()).count())

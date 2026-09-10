@@ -1,136 +1,93 @@
-# SLSA build provenance for the release artifacts. The distributable assets
-# (the universal .deb and the SELinux .noarch.rpm) are built and GPG-signed on
-# the maintainer's machine; this attaches a signed SLSA v1 provenance
-# attestation (multiple.intoto.jsonl, Sigstore/Fulcio keyless-signed and logged
-# in Rekor) covering their sha256 digests. Consumers can then verify a release
-# with slsa-verifier. Complements the GPG-signed SHA256SUMS already published.
+# Attest the verified digests of packages built and signed off CI. This does
+# not turn the maintainer's build into an isolated, reproducible CI build.
 name: SLSA release provenance
 
 on:
   release:
     types: [published]
-  # A release is published BEFORE its assets are uploaded: they are built and
-  # GPG-signed off-CI, and GitHub has no asset-upload event. So the automatic
-  # run always fires against a release with nothing on it, goes green having
-  # attested nothing, and there was no way to ask for it again. Provenance for
-  # every release published so far is therefore missing. The tag is REQUIRED,
-  # matching verify-release: a dispatch carries no release context, so
-  # github.ref_name would be the branch and the download would look for a
-  # release called `main`.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to attest (e.g. v0.7.1), after its assets are uploaded"
+        description: "Release tag to attest after all signed assets are uploaded"
         required: true
         type: string
 
-permissions: read-all
-
-env:
-  # The one place the tag is resolved. Every step reads this rather than
-  # github.ref_name, which is only correct on the release trigger.
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+permissions:
+  contents: read
 
 jobs:
-  # Collect the sha256 of the release's distributable artifacts into the
-  # base64 subjects blob the generator signs over.
   hashes:
-    # Version releases only. The model-weights release (`models-v1`) carries
-    # .onnx files and no packages, so it has nothing for this workflow to
-    # attest; it used to run anyway and fail in the generator's final step.
-    if: startsWith(inputs.tag || github.ref_name, 'v')
+    if: startsWith(inputs.tag || github.event.release.tag_name, 'v')
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
       digests: ${{ steps.hash.outputs.digests }}
+      tag: ${{ steps.hash.outputs.tag }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install package inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm zstd
+
       - name: Download release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        # `gh release download` exits 1 on "no assets to download". A release is
-        # always published BEFORE its assets are uploaded (they are built and
-        # GPG-signed off-CI), so at publish time there are zero assets and this
-        # step failed on every release, v0.7.0 included. That red run says
-        # nothing about the release; it only says the maintainer has not
-        # uploaded yet.
-        #
-        # Tolerating it with `|| echo` was too broad: a bad token, a rate limit,
-        # a network blip and a nonexistent tag were all swallowed into the same
-        # empty directory, and the job went green having attested nothing. Ask
-        # the API for the asset count and accept only a confirmed zero; a failing
-        # count query is an error, not an empty release.
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          mkdir -p assets
-          count=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.assets | length')
-          if [ "$count" -gt 0 ]; then
-            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir assets
-          else
-            echo "::notice::release $RELEASE_TAG has no assets yet"
-          fi
-      - name: Base64 subjects for the deb + rpm
-        id: hash
-        working-directory: assets
-        run: |
-          set -euo pipefail
-          # Provenance covers the distributables, not the checksum manifest or
-          # its detached signature (those authenticate these same artifacts).
-          #
-          # Compute into a variable first. Writing `echo "digests=$(sha256sum
-          # ...)"` hides the failure, because the exit status belongs to echo:
-          # a release with no packages produced an EMPTY digests output, this
-          # job went green, and the generator failed later with a bare exit 27.
-          # Glob into an array with nullglob, so a pattern that matches nothing
-          # contributes nothing instead of reaching sha256sum as a literal.
-          # `irlume-selinux-*.rpm` has never been a release asset (the subpackage
-          # is built in Copr, not uploaded here), so under `set -euo pipefail`
-          # the substitution failed and this job went red on every publish. The
-          # RPM stays listed so it is covered the day it does ship.
-          shopt -s nullglob
-          packages=(irlume_*.deb irlume-selinux-*.rpm)
-          everything=(*)
-          shopt -u nullglob
-          if [ "${#packages[@]}" -eq 0 ]; then
-            # Nothing on the release at all means the assets have not been
-            # uploaded yet, which is the normal state at publish time. Say so
-            # and stop; the maintainer re-runs this once the upload finishes.
-            # Assets present but no package among them is a different thing and
-            # stays an error, because something was uploaded wrong.
-            if [ "${#everything[@]}" -eq 0 ]; then
-              echo "::notice::no assets uploaded yet; nothing to attest, re-run after the upload"
-              exit 0
-            fi
-            echo "::error::assets are present but none is a package; refusing to request provenance over nothing"
-            exit 1
-          fi
-          echo "covering: ${packages[*]}"
-          digests="$(sha256sum "${packages[@]}" | base64 -w0)"
-          if [ -z "$digests" ]; then
-            echo "::error::no package digests computed; refusing to request provenance over nothing"
-            exit 1
-          fi
-          echo "digests=$digests" >> "$GITHUB_OUTPUT"
+          mkdir assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir assets
 
-  # The generic generator runs in an isolated reusable workflow (SLSA L3 for the
-  # provenance step) and uploads multiple.intoto.jsonl to the release. It must be
-  # referenced by tag, not SHA, per its own security model.
+      - name: Verify every package and produce subjects
+        id: hash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # Validate before writing a tag into the line-oriented outputs file.
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          digests="$(python3 scripts/verify-release-assets.py assets --subjects)"
+          {
+            echo "digests=$digests"
+            echo "tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
   provenance:
     needs: hashes
-    # Skipped when `hashes` found nothing to attest (assets not uploaded yet).
-    # Handing the generator an empty subjects blob fails it with a bare exit 27,
-    # which reads like a signing problem rather than an empty release.
-    if: needs.hashes.outputs.digests != ''
     permissions:
-      actions: read # read this run's metadata for the provenance
-      id-token: write # Sigstore/Fulcio keyless signing (no stored secret)
-      contents: write # upload the provenance file to the release
-    # MUST be referenced by an @vX.Y.Z tag, not a SHA: the generator's L3 model
-    # embeds this tag in the signed provenance identity, and slsa-verifier
-    # validates it. scripts/check-action-pins.sh excepts slsa-framework/* for
-    # exactly this reason — do not "pin" this to a commit SHA.
+      actions: read
+      id-token: write
+      contents: write
+    # The generator's verification identity requires a version tag, not a SHA.
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: ${{ needs.hashes.outputs.digests }}
       upload-assets: true
+      upload-tag-name: ${{ needs.hashes.outputs.tag }}
+      provenance-name: multiple.intoto.jsonl
+
+  confirm-upload:
+    needs: [hashes, provenance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require an actual upload to the requested release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.hashes.outputs.tag }}
+          UPLOADED_RELEASE: ${{ needs.provenance.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          test -n "$UPLOADED_RELEASE"
+          expected="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)"
+          test "$UPLOADED_RELEASE" = "$expected"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern multiple.intoto.jsonl
+          test -s multiple.intoto.jsonl

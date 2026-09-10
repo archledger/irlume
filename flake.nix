@@ -129,6 +129,12 @@
           assert authCtl "swaylock" == "sufficient";
           assert authCtl "hyprlock" == "sufficient";
           assert sys.config.systemd.services.irlumed.environment.IRLUME_SOCKET == "/run/irlume.sock";
+          # These shipped PAD cues default to /etc/irlume in the daemon.
+          # A NixOS service must resolve them from its selected package too.
+          assert (sys.config.systemd.services.irlumed.environment.IRLUME_VIT_PAD_MODEL or null)
+            == "${sys.config.services.irlume.package}/share/irlume/models/liveness_vit.onnx";
+          assert (sys.config.systemd.services.irlumed.environment.IRLUME_PAD_IR_MODEL or null)
+            == "${sys.config.services.irlume.package}/share/irlume/models/flir.onnx";
           pkgs.runCommand "irlume-module-checks-ok" { } "echo 'irlume module PAM decision table verified' > $out";
 
         devShells.default = pkgs.mkShell {

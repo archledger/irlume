@@ -226,6 +226,9 @@ jobs:
 
       # --require names the set rather than counting it: renaming one of these
       # while adding another would leave the total intact and hide the loss.
+      - name: Disposable TPM wrapper lifecycle (no hardware)
+        run: python3 scripts/test-with-swtpm.py
+
       - name: test (TPM-gated, against swtpm)
         env:
           IRLUME_TCTI: swtpm:host=127.0.0.1,port=2321

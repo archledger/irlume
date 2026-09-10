@@ -5140,35 +5140,24 @@ mod tests {
         );
     }
 
-    /// The same drift as above, one field over: the gate that refuses to run the
-    /// emitter check and the line that actually runs it must name the same
-    /// mechanism. The step invokes the burst through `sudo -n`, so passwordless
-    /// sudo is the only thing that lets it proceed, and a failure message
-    /// offering any other remedy sends an operator to a change the step ignores.
-    /// #393 shipped exactly that: the message offered a lock-permission route
-    /// while the gate still exited on `sudo -n true`, so following it left the
-    /// nightly red for a reason the message had ruled out.
-    ///
-    /// Both directions matter, which is why the first assertion is here. When
-    /// #392 is decided and the burst stops going through sudo, this fails and
-    /// forces the message to be rewritten in the same commit rather than
-    /// quietly becoming false.
-    ///
-    /// No `concat!` dance is needed: this reads the workflow only, and the
-    /// workflow does not contain this file's source, so a needle cannot match
-    /// itself the way it did in the test above.
+    /// Keep the privileged invocation and its operator guidance in agreement.
+    /// Raw capture can succeed even when emitter setup refuses an unreadable
+    /// recovery journal. Video-group membership cannot read that root-private
+    /// state, so the nightly must not advertise it as an alternative to sudo.
     #[test]
-    fn the_emitter_gate_names_both_remedies() {
+    fn the_emitter_gate_names_the_required_privilege() {
         let workflow = include_str!("../../../.github/workflows/hardware-suite.yml");
         assert!(
-            workflow.contains("env IRLUME_LOG_EMITTER_WRITES=1"),
-            "the burst no longer carries IRLUME_LOG_EMITTER_WRITES in its \
-             invocation; the gate below has stopped being true (#392)"
+            workflow.contains("sudo -n env IRLUME_LOG_EMITTER_WRITES=1"),
+            "the emitter invocation must carry its trace flag through noninteractive sudo"
         );
         assert!(
-            workflow.contains("Two remedies"),
-            "the gate message no longer names both remedies: the video group \
-             route and the sudo fallback (#392)"
+            workflow.contains("needs noninteractive sudo for burst_dump"),
+            "the gate message must name the privilege used by the capture invocation"
+        );
+        assert!(
+            !workflow.contains("Two remedies"),
+            "video-group access alone cannot authorize recovery-journal inspection"
         );
     }
 

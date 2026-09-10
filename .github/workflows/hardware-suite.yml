@@ -27,6 +27,8 @@ concurrency:
 
 jobs:
   hardware:
+    # Manual dispatch must not run privileged hardware code from another ref.
+    if: github.ref == 'refs/heads/main'
     name: build · test · real-TPM · IR camera
     # Either available runner may take this lane when it carries every
     # required capability label. Labels describe capabilities, not priority.
@@ -77,6 +79,7 @@ jobs:
       # and are deleted; they are never uploaded (they picture the room).
       - name: IR camera strobe-burst capture
         run: |
+          set -o pipefail
           # Distinguish "camera genuinely absent" from "doctor itself failed":
           # a doctor crash or a changed output format must NOT read as a clean
           # skip (that would let a real regression pass green). Run doctor once,
@@ -140,16 +143,9 @@ jobs:
           echo "IR node: $ir"
           out=$(mktemp -d)
           trap 'rm -rf "$out"' EXIT
-          # Run the burst unprivileged. Since #392, irlume-camera creates the
-          # emitter lock 0660 root:video, matching /dev/video* (root:video
-          # 0660). The runner account is in the video group, so it can take
-          # the lock directly. Falling back to sudo if the lock is somehow
-          # still unreachable (the daemon has not run yet on this boot).
-          # The check below asserts the emitter strobes, and an unprivileged
-          # run measures whatever state the emitter was left in by the last
-          # root process rather than anything irlume did. It passed at a spread
-          # of 17.9 on 2026-08-08 with irlume's emitter control disabled
-          # throughout (#384).
+          # This trusted-main-only job must inspect the root-private recovery
+          # journal and create a lock when the daemon has not used this camera.
+          # Video-group membership alone cannot authorize those operations.
           burst="${CARGO_TARGET_DIR:-target}/debug/examples/burst_dump"
           cargo build -q -p irlume-camera --example burst_dump
           if [ ! -x "$burst" ]; then
@@ -157,23 +153,26 @@ jobs:
             exit 1
           fi
           err="$(mktemp)"
-          # irlume-camera creates the emitter lock 0660 root:video, matching
-          # /dev/video* (root:video 0660). The runner account is in the video
-          # group, so the burst runs unprivileged. If the lock is somehow
-          # unreachable, sudo -n is the fallback, and the error message names
-          # both remedies.
-          # The lock is 0660 root:video since #392, so the runner account can
-          # take it directly. Fall back to sudo if the lock is still unreachable
-          # (the daemon has not run yet on this boot, or the machine's video
-          # group has a different gid than the one the daemon set).
-          locked=0
-          if env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"; then
-            locked=1
-          elif grep -q "cannot lock" "$err" && sudo -n true 2>/dev/null; then
-            sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err" && locked=1
+          # Raw capture can succeed while emitter setup refuses to write, so
+          # its exit status cannot select an unprivileged-to-sudo fallback.
+          # Run once with the required privilege, keeping the positive-write
+          # marker, frame count and spread checks below as independent gates.
+          helper=/usr/local/libexec/irlume-ci-capture
+          captured=0
+          if [ -x "$helper" ]; then
+            # Restricted runners use an administrator-approved binary. The
+            # helper rejects a different source tree before opening the camera and
+            # streams only capture files from its private output directory.
+            tree=$(git rev-parse 'HEAD^{tree}')
+            if sudo -n "$helper" "$tree" "$ir" 2>"$err" | tar -xf - -C "$out"; then
+              captured=1
+            fi
+          elif sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"; then
+            captured=1
           fi
-          if [ "$locked" -eq 0 ]; then
-            echo "::error::this runner cannot take the emitter lock, so the emitter check cannot run. The lock is /run/lock/irlume-emitter-*.lock, created 0660 root:video by the daemon since #392. Two remedies: (a) make sure the runner account is in the video group, or (b) give it passwordless sudo. Failing rather than passing, because a check that cannot run has not passed"
+          if [ "$captured" -eq 0 ]; then
+            cat "$err"
+            echo "::error::privileged IR burst failed; inspect the capture or sudo diagnostic above. The trusted hardware runner needs noninteractive sudo for burst_dump (or its installed fixed capture helper)."
             exit 1
           fi
           cat "$err"

@@ -168,6 +168,68 @@ Do not delete individual fixture files or restart the sequence on a partially
 tested installation. Discard only the task-owned guest after preserving the
 sanitized evidence.
 
+## Administrator service choices
+
+The four-stage harness above intentionally requires a running daemon. Use
+[`check-upgrade-service-state.py`](../scripts/check-upgrade-service-state.py)
+for separate service-state trials in inspected disposable guests with the same
+admission marker. Stage it beside `test-package-upgrade.py`, which supplies its
+read-only admission and command helpers. The checker only observes systemd;
+it never starts a unit or connects to `/run/irlume.sock`.
+
+Test **both** `irlumed.service` and `irlumed.socket` together:
+
+| Case | Enablement | Runtime state after each transaction |
+| --- | --- | --- |
+| `disabled-running` | Both disabled | Both active; daemon has a new PID |
+| `disabled-stopped` | Both disabled | Both inactive |
+| `enabled-stopped` | Both enabled | Both inactive |
+| `masked-stopped` | Both masked | Both inactive and still masked |
+
+Disabling a unit does not stop it. Stopping only the daemon while its socket
+remains active permits the next connection to activate it again. Paired states
+make the administrator's intent explicit. NixOS activation is declarative and
+needs its own module/generation test; these package tests do not establish that
+imperative `systemctl` changes survive a NixOS switch.
+
+For example, after preparing the old package in a disposable guest, deliberately
+stop both enabled units and save a baseline:
+
+```sh
+systemctl enable irlumed.service irlumed.socket
+systemctl stop irlumed.service irlumed.socket
+python3 /var/tmp/irlume-upgrade-input/check-upgrade-service-state.py \
+  --case enabled-stopped \
+  --output /var/tmp/irlume-upgrade-output/stopped-before.json
+```
+
+Run the candidate package transaction using the distribution command and
+signature/conffile options described above, then check without activating it:
+
+```sh
+python3 /var/tmp/irlume-upgrade-input/check-upgrade-service-state.py \
+  --case enabled-stopped \
+  --before /var/tmp/irlume-upgrade-output/stopped-before.json \
+  --output /var/tmp/irlume-upgrade-output/stopped-after.json
+```
+
+Require both receipts to pass. Repeat for upgrade, old-package rollback, and
+candidate re-upgrade in every case, retaining exact package digests and source
+revisions. Use `disable` for disabled states, a separate `start` of both units
+for disabled-running, or `mask --now` for masked-stopped. Set these states only
+on the disposable guest. Preserve failure receipts before changing the fixture;
+if intent is deliberately re-established before each transaction, report that
+these are independent transition tests, not one uninterrupted passing cycle.
+An old package's rollback hook may itself violate the state contract: record
+that result separately; do not modify the published old package to hide it.
+
+This passive checker qualifies systemd state only. Retain separate package
+version/payload checks, configuration and synthetic-state preservation checks,
+AppArmor/SELinux assertions, and a working independent administrator login.
+For a running case, also verify the live executable matches the installed
+candidate. Never use the active-daemon harness or its Ping check to validate an
+inactive case: the check itself could activate the socket and invalidate it.
+
 ## Qualification limits
 
 - Synthetic configuration, state bytes, and retry records establish preservation
@@ -180,8 +242,9 @@ sanitized evidence.
   separately. Do not turn off confinement to change the outcome.
 - The transaction sequence covers the package's enabled, running service path
   and checks that its enabled state remains unchanged. It does not qualify an
-  administrator-disabled or stopped-service upgrade, a wired graphical greeter,
-  or every login manager. An enabled SELinux module listing does not prove its
+  administrator-disabled or stopped-service upgrade; use the separate state
+  procedure above. Neither procedure qualifies a wired graphical greeter or
+  every login manager. An enabled SELinux module listing does not prove its
   live byte equivalence or confined greeter access.
 - A separate Nix profile generation rollback is not a NixOS system-generation,
   module, service, PAM, or hardware qualification. This package harness does not
@@ -192,4 +255,6 @@ Run the local harness regressions without installing any packages:
 ```sh
 python3 scripts/test-package-upgrade-harness.py
 python3 scripts/test-check-upgrade-auth.py
+python3 scripts/test-check-upgrade-service-state.py
+python3 scripts/test-package-service-hooks.py
 ```

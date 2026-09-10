@@ -60,9 +60,17 @@ fi
 if [ -n "${2:-}" ]; then
     systemctl start irlume-reconcile.service 2>/dev/null || true
 fi
-# Upgrading from a version without the socket unit.
-if systemctl is-enabled --quiet irlumed.service 2>/dev/null; then
-    systemctl enable --now irlumed.socket 2>/dev/null || true
+# The socket first shipped in 0.8.1. Migrate older releases only: repeating
+# this on modern upgrades would undo an administrator's socket disable/stop.
+if [ -n "${2:-}" ] && dpkg --compare-versions "$2" lt 0.8.1 &&
+    systemctl is-enabled --quiet irlumed.service 2>/dev/null; then
+    # An enabled service can still be deliberately stopped. Preserve that
+    # runtime choice while enabling its new socket for the next boot.
+    if systemctl is-active --quiet irlumed.service 2>/dev/null; then
+        systemctl enable --now irlumed.socket 2>/dev/null || true
+    else
+        systemctl enable irlumed.socket 2>/dev/null || true
+    fi
 fi
 systemctl try-restart irlumed.service 2>/dev/null || true
 cat <<'EOF'

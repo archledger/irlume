@@ -22,6 +22,17 @@ class CaptureValidationTests(unittest.TestCase):
         for i in range(6):
             (self.output / f'frame{i:02}.pgm').write_bytes(b'P5\n1 1\n255\n\x01')
 
+    def test_capture_proof_requires_one_exact_positive_outcome(self):
+        write = 'irlume: capture emitter write completed'
+        default = 'irlume: capture emitter device default verified'
+        self.assertEqual(HELPER.capture_proof(write), 'write')
+        self.assertEqual(HELPER.capture_proof(default), 'default')
+        for diagnostic in ['', 'irlume: capture emitter already held the requested value',
+                           'prefix ' + default, default + ' suffix',
+                           write + '\n' + default, write + '\n' + write]:
+            with self.subTest(diagnostic=diagnostic), self.assertRaises(ValueError):
+                HELPER.capture_proof(diagnostic)
+
     def test_only_fixed_flat_files_are_archived(self):
         self.assertEqual(len(HELPER.archive_paths(self.output)), 7)
 

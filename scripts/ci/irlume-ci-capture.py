@@ -90,6 +90,16 @@ def archive_paths(output):
     return paths
 
 
+def capture_proof(diagnostic):
+    """Require exactly one positive outcome; an already-held value is neither."""
+    markers = {'irlume: capture emitter write completed': 'write',
+               'irlume: capture emitter device default verified': 'default'}
+    proofs = [markers[line] for line in diagnostic.splitlines() if line in markers]
+    if len(proofs) != 1:
+        raise ValueError('capture needs exactly one emitter write or verified device-default proof')
+    return proofs[0]
+
+
 def capture(tree, device):
     if os.geteuid() != 0:
         raise ValueError('capture helper requires root through its scoped sudo rule')
@@ -113,8 +123,7 @@ def capture(tree, device):
             sys.stderr.write(diagnostic[-16384:])
             if result.returncode:
                 raise ValueError(f'approved capture failed: exit {result.returncode}')
-            if 'irlume: capture emitter write completed' not in diagnostic.splitlines():
-                raise ValueError('approved capture did not complete an emitter write')
+            capture_proof(diagnostic)
             paths = archive_paths(output)
             with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:
                 for path in paths:

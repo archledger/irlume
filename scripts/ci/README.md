@@ -3,8 +3,8 @@
 `irlume-ci-capture.py` is an administrator-installed helper for a self-hosted
 runner without general sudo. The workflow uses it when
 `/usr/local/libexec/irlume-ci-capture` exists. Otherwise it uses the existing
-noninteractive-sudo capture route. Both paths retain the emitter-write marker,
-minimum frame count and brightness-spread gates.
+noninteractive-sudo capture route. Both paths require exactly one positive emitter proof, the minimum frame
+count and brightness-spread gates.
 
 The helper accepts exactly the checked-out Git source-tree ID and IR device. It
 runs a separately approved, root-owned capture ELF for six frames, with a clean
@@ -14,6 +14,33 @@ as a bounded archive into the workflow's temporary directory, and are removed
 by both sides' cleanup. It accepts no command, executable path, output path,
 frame count or environment overrides. The helper does not grant authentication
 or return enrolled biometric data.
+
+## Two positive outcomes
+
+The trace-enabled capture emits one of two exact diagnostic lines:
+
+- `irlume: capture emitter write completed`: this capture actually changed the
+  emitter control. Existing configured and known-device write paths keep this
+  requirement; a failed write or `AlreadyHeld` cannot use the default proof.
+- `irlume: capture emitter device default verified`: no write action was planned,
+  recovery was checked without a restore write, and the open camera advertised
+  a Microsoft Face Authentication control whose current value equals its own
+  validated D1 default. The capability/default validator is shared with setup;
+  a second current-value read rejects a change during validation. The capture
+  retains its stream lock but owns no control change to restore.
+
+The default path makes only control reads and exists only with emitter tracing
+requested. It does not alter normal authentication behavior, save a config,
+replay a payload, or manufacture a write. Missing, partial, repeated or mixed
+positive markers fail. Both outcomes still require frame delivery and brightness
+spread. These checks establish reported control state, frame delivery, and a non-flat
+brightness range;
+they do not establish that a host write caused an optical change. In particular,
+BRIO may operate in D1 by default while NexiGo requires an actual transition.
+
+The control contract is [Microsoft UVC Face Authentication](https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/uvc-extensions-1-5#2226-face-authentication-control).
+Do not infer default readiness from VID:PID, successful face unlock, absence of
+errors, an already-held non-default value, or brightness alone.
 
 ## Installation and approval
 

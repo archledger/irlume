@@ -155,8 +155,8 @@ jobs:
           err="$(mktemp)"
           # Raw capture can succeed while emitter setup refuses to write, so
           # its exit status cannot select an unprivileged-to-sudo fallback.
-          # Run once with the required privilege, keeping the positive-write
-          # marker, frame count and spread checks below as independent gates.
+          # Run once with the required privilege, keeping the positive emitter
+          # proof, frame count and spread checks below as independent gates.
           helper=/usr/local/libexec/irlume-ci-capture
           captured=0
           if [ -x "$helper" ]; then
@@ -176,20 +176,13 @@ jobs:
             exit 1
           fi
           cat "$err"
-          # A POSITIVE marker, not the absence of one refusal string. The first
-          # version of this guard grepped for the lock refusal, which covers one
-          # of at least six inert paths through `ir_emitter::enable`: an
-          # unreadable USB identity, a recovery reporting Busy or
-          # OwnerStillRunning (both silent by design), no applicable control, and
-          # a failed apply_device_default or apply_known_payload. Any of those
-          # captures frames that look exactly like a successful run.
-          #
-          # `AlreadyHeld` is deliberately NOT accepted: it shows the control
-          # holds the wanted value, which is not the same as this invocation
-          # having driven it, and driving it is what this step claims to test
-          # (#384 review).
-          if ! grep -Fxq "irlume: capture emitter write completed" "$err"; then
-            echo "::error::irlume did not complete the emitter write, so the spread below is the emitter's leftover state rather than evidence irlume can light it (#384)"
+          # Two distinct positive proofs from the capture's own open camera:
+          # a completed write, or a validated active device default. The latter
+          # is read-only and cannot be emitted after a failed/configured write.
+          # Neither AlreadyHeld nor brightness alone establishes either proof.
+          proofs=$(grep -Fxc -e "irlume: capture emitter write completed" -e "irlume: capture emitter device default verified" "$err" || true)
+          if [ "$proofs" -ne 1 ]; then
+            echo "::error::irlume did not complete the emitter write or verify a unique active device default; missing, duplicate and ambiguous proofs fail"
             exit 1
           fi
           frames=$(find "$out" -name "frame*.pgm" | wc -l)
@@ -208,8 +201,8 @@ jobs:
           # Both alternate between roughly 30 and roughly 135: the camera cycles
           # its own state between capture sessions (#264's self-strobing seen
           # from the other side), and every run clears this floor by a wide
-          # margin either way. So this asserts that the camera delivers
-          # alternating frames, not that irlume's extension-unit write reached
+          # margin either way. So this asserts a non-flat brightness range,
+          # not frame alternation or that irlume's extension-unit write reached
           # it. A discriminator that depends on the write is tracked on #384.
           awk '{print $2}' "$out/means.txt" | sort -n | awk 'NR==1{min=$1} END{max=$1; d=max-min; printf "mean spread: %.1f\n", d; exit (d < 5)}'
 

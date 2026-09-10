@@ -1799,12 +1799,37 @@ fn enable_guarded(
     // instead.
     let recovery = recover_pending_write(fd, &id);
     let action = planned_action(&recovery, wanted, &id);
+    let can_prove_default = default_proof_allowed(&recovery, &action);
     report_recovery(&id, recovery);
 
     // Which control the write is going to. Needed here only to give the guard
     // its coordinates; every read of the control itself happens inside the
     // apply path, on the same pass that decides whether to write.
     let Some((unit, selector)) = action.coordinates() else {
+        // Diagnostic observation only. A configured/known write, explicit off,
+        // foreign owner or unchecked recovery can never fall back to this proof.
+        // Keep normal authentication's behavior unchanged when tracing is off.
+        if can_prove_default && std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+            if let Ok(lock) = crate::stream_record::acquire(&id) {
+                if let Ok(Some(control)) = read_capture_default(fd, &id) {
+                    eprintln!("irlume: capture emitter device default verified");
+                    return Ok(StreamMode::new(Box::new(UvcMode {
+                        handle: Some(EmitterHandle {
+                            handle,
+                            lease: None,
+                        }),
+                        unit: control.unit,
+                        selector: control.selector,
+                        restore: Vec::new(),
+                        applied: Vec::new(),
+                        armed: false,
+                        active: false, // observational proof, not an enable operation
+                        record: None,
+                        _lock: Some(lock),
+                    })));
+                }
+            }
+        }
         return Ok(StreamMode::inert());
     };
 
@@ -3017,6 +3042,51 @@ struct IntendedValue {
     /// The value is not merely supported: it is also what `GET_DEF` says this
     /// camera chooses without a host write.
     is_device_default: bool,
+}
+
+/// A default observation cannot replace an attempted write or unresolved state.
+fn default_proof_allowed(recovery: &RecoveryOutcome, action: &CaptureAction) -> bool {
+    matches!(action, CaptureAction::Nothing)
+        && matches!(
+            recovery,
+            RecoveryOutcome::NothingPending
+                | RecoveryOutcome::ForAnotherCamera
+                | RecoveryOutcome::AlreadyRestored
+        )
+}
+
+/// Read-only Face Authentication D1 proof, using discovery's value validator.
+/// The descriptor and queries belong to the capture's open device. A current
+/// non-default value (including AlreadyHeld), changed value or query failure
+/// proves nothing. No measurement, SET_CUR, config or undo record is produced.
+fn read_capture_default(
+    fd: c_int,
+    id: &crate::uvc_descriptor::CameraIdentity,
+) -> XuResult<Option<EmitterControl>> {
+    let selector = crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION;
+    let Some(ms) = id.microsoft_xu().filter(|ms| ms.advertises(selector)) else {
+        return Ok(None);
+    };
+    // Synchronous GET/SET support, with no disabled/automatic/async flags.
+    if get_info(fd, ms.unit_id, selector)? != 3 {
+        return Ok(None);
+    }
+    let len = get_len(fd, ms.unit_id, selector)?;
+    let original = get_cur(fd, ms.unit_id, selector, len)?;
+    let Ok(intended) = intended_value(fd, ms.unit_id, selector, len)? else {
+        return Ok(None);
+    };
+    if !intended.is_device_default || original != intended.payload {
+        return Ok(None);
+    }
+    if get_cur(fd, ms.unit_id, selector, len)? != original {
+        return Ok(None);
+    }
+    Ok(Some(EmitterControl {
+        unit: ms.unit_id,
+        selector,
+        payload: original,
+    }))
 }
 
 fn intended_value(
@@ -6001,6 +6071,138 @@ mod tests {
         assert_eq!(records, 0, "the confirmed restore clears the journal");
         drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_default_proof_reads_validated_current_default_without_writes() {
+        let _lock = crate::testenv::env_lock();
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: vec![1, 2, 2],
+            def: vec![1, 2, 2],
+            max: vec![1, 2, 3],
+            len: 3,
+            info: 3,
+            ..Default::default()
+        });
+        let control = read_capture_default(-1, &identity(0x046d, 0x085e))
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.payload, vec![1, 2, 2]);
+        assert_eq!(fake_camera::current(), vec![1, 2, 2]);
+        let log = fake_camera::log();
+        assert_eq!(
+            log.iter()
+                .filter(|r| matches!(
+                    r,
+                    fake_camera::Request::Get {
+                        query: UVC_GET_CUR,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(log
+            .iter()
+            .all(|r| matches!(r, fake_camera::Request::Get { .. })));
+    }
+
+    #[test]
+    fn capture_default_proof_requires_an_advertised_microsoft_control() {
+        let _lock = crate::testenv::env_lock();
+        let _fake = fake_camera::install(fake_camera::Camera::default());
+        let mut id = identity(0x046d, 0x085e);
+        id.descriptors.clear();
+        assert!(read_capture_default(-1, &id).unwrap().is_none());
+        assert!(fake_camera::log().is_empty());
+    }
+
+    #[test]
+    fn capture_default_proof_marker_has_both_consumers() {
+        let marker = concat!("irlume: capture emitter ", "device default verified");
+        for consumer in [
+            include_str!("../../../.github/workflows/hardware-suite.yml"),
+            include_str!("../../../scripts/ci/irlume-ci-capture.py"),
+        ] {
+            assert!(consumer.contains(marker));
+        }
+        let producer = concat!(
+            "eprintln!(\"irlume: capture emitter ",
+            "device default verified\")"
+        );
+        assert!(include_str!("ir_emitter.rs").contains(producer));
+    }
+
+    #[test]
+    fn capture_default_proof_refuses_unverified_or_changing_state() {
+        let _lock = crate::testenv::env_lock();
+        for case in 0..6 {
+            let mut camera = fake_camera::Camera {
+                current: vec![1, 2, 2],
+                def: vec![1, 2, 2],
+                max: vec![1, 2, 3],
+                len: 3,
+                info: 3,
+                ..Default::default()
+            };
+            match case {
+                0 => camera.def = vec![1, 2, 1], // active, but not the default
+                1 => camera.current = vec![1, 2, 1],
+                2 => camera.max = vec![1, 2, 5], // D2 is not D1
+                3 => camera.info = 0x23,         // disabled by commit state
+                4 => camera.change_after_gets = Some((1, vec![1, 2, 1])),
+                _ => camera.fail_get_cur = Some(libc::EIO),
+            }
+            let _fake = fake_camera::install(camera);
+            assert!(
+                read_capture_default(-1, &identity(0x046d, 0x085e))
+                    .ok()
+                    .flatten()
+                    .is_none(),
+                "case {case}"
+            );
+            assert!(fake_camera::log()
+                .iter()
+                .all(|r| matches!(r, fake_camera::Request::Get { .. })));
+        }
+    }
+
+    #[test]
+    fn capture_default_proof_is_never_a_fallback_for_a_write_or_recovery_failure() {
+        let control = EmitterControl {
+            unit: 14,
+            selector: 6,
+            payload: vec![1, 2, 2],
+        };
+        for action in [
+            CaptureAction::KnownPayload(control.clone()),
+            CaptureAction::Override(control),
+            CaptureAction::DeviceDefault {
+                unit: 14,
+                selector: 6,
+            },
+        ] {
+            assert!(!default_proof_allowed(
+                &RecoveryOutcome::NothingPending,
+                &action
+            ));
+        }
+        for recovery in [
+            RecoveryOutcome::Busy,
+            RecoveryOutcome::Unchecked("fixture".into()),
+            RecoveryOutcome::Unresolved("fixture".into()),
+            RecoveryOutcome::OwnerStillRunning { pid: 1 },
+            RecoveryOutcome::Restored {
+                unit: 14,
+                selector: 6,
+            },
+        ] {
+            assert!(!default_proof_allowed(&recovery, &CaptureAction::Nothing));
+        }
+        assert!(default_proof_allowed(
+            &RecoveryOutcome::NothingPending,
+            &CaptureAction::Nothing
+        ));
     }
 
     /// Microsoft's Face Authentication control permits a dedicated IR

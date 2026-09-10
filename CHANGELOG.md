@@ -5,6 +5,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Explicit experimental IR-only policy (`irlume auth sensor ir-only --yes`),
+  with dual RGB+IR remaining the default. Requires enrollment-bound IR capture,
+  fresh emitter evidence and IR PAD; it does not establish deployment qualification.
+- CLI and TUI controls for the machine owner's optional privileged confirmation
+  waiver. Typed `yes` remains the default; restoring it is
+  `sudo irlume auth consent required`. This does not enable automatic desktop scans.
+- Bound OS authorization for enrollment and recovery-credential management,
+  with packaged polkit policies and a dedicated password-verification helper.
+- Durable 50-request face failure limit and independently password-verified retry
+  recovery. Cancellation and interruption retain their charge; password login
+  stays available. See [upgrade and recovery requirements](docs/RELEASING.md).
+
+### Removed
+
+- Head nod/shake consent gestures. Retired settings no longer select a gesture;
+  follow [the migration notes](docs/HEAD-GESTURE-REMOVAL.md) for stale configuration.
+
 ### Changed
 
 - Read KDE wallet salts through the packaged helper after it permanently enters
@@ -21,6 +40,12 @@ All notable changes to irlume are documented here. This project adheres to
   and service companion queues through burst completion.
 
 ### Fixed
+
+- Make the emitter undo-record regression independent of root permission bypass,
+  so the Arch container tests the same save-failure invariant as ordinary CI.
+- Fail release verification on incomplete assets, verify Arch packages alongside
+  Debian packages, and attest all signed packages. Manual provenance runs now
+  upload to the requested tag and require a confirmed upload.
 
 - Keep whole-image IR darkness in debug diagnostics without emitter-repair advice;
   a bright face against a dark background no longer triggers that warning (#677).

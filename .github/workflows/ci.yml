@@ -227,6 +227,11 @@ jobs:
 
       # --require names the set rather than counting it: renaming one of these
       # while adding another would leave the total intact and hide the loss.
+      - name: Signed release verification regressions (disposable packages and key)
+        run: |
+          sudo apt-get install -y --no-install-recommends gnupg dpkg rpm zstd
+          python3 scripts/test-release-assets.py
+
       - name: Disposable TPM wrapper lifecycle (no hardware)
         run: python3 scripts/test-with-swtpm.py
 

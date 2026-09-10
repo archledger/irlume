@@ -190,6 +190,43 @@ for model in $models; do
 done
 
 echo
+# Recovery authorization must ship as a unit: helper, dedicated password-only
+# PAM service, and polkit policies. Match an active install destination, not a
+# source name or a commented-out install.
+echo "== authorization and recovery payload in every lane =="
+AUTH_PAYLOAD=(irlume-password-verify irlume-retry-reset org.irlume.enroll.policy org.irlume.recovery-manage.policy)
+for artifact in "${AUTH_PAYLOAD[@]}"; do
+  for lane in "${LANES[@]}"; do
+    dest="$(dest_for "$lane")"
+    if uncommented "$lane" | grep -F -A1 -- "$artifact" | grep -qF -- "$dest"; then
+      printf '  ok    %-34s %s\n' "$artifact" "$lane"
+    else
+      printf '  MISS  %-34s %s (not installed)\n' "$artifact" "$lane"
+      fail=1
+    fi
+  done
+  # Nix substitutes the compiled helper path and installs the PAM template to
+  # its store; module.nix supplies the service under /etc/pam.d.
+  case "$artifact" in
+    irlume-password-verify) target="libexec/$artifact" ;;
+    irlume-retry-reset) target="share/irlume/pam/$artifact" ;;
+    *) target="share/polkit-1/actions/$artifact" ;;
+  esac
+  if uncommented nix/package.nix | grep -F -- "\$out/$target" | grep -qF 'install -'; then
+    printf '  ok    %-34s %s\n' "$artifact" nix/package.nix
+  elif uncommented nix/package.nix | grep -F -B1 -- "\$out/$target" | grep -qF 'install -'; then
+    printf '  ok    %-34s %s\n' "$artifact" nix/package.nix
+  else
+    printf '  MISS  %-34s %s (not installed)\n' "$artifact" nix/package.nix
+    fail=1
+  fi
+done
+if ! uncommented nix/module.nix | grep -Fq 'irlume-retry-reset.text = lib.mkForce (builtins.readFile ../packaging/pam/irlume-retry-reset)'; then
+  echo "  MISS  nix/module.nix dedicated password-only retry reset service"
+  fail=1
+fi
+echo
+
 echo "== version agreement =="
 cargo_v="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
 spec_v="$(sed -n 's/^Version: *\(.*\)/\1/p' packaging/fedora/irlume.spec | tr -d ' ' | head -1)"

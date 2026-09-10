@@ -81,7 +81,9 @@ passed_names() {
 # it would also let a metacharacter in a future test name change the match.
 ran_as_pass() {
   local name="$1" log="$2"
-  passed_names "$log" | grep -qxF "$name"
+  # Drain the producer even after a match. grep -q can close this pipe early,
+  # making a large successful run fail with SIGPIPE under pipefail.
+  passed_names "$log" | grep -xF "$name" >/dev/null
 }
 
 self_test() {
@@ -157,6 +159,22 @@ test result: ok. 1 passed; 0 failed'
 test m::tests::beta ... ok
 
 test result: ok. 2 passed; 0 failed'
+
+  # A full workspace emits more than a pipe buffer of names. grep -q exits
+  # early on a match and SIGPIPE kills its producer under pipefail, turning a
+  # real pass near the start or middle into a reported missing test.
+  expect "required names survive output larger than a pipe buffer" 0 \
+    "$0" --require case_0,case_5000,case_9999 --min 10000 -- awk '
+      BEGIN {
+        for (i=0; i<10000; i++) printf "test m::tests::case_%d ... ok\n", i
+        print "test result: ok. 10000 passed; 0 failed"
+      }'
+  expect "a large passing run still refuses an absent required name" 1 \
+    "$0" --require missing --min 10000 -- awk '
+      BEGIN {
+        for (i=0; i<10000; i++) printf "test m::tests::case_%d ... ok\n", i
+        print "test result: ok. 10000 passed; 0 failed"
+      }'
 
   # The case a count cannot catch: one renamed away, one added, total unchanged.
   expect "a renamed test is caught even when the total is unchanged" 1 \

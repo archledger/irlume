@@ -242,7 +242,9 @@ jobs:
 
       - name: Package service hook and state preservation regressions
         run: |
-          sudo apt-get install -y --no-install-recommends pacman-package-manager
+          # Ubuntu ships vercmp in makepkg, a recommendation of pacman-package-manager.
+          # Install it explicitly because recommendations are disabled here.
+          sudo apt-get install -y --no-install-recommends pacman-package-manager makepkg
           python3 scripts/test-package-service-hooks.py
           python3 scripts/test-check-upgrade-service-state.py
 

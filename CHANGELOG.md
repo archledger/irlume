@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-11
+
 ### Added
 
 - Application-menu launcher for the TUI, using the desktop's terminal as the
@@ -35,6 +37,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Bound routine status observations with a shared deadline, move TUI probes off
+  the input thread, and use wallet metadata for routine status. Reuse verified
+  model buffers and release serialized recognizer weights before auxiliary
+  sessions are loaded.
+- Use adaptive startup for validated, configured IR-only targets while
+  preserving the full rate window, rate floor, continuity and exact metadata
+  selection. Generic fixed and paired sessions retain their existing behavior.
+- Collect complete PAD evidence in one serviced RGB/IR session for eligible
+  concurrent login/lock requests, then prepare identity for the final admissible
+  sample. Ordinary RGB+IR preparation remains eager; capture ownership,
+  cancellation, deadlines and admission checks remain enforced.
 - Read KDE wallet salts through the packaged helper after it permanently enters
   the target account, then pass the fixed-size value to the daemon's unchanged KDF.
   The daemon no longer opens that user path as root or falls back to doing so;
@@ -50,6 +63,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Preserve administrator-selected daemon/socket activity and enablement during
+  package upgrades, including stopped services in the PPA hooks.
+- Require recorded IR template provenance before using IR identity evidence.
+  Faces and the CLI explain compatible, missing and unknown IR coverage without
+  guessing provenance for old scans or removing existing RGB data.
+- Avoid duplicate login scans except after an explicit pre-authentication
+  unseal refusal, and report camera contention with actionable feedback.
+- Correct package descriptions for removed head gestures and persistent face
+  retry limits; password login remains available.
 - Refresh TUI camera choices on device changes, reject a switch whose device
   changed during confirmation, and show failed or expired observations as
   unavailable. Live daemon worker status remains observable during TUI dialogs.
@@ -3241,7 +3263,8 @@ is always the fallback: no lockout, ever.
   credentials).
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.11.3...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/archledger/irlume/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/archledger/irlume/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/archledger/irlume/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/archledger/irlume/compare/v0.11.0...v0.11.1

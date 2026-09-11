@@ -15,7 +15,8 @@ description: |
   IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed
   keyring unlock with algorithmic IR liveness. Regular RGB webcams get screen
   unlock; a fingerprint reader can join as a companion factor. Thin PAM module
-  + privileged daemon; YuNet + AuraFace. Password is always the fallback.
+  + privileged daemon with face detection, recognition and liveness models.
+  Face authentication has a persistent retry limit; password login remains available.
 vendor: irlume
 homepage: https://github.com/archledger/irlume
 license: GPL-3.0-or-later

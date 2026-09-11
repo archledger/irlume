@@ -27,8 +27,9 @@ Description: Windows Hello-style face login for Linux
  IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed
  keyring unlock with algorithmic IR liveness. Regular RGB webcams get screen
  unlock; a fingerprint reader can join as a companion factor. Thin PAM module
- plus privileged daemon; YuNet detection + AuraFace recognition. Password is
- always the fallback - no lockout.
+ plus privileged daemon with face detection, recognition and liveness models.
+ Password login remains available when face authentication is unavailable
+ or retry-limited.
  .
  Bundles onnxruntime (>= 1.24) under /opt/irlume because irlume needs a newer
  runtime than the Ubuntu archive ships. Model weights install to

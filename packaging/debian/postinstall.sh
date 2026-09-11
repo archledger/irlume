@@ -79,5 +79,5 @@ irlume installed. Next steps:
   sudo irlume login enable --apply   # opt-in: wire greeter/lock screen
 (most Hello cameras need no emitter step; if IR frames stay dark,
  sudo irlume ir-setup writes to the camera and tells you so first)
-Password is always the fallback; no lockout.
+Password login remains available when face authentication is retry-limited.
 EOF

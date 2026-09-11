@@ -1,6 +1,6 @@
 # Head-gesture removal
 
-Head gestures are removed in the unreleased source build after 0.11.3. Face
+Head gestures are removed in 0.12.0. Face
 authentication no longer watches for nods or shakes before or after matching.
 The change removes an optional intent step; it does not change recognition
 thresholds, passive PAD, IR provenance, camera binding, retry accounting, or the

@@ -72,9 +72,10 @@ machine has: an infrared (Windows Hello) camera enables the secure tier
 while a regular RGB webcam enables convenient screen unlock, and a
 fingerprint reader can join as a companion factor. A thin PAM module talks
 to a privileged daemon that owns the camera and runs a clean-license model
-stack. Gesture-gated requests use head nodding to approve and a head shake to
-decline; passive PAD remains separate. Password is always the fallback; no
-lockout.
+stack. Privileged face authentication requests require typed confirmation by
+default; the machine owner can explicitly waive it. Face authentication has a persistent retry
+limit, while password login remains available. The TUI provides setup,
+configuration, recovery controls, and current daemon observations.
 
 %package selinux
 Summary:        SELinux policy module for irlume

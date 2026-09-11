@@ -248,6 +248,22 @@ jobs:
           python3 scripts/test-package-service-hooks.py
           python3 scripts/test-check-upgrade-service-state.py
 
+      - name: PPA native maintainer hook regressions
+        env:
+          # Match the supported PPA series and packaging/ppa/build-ppa-container.sh.
+          # Noble's older debhelper emits different removal hooks for --no-start.
+          PPA_IMAGE: docker.io/library/ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
+        run: |
+          docker run --rm --memory=1g --cpus=2 --pids-limit=256 \
+            --security-opt=no-new-privileges \
+            -v "$PWD:/src:ro" -w /src "$PPA_IMAGE" bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends python3 debhelper init-system-helpers
+              dpkg-query -W python3 debhelper init-system-helpers
+              python3 scripts/test-ppa-service-hooks.py
+            '
+
       - name: test (TPM-gated, against swtpm)
         env:
           IRLUME_TCTI: swtpm:host=127.0.0.1,port=2321

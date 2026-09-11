@@ -59,6 +59,11 @@ checklist](../docs/RELEASING.md); recipe parity alone does not validate installa
   to build, and left Ubuntu users on 0.6.0 for four days unnoticed; this is the
   only lane where a green upload and a broken package look the same from the
   maintainer's side.
+  PPA upgrades restart an already running daemon/socket while preserving units
+  that an administrator stopped, disabled or masked. A first installation still
+  enables and starts them, subject to the system's service-start policy.
+  Reconciliation keeps its existing upgrade behavior. After an aborted removal,
+  a stopped daemon stays stopped until an administrator starts it again.
 - **Debian** (and Ubuntu series the PPA doesn't cover), `debian/` via nfpm or
   dpkg-buildpackage: **bundles onnxruntime** (the archive ships 1.22; irlume
   needs ≥1.24); ships the AppArmor profile; PAM to the multiarch dir. The

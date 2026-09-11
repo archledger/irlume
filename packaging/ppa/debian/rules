@@ -30,6 +30,13 @@ override_dh_auto_clean:
 override_dh_clean:
 	dh_clean -Xvendor/
 
+# Restart the daemon/socket only if already running. Explicitly combine these
+# flags: --no-start alone also suppresses the default restart-after-upgrade.
+# Keep the reconcile oneshot/path/timer's existing upgrade activation.
+override_dh_installsystemd:
+	dh_installsystemd --no-start --restart-after-upgrade irlumed.service irlumed.socket
+	dh_installsystemd irlume-reconcile.path irlume-reconcile.service irlume-reconcile.timer
+
 override_dh_auto_install:
 	install -D -m0644 packaging/polkit/org.irlume.enroll.policy \
 		debian/irlume/usr/share/polkit-1/actions/org.irlume.enroll.policy

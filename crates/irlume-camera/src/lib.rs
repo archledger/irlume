@@ -5582,9 +5582,11 @@ impl IrCamera {
         )
     }
 
-    /// Start a fixed-startup IR-only session bound to a previously validated
-    /// configured target. The target is revalidated before any stream or
-    /// metadata endpoint is opened; explicit metadata absence never discovers.
+    /// Start an adaptive-startup IR-only session bound to a previously validated
+    /// configured target. A full delivered-rate window remains mandatory; only
+    /// the unconditional startup flush is avoided when that window meets the
+    /// floor. The target is revalidated before any stream or metadata endpoint
+    /// is opened; explicit metadata absence never discovers.
     ///
     /// # Errors
     /// Returns target-change, camera, metadata, privacy, emitter, or capture errors.
@@ -5593,18 +5595,12 @@ impl IrCamera {
         target: &IrCaptureTarget,
         control: &CaptureControl,
     ) -> irlume_common::Result<IrSession<'a>> {
-        if self.device != target.endpoint() {
-            return Err(Error::Hardware(
-                "opened IR camera does not match validated target".into(),
-            ));
-        }
-        target
-            .validate()
-            .map_err(|error| Error::Hardware(error.to_string()))?;
-        self.session_with_control_startup_metadata(
-            control,
-            IrSessionStartup::Fixed,
-            target.metadata_selection(),
+        target.session_with(
+            &self.device,
+            || target.validate(),
+            |startup, metadata| {
+                self.session_with_control_startup_metadata(control, startup, metadata)
+            },
         )
     }
 
@@ -11132,7 +11128,7 @@ mod tests {
         }
     }
 
-    struct QueuedContinuityFixture {
+    pub(super) struct QueuedContinuityFixture {
         payload: [u8; 1],
         metadata: std::collections::VecDeque<v4l::buffer::Metadata>,
     }
@@ -11164,7 +11160,7 @@ mod tests {
         }
     }
 
-    fn rate_fill_fixture(
+    pub(super) fn rate_fill_fixture(
         role: contracts::StreamRole,
         frames: u32,
         interval_us: i64,

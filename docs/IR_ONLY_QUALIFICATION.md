@@ -223,7 +223,12 @@ does not grant from the diagnostic category. Camera-free preflight establishes
 prerequisites only. The existing product windows remain 15 seconds for login/lock
 and 5 seconds for short privileged services; a measured fixed-startup Minihost
 empty-view capture of about 5.5 seconds exceeded that short window before identity.
-The policy does not silently extend a window, adopt adaptive startup, or revive
+The target-bound IR route now uses the existing adaptive startup strategy: it
+measures the full 30-interval rate window first and uses up to ten additional
+dequeues if that window is too slow. The rate floor, continuity, metadata binding
+and all downstream authentication checks remain in place. This replaces the
+original integration's fixed startup; the historical Minihost measurement above
+describes that earlier behavior. It does not extend a window or revive
 stock-desktop hands-free scanning. This integration coverage permits explicit
 experimental opt-in; it does not qualify a device, participant group, or population.
 

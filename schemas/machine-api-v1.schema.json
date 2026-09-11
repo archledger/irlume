@@ -434,13 +434,17 @@
           }
         },
         "camera": {
-          "description": "Camera capability, never camera identity. Device nodes are not published by any machine command.",
+          "description": "Camera capability, never camera identity. Status does not publish device nodes; the explicit camera census does.",
           "type": "object",
           "required": [
             "rgb",
             "ir"
           ],
           "properties": {
+            "known": {
+              "description": "Whether a daemon Health observation was obtained. When false, rgb and ir only report whether configured device nodes exist. Optional for compatibility with older contract 1 engines.",
+              "type": "boolean"
+            },
             "rgb": {
               "type": "boolean"
             },
@@ -451,6 +455,10 @@
         },
         "fingerprint": {
           "description": "Whether a fingerprint reader was found.",
+          "type": "boolean"
+        },
+        "fingerprint_known": {
+          "description": "Whether the bounded tooling and reader probe completed. When false, fingerprint=false means unknown, not confirmed absent. Optional for compatibility with older contract 1 engines.",
           "type": "boolean"
         }
       }

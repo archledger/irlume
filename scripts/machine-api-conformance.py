@@ -29,6 +29,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -78,10 +79,28 @@ STREAMING_CAPABILITY_REFUSALS = {
 
 # Commands whose output must never contain these, per the security and privacy
 # section of docs/MACHINE-API.md. Camera device nodes and PAM file paths are the
-# two that a well-meaning addition would most plausibly reintroduce.
+# two that a well-meaning addition would most plausibly reintroduce. The census
+# explicitly publishes video nodes in its entries; only that field is exempt.
 FORBIDDEN_SUBSTRINGS = ["/dev/video", "/etc/pam.d", "/usr/lib/pam.d"]
 
 CONTRACT = 1
+
+
+def forbidden_paths(document, capability):
+    """Check path privacy without rejecting the census's documented node field."""
+    checked = copy.deepcopy(document)
+    if (capability == "camera-census" and checked.get("command") == "camera.census"
+            and checked.get("ok") is True):
+        data = checked.get("data")
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict):
+                    node = entry.get("node")
+                    if isinstance(node, str) and re.fullmatch(r"/dev/video[0-9]+", node):
+                        entry["node"] = None
+    encoded = json.dumps(checked)
+    return [path for path in FORBIDDEN_SUBSTRINGS if path in encoded]
 
 
 class Results:
@@ -316,7 +335,7 @@ def check_engine(results, binary, validate, validate_note):
         if not document["ok"] and proc.returncode == 0:
             results.fail(what, "error document with exit 0")
             continue
-        leaked = [s for s in FORBIDDEN_SUBSTRINGS if s in proc.stdout]
+        leaked = forbidden_paths(document, capability)
         if leaked:
             results.fail(what, f"output contains paths the contract does not publish: {leaked}")
             continue

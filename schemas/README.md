@@ -30,6 +30,12 @@ consumer can build against documents irlume actually wrote rather than documents
 someone imagined, which is a mistake that has already reached a downstream
 project.
 
+The `status-observations-*.json` fixtures were captured with 0.12.0 and cover
+the additive `camera.known` and `fingerprint_known` fields. The older status
+fixtures remain to verify that these fields are optional within contract 1.
+`camera-census.json` was captured on the same engine with physical video nodes,
+covering the census's documented device paths even on camera-free CI runners.
+
 Two things are not verbatim, and both are deliberate:
 
 - profile and scan display names are replaced with placeholders, because they

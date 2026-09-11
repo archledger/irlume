@@ -128,7 +128,47 @@ pub(crate) enum TuiState {
 }
 
 pub(crate) fn tui_state() -> Option<TuiState> {
-    let flavors = detect_flavors(Path::new("/"), detection_home().as_deref());
+    tui_state_for_home(detection_home().as_deref())
+}
+
+/// A bounded observation for the background TUI worker. A failed NSS lookup
+/// leaves status unknown; it must not turn an existing install into absence.
+pub(crate) fn tui_observation() -> std::io::Result<Option<TuiState>> {
+    let home =
+        observation_home(std::time::Instant::now() + std::time::Duration::from_millis(1500))?;
+    Ok(tui_state_for_home(home.as_deref()))
+}
+
+fn observation_home(deadline: std::time::Instant) -> std::io::Result<Option<PathBuf>> {
+    if crate::is_root() {
+        if let Ok(user) = std::env::var("SUDO_USER") {
+            if !user.is_empty() {
+                return passwd_home_until(Path::new("getent"), &user, deadline).map(Some);
+            }
+        }
+    }
+    Ok(std::env::var_os("HOME").map(PathBuf::from))
+}
+
+fn passwd_home_until(
+    helper: &Path,
+    user: &str,
+    deadline: std::time::Instant,
+) -> std::io::Result<PathBuf> {
+    let out = irlume_common::process::output_until(
+        std::process::Command::new(helper).args(["passwd", user]),
+        deadline,
+    )?;
+    if out.status.success() {
+        if let Some(home) = parse_passwd_home(&String::from_utf8_lossy(&out.stdout)) {
+            return Ok(home);
+        }
+    }
+    Err(std::io::Error::other("invoking user's home is unavailable"))
+}
+
+fn tui_state_for_home(home: Option<&Path>) -> Option<TuiState> {
+    let flavors = detect_flavors(Path::new("/"), home);
     if flavors.is_empty() {
         return None;
     }
@@ -445,6 +485,38 @@ fn print_app_steps() {
 mod tests {
     use super::{classify_policy, detect_flavors, Flavor, PolicyState, POLICY};
     use std::path::Path;
+
+    #[test]
+    fn bounded_home_observation_reports_relocated_home_and_helper_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("irlume-bitwarden-nss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("getent");
+        std::fs::write(&helper, "#!/bin/sh\ncase \"$2\" in\n slow) exec /bin/sleep 5;;\n missing) exit 2;;\n malformed) printf 'garbage\\n';;\n *) printf '%s:x:1000:1000::/srv/relocated:/bin/sh\\n' \"$2\";;\nesac\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let valid =
+            super::passwd_home_until(&helper, "testuser", Instant::now() + Duration::from_secs(1));
+        let missing =
+            super::passwd_home_until(&helper, "missing", Instant::now() + Duration::from_secs(1));
+        let malformed = super::passwd_home_until(
+            &helper,
+            "malformed",
+            Instant::now() + Duration::from_secs(1),
+        );
+        let started = Instant::now();
+        let slow = super::passwd_home_until(&helper, "slow", started + Duration::from_millis(75));
+        let elapsed = started.elapsed();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(valid.unwrap(), Path::new("/srv/relocated"));
+        assert!(missing.is_err());
+        assert!(malformed.is_err());
+        assert_eq!(slow.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "NSS cannot leave the observer in flight indefinitely"
+        );
+    }
 
     #[test]
     fn embedded_policy_declares_the_expected_action() {

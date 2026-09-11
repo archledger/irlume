@@ -777,6 +777,11 @@ pub enum Request {
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.
     HasSealedPassword { user: String },
+    /// Describe the sealed envelope without reading live PCRs or opening the
+    /// TPM. Returns `KeyringInfo` with `drifted: None`. Routine status clients
+    /// should use this and fall back to `HasSealedPassword` on old daemons.
+    /// Unprivileged: root or `user`.
+    KeyringMetadata { user: String },
     /// Describe `user`'s sealed-password envelope: whether one is armed and,
     /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer
     /// sibling of `HasSealedPassword` for status surfaces (the envelope file
@@ -1352,9 +1357,10 @@ pub enum Response {
     },
     /// Whether a sealed password exists (`HasSealedPassword`).
     HasPassword(bool),
-    /// Envelope detail (`KeyringInfo`). `policy` is `None` and `pcrs` empty
-    /// when nothing is armed (or the envelope is unreadable); `drifted` is
-    /// `None` when there is nothing to compare or the PCR replay failed.
+    /// Envelope detail (`KeyringInfo` or `KeyringMetadata`). `policy` is `None`
+    /// and `pcrs` empty when nothing is armed (or the envelope is unreadable); `drifted` is
+    /// `None` for metadata-only requests, when there is nothing to compare,
+    /// or when the PCR replay failed.
     KeyringInfo {
         armed: bool,
         #[serde(default)]

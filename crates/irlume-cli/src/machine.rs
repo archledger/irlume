@@ -11,6 +11,7 @@ use irlume_common::{OperationErrorCode, ProfileSummary, Request, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 /// Lowest contract this build can speak.
 pub const CONTRACT_MIN: u32 = 1;
@@ -354,9 +355,9 @@ pub fn version(args: &[String]) -> ExitCode {
 /// Deliberately narrower than the human `status`. It omits camera device paths
 /// and the account name: a consumer needs to know whether an IR camera is
 /// usable, not which node it is, and it already knows which account it asked
-/// about. Everything here is derived from the same sources the human command
-/// reads, so the two cannot disagree about the machine's state, only about how
-/// it is worded.
+/// about. The observations use the same sources as the human command, with a
+/// shorter shared deadline. A field can remain unknown here when a longer
+/// interactive query would complete.
 pub fn status(args: &[String]) -> ExitCode {
     const COMMAND: &str = "status";
     let contract = match negotiate(args) {
@@ -386,19 +387,83 @@ pub fn status(args: &[String]) -> ExitCode {
     // Reachability is reported, not fatal: a consumer wants to render "the
     // daemon is not answering" rather than receive an error with no detail, and
     // the fields that do not need the daemon are still worth having.
-    let daemon = match crate::commands::daemon_reach() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let reach = crate::commands::classify_reach(irlume_common::client::request_until(
+        &Request::Ping,
+        deadline,
+    ));
+    let daemon = match reach {
         crate::commands::DaemonReach::Running => "running",
         crate::commands::DaemonReach::Starting => "starting",
         crate::commands::DaemonReach::AccessDenied => "access-denied",
         crate::commands::DaemonReach::Down => "unreachable",
     };
 
+    // Only a ready daemon receives follow-up observations. All requests share
+    // the same deadline; a slow profile load cannot multiply the total budget.
+    let observe = |request: &Request| {
+        if reach == crate::commands::DaemonReach::Running {
+            irlume_common::client::request_until(request, deadline).ok()
+        } else {
+            None
+        }
+    };
+    // Observe Health once. Management status never needs to open cameras; a
+    // configured-path fallback remains explicitly unobserved.
+    let camera = match observe(&Request::Health) {
+        Some(Response::Health {
+            tier,
+            rgb_dev,
+            ir_dev,
+            ..
+        }) => json!({
+            "known": true,
+            "rgb": (rgb_dev.is_some() || tier == "secure") && rgb_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
+            "ir": tier == "secure" && ir_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
+        }),
+        _ => {
+            let pair = irlume_camera::configured_pair_no_probe();
+            json!({
+                "known": false,
+                "rgb": pair.as_ref().is_some_and(|(rgb, _)| std::path::Path::new(rgb).exists()),
+                "ir": pair.as_ref().is_some_and(|(_, ir)| std::path::Path::new(ir).exists()),
+            })
+        }
+    };
+    let keyring = match observe(&Request::KeyringMetadata { user: user.clone() }) {
+        Some(Response::KeyringInfo { armed, policy, .. }) => {
+            json!({ "known": true, "armed": armed, "policy": policy })
+        }
+        // Upgrade compatibility: old daemons do not know KeyringMetadata.
+        // Never fall back to the live PCR diagnostic merely to render status.
+        Some(Response::Error(_)) => {
+            match observe(&Request::HasSealedPassword { user: user.clone() }) {
+                Some(Response::HasPassword(armed)) => {
+                    json!({ "known": true, "armed": armed, "policy": null })
+                }
+                _ => json!({ "known": false }),
+            }
+        }
+        _ => json!({ "known": false }),
+    };
+    let (templates, recovery) = match observe(&Request::RecoveryStatus { user: user.clone() }) {
+        Some(Response::RecoveryStatus {
+            encrypted,
+            recovery_set,
+            key_present,
+            ..
+        }) => (
+            json!(if encrypted { "encrypted" } else { "plaintext" }),
+            json!({ "known": true, "passphrase_set": recovery_set, "key_present": key_present }),
+        ),
+        _ => (json!("unknown"), json!({ "known": false })),
+    };
     let method = irlume_core::policy::method();
-    let enrollment = match crate::daemon_request(&Request::ListProfiles {
+    let enrollment = match observe(&Request::ListProfiles {
         user: user.clone(),
         structured_errors: true,
     }) {
-        Ok(Response::Enrollment { profiles, .. }) => {
+        Some(Response::Enrollment { profiles, .. }) => {
             let scans: usize = profiles.iter().map(|p| p.scans.len()).sum();
             json!({ "known": true, "profiles": profiles.len(), "scans": scans })
         }
@@ -407,51 +472,7 @@ pub fn status(args: &[String]) -> ExitCode {
         _ => json!({ "known": false }),
     };
 
-    let keyring = match crate::daemon_request(&Request::KeyringInfo { user: user.clone() }) {
-        Ok(Response::KeyringInfo { armed, policy, .. }) => {
-            json!({ "known": true, "armed": armed, "policy": policy })
-        }
-        _ => json!({ "known": false }),
-    };
-
-    let (templates, recovery) = match crate::daemon_request(&Request::RecoveryStatus { user }) {
-        Ok(Response::RecoveryStatus {
-            encrypted,
-            recovery_set,
-            key_present,
-            ..
-        }) => (
-            // `templates` stays the documented STRING with its two values, so a
-            // contract 1 consumer is unaffected. The orphaned case rides along
-            // on `recovery.key_present`, an ADDED field, which contract 1
-            // permits; a new enum value in `templates` would not be.
-            json!(if encrypted { "encrypted" } else { "plaintext" }),
-            json!({
-                "known": true,
-                "passphrase_set": recovery_set,
-                "key_present": key_present,
-            }),
-        ),
-        _ => (json!("unknown"), json!({ "known": false })),
-    };
-
-    // Camera capability, not camera identity: whether each spectrum resolved to
-    // a device that is actually THERE, never which one.
-    //
-    // Emptiness is not the test. `select_pair` falls back to the compiled
-    // default node names when discovery finds nothing, so the strings are never
-    // empty and this reported `{"rgb":true,"ir":true}` on a machine with no
-    // camera at all: in a container, on a desktop without one, or before the
-    // nodes appear at boot. A consumer reading that offers face setup, or shows
-    // Secure-tier hardware, that does not exist. The daemon's own Health reply
-    // has always paired the capability probe with an existence check; this now
-    // agrees with it.
-    let caps = crate::caps();
-    let (rgb, ir) = crate::camera_pair();
-    let camera = json!({
-        "rgb": caps.rgb && std::path::Path::new(&rgb).exists(),
-        "ir": caps.ir_pair && std::path::Path::new(&ir).exists(),
-    });
+    let fingerprint = irlume_fingerprint::available_until(deadline);
 
     emit(
         &success(
@@ -469,7 +490,8 @@ pub fn status(args: &[String]) -> ExitCode {
                 // it: fprintd present AND a reader present, the same predicate
                 // doctor's line and its `fingerprint-reader` check use. Naming
                 // the device is a narrower question and disagreed with both.
-                "fingerprint": irlume_fingerprint::available(),
+                "fingerprint": fingerprint.unwrap_or(false),
+                "fingerprint_known": fingerprint.is_some(),
             }),
             contract,
         ),

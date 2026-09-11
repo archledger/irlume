@@ -3198,13 +3198,14 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             },
             enrollment: Reads,
         },
-        HasSealedPassword { user } | KeyringInfo { user } | RecoveryStatus { user } => {
-            RequestPosture {
-                privilege: RootOrTarget { verb: "query" },
-                user: Some(user.as_str()),
-                enrollment: Reads,
-            }
-        }
+        HasSealedPassword { user }
+        | KeyringMetadata { user }
+        | KeyringInfo { user }
+        | RecoveryStatus { user } => RequestPosture {
+            privilege: RootOrTarget { verb: "query" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
         SealPassword { user, .. } => RequestPosture {
             privilege: RootOrTarget {
                 verb: "seal password for",
@@ -3818,6 +3819,7 @@ fn dispatch_status_with_diagnostics(
         Request::HasSealedPassword { user } => {
             Response::HasPassword(irlume_core::keyring::has_sealed_password(user))
         }
+        Request::KeyringMetadata { user } => keyring_info(user, |_| None),
         Request::RecoveryStatus { user } => {
             Response::RecoveryStatus {
                 // The store's own shape, not the key's presence: those differ
@@ -3850,6 +3852,31 @@ fn dispatch_status_with_diagnostics(
         }
         _ => return None,
     })
+}
+
+/// Read the envelope once. Only the worker's explicit diagnostic request supplies
+/// a TPM-backed observer; metadata status always supplies a no-op observer.
+fn keyring_info(
+    user: &str,
+    diagnose: impl FnOnce(&irlume_core::envelope::SealedEnvelope) -> Option<bool>,
+) -> Response {
+    let armed = irlume_core::keyring::has_sealed_password(user);
+    match irlume_core::envelope::SealedEnvelope::load(&irlume_core::keyring::envelope_path(user)) {
+        Ok(env) => Response::KeyringInfo {
+            armed,
+            policy: Some(env.policy.describe()),
+            pcrs: env.pcrs.clone(),
+            drifted: diagnose(&env),
+            kind: Some(crate::users::core_to_wire_kind(env.secret)),
+        },
+        Err(_) => Response::KeyringInfo {
+            armed,
+            policy: None,
+            pcrs: Vec::new(),
+            drifted: None,
+            kind: None,
+        },
+    }
 }
 
 /// Probe rounds when nobody sized the run explicitly. Enough that one unlucky
@@ -4368,6 +4395,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | TraceSubscribe { .. }
         | SealPassword { .. }
         | HasSealedPassword { .. }
+        | KeyringMetadata { .. }
         | KeyringInfo { .. }
         | ForgetPassword { .. }
         | ReleaseTokenForDisarm { .. }
@@ -4574,6 +4602,7 @@ fn dispatch_scoped_session_inner(
         | Request::FaceSensorStatus { user: None }
         | Request::PreferencesStatus
         | Request::HasSealedPassword { .. }
+        | Request::KeyringMetadata { .. }
         | Request::RecoveryStatus { .. }
         | Request::SupportSnapshot { .. }
         | Request::TraceSubscribe { .. } => {
@@ -4597,33 +4626,12 @@ fn dispatch_scoped_session_inner(
                 ir_readiness: Some(readiness),
             }
         }
-        Request::KeyringInfo { user } => {
-            let armed = irlume_core::keyring::has_sealed_password(&user);
-            let path = irlume_core::keyring::envelope_path(&user);
-            match irlume_core::envelope::SealedEnvelope::load(&path) {
-                Ok(env) => Response::KeyringInfo {
-                    armed,
-                    policy: Some(env.policy.describe()),
-                    pcrs: env.pcrs.clone(),
-                    // None when the envelope carries no PCR snapshot or the
-                    // replay failed; the CLI then just omits the drift note.
-                    drifted: irlume_core::tpm::diagnose_pcrs(&env)
-                        .ok()
-                        .filter(|_| !env.pcr_values.is_empty())
-                        .map(|d| !d.is_empty()),
-                    kind: Some(crate::users::core_to_wire_kind(env.secret)),
-                },
-                // Not armed, or the envelope is unreadable/corrupt: report the
-                // armed bit alone rather than failing the whole query.
-                Err(_) => Response::KeyringInfo {
-                    armed,
-                    policy: None,
-                    pcrs: Vec::new(),
-                    drifted: None,
-                    kind: None,
-                },
-            }
-        }
+        Request::KeyringInfo { user } => keyring_info(&user, |env| {
+            irlume_core::tpm::diagnose_pcrs(env)
+                .ok()
+                .filter(|_| !env.pcr_values.is_empty())
+                .map(|d| !d.is_empty())
+        }),
         Request::ListProfiles {
             user,
             structured_errors,
@@ -7675,6 +7683,7 @@ mod tests {
             have_password: false,
         },
         HasSealedPassword => Request::HasSealedPassword { user: u() },
+        KeyringMetadata => Request::KeyringMetadata { user: u() },
         KeyringInfo => Request::KeyringInfo { user: u() },
         ForgetPassword => Request::ForgetPassword { user: u() },
         ReleaseTokenForDisarm => Request::ReleaseTokenForDisarm {
@@ -8959,6 +8968,7 @@ mod tests {
             Request::Ping,
             Request::Health,
             Request::HasSealedPassword { user: u() },
+            Request::KeyringMetadata { user: u() },
             Request::RecoveryStatus { user: u() },
             Request::ListProfiles {
                 user: u(),
@@ -12482,6 +12492,82 @@ mod tests {
             !irlume_core::keyring::envelope_path("carol").exists(),
             "ForgetPassword must remove the envelope file"
         );
+    }
+
+    #[test]
+    fn keyring_metadata_is_authorized_status_without_live_diagnosis() {
+        let _g = env_lock();
+        let _sb = sandbox("krmetadata");
+        let req: Request = serde_json::from_str(r#"{"KeyringMetadata":{"user":"carol"}}"#)
+            .expect("metadata status must be supported");
+        assert_eq!(arbiter::classify(&req), arbiter::Class::Status);
+        assert!(matches!(
+            dispatch_status(&req, &peer(NOBODY)),
+            Some(Response::Error(_))
+        ));
+        assert!(matches!(
+            dispatch_status(&req, &peer(0)),
+            Some(Response::KeyringInfo {
+                armed: false,
+                policy: None,
+                drifted: None,
+                ..
+            })
+        ));
+        plant_fake_envelope("carol");
+        assert!(matches!(
+            dispatch_status(&req, &peer(0)),
+            Some(Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                drifted: None,
+                ..
+            })
+        ));
+        let envelope = irlume_core::envelope::SealedEnvelope {
+            version: 1,
+            policy: irlume_core::envelope::PolicyKind::PcrLiteral,
+            secret: irlume_core::envelope::SecretKind::LoginPassword,
+            pcrs: vec![7],
+            public: Vec::new(),
+            private: Vec::new(),
+            pcr_values: vec![irlume_core::envelope::PcrValue {
+                pcr: 7,
+                value: vec![0; 32],
+            }],
+            password_wrap: None,
+        };
+        let path = irlume_core::keyring::envelope_path("carol");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        assert!(
+            matches!(dispatch_status(&req, &peer(0)), Some(Response::KeyringInfo {
+            armed: true, policy: Some(_), drifted: None, kind: Some(_), pcrs,
+        }) if pcrs == [7])
+        );
+        // The live request still uses its observer after loading the same
+        // envelope; a metadata response has no such observer to invoke.
+        assert!(matches!(
+            keyring_info("carol", |_| Some(true)),
+            Response::KeyringInfo {
+                drifted: Some(true),
+                ..
+            }
+        ));
+        let mut unsupported = serde_json::to_value(&envelope).unwrap();
+        unsupported["version"] = serde_json::json!(999);
+        std::fs::write(path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        assert!(matches!(
+            keyring_info("carol", |_| panic!(
+                "unsupported envelope must not be diagnosed"
+            )),
+            Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                drifted: None,
+                ..
+            }
+        ));
     }
 
     #[test]

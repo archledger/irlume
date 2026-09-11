@@ -258,3 +258,22 @@ python3 scripts/test-check-upgrade-auth.py
 python3 scripts/test-check-upgrade-service-state.py
 python3 scripts/test-package-service-hooks.py
 ```
+
+On the PPA's supported Ubuntu 26.04 (Resolute) development system with
+`python3`, `debhelper` and `init-system-helpers` installed, also run:
+
+```sh
+python3 scripts/test-ppa-service-hooks.py
+```
+
+CI runs this command in the same digest-pinned Resolute base as
+`packaging/ppa/build-ppa-container.sh`, installs those dependencies inside the
+disposable container and records their versions. Older Debian/Ubuntu debhelper
+versions generate different hooks and do not represent the supported PPA lane.
+
+This generates the PPA's real maintainer scripts in a temporary package tree
+and exercises them with isolated service and policy boundaries. It covers
+stopped/running units, first-install ordering, policy refusal, masks, removal
+and bounded abort recovery. It does not install packages or replace the real
+systemd state procedure above. The PPA test has separate dependencies so the
+Debian/Arch hook regressions remain runnable without debhelper.

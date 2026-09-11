@@ -6,8 +6,8 @@
 use irlume_common::diagnostics::{
     CaptureStatus, CategoricalOutcome, DiagnosticSink, OperationClass, OperationId,
     SanitizedCameraContext, ShareSafeEvent, ShareSafeEventKind, SupportSnapshot, TraceEventKind,
-    TraceLimits, TraceRecord, TraceWarning, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS,
-    MAX_TRACE_LINE_BYTES, TRACE_SCHEMA_VERSION,
+    TraceLimits, TraceRecord, TraceWarning, CURRENT_TRACE_SCHEMA_VERSION,
+    LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
@@ -55,6 +55,7 @@ struct TraceSubscriber {
     inner: Mutex<TraceInner>,
     limits: TraceLimits,
     started_ms: u64,
+    trace_schema: u32,
 }
 
 struct TraceInner {
@@ -74,6 +75,7 @@ pub(crate) struct TraceSubscription {
 pub(crate) enum TraceSubscribeError {
     NotRoot,
     Busy,
+    UnsupportedSchema,
 }
 
 #[derive(Default)]
@@ -175,18 +177,32 @@ impl DiagnosticState {
         &self,
         peer_uid: u32,
         duration_ms: u64,
+        trace_schema: Option<u32>,
     ) -> Result<TraceSubscription, TraceSubscribeError> {
-        self.subscribe_trace_with_capacity(peer_uid, duration_ms, TRACE_CHANNEL_CAPACITY)
+        self.subscribe_trace_with_capacity(
+            peer_uid,
+            duration_ms,
+            trace_schema,
+            TRACE_CHANNEL_CAPACITY,
+        )
     }
 
     fn subscribe_trace_with_capacity(
         &self,
         peer_uid: u32,
         duration_ms: u64,
+        trace_schema: Option<u32>,
         capacity: usize,
     ) -> Result<TraceSubscription, TraceSubscribeError> {
         if peer_uid != 0 {
             return Err(TraceSubscribeError::NotRoot);
+        }
+        let trace_schema = trace_schema.unwrap_or(LEGACY_TRACE_SCHEMA_VERSION);
+        if !matches!(
+            trace_schema,
+            LEGACY_TRACE_SCHEMA_VERSION | CURRENT_TRACE_SCHEMA_VERSION
+        ) {
+            return Err(TraceSubscribeError::UnsupportedSchema);
         }
         let mut active = self
             .shared
@@ -209,6 +225,7 @@ impl DiagnosticState {
             }),
             limits,
             started_ms: monotonic_ms(),
+            trace_schema,
         });
         *active = Some(Arc::downgrade(&subscriber));
         drop(active);
@@ -319,6 +336,11 @@ impl DiagnosticState {
 
 impl TraceSubscriber {
     fn emit(&self, operation_id: OperationId, operation: OperationClass, kind: TraceEventKind) {
+        // Vocabulary negotiation is not backpressure: omitted newer events
+        // must not occupy capacity, flush drop markers, or consume sequence IDs.
+        if !kind.supports_schema(self.trace_schema) {
+            return;
+        }
         let mut inner = self
             .inner
             .lock()
@@ -403,7 +425,7 @@ impl TraceSubscriber {
     ) -> TraceRecord {
         let monotonic_ms = monotonic_ms();
         TraceRecord {
-            trace_schema: TRACE_SCHEMA_VERSION,
+            trace_schema: self.trace_schema,
             sequence,
             monotonic_us: monotonic_ms
                 .saturating_sub(self.started_ms)
@@ -731,22 +753,150 @@ mod tests {
     fn trace_subscription_is_root_only_and_single_owner() {
         let state = DiagnosticState::default();
         assert!(matches!(
-            state.subscribe_trace(1_000, 60_000),
+            state.subscribe_trace(1_000, 60_000, None),
             Err(TraceSubscribeError::NotRoot)
         ));
-        let subscription = state.subscribe_trace(0, 60_000).unwrap();
+        let subscription = state.subscribe_trace(0, 60_000, None).unwrap();
         assert!(matches!(
-            state.subscribe_trace(0, 60_000),
+            state.subscribe_trace(0, 60_000, None),
             Err(TraceSubscribeError::Busy)
         ));
         drop(subscription);
-        assert!(state.subscribe_trace(0, 60_000).is_ok());
+        assert!(state.subscribe_trace(0, 60_000, None).is_ok());
+    }
+
+    #[test]
+    fn trace_negotiation_defaults_to_legacy_and_rejects_unknown_versions_without_ownership() {
+        let state = DiagnosticState::default();
+        for unsupported in [0, 3, u32::MAX] {
+            assert!(matches!(
+                state.subscribe_trace(0, 60_000, Some(unsupported)),
+                Err(TraceSubscribeError::UnsupportedSchema)
+            ));
+        }
+        for (requested, expected) in [(None, 1), (Some(1), 1), (Some(2), 2)] {
+            let subscription = state.subscribe_trace(0, 60_000, requested).unwrap();
+            let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+            records.extend(subscription.finish(CategoricalOutcome::Completed));
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|record| record.trace_schema == expected));
+        }
+    }
+
+    #[test]
+    fn modern_trace_delivers_refusal_and_identity_release_timings() {
+        use irlume_common::diagnostics::{TraceRefusalReason, TraceStage};
+        let state = DiagnosticState::default();
+        let subscription = state.subscribe_trace(0, 60_000, Some(2)).unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        let expected = [
+            TraceEventKind::AuthenticationRefusal {
+                reason: TraceRefusalReason::RgbPadPending,
+            },
+            TraceEventKind::StageTiming {
+                stage: TraceStage::IdentityInference,
+                elapsed_us: 12,
+            },
+            TraceEventKind::StageTiming {
+                stage: TraceStage::StreamOwnerRelease,
+                elapsed_us: 34,
+            },
+        ];
+        for event in &expected {
+            operation.emit_trace(event.clone());
+        }
+        let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+        assert_eq!(records.len(), 5);
+        assert!(records.iter().all(|record| record.trace_schema == 2));
+        for (record, expected) in records[1..4].iter().zip(expected) {
+            assert_eq!(record.event, expected);
+            assert_eq!(record.operation_id, operation.operation_id);
+            assert_eq!(record.operation, OperationClass::Authentication);
+        }
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        assert!(records.last().unwrap().terminal);
+    }
+
+    #[test]
+    fn legacy_trace_omits_new_events_before_queue_drop_and_sequence_accounting() {
+        use irlume_common::diagnostics::{TraceRefusalReason, TraceStage};
+        let state = DiagnosticState::default();
+        // The initial record fills this queue. New vocabulary must neither
+        // consume capacity nor be misreported as a lost legacy record.
+        let subscription = state
+            .subscribe_trace_with_capacity(0, 60_000, None, 1)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        for _ in 0..100 {
+            operation.emit_trace(TraceEventKind::AuthenticationRefusal {
+                reason: TraceRefusalReason::RgbPadPending,
+            });
+            for stage in [
+                TraceStage::IdentityInference,
+                TraceStage::StreamOwnerRelease,
+            ] {
+                operation.emit_trace(TraceEventKind::StageTiming {
+                    stage,
+                    elapsed_us: 12,
+                });
+            }
+        }
+        let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+        // Ordinary events still take the next sequence and remain deliverable.
+        operation.emit(selected());
+        records.extend(subscription.receiver.try_iter());
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.trace_schema == 1));
+        assert!(matches!(records[1].event, TraceEventKind::Shared { .. }));
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record.event, TraceEventKind::EventsDropped { .. })));
+        assert!(records.last().unwrap().terminal);
+    }
+
+    #[test]
+    fn legacy_trace_omissions_do_not_flush_or_inflate_real_pending_drops() {
+        use irlume_common::diagnostics::TraceRefusalReason;
+        let state = DiagnosticState::default();
+        let subscription = state
+            .subscribe_trace_with_capacity(0, 60_000, None, 1)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        operation.emit(selected()); // one real event lost while trace_started fills the queue
+        let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+        for _ in 0..100 {
+            operation.emit_trace(TraceEventKind::AuthenticationRefusal {
+                reason: TraceRefusalReason::RgbPadPending,
+            });
+        }
+        assert!(
+            subscription.receiver.try_iter().next().is_none(),
+            "filtered vocabulary must not flush a pending legacy drop marker"
+        );
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+        assert_eq!(records.len(), 3);
+        assert!(matches!(
+            records[1].event,
+            TraceEventKind::EventsDropped { count: 1 }
+        ));
+        assert_eq!(records[2].sequence, 2);
     }
 
     #[test]
     fn slow_trace_reader_never_blocks_producers_and_gets_an_explicit_drop_marker() {
         let state = DiagnosticState::default();
-        let subscription = state.subscribe_trace_with_capacity(0, 60_000, 2).unwrap();
+        let subscription = state
+            .subscribe_trace_with_capacity(0, 60_000, None, 2)
+            .unwrap();
         let operation = state.begin(OperationClass::Authentication);
         let started = std::time::Instant::now();
         for _ in 0..10_000 {
@@ -779,7 +929,7 @@ mod tests {
     #[test]
     fn trace_projects_share_safe_events_with_the_originating_operation_id() {
         let state = DiagnosticState::default();
-        let subscription = state.subscribe_trace(0, 60_000).unwrap();
+        let subscription = state.subscribe_trace(0, 60_000, None).unwrap();
         let operation = state.begin(OperationClass::Enrollment);
         operation.emit(selected());
         operation.finish(CategoricalOutcome::Completed);

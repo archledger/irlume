@@ -195,6 +195,7 @@ pub struct Assessment {
 mod authentication_window;
 pub use authentication_window::AuthenticationWindow;
 mod grouped_auth;
+mod managed_pad;
 
 struct DeferredAssessment<I> {
     assessment: Assessment,
@@ -209,6 +210,13 @@ struct IdentityImage {
 }
 
 type PairIdentity = (Option<IdentityImage>, Option<IdentityImage>);
+
+enum PreparedPairAuthentication {
+    // Already qualified once; final admission must not reset a pending vote by
+    // entering the qualifying eager wrapper again.
+    Ready(Box<Assessment>),
+    Refused(Outcome),
+}
 
 struct PairAssessmentContext<'a> {
     sequential: bool,
@@ -245,6 +253,9 @@ pub enum OutcomeKind {
     NoFace,
     /// Liveness gate returned Uncertain (framing/quality, not an attack).
     Uncertain,
+    /// The live RGB presentation needs more samples for its required PAD vote.
+    /// Retains the retry and account-history semantics of liveness Uncertain.
+    RgbPadPending,
     /// Spoof verdict raised only because RGB saw a face and IR did not. Both a
     /// screen attack and a genuine user mid-settle produce it, so it is the
     /// one Spoof class the grace window may retry (see [`presence_retryable`]).
@@ -1063,7 +1074,10 @@ fn legacy_eye_policy(enrollment: &irlume_core::storage::Enrollment) -> Result<()
 pub fn presence_retryable(o: &Outcome) -> bool {
     matches!(
         o.kind,
-        OutcomeKind::NoFace | OutcomeKind::Uncertain | OutcomeKind::SpoofNoIrFace
+        OutcomeKind::NoFace
+            | OutcomeKind::Uncertain
+            | OutcomeKind::RgbPadPending
+            | OutcomeKind::SpoofNoIrFace
     )
 }
 
@@ -1107,6 +1121,61 @@ fn emit_trace_stage_ms(
             .unwrap_or(u64::MAX)
             .saturating_mul(1_000),
     });
+}
+
+/// Measure work through early returns and unwinding without recording its data
+/// or error text. The scope chooses the exact work included in this interval.
+struct TraceStageTimer<'a> {
+    diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    stage: irlume_common::diagnostics::TraceStage,
+    started: std::time::Instant,
+}
+
+impl<'a> TraceStageTimer<'a> {
+    fn new(
+        diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+        stage: irlume_common::diagnostics::TraceStage,
+    ) -> Self {
+        Self {
+            diagnostics,
+            stage,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for TraceStageTimer<'_> {
+    fn drop(&mut self) {
+        self.diagnostics
+            .emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+                stage: self.stage,
+                elapsed_us: u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            });
+    }
+}
+
+fn emit_authentication_refusal(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    outcome: &Outcome,
+) {
+    use irlume_common::diagnostics::{TraceEventKind, TraceRefusalReason};
+    if outcome.granted {
+        return;
+    }
+    let reason = match outcome.kind {
+        OutcomeKind::Granted => return,
+        OutcomeKind::RgbPadPending => TraceRefusalReason::RgbPadPending,
+        OutcomeKind::NoFace => TraceRefusalReason::NoFace,
+        OutcomeKind::Uncertain => TraceRefusalReason::Uncertain,
+        OutcomeKind::SpoofNoIrFace => TraceRefusalReason::SpoofNoIrFace,
+        OutcomeKind::Spoof => TraceRefusalReason::Spoof,
+        OutcomeKind::BelowThreshold => TraceRefusalReason::BelowThreshold,
+        OutcomeKind::SetupUnavailable => TraceRefusalReason::SetupUnavailable,
+        OutcomeKind::DeadlineExpired => TraceRefusalReason::DeadlineExpired,
+        OutcomeKind::RuntimeUnavailable => TraceRefusalReason::RuntimeUnavailable,
+        OutcomeKind::OtherDeny => TraceRefusalReason::OtherDeny,
+    };
+    diagnostics.emit_trace(TraceEventKind::AuthenticationRefusal { reason });
 }
 
 fn emit_trace_match(
@@ -1379,6 +1448,10 @@ enum PadRequirements {
 }
 
 fn pad_evidence_refusal(modality: PadModality, evidence: PadEvidence) -> Option<Outcome> {
+    let pending_kind = match modality {
+        PadModality::Rgb => OutcomeKind::RgbPadPending,
+        PadModality::Ir => OutcomeKind::Uncertain,
+    };
     let modality = match modality {
         PadModality::Rgb => "RGB",
         PadModality::Ir => "IR",
@@ -1386,7 +1459,7 @@ fn pad_evidence_refusal(modality: PadModality, evidence: PadEvidence) -> Option<
     let reason = match evidence {
         PadEvidence::Pending => {
             return Some(Outcome::deny(
-                OutcomeKind::Uncertain,
+                pending_kind,
                 format!("collecting {modality} PAD evidence"),
             ));
         }
@@ -3073,7 +3146,36 @@ mod capture_mode_switch_tests {
 
 /// Own streaming queues only for one assessment. The result cannot borrow
 /// either session, so both drop before matching, consent or another attempt.
-fn with_owned_pair<R, I, T>(mut pair: (R, I), assess: impl FnOnce(&mut R, &mut I) -> T) -> T {
+fn with_owned_pair<R, I, T>(
+    pair: (R, I),
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    assess: impl FnOnce(&mut R, &mut I) -> T,
+) -> T {
+    struct Owners<'a, R, I> {
+        pair: Option<(R, I)>,
+        diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    }
+
+    impl<R, I> Drop for Owners<'_, R, I> {
+        fn drop(&mut self) {
+            // This interval covers only the two attempt streaming owners. The
+            // camera objects and request lease are owned by the caller.
+            let _timing = TraceStageTimer::new(
+                self.diagnostics,
+                irlume_common::diagnostics::TraceStage::StreamOwnerRelease,
+            );
+            drop(self.pair.take());
+        }
+    }
+
+    let mut owners = Owners {
+        pair: Some(pair),
+        diagnostics,
+    };
+    let pair = owners
+        .pair
+        .as_mut()
+        .expect("owners hold the assessment pair");
     assess(&mut pair.0, &mut pair.1)
 }
 
@@ -4065,6 +4167,29 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<Assessment, CapturePathError> {
+        self.assess_with_fresh_pair_finish(
+            rgb,
+            ir,
+            mode,
+            operation,
+            diagnostics,
+            |engine, evidence| {
+                engine
+                    .materialize_pair_identity(evidence, diagnostics)
+                    .map_err(CapturePathError::from)
+            },
+        )
+    }
+
+    fn assess_with_fresh_pair_finish<T>(
+        &mut self,
+        rgb: &irlume_camera::RgbCamera,
+        ir: &irlume_camera::IrCamera,
+        mode: Option<&CaptureModeSelection>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        finish: impl FnOnce(&mut Self, DeferredAssessment<PairIdentity>) -> Result<T, CapturePathError>,
+    ) -> Result<T, CapturePathError> {
         let setup_error = |reason, error| concurrent_setup_error(mode, diagnostics, reason, error);
         let control = self.capture_control();
         let started = std::time::Instant::now();
@@ -4077,7 +4202,7 @@ impl Engine {
             elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
         let pair = pair.map_err(|error| setup_error(RuntimeDegradation::PairArmFailure, error))?;
-        with_owned_pair(pair, |rgb, ir| {
+        with_owned_pair(pair, diagnostics, |rgb, ir| {
             let started = std::time::Instant::now();
             let rate = irlume_camera::establish_pair_rate(rgb, ir);
             diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
@@ -4087,7 +4212,7 @@ impl Engine {
             rate.map_err(|error| {
                 setup_error(RuntimeDegradation::PairRateEstablishmentFailure, error)
             })?;
-            self.assess_full_with(Some((rgb, ir)), mode, operation, diagnostics)
+            self.assess_full_with_finish(Some((rgb, ir)), mode, operation, diagnostics, finish)
         })
     }
 
@@ -4119,6 +4244,30 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<Assessment, CapturePathError> {
+        self.assess_full_with_finish(
+            held,
+            capture_mode,
+            operation,
+            diagnostics,
+            |engine, evidence| {
+                engine
+                    .materialize_pair_identity(evidence, diagnostics)
+                    .map_err(CapturePathError::from)
+            },
+        )
+    }
+
+    fn assess_full_with_finish<T>(
+        &mut self,
+        held: Option<(
+            &mut irlume_camera::RgbSession<'_>,
+            &mut irlume_camera::IrSession<'_>,
+        )>,
+        capture_mode: Option<&CaptureModeSelection>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        finish: impl FnOnce(&mut Self, DeferredAssessment<PairIdentity>) -> Result<T, CapturePathError>,
+    ) -> Result<T, CapturePathError> {
         // Median-denoise the RGB frame so a single blurry/over-exposed frame
         // can't false-reject a genuine user (IR is already brightest-of-burst).
         //
@@ -4566,8 +4715,7 @@ impl Engine {
                 diagnostics,
             },
         )?;
-        self.materialize_pair_identity(evidence)
-            .map_err(CapturePathError::from)
+        finish(self, evidence)
     }
 
     fn detect_rgb_assessment(
@@ -5055,7 +5203,15 @@ impl Engine {
     fn materialize_pair_identity(
         &mut self,
         evidence: DeferredAssessment<PairIdentity>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Assessment> {
+        // One materializer invocation, possibly with no identity inputs. RGB
+        // alignment/TTA and IR alignment/inference/adapter work share this
+        // interval; its event count is not a count of model invocations.
+        let _timing = TraceStageTimer::new(
+            diagnostics,
+            irlume_common::diagnostics::TraceStage::IdentityInference,
+        );
         let DeferredAssessment {
             mut assessment,
             identity: (rgb, ir),
@@ -5588,6 +5744,28 @@ impl Engine {
             |engine| {
                 let mut held_pair_failed = false;
                 let result = Self::run_camera_operation(camera_operation, || {
+                    if let Some(cameras) = cameras.filter(|_| {
+                        managed_pad::eligible(
+                            capture_mode,
+                            engine.ir_available,
+                            engine.has_vit_pad(),
+                            engine.has_pad_ir(),
+                            window,
+                            purpose,
+                            service,
+                        )
+                    }) {
+                        return engine.authenticate_managed_concurrent_once(
+                            enr,
+                            purpose,
+                            service,
+                            cameras,
+                            capture_mode,
+                            deadline,
+                            &mut held_pair_failed,
+                            diagnostics,
+                        );
+                    }
                     engine.authenticate_once(
                         enr,
                         purpose,
@@ -5714,18 +5892,113 @@ impl Engine {
             held_pair_failed,
             diagnostics,
         } = capture;
-        let assessment = if !self.ir_available {
-            self.assess_rgb_only_with_diagnostics(diagnostics)
-                .map_err(CapturePathError::from)
-        } else if let (Some((rgb, ir)), Some(operation)) = (cameras, operation) {
-            self.assess_with_fresh_pair(rgb, ir, mode, operation, diagnostics)
-        } else if let Some(operation) = operation {
-            self.assess_full_with(None, mode, operation, diagnostics)
-        } else {
-            self.assess().map_err(CapturePathError::from)
+        let operation = match (self.ir_available, operation) {
+            (true, Some(operation)) => operation,
+            _ => {
+                // RGB-only and the legacy operationless path remain eager.
+                let assessment = if !self.ir_available {
+                    self.assess_rgb_only_with_diagnostics(diagnostics)
+                } else {
+                    self.assess()
+                };
+                let a = match assessment {
+                    Ok(a) => a,
+                    Err(error) => {
+                        self.vit_scores.clear();
+                        return Err(error);
+                    }
+                };
+                self.last_attempt_facts = AttemptFacts::from_assessment(&a);
+                return self.authenticate_assessment(enr, purpose, service, a, diagnostics);
+            }
         };
-        let a = match assessment {
-            Ok(assessment) => assessment,
+        let finish = |engine: &mut Self, evidence| {
+            engine
+                .prepare_ordinary_pair_authentication_with(evidence, |engine, evidence| {
+                    engine.materialize_pair_identity(evidence, diagnostics)
+                })
+                .map_err(CapturePathError::from)
+        };
+        let prepared = if let Some((rgb, ir)) = cameras {
+            self.assess_with_fresh_pair_finish(rgb, ir, mode, operation, diagnostics, finish)
+        } else {
+            self.assess_full_with_finish(None, mode, operation, diagnostics, finish)
+        };
+        self.finish_pair_authentication(
+            enr,
+            purpose,
+            service,
+            prepared,
+            held_pair_failed,
+            diagnostics,
+        )
+    }
+
+    /// Ordinary capture stays eager, including Pending PAD and PAD failures.
+    /// Only the separately eligible managed collector defers identity work.
+    fn prepare_ordinary_pair_authentication_with(
+        &mut self,
+        evidence: DeferredAssessment<PairIdentity>,
+        materialize: impl FnOnce(
+            &mut Self,
+            DeferredAssessment<PairIdentity>,
+        ) -> irlume_common::Result<Assessment>,
+    ) -> irlume_common::Result<PreparedPairAuthentication> {
+        self.check_request_active()?;
+        let mut assessment = materialize(self, evidence)?;
+        self.check_request_active()?;
+        self.qualify_rgb_pad_evidence(&mut assessment);
+        Ok(PreparedPairAuthentication::Ready(Box::new(assessment)))
+    }
+
+    /// Managed collection defers visible-pair identity until required PAD admits
+    /// it, using ordinary admission policy. Actual eligible identity input
+    /// distinguishes visible from dark; unfinished embeddings say nothing about
+    /// face presence. Ordinary attempts use the eager preparation above.
+    fn prepare_pair_authentication_with(
+        &mut self,
+        mut evidence: DeferredAssessment<PairIdentity>,
+        materialize: impl FnOnce(
+            &mut Self,
+            DeferredAssessment<PairIdentity>,
+        ) -> irlume_common::Result<Assessment>,
+    ) -> irlume_common::Result<PreparedPairAuthentication> {
+        self.check_request_active()?;
+        let qualified_before_identity =
+            evidence.identity.0.is_some() && evidence.assessment.verdict == Verdict::Live;
+        if qualified_before_identity {
+            self.qualify_rgb_pad_evidence(&mut evidence.assessment);
+            if let Some(outcome) = pad_policy_refusal(
+                PadRequirements::RgbAndIr,
+                evidence.assessment.rgb_pad,
+                evidence.assessment.ir_pad,
+            ) {
+                self.last_attempt_facts = AttemptFacts::from_assessment(&evidence.assessment);
+                return Ok(PreparedPairAuthentication::Refused(outcome));
+            }
+        }
+        let mut assessment = materialize(self, evidence)?;
+        self.check_request_active()?;
+        // Dark and non-Live paths retain eager materialization and the existing
+        // outcome precedence. Pending Live evidence keeps its accumulated vote.
+        if !qualified_before_identity {
+            self.qualify_rgb_pad_evidence(&mut assessment);
+        }
+        Ok(PreparedPairAuthentication::Ready(Box::new(assessment)))
+    }
+
+    /// Complete the ordinary pair attempt after its streaming owners drop.
+    fn finish_pair_authentication(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        prepared: Result<PreparedPairAuthentication, CapturePathError>,
+        held_pair_failed: Option<&mut bool>,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
             Err(CapturePathError::ConcurrentPair(error)) => {
                 self.vit_scores.clear();
                 if let Some(failed) = held_pair_failed {
@@ -5738,10 +6011,15 @@ impl Engine {
                 return Err(error.into_inner());
             }
         };
-        // Snapshot capture facts before any decision branch returns. This stays
-        // on the attempt path so failed-attempt diagnostics describe this take.
-        self.last_attempt_facts = AttemptFacts::from_assessment(&a);
-        self.authenticate_assessment(enr, purpose, service, a, diagnostics)
+        let outcome = match prepared {
+            PreparedPairAuthentication::Ready(a) => {
+                self.last_attempt_facts = AttemptFacts::from_assessment(&a);
+                self.authenticate_qualified_assessment(enr, purpose, service, *a, diagnostics)?
+            }
+            PreparedPairAuthentication::Refused(outcome) => outcome,
+        };
+        emit_authentication_refusal(diagnostics, &outcome);
+        Ok(outcome)
     }
 
     /// Decide using a captured assessment after its streaming owners have been
@@ -5755,7 +6033,10 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
         self.qualify_rgb_pad_evidence(&mut a);
-        self.authenticate_qualified_assessment(enr, purpose, service, a, diagnostics)
+        let outcome =
+            self.authenticate_qualified_assessment(enr, purpose, service, a, diagnostics)?;
+        emit_authentication_refusal(diagnostics, &outcome);
+        Ok(outcome)
     }
 
     fn authenticate_qualified_assessment(
@@ -6539,7 +6820,10 @@ impl Engine {
                 PadRequirements::RgbOnly
             };
             if let Some(refusal) = pad_policy_refusal(requirements, a.rgb_pad, a.ir_pad) {
-                if refusal.kind == OutcomeKind::Uncertain {
+                if matches!(
+                    refusal.kind,
+                    OutcomeKind::Uncertain | OutcomeKind::RgbPadPending
+                ) {
                     return Ok(None);
                 }
                 return Err(CapturePathError::Other(irlume_common::Error::Protocol(
@@ -10769,6 +11053,8 @@ mod pad_cue_tests {
 #[cfg(test)]
 mod engine_tests {
     mod grouped_tests;
+    mod managed_pad_tests;
+    mod pair_identity_tests;
     use super::tests::env_guard;
     use super::*;
     use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
@@ -11352,6 +11638,7 @@ mod engine_tests {
             OutcomeKind::BelowThreshold,
             OutcomeKind::Spoof,
             OutcomeKind::Uncertain,
+            OutcomeKind::RgbPadPending,
             OutcomeKind::DeadlineExpired,
         ] {
             let start = std::time::Instant::now();
@@ -11413,7 +11700,7 @@ mod engine_tests {
         let (out, calls, cost) = scripted_pad_retry(&mut s.engine, 15_000, 100, &[7_800], 0.20, 0);
         assert_eq!(calls, 1);
         assert!(!out.granted);
-        assert_eq!(out.kind, OutcomeKind::Uncertain);
+        assert_eq!(out.kind, OutcomeKind::RgbPadPending);
         assert!(out.reason.contains("collecting RGB PAD evidence"));
         assert_eq!(out.score, 0.0);
         assert_eq!(cost, std::time::Duration::from_millis(7_800));
@@ -11439,7 +11726,7 @@ mod engine_tests {
             "an exactly fitting retry is admitted, a third is not"
         );
         assert!(!out.granted);
-        assert_eq!(out.kind, OutcomeKind::Uncertain);
+        assert_eq!(out.kind, OutcomeKind::RgbPadPending);
     }
 
     #[test]
@@ -11477,7 +11764,7 @@ mod engine_tests {
         let (out, calls, _) = scripted_pad_retry(&mut s.engine, 5_000, 0, &[1_100; 4], 0.20, 0);
         assert_eq!(calls, 4);
         assert!(!out.granted);
-        assert_eq!(out.kind, OutcomeKind::Uncertain);
+        assert_eq!(out.kind, OutcomeKind::RgbPadPending);
         let (out, calls, _) = scripted_pad_retry(&mut s.engine, 15_000, 0, &[1_000; 5], 0.99, 0);
         assert_eq!(calls, 5);
         assert!(!out.granted);
@@ -11710,7 +11997,7 @@ mod engine_tests {
             assert_eq!(
                 out.kind,
                 if sample < 5 {
-                    OutcomeKind::Uncertain
+                    OutcomeKind::RgbPadPending
                 } else {
                     OutcomeKind::Spoof
                 }
@@ -11780,7 +12067,7 @@ mod engine_tests {
                 .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
                 .unwrap();
             assert!(!out.granted);
-            assert_eq!(out.kind, OutcomeKind::Uncertain);
+            assert_eq!(out.kind, OutcomeKind::RgbPadPending);
             assert_eq!(out.score, 0.0);
         }
         e.ir_available = prior_ir;
@@ -11817,7 +12104,7 @@ mod engine_tests {
             let out = e
                 .authenticate_assessment(&enr, AuthenticationPurpose::Verify, None, a, &())
                 .unwrap();
-            assert_eq!(out.kind, OutcomeKind::Uncertain);
+            assert_eq!(out.kind, OutcomeKind::RgbPadPending);
         }
         e.vit_scores.clear();
     }
@@ -13343,6 +13630,7 @@ mod engine_tests {
         for attempt in 0..3 {
             let output = with_owned_pair(
                 (AttemptStream::open(&active), AttemptStream::open(&active)),
+                &(),
                 |_, _| {
                     assert_eq!(active.get(), 2);
                     attempt
@@ -13362,6 +13650,7 @@ mod engine_tests {
         let active = std::cell::Cell::new(0);
         let result = with_owned_pair(
             (AttemptStream::open(&active), AttemptStream::open(&active)),
+            &(),
             |_, _| Err::<(), _>("assessment refused"),
         );
         assert_eq!(result, Err("assessment refused"));
@@ -13374,6 +13663,7 @@ mod engine_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_owned_pair(
                 (AttemptStream::open(&active), AttemptStream::open(&active)),
+                &(),
                 |_, _| panic!("assessment panicked"),
             );
         }));
@@ -13401,6 +13691,7 @@ mod engine_tests {
                 rgb_cam.session().expect("hold RGB"),
                 cam.session().expect("hold IR"),
             ),
+            &(),
             |_, _| {
                 assert!(
                     cam.session().is_err() && rgb_cam.session().is_err(),

@@ -12,20 +12,21 @@ fn function<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 fn assert_scoped_pair_assessment(source: &str) {
     let assessment = function(
         source,
-        "    fn assess_with_fresh_pair(",
+        "    fn assess_with_fresh_pair_finish<T>(",
         "\n    fn assess_full_with_operation(",
     );
     let owner = assessment
         .find("with_owned_pair(pair,")
         .expect("own both sessions");
     let capture = assessment
-        .find("self.assess_full_with(Some((rgb, ir))")
+        .find("self.assess_full_with_finish(Some((rgb, ir))")
         .expect("paired assessment");
     assert!(
         owner < capture,
         "capture must finish inside the session owner scope"
     );
-    assert!(assessment.contains("Result<Assessment, CapturePathError>"));
+    assert!(assessment.contains("Result<T, CapturePathError>"));
+    assert!(assessment.contains("diagnostics, finish)"));
     assert!(assessment.contains("arm_pair_transactionally("));
     assert!(assessment.contains("establish_pair_rate(rgb, ir)"));
 }
@@ -36,7 +37,7 @@ fn held_concurrent_failure_is_returned_to_the_pair_owner() {
         .expect("read auth source");
     let assess = function(
         &source,
-        "    fn assess_full_with(",
+        "    fn assess_full_with_finish<T>(",
         "\n    pub fn authenticate(",
     );
 
@@ -65,7 +66,18 @@ fn authentication_fallback_drops_the_entire_held_pair_before_retry() {
         "    fn authenticate_once(",
         "\n    pub fn identify(",
     );
-    assert!(attempt.contains("self.assess_with_fresh_pair(rgb, ir, mode, operation, diagnostics)"));
+    assert!(attempt.contains("self.assess_with_fresh_pair_finish("));
+    assert!(attempt
+        .contains("self.assess_full_with_finish(None, mode, operation, diagnostics, finish)"));
+    let captured = attempt
+        .find("let prepared = if let Some((rgb, ir)) = cameras")
+        .unwrap();
+    let decision = attempt.find("self.finish_pair_authentication(").unwrap();
+    assert!(
+        captured < decision,
+        "identity admission follows the returning owner scope"
+    );
+    assert!(attempt[..captured].contains(".prepare_ordinary_pair_authentication_with("));
     assert!(!authenticate.contains("RgbSession"));
     assert!(!authenticate.contains("IrSession"));
     let fallback = authenticate
@@ -81,6 +93,40 @@ fn authentication_fallback_drops_the_entire_held_pair_before_retry() {
         "fallback must release handles before reopening"
     );
     assert!(fallback[..retry].contains("demote_after_concurrent_capture_failure"));
+}
+
+#[test]
+fn public_and_enrollment_pair_wrappers_still_finish_with_eager_identity() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read auth source");
+    for (start, end, finish) in [
+        (
+            "    fn assess_with_fresh_pair(",
+            "    fn assess_with_fresh_pair_finish<T>(",
+            "self.assess_with_fresh_pair_finish(",
+        ),
+        (
+            "    fn assess_full_with(",
+            "    fn assess_full_with_finish<T>(",
+            "self.assess_full_with_finish(",
+        ),
+    ] {
+        let wrapper = function(&source, start, end);
+        assert!(wrapper.contains("Result<Assessment, CapturePathError>"));
+        assert!(wrapper.contains(finish));
+        assert!(wrapper.contains(".materialize_pair_identity(evidence, diagnostics)"));
+        assert!(!wrapper.contains("prepare_pair_authentication_with"));
+        assert!(!wrapper.contains("qualify_rgb_pad_evidence"));
+    }
+    let capture = function(
+        &source,
+        "    fn assess_full_with_finish<T>(",
+        "    fn detect_rgb_assessment(",
+    );
+    assert!(
+        capture.find("self.assess_captured_pair(").unwrap()
+            < capture.find("finish(self, evidence)").unwrap()
+    );
 }
 
 #[test]

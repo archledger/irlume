@@ -479,6 +479,7 @@ impl Store {
             match outcome.kind {
                 OutcomeKind::NoFace
                 | OutcomeKind::Uncertain
+                | OutcomeKind::RgbPadPending
                 | OutcomeKind::SpoofNoIrFace
                 | OutcomeKind::SetupUnavailable => return Ok(()),
                 OutcomeKind::Granted
@@ -604,6 +605,7 @@ impl FaceAttempt {
         match outcome.kind {
             OutcomeKind::NoFace
             | OutcomeKind::Uncertain
+            | OutcomeKind::RgbPadPending
             | OutcomeKind::SpoofNoIrFace
             | OutcomeKind::SetupUnavailable => (),
             OutcomeKind::Granted

@@ -171,6 +171,16 @@ consumer. Event emission is a non-blocking side channel with a bounded queue.
 Losing trace events can reduce diagnostic completeness but cannot affect an
 authentication result, camera lease, emitter restoration, or fallback.
 
+Trace schema 2 is explicitly negotiated with the optional `trace_schema`
+subscription field. Omission selects legacy schema 1; unsupported requests are
+refused. Current readers accept either version and require a single version
+throughout the stream. Schema 2 adds closed authentication-refusal labels and
+identity-inference / stream-owner-release timings; schema 1 subscribers filter
+these additions before queue capacity, sequence and dropped-event accounting.
+The unchanged acceptance response reports bounds, while each trace record,
+including `trace_started`, identifies the negotiated version. An older daemon
+can ignore the optional request field and continue emitting schema 1.
+
 Exact match and liveness measurements are permitted only in the root-owned
 trace because they can provide iterative feedback to an attacker. The trace
 header warns about that oracle. Frames, crops, landmarks, embeddings,

@@ -12,7 +12,12 @@ pub const MAX_SHARE_SAFE_EVENTS: usize = 256;
 pub const MAX_SANITIZED_CAMERAS: usize = 8;
 pub const MAX_UNAVAILABLE_SECTIONS: usize = 16;
 pub const MAX_HISTORY_MS: u64 = 30 * 60 * 1_000;
-pub const TRACE_SCHEMA_VERSION: u32 = 1;
+/// The schema selected when a subscriber does not request a version.
+pub const LEGACY_TRACE_SCHEMA_VERSION: u32 = 1;
+/// Latest trace vocabulary, requested explicitly by current clients.
+pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 2;
+/// Current schema for callers constructing new records, not a subscription default.
+pub const TRACE_SCHEMA_VERSION: u32 = CURRENT_TRACE_SCHEMA_VERSION;
 pub const DEFAULT_TRACE_DURATION_MS: u64 = 60_000;
 pub const MAX_TRACE_DURATION_MS: u64 = 5 * 60_000;
 pub const MAX_TRACE_EVENTS: u64 = 50_000;
@@ -694,8 +699,22 @@ diagnostic_enum!(TraceStage {
     IrCapture,
     Detection,
     Liveness,
+    IdentityInference,
+    StreamOwnerRelease,
     Matching,
     EmitterRestore,
+});
+diagnostic_enum!(TraceRefusalReason {
+    RgbPadPending,
+    NoFace,
+    Uncertain,
+    SpoofNoIrFace,
+    Spoof,
+    BelowThreshold,
+    SetupUnavailable,
+    DeadlineExpired,
+    RuntimeUnavailable,
+    OtherDeny,
 });
 diagnostic_enum!(TraceMetric {
     DeliveredFramesPerSecond,
@@ -816,12 +835,35 @@ pub enum TraceEventKind {
         verdict: TraceVerdict,
         measurements: Vec<TraceMeasurement>,
     },
+    AuthenticationRefusal {
+        reason: TraceRefusalReason,
+    },
     EventsDropped {
         count: u64,
     },
     Finished {
         outcome: CategoricalOutcome,
     },
+}
+
+impl TraceEventKind {
+    /// Whether this closed event vocabulary is available in the selected
+    /// schema. Legacy subscribers omit newer events before queue accounting.
+    #[must_use]
+    pub const fn supports_schema(&self, schema: u32) -> bool {
+        match schema {
+            LEGACY_TRACE_SCHEMA_VERSION => !matches!(
+                self,
+                Self::AuthenticationRefusal { .. }
+                    | Self::StageTiming {
+                        stage: TraceStage::IdentityInference | TraceStage::StreamOwnerRelease,
+                        ..
+                    }
+            ),
+            CURRENT_TRACE_SCHEMA_VERSION => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -849,6 +891,7 @@ pub struct TraceValidator {
     total_bytes: u64,
     records: u64,
     terminal_seen: bool,
+    trace_schema: Option<u32>,
 }
 
 impl TraceValidator {
@@ -866,6 +909,7 @@ impl TraceValidator {
             total_bytes: 0,
             records: 0,
             terminal_seen: false,
+            trace_schema: None,
         })
     }
 
@@ -891,13 +935,18 @@ impl TraceValidator {
             return Err(TraceParseError::Terminal);
         }
         let record: TraceRecord = serde_json::from_slice(line).map_err(TraceParseError::Json)?;
-        if record.trace_schema != TRACE_SCHEMA_VERSION {
+        if !record.event.supports_schema(record.trace_schema)
+            || self
+                .trace_schema
+                .is_some_and(|schema| schema != record.trace_schema)
+        {
             return Err(TraceParseError::Schema);
         }
         if record.sequence != self.records {
             return Err(TraceParseError::Sequence);
         }
         validate_trace_event(&record.event)?;
+        self.trace_schema = Some(record.trace_schema);
         self.terminal_seen = record.terminal;
         if record.terminal && !matches!(record.event, TraceEventKind::Finished { .. }) {
             return Err(TraceParseError::Terminal);
@@ -1411,6 +1460,111 @@ mod tests {
             bytes.push(b'\n');
         }
         bytes
+    }
+
+    #[test]
+    fn trace_subscription_preserves_explicit_schema_and_legacy_omission() {
+        let legacy = serde_json::json!({"TraceSubscribe": {"duration_ms": 1000}});
+        let request: Request = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), legacy);
+        for schema in [1, 2, 99] {
+            let wire = serde_json::json!({
+                "TraceSubscribe": {"duration_ms": 1000, "trace_schema": schema}
+            });
+            let request: Request = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn trace_parser_accepts_both_wire_versions_but_never_mixes_them() {
+        let limits = TraceLimits::bounded(1000);
+        let mut records = vec![
+            trace_record(
+                0,
+                TraceEventKind::TraceStarted {
+                    limits,
+                    warning: TraceWarning::PrivilegedDiagnosticOracle,
+                },
+                false,
+            ),
+            trace_record(
+                1,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        for schema in [1, 2] {
+            for record in &mut records {
+                record.trace_schema = schema;
+            }
+            assert!(
+                parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits).is_ok(),
+                "valid schema {schema} must remain readable"
+            );
+            records[1].trace_schema = if schema == 1 { 2 } else { 1 };
+            assert!(matches!(
+                parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits),
+                Err(TraceParseError::Schema)
+            ));
+        }
+        for schema in [0, 3, u32::MAX] {
+            records[0].trace_schema = schema;
+            assert!(matches!(
+                parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits),
+                Err(TraceParseError::Schema)
+            ));
+        }
+    }
+
+    #[test]
+    fn trace_v2_closed_refusals_and_timings_are_not_valid_v1_records() {
+        let limits = TraceLimits::bounded(1000);
+        let mut events = vec![
+            serde_json::json!({"event":"stage_timing", "stage":"identity_inference", "elapsed_us":12}),
+            serde_json::json!({"event":"stage_timing", "stage":"stream_owner_release", "elapsed_us":13}),
+        ];
+        for reason in [
+            "rgb_pad_pending",
+            "no_face",
+            "uncertain",
+            "spoof_no_ir_face",
+            "spoof",
+            "below_threshold",
+            "setup_unavailable",
+            "deadline_expired",
+            "runtime_unavailable",
+            "other_deny",
+        ] {
+            events.push(serde_json::json!({"event":"authentication_refusal", "reason":reason}));
+        }
+        for event in events {
+            let typed = serde_json::from_value::<TraceEventKind>(event.clone())
+                .expect("schema 2 closed event vocabulary must deserialize");
+            assert_eq!(serde_json::to_value(&typed).unwrap(), event);
+            for schema in [1, 2] {
+                let mut record = trace_record(0, typed.clone(), false);
+                record.trace_schema = schema;
+                let mut validator = TraceValidator::new(limits).unwrap();
+                let result = validator.push_line(&serde_json::to_vec(&record).unwrap());
+                assert_eq!(result.is_ok(), schema == 2, "{event} under schema {schema}");
+                if schema == 1 {
+                    assert!(matches!(result, Err(TraceParseError::Schema)));
+                }
+            }
+        }
+        for reason in [
+            serde_json::json!("unrestricted prose"),
+            serde_json::json!(5),
+            serde_json::Value::Null,
+        ] {
+            assert!(serde_json::from_value::<TraceEventKind>(serde_json::json!({
+                "event":"authentication_refusal", "reason":reason,
+            }))
+            .is_err());
+        }
     }
 
     #[test]

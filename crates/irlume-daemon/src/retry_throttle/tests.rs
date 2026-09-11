@@ -168,6 +168,7 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         (Kind::Granted, false),
         (Kind::NoFace, false),
         (Kind::Uncertain, false),
+        (Kind::RgbPadPending, false),
         (Kind::SpoofNoIrFace, false),
         (Kind::SetupUnavailable, false),
         (Kind::Spoof, true),
@@ -196,7 +197,11 @@ fn rate_throttle_outcome_classes_preserve_rejection_policy() {
         );
         if matches!(
             kind,
-            Kind::NoFace | Kind::Uncertain | Kind::SpoofNoIrFace | Kind::SetupUnavailable
+            Kind::NoFace
+                | Kind::Uncertain
+                | Kind::RgbPadPending
+                | Kind::SpoofNoIrFace
+                | Kind::SetupUnavailable
         ) {
             assert!(
                 !f.path().exists(),
@@ -226,6 +231,54 @@ fn terminal_diagnostic_classes_preserve_existing_other_deny_accounting() {
             assert_eq!(old.check(), classified.check());
         }
     }
+}
+
+#[test]
+fn pending_pad_preserves_uncertain_strikes_and_cumulative_request_charge() {
+    for strikes in [0, 2, 3] {
+        let old = Fixture::new();
+        let pending = Fixture::new();
+        for _ in 0..strikes {
+            old.record(Kind::Spoof);
+            pending.record(Kind::Spoof);
+        }
+        old.record(Kind::Uncertain);
+        pending.record(Kind::RgbPadPending);
+        if strikes == 0 {
+            assert!(!old.path().exists() && !pending.path().exists());
+        } else {
+            assert_eq!(old.bytes(), pending.bytes());
+        }
+        assert_eq!(old.check(), pending.check());
+    }
+    cumulative::TIME.set(100);
+    let old = Fixture::new();
+    let pending = Fixture::new();
+    old.record(Kind::Spoof);
+    pending.record(Kind::Spoof);
+    for count in 1..=50 {
+        cumulative::start_attempt(&old)
+            .unwrap()
+            .unwrap()
+            .denied(&outcome(Kind::Uncertain))
+            .unwrap();
+        cumulative::start_attempt(&pending)
+            .unwrap()
+            .unwrap()
+            .denied(&outcome(Kind::RgbPadPending))
+            .unwrap();
+        assert_eq!(old.bytes(), pending.bytes(), "request {count}");
+        let saved = pending.saved();
+        assert_eq!(
+            saved.strikes, 1,
+            "incomplete PAD neither adds nor clears strikes"
+        );
+        let budget = saved.budget.unwrap();
+        assert_eq!(budget.unsuccessful_requests, count);
+        assert!(!budget.pending);
+    }
+    assert!(cumulative::start_attempt(&old).unwrap().is_none());
+    assert!(cumulative::start_attempt(&pending).unwrap().is_none());
 }
 
 #[test]

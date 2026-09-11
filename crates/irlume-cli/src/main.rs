@@ -687,20 +687,42 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
 /// (the daemon writes /etc/irlume/cameras.conf); the TUI camera picker runs this
 /// via sudo, and headless setups call it directly.
 fn set_cameras(args: &[String]) -> std::process::ExitCode {
+    let request = match set_cameras_request(args) {
+        Ok(request) => request,
+        Err(reason) => {
+            eprintln!("{reason}\nusage: irlume set-cameras <rgb-node> <ir-node> [--expected-camera JSON]   (root)");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    // A guarded request is never retried as the legacy unguarded operation.
+    // Older daemons must refuse rather than silently ignore camera continuity.
+    report_ok_response("set-cameras", daemon_request(&request))
+}
+
+fn set_cameras_request(args: &[String]) -> Result<irlume_common::Request, &'static str> {
     use irlume_common::Request;
     let (Some(rgb), Some(ir)) = (args.get(1), args.get(2)) else {
-        eprintln!(
-            "usage: irlume set-cameras <rgb-node> <ir-node>   (root; e.g. /dev/video0 /dev/video2)"
-        );
-        return std::process::ExitCode::from(2);
+        return Err("both camera paths are required");
     };
-    report_ok_response(
-        "set-cameras",
-        daemon_request(&Request::SetCameras {
+    match args.len() {
+        3 => Ok(Request::SetCameras {
             rgb: rgb.clone(),
             ir: ir.clone(),
         }),
-    )
+        5 if args[3] == "--expected-camera" => {
+            let expected =
+                serde_json::from_str::<irlume_common::live_camera::CameraSelection>(&args[4])
+                    .map_err(|_| {
+                        "invalid expected camera identity; select the camera again in the TUI"
+                    })?;
+            Ok(Request::SetCamerasIfCurrent {
+                rgb: rgb.clone(),
+                ir: ir.clone(),
+                expected,
+            })
+        }
+        _ => Err("unexpected or incomplete camera-selection arguments"),
+    }
 }
 
 /// Report the daemon's answer to a request whose success case is
@@ -4425,6 +4447,61 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn set_cameras_preserves_legacy_request_and_carries_guard_without_fallback() {
+        let plain = argv(&["set-cameras", "/dev/video40", "/dev/video42"]);
+        assert!(
+            matches!(set_cameras_request(&plain), Ok(irlume_common::Request::SetCameras { rgb, ir })
+            if rgb == "/dev/video40" && ir == "/dev/video42")
+        );
+        let guard = serde_json::json!({
+            "supervisor_id":"11111111111111111111111111111111",
+            "candidate":{"instance_id":"22222222222222222222222222222222",
+                "generation":7, "endpoint_paths":["/dev/video40","/dev/video42"]}
+        })
+        .to_string();
+        let mut guarded = plain;
+        guarded.extend(["--expected-camera".into(), guard]);
+        let request = set_cameras_request(&guarded).unwrap();
+        assert!(
+            matches!(request, irlume_common::Request::SetCamerasIfCurrent { ref rgb, ref ir, ref expected }
+            if rgb == "/dev/video40" && ir == "/dev/video42" && expected.candidate.generation == 7)
+        );
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("SetCamerasIfCurrent").is_some());
+        assert!(encoded.get("SetCameras").is_none());
+    }
+
+    #[test]
+    fn set_cameras_refuses_missing_malformed_or_unknown_guard_arguments() {
+        for args in [
+            argv(&["set-cameras"]),
+            argv(&[
+                "set-cameras",
+                "/dev/video40",
+                "/dev/video42",
+                "--expected-camera",
+            ]),
+            argv(&[
+                "set-cameras",
+                "/dev/video40",
+                "/dev/video42",
+                "--expected-camera",
+                "{}",
+            ]),
+            argv(&[
+                "set-cameras",
+                "/dev/video40",
+                "/dev/video42",
+                "--unknown",
+                "{}",
+            ]),
+            argv(&["set-cameras", "/dev/video40", "/dev/video42", "unexpected"]),
+        ] {
+            assert!(set_cameras_request(&args).is_err());
+        }
     }
 
     // ---- the shared flags-first subcommand scanner ----

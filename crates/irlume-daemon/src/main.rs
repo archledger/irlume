@@ -60,6 +60,7 @@ pub(crate) mod test_support {
 mod arbiter;
 mod diagnostics;
 mod enrollment_session;
+mod live;
 mod operation_authorization;
 mod position_session;
 mod retry_recovery;
@@ -603,12 +604,20 @@ fn main() {
     let engine_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
     let diagnostic_state = std::sync::Arc::new(diagnostics::DiagnosticState::default());
+    diagnostic_state
+        .live()
+        .set_cancel_token(arbiter.cancel_token());
     {
         let arbiter = std::sync::Arc::clone(&arbiter);
         let engine_ready = std::sync::Arc::clone(&engine_ready);
+        let diagnostic_state = std::sync::Arc::clone(&diagnostic_state);
         std::thread::Builder::new()
             .name("irlume-startup".into())
             .spawn(move || {
+            // Descriptor monitoring is independent of model readiness, but its
+            // initialization must not delay the already-bound accept loop.
+            // LiveStatus only copies an existing publication; it never starts it.
+            irlume_auth::initialize_camera_monitor();
             eprintln!("irlumed: loading models (det={det}, model={model})…");
             // The recognizer's verified bytes come back and go straight into the
             // engine below (#346), so the 260MB file is read and hashed once per
@@ -655,7 +664,7 @@ fn main() {
             if !ir_dev.is_empty() {
                 eprintln!(
                     "irlumed: IR emitter verification deferred to the first authentication \
-                     (no camera opens at boot; every capture re-applies the known control)"
+                     (capture re-applies the known control)"
                 );
             }
             // Background auto-requalification (#586 gap): when the stored
@@ -670,6 +679,7 @@ fn main() {
             if !ir_dev.is_empty() && permits_background_requalification(startup_policy) {
                 let rgb_for_requalify = rgb_dev.clone();
                 let ir_for_requalify = ir_dev.clone();
+                let requalification_diagnostics = std::sync::Arc::clone(&diagnostic_state);
                 std::thread::Builder::new()
                     .name("irlume-requalify".into())
                     .spawn(move || {
@@ -689,6 +699,10 @@ fn main() {
                                      qualification; running a background requalification \\
                                      (the IR emitter fires for up to a minute)"
                                 );
+                                // This task bypasses the request worker. Its
+                                // separate guard begins only for actual probe
+                                // work, and drops on success, error or unwind.
+                                let _live_background = requalification_diagnostics.begin_background_qualification();
                                 match run_capture_mode_probe(
                                     &rgb_for_requalify,
                                     &ir_for_requalify,
@@ -914,9 +928,11 @@ fn main() {
             // read yet cannot be prioritised.
             let _worker = {
                 let arbiter = std::sync::Arc::clone(&arbiter);
+                let diagnostic_state = std::sync::Arc::clone(&diagnostic_state);
                 std::thread::Builder::new()
                     .name("irlume-camera".into())
                     .spawn(move || {
+                        let _live_worker_lifetime = diagnostic_state.live().worker_lifetime();
                         // The engine asks this between whole captures, so a long
                         // enrolment yields the camera to an authentication instead of
                         // making it wait for ten scans, and the watchdog (#141) reads
@@ -941,6 +957,7 @@ fn main() {
                             // the slot first, exactly as the normal path does, so the
                             // uid is not locked out of the camera.
                             if !link.claim() {
+                                link.finish_activity();
                                 scope.finish(
                                     irlume_common::diagnostics::CategoricalOutcome::Cancelled,
                                 );
@@ -970,6 +987,7 @@ fn main() {
                             let resp = match outcome {
                                 Ok(resp) => resp,
                                 Err(_) => {
+                                    diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Rebuilding);
                                     eprintln!(
                                         "irlumed: request handler PANICKED; this request was denied \
                                          (PAM falls back to the password). Rebuilding the engine for a \
@@ -1017,9 +1035,11 @@ fn main() {
                                              with the existing engine"
                                         ),
                                     }
+                                    diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Ready);
                                     Response::Error("request failed".into()).into()
                                 }
                             };
+                            link.finish_activity();
                             scope.finish(categorical_outcome(&resp.response));
                             // The client may already be gone; its thread owns that.
                             let _ = reply.send(resp);
@@ -1027,6 +1047,7 @@ fn main() {
                             // last job's timestamp behind would read as a wedge (#141).
                             note_worker_idle();
                         }
+                        diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Stopping);
                     })
                     .unwrap_or_else(|e| {
                         // Without the worker nothing can be served, and a daemon that
@@ -1040,6 +1061,7 @@ fn main() {
                 // engine-free path. Release pairs with the Acquire load there,
                 // so a thread that sees `true` also sees the worker it needs.
                 engine_ready.store(true, std::sync::atomic::Ordering::Release);
+                diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Ready);
             })
             .unwrap_or_else(|e| {
                 eprintln!("irlumed: could not start the startup thread: {e}");
@@ -1173,6 +1195,9 @@ fn main() {
             Err(e) => eprintln!("irlumed: accept error: {e}"),
         }
     }
+    diagnostic_state
+        .live()
+        .set_stage(irlume_common::live::LiveStage::Stopping);
     arbiter.close();
     // The accept loop above only ends if the listener dies; nothing to join.
 }
@@ -1573,6 +1598,7 @@ struct Queued {
 #[derive(Default)]
 struct ClientLink {
     state: std::sync::Mutex<ClientState>,
+    activity: Option<live::LiveGuard>,
 }
 
 #[derive(Default)]
@@ -1598,6 +1624,9 @@ impl ClientLink {
             return false;
         }
         *state = ClientState::Running;
+        if let Some(activity) = &self.activity {
+            activity.running();
+        }
         true
     }
 
@@ -1606,6 +1635,12 @@ impl ClientLink {
     /// this boundary into the next job's freshly reset shared token.
     fn released(&self) {
         *self.lock() = ClientState::Released;
+    }
+
+    fn finish_activity(&self) {
+        if let Some(activity) = &self.activity {
+            activity.finish();
+        }
     }
 
     /// Connection side: abandon this request and stop it if it owns the camera.
@@ -1618,7 +1653,16 @@ impl ClientLink {
         let running = matches!(*state, ClientState::Running);
         *state = ClientState::Abandoned;
         if running {
+            if let Some(activity) = &self.activity {
+                activity.cancel();
+            }
             stop.request_cancel();
+        } else {
+            // A cancelled queued request is no longer waiting for worker work.
+            // RUNNING completion is left to the worker, even after disconnect.
+            if let Some(activity) = &self.activity {
+                activity.finish_waiting();
+            }
         }
         running
     }
@@ -2813,7 +2857,8 @@ fn serve_peer(
             // startup instead of replacing them with a generic starting reply.
             if matches!(
                 req,
-                Request::SupportSnapshot { .. }
+                Request::LiveStatus
+                    | Request::SupportSnapshot { .. }
                     | Request::FaceSensorStatus { .. }
                     | Request::PreferencesStatus
             ) {
@@ -2886,7 +2931,15 @@ fn serve_peer(
                 };
             let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
             let (reply, answer) = std::sync::mpsc::channel();
-            let link = std::sync::Arc::new(ClientLink::default());
+            let activity = live::request_kind(&req).map(|(kind, changes_state)| {
+                diagnostic_state
+                    .live()
+                    .register(scope.operation_id(), kind, changes_state)
+            });
+            let link = std::sync::Arc::new(ClientLink {
+                activity: activity.clone(),
+                ..ClientLink::default()
+            });
             let queued = Queued {
                 authorization,
                 session,
@@ -2905,6 +2958,9 @@ fn serve_peer(
                 record_refusal(peer.uid);
                 scope.finish(irlume_common::diagnostics::CategoricalOutcome::Unavailable);
                 return respond(stream, &Response::Error(refusal.message().into()));
+            }
+            if let Some(activity) = &activity {
+                activity.waiting();
             }
             // Wait for the worker, checking between slices whether the client is
             // still there. A polkit dialog the user dismissed (or that closed on a
@@ -3277,7 +3333,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         },
         // Root-only and account-free: system-wide camera policy under /etc,
         // and a self-test whose raw liveness numbers are a spoof-tuning oracle.
-        SetCameras { .. } => RequestPosture {
+        SetCameras { .. } | SetCamerasIfCurrent { .. } => RequestPosture {
             privilege: RootOnly {
                 command: "set_cameras",
             },
@@ -3350,7 +3406,8 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         | ListCameras
         | CameraDiagnostics
         | CaptureModeStatus
-        | SupportSnapshot { .. } => RequestPosture {
+        | SupportSnapshot { .. }
+        | LiveStatus => RequestPosture {
             privilege: AnyPeer,
             user: None,
             enrollment: Reads,
@@ -3360,15 +3417,15 @@ fn posture(req: &Request) -> RequestPosture<'_> {
 
 /// The engine-derived facts `Health` reports, published once the engine is
 /// built (and again after a panic rebuild) so status requests can answer on
-/// the connection thread without touching the engine. The socket binds only
-/// after the first publish, so no connection can observe the empty state.
+/// the connection thread without touching the engine. Camera switches update
+/// the selection fields. Before the engine is ready, Health reports startup.
 #[derive(Clone, Default)]
 struct EngineBits {
     mesh: bool,
     adapter: bool,
     rgb_pad: Option<irlume_common::PadModelStatus>,
     ir_pad: Option<irlume_common::PadModelStatus>,
-    /// The camera facts as the ENGINE observed them when it loaded, so
+    /// The engine's camera selection and tier at load or the latest switch, so
     /// `Health` can answer from memory. Probing them per request opened
     /// video nodes on a connection thread, outside the camera worker's
     /// serialization, which is a second opener racing the worker's own
@@ -3388,32 +3445,42 @@ fn publish_engine_bits_raw(bits: EngineBits) {
     *engine_bits().lock().unwrap_or_else(|e| e.into_inner()) = bits;
 }
 
+/// Publish the engine's changed selection without discovering or opening any
+/// device. Physical connection state belongs to the passive inventory.
+fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
+    let mut bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
+    copy_engine_camera_selection(&mut bits, engine);
+}
+
+fn copy_engine_camera_selection(bits: &mut EngineBits, engine: &irlume_auth::Engine) {
+    bits.rgb_dev = (!engine.rgb_device().is_empty()).then(|| engine.rgb_device().to_owned());
+    bits.ir_dev = (!engine.ir_device().is_empty()).then(|| engine.ir_device().to_owned());
+    bits.tier = if bits.rgb_dev.is_none() && bits.ir_dev.is_none() {
+        "none"
+    } else if engine.tier() == irlume_auth::Tier::Secure {
+        "secure"
+    } else {
+        "convenience"
+    }
+    .into();
+}
+
 fn publish_engine_bits(
     engine: &irlume_auth::Engine,
     rgb_pad: irlume_common::PadModelStatus,
     ir_pad: irlume_common::PadModelStatus,
 ) {
-    // Dual retains its discovery path. Experimental IR uses configured sysfs
-    // evidence only; status publication must not cause an RGB camera open.
-    let devices = select_engine_devices(irlume_common::config::observe_face_sensor_policy());
-    let rgb_dev = devices.rgb_available.then_some(devices.rgb);
-    let ir_dev = devices.ir_available.then_some(devices.ir);
-    let tier = if ir_dev.is_some() {
-        "secure"
-    } else if rgb_dev.is_some() {
-        "convenience"
-    } else {
-        "none"
-    };
-    publish_engine_bits_raw(EngineBits {
+    // All fields come from this engine. A second discovery could select a
+    // different pair after hotplug and open devices merely to publish status.
+    let mut bits = EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
         rgb_pad: Some(rgb_pad),
         ir_pad: Some(ir_pad),
-        tier: tier.into(),
-        rgb_dev,
-        ir_dev,
-    });
+        ..EngineBits::default()
+    };
+    copy_engine_camera_selection(&mut bits, engine);
+    publish_engine_bits_raw(bits);
 }
 
 /// One user's enrollment as the status path may report it, published by the
@@ -3785,6 +3852,19 @@ fn dispatch_status_with_diagnostics(
     if let Some(resp) = pregate(req, peer) {
         return Some(resp);
     }
+    if matches!(req, Request::LiveStatus) {
+        return Some(match diagnostic_state {
+            Some(state) => Response::LiveStatus(Box::new(
+                state
+                    .live()
+                    .snapshot(irlume_auth::camera_inventory_snapshot()),
+            )),
+            None => Response::OperationError {
+                code: irlume_common::OperationErrorCode::OperationFailed,
+                retryable: false,
+            },
+        });
+    }
     if let Request::SupportSnapshot { since_ms } = req {
         return Some(match diagnostic_state {
             Some(state) => Response::SupportSnapshot(Box::new(
@@ -3811,12 +3891,12 @@ fn dispatch_status_with_diagnostics(
         },
         Request::Ping => Response::Pong,
         Request::Health => {
-            // MEMORY ONLY. The camera facts were probed once when the engine
-            // loaded and published with the rest of the bits; probing here
+            // MEMORY ONLY. Camera selection is published when the engine
+            // loads or a camera switch changes it; probing here
             // opened video nodes on a connection thread while the worker
-            // might be streaming them (#187 review). A camera that appears
-            // or vanishes is picked up at the next engine (re)load, which is
-            // also when the daemon could act on it.
+            // might be streaming them (#187 review). These are engine selection
+            // and tier observations; current connection state is independently
+            // reported by LiveStatus's passive inventory.
             Response::Health {
                 tier: bits.tier.clone(),
                 rgb_dev: bits.rgb_dev.clone(),
@@ -4395,6 +4475,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | ListCameras
         | CameraDiagnostics => OperationClass::CameraDiagnostics,
         SetCameras { .. }
+        | SetCamerasIfCurrent { .. }
         | FaceSensorStatus { .. }
         | PreferencesStatus
         | ListProfiles { .. }
@@ -4409,6 +4490,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | Ping
         | Health
         | SupportSnapshot { .. }
+        | LiveStatus
         | TraceSubscribe { .. }
         | SealPassword { .. }
         | HasSealedPassword { .. }
@@ -4458,6 +4540,57 @@ fn camera_path_is_serializable(path: &str) -> bool {
         || (std::path::Path::new(path).is_absolute()
             && path.trim() == path
             && !path.chars().any(char::is_control))
+}
+
+/// Shared mutation after request posture and any continuity guard have passed.
+fn set_camera_devices(rgb: &str, ir: &str, engine: &mut irlume_auth::Engine) -> Response {
+    // Root only (posture table): this persists to /etc and repoints the
+    // camera the daemon trusts, and an attacker who could set it to a
+    // v4l2loopback node feeds recorded video into the match path
+    // (spoof) or bricks face auth (DoS).
+    if !camera_path_is_serializable(rgb) || !camera_path_is_serializable(ir) {
+        return Response::Error(
+            "camera paths must be empty or absolute, without control characters or surrounding whitespace"
+                .into(),
+        );
+    }
+    engine.set_devices(rgb, ir);
+    publish_engine_camera_selection(engine);
+    let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
+    // Record each node's stable device identity (vid:pid:serial) next to
+    // its path so select_pair can survive a udev renumber: after an
+    // upgrade shuffles /dev/videoN, the identity re-anchors the pin to the
+    // right sensor instead of trusting a now-stale number. An empty value
+    // clears a stale id when the current node has no USB descriptor.
+    let rgb_id = irlume_auth::device_identity(rgb).unwrap_or_default();
+    let ir_id = irlume_auth::device_identity(ir).unwrap_or_default();
+    // One publication, under the file's own lock. The four writes were
+    // individually atomic and collectively not: a reader racing the
+    // sequence could see one camera's RGB path beside another's IR path,
+    // a write failing partway left the earlier keys published, and an
+    // unlocked rewrite could erase a locked writer's keys (#365, #374).
+    // `write_camera_pin` now takes the lock AND builds the whole file
+    // once, so the pin lands whole or not at all.
+    if let Err(e) = irlume_common::config::write_camera_pin(rgb, ir, &rgb_id, &ir_id) {
+        msg = format!("{msg} (live only; could not persist: {e})");
+    }
+    eprintln!("irlumed: {msg}");
+    Response::Ok(msg)
+}
+
+fn set_cameras_if_current(
+    rgb: &str,
+    ir: &str,
+    expected: &irlume_common::live_camera::CameraSelection,
+    inventory: &irlume_common::live_camera::CameraInventorySnapshot,
+    engine: &mut irlume_auth::Engine,
+) -> Response {
+    if !expected.matches(inventory, rgb, ir) {
+        return Response::Error(
+            "camera connection changed or its current inventory is unavailable; select the camera again in the TUI".into(),
+        );
+    }
+    set_camera_devices(rgb, ir, engine)
 }
 
 #[cfg(test)]
@@ -4622,6 +4755,7 @@ fn dispatch_scoped_session_inner(
         | Request::KeyringMetadata { .. }
         | Request::RecoveryStatus { .. }
         | Request::SupportSnapshot { .. }
+        | Request::LiveStatus
         | Request::TraceSubscribe { .. } => {
             Response::Error("status request routed past its handler".into())
         }
@@ -4914,39 +5048,14 @@ fn dispatch_scoped_session_inner(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        Request::SetCameras { rgb, ir } => {
-            // Root only (posture table): this persists to /etc and repoints the
-            // camera the daemon trusts, and an attacker who could set it to a
-            // v4l2loopback node feeds recorded video into the match path
-            // (spoof) or bricks face auth (DoS).
-            if !camera_path_is_serializable(&rgb) || !camera_path_is_serializable(&ir) {
-                return Response::Error(
-                    "camera paths must be empty or absolute, without control characters or surrounding whitespace"
-                        .into(),
-                );
-            }
-            engine.set_devices(&rgb, &ir);
-            let mut msg = format!("cameras set to rgb={rgb} ir={ir}");
-            // Record each node's stable device identity (vid:pid:serial) next to
-            // its path so select_pair can survive a udev renumber: after an
-            // upgrade shuffles /dev/videoN, the identity re-anchors the pin to the
-            // right sensor instead of trusting a now-stale number. An empty value
-            // clears a stale id when the current node has no USB descriptor.
-            let rgb_id = irlume_auth::device_identity(&rgb).unwrap_or_default();
-            let ir_id = irlume_auth::device_identity(&ir).unwrap_or_default();
-            // One publication, under the file's own lock. The four writes were
-            // individually atomic and collectively not: a reader racing the
-            // sequence could see one camera's RGB path beside another's IR path,
-            // a write failing partway left the earlier keys published, and an
-            // unlocked rewrite could erase a locked writer's keys (#365, #374).
-            // `write_camera_pin` now takes the lock AND builds the whole file
-            // once, so the pin lands whole or not at all.
-            if let Err(e) = irlume_common::config::write_camera_pin(&rgb, &ir, &rgb_id, &ir_id) {
-                msg = format!("{msg} (live only; could not persist: {e})");
-            }
-            eprintln!("irlumed: {msg}");
-            Response::Ok(msg)
-        }
+        Request::SetCamerasIfCurrent { rgb, ir, expected } => set_cameras_if_current(
+            &rgb,
+            &ir,
+            &expected,
+            &irlume_auth::camera_inventory_snapshot(),
+            engine,
+        ),
+        Request::SetCameras { rgb, ir } => set_camera_devices(&rgb, &ir, engine),
         Request::Enroll {
             user,
             profile,
@@ -7207,8 +7316,9 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 10] = [
+        let sources: [(&str, &str); 11] = [
             ("main.rs", include_str!("main.rs")),
+            ("live.rs", include_str!("live.rs")),
             ("users.rs", include_str!("users.rs")),
             (
                 "retry_throttle.rs",
@@ -7616,6 +7726,18 @@ mod tests {
             reset: false,
         },
         Identify => Request::Identify,
+        SetCamerasIfCurrent => Request::SetCamerasIfCurrent {
+            rgb: "/dev/video0".into(),
+            ir: "/dev/video1".into(),
+            expected: irlume_common::live_camera::CameraSelection {
+                supervisor_id: "11111111111111111111111111111111".into(),
+                candidate: irlume_common::live_camera::CameraCandidate {
+                    instance_id: "22222222222222222222222222222222".into(),
+                    generation: 1,
+                    endpoint_paths: vec!["/dev/video0".into(), "/dev/video1".into()],
+                },
+            },
+        },
         SetCameras => Request::SetCameras {
             rgb: "/dev/video0".into(),
             ir: "/dev/video2".into(),
@@ -7678,6 +7800,7 @@ mod tests {
         Health => Request::Health,
         CameraDiagnostics => Request::CameraDiagnostics,
         SupportSnapshot => Request::SupportSnapshot { since_ms: 60_000 },
+        LiveStatus => Request::LiveStatus,
         SupportProbe => Request::SupportProbe { since_ms: 60_000 },
         TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000, trace_schema: None },
         // The user-bearing form, so the traversal walk covers it.
@@ -8484,6 +8607,115 @@ mod tests {
         assert_eq!(snapshot.events().len(), 1);
         arbiter.close();
         assert!(arbiter.take().is_none(), "snapshot must never queue");
+    }
+
+    #[test]
+    fn live_status_answers_before_readiness_without_worker_or_history() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let arbiter = arbiter::Arbiter::<Queued>::new();
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let diagnostics = diagnostics::DiagnosticState::default();
+        let seeded = diagnostics.begin(irlume_common::diagnostics::OperationClass::Authentication);
+        seeded.finish(irlume_common::diagnostics::CategoricalOutcome::Denied);
+        let before = diagnostics.snapshot(std::time::Duration::from_secs(60));
+        let mut instance = None;
+        for _ in 0..3 {
+            let response = with_serve_and_diagnostics(&arbiter, &ready, &diagnostics, |client| {
+                (&*client).write_all(b"\"LiveStatus\"\n").unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            });
+            let Response::LiveStatus(snapshot) = response else {
+                panic!("expected memory-only live status");
+            };
+            assert_eq!(snapshot.stage, irlume_common::live::LiveStage::Starting);
+            assert!(snapshot.worker.is_none());
+            assert!(snapshot.waiting.is_empty());
+            assert!(snapshot.tracking_available);
+            assert_eq!(snapshot.state_revision, 0);
+            if let Some(previous) = instance {
+                assert_eq!(snapshot.daemon_instance, previous);
+            }
+            instance = Some(snapshot.daemon_instance);
+        }
+        let after = diagnostics.snapshot(std::time::Duration::from_secs(60));
+        // Ages advance while polling; retained identities, sequence and facts
+        // must remain unchanged, and no observer events may be appended.
+        let event_facts = |snapshot: &irlume_common::diagnostics::SupportSnapshot| {
+            snapshot
+                .events()
+                .iter()
+                .map(|event| {
+                    (
+                        event.sequence,
+                        event.operation_id,
+                        event.operation,
+                        event.kind.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(event_facts(&after), event_facts(&before));
+        arbiter.close();
+        assert!(arbiter.take().is_none(), "observer must never queue");
+    }
+
+    #[test]
+    fn live_status_client_link_preserves_owner_and_completion_after_disconnect() {
+        use irlume_common::live::LiveOperationKind;
+        let diagnostics = diagnostics::DiagnosticState::default();
+        let snapshot = || {
+            diagnostics
+                .live()
+                .snapshot(irlume_common::live_camera::CameraInventorySnapshot::default())
+        };
+        let token = arbiter::CancelToken::new();
+        let first = ClientLink {
+            activity: Some(
+                diagnostics.live().register(
+                    diagnostics
+                        .begin(irlume_common::diagnostics::OperationClass::Enrollment)
+                        .operation_id(),
+                    LiveOperationKind::Enrollment,
+                    true,
+                ),
+            ),
+            ..ClientLink::default()
+        };
+        first.activity.as_ref().unwrap().waiting();
+        assert!(first.claim());
+        assert!(first.abandon(&token));
+        assert!(snapshot().worker.unwrap().cancellation_requested);
+        assert_eq!(snapshot().state_revision, 0, "disconnect is not completion");
+        first.released();
+        first.finish_activity();
+        token.reset();
+        let second = ClientLink {
+            activity: Some(
+                diagnostics.live().register(
+                    diagnostics
+                        .begin(irlume_common::diagnostics::OperationClass::Authentication)
+                        .operation_id(),
+                    LiveOperationKind::Authentication,
+                    false,
+                ),
+            ),
+            ..ClientLink::default()
+        };
+        assert!(second.claim());
+        let second_id = snapshot().worker.unwrap().operation_id;
+        assert!(!first.abandon(&token));
+        first.finish_activity();
+        let live = snapshot();
+        assert_eq!(live.worker.as_ref().unwrap().operation_id, second_id);
+        assert!(!live.worker.unwrap().cancellation_requested);
+        assert!(!token.cancel_requested());
+        assert_eq!(live.state_revision, 1);
+        second.released();
+        second.finish_activity();
+        assert!(snapshot().worker.is_none());
+        assert_eq!(snapshot().state_revision, 1);
     }
 
     /// Exercise the production socket route: invalid intent is a recorded typed
@@ -12908,6 +13140,52 @@ mod tests {
     }
 
     #[test]
+    fn status_publication_does_not_rediscover_devices() {
+        let source = include_str!("main.rs");
+        let publication = source
+            .split("fn publish_engine_camera_selection(")
+            .nth(1)
+            .unwrap()
+            .split("/// One user's enrollment")
+            .next()
+            .unwrap();
+        assert!(!publication.contains("select_engine_devices"), "publishing status must copy the actual engine selection without a second camera discovery");
+        assert!(
+            !publication.contains("observe_face_sensor_policy"),
+            "status publication must not reselect from a newer policy"
+        );
+    }
+
+    #[test]
+    fn status_publication_copies_selected_paths_without_changing_model_facts() {
+        let _guard = env_lock();
+        let mut e = engine();
+        let original_paths = (e.rgb_device().to_owned(), e.ir_device().to_owned());
+        e.set_devices("/dev/irlume-no-probe-rgb", "/dev/irlume-no-probe-ir");
+        let mut bits = EngineBits {
+            mesh: true,
+            adapter: true,
+            ..EngineBits::default()
+        };
+        copy_engine_camera_selection(&mut bits, &e);
+        assert!(bits.mesh && bits.adapter);
+        assert_eq!(bits.rgb_dev.as_deref(), Some("/dev/irlume-no-probe-rgb"));
+        assert_eq!(bits.ir_dev.as_deref(), Some("/dev/irlume-no-probe-ir"));
+        let expected_tier = if e.tier() == irlume_auth::Tier::Secure {
+            "secure"
+        } else {
+            "convenience"
+        };
+        assert_eq!(bits.tier, expected_tier);
+        e.set_devices("", "");
+        copy_engine_camera_selection(&mut bits, &e);
+        assert!(bits.rgb_dev.is_none() && bits.ir_dev.is_none());
+        assert_eq!(bits.tier, "none");
+        assert!(bits.mesh && bits.adapter);
+        e.set_devices(&original_paths.0, &original_paths.1);
+    }
+
+    #[test]
     fn set_cameras_syntax_preserves_empty_stable_and_custom_paths() {
         for path in [
             "",
@@ -12929,9 +13207,95 @@ mod tests {
     }
 
     #[test]
+    fn set_cameras_if_current_checks_identity_before_engine_and_config_changes() {
+        use irlume_common::live_camera::{
+            CameraCandidate, CameraInventorySnapshot, CameraInventoryState, CameraSelection,
+        };
+        let _guard = env_lock();
+        let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
+        let _sandbox = sandbox("guarded-setcam");
+        let (rgb, ir) = ("/dev/irlume-test-alt-rgb", "/dev/irlume-test-alt-ir");
+        let candidate = CameraCandidate {
+            instance_id: "22222222222222222222222222222222".into(),
+            generation: 1,
+            endpoint_paths: vec![rgb.into(), ir.into()],
+        };
+        let expected = CameraSelection {
+            supervisor_id: "11111111111111111111111111111111".into(),
+            candidate: candidate.clone(),
+        };
+        let inventory = CameraInventorySnapshot {
+            state: CameraInventoryState::Current,
+            supervisor_id: Some(expected.supervisor_id.clone()),
+            revision: 1,
+            observed_ago_ms: Some(0),
+            reason: None,
+            candidates: vec![candidate],
+        };
+        let unprivileged = dispatch(
+            Request::SetCamerasIfCurrent {
+                rgb: rgb.into(),
+                ir: ir.into(),
+                expected: expected.clone(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        );
+        assert!(
+            matches!(unprivileged, Response::Error(ref message) if message.contains("requires root"))
+        );
+        assert_eq!((e.rgb_device(), e.ir_device()), (NO_RGB, NO_IR));
+        let pin = irlume_common::config::config_path("cameras.conf");
+        assert!(!pin.exists());
+
+        // Inject only copied metadata; no monitor, video node or camera capture
+        // is started. The same guarded helper is called by production dispatch.
+        assert!(matches!(
+            set_cameras_if_current(rgb, ir, &expected, &inventory, &mut e),
+            Response::Ok(_)
+        ));
+        assert_eq!((e.rgb_device(), e.ir_device()), (rgb, ir));
+        assert!(matches!(dispatch_status(&Request::Health, &peer(0)),
+            Some(Response::Health { rgb_dev: Some(ref selected_rgb), ir_dev: Some(ref selected_ir), .. })
+                if selected_rgb == rgb && selected_ir == ir));
+        let saved = std::fs::read(&pin).unwrap();
+        for change in ["refreshing", "removed", "replaced", "generation", "restart"] {
+            let mut changed = inventory.clone();
+            match change {
+                "refreshing" => changed.state = CameraInventoryState::Refreshing,
+                "removed" => changed.candidates.clear(),
+                "replaced" => {
+                    changed.candidates[0].instance_id = "33333333333333333333333333333333".into()
+                }
+                "generation" => changed.candidates[0].generation += 1,
+                "restart" => {
+                    changed.supervisor_id = Some("44444444444444444444444444444444".into())
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(set_cameras_if_current(rgb, ir, &expected, &changed, &mut e), Response::Error(ref message)
+                if message.contains("select the camera again")),
+                "{change}"
+            );
+            assert_eq!((e.rgb_device(), e.ir_device()), (rgb, ir), "{change}");
+            assert_eq!(std::fs::read(&pin).unwrap(), saved, "{change}");
+        }
+        assert!(matches!(
+            set_cameras_if_current(rgb, rgb, &expected, &inventory, &mut e),
+            Response::Error(_)
+        ));
+        assert_eq!(std::fs::read(&pin).unwrap(), saved);
+        e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
+    }
+
+    #[test]
     fn set_cameras_requires_root_then_repoints_and_persists() {
         let _g = env_lock();
         let mut e = engine();
+        let previous_bits = engine_bits().lock().unwrap().clone();
         let sb = sandbox("setcam");
         let _ = &sb;
         match dispatch(
@@ -13000,6 +13364,7 @@ mod tests {
         }
         // Restore the shared engine's baseline devices.
         e.set_devices(NO_RGB, NO_IR);
+        publish_engine_bits_raw(previous_bits);
     }
 
     #[test]

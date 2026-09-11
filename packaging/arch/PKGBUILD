@@ -64,6 +64,8 @@ package() {
     cd "$srcdir/$pkgname"
     install -Dm0755 target/release/irlumed "$pkgdir/usr/bin/irlumed"
     install -Dm0755 target/release/irlume  "$pkgdir/usr/bin/irlume"
+    install -Dm0644 packaging/desktop/io.github.archledger.Irlume.desktop "$pkgdir/usr/share/applications/io.github.archledger.Irlume.desktop"
+    install -Dm0644 packaging/desktop/io.github.archledger.Irlume.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg"
     install -Dm0644 target/release/libpam_irlume.so "$pkgdir/usr/lib/security/pam_irlume.so"
     # KDE wallet handoff helper. Not in /usr/bin: it is not a command a user
     # runs, it takes a secret on stdin, and it is only meaningful inside a PAM

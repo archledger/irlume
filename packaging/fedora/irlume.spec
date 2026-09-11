@@ -43,6 +43,7 @@ BuildRequires:  dbus-devel
 BuildRequires:  tpm2-tss-devel
 BuildRequires:  systemd-devel
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  desktop-file-utils
 # v4l2-sys-mit generates bindings at build time: bindgen dlopens libclang
 # and parses the kernel's videodev2.h; tss-esapi locates tss2 via pkg-config.
 BuildRequires:  clang-devel
@@ -56,6 +57,7 @@ BuildRequires:  selinux-policy-devel
 Requires:       polkit
 Requires:       pam
 Requires:       tpm2-tss
+Requires:       hicolor-icon-theme
 Recommends:     fprintd
 # Fedora enforces SELinux by default and the greeter can't reach the daemon
 # without the policy module; pull the subpackage in by default (weak dep, so
@@ -117,6 +119,9 @@ install -Dm0644 packaging/polkit/org.irlume.enroll.policy %{buildroot}%{_datadir
 install -Dm0644 packaging/polkit/org.irlume.recovery-manage.policy %{buildroot}%{_datadir}/polkit-1/actions/org.irlume.recovery-manage.policy
 install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
 install -Dm0755 target/release/irlume  %{buildroot}%{_bindir}/irlume
+install -Dm0644 packaging/desktop/io.github.archledger.Irlume.desktop %{buildroot}%{_datadir}/applications/io.github.archledger.Irlume.desktop
+install -Dm0644 packaging/desktop/io.github.archledger.Irlume.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
+desktop-file-validate %{buildroot}%{_datadir}/applications/io.github.archledger.Irlume.desktop
 install -Dm0644 target/release/libpam_irlume.so %{buildroot}%{_libdir}/security/pam_irlume.so
 # The KDE wallet handoff helper. libexec, not bindir: it is not a command a
 # user runs, it takes a secret on stdin, and it is only meaningful inside a
@@ -254,6 +259,8 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %doc README.md docs/SECURITY_AT_REST.md docs/MACHINE-API.md docs/INTEGRATION.md
 %{_bindir}/irlumed
 %{_bindir}/irlume
+%{_datadir}/applications/io.github.archledger.Irlume.desktop
+%{_datadir}/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
 %{_libdir}/security/pam_irlume.so
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/irlume-kwallet-init

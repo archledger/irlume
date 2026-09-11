@@ -56,6 +56,20 @@ mod ir_target;
 pub use ir_target::{configured_ir_target, IrCaptureTarget, IrTargetError};
 pub mod lease;
 mod lifecycle;
+
+/// Copy the already-published UVC connection inventory. This never initializes
+/// the supervisor, probes devices, acquires a lease, or starts monitor work.
+#[must_use]
+pub fn camera_inventory_snapshot() -> irlume_common::live_camera::CameraInventorySnapshot {
+    backend::camera_inventory_snapshot()
+}
+
+/// Explicit daemon startup hook for passive connection monitoring. The existing
+/// supervisor is reused; status requests must call `camera_inventory_snapshot`
+/// instead. Monitoring reads sysfs/media topology without opening video nodes.
+pub fn initialize_camera_monitor() {
+    let _ = backend::default_camera_supervisor();
+}
 mod media_graph;
 mod paired_processing;
 pub use paired_processing::process_pair_while_draining;

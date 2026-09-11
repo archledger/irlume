@@ -80,6 +80,13 @@ Conventions that apply everywhere:
 
 ## TUI access
 
+Open **Irlume** from your desktop's application menu or run `irlume tui`. The desktop
+entry uses your desktop's terminal launcher and starts as your account.
+F3 chooses a section, F4 opens Current observations, F6 focuses page actions,
+and Shift+L opens detailed session history. The observations panel shows each
+source's age and availability; session history records earlier activity.
+Administrator access remains attached to the individual action.
+
 Press **F2** in the TUI to search additional CLI tasks, fill their options, and
 review the account and effects before running them. See the [workflow and parity
 reference](TUI.md), including multi-person profiles and appearance scans.

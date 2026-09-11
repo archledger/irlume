@@ -3,6 +3,9 @@
 
 //! Crate-private capture-backend ownership and operation routing.
 
+use irlume_common::live_camera::{
+    CameraInventoryReason, CameraInventorySnapshot, CameraInventoryState,
+};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -52,6 +55,41 @@ impl CameraSupervisor {
         }
     }
 
+    fn inventory_snapshot(&self) -> CameraInventorySnapshot {
+        match self.inventory.lock() {
+            Ok(inventory) => inventory.snapshot(),
+            Err(_) => CameraInventorySnapshot {
+                state: CameraInventoryState::Unavailable,
+                reason: Some(CameraInventoryReason::Inventory),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub(crate) fn mark_inventory_unavailable(
+        &self,
+        reason: CameraInventoryReason,
+    ) -> Result<(), CameraInventoryError> {
+        self.inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?
+            .mark_unavailable(reason);
+        Ok(())
+    }
+
+    pub(crate) fn retire_inventory_unavailable(
+        &self,
+        reason: CameraInventoryReason,
+    ) -> Result<(), CameraInventoryError> {
+        let mut inventory = self
+            .inventory
+            .lock()
+            .map_err(|_| CameraInventoryError::Poisoned)?;
+        inventory.retire_unavailable(reason);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn reconcile_inventory(
         &self,
         observations: Vec<CameraObservation>,
@@ -256,6 +294,17 @@ impl CameraBackend for UvcV4l2Backend {
 
 static DEFAULT_CAMERA_SUPERVISOR: OnceLock<Arc<CameraSupervisor>> = OnceLock::new();
 
+fn snapshot_from_slot(slot: &OnceLock<Arc<CameraSupervisor>>) -> CameraInventorySnapshot {
+    slot.get()
+        .map_or_else(CameraInventorySnapshot::default, |supervisor| {
+            supervisor.inventory_snapshot()
+        })
+}
+
+pub(crate) fn camera_inventory_snapshot() -> CameraInventorySnapshot {
+    snapshot_from_slot(&DEFAULT_CAMERA_SUPERVISOR)
+}
+
 pub(crate) fn default_camera_supervisor() -> &'static CameraSupervisor {
     DEFAULT_CAMERA_SUPERVISOR
         .get_or_init(|| {
@@ -371,6 +420,71 @@ pub(crate) mod tests {
                 .expect("recording lock poisoned")
                 .push(call.into());
         }
+    }
+
+    #[test]
+    fn live_inventory_getter_does_not_initialize_or_call_backend() {
+        let slot = OnceLock::new();
+        assert_eq!(
+            snapshot_from_slot(&slot),
+            CameraInventorySnapshot::default()
+        );
+        assert!(
+            slot.get().is_none(),
+            "reading status must not initialize a supervisor"
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend {
+            calls: calls.clone(),
+        }));
+        seed_test_endpoints(&supervisor, &["/dev/video0"]);
+        assert!(slot.set(supervisor).is_ok());
+        let snapshot = snapshot_from_slot(&slot);
+        assert_eq!(snapshot.state, CameraInventoryState::Current);
+        assert_eq!(snapshot.candidates[0].endpoint_paths, ["/dev/video0"]);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "status called a discovery/open delegate"
+        );
+    }
+
+    #[test]
+    fn live_inventory_poisoned_mutex_is_unavailable_not_a_recovered_old_snapshot() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Arc::new(CameraSupervisor::new(RecordingBackend { calls }));
+        seed_test_endpoints(&supervisor, &["/dev/video0"]);
+        let poison = supervisor.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.inventory.lock().unwrap();
+            panic!("synthetic poison");
+        })
+        .join();
+        let snapshot = supervisor.inventory_snapshot();
+        assert_eq!(snapshot.state, CameraInventoryState::Unavailable);
+        assert_eq!(snapshot.reason, Some(CameraInventoryReason::Inventory));
+        assert!(snapshot.candidates.is_empty());
+    }
+
+    #[test]
+    fn live_inventory_snapshot_does_not_acquire_or_extend_an_operation_permit() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = CameraSupervisor::new(RecordingBackend { calls });
+        seed_test_endpoints(&supervisor, &["/dev/video0"]);
+        let operation = supervisor
+            .acquire_operation(&["/dev/video0"], CameraOperationKind::Setup, Instant::now())
+            .unwrap();
+        let snapshot = supervisor.inventory_snapshot();
+        drop(operation);
+        let next = supervisor.acquire_operation(
+            &["/dev/video0"],
+            CameraOperationKind::Diagnostics,
+            Instant::now(),
+        );
+        assert!(
+            next.is_ok(),
+            "retaining the snapshot must not retain the permit"
+        );
+        assert_eq!(snapshot.state, CameraInventoryState::Current);
     }
 
     impl CameraBackend for RecordingBackend {

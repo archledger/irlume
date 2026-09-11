@@ -22,6 +22,7 @@ pub use irlume_camera::capture_qualification::{
     QualificationResolution, QualificationStore, QualificationStoreError, SequentialReason,
 };
 pub use irlume_camera::lease;
+pub use irlume_camera::{camera_inventory_snapshot, initialize_camera_monitor};
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves
 /// (#187), so this is the only path to a listing.

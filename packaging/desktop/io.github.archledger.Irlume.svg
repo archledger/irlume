@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Project-owned scanner mark, adapted from docs/assets/banner.svg. -->
+  <defs>
+    <linearGradient id="ir" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c1d3f"/>
+      <stop offset="0.5" stop-color="#c0304f"/>
+      <stop offset="1" stop-color="#ff6a3d"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#0d1117"/>
+  <g transform="translate(128 128)">
+    <circle r="62" fill="none" stroke="url(#ir)" stroke-width="8"/>
+    <circle r="30" fill="none" stroke="url(#ir)" stroke-width="12"/>
+    <circle r="8" fill="#ff6a3d"/>
+    <path d="M -62 0 H 62" stroke="#ff6a3d" stroke-width="3" opacity="0.55"/>
+    <g stroke="url(#ir)" stroke-width="7" fill="none" stroke-linecap="round">
+      <path d="M -84 -58 V -80 H -62"/>
+      <path d="M 84 -58 V -80 H 62"/>
+      <path d="M -84 58 V 80 H -62"/>
+      <path d="M 84 58 V 80 H 62"/>
+    </g>
+  </g>
+</svg>

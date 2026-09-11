@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Irlume
+GenericName=Authentication Settings
+Comment=Manage face and fingerprint sign-in
+Exec=irlume tui
+TryExec=irlume
+Icon=io.github.archledger.Irlume
+Terminal=true
+Categories=Settings;
+Keywords=Face;Fingerprint;Authentication;Login;

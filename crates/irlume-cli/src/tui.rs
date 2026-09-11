@@ -11,6 +11,9 @@
 //! show). A thin client: all work happens in the daemon.
 
 mod actions;
+mod activity;
+mod freshness;
+use freshness::{Freshness, Source, Worker};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -20,73 +23,58 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::Frame;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use irlume_common::{PositionReport, ProfileSummary, Request, Response};
 
-/// Semantic color slots, resolved once at startup down a capability ladder:
-/// NO_COLOR (no-color.org) gets none and the glyphs carry all state; plain
-/// terminals get ANSI names so the USER'S terminal theme is the palette
-/// (light themes stay readable); truecolor terminals get the soft irlume
-/// palette as polish. Every use is a semantic slot (accent/ok/warn/err),
-/// never decoration, so the ladder degrades without losing information.
+/// Semantic foregrounds use the user's ANSI palette on both light and dark
+/// terminals. Leave backgrounds at their terminal defaults; fixed RGB pastels
+/// cannot assume the background is dark. Glyphs and words also carry state.
 struct Theme {
     accent: Color,
     blue: Color,
     ok: Color,
     err: Color,
     warn: Color,
-    /// Key-chip style for the footer (`[w]`, `[?]`…): colored chip normally,
-    /// REVERSED under NO_COLOR (a black-on-Reset chip would be invisible).
     chip: Style,
 }
 
 fn th() -> &'static Theme {
     static T: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
-            return Theme {
-                accent: Color::Reset,
-                blue: Color::Reset,
-                ok: Color::Reset,
-                err: Color::Reset,
-                warn: Color::Reset,
-                chip: Style::new().add_modifier(Modifier::REVERSED),
-            };
-        }
-        let truecolor = std::env::var("COLORTERM")
-            .map(|v| v.contains("truecolor") || v.contains("24bit"))
-            .unwrap_or(false);
-        if truecolor {
-            let accent = Color::Rgb(0x6c, 0xb6, 0xff);
-            Theme {
-                accent,
-                blue: Color::Rgb(0x4a, 0x90, 0xd9),
-                ok: Color::Rgb(0x73, 0xc9, 0x91),
-                err: Color::Rgb(0xe8, 0x7a, 0x7a),
-                warn: Color::Rgb(0xe6, 0xc0, 0x7a),
-                chip: Style::new().fg(Color::Black).bg(accent),
-            }
-        } else {
-            Theme {
-                accent: Color::Cyan,
-                blue: Color::Blue,
-                ok: Color::Green,
-                err: Color::Red,
-                warn: Color::Yellow,
-                chip: Style::new().fg(Color::Black).bg(Color::Cyan),
-            }
+        let monochrome = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        let color = |value| if monochrome { Color::Reset } else { value };
+        Theme {
+            accent: color(Color::Cyan),
+            blue: color(Color::Blue),
+            ok: color(Color::Green),
+            err: color(Color::Red),
+            warn: color(Color::Yellow),
+            chip: Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
         }
     })
 }
 
-/// Selection uses the terminal's own foreground/background relationship, so it
-/// remains legible on light, dark, ANSI-only, and NO_COLOR terminals.
+/// Reverse the terminal's own foreground/background for a visible focus cue.
 fn selected_style() -> Style {
-    Style::new()
-        .fg(th().accent)
-        .add_modifier(Modifier::BOLD)
-        .add_modifier(Modifier::REVERSED)
+    Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+}
+
+/// A setting state always has a readable word and glyph, including NO_COLOR.
+fn setting_badge(state: Option<bool>) -> Span<'static> {
+    let (label, color) = match state {
+        Some(true) => ("● ON", th().ok),
+        Some(false) => ("○ OFF", Color::Reset),
+        None => ("◐ UNKNOWN", th().warn),
+    };
+    Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD))
+}
+
+const MIN_WINDOW_COLS: u16 = 80;
+const MIN_WINDOW_ROWS: u16 = 24;
+
+fn window_fits(area: Rect) -> bool {
+    area.width >= MIN_WINDOW_COLS && area.height >= MIN_WINDOW_ROWS
 }
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -188,6 +176,7 @@ enum Click {
     Key(KeyCode),
     DialogKey(KeyCode),
     ActionRow(usize),
+    SectionRow(usize),
     Hub(usize),
     /// Select a row in the current screen's list. The screen is intentionally
     /// resolved when the click is handled: targets are cleared and rebuilt on
@@ -246,7 +235,7 @@ enum Suspend {
     SelinuxLoad,
     /// Switch the active camera pair; root op (writes /etc), so it suspends to
     /// `sudo irlume set-cameras <rgb> <ir>`.
-    SetCameras(String, String),
+    SetCameras(String, String, irlume_common::live_camera::CameraSelection),
     /// Set up the IR emitter; root op, suspends to `sudo irlume ir-setup`.
     IrSetup,
     /// Measure whether the camera can stream RGB and IR at once and persist
@@ -313,6 +302,7 @@ enum Suspend {
 enum ConfirmAct {
     Daemon(Request),
     Sus(Suspend),
+    CameraQualification,
 }
 
 /// A y/n confirm with a SPECIFIC verb on the affirmative (GNOME HIG: "Label
@@ -387,6 +377,7 @@ enum ResumeEnroll {
 }
 
 /// One Repair-tab diagnostic row.
+#[derive(Clone)]
 struct Check {
     label: String,
     sev: Sev,
@@ -534,68 +525,114 @@ struct Op {
     rx: mpsc::Receiver<(bool, String)>,
 }
 
-/// Camera metadata gathered off the event thread; failed fields retain their previous values.
+/// Camera roles gathered off the event thread and bound to a passive inventory epoch.
 #[derive(Default)]
 struct CameraListing {
     pairs: Option<Vec<irlume_common::CameraPairInfo>>,
-    mode: Option<String>,
 }
 
 impl CameraListing {
     fn gather() -> Self {
-        let mut listing = Self::default();
-        if let Ok(Response::Cameras(pairs)) = crate::daemon_poll(&Request::ListCameras) {
-            listing.pairs = Some(pairs);
+        Self {
+            pairs: match crate::daemon_poll(&Request::ListCameras) {
+                Ok(Response::Cameras(pairs)) => Some(pairs),
+                _ => None,
+            },
         }
-        // The same camera-class slot as the listing above: the arbiter
-        // serializes this against captures, and it is refreshed on screen
-        // entry (not per frame). A refusal or older daemon leaves the last
-        // answer in place — unknown is not "default".
-        if let Ok(Response::CaptureModeStatus {
-            mode,
-            source,
-            qualification_state,
-            qualification_reason,
-            runtime_degradation,
-            ..
-        }) = crate::daemon_poll(&Request::CaptureModeStatus)
-        {
-            // The qualification state tells the user WHY their camera is in
-            // this mode: "measured_sequential" (the camera cannot sustain
-            // concurrent) reads very differently from
-            // "unqualified_context_changed" (kernel or USB changed; re-tune).
-            // Both are actionable facts the bare mode string hides (#586
-            // audit: a user who never runs camera-mode or doctor has no way
-            // to learn their qualification is stale).
-            let mut text = format!("{mode} (source: {source})");
-            if !qualification_state.is_empty() {
-                text.push_str("; qualification: ");
-                text.push_str(&qualification_state);
-                if let Some(reason) = &qualification_reason {
-                    text.push_str(" (");
-                    text.push_str(reason);
-                    text.push(')');
-                }
-            }
-            if let Some(why) = runtime_degradation {
-                text.push_str("; degraded: ");
-                text.push_str(&why);
-            }
-            listing.mode = Some(text);
-        }
-        listing
     }
+}
+
+fn gather_capture_qualification() -> Option<String> {
+    let Ok(Response::CaptureModeStatus {
+        mode,
+        source,
+        qualification_state,
+        qualification_reason,
+        runtime_degradation,
+        ..
+    }) = crate::daemon_poll(&Request::CaptureModeStatus)
+    else {
+        return None;
+    };
+    let mut text = format!("{mode} (source: {source}); qualification: {qualification_state}");
+    if let Some(reason) = qualification_reason {
+        text.push_str(&format!(" ({reason})"));
+    }
+    if let Some(reason) = runtime_degradation {
+        text.push_str(&format!("; degraded: {reason}"));
+    }
+    Some(text)
+}
+
+fn receive_finished<T>(receiver: &Option<mpsc::Receiver<T>>) -> Option<Result<T, ()>> {
+    match receiver.as_ref()?.try_recv() {
+        Ok(value) => Some(Ok(value)),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+    }
+}
+
+fn live_kind_label(kind: irlume_common::live::LiveOperationKind) -> &'static str {
+    use irlume_common::live::LiveOperationKind as K;
+    match kind {
+        K::Authentication => "authentication",
+        K::WalletAuthentication => "wallet authentication",
+        K::Enrollment => "enrollment",
+        K::Framing => "framing guide",
+        K::Identification => "recognition test",
+        K::CameraEnumeration => "camera inspection",
+        K::CameraSetup => "camera setup",
+        K::CaptureQualification => "capture qualification",
+        K::CameraDiagnostics => "camera diagnostics",
+        K::ProfileRead => "reading profiles",
+        K::ProfileUpdate => "updating profiles",
+        K::SensorReadiness => "sensor readiness",
+        K::WalletRead => "reading wallet status",
+        K::WalletUpdate => "updating wallet",
+        K::RecoveryUpdate => "updating recovery",
+        K::Compatibility => "compatibility work",
+        K::Status => "status",
+        K::Unknown => "unknown work",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CameraEpoch {
+    supervisor: String,
+    revision: u64,
+}
+
+#[derive(Clone)]
+struct CameraChoice {
+    supervisor: String,
+    candidate: irlume_common::live_camera::CameraCandidate,
+    rgb: String,
+    ir: String,
 }
 
 /// TUI state. `Option` fields act as modal overlays; when several are
 /// `Some`, `on_key` consumes input in this order (first match wins):
-/// `error` (any key dismisses) > `more_actions` (search/navigation) > `enroll` (Esc only) > `op` (q/Esc only) >
+/// `error` (reading keys scroll; other keys dismiss) > `more_actions` (search/navigation) > `enroll` (Esc only) > `op` (q/Esc only) >
 /// `input` (text entry) > `confirm` (y/n) > `enroll_merge` (y/n) > normal
 /// screen keys. `suspend` is not a key state: the main loop takes it after
 /// each key/tick, leaves the TUI, and runs the command. PageUp/PageDown
 /// scroll the Activity panel in every state except text entry.
 struct App {
     user: String,
+    freshness: Freshness,
+    clock_override: Option<Instant>,
+    usable_sources: [bool; 13],
+    show_live: bool,
+    live: Option<irlume_common::live::LiveStatusSnapshot>,
+    live_load: Option<mpsc::Receiver<Result<irlume_common::live::LiveStatusSnapshot, String>>>,
+    live_epoch: Option<(irlume_common::diagnostics::OperationId, u64)>,
+    camera_epoch: Option<CameraEpoch>,
+    classified_epoch: Option<CameraEpoch>,
+    camera_confirmation: Option<CameraChoice>,
+    selected_camera_choice: Option<Option<CameraChoice>>,
+    selected_profile_identity: Option<Option<(String, Option<String>)>>,
+    qualification_load: Option<mpsc::Receiver<Option<String>>>,
+    identify_checked_at: Option<Instant>,
     screen: usize,
     sel: usize,
     profiles: Vec<ProfileSummary>,
@@ -632,7 +669,7 @@ struct App {
     /// `None` = not fetched / daemon refused: drawn as unknown, never blank.
     capture_mode: Option<String>,
     camera_load: Option<mpsc::Receiver<CameraListing>>,
-    activity: Vec<(char, String)>,
+    activity: activity::Activity,
     input: Option<(String, String, Pending)>,
     confirm: Option<Confirm>,
     /// True while mouse capture is released so the terminal's own selection
@@ -641,6 +678,8 @@ struct App {
     /// Clickable content regions recorded each frame by `draw`, consulted by
     /// `on_click`. Interior mutability because `draw` takes `&self`.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    /// Input must match a fully drawn window, including after a resize.
+    window_area: std::cell::Cell<Option<Rect>>,
     /// Last rendered dialog bounds and scroll limit; controls stay outside the body.
     dialog_view: std::cell::Cell<(Rect, u16)>,
     dialog_scroll: std::cell::Cell<u16>,
@@ -649,6 +688,12 @@ struct App {
     /// The [?] full-keymap overlay (tier two of the disclosure ladder).
     show_help: bool,
     more_actions: Option<(String, usize)>,
+    /// The compact section chooser uses the same visible navigation order.
+    sections: Option<usize>,
+    /// Screen and selected action index; stale focus never carries to a new page.
+    action_focus: Option<(usize, usize)>,
+    /// Reveal a newly focused action once, leaving subsequent wheel scroll free.
+    action_reveal: std::cell::Cell<bool>,
     /// Selected row of the Welcome hub (Enter jumps to its screen).
     hub_sel: usize,
     op: Option<Op>,
@@ -697,6 +742,8 @@ struct App {
     /// Whether the activity history is expanded. The default is a one-line
     /// recent-status strip so content keeps the vertical space.
     activity_open: bool,
+    /// Full-height, session-only history; opening it performs no I/O.
+    activity_history_open: bool,
     /// Disable repeating motion while preserving static status/progress.
     /// Set by `IRLUME_REDUCE_MOTION` for terminals or users that prefer it.
     reduce_motion: bool,
@@ -708,6 +755,8 @@ struct App {
     advanced: bool,
     /// Detected face-hardware capabilities (drives `visible` + the recommendation).
     caps: irlume_camera::Caps,
+    reported_caps: irlume_camera::Caps,
+    known_uvc_paths: Vec<String>,
     /// A fingerprint reader is present.
     fp_present: bool,
     fp_known: bool,
@@ -789,6 +838,9 @@ struct PamCache {
 /// deterministic under test for the first time.
 #[derive(Default, Clone)]
 struct Probes {
+    runtime_checks: Vec<Check>,
+    fprintd_wired: bool,
+    foreign_pam: Vec<&'static str>,
     caps: irlume_camera::Caps,
     /// Whether `caps` came from an actual device probe. False means the
     /// daemon was up and the probe was skipped to avoid opening nodes it may
@@ -797,6 +849,7 @@ struct Probes {
     caps_probed: bool,
     /// None is an unavailable observation, not a missing reader.
     fp_present: Option<bool>,
+    fp_enrollment_observed: bool,
     fp: FpInfo,
     pam_cache: PamCache,
     fp_coverage: Vec<(&'static str, &'static str, bool)>,
@@ -824,6 +877,71 @@ struct Probes {
 }
 
 impl Probes {
+    fn runtime_fallback_checks() -> Vec<Check> {
+        let mut v = Vec::new();
+        let mk = |label: &str, sev, detail: String, fix| Check {
+            label: label.into(),
+            sev,
+            detail,
+            fix,
+        };
+        let ort = std::env::var("ORT_DYLIB_PATH")
+            .ok()
+            .filter(|p| std::path::Path::new(p).exists())
+            .is_some()
+            || ORT_FALLBACK_PATHS
+                .iter()
+                .any(|p| std::path::Path::new(p).exists());
+        v.push(ort_fallback_check(ort));
+        v.push(tflite_fallback_check(
+            std::env::var(irlume_vision::tflite::TFLITE_LIB_ENV)
+                .ok()
+                .as_deref(),
+            |p| p.exists(),
+        ));
+
+        // Resolve models the way the daemon does (env → /usr/share/irlume/models
+        // → repo cwd), NOT just cwd-relative; a packaged install keeps them in
+        // /usr/share and the TUI is rarely launched from the repo.
+        let m1 = crate::commands::resolve_model("glintr100.onnx", "IRLUME_MODEL").is_some();
+        let m2 =
+            crate::commands::resolve_model("face_detection_yunet_2023mar.onnx", "IRLUME_DET_MODEL")
+                .is_some();
+        v.push(mk(
+            "Models",
+            if m1 && m2 { Sev::Ok } else { Sev::Fail },
+            if m1 && m2 {
+                "YuNet + AuraFace present".into()
+            } else {
+                "not found (daemon down; local probe)".into()
+            },
+            if m1 && m2 {
+                Fix::None
+            } else {
+                Fix::Manual(
+                    "install the irlume package (models ship in /usr/share/irlume/models)".into(),
+                )
+            },
+        ));
+        v
+    }
+
+    fn foreign_pam_modules() -> Vec<&'static str> {
+        let contents: Vec<_> = ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect();
+        ["howdy", "linhello"]
+            .into_iter()
+            .filter(|needle| {
+                contents.iter().any(|text| {
+                    text.lines()
+                        .any(|line| crate::pamwire::directive(line).contains(needle))
+                })
+            })
+            .collect()
+    }
+
     /// The full sweep, verbatim from the code that used to run inline. Runs
     /// on a worker thread; everything here may block on D-Bus activation, a
     /// subprocess, or a device open without costing the UI a frame.
@@ -839,13 +957,20 @@ impl Probes {
             std::time::Instant::now() + Duration::from_millis(1500),
         );
         let fp_present = fp_observed == Some(true);
+        let listed = if fp_present {
+            Some(irlume_fingerprint::list_fingers(user))
+        } else {
+            None
+        };
+        let fp_enrollment_observed =
+            matches!(&listed, Some(irlume_fingerprint::ListOutcome::Fingers(_)))
+                || fp_observed == Some(false);
         let fp = FpInfo {
             available: fp_present,
             device: fp_present.then(irlume_fingerprint::device_name).flatten(),
-            enrolled: if fp_present {
-                irlume_fingerprint::enrolled_fingers(user)
-            } else {
-                Vec::new()
+            enrolled: match listed {
+                Some(irlume_fingerprint::ListOutcome::Fingers(fingers)) => fingers,
+                _ => Vec::new(),
             },
             method: irlume_core::policy::method().as_str().to_string(),
         };
@@ -861,9 +986,15 @@ impl Probes {
             handoffs: crate::pamwire::keyring_handoff_warnings(),
         };
         Probes {
+            runtime_checks: Self::runtime_fallback_checks(),
+            fprintd_wired: crate::fingerprint::pam_fprintd_wired_pub(
+                &crate::fingerprint::PamSearchPath::live(),
+            ),
+            foreign_pam: Self::foreign_pam_modules(),
             caps,
             caps_probed: false,
             fp_present: fp_observed,
+            fp_enrollment_observed,
             reader_stuck: fp_present && irlume_fingerprint::reader_stuck(user),
             fp,
             fp_coverage: if fp_present {
@@ -900,6 +1031,7 @@ impl Probes {
 /// poll budget is 1.5s per request, and paying that between keystrokes is
 /// what made the whole TUI feel wedged whenever the daemon was.
 struct LightState {
+    observed_at: [Option<Instant>; 4],
     daemon_up: bool,
     /// The classified Ping outcome behind `daemon_up`. Kept alongside the
     /// bool because Repair needs four answers where the gating logic needs
@@ -918,7 +1050,7 @@ impl LightState {
     /// Verbatim the reads `refresh_light` used to make inline, EXCEPT that
     /// it no longer enumerates cameras at all: the daemon answers Health for
     /// capabilities and ListCameras for the picker (#187).
-    fn gather(user: &str, prev_armed: Option<bool>) -> Self {
+    fn gather(user: &str, _prev_armed: Option<bool>) -> Self {
         // The raw client call, not `daemon_poll`: classification needs the
         // errno kind and daemon_poll flattens errors to String.
         let reach =
@@ -933,17 +1065,19 @@ impl LightState {
         // come from Health, the picker's listing from ListCameras, and both
         // are serialized against captures on the daemon's side.
         let mut out = LightState {
+            observed_at: [None; 4],
             daemon_up,
             reach,
             health: None,
             preferences: None,
-            keyring_armed: prev_armed,
+            keyring_armed: None,
             keyring_policy: None,
             keyring_kind: None,
             recovery: None,
         };
         if daemon_up || reach == crate::commands::DaemonReach::Starting {
             out.preferences = crate::preferences::daemon_state();
+            out.observed_at[1] = out.preferences.map(|_| Instant::now());
         }
         if !daemon_up {
             return out;
@@ -972,6 +1106,7 @@ impl LightState {
             }),
             _ => None, // older daemon / daemon down → Repair falls back to local probes
         };
+        out.observed_at[0] = out.health.as_ref().map(|_| Instant::now());
         // Routine status reads envelope metadata only. An older daemon falls
         // back to the armed bit, never to implicit live PCR diagnosis.
         match crate::daemon_poll(&Request::KeyringMetadata {
@@ -992,10 +1127,11 @@ impl LightState {
                     user: user.to_string(),
                 }) {
                     Ok(Response::HasPassword(b)) => Some(b),
-                    _ => prev_armed,
+                    _ => None,
                 };
             }
         }
+        out.observed_at[2] = out.keyring_armed.map(|_| Instant::now());
         if let Ok(Response::RecoveryStatus {
             encrypted,
             recovery_set,
@@ -1004,6 +1140,7 @@ impl LightState {
         }) = crate::daemon_poll(&Request::RecoveryStatus {
             user: user.to_string(),
         }) {
+            out.observed_at[3] = Some(Instant::now());
             out.recovery = Some(RecoveryInfo {
                 encrypted,
                 key_present,
@@ -1040,6 +1177,535 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 }
 
 impl App {
+    fn now(&self) -> Instant {
+        self.clock_override.unwrap_or_else(Instant::now)
+    }
+
+    fn source_usable(&self, source: Source) -> bool {
+        self.freshness.usable(source, self.now())
+    }
+
+    fn source_status(&self, source: Source) -> String {
+        self.freshness
+            .observation(source)
+            .describe(self.now(), source.max_age(), false)
+    }
+
+    #[cfg(test)]
+    fn mark_fixture_observations_fresh(&mut self, now: Instant) {
+        for source in Source::ALL {
+            self.freshness.observation_mut(source).record(true, now);
+        }
+    }
+
+    fn clear_source(&mut self, source: Source) {
+        match source {
+            Source::Live => self.live = None,
+            Source::Health => self.health = None,
+            Source::Preferences => self.preferences = None,
+            Source::Wallet => {
+                self.keyring_armed = None;
+                self.keyring_policy = None;
+                self.keyring_kind = None;
+            }
+            Source::Recovery => self.recovery = None,
+            Source::Profiles => {
+                if (self.profiles_loaded || !self.profiles.is_empty())
+                    && self.selected_profile_identity.is_none()
+                {
+                    self.selected_profile_identity = Some(self.selected_profile_row());
+                }
+                self.profiles.clear();
+                self.profiles_loaded = false;
+            }
+            Source::Cameras => {
+                if (self.pairs_known || !self.pairs.is_empty())
+                    && self.selected_camera_choice.is_none()
+                {
+                    self.selected_camera_choice = Some(
+                        self.pairs
+                            .get(self.cam_sel)
+                            .and_then(|pair| self.camera_choice(&pair.rgb, &pair.ir)),
+                    );
+                }
+                self.pairs.clear();
+                self.pairs_known = false;
+                self.cam_sel = 0;
+            }
+            Source::CameraPrivacy => {} // the renderer gates this mutable inspection field
+            Source::Qualification => {} // retained only as explicitly historical text
+            Source::Machine => {
+                self.probes_landed = false;
+                self.pam_cache = PamCache::default();
+            }
+            Source::FingerprintReader => {
+                self.fp_known = false;
+            }
+            Source::Fingerprint => {
+                self.fp.enrolled.clear();
+            }
+            Source::Apps => {
+                self.heavy = None;
+                self.heavy_known = false;
+            }
+        }
+    }
+
+    fn invalidate_source(&mut self, source: Source) {
+        self.freshness.observation_mut(source).invalidate();
+        self.clear_source(source);
+    }
+
+    fn invalidate_daemon_observations(&mut self) {
+        for source in [
+            Source::Health,
+            Source::Preferences,
+            Source::Wallet,
+            Source::Recovery,
+            Source::Profiles,
+            Source::Qualification,
+        ] {
+            self.invalidate_source(source);
+        }
+        for worker in [Worker::Light, Worker::Profiles, Worker::Qualification] {
+            self.freshness.cycle_mut(worker).invalidate();
+        }
+        self.invalidate_keyring_diagnostic();
+    }
+
+    fn current_inventory(&self) -> Option<&irlume_common::live_camera::CameraInventorySnapshot> {
+        use irlume_common::live_camera::CameraInventoryState;
+        self.live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+            .map(|live| &live.cameras)
+            .filter(|inventory| inventory.state == CameraInventoryState::Current)
+    }
+
+    fn face_camera_presence(&self) -> Option<bool> {
+        let health = self
+            .health
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Health))?;
+        let rgb = health.rgb_dev.as_deref()?;
+        let inventory = self.current_inventory()?;
+        if inventory
+            .candidates
+            .iter()
+            .any(|candidate| candidate.endpoint_paths.iter().any(|path| path == rgb))
+        {
+            Some(true)
+        } else if self.known_uvc_paths.iter().any(|path| path == rgb) {
+            Some(false)
+        } else {
+            // The passive inventory covers UVC. A platform/libcamera backend
+            // absent from it is unobserved, not proven disconnected.
+            None
+        }
+    }
+
+    fn update_camera_availability(&mut self) {
+        let rgb = self.face_camera_presence() == Some(true);
+        let ir_pair = rgb
+            && self.health.as_ref().is_some_and(|health| {
+                health.tier == "secure"
+                    && health
+                        .rgb_dev
+                        .as_deref()
+                        .zip(health.ir_dev.as_deref())
+                        .is_some_and(|(rgb, ir)| self.camera_choice(rgb, ir).is_some())
+            });
+        self.caps = irlume_camera::Caps { rgb, ir_pair };
+    }
+
+    fn refresh_qualification(&mut self) {
+        if self.qualification_load.is_some() {
+            return;
+        }
+        self.freshness.cycle_mut(Worker::Qualification).begin();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(gather_capture_qualification());
+        });
+        self.qualification_load = Some(rx);
+    }
+
+    fn camera_choice(&self, rgb: &str, ir: &str) -> Option<CameraChoice> {
+        let inventory = self.current_inventory()?;
+        let candidate = inventory.candidates.iter().find(|candidate| {
+            candidate.endpoint_paths.iter().any(|path| path == rgb)
+                && candidate.endpoint_paths.iter().any(|path| path == ir)
+        })?;
+        Some(CameraChoice {
+            supervisor: inventory.supervisor_id.clone()?,
+            candidate: candidate.clone(),
+            rgb: rgb.into(),
+            ir: ir.into(),
+        })
+    }
+
+    fn camera_choice_current(&self, choice: &CameraChoice) -> bool {
+        self.camera_choice(&choice.rgb, &choice.ir)
+            .is_some_and(|current| {
+                current.supervisor == choice.supervisor && current.candidate == choice.candidate
+            })
+    }
+
+    fn check_camera_confirmation(&mut self) {
+        if self
+            .camera_confirmation
+            .as_ref()
+            .is_some_and(|choice| !self.camera_choice_current(choice))
+        {
+            self.camera_confirmation = None;
+            if matches!(
+                self.confirm,
+                Some((_, _, ConfirmAct::Sus(Suspend::SetCameras(..))))
+            ) {
+                self.confirm = None;
+                self.set_error("Camera connection changed or its current inventory is unavailable. Select the camera again before switching.");
+            }
+        }
+    }
+
+    fn apply_live_snapshot(
+        &mut self,
+        snapshot: irlume_common::live::LiveStatusSnapshot,
+        now: Instant,
+    ) {
+        let epoch = (snapshot.daemon_instance, snapshot.state_revision);
+        if self
+            .live_epoch
+            .as_ref()
+            .is_some_and(|prior| prior != &epoch)
+        {
+            self.invalidate_daemon_observations();
+        }
+        self.live_epoch = Some(epoch);
+        self.daemon_up = matches!(
+            snapshot.stage,
+            irlume_common::live::LiveStage::Ready | irlume_common::live::LiveStage::Rebuilding
+        );
+        self.daemon_reach = if self.daemon_up {
+            crate::commands::DaemonReach::Running
+        } else {
+            crate::commands::DaemonReach::Starting
+        };
+        let camera_epoch = if snapshot.cameras.state
+            == irlume_common::live_camera::CameraInventoryState::Current
+        {
+            snapshot
+                .cameras
+                .supervisor_id
+                .clone()
+                .map(|supervisor| CameraEpoch {
+                    supervisor,
+                    revision: snapshot.cameras.revision,
+                })
+        } else {
+            None
+        };
+        if self.camera_epoch != camera_epoch {
+            self.invalidate_source(Source::Cameras);
+            self.invalidate_source(Source::CameraPrivacy);
+            self.invalidate_source(Source::Qualification);
+            self.freshness.cycle_mut(Worker::Cameras).invalidate();
+            self.freshness.cycle_mut(Worker::Qualification).invalidate();
+            self.classified_epoch = None;
+            self.camera_epoch = camera_epoch;
+        }
+        if snapshot.cameras.state == irlume_common::live_camera::CameraInventoryState::Current {
+            // Retain only the two configured endpoints needed to distinguish a
+            // previously observed UVC removal from an unmonitored backend.
+            if let Some(health) = &self.health {
+                let configured: Vec<_> =
+                    health.rgb_dev.iter().chain(health.ir_dev.iter()).collect();
+                self.known_uvc_paths
+                    .retain(|path| configured.contains(&path));
+                for path in configured {
+                    if snapshot
+                        .cameras
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.endpoint_paths.contains(path))
+                        && !self.known_uvc_paths.contains(path)
+                    {
+                        self.known_uvc_paths.push(path.clone());
+                    }
+                }
+            }
+        }
+        self.live = Some(snapshot);
+        self.freshness
+            .observation_mut(Source::Live)
+            .record(true, now);
+        self.check_camera_confirmation();
+        self.update_camera_availability();
+        self.run_checks();
+        self.recompute_visible();
+    }
+
+    fn refresh_live(&mut self) {
+        if self.live_load.is_some() {
+            return;
+        }
+        self.freshness.cycle_mut(Worker::Live).begin();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match crate::daemon_poll(&Request::LiveStatus) {
+                Ok(Response::LiveStatus(snapshot)) => Ok(*snapshot),
+                Ok(_) => Err("live status is unavailable from this daemon".into()),
+                Err(_) => Err("live status is unavailable".into()),
+            };
+            let _ = tx.send(result);
+        });
+        self.live_load = Some(rx);
+    }
+
+    fn live_summary(&self) -> String {
+        use irlume_common::live::LiveStage;
+        let Some(live) = self
+            .live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+        else {
+            return "Daemon activity unavailable".into();
+        };
+        let stage = match live.stage {
+            LiveStage::Starting => "starting",
+            LiveStage::Ready => "ready",
+            LiveStage::Rebuilding => "rebuilding",
+            LiveStage::Stopping => "stopping",
+            LiveStage::Unknown => "state unknown",
+        };
+        if !live.tracking_available {
+            return format!("Daemon {stage}; activity unavailable");
+        }
+        let waiting: u128 = live
+            .waiting
+            .iter()
+            .map(|entry| u128::from(entry.count))
+            .sum();
+        if let Some(worker) = &live.worker {
+            format!(
+                "Daemon {stage}: {} · {}s{} · {waiting} waiting · {} background",
+                live_kind_label(worker.kind),
+                worker.elapsed_ms / 1000,
+                if worker.cancellation_requested {
+                    "; stop requested"
+                } else {
+                    ""
+                },
+                live.background.len()
+            )
+        } else if !live.background.is_empty() {
+            let work = &live.background[0];
+            format!(
+                "Daemon {stage}: background {} · {}s{} · {} other background · {waiting} waiting",
+                live_kind_label(work.kind),
+                work.elapsed_ms / 1000,
+                if work.cancellation_requested {
+                    "; stop requested"
+                } else {
+                    ""
+                },
+                live.background.len() - 1
+            )
+        } else if live.stage == LiveStage::Ready && waiting == 0 {
+            "Daemon ready · worker idle (Irlume only)".into()
+        } else {
+            format!("Daemon {stage} · {waiting} waiting")
+        }
+    }
+
+    fn live_details(&self) -> String {
+        let mut lines = vec![self.live_summary(), self.source_status(Source::Live),
+            "This observes Irlume's worker and known automatic tasks, not every application or physical camera power.".into()];
+        if let Some(live) = self
+            .live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+        {
+            if live.tracking_available {
+                for waiting in &live.waiting {
+                    lines.push(format!(
+                        "Waiting: {} × {}",
+                        waiting.count,
+                        live_kind_label(waiting.kind)
+                    ));
+                }
+            }
+            if live.tracking_available {
+                for work in &live.background {
+                    lines.push(format!(
+                        "Background: {} · {}s{}",
+                        live_kind_label(work.kind),
+                        work.elapsed_ms / 1000,
+                        if work.cancellation_requested {
+                            "; stop requested"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+            lines.push(String::new());
+            lines.push(match self.current_inventory() {
+                Some(inventory) => format!(
+                    "UVC inventory: {} connected candidate(s); roles require inspection",
+                    inventory.candidates.len()
+                ),
+                None => "UVC inventory unavailable; no absence or idle state is inferred".into(),
+            });
+            if let Some(inventory) = self.current_inventory() {
+                for camera in &inventory.candidates {
+                    lines.push(format!("  {}", camera.endpoint_paths.join(" + ")));
+                }
+            }
+        }
+        lines.push("\nSource observations".into());
+        for (source, label) in [
+            (Source::Health, "Engine configuration"),
+            (Source::Preferences, "Preferences"),
+            (Source::Wallet, "Wallet metadata"),
+            (Source::Recovery, "Recovery"),
+            (Source::Profiles, "Faces"),
+            (Source::Cameras, "Camera role inspection"),
+            (Source::CameraPrivacy, "Camera privacy inspection"),
+            (Source::Qualification, "Historical qualification"),
+            (Source::Machine, "Machine setup"),
+            (Source::FingerprintReader, "Fingerprint reader"),
+            (Source::Fingerprint, "Fingerprint enrollment"),
+            (Source::Apps, "Applications"),
+        ] {
+            lines.push(format!("{label}: {}", self.source_status(source)));
+        }
+        lines.push("\nSession action history is separate (L). PCR and recognition results are explicit historical checks, not live guarantees.".into());
+        lines.join("\n")
+    }
+
+    fn page_observation(&self) -> String {
+        let sources: &[Source] = match self.screen {
+            SC_PROFILES => &[Source::Profiles],
+            SC_CAMERAS => &[Source::Live, Source::Cameras, Source::CameraPrivacy],
+            SC_RECOVERY => &[Source::Recovery],
+            SC_KEYRING => &[Source::Wallet, Source::Machine],
+            SC_FINGERPRINT => &[Source::FingerprintReader, Source::Fingerprint],
+            SC_SETTINGS => &[Source::Preferences],
+            SC_PAM => &[Source::Machine, Source::Apps],
+            SC_REPAIR => &[Source::Health, Source::Machine, Source::Profiles],
+            SC_IDENTIFY => return "last test only · F4 current status".into(),
+            _ => &[Source::Health, Source::Profiles, Source::Machine],
+        };
+        if sources.iter().any(|source| !self.source_usable(*source)) {
+            "some observations unavailable · F4 details".into()
+        } else {
+            let age = sources
+                .iter()
+                .filter_map(|source| self.freshness.observation(*source).last_success)
+                .map(|at| self.now().saturating_duration_since(at).as_secs())
+                .max()
+                .unwrap_or(0);
+            format!("observations ≤{age}s old · F4 details")
+        }
+    }
+
+    fn background_idle(&self) -> bool {
+        self.op.is_none()
+            && self.enroll.is_none()
+            && self.input.is_none()
+            && self.confirm.is_none()
+            && self.enroll_merge.is_none()
+            && self.suspend.is_none()
+    }
+
+    fn profiles_refresh_due(&self, now: Instant, daemon_idle: bool) -> bool {
+        self.background_idle()
+            && daemon_idle
+            && (self.freshness.cycle(Worker::Profiles).pending()
+                || (matches!(self.screen, SC_WELCOME | SC_PROFILES | SC_REPAIR | SC_DONE)
+                    && self
+                        .freshness
+                        .cycle(Worker::Profiles)
+                        .due(now, Duration::from_secs(30))))
+    }
+
+    fn cameras_refresh_due(&self, daemon_idle: bool) -> bool {
+        daemon_idle
+            && self.background_idle()
+            && self.screen == SC_CAMERAS
+            && self.current_inventory().is_some()
+            && self.camera_epoch.is_some()
+            && (self.classified_epoch != self.camera_epoch
+                || self.freshness.cycle(Worker::Cameras).pending())
+            && self.camera_load.is_none()
+    }
+
+    fn refresh_due(&mut self, now: Instant) {
+        if self
+            .freshness
+            .cycle(Worker::Live)
+            .due(now, Duration::from_secs(1))
+        {
+            self.refresh_live();
+        }
+        if !self.background_idle() {
+            return;
+        }
+        if self
+            .freshness
+            .cycle(Worker::Light)
+            .due(now, Duration::from_millis(LIGHT_REFRESH_MS))
+        {
+            self.refresh_light();
+        }
+        if self
+            .freshness
+            .cycle(Worker::Machine)
+            .due(now, Duration::from_millis(HEAVY_REFRESH_MS))
+        {
+            self.request_probes();
+        }
+        if self.freshness.cycle(Worker::Apps).due(now, Self::HEAVY_TTL) {
+            self.refresh_heavy();
+        }
+        let daemon_idle = self
+            .live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+            .is_some_and(|live| {
+                live.stage == irlume_common::live::LiveStage::Ready
+                    && live.tracking_available
+                    && live.worker.is_none()
+                    && live.background.is_empty()
+                    && live.waiting.is_empty()
+            });
+        if self.profiles_refresh_due(now, daemon_idle) {
+            self.refresh_profiles();
+        }
+        if self.cameras_refresh_due(daemon_idle) {
+            self.refresh_camera_listing();
+        }
+    }
+
+    fn expire_observations(&mut self, now: Instant) {
+        let mut changed = false;
+        for source in Source::ALL {
+            let usable = self.freshness.usable(source, now);
+            changed |= self.usable_sources[source as usize] != usable;
+            self.usable_sources[source as usize] = usable;
+            if !usable {
+                self.clear_source(source);
+            }
+        }
+        self.check_camera_confirmation();
+        self.update_camera_availability();
+        if changed {
+            self.run_checks();
+            self.recompute_visible();
+        }
+    }
+
     /// `user` is resolved by the caller through `crate::user_arg`, NOT from
     /// $USER here.
     ///
@@ -1080,6 +1746,20 @@ impl App {
         let screen = visible.first().copied().unwrap_or(0);
         Self {
             user,
+            freshness: Freshness::default(),
+            clock_override: None,
+            usable_sources: [false; 13],
+            show_live: false,
+            live: None,
+            live_load: None,
+            live_epoch: None,
+            camera_epoch: None,
+            classified_epoch: None,
+            camera_confirmation: None,
+            selected_camera_choice: None,
+            selected_profile_identity: None,
+            qualification_load: None,
+            identify_checked_at: None,
             screen,
             sel: 0,
             profiles: Vec::new(),
@@ -1099,16 +1779,20 @@ impl App {
             pairs_known: false,
             capture_mode: None,
             camera_load: None,
-            activity: Vec::new(),
+            activity: activity::Activity::default(),
             input: None,
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
+            window_area: std::cell::Cell::new(None),
             dialog_view: std::cell::Cell::new((Rect::default(), 0)),
             dialog_scroll: std::cell::Cell::new(0),
             page_view: std::cell::Cell::new((usize::MAX, Rect::default(), 0, 0)),
             show_help: false,
             more_actions: None,
+            sections: None,
+            action_focus: None,
+            action_reveal: std::cell::Cell::new(false),
             hub_sel: 0,
             op: None,
             enroll: None,
@@ -1133,9 +1817,12 @@ impl App {
             preferences: None,
             act_scroll: 0,
             activity_open: false,
+            activity_history_open: false,
             reduce_motion: std::env::var_os("IRLUME_REDUCE_MOTION")
                 .is_some_and(|v| !v.is_empty() && v != "0"),
             visible,
+            reported_caps: caps,
+            known_uvc_paths: Vec::new(),
             caps,
             fp_present,
             fp_known: false,
@@ -1196,20 +1883,45 @@ impl App {
     /// Re-derive tab visibility from live state; keeps the current screen when
     /// it survives, else snaps to the nearest visible step.
     fn recompute_visible(&mut self) {
+        let chosen_screen = self
+            .sections
+            .and_then(|index| self.visible.get(index))
+            .copied();
         // The hub lists the VISIBLE screens, so this is where its list can
         // shrink ([v] leaves advanced view, a probe lands, the daemon goes
         // away). `move_sel` wraps modulo the current length, so a stale index
         // fixes itself on the next arrow, but until then no row is highlighted
         // and Enter silently opens nothing: an advertised key doing nothing,
         // which is the shape this pass keeps finding.
+        let navigation_caps = irlume_camera::Caps {
+            rgb: self.caps.rgb || self.reported_caps.rgb,
+            ir_pair: self.caps.ir_pair || self.reported_caps.ir_pair,
+        };
         self.visible = Self::compute_visible(
-            &self.caps,
+            &navigation_caps,
             VisibilityInputs {
                 fp_present: self.fp_present,
                 advanced: self.advanced,
             },
             &self.repair,
         );
+        if (self.screen == SC_CAMERAS || self.current_inventory().is_some())
+            && !self.visible.contains(&SC_CAMERAS)
+        {
+            let insert_at = self
+                .visible
+                .iter()
+                .position(|screen| *screen == SC_IDENTIFY || *screen == SC_SETTINGS)
+                .unwrap_or(self.visible.len());
+            self.visible.insert(insert_at, SC_CAMERAS);
+        }
+        if self.visible.is_empty() {
+            self.sections = None;
+        } else if let Some(selected) = &mut self.sections {
+            *selected = chosen_screen
+                .and_then(|screen| self.visible.iter().position(|&visible| visible == screen))
+                .unwrap_or((*selected).min(self.visible.len() - 1));
+        }
         if !self.visible.contains(&self.screen) {
             let cur = self.screen;
             self.screen = self
@@ -1250,30 +1962,34 @@ impl App {
 
     /// Capability-aware recommended unlock method (item: "suggest the best one").
     fn recommended(&self) -> &'static str {
-        match (self.caps.ir_pair, self.caps.rgb, self.fp_present) {
+        if self.face_camera_presence().is_none() && !self.source_usable(Source::FingerprintReader) {
+            return "Hardware availability unknown; password remains available";
+        }
+        match (
+            self.caps.ir_pair,
+            self.caps.rgb,
+            self.fp_present && self.source_usable(Source::FingerprintReader),
+        ) {
             // "in the dark", never "dark mode": IR needs no visible light,
             // but "dark mode" reads as a UI theme.
             (true, _, _) => "Face (IR) · secure: login, sudo, lock screen, in the dark",
             (false, true, true) => "Fingerprint (secure), or Face (RGB) for lock-screen only",
             (false, true, false) => "Face (RGB) · convenience: lock-screen unlock only",
             (false, false, true) => "Fingerprint",
-            (false, false, false) => "Password only (no supported biometric hardware)",
+            (false, false, false) => {
+                "Password remains available; biometric availability unconfirmed"
+            }
         }
     }
 
     fn log(&mut self, g: char, m: impl Into<String>) {
-        self.activity.push((g, m.into()));
+        self.activity.push(g, m.into());
         // If the user has scrolled up to read history, hold their view in place
         // as new lines arrive (instead of yanking them to the bottom).
         if self.act_scroll > 0 {
             self.act_scroll += 1;
         }
-        let n = self.activity.len();
-        if n > 200 {
-            let d = n - 200;
-            self.activity.drain(0..d);
-            self.act_scroll = self.act_scroll.saturating_sub(d);
-        }
+        self.act_scroll = self.act_scroll.min(self.act_max());
     }
 
     /// Record a failure: log it AND raise the dismissible error banner so the
@@ -1293,6 +2009,7 @@ impl App {
         if self.light_load.is_some() {
             return;
         }
+        self.freshness.cycle_mut(Worker::Light).begin();
         let (tx, rx) = mpsc::channel();
         let user = self.user.clone();
         let prev_armed = self.keyring_armed;
@@ -1308,13 +2025,17 @@ impl App {
     /// serializes it against captures exactly like an enrollment: the
     /// enumeration still opens nodes, but only ever on the one thread that
     /// owns them (#187). A refusal (an authentication holds the camera) or
-    /// any transport error leaves the previous listing in place rather than
-    /// blanking it, because neither is an observation that the cameras are
-    /// gone.
+    /// any transport error makes role inspection unavailable. Passive inventory
+    /// remains the authority for attachment, independently of classification.
     fn refresh_camera_listing(&mut self) {
+        if self.current_inventory().is_none() {
+            return;
+        }
         if self.camera_load.is_some() {
             return;
         }
+        self.classified_epoch = self.camera_epoch.clone();
+        self.freshness.cycle_mut(Worker::Cameras).begin();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(CameraListing::gather());
@@ -1322,11 +2043,9 @@ impl App {
         self.camera_load = Some(rx);
     }
 
-    /// Capabilities as the DAEMON reports them, for use whenever it is
-    /// reachable (#187): it already has the cameras open, so it can say what
-    /// they are without the TUI opening anything. `tier` is the daemon's own
-    /// hardware classification; only the secure tier means a usable IR pair,
-    /// and any reported RGB device means RGB capture works.
+    /// Engine/configuration capabilities as reported by the daemon. Current
+    /// presence is checked independently against passive inventory; this alone
+    /// is not evidence of an open device or usable capture.
     fn caps_from_health(h: &HealthInfo) -> irlume_camera::Caps {
         irlume_camera::Caps {
             ir_pair: h.tier == "secure",
@@ -1337,6 +2056,25 @@ impl App {
     /// Land a background light poll: the daemon reads plus the selection
     /// clamps the inline version used to apply.
     fn apply_light(&mut self, l: LightState) {
+        let became_up = !self.daemon_up && l.daemon_up;
+        for (index, source) in [
+            Source::Health,
+            Source::Preferences,
+            Source::Wallet,
+            Source::Recovery,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.freshness.observation_mut(source).record(
+                l.observed_at[index].is_some(),
+                l.observed_at[index].unwrap_or_else(Instant::now),
+            );
+            if l.observed_at[index].is_none() {
+                self.clear_source(source);
+            }
+        }
+
         if (self.daemon_up && !l.daemon_up)
             || (self.keyring_armed.is_some()
                 && (self.keyring_armed != l.keyring_armed
@@ -1353,31 +2091,23 @@ impl App {
         self.preferences = l.preferences;
         // The daemon is the authority on cameras while it is reachable.
         if let Some(h) = self.health.as_ref() {
-            self.caps = Self::caps_from_health(h);
+            self.reported_caps = Self::caps_from_health(h);
         }
         if l.daemon_up {
             self.keyring_armed = l.keyring_armed;
             self.keyring_policy = l.keyring_policy;
             self.keyring_kind = l.keyring_kind;
-            if l.recovery.is_some() {
-                self.recovery = l.recovery;
-            }
+            self.recovery = l.recovery;
         }
         // The daemon just became reachable and no list was ever loaded (the
         // startup attempt may have raced a still-booting daemon): fetch it
         // now instead of waiting for a tab visit.
-        if self.daemon_up && !self.profiles_loaded && self.enroll_error.is_none() {
+        if became_up && !self.source_usable(Source::Profiles) && self.enroll_error.is_none() {
             self.refresh_profiles();
         }
-        let max = self.rows().len().max(1);
-        // One past the list is an intentionally cleared selection after a removal.
-        if self.sel > max {
-            self.sel = max - 1;
-        }
-        let pairs = self.pairs.len().max(1);
-        if self.cam_sel >= pairs {
-            self.cam_sel = pairs - 1;
-        }
+        // A status reply cannot select a different profile or camera. List
+        // publication preserves stable identities and deliberately allows an
+        // unselected sentinel after the previous target disappeared.
     }
 
     /// Request the FULL machine sweep (fingerprint via fprintd, the PAM and
@@ -1388,6 +2118,7 @@ impl App {
         if self.probes_load.is_some() {
             return;
         }
+        self.freshness.cycle_mut(Worker::Machine).begin();
         let (tx, rx) = mpsc::channel();
         let user = self.user.clone();
         std::thread::spawn(move || {
@@ -1416,6 +2147,7 @@ impl App {
         if self.profiles_load.is_some() {
             return;
         }
+        self.freshness.cycle_mut(Worker::Profiles).begin();
         let (tx, rx) = mpsc::channel();
         let user = self.user.clone();
         std::thread::spawn(move || {
@@ -1492,11 +2224,21 @@ impl App {
     /// refresh_profiles needs), profiles load, THEN recompute_checks runs so
     /// run_checks sees the fresh profile list (not the stale/empty one).
     /// Full refresh: request daemon state, enrollment state, and the complete
-    /// machine snapshot. Existing landed state stays visible until the
-    /// replacements arrive through `poll()`; recomputing here would copy a
-    /// default (unlanded) snapshot over real observations and hide screens.
+    /// machine snapshot. Invalidate old observations and discard pre-mutation
+    /// worker replies; replacements arrive through `poll()` without blocking input.
     fn refresh(&mut self) {
-        self.invalidate_keyring_diagnostic();
+        self.invalidate_daemon_observations();
+        for source in [
+            Source::Machine,
+            Source::FingerprintReader,
+            Source::Fingerprint,
+            Source::Apps,
+        ] {
+            self.invalidate_source(source);
+        }
+        self.freshness.cycle_mut(Worker::Machine).invalidate();
+        self.freshness.cycle_mut(Worker::Apps).invalidate();
+        self.refresh_live();
         self.refresh_light();
         self.refresh_profiles();
         self.request_probes();
@@ -1573,7 +2315,49 @@ impl App {
                     Fix::Root(RootFix::RestartDaemon),
                 ),
             };
+            let (sev, detail, fix) = if let Some(live) = self
+                .live
+                .as_ref()
+                .filter(|_| self.source_usable(Source::Live))
+            {
+                let sev = if live.stage == irlume_common::live::LiveStage::Ready
+                    && live.tracking_available
+                {
+                    Sev::Ok
+                } else if live.stage == irlume_common::live::LiveStage::Unknown
+                    || !live.tracking_available
+                {
+                    Sev::Unknown
+                } else {
+                    Sev::Warn
+                };
+                (sev, self.live_summary(), Fix::None)
+            } else if !self.source_usable(Source::Health) && self.daemon_reach == R::Running {
+                (
+                    Sev::Unknown,
+                    "daemon observations unavailable; last reachability result was running".into(),
+                    Fix::None,
+                )
+            } else {
+                (
+                    sev,
+                    format!("{detail}; current worker status unavailable"),
+                    fix,
+                )
+            };
             v.push(mk("Daemon (irlumed)", sev, detail, fix));
+        }
+
+        if !self.source_usable(Source::Machine) {
+            v.push(mk(
+                "Setup observations",
+                Sev::Unknown,
+                self.source_status(Source::Machine),
+                Fix::None,
+            ));
+            self.repair = v;
+            self.repair_sel = self.repair_sel.min(self.repair.len().saturating_sub(1));
+            return;
         }
 
         // ONNX Runtime + Models: the daemon is the ground truth: if it answers
@@ -1694,20 +2478,41 @@ impl App {
                 },
             ));
             // Camera row from the daemon's validated tier (never the raw fallback).
-            let priv_on = self.pairs.iter().any(|p| p.privacy);
+            let priv_on = self.current_inventory().is_some()
+                && self.source_usable(Source::CameraPrivacy)
+                && self.pairs.iter().any(|p| p.privacy);
             let (csev, cdetail, cfix) = match h.tier.as_str() {
-                _ if priv_on => (Sev::Warn, "camera present, but a privacy switch is ON".to_string(),
-                    Fix::Manual("turn off the camera privacy switch".into())),
-                "secure" => (Sev::Ok,
-                    format!("RGB + IR ({} + {}): secure tier",
-                        h.rgb_dev.as_deref().unwrap_or("?"), h.ir_dev.as_deref().unwrap_or("?")),
-                    Fix::None),
-                "convenience" => (Sev::Warn,
-                    format!("RGB-only ({}), convenience tier: face unlocks the screen only, never sudo/login",
-                        h.rgb_dev.as_deref().unwrap_or("?")),
-                    Fix::None),
-                _ => (Sev::Warn, "no camera: face auth unavailable (password/fingerprint only)".to_string(),
-                    Fix::None),
+                _ if self.face_camera_presence() == Some(false) => (Sev::Warn,
+                    "configured UVC camera disconnected; last engine configuration is historical".into(), Fix::None),
+                _ if self.face_camera_presence().is_none() => (Sev::Unknown,
+                    "current camera presence unconfirmed; engine configuration is not an attachment observation".into(), Fix::None),
+                _ if priv_on => (
+                    Sev::Warn,
+                    "camera present, but a privacy switch is ON".to_string(),
+                    Fix::Manual("turn off the camera privacy switch".into()),
+                ),
+                "secure" => (
+                    Sev::Ok,
+                    format!(
+                        "UVC endpoints present ({} + {}); engine configured secure",
+                        h.rgb_dev.as_deref().unwrap_or("?"),
+                        h.ir_dev.as_deref().unwrap_or("?")
+                    ),
+                    Fix::None,
+                ),
+                "convenience" => (
+                    Sev::Warn,
+                    format!(
+                        "RGB-only ({}), convenience tier: face unlocks the screen only, never sudo/login",
+                        h.rgb_dev.as_deref().unwrap_or("?")
+                    ),
+                    Fix::None,
+                ),
+                _ => (
+                    Sev::Warn,
+                    "camera role unclassified; no physical absence is inferred".to_string(),
+                    Fix::None,
+                ),
             };
             v.push(mk("Cameras", csev, cdetail, cfix));
             // Emitter fix only makes sense when an IR node exists.
@@ -1724,47 +2529,7 @@ impl App {
                 // where it is offered without a diagnosis attached.
             }
         } else {
-            let ort = std::env::var("ORT_DYLIB_PATH")
-                .ok()
-                .filter(|p| std::path::Path::new(p).exists())
-                .is_some()
-                || ORT_FALLBACK_PATHS
-                    .iter()
-                    .any(|p| std::path::Path::new(p).exists());
-            v.push(ort_fallback_check(ort));
-            v.push(tflite_fallback_check(
-                std::env::var(irlume_vision::tflite::TFLITE_LIB_ENV)
-                    .ok()
-                    .as_deref(),
-                |p| p.exists(),
-            ));
-
-            // Resolve models the way the daemon does (env → /usr/share/irlume/models
-            // → repo cwd), NOT just cwd-relative; a packaged install keeps them in
-            // /usr/share and the TUI is rarely launched from the repo.
-            let m1 = crate::commands::resolve_model("glintr100.onnx", "IRLUME_MODEL").is_some();
-            let m2 = crate::commands::resolve_model(
-                "face_detection_yunet_2023mar.onnx",
-                "IRLUME_DET_MODEL",
-            )
-            .is_some();
-            v.push(mk(
-                "Models",
-                if m1 && m2 { Sev::Ok } else { Sev::Fail },
-                if m1 && m2 {
-                    "YuNet + AuraFace present".into()
-                } else {
-                    "not found (daemon down; local probe)".into()
-                },
-                if m1 && m2 {
-                    Fix::None
-                } else {
-                    Fix::Manual(
-                        "install the irlume package (models ship in /usr/share/irlume/models)"
-                            .into(),
-                    )
-                },
-            ));
+            v.extend(self.probes.runtime_checks.clone());
 
             let rgb = self
                 .nodes
@@ -1774,7 +2539,9 @@ impl App {
                 .nodes
                 .iter()
                 .any(|(_, r)| matches!(r, irlume_camera::Role::Ir));
-            let priv_on = self.pairs.iter().any(|p| p.privacy);
+            let priv_on = self.current_inventory().is_some()
+                && self.source_usable(Source::CameraPrivacy)
+                && self.pairs.iter().any(|p| p.privacy);
             let (csev, cdetail, cfix) = if self.nodes.is_empty() {
                 // No observation is not proof of missing cameras. In particular,
                 // restarting cannot fix a still-loading or inaccessible daemon.
@@ -1788,7 +2555,7 @@ impl App {
             } else if !rgb && !ir {
                 (
                     Sev::Warn,
-                    "no camera: face auth unavailable (password/fingerprint only)".to_string(),
+                    "camera role unclassified; no physical absence is inferred".to_string(),
                     Fix::None,
                 )
             } else if !ir {
@@ -1917,8 +2684,15 @@ impl App {
         }
         // Fingerprint reader health: a crashed/aborted enrollment leaves the
         // device CLAIMED and pam_fprintd fails silently (no finger prompt).
-        if self.fp.available {
-            if self.probes.reader_stuck {
+        if self.fp.available && self.source_usable(Source::FingerprintReader) {
+            if !self.source_usable(Source::Fingerprint) {
+                v.push(mk(
+                    "Fingerprint enrollment",
+                    Sev::Unknown,
+                    "reader observed; enrollment list unavailable".into(),
+                    Fix::None,
+                ));
+            } else if self.probes.reader_stuck {
                 v.push(mk(
                     "Fingerprint reader",
                     Sev::Fail,
@@ -1945,25 +2719,16 @@ impl App {
         // instead asks "does an auth RULE run this module", the same parsed
         // question the enable gate asks, so a session line or an argument
         // naming the file cannot suppress the not-wired Fail.
-        let pam_has = |needle: &str| {
-            ["/etc/pam.d/common-auth", "/etc/pam.d/system-auth"]
-                .iter()
-                .any(|p| {
-                    std::fs::read_to_string(p)
-                        .map(|s| {
-                            s.lines()
-                                .any(|l| crate::pamwire::directive(l).contains(needle))
-                        })
-                        .unwrap_or(false)
-                })
-        };
-        // The CLI's own gate, not a copy (#583 audit): Omarchy wires
-        // pam_fprintd into sudo/polkit-1 and the lock lane, never into
-        // common-auth/system-auth, so the old two-file probe read a
-        // healthy Omarchy box as unwired.
-        let fprintd_wired =
-            crate::fingerprint::pam_fprintd_wired_pub(&crate::fingerprint::PamSearchPath::live());
+        let fprintd_wired = self.probes.fprintd_wired;
         match self.fp.method.as_str() {
+            "fingerprint" if !self.source_usable(Source::Fingerprint) => {
+                v.push(mk(
+                    "Method wiring",
+                    Sev::Unknown,
+                    "fingerprint enrollment is unobserved".into(),
+                    Fix::None,
+                ));
+            }
             "fingerprint" => {
                 if !fprintd_wired {
                     v.push(mk(
@@ -2067,7 +2832,7 @@ impl App {
         // Foreign face-auth modules left over from another tool hijack the same
         // PAM slots (a leftover module intercepted the greeter in live testing).
         for foreign in ["howdy", "linhello"] {
-            if pam_has(foreign) {
+            if self.probes.foreign_pam.contains(&foreign) {
                 v.push(mk("Other face auth", Sev::Warn,
                     format!("another face-auth module ({foreign}) is wired; it will conflict with irlume"),
                     Fix::Manual(format!("remove the {foreign} lines from /etc/pam.d (or uninstall it)"))));
@@ -2404,7 +3169,7 @@ impl App {
         map: fn(Response) -> (bool, String),
     ) {
         let label = label.into();
-        self.log('→', format!("daemon: {label}"));
+        self.log('→', format!("daemon: {label}\n{}", request_effect(&req)));
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let r = match crate::daemon_request(&req) {
@@ -2558,6 +3323,7 @@ impl App {
         if self.heavy_load.is_some() {
             return;
         }
+        self.freshness.cycle_mut(Worker::Apps).begin();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(gather());
@@ -2566,88 +3332,188 @@ impl App {
     }
 
     fn poll(&mut self) {
-        if let Some(rx) = &self.heavy_load {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.heavy_load = None;
-                    self.heavy_at = std::time::Instant::now();
-                    if let Ok(state) = result {
+        let now = self.now();
+        if let Some(result) = receive_finished(&self.live_load) {
+            self.live_load = None;
+            if self.freshness.cycle_mut(Worker::Live).finish(now) {
+                match result {
+                    Ok(Ok(snapshot)) => self.apply_live_snapshot(snapshot, now),
+                    _ => {
+                        self.freshness
+                            .observation_mut(Source::Live)
+                            .record(false, now);
+                        self.clear_source(Source::Live);
+                    }
+                }
+            }
+        }
+        if let Some(result) = receive_finished(&self.heavy_load) {
+            self.heavy_load = None;
+            self.heavy_at = now;
+            if self.freshness.cycle_mut(Worker::Apps).finish(now) {
+                let success = matches!(&result, Ok(Ok(_)));
+                self.freshness
+                    .observation_mut(Source::Apps)
+                    .record(success, now);
+                match result {
+                    Ok(Ok(state)) => {
                         self.heavy = state;
                         self.heavy_known = true;
                     }
+                    Err(()) => {
+                        self.clear_source(Source::Apps);
+                        self.log('!', "app status refresh ended without a result; current app state is unavailable. Refresh to retry.");
+                    }
+                    Ok(Err(_)) => self.clear_source(Source::Apps),
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.heavy_load = None;
-                    self.heavy_at = std::time::Instant::now();
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(rx) = &self.camera_load {
-            match rx.try_recv() {
-                Ok(listing) => {
-                    self.camera_load = None;
-                    if let Some(pairs) = listing.pairs {
-                        self.pairs = pairs;
-                        self.pairs_known = true;
-                        self.cam_sel = self.cam_sel.min(self.pairs.len().saturating_sub(1));
+        if let Some(result) = receive_finished(&self.camera_load) {
+            self.camera_load = None;
+            if self.freshness.cycle_mut(Worker::Cameras).finish(now) {
+                let pairs = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|listing| listing.pairs.as_ref());
+                self.freshness
+                    .observation_mut(Source::Cameras)
+                    .record(pairs.is_some(), now);
+                self.freshness
+                    .observation_mut(Source::CameraPrivacy)
+                    .record(pairs.is_some(), now);
+                if let Some(pairs) = pairs {
+                    let selected = self.selected_camera_choice.take().or_else(|| {
+                        (self.pairs_known || !self.pairs.is_empty()).then(|| {
+                            self.pairs
+                                .get(self.cam_sel)
+                                .and_then(|pair| self.camera_choice(&pair.rgb, &pair.ir))
+                        })
+                    });
+                    self.pairs = pairs
+                        .iter()
+                        .filter(|pair| self.camera_choice(&pair.rgb, &pair.ir).is_some())
+                        .cloned()
+                        .collect();
+                    self.pairs_known = true;
+                    self.cam_sel = match selected {
+                        None => 0,
+                        Some(Some(choice)) if self.camera_choice_current(&choice) => self
+                            .pairs
+                            .iter()
+                            .position(|pair| pair.rgb == choice.rgb && pair.ir == choice.ir)
+                            .unwrap_or(self.pairs.len()),
+                        Some(_) => self.pairs.len(),
+                    };
+                } else {
+                    self.clear_source(Source::Cameras);
+                    if result.is_err() {
+                        self.log('!', "camera refresh ended without a result; current camera classification is unavailable. Refresh to retry.");
                     }
-                    if let Some(mode) = listing.mode {
-                        self.capture_mode = Some(mode);
-                    }
-                    self.run_checks();
-                    self.recompute_visible();
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.camera_load = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        if self.heavy_at.elapsed() >= Self::HEAVY_TTL {
-            self.refresh_heavy();
-        }
-        if let Some(rx) = &self.light_load {
-            if let Ok(l) = rx.try_recv() {
-                self.light_load = None;
-                self.apply_light(l);
-                // The checklist reads daemon_up/health; rebuild it from the
-                // fresh reads (pure: no probes are taken here).
                 self.run_checks();
                 self.recompute_visible();
             }
         }
-        if let Some(rx) = &self.probes_load {
-            if let Ok(p) = rx.try_recv() {
-                self.probes_load = None;
-                self.probes = p;
-                self.probes_landed = true;
-                self.recompute_checks();
+        if let Some(result) = receive_finished(&self.qualification_load) {
+            self.qualification_load = None;
+            if self.freshness.cycle_mut(Worker::Qualification).finish(now) {
+                let value = result.ok().flatten();
+                self.freshness
+                    .observation_mut(Source::Qualification)
+                    .record(value.is_some(), now);
+                if let Some(value) = value {
+                    self.capture_mode = Some(value);
+                }
             }
         }
-        if let Some(rx) = &self.keyring_load {
-            match rx.try_recv() {
-                Ok((generation, reply)) => {
-                    self.keyring_load = None;
-                    if generation == self.keyring_generation {
-                        self.keyring_drift = match reply {
-                            Ok(Response::KeyringInfo { drifted, .. }) => drifted,
-                            _ => None,
-                        };
-                        self.keyring_checked_at = Some(std::time::Instant::now());
-                        self.run_checks();
-                        self.recompute_visible();
+        if let Some(result) = receive_finished(&self.light_load) {
+            self.light_load = None;
+            if self.freshness.cycle_mut(Worker::Light).finish(now) {
+                match result {
+                    Ok(light) => self.apply_light(light),
+                    Err(()) => {
+                        for source in [
+                            Source::Health,
+                            Source::Preferences,
+                            Source::Wallet,
+                            Source::Recovery,
+                        ] {
+                            self.freshness.observation_mut(source).record(false, now);
+                            self.clear_source(source);
+                        }
+                        self.log('!', "status refresh ended without a result; current status is unavailable. Refresh to retry.");
                     }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.keyring_load = None,
-                Err(mpsc::TryRecvError::Empty) => {}
+                self.run_checks();
+                self.recompute_visible();
             }
         }
-        if let Some(rx) = &self.profiles_load {
-            if let Ok(outcome) = rx.try_recv() {
-                self.profiles_load = None;
+        if let Some(result) = receive_finished(&self.probes_load) {
+            self.probes_load = None;
+            if self.freshness.cycle_mut(Worker::Machine).finish(now) {
+                self.freshness
+                    .observation_mut(Source::Machine)
+                    .record(result.is_ok(), now);
+                match result {
+                    Ok(probes) => {
+                        self.freshness
+                            .observation_mut(Source::FingerprintReader)
+                            .record(probes.fp_present.is_some(), now);
+                        self.freshness
+                            .observation_mut(Source::Fingerprint)
+                            .record(probes.fp_enrollment_observed, now);
+                        self.probes = probes;
+                        self.probes_landed = true;
+                        self.recompute_checks();
+                    }
+                    Err(()) => {
+                        for source in [
+                            Source::Machine,
+                            Source::FingerprintReader,
+                            Source::Fingerprint,
+                        ] {
+                            self.freshness.observation_mut(source).record(false, now);
+                            self.clear_source(source);
+                        }
+                        self.log('!', "diagnostics refresh ended without a result; current checks are unavailable. Refresh to retry.");
+                    }
+                }
+            }
+        }
+        if let Some(result) = receive_finished(&self.keyring_load) {
+            self.keyring_load = None;
+            match result {
+                Ok((generation, reply)) if generation == self.keyring_generation => {
+                    self.keyring_drift = match reply {
+                        Ok(Response::KeyringInfo { drifted, .. }) => drifted,
+                        _ => None,
+                    };
+                    self.keyring_checked_at = Some(now);
+                    self.run_checks();
+                    self.recompute_visible();
+                }
+                Err(()) => {
+                    self.keyring_drift = None;
+                    self.log('!', "wallet check ended without a result; current PCR state is unavailable. Check again to retry.");
+                }
+                _ => {}
+            }
+        }
+        if let Some(result) = receive_finished(&self.profiles_load) {
+            self.profiles_load = None;
+            if self.freshness.cycle_mut(Worker::Profiles).finish(now) {
+                let outcome = result.unwrap_or_else(|()| ProfilesOutcome::Transport("profile refresh ended without a result; current profiles are unavailable. Refresh to retry.".into()));
+                self.freshness
+                    .observation_mut(Source::Profiles)
+                    .record(matches!(&outcome, ProfilesOutcome::Loaded { .. }), now);
                 match outcome {
                     ProfilesOutcome::Loaded { profiles } => {
-                        let selected = self.selected_profile_row();
-                        let selection_cleared = !self.profiles.is_empty() && selected.is_none();
+                        let selected = self.selected_profile_identity.take().or_else(|| {
+                            (self.profiles_loaded || !self.profiles.is_empty())
+                                .then(|| self.selected_profile_row())
+                        });
+                        let selection_cleared = matches!(selected, Some(None));
+                        let selected = selected.flatten();
                         self.profiles = profiles;
                         if let Some(selected) = selected {
                             self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
@@ -2661,26 +3527,36 @@ impl App {
                         self.enroll_error = None;
                         self.profiles_loaded = true;
                     }
-                    ProfilesOutcome::DaemonError(e) => self.enroll_error = Some(e),
-                    // Transport failures are not state: the previous list
-                    // stays, the next refresh retries, and the Activity log
-                    // says why the list may be stale.
-                    ProfilesOutcome::Transport(e) => {
-                        self.log('·', format!("profile list not refreshed: {e}"));
+                    ProfilesOutcome::DaemonError(error) => {
+                        self.clear_source(Source::Profiles);
+                        self.enroll_error = Some(error);
+                    }
+                    ProfilesOutcome::Transport(error) => {
+                        self.clear_source(Source::Profiles);
+                        self.enroll_error = None;
+                        self.log('·', format!("profile list not refreshed: {error}"));
                     }
                 }
-                // The checks read the profile list (the no-enrollment warn);
-                // recompute now that it is current.
                 self.recompute_checks();
             }
         }
         if let Some(op) = &self.op {
-            if let Ok((ok, msg)) = op.rx.try_recv() {
-                let tag = op.tag;
-                // The IR self-test shows its own result line on the Repair screen;
-                // a normal "no face / uncertain" outcome shouldn't also raise the
-                // alarming error modal (that's for genuine failures like a busy
-                // camera). Identify/Generic keep the modal on failure.
+            let tag = op.tag;
+            let result = match op.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let msg = format!("The {} task ended without a result. Its outcome is unknown; refresh status before retrying.", op.label);
+                    self.op = None;
+                    if matches!(tag, OpTag::Identify) {
+                        self.identify_result = Some((false, msg.clone()));
+                        self.identify_checked_at = Some(now);
+                    }
+                    self.set_error(msg);
+                    None
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some((ok, msg)) = result {
                 if ok {
                     self.log('✓', msg.clone());
                 } else if !matches!(tag, OpTag::Identify) {
@@ -2688,9 +3564,9 @@ impl App {
                 } else {
                     self.log('·', msg.clone());
                 }
-                match tag {
-                    OpTag::Identify => self.identify_result = Some((ok, msg)),
-                    OpTag::Generic => {}
+                if matches!(tag, OpTag::Identify) {
+                    self.identify_result = Some((ok, msg));
+                    self.identify_checked_at = Some(now);
                 }
                 self.op = None;
                 self.refresh();
@@ -2699,9 +3575,13 @@ impl App {
         if let Some(e) = &self.enroll {
             let target = e.target;
             let mut msgs = Vec::new();
-            while let Ok(m) = e.rx.try_recv() {
-                msgs.push(m);
-            }
+            let disconnected = loop {
+                match e.rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(mpsc::TryRecvError::Empty) => break false,
+                    Err(mpsc::TryRecvError::Disconnected) => break true,
+                }
+            };
             let mut finished = false;
             let mut merge: Option<MergeConfirm> = None;
             for m in msgs {
@@ -2807,81 +3687,35 @@ impl App {
                     }
                 }
             }
+            if disconnected && !finished {
+                if let Some(enrollment) = &self.enroll {
+                    enrollment.stop.store(true, Ordering::Relaxed);
+                }
+                self.set_error("The enrollment task ended without a result. Its outcome is unknown; refreshing saved profiles before you retry.");
+                finished = true;
+            }
             if finished {
                 self.enroll = None;
                 self.enroll_merge = merge;
                 self.refresh();
             }
         }
+        self.expire_observations(now);
     }
 
     fn main_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
-        use ratatui::crossterm::event::MouseEventKind;
-        let mut last_light = std::time::Instant::now();
-        let mut last_heavy = std::time::Instant::now();
         while !self.quit {
-            terminal.draw(|f| self.draw(f))?;
+            terminal.draw(|f| self.draw_window(f))?;
             if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => {
-                        // A Ctrl-modified letter (Ctrl-C…) must not alias to
-                        // that letter's action. Plain keys pass through.
-                        let ctrl = k
-                            .modifiers
-                            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
-                        if !(ctrl && matches!(k.code, KeyCode::Char(_))) {
-                            self.on_key(k.code)
-                        }
-                    }
-                    Event::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                            let size = terminal.size()?;
-                            self.on_scroll(
-                                m.column,
-                                m.row,
-                                Rect::new(0, 0, size.width, size.height),
-                                if m.kind == MouseEventKind::ScrollUp {
-                                    -1
-                                } else {
-                                    1
-                                },
-                            );
-                        }
-                        MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
-                            let size = terminal.size()?;
-                            self.on_click(
-                                m.column,
-                                m.row,
-                                Rect::new(0, 0, size.width, size.height),
-                            );
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
+                let input = event::read()?;
+                // Re-read dimensions at input time: a shrink between drawing
+                // and pressing Enter must not approve a hidden confirmation.
+                let size = terminal.size()?;
+                self.on_window_event(input, Rect::new(0, 0, size.width, size.height));
             }
             self.spin = (self.spin + 1) % SPIN.len();
             self.poll();
-            // Live auto-refresh, tiered so external changes appear on their own
-            // without periodic subprocess hitches. Skip while the user is mid-flow.
-            if self.op.is_none()
-                && self.enroll.is_none()
-                && self.input.is_none()
-                && self.confirm.is_none()
-            {
-                if last_heavy.elapsed() >= Duration::from_millis(HEAVY_REFRESH_MS) {
-                    // Diagnostics only, NOT the slow profile poll: keeping the
-                    // ListProfiles TPM-unseal off every timer tick is what makes
-                    // the UI stay smooth. Profiles refresh on mutation / Profiles
-                    // tab / startup instead.
-                    self.refresh_diagnostics();
-                    last_heavy = std::time::Instant::now();
-                    last_light = std::time::Instant::now();
-                } else if last_light.elapsed() >= Duration::from_millis(LIGHT_REFRESH_MS) {
-                    self.refresh_light(); // daemon state + cameras only
-                    last_light = std::time::Instant::now();
-                }
-            }
+            self.refresh_due(self.now());
             // Interactive flows that need a cooked terminal: tear down, run, re-enter.
             if let Some(s) = self.suspend.take() {
                 let _ = ratatui::crossterm::execute!(
@@ -2949,6 +3783,62 @@ impl App {
             e.stop.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Terminal boundary: keep hidden controls inactive until this exact size
+    /// has been drawn. Internal page handlers retain their ordinary behavior.
+    fn on_window_event(&mut self, input: Event, area: Rect) {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        if !window_fits(area) || self.window_area.get() != Some(area) {
+            self.click_targets.borrow_mut().clear();
+            if let Event::Key(key) = input {
+                if key.kind == KeyEventKind::Press && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            if let Some(enrollment) = &self.enroll {
+                                enrollment.stop.store(true, Ordering::Relaxed);
+                            }
+                            self.quit = true;
+                        }
+                        KeyCode::Esc => {
+                            if let Some(enrollment) = &self.enroll {
+                                enrollment.stop.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+        match input {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Ctrl-C must not alias to the page's ordinary c action.
+                if !(key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char(_)))
+                {
+                    self.on_key(key.code);
+                }
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self.on_scroll(
+                    mouse.column,
+                    mouse.row,
+                    area,
+                    if mouse.kind == MouseEventKind::ScrollUp {
+                        -1
+                    } else {
+                        1
+                    },
+                ),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.on_click(mouse.column, mouse.row, area);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
 
     /// Flip mouse capture so the terminal's native selection (highlight +
@@ -3160,10 +4050,21 @@ impl App {
                 "wire the login stack",
                 &["irlume", "login", "enable", "--apply"],
             ),
-            Suspend::SetCameras(rgb, ir) => self.sudo_step(
-                "switch the active camera pair",
-                &["irlume", "set-cameras", &rgb, &ir],
-            ),
+            Suspend::SetCameras(rgb, ir, expected) => {
+                let guard =
+                    serde_json::to_string(&expected).expect("camera selection is serializable");
+                self.sudo_step(
+                    "switch the same connected camera pair",
+                    &[
+                        "irlume",
+                        "set-cameras",
+                        &rgb,
+                        &ir,
+                        "--expected-camera",
+                        &guard,
+                    ],
+                );
+            }
             Suspend::IrSetup => self.sudo_step("enable the IR emitter", &["irlume", "ir-setup"]),
             Suspend::CameraTune => self.sudo_step(
                 "measure simultaneous RGB+IR capture",
@@ -3347,11 +4248,67 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        // A long dialog owns its reading keys. They never dismiss/approve the
+        // dialog or scroll the Activity behind it. Text-entry keeps its keys.
+        if self.input.is_none() && self.dialog_open() {
+            let (bounds, max) = self.dialog_view.get();
+            let step = match code {
+                KeyCode::Up => Some(-1),
+                KeyCode::Down => Some(1),
+                KeyCode::PageUp => Some(-i32::from(bounds.height.saturating_sub(4).max(1))),
+                KeyCode::PageDown => Some(i32::from(bounds.height.saturating_sub(4).max(1))),
+                _ => None,
+            };
+            if let Some(step) = step.filter(|_| max > 0 || self.error.is_none()) {
+                self.dialog_scroll.set(
+                    (i32::from(self.dialog_scroll.get()) + step).clamp(0, i32::from(max)) as u16,
+                );
+                return;
+            }
+        }
+        if let Some(selected) = self.sections.filter(|_| self.error.is_none()) {
+            match code {
+                KeyCode::Esc | KeyCode::F(3) => self.sections = None,
+                KeyCode::Up => self.sections = Some(selected.saturating_sub(1)),
+                KeyCode::Down => {
+                    self.sections = Some((selected + 1).min(self.visible.len().saturating_sub(1)))
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.sections = None;
+                    if let Some(&screen) = self.visible.get(selected) {
+                        self.enter_screen(screen);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         self.dialog_scroll.set(0);
-        // A raised error banner says "press any key to dismiss", so it takes the
-        // next key BEFORE anything else (including the activity scroll below).
+        // Reading keys were handled above. Every other key dismisses an error
+        // before it can reach background controls or Activity.
         if self.error.is_some() {
             self.error = None;
+            return;
+        }
+        if self.live_overlay_visible() {
+            if matches!(code, KeyCode::Esc | KeyCode::F(4)) {
+                self.show_live = false;
+            }
+            return;
+        }
+        if code == KeyCode::F(4)
+            && !self.dialog_open()
+            && self.sections.is_none()
+            && self.more_actions.is_none()
+        {
+            self.show_live = true;
+            return;
+        }
+        if self.activity_history_open && !self.dialog_open() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('L') => self.activity_history_open = false,
+                key => self.activity.scroll(key),
+            }
             return;
         }
         if let Some((query, selected)) = self.more_actions.as_mut() {
@@ -3383,12 +4340,38 @@ impl App {
             }
             return;
         }
+        // Explicit page focus owns page reading. Without it, keep Activity's
+        // established PgUp/PgDn contract, including during a running operation.
+        if self.focused_action().is_some()
+            && !self.dialog_open()
+            && self.op.is_none()
+            && self.enroll.is_none()
+        {
+            let (screen, bounds, scroll, max) = self.page_view.get();
+            if screen == self.screen && bounds.height > 0 {
+                let next = match code {
+                    KeyCode::PageUp => Some(scroll.saturating_sub(bounds.height)),
+                    KeyCode::PageDown => Some(scroll.saturating_add(bounds.height).min(max)),
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    self.page_view.set((screen, bounds, next, max));
+                    self.action_reveal.set(false);
+                    return;
+                }
+            }
+        }
         // Activity history scroll works in every state except text entry:
         // mid-enroll and mid-op, when lines stream fastest, is exactly when
         // the user wants to read back. Handled before the state gates below
         // so those can't swallow it.
         if self.input.is_none() {
             match code {
+                KeyCode::Char('L') if !self.dialog_open() => {
+                    self.activity_history_open = true;
+                    self.activity.follow();
+                    return;
+                }
                 KeyCode::Char('A') => {
                     self.activity_open = !self.activity_open;
                     if !self.activity_open {
@@ -3428,7 +4411,10 @@ impl App {
                         }
                         e.stop.store(true, Ordering::Relaxed);
                     }
-                    self.log('·', "enrollment cancelled; pending scans were not saved");
+                    self.log(
+                        '·',
+                        "enrollment cancellation requested; refreshing saved profiles",
+                    );
                     self.refresh_profiles();
                 }
                 _ => {}
@@ -3440,7 +4426,10 @@ impl App {
             if matches!(code, KeyCode::Esc) {
                 e.stop.store(true, Ordering::Relaxed);
                 self.enroll = None;
-                self.log('·', "enrollment cancelled");
+                self.log(
+                    '·',
+                    "enrollment cancellation requested; refreshing saved profiles",
+                );
                 // The daemon may already hold what the cancelled run created:
                 // scan 1 creates the profile before any of the later scans, so
                 // stopping after it leaves a real profile the cached list has
@@ -3487,6 +4476,17 @@ impl App {
             match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let (_, _, act) = self.confirm.take().unwrap();
+                    if matches!(&act, ConfirmAct::Sus(Suspend::SetCameras(..)))
+                        && !self
+                            .camera_confirmation
+                            .as_ref()
+                            .is_some_and(|choice| self.camera_choice_current(choice))
+                    {
+                        self.camera_confirmation = None;
+                        self.set_error("Current camera connection could not be confirmed. Select the camera again.");
+                        return;
+                    }
+                    self.camera_confirmation = None;
                     match act {
                         // Async so the UI keeps animating; poll() logs the
                         // result (✓/error banner) and refreshes. map_confirm
@@ -3496,10 +4496,12 @@ impl App {
                         }
                         // Root op: leave the alt-screen and run it under sudo.
                         ConfirmAct::Sus(s) => self.suspend = Some(s),
+                        ConfirmAct::CameraQualification => self.refresh_qualification(),
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm = None;
+                    self.camera_confirmation = None;
                 }
                 _ => {} // ignore stray keys
             }
@@ -3540,6 +4542,22 @@ impl App {
             KeyCode::Esc => self.go_home(),
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::F(2) => self.more_actions = Some((String::new(), 0)),
+            KeyCode::F(3) => {
+                self.sections = Some(
+                    self.visible
+                        .iter()
+                        .position(|&s| s == self.screen)
+                        .unwrap_or(0),
+                );
+            }
+            KeyCode::F(6) => {
+                self.action_focus = if self.focused_action().is_some() {
+                    None
+                } else {
+                    Some((self.screen, 0))
+                };
+                self.action_reveal.set(true);
+            }
             // Home: jump back to the Welcome hub from any tab, so the "at a
             // glance" summary is one key away instead of a Tab walk. (Home the
             // KEY is taken by activity scroll; 'h' for home is unused globally.)
@@ -3563,6 +4581,24 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Right => self.step(1),
             KeyCode::BackTab | KeyCode::Left => self.step(-1),
+            KeyCode::Up | KeyCode::Char('k') if self.focused_action().is_some() => {
+                self.move_action_focus(-1)
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focused_action().is_some() => {
+                self.move_action_focus(1)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.focused_action().is_some() => {
+                if let Some((key, _)) = self
+                    .focused_action()
+                    .and_then(|(k, d)| footer_keycode(k).map(|k| (k, d)))
+                {
+                    // Replay the established handler without interpreting a
+                    // focused Enter (e.g. Use camera) recursively as activation.
+                    let focus = self.action_focus.take();
+                    self.on_key(key);
+                    self.action_focus = focus;
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             // Activity jump-to-oldest/newest (PgUp/PgDn are handled at the top
@@ -3575,6 +4611,37 @@ impl App {
 
     fn act_max(&self) -> usize {
         self.activity.len().saturating_sub(ACT_H)
+    }
+
+    fn focused_action(&self) -> Option<(&'static str, &'static str)> {
+        self.action_focus
+            .filter(|(screen, _)| *screen == self.screen)
+            .and_then(|(_, index)| self.focus_actions().get(index).copied())
+    }
+
+    fn focus_actions(&self) -> &'static [(&'static str, &'static str)] {
+        if self.is_first_run() {
+            &[("e", "Scan my face")]
+        } else {
+            self.screen_actions()
+        }
+    }
+
+    fn move_action_focus(&mut self, direction: i32) {
+        if let Some((screen, index)) = &mut self.action_focus {
+            if *screen == self.screen {
+                *index = if direction < 0 {
+                    index.saturating_sub(1)
+                } else {
+                    index.saturating_add(1)
+                };
+            }
+        }
+        let last = self.focus_actions().len().saturating_sub(1);
+        if let Some((_, index)) = &mut self.action_focus {
+            *index = (*index).min(last);
+        }
+        self.action_reveal.set(true);
     }
 
     /// Step `d` tabs through the VISIBLE (hardware-applicable) screens, wrapping.
@@ -3696,7 +4763,7 @@ impl App {
                 );
             }
             (SC_WELCOME, KeyCode::Char('e' | 'i')) => {
-                self.log('·', "no camera on this device: face enrollment/identify unavailable (see Fingerprint/Settings)");
+                self.log('·', "current camera availability is unconfirmed; inspect Cameras or Diagnostics before face enrollment/identify");
             }
             // Cameras: switch the active pair; persists to /etc, so it's a root
             // op that suspends to `sudo irlume set-cameras`. Confirmed first:
@@ -3708,6 +4775,11 @@ impl App {
                 // free for the log/suspend below).
                 match self.pairs.get(self.cam_sel).cloned() {
                     Some(p) => {
+                        let Some(choice) = self.camera_choice(&p.rgb, &p.ir) else {
+                            self.set_error("Current camera connection is unavailable; wait for the live inventory and inspect the camera again.");
+                            return;
+                        };
+                        self.camera_confirmation = Some(choice.clone());
                         self.confirm = Some((
                             format!(
                                 "Switch the active camera pair to {} + {}? This \
@@ -3716,7 +4788,8 @@ impl App {
                                 p.rgb, p.ir
                             ),
                             "Switch",
-                            ConfirmAct::Sus(Suspend::SetCameras(p.rgb.clone(), p.ir.clone())),
+                            ConfirmAct::Sus(Suspend::SetCameras(p.rgb.clone(), p.ir.clone(),
+                                irlume_common::live_camera::CameraSelection { supervisor_id: choice.supervisor, candidate: choice.candidate })),
                         ));
                     }
                     None => self.log(
@@ -3781,6 +4854,14 @@ impl App {
             }
             // Cameras: IR emitter auto-setup (root; writes the persisted UVC
             // control) suspends to sudo; the [p] probe below is read-only.
+            (SC_CAMERAS, KeyCode::Char('r')) => {
+                self.freshness.cycle_mut(Worker::Cameras).invalidate();
+                self.invalidate_source(Source::Cameras);
+                self.refresh_camera_listing();
+            }
+            (SC_CAMERAS, KeyCode::Char('c')) => {
+                self.confirm = Some(("Inspect capture qualification? This opens camera controls when available; it does not capture frames. The result is a dated observation, not a live readiness guarantee.".into(), "Inspect", ConfirmAct::CameraQualification));
+            }
             (SC_CAMERAS, KeyCode::Char('s')) => {
                 self.log('→', "sudo irlume ir-setup: set up the 850nm emitter; this writes to the camera (you'll be asked for your password)");
                 self.suspend = Some(Suspend::IrSetup);
@@ -3897,7 +4978,9 @@ impl App {
             }
             // Fingerprint.
             (SC_FINGERPRINT, KeyCode::Char('a')) => {
-                if self.fp.available {
+                if !self.fp_known || !self.source_usable(Source::FingerprintReader) {
+                    self.log('·', "current fingerprint reader observation unavailable; refresh before enrollment");
+                } else if self.fp.available {
                     self.suspend = Some(Suspend::FingerprintAdd);
                 } else {
                     self.log('✗', "no fingerprint reader detected");
@@ -3906,7 +4989,9 @@ impl App {
             // 't' not 'v': 'v' is the global basic/advanced view toggle and
             // never reaches per-screen actions (found in container E2E).
             (SC_FINGERPRINT, KeyCode::Char('t')) => {
-                if self.fp.available {
+                if !self.fp_known || !self.source_usable(Source::FingerprintReader) {
+                    self.log('·', "current fingerprint reader observation unavailable; refresh before verification");
+                } else if self.fp.available {
                     self.suspend = Some(Suspend::FingerprintVerify);
                 } else {
                     self.log('✗', "no fingerprint reader detected");
@@ -3990,7 +5075,7 @@ impl App {
             (SC_SETTINGS, KeyCode::Char('r')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
             // Settings.
             (SC_SETTINGS, KeyCode::Char('p')) => {
-                if crate::consent::overridden() || self.preference_state().consent_overridden {
+                if self.preference_state().consent_overridden {
                     self.log('·', "An environment override controls privileged consent; remove it before changing the saved setting.");
                     return;
                 }
@@ -4134,7 +5219,9 @@ impl App {
             Some(Row::Profile(pi)) => {
                 let p = self.profiles[pi].name.clone();
                 self.confirm = Some((
-                    format!("Delete profile '{p}' and all its scans? OS approval is required for non-root users. Removing the last profile also erases its recovery passphrase."),
+                    format!(
+                        "Delete profile '{p}' and all its scans? OS approval is required for non-root users. Removing the last profile also erases its recovery passphrase."
+                    ),
                     "Delete",
                     ConfirmAct::Daemon(Request::DeleteProfile {
                         user: self.user.clone(),
@@ -4283,6 +5370,69 @@ impl App {
         }
     }
 
+    fn sections_rect(area: Rect) -> Rect {
+        let width = area.width.saturating_sub(2).min(48);
+        let height = area.height.saturating_sub(2).min(16);
+        Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        )
+    }
+
+    fn draw_sections(&self, f: &mut Frame, selected: usize) {
+        self.click_targets.borrow_mut().clear();
+        let rect = Self::sections_rect(f.area());
+        f.render_widget(Clear, rect);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(" Choose section ")
+            .border_style(Style::new().fg(th().accent));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let [list, controls] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        let items = self
+            .visible
+            .iter()
+            .map(|&screen| {
+                ListItem::new(format!(
+                    "{} {}",
+                    if screen == self.screen { "●" } else { " " },
+                    SCREENS[screen]
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_style(selected_style())
+                .highlight_symbol("› "),
+            list,
+            &mut state,
+        );
+        for (row, index) in (state.offset()..self.visible.len())
+            .take(list.height as usize)
+            .enumerate()
+        {
+            self.hit(
+                Rect::new(list.x, list.y + row as u16, list.width, 1),
+                Click::SectionRow(index),
+            );
+        }
+        let [close, open] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(controls);
+        for (rect, label, key) in [
+            (close, "[Esc] Close", KeyCode::Esc),
+            (open, "[Enter] Open", KeyCode::Enter),
+        ] {
+            f.render_widget(Paragraph::new(label).style(th().chip), rect);
+            self.hit(rect, Click::DialogKey(key));
+        }
+    }
+
     fn submit_input(&mut self) {
         let Some((_, buf, pending)) = self.input.take() else {
             return;
@@ -4369,7 +5519,7 @@ impl App {
                 // TokenSealed reply (GNOME, #250) must be followed by the
                 // keyring re-key, which needs the password and user.
                 self.start_async_task(
-                    "SealPassword",
+                    "Connect Password Wallet: seal its secret with the TPM and update the wallet if needed",
                     OpTag::Generic,
                     Box::new(move || {
                         let wallet_salt = match irlume_common::client::read_wallet_salt(&user) {
@@ -4481,8 +5631,52 @@ impl App {
         }
     }
 
+    /// Render only the resize notice below the supported terminal size.
+    fn draw_window(&self, f: &mut Frame) {
+        let area = f.area();
+        self.window_area.set(Some(area));
+        self.click_targets.borrow_mut().clear();
+        if window_fits(area) {
+            self.draw(f);
+            return;
+        }
+        f.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::styled("Window too small", Style::new().fg(th().warn).bold()),
+            Line::raw(""),
+            Line::raw(format!("Minimum: {MIN_WINDOW_COLS} × {MIN_WINDOW_ROWS}")),
+            Line::raw(format!("Current: {} × {}", area.width, area.height)),
+            Line::raw(""),
+            Line::raw("Enlarge the terminal to continue."),
+        ];
+        if self.enroll.is_some() {
+            lines.push(Line::raw("Esc: request enrollment cancellation"));
+        }
+        lines.push(Line::raw(if self.op.is_some() {
+            "q: exit (current task keeps running)"
+        } else {
+            "q: exit"
+        }));
+        let notice = Paragraph::new(lines).centered().wrap(Wrap { trim: false });
+        let rows = notice.line_count(area.width).min(usize::from(u16::MAX)) as u16;
+        let offset = area.height.saturating_sub(rows) / 2;
+        f.render_widget(
+            notice,
+            Rect::new(
+                area.x,
+                area.y.saturating_add(offset),
+                area.width,
+                area.height.saturating_sub(offset),
+            ),
+        );
+    }
+
     fn draw(&self, f: &mut Frame) {
         self.click_targets.borrow_mut().clear();
+        if self.activity_history_open && !self.dialog_open() {
+            self.draw_activity_history(f);
+            return;
+        }
         let [header, hint, body, activity, footer] = self.frame_rows(f.area());
         self.draw_header(f, header);
         self.draw_hint(f, hint);
@@ -4558,6 +5752,14 @@ impl App {
                 ],
             );
         }
+        if self.live_overlay_visible() {
+            self.modal(
+                f,
+                "Current observations",
+                &self.live_details(),
+                &[("[Esc / F4] Close", KeyCode::Esc)],
+            );
+        }
         // Tier two of the key-disclosure ladder; drawn last so it sits above
         // everything except nothing (help is always answerable).
         if let Some((query, selected)) = &self.more_actions {
@@ -4571,6 +5773,9 @@ impl App {
                 &[("[Esc] Close", KeyCode::Esc)],
             );
         }
+        if let Some(selected) = self.sections.filter(|_| self.error.is_none()) {
+            self.draw_sections(f, selected);
+        }
     }
 
     /// A red, dismissible error banner centred on screen.
@@ -4578,7 +5783,7 @@ impl App {
         self.modal(
             f,
             "⚠ Problem",
-            &format!("{msg}\n\n[any key] dismiss"),
+            &format!("{msg}\n\n[Esc] dismiss · arrows scroll"),
             &[("[Esc] Dismiss", KeyCode::Esc)],
         );
     }
@@ -4600,70 +5805,50 @@ impl App {
     /// three steps of what happens, and the reassurance that the password never
     /// stops working. Deliberately no sidebar — nothing to parse on run one.
     fn draw_firstrun(&self, f: &mut Frame, area: Rect) {
-        let a = th().accent;
-        let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
-        let lines = vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Set up face unlock",
-                Style::new().fg(a).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Private, local enrollment using your infrared camera.",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Your password remains available during and after setup.",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled(
-                    "  ▶  Scan my face  ",
-                    Style::new()
-                        .fg(Color::Black)
-                        .bg(a)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   "),
-                key("e"),
-            ]),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "1  Look at the camera     2  Follow the cues     3  Finish login setup",
-                Style::new().dim(),
-            )),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("Tab", Style::new().fg(a)),
-                Span::styled(" walks every step   ", Style::new().dim()),
-                Span::styled("[v]", Style::new().fg(a)),
-                Span::styled(" shows all sections", Style::new().dim()),
-            ]),
-        ];
-        let blk = Block::bordered()
+        let block = Block::bordered()
+            .title(" Set up face unlock ")
+            .title_bottom(if self.focused_action().is_some() {
+                " PgUp/Dn read · F6 back "
+            } else {
+                " F6 controls · wheel to read "
+            })
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim());
-        let inner = blk.inner(area);
-        // Register the "Scan my face" row as a click target (→ enroll).
-        if let Some(i) = lines
-            .iter()
-            .position(|l| l.spans.iter().any(|s| s.content.contains("Scan my face")))
-        {
-            let y = inner.y.saturating_add(i as u16);
-            if y < inner.y.saturating_add(inner.height) {
-                self.hit(
-                    Rect::new(inner.x, y, inner.width, 1),
-                    Click::Key(KeyCode::Char('e')),
-                );
-            }
-        }
-        f.render_widget(
-            Paragraph::new(lines)
-                .block(blk)
-                .alignment(ratatui::layout::Alignment::Center),
-            area,
+            .border_style(Style::new().fg(th().accent));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let [button_area, guidance] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        // The only primary action stays visible even with a one-line guidance
+        // viewport. Its hit region is the rendered button, not blank row space.
+        let button = Line::from(Span::styled(" [e] Scan my face ", th().chip));
+        let button_area = Rect::new(
+            button_area.x,
+            button_area.y,
+            button_area.width.min(button.width() as u16),
+            button_area.height,
+        );
+        f.render_widget(Paragraph::new(button), button_area);
+        self.hit(button_area, Click::Key(KeyCode::Char('e')));
+        let camera = if self.caps.ir_pair {
+            "Private, local enrollment with your RGB + infrared cameras."
+        } else {
+            "Private, local enrollment with your RGB camera."
+        };
+        self.draw_action_paragraph(
+            f,
+            guidance,
+            vec![
+                Line::raw(camera),
+                Line::raw("Your password remains available during and after setup."),
+                Line::raw(""),
+                Line::raw("1  Look at the camera"),
+                Line::raw("2  Follow the cues"),
+                Line::raw("3  Finish login setup"),
+                Line::raw(""),
+                Line::raw("F3 chooses a section; Tab goes to the next section."),
+                Line::raw("v shows or hides technical tools."),
+            ],
+            &[],
         );
     }
 
@@ -4752,7 +5937,22 @@ impl App {
         let blk = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
-        f.render_widget(Paragraph::new(lines).block(blk), area);
+        let offset = self.sidebar_offset(blk.inner(area).height);
+        f.render_widget(
+            Paragraph::new(lines).scroll((offset as u16, 0)).block(blk),
+            area,
+        );
+    }
+
+    fn sidebar_offset(&self, height: u16) -> usize {
+        let rows = self.sidebar_rows();
+        let selected = rows
+            .iter()
+            .position(|row| matches!(row, SidebarRow::Nav(screen) if *screen == self.screen))
+            .unwrap_or(0);
+        selected
+            .saturating_sub(usize::from(height.saturating_sub(1)))
+            .min(rows.len().saturating_sub(usize::from(height)))
     }
 
     /// Split the body area into (optional sidebar, content). Shared by `draw`
@@ -4772,12 +5972,36 @@ impl App {
         self.click_targets.borrow_mut().push((rect, c));
     }
 
+    fn live_overlay_visible(&self) -> bool {
+        self.show_live
+            && self.error.is_none()
+            && self.input.is_none()
+            && self.confirm.is_none()
+            && self.enroll_merge.is_none()
+            && !self.show_help
+            && self
+                .enroll
+                .as_ref()
+                .is_none_or(|enroll| enroll.session_merge.is_none())
+    }
+
+    fn daemon_ready_observed(&self) -> Option<bool> {
+        self.live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+            .filter(|live| {
+                live.tracking_available && live.stage != irlume_common::live::LiveStage::Unknown
+            })
+            .map(|live| live.stage == irlume_common::live::LiveStage::Ready)
+    }
+
     fn dialog_open(&self) -> bool {
         self.error.is_some()
             || self.input.is_some()
             || self.confirm.is_some()
             || self.enroll_merge.is_some()
             || self.show_help
+            || self.show_live
             || self
                 .enroll
                 .as_ref()
@@ -4785,6 +6009,24 @@ impl App {
     }
 
     fn on_scroll(&mut self, col: u16, row: u16, area: Rect, direction: i32) {
+        if self.activity_history_open && !self.dialog_open() {
+            self.activity.scroll(if direction < 0 {
+                KeyCode::Up
+            } else {
+                KeyCode::Down
+            });
+            return;
+        }
+        if self.sections.is_some() && !self.dialog_open() {
+            if Self::sections_rect(area).contains((col, row).into()) {
+                self.on_key(if direction < 0 {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                });
+            }
+            return;
+        }
         if self.dialog_open() {
             let (bounds, max) = self.dialog_view.get();
             if bounds.contains((col, row).into()) {
@@ -4868,9 +6110,27 @@ impl App {
     /// first-run button replays its key. Clicks while a modal/flow owns the
     /// screen are ignored.
     fn on_click(&mut self, col: u16, row: u16, area: Rect) {
+        if self.activity_history_open && !self.dialog_open() {
+            let key = self
+                .click_targets
+                .borrow()
+                .iter()
+                .find_map(|(rect, click)| {
+                    if rect.contains((col, row).into()) {
+                        if let Click::DialogKey(key) = click {
+                            return Some(*key);
+                        }
+                    }
+                    None
+                });
+            if let Some(key) = key {
+                self.on_key(key);
+            }
+            return;
+        }
         // Only the top overlay registers targets; background clicks never
         // dismiss a warning, approve an action or navigate behind a dialog.
-        if self.dialog_open() || self.more_actions.is_some() {
+        if self.dialog_open() || self.more_actions.is_some() || self.sections.is_some() {
             let target = self
                 .click_targets
                 .borrow()
@@ -4885,6 +6145,12 @@ impl App {
                         }
                     }
                 }
+                Some(Click::SectionRow(index)) if !self.dialog_open() => {
+                    if let Some(&screen) = self.visible.get(index) {
+                        self.sections = None;
+                        self.enter_screen(screen);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -4892,14 +6158,15 @@ impl App {
         // Activity remains usable while a camera/daemon operation owns normal
         // input, matching PgUp and [A]. Resolve that one safe disclosure before
         // the flow gate; it never starts, cancels, or confirms an operation.
-        let activity_hit = self.click_targets.borrow().iter().any(|(r, c)| {
-            col >= r.x
-                && col < r.x + r.width
-                && row >= r.y
-                && row < r.y + r.height
-                && matches!(c, Click::Key(KeyCode::Char('A')))
+        let activity_hit = self.click_targets.borrow().iter().find_map(|(r, c)| {
+            if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+                if let Click::Key(key @ (KeyCode::Char('A' | 'L') | KeyCode::F(4))) = c {
+                    return Some(*key);
+                }
+            }
+            None
         });
-        if activity_hit
+        if activity_hit.is_some()
             && !self.show_help
             && self.more_actions.is_none()
             && self.error.is_none()
@@ -4907,7 +6174,20 @@ impl App {
             && self.confirm.is_none()
             && self.enroll_merge.is_none()
         {
-            self.on_key(KeyCode::Char('A'));
+            if let Some(key) = activity_hit {
+                self.on_key(key);
+            }
+            return;
+        }
+        if self.enroll.is_some() || self.op.is_some() {
+            // Only the visible flow footer can cancel/exit. In particular,
+            // normal page controls and the header never act behind a flow.
+            let flow_control = self.click_targets.borrow().iter().any(|(rect, click)| {
+                rect.contains((col, row).into()) && matches!(click, Click::Key(KeyCode::Esc))
+            });
+            if flow_control {
+                self.on_key(KeyCode::Esc);
+            }
             return;
         }
         if self.more_actions.is_some()
@@ -4916,8 +6196,6 @@ impl App {
             || self.input.is_some()
             || self.confirm.is_some()
             || self.enroll_merge.is_some()
-            || self.enroll.is_some()
-            || self.op.is_some()
         {
             return;
         }
@@ -4930,9 +6208,15 @@ impl App {
             .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
             .map(|(_, c)| *c);
         if let Some(c) = hit {
+            // A pointer-selected row or action owns the click. In particular,
+            // an existing row's Enter must not activate a different F6 action.
+            if !matches!(c, Click::Key(KeyCode::F(6))) {
+                self.action_focus = None;
+                self.action_reveal.set(false);
+            }
             match c {
                 Click::Key(kc) => self.on_key(kc),
-                Click::DialogKey(_) | Click::ActionRow(_) => {}
+                Click::DialogKey(_) | Click::ActionRow(_) | Click::SectionRow(_) => {}
                 Click::Hub(i) => {
                     if let Some((_, _, target)) = self.hub_rows().get(i).copied() {
                         self.hub_sel = i;
@@ -4975,7 +6259,7 @@ impl App {
         if !in_inner {
             return;
         }
-        let idx = (row - inner.y) as usize;
+        let idx = (row - inner.y) as usize + self.sidebar_offset(inner.height);
         if let Some(SidebarRow::Nav(s)) = self.sidebar_rows().get(idx).copied() {
             self.enter_screen(s);
         }
@@ -4985,17 +6269,8 @@ impl App {
         // Slim one-line title bar. On a wide terminal the sidebar shows position;
         // on a narrow terminal a compact N/M location keeps orientation without
         // presenting the persistent settings app as a wizard.
-        let mut left = vec![
-            Span::styled(
-                " irlume ",
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(th().accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-        ];
-        if area.width < SIDEBAR_MIN_COLS {
+        let mut left = vec![Span::styled(" irlume ", th().chip), Span::raw("  ")];
+        if (60..SIDEBAR_MIN_COLS).contains(&area.width) {
             left.push(Span::styled(
                 format!(
                     "{}/{} · ",
@@ -5012,36 +6287,43 @@ impl App {
             SCREENS[self.screen],
             Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
         ));
+        // Give the page title and Exit separate rectangles. A long account
+        // name must never overwrite either on a compact terminal.
+        let exit_span = Span::styled(" ✕ Exit (q) ", th().chip);
+        let exit_width = (exit_span.width() as u16).min(area.width);
+        let exit = Rect::new(
+            area.right().saturating_sub(exit_width),
+            area.y,
+            exit_width,
+            area.height,
+        );
+        let title = Line::from(left);
+        let remaining = area.width.saturating_sub(exit_width);
         let account = if self.advanced {
             format!("advanced · {} ", self.user)
         } else {
             format!("{} ", self.user)
         };
-        // Visible, clickable exit: 'q' quits but a key nobody mentions is not
-        // discoverability (user report 2026-08-23: "how would I exit?"). The
-        // chip both teaches the key and is a click target for it.
-        let exit_span = Span::styled(
-            " ✕ Exit (q) ",
-            Style::new()
-                .fg(Color::Black)
-                .bg(th().warn)
-                .add_modifier(Modifier::BOLD),
+        let account_width = (Span::raw(&account).width().min(u16::MAX as usize) as u16).min(
+            remaining
+                .saturating_sub((title.width().min(u16::MAX as usize) as u16).saturating_add(1)),
         );
-        let exit_width = exit_span.content.len() as u16;
-        let right =
-            Line::from(vec![Span::styled(account, Style::new().dim()), exit_span]).right_aligned();
-        f.render_widget(Paragraph::new(Line::from(left)), area);
-        f.render_widget(Paragraph::new(right.clone()), area);
-        // The chip sits at the line's right edge; register its exact rect.
-        self.click_targets.borrow_mut().push((
-            Rect::new(
-                area.right().saturating_sub(exit_width),
-                area.y,
-                exit_width,
-                1,
-            ),
-            Click::Key(KeyCode::Char('q')),
-        ));
+        let title_area = Rect::new(
+            area.x,
+            area.y,
+            remaining.saturating_sub(account_width),
+            area.height,
+        );
+        let account_area = Rect::new(title_area.right(), area.y, account_width, area.height);
+        f.render_widget(Paragraph::new(title), title_area);
+        f.render_widget(
+            Paragraph::new(account)
+                .style(Style::new().dim())
+                .right_aligned(),
+            account_area,
+        );
+        f.render_widget(Paragraph::new(exit_span), exit);
+        self.hit(exit, Click::Key(KeyCode::Char('q')));
     }
 
     /// A single plain-language line under the header: what THIS tab is for and
@@ -5109,7 +6391,25 @@ impl App {
             .border_style(Style::new().fg(th().accent))
             // Breathing room (whitespace over chrome): content never touches
             // the frame.
-            .padding(ratatui::widgets::Padding::new(2, 2, 1, 0));
+            .padding(ratatui::widgets::Padding::new(
+                2,
+                2,
+                u16::from(area.height >= 6),
+                0,
+            ));
+        let blk = if self.focused_action().is_some() {
+            blk.title(format!(
+                " Action: {} ",
+                self.focused_action().map_or("", |(_, label)| label)
+            ))
+        } else {
+            blk
+        };
+        let blk = if self.enroll.is_none() {
+            blk.title(self.page_observation())
+        } else {
+            blk
+        };
         let inner = blk.inner(area);
         f.render_widget(blk.clone(), area);
         if self.enroll.is_some() {
@@ -5129,9 +6429,19 @@ impl App {
             SC_SETTINGS => self.draw_settings(f, inner),
             _ => self.draw_done(f, inner),
         }
-        let (screen, _, _, max) = self.page_view.get();
-        if screen == self.screen && max > 0 {
-            f.render_widget(blk.title_bottom(" Scroll inside panel for more "), area);
+        let (screen, bounds, _, max) = self.page_view.get();
+        if self.focused_action().is_some() {
+            let hint = if screen == self.screen && bounds.height > 0 {
+                " ↑↓ action · Enter/Space · PgUp/Dn read "
+            } else {
+                " ↑↓ action · Enter/Space · F6 back "
+            };
+            f.render_widget(blk.title_bottom(hint), area);
+        } else if screen == self.screen && max > 0 {
+            f.render_widget(
+                blk.title_bottom(" Wheel scroll · F6 keyboard controls "),
+                area,
+            );
         }
     }
 
@@ -5164,7 +6474,32 @@ impl App {
             ])
         };
         let face = r.map(|x| x.face).unwrap_or(false);
+        let cue = if e.stalled.is_some() {
+            Line::from(Span::styled(
+                "Camera guide not answering; this is not about your face or lighting.",
+                Style::new().fg(th().err).bold(),
+            ))
+        } else if let Some(count) = e.count {
+            Line::from(Span::styled(
+                format!("● Hold still; capturing in {count}…"),
+                Style::new().fg(th().ok).bold(),
+            ))
+        } else {
+            let guidance = r.map(|report| report.guidance.clone()).unwrap_or_else(|| {
+                let spinner = if self.reduce_motion {
+                    "·"
+                } else {
+                    SPIN[self.spin]
+                };
+                format!("{spinner} Starting camera…")
+            });
+            Line::from(vec![
+                Span::styled("→ ", Style::new().fg(th().accent)),
+                Span::styled(guidance, Style::new().bold()),
+            ])
+        };
         let mut lines = vec![
+            cue,
             Line::from(Span::styled(
                 format!("Enrolling '{}'", e.profile),
                 Style::new().add_modifier(Modifier::BOLD),
@@ -5186,13 +6521,6 @@ impl App {
             // live reading (quality bar, checklist, guidance) is stale and
             // rendering any of it reads as a current verdict against a hung
             // capture (#309). The stall replaces the whole live panel.
-            lines.push(Line::from(vec![
-                Span::styled("  ✗ ", Style::new().fg(th().err)),
-                Span::styled(
-                    "Camera guide not answering; this is not about your face or lighting.",
-                    Style::new().fg(th().err).add_modifier(Modifier::BOLD),
-                ),
-            ]));
             lines.push(Line::from(Span::styled(
                 format!("    ({err}) Check: journalctl -u irlumed -n 50"),
                 Style::new().dim(),
@@ -5223,25 +6551,6 @@ impl App {
             ),
             Line::raw(""),
         ]);
-        if let Some(c) = e.count {
-            lines.push(Line::from(Span::styled(
-                format!("  ● Hold still; capturing in {c}…",),
-                Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            let g = r.map(|x| x.guidance.clone()).unwrap_or_else(|| {
-                let spinner = if self.reduce_motion {
-                    "·"
-                } else {
-                    SPIN[self.spin]
-                };
-                format!("{spinner} Starting camera…")
-            });
-            lines.push(Line::from(vec![
-                Span::styled("  → ", Style::new().fg(th().accent)),
-                Span::styled(g, Style::new().add_modifier(Modifier::BOLD)),
-            ]));
-        }
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "  [esc] cancel",
@@ -5262,7 +6571,9 @@ impl App {
                 // The load FAILED (daemon up, enrollment unreadable). The [e]
                 // prompt here invited overwriting an enrollment that exists;
                 // Repair carries the recovery guidance.
-                format!("\nProfile list unreadable: {err}\n\nDo not re-enroll over it; see Diagnostics first.")
+                format!(
+                    "\nProfile list unreadable: {err}\n\nDo not re-enroll over it; see Diagnostics first."
+                )
             } else if !self.profiles_loaded {
                 // Never answered (daemon unreachable): the enrollment may
                 // exist and be fine, so no "none" and no enroll prompt.
@@ -5422,11 +6733,36 @@ impl App {
         let total = heights.iter().fold(0u16, |sum, h| sum.saturating_add(*h));
         let max = total.saturating_sub(area.height);
         let (screen, _, old_scroll, _) = self.page_view.get();
-        let scroll = if screen == self.screen {
+        let mut scroll = if screen == self.screen {
             old_scroll.min(max)
         } else {
             0
         };
+        let focused_key = self
+            .focused_action()
+            .and_then(|(key, _)| footer_keycode(key));
+        let focused_row = actions
+            .iter()
+            .find_map(|(row, key)| (Some(*key) == focused_key).then_some(*row));
+        if self.action_reveal.replace(false) {
+            if let Some(row) = focused_row {
+                let start = heights
+                    .iter()
+                    .take(row)
+                    .fold(0u16, |sum, height| sum.saturating_add(*height));
+                let end = start.saturating_add(heights.get(row).copied().unwrap_or(1));
+                if start < scroll || end > scroll.saturating_add(area.height) {
+                    // Prioritize the beginning of a wrapped action even when
+                    // its explanation is taller than the whole viewport.
+                    scroll = if heights.get(row).copied().unwrap_or(0) > area.height {
+                        start
+                    } else {
+                        end.saturating_sub(area.height).min(start)
+                    }
+                    .min(max);
+                }
+            }
+        }
         self.page_view.set((self.screen, area, scroll, max));
         let mut offset = 0u16;
         for (index, (line, height)) in lines.into_iter().zip(heights).enumerate() {
@@ -5441,9 +6777,13 @@ impl App {
                     height.saturating_sub(skipped).min(area.bottom() - y),
                 );
                 f.render_widget(
-                    Paragraph::new(line)
-                        .wrap(Wrap { trim: false })
-                        .scroll((skipped, 0)),
+                    Paragraph::new(if focused_row == Some(index) {
+                        line.style(selected_style())
+                    } else {
+                        line
+                    })
+                    .wrap(Wrap { trim: false })
+                    .scroll((skipped, 0)),
                     rect,
                 );
                 if let Some((_, key)) = actions.iter().find(|(row, _)| *row == index) {
@@ -5456,7 +6796,14 @@ impl App {
 
     fn preference_state(&self) -> irlume_common::PreferencesState {
         self.preferences
-            .unwrap_or_else(irlume_common::PreferencesState::observe)
+            .filter(|_| self.source_usable(Source::Preferences))
+            .unwrap_or(irlume_common::PreferencesState {
+                face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::Unreadable,
+                privileged_face_consent: None,
+                enforce_biopolicy: None,
+                consent_overridden: false,
+                biopolicy_overridden: false,
+            })
     }
 
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
@@ -5473,18 +6820,25 @@ impl App {
             v.push(Line::raw(if self.preferences.is_some() {
                 "  State: daemon observed (refreshes automatically)"
             } else {
-                "  State: local observation; daemon preferences unavailable"
+                "  State: daemon preferences unavailable"
             }));
+            v.push(Line::raw(format!(
+                "  {}",
+                self.source_status(Source::Preferences)
+            )));
             v.push(Line::raw(""));
             v.push(section("Face sensor policy"));
             let ir_only = state.face_sensor_policy.resolve().ok().map(|policy| {
                 policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental
             });
-            v.push(Line::raw(format!(
-                "  IR-only: {} — {}",
-                crate::preferences::toggle_label(ir_only),
-                crate::sensor_policy::state_label(state.face_sensor_policy)
-            )));
+            v.push(Line::from(vec![
+                Span::raw("  IR-only: "),
+                setting_badge(ir_only),
+                Span::raw(format!(
+                    " — {}",
+                    crate::sensor_policy::state_label(state.face_sensor_policy)
+                )),
+            ]));
             push_page_actions(
                 &mut v,
                 &mut page_actions,
@@ -5506,11 +6860,11 @@ impl App {
             v.push(Line::raw(""));
             v.push(section("Face authentication at privileged prompts"));
             v.push(Line::raw(""));
-            v.push(Line::raw(format!(
-                "  Hands-free: {} — {}",
-                crate::preferences::toggle_label(consent.map(|required| !required)),
-                crate::consent::state_label(consent)
-            )));
+            v.push(Line::from(vec![
+                Span::raw("  Hands-free: "),
+                setting_badge(consent.map(|required| !required)),
+                Span::raw(format!(" — {}", crate::consent::state_label(consent))),
+            ]));
             v.push(Line::raw(
                 "  Machine-wide for configured sudo/polkit and other privileged services.",
             ));
@@ -5544,29 +6898,15 @@ impl App {
             v.extend(vec![
                 section("Biopolicy operation-class gate"),
                 {
-                    // The shared tri-state reader, not the raw config read the
-                    // [b] direction uses: settings.conf is 0600 root-only, so
-                    // the raw read showed "off (default)" here while the Done
-                    // dashboard said "◐ root-only" for the same key. Same
-                    // truthy set and env override as the daemon.
-                    let (icon, icon_style, label) = match self.preference_state().enforce_biopolicy
-                    {
-                        Some(true) => (
-                            "●",
-                            Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
-                            "ON — ENFORCING",
-                        ),
-                        Some(false) => ("○", Style::new().dim(), "OFF — off (default)"),
-                        None => (
-                            "◐",
-                            Style::new().fg(th().warn),
-                            "UNKNOWN — settings unavailable",
-                        ),
+                    let detail = match bio {
+                        Some(true) => " — ENFORCING",
+                        Some(false) => " — off (default)",
+                        None => " — settings unavailable",
                     };
                     Line::from(vec![
                         Span::raw("  state  "),
-                        Span::styled(format!("{icon} "), icon_style),
-                        Span::styled(label, Style::new().dim()),
+                        setting_badge(bio),
+                        Span::raw(detail),
                     ])
                 },
                 Line::from(Span::styled(
@@ -5582,8 +6922,7 @@ impl App {
                     Style::new().dim(),
                 )),
             ]);
-            if state.biopolicy_overridden || std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some()
-            {
+            if state.biopolicy_overridden {
                 v.push(Line::raw(if self.preferences.is_some_and(|state| state.biopolicy_overridden) { "  Daemon environment override controls biopolicy; the saved value has no effect." } else { "  Local environment override; daemon policy may differ. Remove it before changing this setting." }));
             }
             push_page_actions(
@@ -5616,10 +6955,8 @@ impl App {
         // The active pair comes from the daemon's Health, NOT from
         // select_pair(): that helper falls through to discovery when no
         // explicit pair is configured, and discovery opens every node. This
-        // is a DRAW function, so it ran per frame, which is where the last
-        // hundred-odd opens per session came from (#187). Health reports the
-        // devices the daemon actually has open, which is a better answer
-        // anyway.
+        // is a DRAW function, so it ran per frame (#187). Health reports the
+        // selected configuration, not open devices or an active capture.
         let (argb, air) = self
             .health
             .as_ref()
@@ -5630,32 +6967,42 @@ impl App {
                 )
             })
             .unwrap_or_default();
-        let pairs = &self.pairs;
+        let inventory = self.current_inventory();
+        let pairs = if inventory.is_some() && self.source_usable(Source::Cameras) {
+            self.pairs.as_slice()
+        } else {
+            &[]
+        };
         // Size the list to its rows (header + one row per camera/note) so the
         // info block sits right under it instead of a stretched gap; leftover
         // space stays empty at the bottom (content near the top).
-        let list_rows = self.nodes.len().max(pairs.len()).max(1) as u16 + 1;
-        let [list_area, info_area] =
-            Layout::vertical([Constraint::Length(list_rows + 1), Constraint::Min(9)]).areas(area);
+        let list_rows = pairs
+            .len()
+            .max(inventory.map_or(0, |value| value.candidates.len()))
+            .max(1) as u16
+            + 1;
+        let [list_area, info_area] = Layout::vertical([
+            Constraint::Length((list_rows + 1).min(area.height.saturating_sub(1).max(1))),
+            Constraint::Min(0),
+        ])
+        .areas(area);
 
         // ---- selectable list of trusted (physical) Hello camera pairs ----
         // No pair ≠ no camera: an RGB-only device still serves the convenience
         // tier, so show what exists instead of only an error line.
         let items: Vec<ListItem> = if pairs.is_empty() {
             let mut v = Vec::new();
-            for (path, role) in &self.nodes {
-                if matches!(role, irlume_camera::Role::Rgb) {
-                    v.push(ListItem::new(Line::from(vec![
-                        Span::styled(" ● ", Style::new().fg(th().ok)),
-                        Span::styled(
-                            format!("{:<16}", path.trim_start_matches("/dev/")),
-                            Style::new().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            "RGB-only, convenience tier (face unlocks the screen only)",
-                            Style::new().dim(),
-                        ),
-                    ])));
+            if let Some(inventory) = inventory {
+                for candidate in &inventory.candidates {
+                    v.push(ListItem::new(Line::raw(format!(
+                        " ◐ {} · {}",
+                        if self.camera_load.is_some() {
+                            "Inspecting"
+                        } else {
+                            "Attached; inspect roles"
+                        },
+                        candidate.endpoint_paths.join(" + ")
+                    ))));
                 }
             }
             if v.is_empty() {
@@ -5665,20 +7012,11 @@ impl App {
                 // printing "no camera found" for it contradicted the active
                 // pair shown right below (#187).
                 v.push(ListItem::new(Span::styled(
-                    if self.pairs_known {
-                        "no paired RGB+IR camera found: an RGB webcam alone gives the \
-                         Convenience tier (lock-screen face only); run `irlume camera census` \
-                         or `sudo irlume doctor --probe` to see every camera-like device"
-                    } else if self.daemon_up {
-                        "asking irlumed for the camera list (it answers once the camera is free)"
+                    if inventory.is_some() {
+                        "No UVC candidates in the current passive inventory; other camera backends are not covered."
                     } else {
-                        "irlumed is not running, so the camera list is unknown; start it from Repair"
+                        "Current camera inventory unavailable; no hardware absence is inferred."
                     },
-                    Style::new().dim(),
-                )));
-            } else {
-                v.push(ListItem::new(Span::styled(
-                    "   no IR node: the Secure tier (sudo/login/keyring) needs an IR Hello camera",
                     Style::new().dim(),
                 )));
             }
@@ -5690,11 +7028,11 @@ impl App {
                     let active = p.rgb == argb && p.ir == air;
                     let kind = if p.fixed { "built-in" } else { "external" };
                     let id = p.id.clone().unwrap_or_else(|| "?".into());
-                    let priv_on = p.privacy;
+                    let priv_on = p.privacy && self.source_usable(Source::CameraPrivacy);
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
-                            Style::new().fg(if active { th().ok } else { Color::DarkGray }),
+                            Style::new().fg(if active { th().ok } else { Color::Reset }),
                         ),
                         Span::styled(
                             format!(
@@ -5715,6 +7053,8 @@ impl App {
                         Span::styled(format!("[{id}]"), Style::new().dim()),
                         if priv_on {
                             Span::styled("  ⚠ privacy ON", Style::new().fg(th().err))
+                        } else if !self.source_usable(Source::CameraPrivacy) {
+                            Span::styled("  ◐ privacy unobserved", Style::new().fg(th().warn))
                         } else {
                             Span::raw("")
                         },
@@ -5723,14 +7063,17 @@ impl App {
                 .collect()
         };
         let mut st = ListState::default()
-            .with_selected(Some(self.cam_sel.min(pairs.len().saturating_sub(1))));
+            .with_selected((self.cam_sel < pairs.len()).then_some(self.cam_sel));
         // No inner border (whitespace over chrome; the content panel already
         // frames this). A section header carries what the border title did.
-        let [hdr_area, rows_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(list_area);
+        let [hdr_area, rows_area] = Layout::vertical([
+            Constraint::Length(u16::from(list_area.height > 1)),
+            Constraint::Min(1),
+        ])
+        .areas(list_area);
         f.render_widget(
             Paragraph::new(section(
-                "Cameras  (● = active · ↑↓ select · Enter uses one)",
+                "Cameras  (● = configured · ↑↓ select · Enter uses one)",
             )),
             hdr_area,
         );
@@ -5739,7 +7082,11 @@ impl App {
             rows_area,
             &mut st,
         );
-        for i in 0..pairs.len().min(rows_area.height as usize) {
+        for i in 0..pairs
+            .len()
+            .saturating_sub(st.offset())
+            .min(rows_area.height as usize)
+        {
             self.hit(
                 Rect::new(
                     rows_area.x,
@@ -5747,35 +7094,32 @@ impl App {
                     rows_area.width,
                     1,
                 ),
-                Click::Select(i),
+                Click::Select(i + st.offset()),
             );
         }
 
-        // ---- info: active pair, selected pair nodes, emitter ----
-        // Only claim a node as "active" if it exists; select_pair's fixed
-        // fallback names devices that may be absent on this hardware.
-        let ex = |d: &str| std::path::Path::new(d).exists();
-        // "No camera hardware" is a claim about the MACHINE, so it needs an
-        // answer from the daemon to stand on. With health absent the paths
-        // above default to "", `ex("")` is false, and this line asserted no
-        // hardware on machines with four video nodes, contradicting the
-        // daemon row rendered above it. Unknown is not none.
+        // Health carries the daemon's cached device observation. Client-side
+        // path visibility (permissions or a different mount namespace) cannot
+        // establish camera absence, and rendering must not probe devices.
         let (active, active_style) = if self.health.is_none() {
             (
-                "unknown (daemon not answering; see Diagnostics)".to_string(),
+                "unknown (observation unavailable; see Diagnostics)".to_string(),
                 Style::new().dim(),
             )
         } else {
             let ok = Style::new().fg(th().ok).add_modifier(Modifier::BOLD);
-            match (ex(&argb), ex(&air)) {
+            match (!argb.is_empty(), !air.is_empty()) {
                 (true, true) => (format!("{argb} + {air}"), ok),
                 (true, false) => (format!("{argb} (RGB only)"), ok),
                 (false, true) => (format!("{air} (IR only)"), ok),
-                (false, false) => ("none (no camera hardware)".to_string(), Style::new().dim()),
+                (false, false) => (
+                    "no camera reported by daemon".to_string(),
+                    Style::new().dim(),
+                ),
             }
         };
         let mut lines = vec![Line::from(vec![
-            Span::styled("  active   ", Style::new().dim()),
+            Span::styled("  configured ", Style::new().dim()),
             Span::styled(active, active_style),
         ])];
         if let Some(p) = pairs.get(self.cam_sel) {
@@ -5792,14 +7136,17 @@ impl App {
         // without leaving the screen. Not-fetched draws as unknown, never
         // as the default schedule.
         let capture = match &self.capture_mode {
-            Some(text) => Span::raw(text.clone()),
+            Some(text) => Span::raw(format!(
+                "last observation ({}): {text}",
+                self.source_status(Source::Qualification)
+            )),
             None => Span::styled(
                 "unknown (daemon not answering)".to_string(),
                 Style::new().dim(),
             ),
         };
         lines.push(Line::from(vec![
-            Span::styled("  capture  ", Style::new().dim()),
+            Span::styled("  capture history  ", Style::new().dim()),
             capture,
         ]));
         lines.push(Line::raw(""));
@@ -5809,13 +7156,21 @@ impl App {
             Style::new().dim(),
         )));
         lines.push(Line::from(Span::styled(
-            "  your camera's USB descriptor documents, and never runs on its own.",
+            "  your camera's USB descriptor documents; this setup runs on request.",
             Style::new().dim(),
         )));
+        lines.push(Line::raw(
+            "  Authentication and automatic qualification may use the emitter.",
+        ));
+        lines.push(Line::raw(
+            "  F4 shows known current work; it does not prove physical camera power.",
+        ));
         push_page_actions(
             &mut lines,
             &mut page_actions,
             &[
+                ("r", "inspect attached candidates"),
+                ("c", "inspect capture qualification (asks first)"),
                 ("s", "set up emitter"),
                 ("t", "tune capture (holds the camera ~1 min)"),
                 ("p", "list units (writes nothing)"),
@@ -5845,7 +7200,12 @@ impl App {
             (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
             (None, false) => Span::styled("○ none detected", Style::new().dim()),
         };
-        let enrolled = if self.fp.enrolled.is_empty() {
+        let enrolled = if !self.source_usable(Source::Fingerprint) {
+            Span::styled(
+                "unknown (enrollment observation unavailable)",
+                Style::new().fg(th().warn),
+            )
+        } else if self.fp.enrolled.is_empty() {
             Span::styled("none".to_string(), Style::new().dim())
         } else {
             Span::styled(
@@ -5944,7 +7304,10 @@ impl App {
                 Style::new().fg(th().err).add_modifier(Modifier::BOLD),
             ),
             Some(_) => Span::styled("○ plaintext at rest", Style::new().dim()),
-            None => Span::styled("◐ unknown (daemon unreachable)", Style::new().fg(th().warn)),
+            None => Span::styled(
+                "◐ unknown (observation unavailable)",
+                Style::new().fg(th().warn),
+            ),
         };
         let rec = match self.recovery {
             Some(r) if r.recovery_set => Span::styled(
@@ -5952,10 +7315,14 @@ impl App {
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             ),
             Some(_) => Span::styled("○ not set", Style::new().dim()),
-            None => Span::styled("◐ unknown (daemon unreachable)", Style::new().fg(th().warn)),
+            None => Span::styled(
+                "◐ unknown (observation unavailable)",
+                Style::new().fg(th().warn),
+            ),
         };
         let mut lines = vec![
             section("Recovery + template encryption"),
+            Line::raw(format!("  {}", self.source_status(Source::Recovery))),
             state_row("templates", 12, enc),
             state_row("passphrase", 12, rec),
             Line::raw(""),
@@ -6015,11 +7382,12 @@ impl App {
                 Style::new().fg(th().ok).add_modifier(Modifier::BOLD),
             ),
             Some(false) => Span::styled("○ not armed", Style::new().dim()),
-            None => Span::styled("unknown (daemon unreachable)", Style::new().dim()),
+            None => Span::styled("unknown (observation unavailable)", Style::new().dim()),
         };
         let tpm = self.probes.tpm_present;
         let mut lines = vec![
             section("TPM keyring unlock"),
+            Line::raw(format!("  wallet {}", self.source_status(Source::Wallet))),
             Line::from(vec![Span::raw("  state    "), status]),
         ];
         // WHAT is sealed, not just whether something is. A GNOME token means
@@ -6070,13 +7438,15 @@ impl App {
         // the literal tier). Unanswered, it read as this machine's binding.
         let binding = match (&self.keyring_policy, self.keyring_armed) {
             (Some(p), _) => p.clone(),
-            (None, None) => "unknown (daemon unreachable)".to_string(),
-            (None, Some(_)) => "PCR-7 (Secure Boot state)".to_string(),
+            (None, None) => "unknown (observation unavailable)".to_string(),
+            (None, Some(_)) => "policy unreported by daemon".to_string(),
         };
         lines.extend([
             Line::from(vec![
                 Span::raw("  TPM      "),
-                if tpm {
+                if !self.source_usable(Source::Machine) {
+                    Span::styled("◐ unknown", Style::new().fg(th().warn))
+                } else if tpm {
                     Span::styled("● present", Style::new().fg(th().ok))
                 } else {
                     Span::styled("✗ none", Style::new().fg(th().err))
@@ -6242,7 +7612,9 @@ impl App {
             ),
             (
                 "Fingerprint",
-                self.fp_present.then_some(!self.fp.enrolled.is_empty()),
+                (self.source_usable(Source::FingerprintReader)
+                    && self.source_usable(Source::Fingerprint))
+                .then_some(self.fp_present && !self.fp.enrolled.is_empty()),
                 SC_FINGERPRINT,
             ),
             ("Diagnostics", diagnostics, SC_REPAIR),
@@ -6275,12 +7647,30 @@ impl App {
         let scans: usize = self.profiles.iter().map(|p| p.scans.len()).sum();
         let fails = self.repair.iter().filter(|c| c.sev == Sev::Fail).count();
         let warns = self.repair.iter().filter(|c| c.sev == Sev::Warn).count();
-        let (headline, detail, color) = if !self.daemon_up {
+        let live_transition = self
+            .live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+            .is_some_and(|live| {
+                live.stage != irlume_common::live::LiveStage::Ready || !live.tracking_available
+            });
+        let (headline, detail, color) = if live_transition {
+            ("Checking daemon readiness", "The daemon responded; its work state is changing or unavailable. F4 shows the current observation.", th().warn)
+        } else if !self.daemon_up {
             (
                 "Irlume needs attention",
                 "The background service is not responding.",
                 th().err,
             )
+        } else if !self
+            .live
+            .as_ref()
+            .filter(|_| self.source_usable(Source::Live))
+            .is_some_and(|live| {
+                live.stage == irlume_common::live::LiveStage::Ready && live.tracking_available
+            })
+        {
+            ("Checking daemon readiness", "Current daemon work state is unavailable or changing; F4 shows the latest observation.", th().warn)
         } else if fails > 0 {
             (
                 "Irlume needs attention",
@@ -6299,9 +7689,23 @@ impl App {
                 "Your face is enrolled; connect it to login and the lock screen.",
                 th().warn,
             )
+        } else if self.enrolled_known() == Some(true) && self.login_wired_known().is_none() {
+            (
+                "Checking login integration",
+                "Your face is enrolled; login wiring has not been observed yet.",
+                th().accent,
+            )
+        } else if self.enrolled_known() == Some(true) && self.face_camera_presence() != Some(true) {
+            ("Camera availability unconfirmed", "The saved enrollment remains; current face-camera availability is not established.", th().warn)
+        } else if !self.source_usable(Source::Machine) {
+            (
+                "Checking setup observations",
+                "Current diagnostics are unavailable; previous checks are not a readiness result.",
+                th().warn,
+            )
         } else if warns > 0 {
             (
-                "Face unlock is available",
+                "Setup has advisories",
                 "Diagnostics has an advisory worth reviewing.",
                 th().warn,
             )
@@ -6434,7 +7838,7 @@ impl App {
                         Style::new().fg(color).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{:<19}", c.label),
+                        format!("{:<19} · ", c.label),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(c.detail.clone(), Style::new().dim()),
@@ -6552,7 +7956,7 @@ impl App {
                 if let Some(p) = &self.keyring_policy {
                     p.clone()
                 } else if !self.daemon_up {
-                    "unknown (daemon unreachable)".to_string()
+                    "unknown (observation unavailable)".to_string()
                 } else if self.keyring_armed == Some(true) {
                     "unreported by this daemon".to_string()
                 } else if irlume_core::pcrsig::signed_policy_available() {
@@ -6611,6 +8015,12 @@ impl App {
             )),
             Line::raw(""),
         ];
+        if let Some(at) = self.identify_checked_at {
+            lines.push(Line::raw(format!(
+                "  Last recognition test: {}s ago",
+                self.now().saturating_duration_since(at).as_secs()
+            )));
+        }
         match &self.identify_result {
             Some((true, who)) => {
                 lines.push(Line::from(vec![
@@ -6621,11 +8031,11 @@ impl App {
                     Span::styled(who.clone(), Style::new().fg(th().ok)),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    "    confidence is 0.00-1.00 (higher = surer); this cleared your match",
+                    "    The match score cleared the configured threshold.",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "    threshold. Identify is a diagnostic check, not a login.",
+                    "    This is a diagnostic check, not a login or a probability estimate.",
                     Style::new().dim(),
                 )));
             }
@@ -6645,7 +8055,10 @@ impl App {
 
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
         let mut page_actions = Vec::new();
-        let mut lines = vec![section("PAM services (face auth wiring)")];
+        let mut lines = vec![
+            section("PAM services (face auth wiring)"),
+            Line::raw(format!("  {}", self.source_status(Source::Machine))),
+        ];
         // Everything below renders `self.pam_cache`, computed with the
         // diagnostics: draw used to re-read every PAM service file and probe
         // the LSM on EVERY FRAME, which is I/O in a render loop.
@@ -6759,7 +8172,7 @@ impl App {
             }
             // Daemon unreachable/older, or no camera; don't promise credential release.
             _ => lines.push(Line::from(Span::styled(
-                "  tier unknown (daemon unreachable); password remains the fallback",
+                "  tier unknown (observation unavailable); password remains the fallback",
                 Style::new().dim(),
             ))),
         }
@@ -6870,7 +8283,7 @@ impl App {
             Line::raw(""),
             Line::from(vec![
                 Span::raw("  daemon            "),
-                onoff(self.daemon_up),
+                onoff_opt(self.daemon_ready_observed()),
             ]),
             Line::from(vec![
                 Span::raw("  auth method       "),
@@ -6922,21 +8335,34 @@ impl App {
             ]),
             Line::from(vec![
                 Span::raw("  fingerprint       "),
-                onoff(self.fp.available),
+                onoff_opt(
+                    self.source_usable(Source::FingerprintReader)
+                        .then_some(self.fp.available),
+                ),
             ]),
             Line::from(vec![Span::raw("  login connection  "), onoff_opt(wired)]),
             Line::raw(""),
             Line::from(Span::styled(
-                if !self.daemon_up {
+                if self.daemon_ready_observed().is_none() {
+                    "  Current daemon readiness unavailable; F4 shows observation status."
+                } else if self.daemon_ready_observed() == Some(false) {
+                    "  Daemon is changing state; wait for Ready before checking setup."
+                } else if !self.daemon_up {
                     "  Daemon not running; see Diagnostics before quitting."
+                } else if !self.source_usable(Source::Profiles) || self.enrolled_known().is_none() {
+                    "  Current enrollment observation unavailable; wait for Faces to refresh."
                 } else if self.profiles.is_empty() && self.caps.rgb {
                     "  Not set up yet; enroll a face (Overview [e]) to begin."
                 } else if self.profiles.is_empty() {
-                    "  No face hardware; fingerprint/password remain your methods."
+                    "  Face hardware availability is unconfirmed; password remains available."
                 } else if wired == Some(false) {
                     "  One step left: your login screen isn't wired yet; press [w] (sudo; password stays the fallback)."
                 } else if wired.is_none() {
                     "  Checking login connection; the row above fills in when the probe lands."
+                } else if self.face_camera_presence() != Some(true)
+                    || !self.source_usable(Source::Profiles)
+                {
+                    "  Current face setup is unconfirmed; inspect Cameras and Faces observations."
                 } else {
                     "  All set. irlume keeps running as a daemon; this panel is safe to quit."
                 },
@@ -6962,17 +8388,55 @@ impl App {
         } else {
             SPIN[self.spin]
         };
-        let title = match (&self.op, expanded, scrolled) {
+        let history_title = match (&self.op, expanded, scrolled) {
             (Some(op), _, _) => format!(" Activity · {spinner} {}… ", op.label),
             (None, true, true) => format!(
                 " Activity · ↑ history ({} up · PgDn/End to follow) ",
                 self.act_scroll
             ),
             (None, true, false) => {
-                " Activity · newest last · [A] collapse · PgUp history ".to_string()
+                " Activity · newest last · [A] collapse · [L] full history ".to_string()
             }
-            (None, false, _) => " Recent activity · [A] expand ".to_string(),
+            (None, false, _) => " Session activity · [A] expand · [L] full history ".to_string(),
         };
+        let live_label = if !self.source_usable(Source::Live) || self.live.is_none() {
+            "unavailable"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| !live.tracking_available)
+        {
+            "activity unknown"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.worker.is_some() || !live.background.is_empty())
+        {
+            "working"
+        } else if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.stage == irlume_common::live::LiveStage::Ready)
+        {
+            "worker ready"
+        } else {
+            "changing state"
+        };
+        let title = format!(" [F4] Daemon {live_label} ·{history_title}");
+        self.hit(
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y,
+                5.min(area.width.saturating_sub(1)),
+                u16::from(area.height > 0),
+            ),
+            Click::Key(KeyCode::F(4)),
+        );
+        let history_button = title.find("[L]").map(|index| {
+            let left = u16::try_from(Line::raw(&title[..index]).width()).unwrap_or(u16::MAX);
+            Rect::new(area.x.saturating_add(1).saturating_add(left), area.y, 16, 1)
+                .intersection(area)
+        });
         let blk = Block::bordered()
             .title(title)
             .border_type(BorderType::Rounded)
@@ -6986,14 +8450,21 @@ impl App {
         } else {
             area
         };
+        if let Some(button) = history_button {
+            self.hit(button, Click::Key(KeyCode::Char('L')));
+        }
         self.hit(activity_target, Click::Key(KeyCode::Char('A')));
+        // Detail text always opens a fully readable view; the title keeps the
+        // compact disclosure behavior. No normal screen action is dispatched.
+        self.hit(inner, Click::Key(KeyCode::Char('L')));
         let h = inner.height as usize;
         // Window ends `act_scroll` lines up from the newest entry.
         // Designed empty state (HIG placeholders): say what will appear, not
         // nothing.
         if self.activity.is_empty() {
             f.render_widget(
-                Paragraph::new("No activity yet.").style(Style::new().dim()),
+                Paragraph::new("No actions recorded in this TUI session.")
+                    .style(Style::new().dim()),
                 inner,
             );
             return;
@@ -7002,20 +8473,115 @@ impl App {
         let start = end.saturating_sub(h);
         let lines: Vec<Line> = self.activity[start..end]
             .iter()
-            .map(|(g, m)| {
+            .enumerate()
+            .map(|(offset, (g, _))| {
                 let gs = match g {
                     '→' => Style::new().fg(th().accent),
                     '✓' => Style::new().fg(th().ok),
                     '✗' => Style::new().fg(th().err),
                     _ => Style::new().dim(),
                 };
-                Line::from(vec![
-                    Span::styled(format!("{g} "), gs),
-                    Span::raw(m.clone()),
-                ])
+                Line::styled(self.activity.summary(start + offset, inner.width), gs)
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_activity_history(&self, f: &mut Frame) {
+        let area = f.area();
+        f.render_widget(Clear, area);
+        let block = Block::bordered()
+            .title(" Session history · [F4] Current status ")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(th().accent));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        self.hit(
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y,
+                area.width.saturating_sub(2),
+                u16::from(area.height > 0),
+            ),
+            Click::DialogKey(KeyCode::F(4)),
+        );
+        let descriptions = [
+            "This TUI session: selected actions only; other apps and past sessions are not recorded. Status refreshes automatically query daemon, device and setup observations; camera enumeration may open devices. Setup/test actions can use the camera or TPM, or change configuration. Completion does not prove rollback or camera shutoff. F2 on the main screen opens history and diagnostic tools.",
+            "This TUI session only. Refreshes query devices; actions may use hardware or change settings. F2: history/diagnostics.",
+            "This TUI session. F2: tools.",
+        ];
+        // Shorten the explanation on small terminals, never the retained
+        // detail viewport. All entry text remains available through scrolling.
+        let scope = descriptions
+            .iter()
+            .copied()
+            .find(|text| {
+                Paragraph::new(*text)
+                    .wrap(Wrap { trim: false })
+                    .line_count(inner.width)
+                    <= usize::from((inner.height / 2).max(1))
+            })
+            .unwrap_or(descriptions[2]);
+        let scope_rows = Paragraph::new(scope)
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width) as u16;
+        let [context, state, _separator, body, controls] = Layout::vertical([
+            Constraint::Length(scope_rows),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        f.render_widget(
+            Paragraph::new(scope)
+                .wrap(Wrap { trim: false })
+                .style(Style::new().dim()),
+            context,
+        );
+        let status = if let Some(op) = &self.op {
+            format!("In progress: {} (history does not cancel it)", op.label)
+        } else if self.enroll.is_some() {
+            "Enrollment in progress (history does not cancel it)".to_string()
+        } else if self.activity.following() {
+            "Following newest · ↑/PgUp to read earlier".to_string()
+        } else {
+            "Reading history · End to follow newest".to_string()
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(format!("{} · {status}", self.activity.retention())),
+                Line::raw(format!("{} · F4 details", self.live_summary())),
+            ]),
+            state,
+        );
+        if self.activity.is_empty() {
+            f.render_widget(
+                Paragraph::new("No actions recorded in this TUI session."),
+                body,
+            );
+        } else {
+            f.render_widget(self.activity.paragraph(body.width, body.height), body);
+        }
+        let labels = if controls.width >= 39 {
+            ["[Esc/L] Close", "[Home] First", "[End] Last"]
+        } else {
+            ["[Esc] Close", "[Home]", "[End]"]
+        };
+        let mut x = controls.x;
+        for (label, key) in labels
+            .into_iter()
+            .zip([KeyCode::Esc, KeyCode::Home, KeyCode::End])
+        {
+            let width = (label.len() as u16).min(controls.right().saturating_sub(x));
+            let button = Rect::new(x, controls.y, width, controls.height);
+            f.render_widget(Paragraph::new(label).style(selected_style()), button);
+            self.hit(button, Click::DialogKey(key));
+            x = x
+                .saturating_add(width)
+                .saturating_add(2)
+                .min(controls.right());
+        }
     }
 
     /// Per-screen action keys, ordered primary-first: the footer shows
@@ -7077,6 +8643,8 @@ impl App {
                 ("t", "Toggle Debug Logs"),
             ],
             SC_CAMERAS => &[
+                ("r", "Inspect Candidates"),
+                ("c", "Inspect Qualification"),
                 ("enter", "Use Selected Pair…"),
                 ("s", "Set Up Emitter…"),
                 ("p", "List Units"),
@@ -7162,114 +8730,128 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
-        // Guided enrollment swallows every key but Esc; show only that, so the
-        // footer doesn't advertise dead nav/action keys during a capture.
-        if self.enroll.is_some() {
-            let spans = vec![
-                key("esc"),
-                Span::styled(" cancel enrollment", Style::new().dim()),
-            ];
-            let blk = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().dim());
-            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
-            return;
-        }
-        // A running op (Identify / IR self-test) also swallows every key but
-        // q/Esc, so don't advertise the live nav/action keys during it.
-        if self.op.is_some() {
-            let spans = vec![
-                key("q / esc"),
-                // "quit", not "cancel": these keys leave the TUI. The op keeps
-                // running in the daemon and its result is dropped; nothing here
-                // can call it back. Esc means "back out and stay" on every other
-                // screen, so promising a cancel here read as the safe choice.
-                Span::styled(
-                    " quit (the op keeps running) · working…",
-                    Style::new().dim(),
-                ),
-            ];
-            let blk = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().dim());
-            f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
-            return;
-        }
-        let actions = self.screen_actions();
-        // Three-tier disclosure: the footer shows the primary action plus one
-        // secondary action; [?] opens the full keymap overlay;
-        // docs hold the rest. The first action is THE action for the screen,
-        // so it alone gets the emphasized label.
-        // Build the chip row while tracking x so each key chip becomes a click
-        // target (border eats one column, so content starts at area.x + 1).
-        let inner_y = area.y + 1;
-        let mut x = area.x + 1;
-        let mut spans: Vec<Span> = Vec::new();
-        let nav_x = x;
-        let s = key("Tab");
-        let w = s.content.chars().count() as u16;
-        x = x.saturating_add(w);
-        spans.push(s);
-        let s = Span::styled(" sections  ", Style::new().dim());
-        x = x.saturating_add(s.content.chars().count() as u16);
-        spans.push(s);
-        self.hit(
-            Rect::new(nav_x, inner_y, x.saturating_sub(nav_x), 1),
-            Click::Key(KeyCode::Tab),
-        );
-        let visible_actions = if area.width >= 100 { 2 } else { 1 };
-        for (i, (k, d)) in actions.iter().take(visible_actions).enumerate() {
-            let action_x = x;
-            let s = key(k);
-            let w = s.content.chars().count() as u16;
-            x = x.saturating_add(w);
-            spans.push(s);
-            let ds = if i == 0 {
-                Span::styled(format!(" {d}  "), Style::new().add_modifier(Modifier::BOLD))
+        // These controls replay the same state-specific keys as the keyboard.
+        // Leaving a generic operation does not retract its daemon request.
+        if self.enroll.is_some() || self.op.is_some() {
+            let label = if self.enroll.is_some() {
+                " cancel enrollment"
             } else {
-                Span::styled(format!(" {d}  "), Style::new().dim())
+                " quit · task keeps running"
             };
-            x = x.saturating_add(ds.content.chars().count() as u16);
-            spans.push(ds);
-            if let Some(kc) = footer_keycode(k) {
+            let line = Line::from(vec![
+                key("esc"),
+                Span::raw(label),
+                Span::raw(if self.op.is_some() && area.width >= 60 {
+                    " · working…"
+                } else {
+                    ""
+                }),
+            ]);
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().dim());
+            let inner = block.inner(area);
+            let width = (line.width().min(u16::MAX as usize) as u16).min(inner.width);
+            f.render_widget(block, area);
+            f.render_widget(Paragraph::new(line), inner);
+            if width > 0 && inner.height > 0 {
                 self.hit(
-                    Rect::new(action_x, inner_y, x.saturating_sub(action_x), 1),
-                    Click::Key(kc),
+                    Rect::new(inner.x, inner.y, width, 1),
+                    Click::Key(KeyCode::Esc),
                 );
             }
+            return;
         }
-        let more_x = x;
-        let chip = key("F2");
-        x = x.saturating_add(chip.content.chars().count() as u16 + 10);
-        spans.push(chip);
-        spans.push(Span::styled(" actions  ", Style::new().dim()));
-        self.hit(
-            Rect::new(more_x, inner_y, x.saturating_sub(more_x), 1),
-            Click::Key(KeyCode::F(2)),
-        );
-        let help_x = x;
-        let s = key("?");
-        let w = s.content.chars().count() as u16;
-        x = x.saturating_add(w);
-        spans.push(s);
-        let s = Span::styled(" shortcuts", Style::new().dim());
-        x = x.saturating_add(s.content.chars().count() as u16);
-        spans.push(s);
-        self.hit(
-            Rect::new(help_x, inner_y, x.saturating_sub(help_x), 1),
-            Click::Key(KeyCode::Char('?')),
-        );
-        let blk = Block::bordered()
+        let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().dim());
-        f.render_widget(Paragraph::new(Line::from(spans)).block(blk), area);
+        let inner = block.inner(area);
+        let compact = inner.width < 78;
+        let control = |key: &str, label: &str, primary: bool| {
+            Line::from(vec![
+                Span::styled(format!(" {key} "), th().chip),
+                Span::styled(
+                    if compact {
+                        format!("{label} ")
+                    } else {
+                        format!(" {label}  ")
+                    },
+                    if primary {
+                        Style::new().bold()
+                    } else {
+                        Style::new()
+                    },
+                ),
+            ])
+        };
+        let labels = if compact {
+            if inner.width >= 36 {
+                ["Menu", "Focus", "More", "Help"]
+            } else {
+                ["", "", "", ""]
+            }
+        } else {
+            ["sections", "controls", "actions", "shortcuts"]
+        };
+        let fixed = [
+            (control("F3", labels[0], false), KeyCode::F(3)),
+            (
+                control("F6", labels[1], self.focused_action().is_some()),
+                KeyCode::F(6),
+            ),
+            (control("F2", labels[2], false), KeyCode::F(2)),
+            (control("?", labels[3], false), KeyCode::Char('?')),
+        ];
+        let reserved = fixed.iter().map(|(line, _)| line.width()).sum::<usize>();
+        let mut controls = Vec::new();
+        let mut used = 0;
+        // Retain the familiar wide-screen Tab/action placement. On compact
+        // terminals F3 provides direct access to every section in one menu.
+        if !compact {
+            let tab = Line::from(vec![key("Tab"), Span::raw(" sections  ")]);
+            used += tab.width();
+            controls.push((tab, KeyCode::Tab));
+        }
+        let actions = self.focused_action().map_or_else(
+            || {
+                self.screen_actions()
+                    .iter()
+                    .take(2)
+                    .copied()
+                    .collect::<Vec<_>>()
+            },
+            |action| vec![action],
+        );
+        for (index, (key, description)) in actions.into_iter().enumerate() {
+            let line = control(key, description, index == 0);
+            if used + line.width() + reserved <= usize::from(inner.width) {
+                if let Some(key) = footer_keycode(key) {
+                    used += line.width();
+                    controls.push((line, key));
+                }
+            }
+        }
+        controls.extend(fixed);
+        f.render_widget(block, area);
+        let mut x = inner.x;
+        for (line, key) in controls {
+            let width =
+                (line.width().min(u16::MAX as usize) as u16).min(inner.right().saturating_sub(x));
+            if width == 0 || inner.height == 0 {
+                break;
+            }
+            let rect = Rect::new(x, inner.y, width, 1);
+            f.render_widget(Paragraph::new(line), rect);
+            self.hit(rect, Click::Key(key));
+            x = x.saturating_add(width);
+        }
     }
 
     /// The full keymap for the [?] overlay: the global keys plus every action
     /// of the CURRENT screen (tier two of the disclosure ladder).
     fn help_body(&self) -> String {
         let mut b = String::from(
-            "Global\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n         PgUp/Dn  scroll activity history\n               h  Overview              q  quit\n           click  rows and action chips\n               M  release mouse (highlight/copy)\n\nThis screen\n",
+            "Global\n              F4  current daemon, camera inventory and observation age\n              F3  choose a section (click or arrows + Enter)\n              F6  focus page actions / return to page selection\n          ↑↓ + Enter/Space  choose and activate a focused action\n              F2  search more actions\n  Tab / \u{2190}\u{2192}  switch section       \u{2191}\u{2193}  select\n               v  show/hide technical tools\n               A  expand/collapse activity history\n               L  full session history and wrapped details\n         PgUp/Dn  read page with F6 focus; otherwise Activity\n               h  Overview              q  quit\n           click  rows and action chips\n        Dialogs  ↑↓ / PgUp/Dn scroll long messages\n               M  release mouse (highlight/copy)\n\nThis screen\n",
         );
         for (k, d) in self.screen_actions() {
             b.push_str(&format!("  {k:<7} {d}\n"));
@@ -7333,7 +8915,7 @@ impl App {
             let hint = Rect::new(inner.x, button_area.y.saturating_sub(1), inner.width, 1)
                 .intersection(inner);
             f.render_widget(
-                Paragraph::new("Scroll to read more").style(Style::new().dim()),
+                Paragraph::new("↑↓ / PgUp/Dn / wheel: read more").style(Style::new().dim()),
                 hint,
             );
         }
@@ -7356,32 +8938,14 @@ impl App {
     }
 }
 
-/// Approximate ratatui's word-wrap line count for `text` at `width` columns, so
-/// `modal()` can size its height to fit. Off-by-one on a word longer than the
-/// width is harmless (the height is clamped to the frame).
+/// Use the same grapheme-aware wrapper for layout and the scroll limit.
 fn wrapped_line_count(text: &str, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
-    // Count each explicit line (split on '\n'), word-wrapped to `width`.
-    text.split('\n')
-        .map(|line| {
-            let mut lines = 1usize;
-            let mut col = 0usize;
-            for word in line.split_whitespace() {
-                let wlen = word.chars().count();
-                if col == 0 {
-                    col = wlen;
-                } else if col + 1 + wlen <= width {
-                    col += 1 + wlen;
-                } else {
-                    lines += 1;
-                    col = wlen;
-                }
-            }
-            lines
-        })
-        .sum()
+    Paragraph::new(text)
+        .wrap(Wrap { trim: true })
+        .line_count(width.clamp(1, u16::MAX as usize) as u16)
 }
 
 // ---- rich-render helpers --------------------------------------------------
@@ -7395,10 +8959,15 @@ fn tui_rows(area: Rect) -> [Rect; 5] {
 }
 
 fn tui_rows_with_activity(area: Rect, activity_rows: u16) -> [Rect; 5] {
+    // Keep three rows for the footer and recent Activity, plus a usable page
+    // before expanding history. Overconstraining Min(6) at small heights can
+    // squeeze the bordered footer/history down to two rows with no content.
+    let activity_rows = activity_rows.min(area.height.saturating_sub(9));
+    let body_min = 6.min(area.height.saturating_sub(5 + activity_rows));
     Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(6),
+        Constraint::Min(body_min),
         Constraint::Length(activity_rows),
         Constraint::Length(3),
     ])
@@ -7621,11 +9190,51 @@ fn tflite_fallback_check(
 
 // ---- async response mappers (Response -> (ok, message)) -------------------
 
+/// Describe the requested effect without formatting request fields. Activity
+/// records intent here; only the later response can establish an outcome.
+fn request_effect(request: &Request) -> &'static str {
+    match request {
+        Request::Identify => {
+            "Requests a camera capture and compares it with enrolled faces. This recognition test does not change login wiring."
+        }
+        Request::SetupIrEmitter { dry_run: true } => {
+            "Inspects the IR emitter controls without applying their configuration."
+        }
+        Request::SetupIrEmitter { dry_run: false } => {
+            "Requests configuration of the camera's IR emitter controls."
+        }
+        Request::DeleteProfile { .. } => {
+            "Requests deletion of the selected face profile and its saved scans."
+        }
+        Request::DeleteScan { .. } => "Requests deletion of the selected saved face scan.",
+        Request::RenameProfile { .. } | Request::RenameScan { .. } => {
+            "Requests a new name for the selected saved profile or scan; no new capture."
+        }
+        Request::ForgetPassword { .. } => {
+            "Requests removal of the sealed wallet secret; wallet unlock will need its password."
+        }
+        Request::RecoverySetup { .. } => {
+            "Creates a passphrase-protected recovery backup for this account's template key."
+        }
+        Request::RecoveryRestore { .. } => {
+            "Restores the template key from its recovery backup and seals it to the current TPM state."
+        }
+        Request::RecoveryForget { .. } => {
+            "Requests removal of the recovery backup while keeping the current template key."
+        }
+        _ => "Requests an operation from the daemon. Waiting for its result.",
+    }
+}
+
+fn unexpected_response() -> String {
+    "unexpected daemon response; the operation's result was not confirmed. Refresh status before retrying.".into()
+}
+
 fn map_ok(resp: Response) -> (bool, String) {
     match resp {
         Response::Ok(m) => (true, m),
         Response::Error(e) => (false, e),
-        o => (false, format!("unexpected: {o:?}")),
+        _ => (false, unexpected_response()),
     }
 }
 
@@ -7655,7 +9264,7 @@ fn map_identify(resp: Response) -> (bool, String) {
         } => (
             true,
             format!(
-                "{u} · {} · confidence {score:.3}",
+                "{u} · {} · match score {score:.3}",
                 profile.unwrap_or_default()
             ),
         ),
@@ -7684,7 +9293,7 @@ fn map_identify(resp: Response) -> (bool, String) {
             )
         }
         Response::Error(e) => (false, e),
-        o => (false, format!("unexpected: {o:?}")),
+        _ => (false, unexpected_response()),
     }
 }
 
@@ -7698,7 +9307,7 @@ fn map_confirm(resp: Response) -> (bool, String) {
             "sealed keyring secret erased; keyring unlock disarmed".into(),
         ),
         Response::Error(e) => (false, e),
-        o => (false, format!("unexpected: {o:?}")),
+        _ => (false, unexpected_response()),
     }
 }
 
@@ -7710,7 +9319,7 @@ fn map_sealed(resp: Response) -> (bool, String) {
             "keyring armed; unlocking your session will open your wallet".into(),
         ),
         Response::Error(e) => (false, format!("arm failed: {e}")),
-        o => (false, format!("arm failed: {o:?}")),
+        _ => (false, unexpected_response()),
     }
 }
 
@@ -7786,10 +9395,8 @@ fn guide_until_capture(
             // A response of the wrong type is a protocol break, not a cue to
             // retry: swallowing it here would spin a tight request loop
             // against a confused daemon.
-            Ok(o) => {
-                let _ = send(WMsg::Err(format!(
-                    "camera guide answered with the wrong response type: {o:?}"
-                )));
+            Ok(_) => {
+                let _ = send(WMsg::Err(unexpected_response()));
                 return GuideOutcome::Halt;
             }
             Err(e) => {
@@ -7828,10 +9435,8 @@ fn guide_until_capture(
                 let _ = send(WMsg::Err(e));
                 return GuideOutcome::Halt;
             }
-            Ok(o) => {
-                let _ = send(WMsg::Err(format!(
-                    "camera guide answered with the wrong response type: {o:?}"
-                )));
+            Ok(_) => {
+                let _ = send(WMsg::Err(unexpected_response()));
                 return GuideOutcome::Halt;
             }
             // A mid-countdown miss counts like any other: the counter
@@ -7928,7 +9533,7 @@ fn enroll_worker(
                     match reply.recv_timeout(Duration::from_millis(100)) {
                         Ok(accept) => return Ok(Some(accept)),
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            return Err(std::io::Error::other("enrollment UI closed"))
+                            return Err(std::io::Error::other("enrollment UI closed"));
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
@@ -7955,8 +9560,8 @@ fn enroll_worker(
         Ok(Response::Error(error)) => {
             let _ = send(WMsg::Err(error));
         }
-        Ok(other) => {
-            let _ = send(WMsg::Err(format!("unexpected enrollment reply: {other:?}")));
+        Ok(_) => {
+            let _ = send(WMsg::Err(unexpected_response()));
         }
         Err(error) => {
             let _ = send(WMsg::Err(format!(
@@ -8066,8 +9671,8 @@ fn legacy_enroll_worker(
                     let _ = send(WMsg::Err(e));
                     return;
                 }
-                Ok(o) => {
-                    let _ = send(WMsg::Err(format!("unexpected: {o:?}")));
+                Ok(_) => {
+                    let _ = send(WMsg::Err(unexpected_response()));
                     return;
                 }
                 Err(e) => {
@@ -8085,6 +9690,8 @@ fn legacy_enroll_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("tui/visual_tests.rs");
+    include!("tui/live_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,
@@ -8960,7 +10567,7 @@ mod tests {
     #[test]
     fn audit_removed_selection_cannot_silently_target_another_person() {
         let _guard = dead_socket();
-        let mut app = test_app();
+        let mut app = live_test_app();
         app.caps.rgb = true;
         app.screen = SC_PROFILES;
         app.profiles = vec![profile("Alice", &["a1"]), profile("Bob", &["b1"])];
@@ -8986,6 +10593,7 @@ mod tests {
             app.confirm.is_none(),
             "another refresh must keep selection cleared"
         );
+        assert_eq!(app.screen, SC_PROFILES, "selection test stays on Faces");
         app.move_sel(1);
         assert!(
             app.sel_profile().is_some(),
@@ -9025,14 +10633,27 @@ mod tests {
             std::process::id()
         ));
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
         std::env::set_var("IRLUME_SOCKET", &sock);
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for response in [
-                Response::Cameras(vec![]),
-                Response::Error("old daemon".into()),
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
+            for response in [Response::Cameras(vec![])] {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("camera fixture accept did not finish: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
                 let mut line = String::new();
                 std::io::BufReader::new(&stream)
                     .read_line(&mut line)
@@ -9043,11 +10664,16 @@ mod tests {
             }
             requests
         });
-        let mut app = test_app();
+        let mut app = live_test_app();
         let started = std::time::Instant::now();
         app.refresh_camera_listing();
         let blocked = started.elapsed();
         let requests = server.join().unwrap();
+        assert!(matches!(requests.as_slice(), [Request::ListCameras]));
+        assert!(
+            app.qualification_load.is_none(),
+            "role inspection never qualifies capture"
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !app.pairs_known && std::time::Instant::now() < deadline {
             app.poll();
@@ -9150,7 +10776,21 @@ mod tests {
             ir_pair: false,
             rgb: false,
         };
-        App {
+        let mut app = App {
+            freshness: Freshness::default(),
+            clock_override: None,
+            usable_sources: [false; 13],
+            show_live: false,
+            live: None,
+            live_load: None,
+            live_epoch: None,
+            camera_epoch: None,
+            classified_epoch: None,
+            camera_confirmation: None,
+            selected_camera_choice: None,
+            selected_profile_identity: None,
+            qualification_load: None,
+            identify_checked_at: None,
             user: "testuser".into(),
             screen: SC_WELCOME,
             sel: 0,
@@ -9167,16 +10807,20 @@ mod tests {
             pairs_known: false,
             capture_mode: None,
             camera_load: None,
-            activity: Vec::new(),
+            activity: activity::Activity::default(),
             input: None,
             confirm: None,
             mouse_select: false,
             click_targets: std::cell::RefCell::new(Vec::new()),
+            window_area: std::cell::Cell::new(None),
             dialog_view: std::cell::Cell::new((Rect::default(), 0)),
             dialog_scroll: std::cell::Cell::new(0),
             page_view: std::cell::Cell::new((usize::MAX, Rect::default(), 0, 0)),
             show_help: false,
             more_actions: None,
+            sections: None,
+            action_focus: None,
+            action_reveal: std::cell::Cell::new(false),
             hub_sel: 0,
             op: None,
             enroll: None,
@@ -9201,9 +10845,12 @@ mod tests {
             preferences: None,
             act_scroll: 0,
             activity_open: false,
+            activity_history_open: false,
             reduce_motion: false,
             visible: App::compute_visible(&caps, VisibilityInputs::default(), &[]),
             advanced: false,
+            reported_caps: caps,
+            known_uvc_paths: Vec::new(),
             caps,
             fp_present: false,
             fp_known: true,
@@ -9217,7 +10864,9 @@ mod tests {
             fp_coverage: Vec::new(),
             spin: 0,
             quit: false,
-        }
+        };
+        app.mark_fixture_observations_fresh(Instant::now());
+        app
     }
 
     /// A running-op placeholder whose worker never answers (the receiver stays
@@ -9946,6 +11595,7 @@ mod tests {
         // Biopolicy [b]: enabling (from off) is confirm-gated; the confirm's
         // affirmative names the specific verb and carries the enable suspend.
         app.screen = SC_SETTINGS;
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.on_key(KeyCode::Char('b'));
         assert!(
             app.suspend.is_none(),
@@ -10531,7 +12181,7 @@ mod tests {
             reason: String::new(),
         });
         assert!(ok);
-        assert_eq!(msg, "alice · Face Profile 1 · confidence 0.812");
+        assert_eq!(msg, "alice · Face Profile 1 · match score 0.812");
         let (ok, msg) = map_identify(Response::Identified {
             user: None,
             profile: None,
@@ -10580,7 +12230,7 @@ mod tests {
             (false, true, true, "Fingerprint (secure), or Face (RGB)"),
             (false, true, false, "Face (RGB) · convenience"),
             (false, false, true, "Fingerprint"),
-            (false, false, false, "Password only"),
+            (false, false, false, "Password remains available"),
         ];
         for (ir_pair, rgb, fp, want) in cases {
             app.caps = irlume_camera::Caps { ir_pair, rgb };
@@ -10857,7 +12507,10 @@ mod tests {
         app.on_key(KeyCode::Char('e'));
         assert!(app.input.is_none(), "no name prompt without a camera");
         let (_, msg) = app.activity.last().expect("a guidance line is logged");
-        assert!(msg.contains("no camera"), "got: {msg}");
+        assert!(
+            msg.contains("current camera availability is unconfirmed"),
+            "got: {msg}"
+        );
         let before = app.activity.len();
         app.on_key(KeyCode::Char('i'));
         assert!(app.op.is_none(), "identify must not start without a camera");
@@ -11130,7 +12783,11 @@ mod tests {
 
     #[test]
     fn cameras_enter_switches_only_when_a_pair_exists() {
-        let mut app = test_app();
+        let mut app = live_test_app();
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
         app.screen = SC_CAMERAS;
         app.on_key(KeyCode::Enter);
         assert!(app.suspend.is_none());
@@ -11154,7 +12811,7 @@ mod tests {
         );
         let (_, _verb, act) = app.confirm.take().expect("confirm dialog armed");
         match act {
-            ConfirmAct::Sus(Suspend::SetCameras(ref r, ref i)) => {
+            ConfirmAct::Sus(Suspend::SetCameras(ref r, ref i, _)) => {
                 assert_eq!((r.as_str(), i.as_str()), ("/dev/video0", "/dev/video2"));
             }
             _ => panic!("confirm action must be SetCameras"),
@@ -11484,7 +13141,9 @@ mod tests {
         app.on_key(KeyCode::Enter);
         assert_eq!(
             app.op.as_ref().map(|o| o.label.as_str()),
-            Some("SealPassword")
+            Some(
+                "Connect Password Wallet: seal its secret with the TPM and update the wallet if needed"
+            )
         );
         wait_op_done(&mut app);
         assert!(app.error.is_some(), "a failed seal must surface");
@@ -11955,6 +13614,36 @@ mod tests {
         assert_eq!(stalls, 2, "misses below the limit render as stalls");
     }
 
+    #[test]
+    fn guide_unexpected_responses_do_not_copy_payloads_in_framing_or_countdown() {
+        for ready_samples in [0, GOOD_STREAK] {
+            let stop = AtomicBool::new(false);
+            let (tx, rx) = mpsc::channel();
+            let send = |m| tx.send(m).is_ok();
+            let mut remaining = ready_samples;
+            let mut sample = |_req: &Request| {
+                if remaining > 0 {
+                    remaining -= 1;
+                    Ok(Response::Position(good_report("hold still")))
+                } else {
+                    Ok(Response::Ok("synthetic-sensitive-payload".into()))
+                }
+            };
+            let outcome = guide_until_capture("synthetic-user", &stop, &send, &mut sample, &mut 0);
+            assert!(matches!(outcome, GuideOutcome::Halt));
+            drop(tx);
+            let error = rx
+                .into_iter()
+                .find_map(|m| match m {
+                    WMsg::Err(e) => Some(e),
+                    _ => None,
+                })
+                .expect("wrong reply must end the guide with an error");
+            assert!(!error.contains("synthetic-sensitive-payload"), "{error}");
+            assert!(error.contains("not confirmed"), "{error}");
+        }
+    }
+
     /// A guide that recovers goes back to live cues with no stall residue.
     #[test]
     fn cue_after_stall_clears_the_stall() {
@@ -11991,7 +13680,7 @@ mod tests {
         assert!(
             app.activity
                 .iter()
-                .any(|(_, m)| m.contains("enrollment cancelled")),
+                .any(|(_, m)| m.contains("enrollment cancellation requested")),
             "the cancel must be logged"
         );
         drain_loads(&mut app);
@@ -12001,7 +13690,8 @@ mod tests {
 
     #[test]
     fn overview_prioritizes_status_and_next_action() {
-        let mut app = test_app();
+        let mut app = live_test_app();
+        app.repair.clear();
         app.caps = irlume_camera::Caps {
             ir_pair: true,
             rgb: true,
@@ -12010,6 +13700,8 @@ mod tests {
         app.daemon_up = true;
         app.profiles = vec![profile("a", &["s1", "s2"])];
         app.profiles_loaded = true;
+        app.probes_landed = true;
+        app.probes.login_wired = true;
         let text = draw_text(&app);
         assert!(text.contains("Face unlock is ready"));
         assert!(text.contains("Status"));
@@ -12029,11 +13721,14 @@ mod tests {
             text.contains("Setup"),
             "the sidebar nav is missing:\n{text}"
         );
-        // No-camera tier: the recommendation flips to password-only.
+        // Unobserved hardware: keep the password fallback without asserting absence.
         let app2 = test_app();
         let text = draw_text(&app2);
         assert!(text.contains("Irlume needs attention"));
-        assert!(text.contains("Password only"), "got no fallback tier");
+        assert!(
+            text.contains("Password remains available"),
+            "got no fallback tier"
+        );
     }
 
     #[test]
@@ -12154,6 +13849,7 @@ mod tests {
         assert!(app.profiles_load.is_none(), "the landed load must clear");
         assert_eq!(app.profiles.len(), 1);
 
+        let last_success = app.freshness.observation(Source::Profiles).last_success;
         // A daemon-side error is STATE (corrupt enrollment): it lands on
         // enroll_error so Repair can flag it, exactly as the sync path did.
         let (tx, rx) = mpsc::channel();
@@ -12163,18 +13859,32 @@ mod tests {
         app.poll();
         assert_eq!(app.enroll_error.as_deref(), Some("corrupt"));
 
-        // A transport failure is NOT state: the loaded list stays, and the
-        // next refresh retries.
+        assert_eq!(
+            app.freshness.observation(Source::Profiles).last_success,
+            last_success
+        );
+        live_test_land_profiles(&mut app, vec![profile("Alice", &["s1"])]);
+        assert_eq!(app.profiles.len(), 1);
+        let last_success = app.freshness.observation(Source::Profiles).last_success;
+        // A transport failure is unavailable, never a successful empty list.
+        // Retain observation age and require a successful replacement.
         let (tx, rx) = mpsc::channel();
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Transport("timeout".into()))
             .unwrap();
         app.poll();
         assert_eq!(
-            app.profiles.len(),
-            1,
-            "a failed refresh must not clear the list"
+            app.freshness.observation(Source::Profiles).last_success,
+            last_success
         );
+        assert!(app.profiles.is_empty());
+        assert!(!app.profiles_loaded && !app.source_usable(Source::Profiles));
+        assert!(app
+            .source_status(Source::Profiles)
+            .contains("last successful check"));
+        live_test_land_profiles(&mut app, vec![profile("Alice", &["s1"])]);
+        assert_eq!(app.profiles.len(), 1);
+        assert!(app.source_usable(Source::Profiles));
     }
 
     #[test]
@@ -12195,6 +13905,7 @@ mod tests {
         assert!(app.profiles_loaded);
         assert!(app.profiles_load.is_none());
         app.apply_light(LightState {
+            observed_at: [Some(Instant::now()); 4],
             daemon_up: true,
             reach: crate::commands::DaemonReach::Running,
             health: None,
@@ -12303,16 +14014,31 @@ mod tests {
         assert!(app.heavy_load.is_none());
         assert!(app.heavy_known);
         assert!(matches!(app.heavy, Some(crate::bitwarden::TuiState::Ready)));
+        let last_success = app.freshness.observation(Source::Apps).last_success;
         app.refresh_heavy_with(|| Err(std::io::ErrorKind::TimedOut.into()));
         while app.heavy_load.is_some() && std::time::Instant::now() < deadline {
             app.poll();
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.heavy_load.is_none());
-        assert!(
-            matches!(app.heavy, Some(crate::bitwarden::TuiState::Ready)),
-            "failed refresh must preserve the last observation"
+        assert!(app.heavy.is_none() && !app.heavy_known);
+        assert!(!app.source_usable(Source::Apps));
+        assert_eq!(
+            app.freshness.observation(Source::Apps).last_success,
+            last_success
         );
+        assert!(app
+            .source_status(Source::Apps)
+            .contains("last successful check"));
+        app.refresh_heavy_with(|| Ok(Some(crate::bitwarden::TuiState::Ready)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.heavy_load.is_some() && Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.heavy_load.is_none());
+        assert!(app.source_usable(Source::Apps));
+        assert!(matches!(app.heavy, Some(crate::bitwarden::TuiState::Ready)));
     }
 
     #[test]
@@ -12324,6 +14050,7 @@ mod tests {
         app.keyring_drift = Some(true);
         app.keyring_checked_at = Some(std::time::Instant::now());
         app.apply_light(LightState {
+            observed_at: [Some(Instant::now()); 4],
             daemon_up: true,
             reach: crate::commands::DaemonReach::Running,
             health: None,
@@ -12487,7 +14214,7 @@ mod tests {
         app.screen = SC_KEYRING;
         // Daemon unreachable: unknown, never a fake "not armed".
         let text = draw_text(&app);
-        assert!(text.contains("unknown (daemon unreachable)"));
+        assert!(text.contains("unknown (observation unavailable)"));
         // Not armed on a fingerprint box: names the fingerprint trigger.
         app.keyring_armed = Some(false);
         app.fp_present = true;
@@ -12514,8 +14241,11 @@ mod tests {
             "Tier 2 offers the [p] pcrlock-refresh action, not the re-arm warning"
         );
         assert!(text.contains("At a face login"));
-        // Armed on the plain PCR-7 tier: the dbx re-arm warning instead.
+        // Missing policy is unavailable, never an invented PCR-7 binding.
         app.keyring_policy = None;
+        assert!(draw_text(&app).contains("policy unreported by daemon"));
+        // Explicit observed PCR-7 binding retains its warning.
+        app.keyring_policy = Some("PCR-7 (Secure Boot state)".into());
         app.keyring_drift = None;
         let text = draw_text(&app);
         assert!(text.contains("PCR-7 (Secure Boot state)"));
@@ -12594,12 +14324,12 @@ mod tests {
         app.screen = SC_IDENTIFY;
         let text = draw_text(&app);
         assert!(text.contains("press [i] and look at the camera"));
-        app.identify_result = Some((true, "alice · Face Profile 1 · confidence 0.912".into()));
+        app.identify_result = Some((true, "alice · Face Profile 1 · match score 0.912".into()));
         let text = draw_text(&app);
-        assert!(text.contains("alice · Face Profile 1 · confidence 0.912"));
+        assert!(text.contains("alice · Face Profile 1 · match score 0.912"));
         assert!(
-            text.contains("✓ Recognized") && text.contains("confidence is 0.00-1.00"),
-            "the hit shows a plain verdict + the confidence scale"
+            text.contains("✓ Recognized") && text.contains("not a login or a probability estimate"),
+            "the hit shows a verdict without presenting similarity as a probability"
         );
         app.identify_result = Some((false, "no live face (flat depth)".into()));
         let text = draw_text(&app);
@@ -12654,13 +14384,16 @@ mod tests {
         // because an unanswered listing is not an observation (#187).
         let text = draw_text(&app);
         assert!(!text.contains("no camera found"), "{text}");
-        assert!(text.contains("camera list is unknown"), "{text}");
+        assert!(
+            text.contains("Current camera inventory unavailable"),
+            "{text}"
+        );
         // The ACTIVE line has the same rule: with health unanswered it used
         // to default the paths to "" and assert "no camera hardware" from
         // Path::new("").exists(), contradicting the list line above it.
         assert!(!text.contains("no camera hardware"), "{text}");
-        assert!(text.contains("unknown (daemon not answering"), "{text}");
-        // The daemon answered but named no devices: now none IS the fact.
+        assert!(text.contains("unknown (observation unavailable"), "{text}");
+        // The daemon answered but named no devices; scope absence to its report.
         app.health = Some(HealthInfo {
             tier: "none".into(),
             rgb_dev: None,
@@ -12673,18 +14406,35 @@ mod tests {
             apparmor: None,
         });
         let text = draw_text(&app);
-        assert!(text.contains("no camera hardware"), "{text}");
+        assert!(text.contains("no camera reported by daemon"), "{text}");
         app.health = None;
-        // The daemon ANSWERED with an empty list: now "none" is a fact.
-        app.pairs_known = true;
+        // An observed empty UVC snapshot scopes absence to this backend.
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates.clear();
+        app.apply_live_snapshot(snapshot, app.now());
+        assert_eq!(app.screen, SC_CAMERAS, "inventory changes stay on Cameras");
         let text = draw_text(&app);
-        assert!(text.contains("no paired RGB+IR camera found"), "{text}");
-        // RGB node only: convenience tier, and why Secure needs IR.
-        app.nodes = vec![("/dev/video9".into(), irlume_camera::Role::Rgb)];
+        assert!(text.contains("No UVC candidates"), "{text}");
+        // Newly attached endpoints are visible before roles are inspected.
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.revision = 2;
+        snapshot.cameras.candidates[0].endpoint_paths = vec!["/dev/video9".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        assert_eq!(app.screen, SC_CAMERAS, "inventory changes stay on Cameras");
         let text = draw_text(&app);
         assert!(text.contains("video9"));
-        assert!(text.contains("RGB-only, convenience tier"));
-        assert!(text.contains("no IR node"));
+        assert!(text.contains("Attached; inspect roles"));
+        assert!(!text.contains("no IR node"));
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.revision = 3;
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        assert_eq!(app.screen, SC_CAMERAS, "inventory changes stay on Cameras");
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Cameras)
+            .record(true, now);
         // A real Hello pair renders its nodes, kind, and USB id.
         app.pairs = vec![irlume_common::CameraPairInfo {
             rgb: "/dev/video0".into(),
@@ -12708,7 +14458,7 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("PAM services"));
         assert!(
-            text.contains("tier unknown (daemon unreachable)"),
+            text.contains("tier unknown (observation unavailable)"),
             "no tier claim without the daemon"
         );
         // The aligned action list retains its current head-gated actions.
@@ -12771,14 +14521,22 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("Setup dashboard"));
         assert!(
-            text.contains("Daemon not running; see Diagnostics"),
-            "a down daemon is the first thing Done must flag"
+            text.contains("Current daemon readiness unavailable"),
+            "unobserved readiness must be explicit"
         );
+        app.apply_live_snapshot(live_test_snapshot(), app.now());
+        app.screen = SC_DONE;
         app.daemon_up = true;
         app.caps = irlume_camera::Caps {
             ir_pair: false,
             rgb: true,
         };
+        assert!(draw_text(&app).contains("enrollment observation unavailable"));
+        app.profiles_loaded = true; // explicitly observed empty enrollment
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Profiles)
+            .record(true, now);
         let text = draw_text(&app);
         assert!(
             text.contains("enroll a face (Overview [e])"),
@@ -12789,7 +14547,7 @@ mod tests {
             rgb: false,
         };
         let text = draw_text(&app);
-        assert!(text.contains("No face hardware"));
+        assert!(text.contains("Face hardware availability is unconfirmed"));
     }
 
     #[test]
@@ -12866,7 +14624,7 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("⚠ Problem"));
         assert!(text.contains("camera busy"));
-        assert!(text.contains("[any key] dismiss"));
+        assert!(text.contains("[Esc] dismiss · arrows scroll"));
         assert!(
             !text.contains("New profile name"),
             "the error modal must take precedence over the input prompt"
@@ -12935,7 +14693,7 @@ mod tests {
         let cases: [(usize, &str, &str); 11] = [
             (SC_WELCOME, "Enroll Face", "Uninstall"),
             (SC_REPAIR, "Fix Selected Issue", "Toggle Debug Logs"),
-            (SC_CAMERAS, "Use Selected Pair", "List Units"),
+            (SC_CAMERAS, "Inspect Candidates", "Use Selected Pair"),
             (SC_PROFILES, "Enroll Face", "Delete"),
             (SC_IDENTIFY, "Test Recognition", "Test Recognition"),
             (SC_KEYRING, "Connect Wallet", "Forget"),
@@ -12952,6 +14710,12 @@ mod tests {
                 "[?] overlay for screen {screen} misses '{in_overlay}':\n{}",
                 app.help_body()
             );
+            if screen == SC_CAMERAS {
+                assert!(
+                    app.help_body().contains("List Units"),
+                    "camera help retains unit inspection"
+                );
+            }
             let needle = primary;
             let text = footer(&app);
             assert!(
@@ -13002,6 +14766,361 @@ mod tests {
         app.op = Some(op);
         let text = panel(&app);
         assert!(text.contains("Identify"));
+    }
+
+    #[test]
+    fn activity_latest_result_survives_wrapped_predecessors() {
+        let mut app = test_app();
+        for _ in 0..4 {
+            app.log('·', "a detailed message ".repeat(30));
+        }
+        app.log('✓', "FINAL_RESULT_SENTINEL");
+        let mut term = Terminal::new(TestBackend::new(60, 7)).unwrap();
+        term.draw(|f| app.draw_activity(f, f.area())).unwrap();
+        assert!(rendered(&term).contains("FINAL_RESULT_SENTINEL"));
+    }
+
+    #[test]
+    fn activity_eviction_keeps_a_retained_reading_anchor() {
+        let mut app = test_app();
+        for i in 0..200 {
+            app.log('·', format!("entry-{i}"));
+        }
+        app.act_scroll = 5;
+        app.log('·', "new entry");
+        let mut term = Terminal::new(TestBackend::new(80, 7)).unwrap();
+        term.draw(|f| app.draw_activity(f, f.area())).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("entry-190"),
+            "retained first row shifted: {text}"
+        );
+        assert!(
+            !text.contains("entry-195"),
+            "newer row displaced the anchor: {text}"
+        );
+    }
+
+    #[test]
+    fn activity_full_history_reaches_a_long_entry_tail_without_running_an_action() {
+        let mut app = test_app();
+        app.log(
+            '·',
+            format!("{}HISTORY_TAIL_SENTINEL", "detail line\n".repeat(60)),
+        );
+        app.on_key(KeyCode::Char('L'));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        app.on_key(KeyCode::End);
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("HISTORY_TAIL_SENTINEL"),
+            "tail inaccessible: {text}"
+        );
+        assert!(
+            text.contains("This TUI session"),
+            "history scope missing: {text}"
+        );
+        assert!(app.op.is_none() && app.enroll.is_none() && app.suspend.is_none());
+        app.on_key(KeyCode::Esc);
+        assert!(!app.quit, "closing history must not exit the TUI");
+    }
+
+    #[test]
+    fn activity_summary_has_elapsed_time_and_textual_status() {
+        let mut app = test_app();
+        app.log('✗', "request was refused");
+        let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        term.draw(|f| app.draw_activity(f, f.area())).unwrap();
+        let text = rendered(&term);
+        assert!(text.contains("00:00"), "elapsed timestamp missing: {text}");
+        assert!(text.contains("Failed"), "textual status missing: {text}");
+    }
+
+    #[test]
+    fn activity_history_keeps_detail_space_in_a_small_terminal() {
+        let mut app = test_app();
+        app.log('·', "SMALL_TAIL");
+        app.on_key(KeyCode::Char('L'));
+        let mut term = Terminal::new(TestBackend::new(30, 16)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(rendered(&term).contains("SMALL_TAIL"));
+    }
+
+    #[test]
+    fn minimum_window_notice_hides_pages_and_overlays_and_restores_them() {
+        for (width, height) in [(40, 12), (79, 24), (80, 23)] {
+            for screen in 0..SCREENS.len() {
+                for overlay in 0..7 {
+                    let mut app = test_app();
+                    app.screen = screen;
+                    match overlay {
+                        1 => app.error = Some("HIDDEN_ERROR_SENTINEL".into()),
+                        2 => {
+                            app.input = Some((
+                                "HIDDEN_INPUT_SENTINEL".into(),
+                                "private input".into(),
+                                Pending::RecoveryPw(None),
+                            ))
+                        }
+                        3 => {
+                            app.confirm = Some((
+                                "HIDDEN_CONFIRM_SENTINEL".into(),
+                                "View",
+                                ConfirmAct::Sus(Suspend::Logs),
+                            ))
+                        }
+                        4 => app.activity_history_open = true,
+                        5 => app.show_help = true,
+                        6 => app.show_live = true,
+                        _ => {}
+                    }
+                    let mut small = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    small.draw(|f| app.draw_window(f)).unwrap();
+                    let text = rendered(&small);
+                    assert!(text.contains("Window too small"));
+                    assert!(text.contains("Minimum: 80 × 24"));
+                    assert!(text.contains(&format!("Current: {width} × {height}")));
+                    assert!(!text.contains("HIDDEN_") && !text.contains("private input"));
+                    assert!(
+                        !text.contains("Session history") && !text.contains("Current observations")
+                    );
+                    assert!(app.click_targets.borrow().is_empty());
+                    assert_eq!(app.screen, screen);
+                    let mut normal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                    normal.draw(|f| app.draw_window(f)).unwrap();
+                    assert!(!rendered(&normal).contains("Window too small"));
+                    assert_eq!(app.screen, screen);
+                    assert_eq!(app.error.is_some(), overlay == 1);
+                    assert_eq!(app.input.is_some(), overlay == 2);
+                    assert_eq!(app.confirm.is_some(), overlay == 3);
+                    assert_eq!(app.activity_history_open, overlay == 4);
+                }
+            }
+        }
+        for (width, height) in [(0, 0), (1, 1), (5, 2)] {
+            let app = test_app();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| app.draw_window(f)).unwrap();
+            assert!(app.click_targets.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn minimum_window_resize_race_blocks_hidden_keyboard_and_mouse_controls() {
+        use ratatui::crossterm::event::{
+            KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        let mut app = test_app();
+        app.confirm = Some((
+            "Visible approval".into(),
+            "View",
+            ConfirmAct::Sus(Suspend::Logs),
+        ));
+        let normal = Rect::new(0, 0, 80, 24);
+        let small = Rect::new(0, 0, 79, 24);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.draw_window(f)).unwrap();
+        let affirmative = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| {
+                matches!(click, Click::DialogKey(KeyCode::Char('y'))).then_some(*rect)
+            })
+            .expect("visible affirmative control");
+        let key = || Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.on_window_event(key(), small);
+        app.on_window_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: affirmative.x,
+                row: affirmative.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            small,
+        );
+        assert!(app.confirm.is_some() && app.suspend.is_none());
+        let mut undersized = Terminal::new(TestBackend::new(79, 24)).unwrap();
+        undersized.draw(|f| app.draw_window(f)).unwrap();
+        // Growing back cannot activate a dialog before it has been redrawn.
+        app.on_window_event(key(), normal);
+        assert!(app.confirm.is_some() && app.suspend.is_none());
+        terminal.draw(|f| app.draw_window(f)).unwrap();
+        app.on_window_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            normal,
+        );
+        let mut released = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        released.kind = KeyEventKind::Release;
+        app.on_window_event(Event::Key(released), normal);
+        assert!(app.confirm.is_some() && app.suspend.is_none());
+        app.on_window_event(key(), normal);
+        assert!(app.confirm.is_none() && matches!(app.suspend, Some(Suspend::Logs)));
+
+        let mut input = test_app();
+        input.input = Some((
+            "Input".into(),
+            "unchanged".into(),
+            Pending::RecoveryPw(None),
+        ));
+        input.page_view.set((SC_SETTINGS, normal, 3, 20));
+        input.act_scroll = 2;
+        undersized.draw(|f| input.draw_window(f)).unwrap();
+        input.on_window_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            small,
+        );
+        input.on_window_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 4,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            }),
+            small,
+        );
+        assert_eq!(input.input.as_ref().unwrap().1, "unchanged");
+        assert_eq!(input.page_view.get().2, 3);
+        assert_eq!(input.act_scroll, 2);
+        assert!(input.op.is_none() && input.suspend.is_none());
+    }
+
+    #[test]
+    fn minimum_window_allows_safe_exit_and_enrollment_cancellation_only() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let small = Rect::new(0, 0, 40, 12);
+        let mut app = test_app();
+        let (_sender, enrollment) = fake_enroll(0, 4);
+        let stop = enrollment.stop.clone();
+        app.enroll = Some(enrollment);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| app.draw_window(f)).unwrap();
+        assert!(
+            !stop.load(Ordering::Relaxed),
+            "resizing must not cancel enrollment"
+        );
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char('e'),
+            KeyCode::F(4),
+            KeyCode::Tab,
+        ] {
+            app.on_window_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), small);
+        }
+        assert!(app.enroll.is_some() && !app.quit && app.suspend.is_none());
+        assert!(!stop.load(Ordering::Relaxed));
+        app.on_window_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            small,
+        );
+        assert!(stop.load(Ordering::Relaxed) && app.enroll.is_some() && !app.quit);
+        // Keep the worker handle for the actual completion/unknown-outcome path.
+        app.on_window_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            small,
+        );
+        assert!(app.quit && stop.load(Ordering::Relaxed));
+
+        let mut direct_quit = test_app();
+        let (_sender, enrollment) = fake_enroll(0, 4);
+        let direct_stop = enrollment.stop.clone();
+        direct_quit.enroll = Some(enrollment);
+        assert!(!direct_stop.load(Ordering::Relaxed));
+        direct_quit.on_window_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            small,
+        );
+        assert!(direct_quit.quit && direct_stop.load(Ordering::Relaxed));
+
+        let mut general = test_app();
+        let (_sender, op) = fake_op();
+        general.op = Some(op);
+        terminal.draw(|f| general.draw_window(f)).unwrap();
+        general.on_window_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            small,
+        );
+        assert!(general.quit && general.op.is_some());
+    }
+
+    #[test]
+    fn activity_history_buttons_have_visible_noninteractive_gaps() {
+        for width in [30, 40, 80] {
+            let mut app = test_app();
+            app.log('·', "history detail");
+            app.on_key(KeyCode::Char('L'));
+            let mut term = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let controls: Vec<_> = app
+                .click_targets
+                .borrow()
+                .iter()
+                .filter_map(|(rect, click)| match click {
+                    Click::DialogKey(key @ (KeyCode::Esc | KeyCode::Home | KeyCode::End)) => {
+                        Some((*rect, *key))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(controls.len(), 3);
+            for pair in controls.windows(2) {
+                let gap = pair[0].0.right();
+                assert!(gap < pair[1].0.x, "buttons touch at width {width}");
+                assert_eq!(term.backend().buffer()[(gap, pair[0].0.y)].symbol(), " ");
+                app.on_click(gap, pair[0].0.y, Rect::new(0, 0, width, 12));
+                assert!(app.activity_history_open && !app.quit);
+            }
+            let row: String = (0..width)
+                .map(|x| term.backend().buffer()[(x, controls[0].0.y)].symbol())
+                .collect();
+            assert!(row.contains("[Esc"), "close shortcut missing: {row}");
+            assert!(row.contains("[Home]"), "first shortcut missing: {row}");
+            assert!(row.contains("[End]"), "last shortcut missing: {row}");
+            let (close, _) = controls[0];
+            app.on_click(close.x, close.y, Rect::new(0, 0, width, 12));
+            assert!(!app.activity_history_open && !app.quit);
+        }
+    }
+
+    #[test]
+    fn activity_full_history_title_button_opens_its_advertised_view() {
+        let mut app = test_app();
+        let mut term = Terminal::new(TestBackend::new(100, 7)).unwrap();
+        term.draw(|f| app.draw_activity(f, f.area())).unwrap();
+        let row = &term.backend().buffer().content[..100];
+        let x = row
+            .windows(3)
+            .position(|cells| {
+                cells[0].symbol() == "[" && cells[1].symbol() == "L" && cells[2].symbol() == "]"
+            })
+            .expect("full history button is visible") as u16;
+        app.on_click(x + 1, 0, Rect::new(0, 0, 100, 7));
+        assert!(
+            app.activity_history_open,
+            "button must not merely toggle the compact strip"
+        );
+    }
+
+    #[test]
+    fn activity_history_does_not_dismiss_an_arriving_error_or_cancel_an_operation() {
+        let mut app = test_app();
+        let (_tx, op) = fake_op();
+        app.op = Some(op);
+        app.on_key(KeyCode::Char('L'));
+        app.error = Some("ATTENTION_SENTINEL".into());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(rendered(&term).contains("ATTENTION_SENTINEL"));
+        app.on_key(KeyCode::Esc);
+        assert!(app.error.is_none());
+        assert!(app.activity_history_open);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(app.op.is_some());
+        assert!(!app.quit);
     }
 
     // ---- log ring, scroll bounds, status poll ------------------------------
@@ -13055,12 +15174,13 @@ mod tests {
     }
 
     #[test]
-    fn refresh_light_clamps_selections_to_the_shrunken_lists() {
+    fn refresh_light_cannot_retarget_selections_in_shrunken_lists() {
         let mut app = test_app();
         app.profiles = vec![profile("a", &["s1"])]; // 2 rows
         app.sel = 9;
         app.cam_sel = 9;
         app.apply_light(LightState {
+            observed_at: [Some(Instant::now()); 4],
             daemon_up: false,
             reach: crate::commands::DaemonReach::Down,
             health: None,
@@ -13070,11 +15190,16 @@ mod tests {
             keyring_kind: None,
             recovery: None,
         });
-        assert_eq!(app.sel, 1, "sel must clamp to the last real row");
-        assert!(
-            app.cam_sel < app.pairs.len().max(1),
-            "cam_sel must clamp to the discovered pairs"
+        assert_eq!(
+            app.sel, 9,
+            "a status reply cannot choose another profile row"
         );
+        assert!(app.selected_profile_row().is_none());
+        assert_eq!(
+            app.cam_sel, 9,
+            "a status reply cannot choose another camera"
+        );
+        assert!(app.pairs.get(app.cam_sel).is_none());
         assert!(!app.daemon_up);
         assert!(app.health.is_none());
     }
@@ -13120,8 +15245,8 @@ mod tests {
         assert!(pad.sev == Sev::Ok);
         assert!(pad.detail.contains("RGB loaded + IR loaded"));
         let cams = find("Cameras");
-        assert!(cams.sev == Sev::Ok);
-        assert!(cams.detail.contains("secure tier"));
+        assert!(cams.sev == Sev::Unknown);
+        assert!(cams.detail.contains("current camera presence unconfirmed"));
         // Repair no longer carries an emitter row. It never measured the
         // emitter: it was unconditionally a warning whenever an IR node
         // existed, so it cried wolf on every working machine and pointed its
@@ -13139,6 +15264,17 @@ mod tests {
         let enroll = find("Enrollment");
         assert!(enroll.sev == Sev::Warn, "no profiles yet is a warning");
         assert!(enroll.detail.contains("no face enrolled yet"));
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        let cameras = app
+            .repair
+            .iter()
+            .find(|check| check.label == "Cameras")
+            .unwrap();
+        assert!(cameras.sev == Sev::Ok);
+        assert!(cameras.detail.contains("engine configured secure"));
     }
 
     #[test]
@@ -13156,6 +15292,10 @@ mod tests {
             version: "0.0.1-old".into(),
             apparmor: None,
         });
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/video0".into(), "/dev/video2".into()];
+        app.apply_live_snapshot(snapshot, app.now());
         app.enroll_error = Some("bad ciphertext".into());
         app.run_checks();
         let find = |label: &str| {
@@ -13563,7 +15703,10 @@ mod tests {
         assert!(!text.contains("plaintext at rest"), "{text}");
         assert!(!text.contains("No TPM on this host"), "{text}");
         assert!(!text.contains("○ not set"), "{text}");
-        assert!(text.contains("◐ unknown (daemon unreachable)"), "{text}");
+        assert!(
+            text.contains("◐ unknown (observation unavailable)"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -13649,7 +15792,7 @@ mod tests {
         let text = draw_text(&app);
         assert!(!text.contains("literal PCR-7"), "{text}");
         assert!(
-            row_with(&text, "PCR policy").contains("unknown (daemon unreachable)"),
+            row_with(&text, "PCR policy").contains("unknown (observation unavailable)"),
             "{text}"
         );
         // The daemon's KeyringInfo names the rung: show it verbatim, exactly
@@ -13691,7 +15834,7 @@ mod tests {
         // The pre-KeyringInfo default described a binding nobody read.
         assert!(!text.contains("PCR-7 (Secure Boot state)"), "{text}");
         assert!(
-            row_with(&text, "binding").contains("unknown (daemon unreachable)"),
+            row_with(&text, "binding").contains("unknown (observation unavailable)"),
             "{text}"
         );
         // And no armed-state consequence line off an unanswered question.
@@ -13743,6 +15886,7 @@ mod tests {
         let old = std::env::var_os("IRLUME_ENFORCE_BIOPOLICY");
         std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "yes");
         let mut app = test_app();
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.screen = SC_DONE;
         let text = draw_text(&app);
         match old {
@@ -13753,7 +15897,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_sensor_policy_is_explicitly_local_experimental_and_read_only() {
+    fn settings_sensor_policy_displays_observed_experimental_policy_without_writing() {
         let _guard = dead_socket();
         let old_cfg = std::env::var_os("IRLUME_CONFIG_DIR");
         let dir = std::env::temp_dir().join(format!("irlume-tui-sensor-{}", std::process::id()));
@@ -13762,11 +15906,11 @@ mod tests {
         let original = "face_sensor_policy=ir-only-experimental\n";
         std::fs::write(dir.join("settings.conf"), original).unwrap();
         let mut app = test_app();
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
         assert!(
-            text.contains("local observation; daemon preferences unavailable")
-                && text.contains("EXPERIMENTAL IR-only"),
+            text.contains("daemon observed") && text.contains("EXPERIMENTAL IR-only"),
             "{text}"
         );
         assert!(text.contains("not qualified"), "{text}");
@@ -13794,6 +15938,7 @@ mod tests {
         std::fs::write(dir.join("settings.conf"), "privileged_face_consent=1\n").unwrap();
         let mut app = test_app();
         app.screen = SC_SETTINGS;
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.on_key(KeyCode::Char('p'));
         assert!(
             app.confirm.is_some() && app.suspend.is_none(),
@@ -13805,6 +15950,7 @@ mod tests {
             std::fs::read_to_string(dir.join("settings.conf")).unwrap(),
             "privileged_face_consent=1\n"
         );
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.on_key(KeyCode::Char('p'));
         app.on_key(KeyCode::Char('y'));
         assert!(
@@ -13813,6 +15959,7 @@ mod tests {
         );
         app.suspend = None;
         std::fs::write(dir.join("settings.conf"), "privileged_face_consent=0\n").unwrap();
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.on_key(KeyCode::Char('p'));
         assert!(
             app.confirm.is_none() && matches!(app.suspend, Some(Suspend::PrivilegedConsent(true))),
@@ -13821,6 +15968,7 @@ mod tests {
         app.suspend = None;
         std::fs::remove_file(dir.join("settings.conf")).unwrap();
         std::fs::create_dir(dir.join("settings.conf")).unwrap();
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.on_key(KeyCode::Char('p'));
         assert!(
             app.confirm.is_none() && app.suspend.is_none(),
@@ -13845,6 +15993,7 @@ mod tests {
         for (v, expected) in [("0", "hands-free"), ("1", "required"), ("typo", "required")] {
             std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", v);
             let mut app = test_app();
+            app.preferences = Some(irlume_common::PreferencesState::observe());
             app.screen = SC_SETTINGS;
             let text = draw_text(&app);
             assert!(
@@ -13853,8 +16002,8 @@ mod tests {
             );
             assert!(text.contains("environment override"), "{text}");
             assert!(
-                !text.contains("Daemon environment override"),
-                "local fallback must not claim a daemon observation: {text}"
+                text.contains("Daemon environment override"),
+                "an explicitly landed observer result identifies the daemon override: {text}"
             );
             app.on_key(KeyCode::Char('p'));
             assert!(app.suspend.is_none() && app.confirm.is_none());
@@ -13863,6 +16012,416 @@ mod tests {
             Some(v) => std::env::set_var("IRLUME_PRIVILEGED_FACE_CONSENT", v),
             None => std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT"),
         }
+    }
+
+    #[test]
+    fn interface_preferences_state_text_uses_semantic_colors() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let monochrome = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        for (observed, label, color) in [
+            (Some(true), "ON", Color::Green),
+            (Some(false), "OFF", Color::Reset),
+            (None, "UNKNOWN", Color::Yellow),
+        ] {
+            let mut app = test_app();
+            let mut state = preference_fixture(observed.unwrap_or(false));
+            state.privileged_face_consent = observed.map(|on| !on);
+            state.enforce_biopolicy = observed;
+            if observed.is_none() {
+                state.face_sensor_policy =
+                    irlume_common::config::FaceSensorPolicyObservation::Unreadable;
+            }
+            app.preferences = Some(state);
+            let mut term = Terminal::new(TestBackend::new(120, 60)).unwrap();
+            term.draw(|f| app.draw_settings(f, f.area())).unwrap();
+            let text = rendered(&term);
+            for row_label in ["IR-only:", "Hands-free:", "  state  "] {
+                let (y, line) = text
+                    .lines()
+                    .enumerate()
+                    .find(|(_, l)| l.contains(row_label))
+                    .unwrap();
+                let byte = line.find(label).unwrap();
+                let x = line[..byte].chars().count() as u16;
+                let cell = &term.backend().buffer()[(x, y as u16)];
+                let expected = if monochrome { Color::Reset } else { color };
+                assert_eq!(
+                    cell.fg, expected,
+                    "{row_label} {label} must color the state text"
+                );
+                assert!(
+                    cell.modifier.contains(Modifier::BOLD),
+                    "state text must stay legible without color"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interface_chrome_keeps_terminal_default_background_and_no_black_text() {
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.profiles_loaded = true;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        for cell in &term.backend().buffer().content {
+            assert_ne!(
+                cell.fg,
+                Color::Black,
+                "chrome must not assume a dark or light background"
+            );
+            assert_eq!(cell.bg, Color::Reset, "the terminal owns the background");
+        }
+    }
+
+    #[test]
+    fn interface_keyboard_focus_reaches_last_wrapped_page_action() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        app.on_key(KeyCode::F(6));
+        for _ in 1..app.screen_actions().len() {
+            app.on_key(KeyCode::Down);
+        }
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        assert!(
+            text.contains("Show full status"),
+            "focused action must scroll into view: {text}"
+        );
+        assert!(!app.activity_open);
+        app.on_key(KeyCode::Enter);
+        assert!(matches!(app.suspend, Some(Suspend::LoginStatus)));
+    }
+
+    #[test]
+    fn interface_focused_toggle_keeps_its_confirmation() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.preferences = Some(preference_fixture(false));
+        let _ = draw_text(&app);
+        app.on_key(KeyCode::F(6));
+        app.on_key(KeyCode::Char(' '));
+        assert!(app.suspend.is_none());
+        assert!(app
+            .confirm
+            .as_ref()
+            .is_some_and(|c| c.0.contains("not qualified")));
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none() && app.suspend.is_none());
+    }
+
+    #[test]
+    fn interface_section_picker_navigates_without_activating_background() {
+        let _g = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_WELCOME;
+        let target = app.visible[1];
+        app.on_key(KeyCode::F(3));
+        assert!(draw_text(&app).contains("Choose section"));
+        app.on_key(KeyCode::Char('e'));
+        assert!(app.input.is_none() && app.enroll.is_none());
+        app.on_key(KeyCode::Down);
+        app.on_key(KeyCode::Enter);
+        assert_eq!(app.screen, target);
+        assert!(!draw_text(&app).contains("Choose section"));
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn interface_short_sidebar_keeps_current_section_visible_and_clickable() {
+        let _g = dead_socket();
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.caps.ir_pair = true;
+        app.fp.available = true;
+        app.advanced = true;
+        app.recompute_visible();
+        app.screen = SC_SETTINGS;
+        let area = Rect::new(0, 0, 100, 20);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let [_, _, body, _, _] = app.frame_rows(area);
+        let inner = Block::bordered().inner(app.body_split(body).0.unwrap());
+        let buffer = term.backend().buffer();
+        let row = (inner.y..inner.bottom())
+            .find(|y| {
+                (inner.x..inner.right())
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("Preferences")
+            })
+            .expect("current section must remain visible in a short sidebar");
+        app.on_click(inner.x + 3, row, area);
+        assert_eq!(
+            app.screen, SC_SETTINGS,
+            "click uses the rendered sidebar offset"
+        );
+    }
+
+    #[test]
+    fn interface_compact_footer_retains_navigation_focus_actions_and_help() {
+        let app = test_app();
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let [_, _, _, _, footer] = app.frame_rows(Rect::new(0, 0, 40, 16));
+        let inner = Block::bordered().inner(footer);
+        for key in [
+            KeyCode::F(3),
+            KeyCode::F(6),
+            KeyCode::F(2),
+            KeyCode::Char('?'),
+        ] {
+            assert!(
+                app.click_targets.borrow().iter().any(|(r, c)| {
+                    matches!(c, Click::Key(k) if *k == key)
+                        && r.width > 0
+                        && r.height > 0
+                        && r.intersection(inner) == *r
+                }),
+                "{key:?} must be visibly clickable in compact footer"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_first_run_compact_button_is_visible_and_clickable() {
+        let _g = dead_socket();
+        for (width, height) in [(40, 12), (80, 24)] {
+            let mut app = test_app();
+            app.caps.rgb = true;
+            app.daemon_up = true;
+            app.profiles_loaded = true;
+            let area = Rect::new(0, 0, width, height);
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            assert!(
+                rendered(&term).contains("Scan my face"),
+                "primary action must fit at {width}x{height}"
+            );
+            let [_, _, body, _, _] = app.frame_rows(area);
+            let button = app
+                .click_targets
+                .borrow()
+                .iter()
+                .find_map(|(rect, click)| {
+                    (matches!(click, Click::Key(KeyCode::Char('e')))
+                        && rect.height > 0
+                        && rect.width > 0
+                        && rect.intersection(body) == *rect)
+                        .then_some(*rect)
+                })
+                .expect("visible primary button needs a matching body hit region");
+            app.on_click(button.x, button.y, area);
+            assert!(matches!(app.input, Some((_, _, Pending::EnrollName))));
+            assert!(app.op.is_none() && app.suspend.is_none());
+            drain_loads(&mut app);
+        }
+    }
+
+    #[test]
+    fn interface_first_run_sensor_wording_and_guidance_are_readable_by_keyboard() {
+        for infrared in [false, true] {
+            let mut app = test_app();
+            app.caps.rgb = true;
+            app.caps.ir_pair = infrared;
+            app.profiles_loaded = true;
+            let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            app.on_key(KeyCode::F(6));
+            let mut seen = String::new();
+            for _ in 0..30 {
+                term.draw(|f| app.draw(f)).unwrap();
+                seen.push_str(&rendered(&term));
+                seen.push('\n');
+                app.on_key(KeyCode::PageDown);
+            }
+            assert!(!app.activity_open, "focused guidance owns reading keys");
+            assert!(seen.contains("RGB"), "identify the observed sensor type");
+            assert_eq!(
+                seen.contains("infrared camera"),
+                infrared,
+                "RGB-only enrollment must not claim an infrared camera"
+            );
+            assert!(
+                seen.contains("Follow the cues") && seen.contains("Finish login setup"),
+                "all setup guidance must be reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_section_picker_preserves_surviving_selection_when_hardware_changes() {
+        let _g = dead_socket();
+        for (selected, expected) in [
+            (SC_PAM, SC_PAM),
+            (SC_SETTINGS, SC_SETTINGS),
+            (SC_CAMERAS, SC_SETTINGS),
+        ] {
+            let mut app = test_app();
+            app.caps.rgb = true;
+            app.caps.ir_pair = true;
+            app.fp.available = true;
+            app.advanced = true;
+            app.recompute_visible();
+            app.on_key(KeyCode::F(3));
+            let index = app.visible.iter().position(|&s| s == selected).unwrap();
+            for _ in 0..index {
+                app.on_key(KeyCode::Down);
+            }
+            app.caps.rgb = false;
+            app.caps.ir_pair = false;
+            app.fp.available = false;
+            app.recompute_visible();
+            assert_eq!(
+                app.sections.and_then(|i| app.visible.get(i)).copied(),
+                Some(expected),
+                "a surviving selected screen keeps its identity after earlier rows disappear"
+            );
+            app.on_key(KeyCode::Enter);
+            assert_eq!(app.screen, expected);
+            drain_loads(&mut app);
+        }
+    }
+
+    #[test]
+    fn interface_first_run_focus_stays_on_the_visible_enrollment_action() {
+        let _g = dead_socket();
+        let mut app = test_app();
+        app.caps.rgb = true;
+        app.caps.ir_pair = true;
+        app.daemon_up = true;
+        app.profiles_loaded = true;
+        assert!(app.is_first_run());
+        let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        app.on_key(KeyCode::F(6));
+        // The unrestricted Overview list ends in a typed uninstall prompt;
+        // exercising that entry stays entirely in UI state even on RED.
+        for _ in 0..5 {
+            app.on_key(KeyCode::Down);
+        }
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(rendered(&term).contains("Scan my face"));
+        app.on_key(KeyCode::Char(' '));
+        assert!(
+            matches!(app.input, Some((_, _, Pending::EnrollName))),
+            "first-run focus must activate its visible enrollment button"
+        );
+        assert!(app.op.is_none() && app.suspend.is_none());
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn interface_compact_header_keeps_page_title_separate_from_account_and_exit() {
+        let mut app = test_app();
+        app.screen = SC_PAM;
+        app.user = "an-account-name-longer-than-the-page-title".into();
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text = rendered(&term);
+        let header = text.lines().next().unwrap();
+        assert!(
+            header.contains("Login & Apps"),
+            "page title must not be overwritten: {header}"
+        );
+        assert!(
+            header.contains("Exit (q)"),
+            "exit remains visible: {header}"
+        );
+    }
+
+    #[test]
+    fn interface_mouse_selection_does_not_activate_an_unrelated_focused_action() {
+        let mut app = live_test_app();
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.candidates[0].endpoint_paths =
+            vec!["/dev/example-rgb".into(), "/dev/example-ir".into()];
+        app.apply_live_snapshot(snapshot, app.now());
+        let now = app.now();
+        app.freshness
+            .observation_mut(Source::Cameras)
+            .record(true, now);
+        app.screen = SC_CAMERAS;
+        app.pairs = vec![irlume_common::CameraPairInfo {
+            rgb: "/dev/example-rgb".into(),
+            ir: "/dev/example-ir".into(),
+            id: Some("example".into()),
+            fixed: true,
+            privacy: false,
+        }];
+        app.on_key(KeyCode::F(6));
+        app.on_key(KeyCode::Down); // keyboard focus is on another control, not the selected camera row
+        let area = Rect::new(0, 0, 120, 40);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let row = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, click)| matches!(click, Click::Select(0)).then_some(*rect))
+            .unwrap();
+        app.on_click(row.x, row.y, area);
+        assert!(
+            matches!(&app.confirm, Some((_, _, ConfirmAct::Sus(Suspend::SetCameras(rgb, ir, _))))
+            if rgb == "/dev/example-rgb" && ir == "/dev/example-ir")
+        );
+        assert!(
+            app.suspend.is_none(),
+            "click retains the camera-switch confirmation"
+        );
+    }
+
+    #[test]
+    fn interface_focused_page_scroll_reaches_text_after_last_action() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        app.preferences = Some(preference_fixture(false));
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        app.on_key(KeyCode::F(6));
+        term.draw(|f| app.draw(f)).unwrap();
+        for _ in 0..100 {
+            app.on_key(KeyCode::PageDown);
+            term.draw(|f| app.draw(f)).unwrap();
+        }
+        assert!(
+            rendered(&term).contains("scan count."),
+            "all page text must be readable after the final action"
+        );
+        assert!(!app.activity_open && app.act_scroll == 0);
+        app.on_key(KeyCode::F(6));
+        app.on_key(KeyCode::PageUp);
+        assert!(
+            app.activity_open,
+            "without page focus PgUp retains Activity ownership"
+        );
+    }
+
+    #[test]
+    fn interface_long_token_dialog_scrolls_by_keyboard_without_confirming() {
+        let mut app = test_app();
+        app.confirm = Some((
+            format!("{}TAIL", "界".repeat(200)),
+            "Confirm",
+            ConfirmAct::Daemon(Request::Ping),
+        ));
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        for _ in 0..100 {
+            app.on_key(KeyCode::PageDown);
+            term.draw(|f| app.draw(f)).unwrap();
+        }
+        assert!(
+            rendered(&term).contains("TAIL"),
+            "all wrapped text must be reachable"
+        );
+        assert!(app.confirm.is_some() && app.op.is_none() && app.suspend.is_none());
+        assert_eq!(app.act_scroll, 0);
+        assert!(!app.activity_open);
     }
 
     fn preference_fixture(ir_only: bool) -> irlume_common::PreferencesState {
@@ -13982,6 +16541,7 @@ mod tests {
         let old = std::env::var_os("IRLUME_ENFORCE_BIOPOLICY");
         std::env::set_var("IRLUME_ENFORCE_BIOPOLICY", "yes");
         let mut app = test_app();
+        app.preferences = Some(irlume_common::PreferencesState::observe());
         app.screen = SC_SETTINGS;
         let text = draw_text(&app);
         match old {
@@ -13999,7 +16559,8 @@ mod tests {
         // Each setup hint has three honest states: not done (instruct), done
         // (describe), never observed (assert neither). The fixed per-screen
         // instruction told a fully configured box to redo every step.
-        let mut app = test_app();
+        let mut app = live_test_app();
+        app.repair.clear();
         app.daemon_up = true;
 
         // Overview: unknown until ListProfiles has answered.
@@ -14008,7 +16569,10 @@ mod tests {
         assert!(draw_text(&app).contains("Set up face unlock while keeping password access"));
         app.profiles = vec![profile("a", &["s1"])];
         let text = draw_text(&app);
-        assert!(text.contains("Face unlock is ready"));
+        assert!(text.contains("Checking login integration"));
+        app.probes_landed = true;
+        app.probes.login_wired = true;
+        assert!(draw_text(&app).contains("Face unlock is ready"));
         assert!(
             !text.contains("Keep nodding to approve"),
             "Overview must not carry the head-gesture line (default-off, \
@@ -14046,7 +16610,8 @@ mod tests {
         });
         assert!(draw_text(&app).contains("A recovery passphrase protects access"));
 
-        // Login wiring: unknown until the first probe sweep lands.
+        // Reset the earlier Overview observation: unknown until a sweep lands.
+        app.probes_landed = false;
         app.screen = SC_PAM;
         let text = draw_text(&app);
         assert!(text.contains("Checking login, lock-screen"), "{text}");
@@ -14078,7 +16643,8 @@ mod tests {
 
     #[test]
     fn done_offers_wire_login_only_when_wiring_is_observed_missing() {
-        let mut app = test_app();
+        let mut app = live_test_app();
+        app.repair.clear();
         app.screen = SC_DONE;
         app.daemon_up = true;
         app.profiles = vec![profile("a", &["s1"])];
@@ -14561,6 +17127,13 @@ mod tests {
                 format!("enforce_biopolicy={on}\n"),
             )
             .unwrap();
+            app.preferences = Some(irlume_common::PreferencesState::observe());
+            // Rendering consumes the observation, not subsequent local edits.
+            std::fs::write(
+                dir.join("settings.conf"),
+                "enforce_biopolicy=unobserved-change\n",
+            )
+            .unwrap();
             let text = draw_text(&app);
             assert!(
                 text.contains("turn it off"),
@@ -14571,6 +17144,13 @@ mod tests {
             std::fs::write(
                 dir.join("settings.conf"),
                 format!("enforce_biopolicy={off}\n"),
+            )
+            .unwrap();
+            app.preferences = Some(irlume_common::PreferencesState::observe());
+            // Rendering consumes the observation, not subsequent local edits.
+            std::fs::write(
+                dir.join("settings.conf"),
+                "enforce_biopolicy=unobserved-change\n",
             )
             .unwrap();
             let text = draw_text(&app);
@@ -14632,5 +17212,291 @@ mod tests {
             "nothing to reseal on an unarmed keyring: {}",
             app.help_body()
         );
+    }
+    #[test]
+    fn disconnected_status_workers_release_loading_state_and_explain_staleness() {
+        fn disconnected<T>() -> mpsc::Receiver<T> {
+            let (sender, receiver) = mpsc::channel();
+            drop(sender);
+            receiver
+        }
+        let mut app = test_app();
+        app.light_load = Some(disconnected());
+        app.probes_load = Some(disconnected());
+        app.profiles_load = Some(disconnected());
+        app.camera_load = Some(disconnected());
+        app.heavy_load = Some(disconnected());
+        app.keyring_load = Some(disconnected());
+        app.poll();
+        assert!(app.light_load.is_none(), "status refresh must be retryable");
+        assert!(app.probes_load.is_none(), "diagnostics must be retryable");
+        assert!(
+            app.profiles_load.is_none(),
+            "profile refresh must be retryable"
+        );
+        let messages = app
+            .activity
+            .iter()
+            .map(|(_, m)| m.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(messages.contains("status refresh ended"), "{messages}");
+        assert!(messages.contains("diagnostics refresh ended"), "{messages}");
+        assert!(messages.contains("profile refresh ended"), "{messages}");
+        assert!(messages.contains("camera refresh ended"), "{messages}");
+        assert!(messages.contains("app status refresh ended"), "{messages}");
+        assert!(messages.contains("wallet check ended"), "{messages}");
+        assert!(
+            app.camera_load.is_none() && app.heavy_load.is_none() && app.keyring_load.is_none()
+        );
+        assert!(
+            !app.profiles_loaded,
+            "worker loss is not an observed empty list"
+        );
+        assert!(
+            app.error.is_none(),
+            "background refresh failure should not steal focus"
+        );
+    }
+
+    #[test]
+    fn visual_review_short_layout_keeps_footer_and_recent_activity_readable() {
+        let mut app = visual_fixture(SC_SETTINGS);
+        let (_sender, op) = fake_op();
+        for busy in [false, true] {
+            if busy {
+                app.op = Some(Op {
+                    label: "synthetic busy".into(),
+                    tag: op.tag,
+                    rx: mpsc::channel().1,
+                });
+            }
+            let [_, _, body, activity, footer] = app.frame_rows(Rect::new(0, 0, 40, 12));
+            assert!(
+                body.height >= 4,
+                "the page needs space for content within its border"
+            );
+            assert_eq!(activity.height, 3, "recent Activity needs a readable row");
+            assert_eq!(footer.height, 3, "navigation/cancel needs a readable row");
+            let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let text = rendered(&terminal);
+            assert!(text.contains(if busy { "quit" } else { "F3" }), "{text}");
+        }
+    }
+
+    #[test]
+    fn visual_review_camera_paths_are_reported_without_local_presence_inference() {
+        let mut app = visual_fixture(SC_CAMERAS);
+        // Deliberately outside passive UVC coverage: local path visibility
+        // cannot turn a reported configuration into proof of physical absence.
+        let health = app.health.as_mut().unwrap();
+        health.rgb_dev = Some("/synthetic/rgb".into());
+        health.ir_dev = Some("/synthetic/ir".into());
+        let text = draw_text(&app);
+        assert!(text.contains("/synthetic/rgb + /synthetic/ir"), "{text}");
+        assert!(text.contains("configured"), "{text}");
+        assert!(
+            !text.contains("no camera hardware"),
+            "local path visibility is not hardware absence"
+        );
+    }
+
+    #[test]
+    fn visual_review_long_diagnostic_label_has_an_explicit_separator() {
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.repair = vec![Check {
+            label: "A long diagnostic label".into(),
+            sev: Sev::Ok,
+            detail: "fixture detail".into(),
+            fix: Fix::None,
+        }];
+        let text = draw_text(&app);
+        assert!(
+            text.contains("A long diagnostic label · fixture detail"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn compact_enrollment_prioritizes_current_guidance_countdown_and_stall() {
+        for (count, stalled, expected) in [
+            (None, None, "Move closer"),
+            (Some(2), None, "Hold still; capturing in 2"),
+            (
+                None,
+                Some("synthetic timeout"),
+                "Camera guide not answering",
+            ),
+        ] {
+            let mut app = test_app();
+            app.screen = SC_PROFILES;
+            let (_sender, mut enrollment) = fake_enroll(0, 4);
+            enrollment.last = Some(good_report("Move closer"));
+            enrollment.count = count;
+            enrollment.stalled = stalled.map(str::to_owned);
+            app.enroll = Some(enrollment);
+            let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let text = rendered(&terminal);
+            assert!(
+                text.contains(expected),
+                "current cue must be visible: {text}"
+            );
+            assert!(text.contains("cancel enrollment"), "{text}");
+            if stalled.is_some() {
+                assert!(!text.contains("Move closer") && !text.contains("Face detected"));
+            }
+        }
+    }
+
+    #[test]
+    fn operation_footer_click_quits_without_claiming_cancellation() {
+        let mut app = test_app();
+        let (_sender, op) = fake_op();
+        app.op = Some(op);
+        click_text(&mut app, "quit");
+        assert!(app.quit, "the visible quit control must accept clicks");
+        assert!(
+            app.op.is_some(),
+            "quitting cannot retract the daemon request"
+        );
+        assert!(!app.activity.iter().any(|(_, m)| m.contains("cancelled")));
+    }
+
+    #[test]
+    fn enrollment_footer_click_requests_cancel_and_keeps_the_interface_open() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (_sender, enroll) = fake_enroll(0, 4);
+        let stop = enroll.stop.clone();
+        app.enroll = Some(enroll);
+        click_text(&mut app, "cancel enrollment");
+        // If the click succeeds it starts a status refresh: finish that worker
+        // before assertions so failure cannot outlive the dead-socket guard.
+        drain_loads(&mut app);
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "the visible cancel control must accept clicks"
+        );
+        assert!(app.enroll.is_none());
+        assert!(!app.quit);
+        assert!(app
+            .activity
+            .iter()
+            .any(|(_, m)| m.contains("cancellation requested")));
+    }
+
+    #[test]
+    fn disconnected_operation_exits_busy_state_without_claiming_success() {
+        let mut app = test_app();
+        let (sender, op) = fake_op();
+        app.op = Some(op);
+        drop(sender);
+        app.poll();
+        assert!(
+            app.op.is_none(),
+            "a lost worker must not leave an endless spinner"
+        );
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|m| m.contains("outcome is unknown")));
+        assert!(!app.activity.iter().any(|(icon, _)| *icon == '✓'));
+        assert!(!app.quit, "the interface remains usable");
+    }
+
+    #[test]
+    fn disconnected_enrollment_reports_unknown_outcome_and_refreshes_saved_profiles() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (sender, enrollment) = fake_enroll(0, 4);
+        let stop = enrollment.stop.clone();
+        app.enroll = Some(enrollment);
+        sender.send(WMsg::Captured(1, 4)).unwrap();
+        drop(sender);
+        app.poll();
+        assert!(
+            app.enroll.is_none(),
+            "worker loss must not leave a stale framing guide"
+        );
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|m| m.contains("outcome is unknown")));
+        assert!(!app.activity.iter().any(|(_, m)| m == "enrollment complete"));
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn enrollment_done_before_channel_close_stays_successful() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        let (sender, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        sender.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        drop(sender);
+        app.poll();
+        assert!(app.enroll.is_none());
+        assert!(app.error.is_none());
+        assert!(app.activity.iter().any(|(_, m)| m == "enrollment complete"));
+        drain_loads(&mut app);
+    }
+
+    #[test]
+    fn unexpected_responses_do_not_copy_payloads_into_activity_messages() {
+        for mapper in [map_ok, map_confirm, map_sealed] {
+            let response = Response::Identified {
+                user: Some("private-account-sentinel".into()),
+                profile: Some("private-profile-sentinel".into()),
+                score: 0.8123,
+                live: true,
+                reason: "private-reason-sentinel".into(),
+            };
+            let (ok, message) = mapper(response);
+            assert!(!ok);
+            assert!(message.contains("unexpected"), "{message}");
+            assert!(
+                !message.contains("sentinel"),
+                "wrong response payload must not enter Activity"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_action_activity_explains_effect_without_copying_request_fields() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.start_async(
+            "(confirmed)",
+            OpTag::Generic,
+            Request::RecoveryForget {
+                user: "private-user-sentinel".into(),
+            },
+            map_confirm,
+        );
+        let message = app.activity.last().unwrap().1.clone();
+        // Drain workers even when the assertion is deliberately RED. Otherwise
+        // it can outlive DeadSocket and race the next test's fake endpoint.
+        wait_op_done(&mut app);
+        assert!(message.contains("recovery backup"), "{message}");
+        assert!(message.contains("template key"), "{message}");
+        assert!(!message.contains("private-user-sentinel"));
+    }
+
+    #[test]
+    fn overview_does_not_claim_ready_before_login_wiring_is_observed() {
+        let mut app = live_test_app();
+        app.repair.clear();
+        app.daemon_up = true;
+        app.caps.rgb = true;
+        app.profiles_loaded = true;
+        app.profiles = vec![profile("Sample", &["scan"])];
+        assert_eq!(app.login_wired_known(), None);
+        let text = draw_text(&app);
+        assert!(!text.contains("Face unlock is ready"), "{text}");
+        assert!(text.contains("Checking login integration"), "{text}");
     }
 }

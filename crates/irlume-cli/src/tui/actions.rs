@@ -125,7 +125,7 @@ pub(super) static ACTIONS: &[Action] = &[
     Action { label: "List profiles and recognizer tags", description: "Shows profiles and scans for the selected account, including recognizer ownership.", args: &["profiles", "list"], root: false, per_user: true, fields: &[] },
     Action { label: "List all camera devices", description: "Read-only camera census, including unsupported devices and classification evidence.", args: &["camera", "census"], root: false, per_user: false, fields: &[] },
     Action { label: "Show full capture qualification", description: "Shows the daemon's active schedule, qualification reason and exact camera context.", args: &["camera-mode"], root: false, per_user: false, fields: &[] },
-    Action { label: "Export camera diagnostics to terminal", description: "Shows the machine-readable delivered-rate and stream evidence; does not start a capture.", args: &["camera", "diagnostics", "--json"], root: false, per_user: false, fields: &[] },
+    Action { label: "Capture camera diagnostics to terminal", description: "Opens the camera and captures gated samples to measure delivered-rate and stream evidence, then displays the report as JSON.", args: &["camera", "diagnostics", "--json"], root: false, per_user: false, fields: &[] },
     Action { label: "Tune capture with a chosen round count", description: "Engages RGB and IR cameras and stores qualification for the exact device context. Requires administrator access.", args: &["camera-tune"], root: true, per_user: false, fields: &[Field { label: "Measurement rounds (blank uses the CLI default)", flag: Some("--rounds"), optional: true }] },
     Action { label: "Record a diagnostic trace", description: "Requires administrator access. Records sensitive diagnostic measurements for a bounded duration, with no frames, embeddings or credentials. Review before sharing.", args: &["trace", "record"], root: true, per_user: false, fields: &[Field { label: "Duration, e.g. 60s (blank uses 60s; maximum 5m)", flag: Some("--duration"), optional: true }, OUTPUT] },
     Action { label: "Explain a recorded trace", description: "Validates a trace file and displays its timeline. Sensitive diagnostic measurements may appear. No camera capture.", args: &["trace", "explain"], root: false, per_user: false, fields: &[Field { label: "Trace file (.jsonl)", flag: None, optional: false }, OUTPUT] },
@@ -216,6 +216,17 @@ pub(super) fn auth_test_feedback(
 mod auth_feedback_tests {
     use super::auth_test_feedback;
     use std::os::unix::process::ExitStatusExt;
+    #[test]
+    fn camera_diagnostics_action_discloses_capture_before_confirmation() {
+        let action = super::matching("camera diagnostics")
+            .into_iter()
+            .find(|action| action.args == ["camera", "diagnostics", "--json"])
+            .unwrap();
+        assert!(!action.description.contains("does not start a capture"));
+        assert!(action.description.contains("captures"));
+        assert!(action.description.contains("camera"));
+    }
+
     fn output(code: i32, value: serde_json::Value) -> std::io::Result<std::process::Output> {
         Ok(std::process::Output {
             status: std::process::ExitStatus::from_raw(code << 8),

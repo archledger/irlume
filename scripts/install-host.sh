@@ -59,6 +59,14 @@ install -Dm0644 "$REPO/packaging/polkit/org.irlume.recovery-manage.policy" \
   /usr/share/polkit-1/actions/org.irlume.recovery-manage.policy
 printf "%s\n" "Enrollment and recovery management require polkit and a desktop or registered terminal authentication agent."
 install -m 0755 "$REPO/target/release/irlumed" "$REPO/target/release/irlume" /usr/local/bin/
+install -Dm0644 "$REPO/packaging/desktop/io.github.archledger.Irlume.desktop" /usr/local/share/applications/io.github.archledger.Irlume.desktop
+install -Dm0644 "$REPO/packaging/desktop/io.github.archledger.Irlume.svg" /usr/local/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
+# Bind this local menu entry to the binary placed above, even when another
+# package is installed. The desktop supplies the terminal and user identity.
+sed -i \
+    -e 's|^Exec=irlume tui$|Exec=/usr/local/bin/irlume tui|' \
+    -e 's|^TryExec=irlume$|TryExec=/usr/local/bin/irlume|' \
+    /usr/local/share/applications/io.github.archledger.Irlume.desktop
 
 install -Dm0755 "$REPO/target/release/irlume-password-verify" /usr/libexec/irlume-password-verify
 # Preserve administrator-owned recovery policy on subsequent development installs.

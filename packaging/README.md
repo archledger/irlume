@@ -10,6 +10,8 @@ own recipe. Everything the daemon does at *runtime* stays capability-detected.
 | Artifact | Path |
 |---|---|
 | `irlumed`, `irlume` | `/usr/bin/` |
+| application menu entry | `/usr/share/applications/io.github.archledger.Irlume.desktop` |
+| application icon | `/usr/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg` |
 | `pam_irlume.so` | Fedora `/usr/lib64/security/` · Debian `/usr/lib/x86_64-linux-gnu/security/` · Arch `/usr/lib/security/` |
 | models (bundled) | `/usr/share/irlume/models/*.onnx` |
 | systemd units | `/usr/lib/systemd/system/irlumed.service` + `irlume-reconcile.path`/`.service` (self-heal watcher; all families incl. PPA enable the `.path`) |
@@ -35,6 +37,27 @@ the PAM service. Before a release, follow the [candidate upgrade and rollback
 checklist](../docs/RELEASING.md); recipe parity alone does not validate installation.
 
 ## Per-family
+
+The application-menu entry uses `Terminal=true` and directly runs `irlume tui`
+as the desktop user. Terminal selection belongs to the desktop; no specific
+emulator or universal terminal preference is assumed. It adds no sudo prompt
+or camera action at launch. A working terminal emulator remains necessary;
+`irlume tui` in an existing terminal is the fallback.
+
+All four FHS package recipes own the entry and SVG icon, so package removal
+removes them. Nix installs both under `$out/share` and binds Exec/TryExec to
+`$out/bin/irlume`; removing the package from the active profile/system removes
+its menu integration. The source host installer uses `/usr/local/share` and
+`/usr/local/bin/irlume`; source uninstall removes only its two desktop assets,
+leaving package-owned entries and user overrides alone. A source launcher has
+the same desktop ID as the packaged one and takes precedence while installed.
+
+`scripts/check-packaging-parity.sh` requires Python 3 and `desktop-file-validate`
+(desktop-file-utils). It runs `scripts/test-desktop-integration.py`, which
+validates the shared entry, checks package ownership and destinations, stages
+the actual install commands in temporary directories, and checks prefix
+bindings. Fedora and Nix also validate their installed entry during the build.
+These checks do not launch the TUI or prove desktop-session compatibility.
 
 - **Fedora** (`fedora/irlume.spec` + `../.packit.yaml`): Packit builds in Copr
   from signed GitHub tags. Bundles onnxruntime 1.28.1 (Source1 →

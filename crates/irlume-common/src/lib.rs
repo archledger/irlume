@@ -16,6 +16,8 @@ pub mod config;
 pub mod dbglog;
 pub mod diagnostics;
 pub mod gkr_wire;
+pub mod live;
+pub mod live_camera;
 pub mod memlock;
 pub mod pam_service;
 pub mod platform;
@@ -573,6 +575,12 @@ pub enum Request {
     /// under /etc/irlume, which is not an arbitrary peer's to change. (This said
     /// "root or self", which never matched the dispatch gate.)
     SetCameras { rgb: String, ir: String },
+    /// Apply a camera choice only while its observed device generation exists.
+    SetCamerasIfCurrent {
+        rgb: String,
+        ir: String,
+        expected: live_camera::CameraSelection,
+    },
     /// Add scans to an existing profile ("improve recognition"). PRIVILEGED.
     /// Add scans to an existing profile, in the recognizer space the daemon
     /// has loaded. Also how a profile gains a second recognizer's templates
@@ -689,6 +697,8 @@ pub enum Request {
     CameraDiagnostics,
     /// Read the daemon's bounded, structurally share-safe diagnostic snapshot.
     SupportSnapshot { since_ms: u64 },
+    /// Copy current daemon worker metadata and passive camera inventory.
+    LiveStatus,
     /// Explicit root-only bounded camera probe for a support report.
     SupportProbe { since_ms: u64 },
     /// Root-only subscription to one bounded daemon-authored diagnostic trace.
@@ -1178,6 +1188,7 @@ pub enum Response {
     },
     /// Structurally share-safe daemon facts and recent typed events.
     SupportSnapshot(Box<diagnostics::SupportSnapshot>),
+    LiveStatus(Box<live::LiveStatusSnapshot>),
     /// Explicit support probe result with its contemporaneous safe snapshot.
     SupportProbe(Box<diagnostics::SupportProbeResult>),
     /// Trace subscription accepted with daemon-applied bounds. Subsequent
@@ -2755,3 +2766,19 @@ pub const KWALLET_INIT_PATH: &str = "/usr/libexec/irlume/irlume-kwallet-init";
 /// [`KWALLET_INIT_PATH`]: takes a secret on stdin, only meaningful inside a PAM
 /// transaction, overridable via `IRLUME_GKR_UNLOCK` for tests.
 pub const GKR_UNLOCK_PATH: &str = "/usr/libexec/irlume/irlume-gkr-unlock";
+
+#[cfg(test)]
+mod live_status_request_tests {
+    #[test]
+    fn live_status_request_is_a_payload_free_read() {
+        let request = serde_json::from_str::<super::Request>(r#""LiveStatus""#);
+        assert!(
+            request.is_ok(),
+            "LiveStatus must be an additive payload-free request"
+        );
+        assert_eq!(
+            serde_json::to_value(request.unwrap()).unwrap(),
+            "LiveStatus"
+        );
+    }
+}

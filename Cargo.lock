@@ -1114,6 +1114,9 @@ dependencies = [
 [[package]]
 name = "irlume-fingerprint"
 version = "0.12.0"
+dependencies = [
+ "irlume-common",
+]
 
 [[package]]
 name = "irlume-gkr-unlock"

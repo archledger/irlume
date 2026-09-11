@@ -19,6 +19,7 @@ pub mod gkr_wire;
 pub mod memlock;
 pub mod pam_service;
 pub mod platform;
+pub mod process;
 pub mod secureboot;
 
 use serde::{Deserialize, Serialize};

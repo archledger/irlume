@@ -168,6 +168,35 @@ pub fn available() -> bool {
     fprintd_present() && reader_present()
 }
 
+/// Observe tooling and reader availability within a shared deadline.
+///
+/// `None` means the reader could not be observed (timeout, execution failure,
+/// invalid output or D-Bus error); it must not be treated as confirmed absence.
+pub fn available_until(deadline: std::time::Instant) -> Option<bool> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
+    if !fprintd_present() {
+        return Some(false);
+    }
+    let Some(busctl) = busctl() else {
+        return Some(false);
+    };
+    let output = irlume_common::process::output_until(
+        helper(busctl).args(["--system", "tree", FPRINT_BUS]),
+        deadline,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    Some(
+        text.lines()
+            .any(|line| line.contains("/net/reactivated/Fprint/Device/")),
+    )
+}
+
 /// What `fprintd-list` actually said, beyond "a list of fingers". `fprintd-list`
 /// exits 0 even with no reader ("No devices available"), and a claim or polkit
 /// failure otherwise reads as "no fingers enrolled", and the wrong advice follows.
@@ -858,6 +887,27 @@ mod tests {
         ft.script("fprintd-delete", "echo 'Not Authorized' >&2\nexit 1");
         let err = delete_all("tester").unwrap_err();
         assert!(err.contains("polkit"), "{err}");
+    }
+
+    #[test]
+    fn bounded_availability_distinguishes_failure_from_absence() {
+        let ft = FakeTools::new("bounded-availability");
+        ft.script("fprintd-list", "exit 0");
+        ft.script("fprintd-verify", "exit 0");
+        ft.script("busctl", "exec sleep 20");
+        let start = std::time::Instant::now();
+        assert_eq!(available_until(start + Duration::from_millis(100)), None);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        ft.script("busctl", "echo '/net/reactivated/Fprint/Device/0'");
+        assert_eq!(
+            available_until(std::time::Instant::now() + Duration::from_secs(1)),
+            Some(true)
+        );
+        ft.script("busctl", "exit 0");
+        assert_eq!(
+            available_until(std::time::Instant::now() + Duration::from_secs(1)),
+            Some(false)
+        );
     }
 
     #[test]

@@ -38,6 +38,10 @@ override_dh_installsystemd:
 	dh_installsystemd irlume-reconcile.path irlume-reconcile.service irlume-reconcile.timer
 
 override_dh_auto_install:
+	install -D -m0644 packaging/desktop/io.github.archledger.Irlume.desktop \
+		debian/irlume/usr/share/applications/io.github.archledger.Irlume.desktop
+	install -D -m0644 packaging/desktop/io.github.archledger.Irlume.svg \
+		debian/irlume/usr/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
 	install -D -m0644 packaging/polkit/org.irlume.enroll.policy \
 		debian/irlume/usr/share/polkit-1/actions/org.irlume.enroll.policy
 	install -D -m0644 packaging/polkit/org.irlume.recovery-manage.policy \

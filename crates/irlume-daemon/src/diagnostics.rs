@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 pub(crate) trait Clock: Send + Sync {
@@ -46,6 +46,7 @@ struct Shared {
     entropy: Mutex<Option<std::fs::File>>,
     fallback_sequence: AtomicU64,
     trace: Mutex<Option<Weak<TraceSubscriber>>>,
+    live: OnceLock<crate::live::LiveState>,
 }
 
 const TRACE_CHANNEL_CAPACITY: usize = 1_024;
@@ -105,7 +106,7 @@ impl DiagnosticState {
     where
         C: Clock + 'static,
     {
-        Self {
+        let state = Self {
             shared: Arc::new(Shared {
                 clock,
                 inner: Mutex::new(Inner {
@@ -115,8 +116,27 @@ impl DiagnosticState {
                 entropy: Mutex::new(std::fs::File::open("/dev/urandom").ok()),
                 fallback_sequence: AtomicU64::new(0),
                 trace: Mutex::new(None),
+                live: OnceLock::new(),
             }),
-        }
+        };
+        let _ = state.shared.live.set(crate::live::LiveState::new(
+            state.next_operation_id(),
+            Arc::clone(&state.shared.clock),
+        ));
+        state
+    }
+
+    pub(crate) fn live(&self) -> &crate::live::LiveState {
+        // Initialized before DiagnosticState can escape its only constructor.
+        self.shared.live.get().expect("live state initialized")
+    }
+
+    /// Track the known automatic camera task without inventing request/history
+    /// records. The guard owns only copied observation metadata.
+    pub(crate) fn begin_background_qualification(&self) -> crate::live::LiveGuard {
+        let guard = self.live().register_background(self.next_operation_id());
+        guard.running();
+        guard
     }
 
     pub(crate) fn begin(&self, operation: OperationClass) -> OperationScope {
@@ -530,7 +550,6 @@ pub(crate) struct OperationScope {
 }
 
 impl OperationScope {
-    #[cfg(test)]
     pub(crate) const fn operation_id(&self) -> OperationId {
         self.operation_id
     }

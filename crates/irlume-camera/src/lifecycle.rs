@@ -7,6 +7,7 @@
 //! comes from a complete sysfs/media snapshot taken after the monitor is already
 //! listening. Neither enumeration nor monitoring opens a video node.
 
+use irlume_common::live_camera::CameraInventoryReason;
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +28,8 @@ const MAX_COALESCE_POLLS: usize = 16;
 const MAX_EVENTS_PER_POLL: usize = 4096;
 const COALESCE_QUIET: Duration = Duration::from_millis(50);
 const MONITOR_WAIT: Duration = Duration::from_secs(60 * 60);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceEventKind {
@@ -138,6 +141,12 @@ trait SnapshotSource {
 trait InventorySink {
     fn invalidate_all(&self) -> Result<(), CameraInventoryError>;
 
+    fn mark_unavailable(&self, reason: CameraInventoryReason) -> Result<(), CameraInventoryError>;
+
+    /// Retire lost continuity and publish failure under one inventory lock.
+    fn retire_unavailable(&self, reason: CameraInventoryReason)
+        -> Result<(), CameraInventoryError>;
+
     fn invalidate_topologies(
         &self,
         topologies: &BTreeSet<String>,
@@ -146,11 +155,6 @@ trait InventorySink {
     fn retire_topologies(
         &self,
         topologies: &BTreeSet<String>,
-    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError>;
-
-    fn reconcile(
-        &self,
-        observations: Vec<CameraObservation>,
     ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError>;
 
     fn reconcile_guarded<F>(
@@ -167,6 +171,17 @@ impl InventorySink for CameraSupervisor {
         self.invalidate_inventory()
     }
 
+    fn mark_unavailable(&self, reason: CameraInventoryReason) -> Result<(), CameraInventoryError> {
+        self.mark_inventory_unavailable(reason)
+    }
+
+    fn retire_unavailable(
+        &self,
+        reason: CameraInventoryReason,
+    ) -> Result<(), CameraInventoryError> {
+        self.retire_inventory_unavailable(reason)
+    }
+
     fn invalidate_topologies(
         &self,
         topologies: &BTreeSet<String>,
@@ -179,13 +194,6 @@ impl InventorySink for CameraSupervisor {
         topologies: &BTreeSet<String>,
     ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
         self.retire_inventory_topologies(topologies)
-    }
-
-    fn reconcile(
-        &self,
-        observations: Vec<CameraObservation>,
-    ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
-        self.reconcile_inventory(observations)
     }
 
     fn reconcile_guarded<F>(
@@ -214,6 +222,9 @@ impl<S: SnapshotSource, E: DeviceEventSource> LifecycleCoordinator<S, E> {
         &mut self,
         inventory: &impl InventorySink,
     ) -> Result<Vec<CameraInventoryEvent>, LifecycleError> {
+        inventory
+            .invalidate_all()
+            .map_err(LifecycleError::Inventory)?;
         self.publish_quiet_snapshot(inventory, Vec::new())
     }
 
@@ -335,7 +346,14 @@ impl<S: SnapshotSource, E: DeviceEventSource> LifecycleCoordinator<S, E> {
 }
 
 fn fail_closed(inventory: &impl InventorySink, error: LifecycleError) -> LifecycleError {
-    match inventory.reconcile(Vec::new()) {
+    let reason = match error {
+        LifecycleError::Monitor(_) => CameraInventoryReason::Monitor,
+        LifecycleError::Snapshot(_)
+        | LifecycleError::UnstableSnapshot
+        | LifecycleError::EventStorm => CameraInventoryReason::Snapshot,
+        LifecycleError::Inventory(_) => CameraInventoryReason::Inventory,
+    };
+    match inventory.retire_unavailable(reason) {
         Ok(_) => error,
         Err(inventory_error) => LifecycleError::Inventory(inventory_error),
     }
@@ -681,7 +699,9 @@ impl<'a, I: InventorySink> WorkerExitGuard<'a, I> {
 
 impl<I: InventorySink> Drop for WorkerExitGuard<'_, I> {
     fn drop(&mut self) {
-        let _ = self.0.invalidate_all();
+        let _ = self
+            .0
+            .mark_unavailable(CameraInventoryReason::WorkerStopped);
     }
 }
 
@@ -689,40 +709,93 @@ impl<I: InventorySink> Drop for WorkerExitGuard<'_, I> {
 /// owns the monitor socket for the supervisor lifetime; dropping the process is
 /// the only normal shutdown path for this process-scoped inventory.
 pub(crate) fn spawn(supervisor: Weak<CameraSupervisor>) -> Result<(), LifecycleError> {
-    let mut coordinator =
-        bind_monitor_before_snapshot(UdevEventSource::new, SysfsSnapshotSource::default)?;
     let Some(supervisor) = supervisor.upgrade() else {
         return Ok(());
     };
-    coordinator.initialize(supervisor.as_ref())?;
+    let mut coordinator = match start_coordinator(
+        supervisor.as_ref(),
+        UdevEventSource::new,
+        SysfsSnapshotSource::default,
+    ) {
+        Ok(coordinator) => Some(coordinator),
+        Err(error) => {
+            eprintln!("irlume: camera lifecycle initialization deferred: {error}");
+            None
+        }
+    };
     let worker_supervisor = supervisor.clone();
     let spawned = std::thread::Builder::new()
         .name("irlume-camera-udev".into())
         .spawn(move || {
             let _exit_guard = WorkerExitGuard::new(worker_supervisor.as_ref());
+            let mut delay = INITIAL_RETRY_DELAY;
+            let mut recovering = coordinator.is_none();
             loop {
-                if let Err(error) =
-                    coordinator.process_next(worker_supervisor.as_ref(), MONITOR_WAIT)
-                {
-                    if worker_retries_after(&error) {
-                        eprintln!(
-                            "irlume: camera lifecycle rescan deferred after a bounded event burst: \
-                             {error}"
-                        );
+                if recovering {
+                    // One bounded attempt per backoff; no RPC starts or drains
+                    // this work. Healthy, quiet monitoring never polls video nodes.
+                    std::thread::sleep(delay);
+                    delay = next_retry_delay(delay);
+                    let attempt = if let Some(current) = coordinator.as_mut() {
+                        current.initialize(worker_supervisor.as_ref()).map(|_| ())
+                    } else {
+                        start_coordinator(
+                            worker_supervisor.as_ref(),
+                            UdevEventSource::new,
+                            SysfsSnapshotSource::default,
+                        )
+                        .map(|new| coordinator = Some(new))
+                    };
+                    if let Err(error) = attempt {
+                        if !worker_retries_after(&error) {
+                            coordinator = None;
+                        }
                         continue;
                     }
-                    eprintln!("irlume: camera lifecycle monitor stopped: {error}");
+                    recovering = false;
+                    delay = INITIAL_RETRY_DELAY;
+                }
+                let Some(current) = coordinator.as_mut() else {
                     return;
+                };
+                if let Err(error) = current.process_next(worker_supervisor.as_ref(), MONITOR_WAIT) {
+                    eprintln!(
+                        "irlume: camera lifecycle observation unavailable, retrying: {error}"
+                    );
+                    if matches!(
+                        error,
+                        LifecycleError::Inventory(CameraInventoryError::Poisoned)
+                    ) {
+                        return;
+                    }
+                    if !worker_retries_after(&error) {
+                        coordinator = None;
+                    }
+                    recovering = true;
                 }
             }
         });
     finish_spawn(supervisor.as_ref(), spawned)
 }
 
+fn next_retry_delay(previous: Duration) -> Duration {
+    previous.saturating_mul(2).min(MAX_RETRY_DELAY)
+}
+
+fn start_coordinator<S: SnapshotSource, E: DeviceEventSource>(
+    inventory: &impl InventorySink,
+    bind: impl FnOnce() -> Result<E, LifecycleError>,
+    snapshots: impl FnOnce() -> S,
+) -> Result<LifecycleCoordinator<S, E>, LifecycleError> {
+    let mut coordinator = bind_monitor_before_snapshot(bind, snapshots)
+        .map_err(|error| fail_closed(inventory, error))?;
+    coordinator.initialize(inventory)?;
+    Ok(coordinator)
+}
+
 /// A quiet-snapshot bound is a fail-closed publication result, not loss of the
-/// monitor itself. Keep the inventory invalidated and retain the udev socket so
-/// a later remove/add event can rebuild it. Socket and inventory failures do
-/// not have that guarantee and still terminate the worker.
+/// monitor itself. Keep its socket for a delayed retry even without a new event.
+/// Other failures require binding a new socket before a fresh census.
 fn worker_retries_after(error: &LifecycleError) -> bool {
     matches!(
         error,
@@ -738,7 +811,7 @@ fn finish_spawn<I: InventorySink>(
         Ok(_) => Ok(()),
         Err(error) => {
             inventory
-                .invalidate_all()
+                .mark_unavailable(CameraInventoryReason::WorkerStopped)
                 .map_err(LifecycleError::Inventory)?;
             Err(LifecycleError::Monitor(error.to_string()))
         }
@@ -764,11 +837,35 @@ mod tests {
         ) -> Result<(), CameraInventoryError> {
             self.0.lock().unwrap().validate(descriptor)
         }
+
+        fn reconcile(
+            &self,
+            observations: Vec<CameraObservation>,
+        ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
+            self.0.lock().unwrap().reconcile(observations)
+        }
     }
 
     impl InventorySink for TestInventory {
         fn invalidate_all(&self) -> Result<(), CameraInventoryError> {
             self.0.lock().unwrap().invalidate_all();
+            Ok(())
+        }
+
+        fn mark_unavailable(
+            &self,
+            reason: CameraInventoryReason,
+        ) -> Result<(), CameraInventoryError> {
+            self.0.lock().unwrap().mark_unavailable(reason);
+            Ok(())
+        }
+
+        fn retire_unavailable(
+            &self,
+            reason: CameraInventoryReason,
+        ) -> Result<(), CameraInventoryError> {
+            let mut inventory = self.0.lock().unwrap();
+            inventory.retire_unavailable(reason);
             Ok(())
         }
 
@@ -785,13 +882,6 @@ mod tests {
             topologies: &BTreeSet<String>,
         ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
             Ok(self.0.lock().unwrap().retire_topologies(topologies))
-        }
-
-        fn reconcile(
-            &self,
-            observations: Vec<CameraObservation>,
-        ) -> Result<Vec<CameraInventoryEvent>, CameraInventoryError> {
-            self.0.lock().unwrap().reconcile(observations)
         }
 
         fn reconcile_guarded<F>(
@@ -836,6 +926,90 @@ mod tests {
             CameraCapabilities::new(vec![StreamRole::Rgb], Default::default(), Vec::new()).unwrap(),
             vec![evidence.into()],
         )
+    }
+
+    #[test]
+    fn live_inventory_rebind_recovers_without_another_hotplug_event_and_retires_old_identity() {
+        use irlume_common::live_camera::CameraInventoryState;
+        let inventory = TestInventory::new();
+        let camera = CameraObservation::with_lifecycle_evidence_and_endpoints(
+            BackendKind::UvcV4l2,
+            PhysicalCameraId::new("/devices/test/camera", None).unwrap(),
+            CameraCapabilities::default(),
+            vec!["fixture".into()],
+            vec!["/dev/video0".into()],
+        );
+        let mut initial = start_coordinator(
+            &inventory,
+            || {
+                Ok(FakeEvents(VecDeque::from([
+                    Ok(vec![]),
+                    Ok(vec![]),
+                    Err(LifecycleError::Monitor("lost".into())),
+                ])))
+            },
+            || FakeSnapshots(VecDeque::from([Ok(vec![camera.clone()])])),
+        )
+        .unwrap();
+        let before = inventory.0.lock().unwrap().snapshot();
+        assert!(initial.process_next(&inventory, Duration::ZERO).is_err());
+        let failed = inventory.0.lock().unwrap().snapshot();
+        assert_eq!(failed.state, CameraInventoryState::Unavailable);
+        assert!(failed.candidates.is_empty());
+        let _rebound = start_coordinator(
+            &inventory,
+            || Ok(FakeEvents(VecDeque::from([Ok(vec![]), Ok(vec![])]))),
+            || FakeSnapshots(VecDeque::from([Ok(vec![camera])])),
+        )
+        .unwrap();
+        let after = inventory.0.lock().unwrap().snapshot();
+        assert_eq!(after.state, CameraInventoryState::Current);
+        assert_eq!(after.supervisor_id, before.supervisor_id);
+        assert!(after.revision > failed.revision);
+        assert_ne!(
+            after.candidates[0].instance_id,
+            before.candidates[0].instance_id
+        );
+    }
+
+    #[test]
+    fn live_inventory_failed_initial_bind_can_recover_to_authoritative_empty() {
+        use irlume_common::live_camera::CameraInventoryState;
+        let inventory = TestInventory::new();
+        let failed = start_coordinator(
+            &inventory,
+            || Err::<FakeEvents, _>(LifecycleError::Monitor("synthetic bind error".into())),
+            || panic!("a failed bind must not construct or scan sysfs"),
+        );
+        // Specify the snapshot source without executing a real constructor.
+        let _: Result<LifecycleCoordinator<FakeSnapshots, FakeEvents>, _> = failed;
+        let unavailable = inventory.0.lock().unwrap().snapshot();
+        assert_eq!(unavailable.state, CameraInventoryState::Unavailable);
+        assert_eq!(unavailable.reason, Some(CameraInventoryReason::Monitor));
+        assert!(unavailable.observed_ago_ms.is_none());
+        let _recovered = start_coordinator(
+            &inventory,
+            || Ok(FakeEvents(VecDeque::from([Ok(vec![]), Ok(vec![])]))),
+            || FakeSnapshots(VecDeque::from([Ok(vec![])])),
+        )
+        .unwrap();
+        let current = inventory.0.lock().unwrap().snapshot();
+        assert_eq!(current.state, CameraInventoryState::Current);
+        assert!(current.candidates.is_empty());
+        assert!(current.observed_ago_ms.is_some());
+    }
+
+    #[test]
+    fn live_inventory_retry_delay_is_positive_exponential_and_capped() {
+        let mut delay = INITIAL_RETRY_DELAY;
+        assert_eq!(delay, Duration::from_secs(1));
+        let mut observed = Vec::new();
+        for _ in 0..10 {
+            observed.push(delay.as_secs());
+            delay = next_retry_delay(delay);
+        }
+        assert_eq!(observed, [1, 2, 4, 8, 16, 30, 30, 30, 30, 30]);
+        assert_eq!(next_retry_delay(Duration::MAX), MAX_RETRY_DELAY);
     }
 
     fn hint(kind: DeviceEventKind) -> DeviceEventHint {

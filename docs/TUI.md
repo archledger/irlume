@@ -1,11 +1,25 @@
 # TUI and CLI workflows
 
-Run `irlume tui` as your account. `--user ACCOUNT` selects the same account as
+Open **Irlume** from your desktop's application menu, or run `irlume tui` as your
+account. The menu entry asks your desktop to open its terminal application;
+it does not run the whole interface as root. A terminal-capable desktop launcher
+and an installed terminal are required. `--user ACCOUNT` selects the same account as
 the CLI; managing another account still requires the existing administrator
 permissions. Read the account name in the header before making changes.
 
-Tab and arrow keys navigate, Enter activates the selected item, and `?` shows
-this screen's shortcuts. `v` reveals technical sections. **F2 opens More actions**
+The minimum window size is **80 columns × 24 rows**. Below either dimension,
+only a resize message is shown with the current and required size. Enlarge the
+terminal to restore the current page or dialog; hidden controls cannot activate.
+Live observations continue refreshing. Esc can request cancellation of an active
+enrollment, and `q` exits (a general daemon task can keep running).
+
+Tab/Shift-Tab and Left/Right switch sections. **F3 opens Sections**, including
+on a supported narrow terminal where the sidebar is hidden. **F6 switches page/action
+focus**: use Up/Down to select a control and Enter or Space to activate it. The
+focused action scrolls into view and uses the same confirmation as its mouse
+button or shortcut. PageUp/PageDown reads the page while actions have focus;
+otherwise it scrolls Activity. `?` shows this screen's shortcuts. `v` reveals technical
+sections. **F2 opens More actions**
 from any idle screen. Type a task or CLI command to filter the list, use Up/Down
 to select, and Enter to open it. Esc closes the list or cancels a field.
 
@@ -24,6 +38,7 @@ Diagnostics or More actions). Over Activity it scrolls the activity history.
 The wheel also scrolls longer information/action panels, including Wallet,
 Recovery and Login. Long dialogs scroll within their own body while the buttons
 remain visible.
+Use Up/Down to scroll long non-text dialogs without activating their buttons.
 Press `M` to release mouse capture for the terminal's text selection and copy
 controls; press it again to resume mouse navigation.
 
@@ -38,6 +53,75 @@ menu are never shell commands. Paths beginning with `-` can use a `./` prefix.
 If a command fails or is interrupted, some changes may already have been
 applied. Review its terminal output and the refreshed status before retrying.
 An unsuccessful daemon-start command does not automatically resume enrollment.
+
+## Activity and device transparency
+
+**A** expands or collapses recent Activity. **Shift+L** opens full-height
+**Session history**; you can also click its History control. This view shows
+elapsed session timestamps, text status labels, and the retained message details.
+Use Up/Down, the wheel, PageUp/PageDown, Home and End to read history. End follows
+new messages; Esc or Shift+L closes history without running a page action.
+
+The compact strip shows one summary per message so a long older explanation
+cannot hide the newest result. Open history to read wrapped details. While you
+read older entries, arriving messages do not pull you to the bottom. History is
+bounded to 200 messages and 32 KiB of text; individual messages are bounded to
+4096 bytes. Omission/truncation is displayed, and history is kept only in this
+process's memory.
+
+Session history describes this TUI's actions and observations. Live daemon
+status separately shows the current worker operation, queued work, and automatic
+background camera qualification, including requests from another Irlume client.
+Press **F4** to open **Current observations**, with operation details and the age
+of each source. It continues refreshing while dialogs or
+an enrollment are open. The observer reads copied metadata; it does not capture
+frames or inspect the TPM. These observations are not a complete operating-system
+audit or proof of camera/IR-emitter shutdown. Explicit setup and test actions
+can use the camera or TPM and change configuration. F2 provides
+existing system/login history, diagnostics and explicit trace tools when more
+detail is needed; camera diagnostics explicitly discloses that it captures.
+
+Status fields carry observation freshness. A failed or expired check becomes
+unavailable; it does not mean OFF, an empty profile list, or an idle daemon.
+Each source is checked separately, so a successful camera refresh cannot make
+an older wallet result current. Live status is polled about once a second; other
+sources refresh at bounded intervals and after relevant changes. This is observed
+state, so a change can take time to reach the display. One-shot recognition and qualification results
+remain past observations until you explicitly run another test. An older daemon
+without live-status support is shown as unavailable for that source.
+
+The Cameras page automatically follows connected devices. New UVC candidates
+appear from the daemon's passive connection monitor, and disconnected choices
+are removed. When the page is open and idle, a changed inventory triggers a
+camera-role inspection; that inspection can open device nodes to identify RGB
+and infrared endpoints. It does not repeatedly run capture qualification.
+Inspection failure is shown separately from an empty device list. Selection
+follows device identity, and a connection change invalidates an open camera
+switch confirmation rather than silently choosing a replacement.
+
+During enrollment, click **Cancel enrollment** or press Esc to request cancellation.
+For a general daemon task, the **quit** control exits the TUI and explicitly says
+the task keeps running. Other page controls stay inactive during these operations.
+
+An action's start describes a request, not confirmed success. Cancellation is
+reported as requested until an outcome is known. A worker that ends without a
+result no longer leaves the interface permanently busy: Activity explains the
+unknown outcome or stale observation. Refresh status before retrying a mutation.
+
+## Appearance and accessibility
+
+Sections use blank rows and clear headings to separate related settings. Labels,
+values and controls have visible spacing; long explanations wrap inside scrollable
+panels. Supported narrow layouts (at least 80×24) keep navigation and dialog controls accessible.
+
+State badges combine text and symbols: green **ON**, neutral **OFF**, and amber
+**UNKNOWN**. Red is reserved for errors and adverse states; switching an optional
+setting off is not inherently an error. Selection and keyboard focus remain
+visible independently of color. The palette follows the terminal's colors
+without assuming that truecolor means a dark background.
+
+Set `NO_COLOR=1` to disable color, or `IRLUME_REDUCE_MOTION=1` to use static
+activity marks. Keyboard shortcuts remain available with mouse capture released.
 
 ## Preferences
 

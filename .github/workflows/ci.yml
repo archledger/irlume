@@ -489,7 +489,10 @@ jobs:
       # existed to resync drifted version fields, and the 0.7.0 audit found the
       # PPA lane missing the reconcile timer entirely.
       - name: packaging parity (units in every lane, versions agree)
-        run: ./scripts/check-packaging-parity.sh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+          ./scripts/check-packaging-parity.sh
 
       # Nothing validated the AppArmor profiles until 0.9.0, and they are the
       # only confinement on the Debian/Ubuntu lane. A profile that fails to

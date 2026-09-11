@@ -100,6 +100,7 @@ pub fn classify(req: &Request) -> Class {
         | RetryReset { .. } // connection-only operation; never a camera job
         | ListProfiles { .. }
         | SupportSnapshot { .. }
+        | LiveStatus
         // Served directly by its connection thread before this classification
         // is consulted; Status documents that it never belongs to the camera
         // worker if a caller reaches this seam independently.
@@ -133,6 +134,7 @@ pub fn classify(req: &Request) -> Class {
         // identity plus a path existence check, which is why it is a write and
         // not a capture.
         SetCameras { .. }
+        | SetCamerasIfCurrent { .. }
         | DeleteProfile { .. }
         | DeleteScan { .. }
         | ForgetRecognizer { .. }

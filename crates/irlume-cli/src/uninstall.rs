@@ -298,15 +298,35 @@ fn remove_source_files() -> Result<String, String> {
         let _ = std::fs::remove_dir_all(d);
     }
 
-    let removed = targets
-        .iter()
-        .filter(|p| p.exists() && std::fs::remove_file(p).is_ok())
-        .count();
+    let desktop_removed = remove_source_desktop_files(Path::new("/usr/local/share"))
+        .map_err(|e| format!("could not remove the source-installed desktop entry: {e}"))?;
+    let removed = desktop_removed
+        + targets
+            .iter()
+            .filter(|p| p.exists() && std::fs::remove_file(p).is_ok())
+            .count();
     let _ = systemctl(&["daemon-reload"]);
     if removed == 0 {
         return Err("found no source-installed files to remove (already gone?)".into());
     }
     Ok(format!("removed {removed} source-installed file(s)"))
+}
+
+/// Only the two files placed by install-host.sh. Leave system package entries,
+/// user overrides, and the shared applications/icon directories alone.
+fn remove_source_desktop_files(share: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for relative in [
+        "applications/io.github.archledger.Irlume.desktop",
+        "icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg",
+    ] {
+        match std::fs::remove_file(share.join(relative)) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
 }
 
 /// Remove irlume artifacts a package `remove` leaves behind: the admin-created
@@ -744,6 +764,47 @@ fn stdin_is_tty() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn source_desktop_removal_preserves_neighbors_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-desktop-removal-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        for relative in [
+            "applications/io.github.archledger.Irlume.desktop",
+            "icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg",
+        ] {
+            let file = root.join(relative);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"irlume fixture").unwrap();
+            std::fs::write(file.with_file_name("unrelated"), b"keep").unwrap();
+        }
+        assert_eq!(super::remove_source_desktop_files(&root).unwrap(), 2);
+        assert_eq!(super::remove_source_desktop_files(&root).unwrap(), 0);
+        for dir in ["applications", "icons/hicolor/scalable/apps"] {
+            assert_eq!(
+                std::fs::read(root.join(dir).join("unrelated")).unwrap(),
+                b"keep"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_desktop_removal_reports_errors_without_removing_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-desktop-removal-error-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let unexpected_dir = root.join("applications/io.github.archledger.Irlume.desktop");
+        std::fs::create_dir_all(&unexpected_dir).unwrap();
+        assert!(super::remove_source_desktop_files(&root).is_err());
+        assert!(unexpected_dir.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A destructive verb must not guess. `--keep-data` mistyped is the whole
     /// reason this exists: it used to be ignored, and with `--yes` beside it the

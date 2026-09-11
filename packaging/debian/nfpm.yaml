@@ -43,6 +43,18 @@ recommends:
   - fprintd
 
 contents:
+  - src: ../desktop/io.github.archledger.Irlume.desktop
+    dst: /usr/share/applications/io.github.archledger.Irlume.desktop
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ../desktop/io.github.archledger.Irlume.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
   - src: ../polkit/org.irlume.enroll.policy
     dst: /usr/share/polkit-1/actions/org.irlume.enroll.policy
   - src: ../polkit/org.irlume.recovery-manage.policy

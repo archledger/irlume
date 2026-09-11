@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Application-menu launcher for the TUI, using the desktop's terminal as the
+  normal user, across Fedora, Arch, Debian, PPA, Nix and source installs.
+- TUI Sections chooser (F3), keyboard page controls (F6), theme-aware state
+  badges, and bounded session Activity with timestamps and full wrapped history
+  (Shift+L). First-run guidance and long dialogs support keyboard scrolling.
+- An 80×24 minimum window size, with a resize-only notice and disabled hidden
+  controls below either dimension. Resizing preserves the current page or dialog.
+- Current observations (F4), with live daemon work, queued requests, automatic
+  background qualification, and separate observation ages and failure states.
 - Explicit experimental IR-only policy (`irlume auth sensor ir-only --yes`),
   with dual RGB+IR remaining the default. Requires enrollment-bound IR capture,
   fresh emitter evidence and IR PAD; it does not establish deployment qualification.
@@ -41,6 +50,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Refresh TUI camera choices on device changes, reject a switch whose device
+  changed during confirmation, and show failed or expired observations as
+  unavailable. Live daemon worker status remains observable during TUI dialogs.
+- Keep TUI enrollment instructions visible in supported terminal sizes, make Cancel and
+  quit controls clickable, and preserve reading position when Activity reflows.
+- Report TUI worker loss as stale state or an unknown outcome, disclose camera
+  diagnostics capture, and avoid copying unexpected protocol payloads into
+  activity messages. Unknown login wiring no longer appears ready.
 - Make the emitter undo-record regression independent of root permission bypass,
   so the Arch container tests the same save-failure invariant as ordinary CI.
 - Fail release verification on incomplete assets, verify Arch packages alongside

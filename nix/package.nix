@@ -14,6 +14,7 @@
   lib,
   rustPlatform,
   pkg-config,
+  desktop-file-utils,
   clang,
   tpm2-tss,
   linux-pam,
@@ -98,6 +99,7 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     pkg-config
+    desktop-file-utils
     clang
     rustPlatform.bindgenHook # sets LIBCLANG_PATH and the bindgen clang args
   ];
@@ -145,6 +147,13 @@ rustPlatform.buildRustPackage {
   # buildRustPackage installs the two bins to $out/bin. The PAM cdylib and the
   # model weights are not bins, so place them here.
   postInstall = ''
+    install -Dm0644 packaging/desktop/io.github.archledger.Irlume.desktop "$out/share/applications/io.github.archledger.Irlume.desktop"
+    install -Dm0644 packaging/desktop/io.github.archledger.Irlume.svg "$out/share/icons/hicolor/scalable/apps/io.github.archledger.Irlume.svg"
+    substituteInPlace "$out/share/applications/io.github.archledger.Irlume.desktop" \
+      --replace-fail 'Exec=irlume tui' "Exec=$out/bin/irlume tui" \
+      --replace-fail 'TryExec=irlume' "TryExec=$out/bin/irlume"
+    desktop-file-validate "$out/share/applications/io.github.archledger.Irlume.desktop"
+
     install -Dm0755 \
       "$(find target -name libpam_irlume.so -print -quit)" \
       "$out/lib/security/pam_irlume.so"

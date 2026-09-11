@@ -8,6 +8,12 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
+
+use irlume_common::live_camera::{
+    CameraCandidate, CameraInventoryReason, CameraInventorySnapshot, CameraInventoryState,
+    MAX_CAMERA_CANDIDATES, MAX_CAMERA_ENDPOINTS, MAX_CAMERA_ENDPOINT_BYTES,
+};
 
 use crate::contracts::{
     BackendKind, CameraCapabilities, CameraDescriptor, CameraGeneration, CameraInstanceId,
@@ -195,6 +201,11 @@ pub(crate) struct CameraInventory {
     retired_instance_ids: BTreeSet<CameraInstanceId>,
     invalidated_instance_ids: BTreeSet<CameraInstanceId>,
     instance_id_source: InstanceIdSource,
+    supervisor_id: CameraInstanceId,
+    revision: u64,
+    publication_state: CameraInventoryState,
+    publication_reason: Option<CameraInventoryReason>,
+    observed_at: Option<Instant>,
 }
 
 impl CameraInventory {
@@ -209,7 +220,110 @@ impl CameraInventory {
             retired_instance_ids: BTreeSet::new(),
             invalidated_instance_ids: BTreeSet::new(),
             instance_id_source,
+            supervisor_id: CameraInstanceId::generate(),
+            revision: 0,
+            publication_state: CameraInventoryState::Uninitialized,
+            publication_reason: None,
+            observed_at: None,
         }
+    }
+
+    fn advance_revision(&mut self) {
+        if let Some(next) = self.revision.checked_add(1) {
+            self.revision = next;
+        } else {
+            // A revision must never alias one published earlier by this producer.
+            self.supervisor_id = CameraInstanceId::generate();
+            self.revision = 1;
+        }
+    }
+
+    fn mark_refreshing(&mut self) {
+        if self.publication_state != CameraInventoryState::Refreshing {
+            self.advance_revision();
+        }
+        self.publication_state = CameraInventoryState::Refreshing;
+        self.publication_reason = None;
+    }
+
+    pub(crate) fn mark_unavailable(&mut self, reason: CameraInventoryReason) {
+        self.invalidated_instance_ids.extend(
+            self.active
+                .values()
+                .map(|entry| entry.descriptor.camera_instance_id().clone()),
+        );
+        if self.publication_state != CameraInventoryState::Unavailable
+            || self.publication_reason != Some(reason)
+        {
+            self.advance_revision();
+        }
+        self.publication_state = CameraInventoryState::Unavailable;
+        self.publication_reason = Some(reason);
+    }
+
+    pub(crate) fn retire_unavailable(&mut self, reason: CameraInventoryReason) {
+        // A failed census is not a new successful empty observation. Retire
+        // identities without resetting the age of the last complete census.
+        let topologies = self.active.keys().cloned().collect();
+        self.retire_topologies(&topologies);
+        self.mark_unavailable(reason);
+    }
+
+    /// Copy a bounded view while holding the inventory lock. No lease, backend,
+    /// filesystem or monitor operation is reachable from this projection.
+    pub(crate) fn snapshot(&self) -> CameraInventorySnapshot {
+        if self.publication_state == CameraInventoryState::Uninitialized {
+            return CameraInventorySnapshot::default();
+        }
+        let mut result = CameraInventorySnapshot {
+            state: self.publication_state,
+            supervisor_id: Some(self.supervisor_id.as_str().to_owned()),
+            revision: self.revision,
+            observed_ago_ms: self
+                .observed_at
+                .map(|at| at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            reason: self.publication_reason,
+            candidates: Vec::new(),
+        };
+        if result.state != CameraInventoryState::Unavailable {
+            for entry in self.active.values().filter(|entry| {
+                !self
+                    .invalidated_instance_ids
+                    .contains(entry.descriptor.camera_instance_id())
+            }) {
+                if result.candidates.len() == MAX_CAMERA_CANDIDATES
+                    || entry.observation.endpoint_paths.len() > MAX_CAMERA_ENDPOINTS
+                    || entry
+                        .observation
+                        .endpoint_paths
+                        .iter()
+                        .any(|path| path.len() > MAX_CAMERA_ENDPOINT_BYTES)
+                {
+                    result.state = CameraInventoryState::Unavailable;
+                    result.reason = Some(CameraInventoryReason::Bounds);
+                    result.candidates.clear();
+                    break;
+                }
+                let candidate = CameraCandidate {
+                    instance_id: entry.descriptor.camera_instance_id().as_str().to_owned(),
+                    generation: entry.descriptor.generation().get(),
+                    endpoint_paths: entry.observation.endpoint_paths.clone(),
+                };
+                if candidate.validate().is_err() {
+                    result.state = CameraInventoryState::Unavailable;
+                    result.reason = Some(CameraInventoryReason::Bounds);
+                    result.candidates.clear();
+                    break;
+                }
+                result.candidates.push(candidate);
+            }
+        }
+        if result.validate().is_err() {
+            result.state = CameraInventoryState::Unavailable;
+            result.reason = Some(CameraInventoryReason::Bounds);
+            result.candidates.clear();
+        }
+        result
     }
 
     fn mint_unique_instance_id(
@@ -337,10 +451,17 @@ impl CameraInventory {
         self.tombstones = next_tombstones;
         self.retired_instance_ids = next_retired_instance_ids;
         self.invalidated_instance_ids.clear();
+        if self.publication_state != CameraInventoryState::Current || !events.is_empty() {
+            self.advance_revision();
+        }
+        self.publication_state = CameraInventoryState::Current;
+        self.publication_reason = None;
+        self.observed_at = Some(Instant::now());
         Ok((events, true))
     }
 
     pub(crate) fn invalidate_all(&mut self) {
+        self.mark_refreshing();
         self.invalidated_instance_ids = self
             .active
             .values()
@@ -349,6 +470,8 @@ impl CameraInventory {
     }
 
     pub(crate) fn invalidate_topologies(&mut self, topologies: &BTreeSet<String>) {
+        // Even an empty affected set may describe a newly added camera.
+        self.mark_refreshing();
         self.invalidated_instance_ids.extend(
             topologies
                 .iter()
@@ -361,6 +484,12 @@ impl CameraInventory {
         &mut self,
         topologies: &BTreeSet<String>,
     ) -> Vec<CameraInventoryEvent> {
+        if topologies
+            .iter()
+            .any(|topology| self.active.contains_key(topology))
+        {
+            self.mark_refreshing();
+        }
         let mut events = Vec::new();
         for topology in topologies {
             let Some(entry) = self.active.remove(topology) else {
@@ -498,10 +627,7 @@ impl CameraInventory {
                     descriptor,
                 },
             )]),
-            tombstones: BTreeSet::new(),
-            retired_instance_ids: BTreeSet::new(),
-            invalidated_instance_ids: BTreeSet::new(),
-            instance_id_source: Box::new(move || replacement_id.clone()),
+            ..Self::with_instance_id_source(Box::new(move || replacement_id.clone()))
         }
     }
 
@@ -560,6 +686,135 @@ mod tests {
                 .map(|endpoint| (*endpoint).to_owned())
                 .collect(),
         )
+    }
+
+    #[test]
+    fn live_inventory_empty_unknown_failed_and_recovered_are_distinct() {
+        let mut inventory = CameraInventory::new();
+        assert_eq!(inventory.snapshot(), CameraInventorySnapshot::default());
+        inventory.reconcile(vec![]).unwrap();
+        let empty = inventory.snapshot();
+        assert_eq!(empty.state, CameraInventoryState::Current);
+        assert!(empty.candidates.is_empty());
+        assert!(empty.observed_ago_ms.is_some());
+        inventory.mark_unavailable(CameraInventoryReason::Monitor);
+        let failed = inventory.snapshot();
+        assert_eq!(failed.state, CameraInventoryState::Unavailable);
+        assert!(failed.revision > empty.revision);
+        inventory.invalidate_all();
+        assert_eq!(inventory.snapshot().state, CameraInventoryState::Refreshing);
+        inventory.reconcile(vec![]).unwrap();
+        let recovered = inventory.snapshot();
+        assert_eq!(recovered.state, CameraInventoryState::Current);
+        assert_eq!(recovered.supervisor_id, empty.supervisor_id);
+        assert!(recovered.revision > failed.revision);
+    }
+
+    #[test]
+    fn live_inventory_invalidates_before_rescan_and_never_publishes_provisional_nodes() {
+        let mut inventory = CameraInventory::new();
+        let camera =
+            observation_with_endpoints("/devices/test/camera", &["/dev/video0", "/dev/video2"]);
+        inventory.reconcile(vec![camera.clone()]).unwrap();
+        let old = inventory.snapshot();
+        inventory.invalidate_all();
+        let invalid = inventory.snapshot();
+        assert_eq!(invalid.state, CameraInventoryState::Refreshing);
+        assert!(invalid.candidates.is_empty());
+        assert!(invalid.revision > old.revision);
+        let (_, committed) = inventory
+            .reconcile_guarded(vec![camera.clone()], || false)
+            .unwrap();
+        assert!(!committed);
+        assert_eq!(inventory.snapshot().state, CameraInventoryState::Refreshing);
+        assert!(inventory.snapshot().candidates.is_empty());
+        inventory.reconcile(vec![camera]).unwrap();
+        let new = inventory.snapshot();
+        assert_eq!(new.candidates[0].instance_id, old.candidates[0].instance_id);
+        assert!(new.candidates[0].generation > old.candidates[0].generation);
+        assert_eq!(
+            new.candidates[0].endpoint_paths,
+            ["/dev/video0", "/dev/video2"]
+        );
+        let json = serde_json::to_value(&new.candidates[0]).unwrap();
+        assert!(json.get("role").is_none());
+        assert!(json.get("streaming").is_none());
+    }
+
+    #[test]
+    fn live_inventory_remove_readd_and_restart_cannot_alias_selection() {
+        let mut inventory = CameraInventory::new();
+        let camera = observation_with_endpoints("/devices/test/camera", &["/dev/video0"]);
+        inventory.reconcile(vec![camera.clone()]).unwrap();
+        let old = inventory.snapshot();
+        inventory.reconcile(vec![]).unwrap();
+        inventory.reconcile(vec![camera.clone()]).unwrap();
+        assert_ne!(
+            inventory.snapshot().candidates[0].instance_id,
+            old.candidates[0].instance_id
+        );
+        let mut restarted = CameraInventory::new();
+        restarted.reconcile(vec![camera]).unwrap();
+        assert_ne!(restarted.snapshot().supervisor_id, old.supervisor_id);
+        inventory.revision = u64::MAX;
+        let before = inventory.snapshot().supervisor_id;
+        inventory.invalidate_all();
+        assert_ne!(inventory.snapshot().supervisor_id, before);
+        assert_eq!(inventory.snapshot().revision, 1);
+    }
+
+    #[test]
+    fn live_inventory_healthy_quiet_age_is_not_failure_or_a_new_epoch() {
+        let mut inventory = CameraInventory::new();
+        inventory.reconcile(vec![]).unwrap();
+        let original = inventory.snapshot();
+        inventory.observed_at = Instant::now().checked_sub(std::time::Duration::from_secs(7200));
+        let quiet = inventory.snapshot();
+        assert_eq!(quiet.state, CameraInventoryState::Current);
+        assert_eq!(quiet.revision, original.revision);
+        assert!(quiet.observed_ago_ms.unwrap() >= 7_200_000);
+        inventory.reconcile(vec![]).unwrap();
+        assert_eq!(inventory.snapshot().revision, original.revision);
+        assert!(inventory.snapshot().observed_ago_ms.unwrap() < 1000);
+    }
+
+    #[test]
+    fn live_inventory_failed_scan_preserves_last_successful_observation_age() {
+        let mut inventory = CameraInventory::new();
+        inventory
+            .reconcile(vec![observation_with_endpoints(
+                "/devices/test/camera",
+                &["/dev/video0"],
+            )])
+            .unwrap();
+        inventory.observed_at = Instant::now().checked_sub(std::time::Duration::from_secs(60));
+        inventory.retire_unavailable(CameraInventoryReason::Snapshot);
+        let snapshot = inventory.snapshot();
+        assert_eq!(snapshot.state, CameraInventoryState::Unavailable);
+        assert!(snapshot.candidates.is_empty());
+        assert!(snapshot.observed_ago_ms.unwrap() >= 60_000);
+    }
+
+    #[test]
+    fn live_inventory_overflow_is_unavailable_never_truncated_current() {
+        let mut inventory = CameraInventory::new();
+        inventory
+            .reconcile(
+                (0..=MAX_CAMERA_CANDIDATES)
+                    .map(|n| {
+                        observation_with_endpoints(
+                            &format!("/devices/test/camera{n}"),
+                            &[&format!("/dev/video{n}")],
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let snapshot = inventory.snapshot();
+        assert_eq!(snapshot.state, CameraInventoryState::Unavailable);
+        assert_eq!(snapshot.reason, Some(CameraInventoryReason::Bounds));
+        assert!(snapshot.candidates.is_empty());
+        assert!(snapshot.validate().is_ok());
     }
 
     #[test]

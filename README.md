@@ -88,6 +88,11 @@ irlume doctor    # what your hardware supports
 irlume tui       # guided enrollment and wiring
 ```
 
+Or open **Irlume** from your application menu. It runs the same TUI as your
+normal user in the terminal selected by your desktop. Privileged changes ask
+for authorization when you choose them. If your desktop cannot select a
+terminal, run `irlume tui` in one you opened yourself.
+
 **You need** x86-64 Linux with systemd and PAM. A TPM 2.0 is strongly recommended.
 Most cameras work and set your tier (an IR node must offer an 8-bit grey format; see [Platforms](docs/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
 unlock · **fingerprint** → companion factor.

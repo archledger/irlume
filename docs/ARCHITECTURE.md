@@ -15,8 +15,9 @@
 The two untrusted clients, `pam_irlume.so` and the `irlume` CLI, reach the
 privileged daemon through a single `SO_PEERCRED`-checked Unix socket. Everything
 sensitive (the camera, IR emitter, ONNX models, enrolled templates, and the TPM)
-lives only inside `irlumed`, which serially handles one request at a time (the camera is one
-shared resource; RGB and IR capture within a request run concurrently):
+lives only inside `irlumed`. Its biometric worker serializes engine and camera
+work; connection threads also serve lightweight status requests. The camera is
+one shared resource; RGB and IR capture within a request can run concurrently:
 
 ```mermaid
 flowchart LR
@@ -65,6 +66,42 @@ flowchart LR
   login password is released only to a root peer. (We use a raw Unix socket +
   explicit peer check rather than D-Bus policy; that is the concrete hardening
   over the `visage` reference design.)
+
+## Live interface observations
+
+`LiveStatus` is an additive, unprivileged read on the peer-checked socket. It
+copies bounded metadata before engine readiness and without entering the
+biometric worker: daemon instance and stage, current worker operation, waiting
+counts, independently tracked background qualification, and the passive camera
+inventory. Polling does not create diagnostic
+history events, initialize monitors, open camera nodes or read the TPM.
+
+Worker registration follows admission, claim, cancellation request and actual
+completion. A cancellation request does not clear running work. Closed operation
+categories omit account names, request arguments and biometric outcomes. A
+state revision advances after potentially mutating work; it tells clients to
+invalidate their observations, not that a write succeeded. This is a logical
+mutation hint, not a disk-write audit: best-effort storage upgrades during a
+profile read do not recursively invalidate that read. Background qualification
+has its own scoped lifetime and does not infer cancellation from the foreground
+worker's stop signal.
+
+Camera connection metadata comes from the daemon's independently initialized
+udev/sysfs monitor. Its copied publication distinguishes current, refreshing,
+uninitialized and unavailable, including a valid empty UVC inventory. Instance
+and generation identify continuity within a supervisor lifetime. RGB/IR role
+classification remains a separate node-opening operation; passive connection
+metadata cannot establish roles, privacy state or physical streaming state.
+The TUI's camera switch carries the selected supervisor and candidate identity
+through sudo. `SetCamerasIfCurrent` checks that observation again before changing
+the pin. The distinct request prevents an older daemon from silently ignoring
+the continuity guard; the original headless `SetCameras` request remains available.
+
+The TUI tracks source freshness and invalidation generations separately. Old
+in-flight responses cannot satisfy a newer explicit refresh. A missing or
+unsupported live response becomes unavailable, not idle. Session history is a
+separate record of TUI observations; neither source claims to audit every process
+or prove physical camera/emitter shutdown.
 
 ## Authentication flow
 

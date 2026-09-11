@@ -16,13 +16,17 @@ you out.
 
 ## Guided setup (TUI)
 
-See [TUI workflows and CLI parity](TUI.md) for F2 More actions and the
-existing-person versus new-person enrollment flow.
+Open **Irlume** from the application menu. Your desktop opens it in a terminal;
+administrator approval is requested only by the actions that need it. You can
+also launch it directly:
 
 
 ```sh
 irlume tui
 ```
+
+Use a window of at least **80 columns × 24 rows**. Smaller windows show a resize
+message; enlarge the terminal to return to the same page or dialog.
 
 The TUI opens as a settings app with stable, grouped navigation and an
 **Overview** that shows live status plus the next recommended action. Use the
@@ -31,6 +35,13 @@ sidebar or click a status row to jump directly to a section; `Tab`/`⇧Tab` and
 (Cameras and Test Recognition), `[A]` expands recent activity, and `[?]` shows
 every action for the current section. Footer actions, selectable rows, and the
 sidebar can all be clicked.
+
+**F3** opens a section chooser, **F4** opens Current observations, and **F6**
+focuses page actions for keyboard use. The observations panel shows each source's
+age and availability; **Shift+L** opens full-height session history with timestamps
+and details of earlier activity.
+See [TUI workflows and CLI parity](TUI.md) for all controls, Activity's scope,
+and the existing-person versus new-person enrollment flow.
 
 1. **Overview**: follow the recommended action, or open any status row.
 2. **Faces**: `[e]` enrolls a face. Look at the camera; it guides your

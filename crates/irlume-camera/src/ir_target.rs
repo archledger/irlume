@@ -137,8 +137,9 @@ impl IrCaptureTarget {
 
     /// Capture once through this exact configured target and operation lease.
     ///
-    /// The target is revalidated before open and again before its fixed-startup
-    /// session. Explicit metadata absence never falls back to discovery.
+    /// The target is revalidated before open and again before its adaptive-startup
+    /// session. The full delivered-rate window remains mandatory; explicit
+    /// metadata absence never falls back to discovery.
     ///
     /// # Errors
     /// Returns cancellation, deadline, target, lease, camera, metadata, emitter,
@@ -174,6 +175,24 @@ impl IrCaptureTarget {
     ) -> irlume_common::Result<T> {
         validate().map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
         open_ir(&self.endpoint)
+    }
+
+    pub(super) fn session_with<T>(
+        &self,
+        opened_endpoint: &str,
+        validate: impl FnOnce() -> Result<(), IrTargetError>,
+        start: impl FnOnce(
+            crate::IrSessionStartup,
+            crate::ir_metadata::MetadataSelection<'_>,
+        ) -> irlume_common::Result<T>,
+    ) -> irlume_common::Result<T> {
+        if opened_endpoint != self.endpoint() {
+            return Err(irlume_common::Error::Hardware(
+                "opened IR camera does not match validated target".into(),
+            ));
+        }
+        validate().map_err(|error| irlume_common::Error::Hardware(error.to_string()))?;
+        start(crate::IrSessionStartup::Adaptive, self.metadata_selection())
     }
 
     pub(crate) fn validate_in(&self, sysfs: &Path) -> Result<(), IrTargetError> {
@@ -675,6 +694,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(opens.into_inner(), [target.endpoint()]);
+    }
+
+    #[test]
+    fn target_session_uses_the_full_rate_window_without_an_unconditional_flush() {
+        let target = unopened_target();
+        let mut stream =
+            crate::tests::rate_fill_fixture(crate::contracts::StreamRole::Ir, 100, 66_667);
+        target
+            .session_with(
+                target.endpoint(),
+                || Ok(()),
+                |startup, metadata| {
+                    assert!(matches!(
+                        metadata,
+                        crate::ir_metadata::MetadataSelection::Absent
+                    ));
+                    startup.warm_up(target.endpoint(), &mut stream, &crate::no_progress())?;
+                    startup
+                        .fill(&mut stream)
+                        .map_err(|error| crate::map_io(target.endpoint(), error))
+                },
+            )
+            .unwrap();
+        assert_eq!(stream.observations, 32);
+        let (_, _, _, _, evidence) = stream.next().unwrap();
+        assert_eq!(evidence.window_count(), 30);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn target_session_keeps_exact_metadata_and_refuses_a_slow_stream() {
+        let mut target = unopened_target();
+        target.metadata_endpoint = Some("/fixture/metadata".into());
+        let mut stream =
+            crate::tests::rate_fill_fixture(crate::contracts::StreamRole::Ir, 100, 200_000);
+        target
+            .session_with(
+                target.endpoint(),
+                || Ok(()),
+                |startup, metadata| {
+                    assert!(matches!(
+                        metadata,
+                        crate::ir_metadata::MetadataSelection::Exact("/fixture/metadata")
+                    ));
+                    startup.warm_up(target.endpoint(), &mut stream, &crate::no_progress())?;
+                    startup
+                        .fill(&mut stream)
+                        .map_err(|error| crate::map_io(target.endpoint(), error))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stream.observations, 42,
+            "slow startup retains the bounded extra work"
+        );
+        assert!(matches!(
+            stream.next(),
+            Err(crate::DeliveryError::BelowFloor(_))
+        ));
+    }
+
+    #[test]
+    fn target_session_refuses_a_mismatched_camera_before_validation_or_startup() {
+        let target = unopened_target();
+        let result: irlume_common::Result<()> = target.session_with(
+            "/fixture/another-camera",
+            || panic!("mismatched camera must be refused before validation"),
+            |_, _| panic!("mismatched camera must never start a session"),
+        );
+        assert!(matches!(result, Err(irlume_common::Error::Hardware(_))));
+    }
+
+    #[test]
+    fn target_session_revalidates_before_startup() {
+        let target = unopened_target();
+        let result: irlume_common::Result<()> = target.session_with(
+            target.endpoint(),
+            || Err(IrTargetError::Changed),
+            |_, _| panic!("changed target must never start a session"),
+        );
+        assert!(matches!(result, Err(irlume_common::Error::Hardware(_))));
     }
 
     #[test]

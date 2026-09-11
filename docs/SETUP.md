@@ -121,8 +121,11 @@ settings select dual; malformed or unreadable settings make face authentication
 unavailable until repaired. IR-only opens only the configured, enrollment-bound IR
 image endpoint and its exact optional metadata companion. It does not probe RGB or
 fall back to RGB, and it adds no startup or background camera opens. The currently
-supported scope requires the enrolled isolated USB IR interface and fixed startup,
-with compatible IR templates and mandatory FLIR PAD.
+supported scope requires the enrolled isolated USB IR interface, compatible IR
+templates and mandatory FLIR PAD. Startup measures the full 30-interval rate window
+before spending up to ten additional dequeues on a slow-starting stream. The rate
+floor and continuity checks still apply; this does not qualify the device or
+guarantee that an attempt will finish within its service window.
 
 This sensor policy is independent of sequential/concurrent `CaptureMode`, the PAM
 `Method`, and privileged per-attempt consent. It changes none of those controls and

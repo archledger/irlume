@@ -49,8 +49,12 @@ earlier. `IRLUME_GRACE_MS` remains the explicit 0–60000 ms override; zero reta
 legacy single-attempt behavior. A measured
 fixed-startup empty-view IR capture on one Minihost took about 5.5 seconds before
 identity work, so prerequisite-ready does not imply the five-second services can
-complete. IR-only opt-in does not silently extend a service window or adopt the
-separately measured adaptive startup experiment.
+complete. The target-bound IR route now uses adaptive startup while retaining the
+full 30-interval rate window, rate floor and continuity checks. Healthy startup
+can avoid the fixed ten-dequeue exclusion; a slow stream can use up to ten extra
+dequeues before the ordinary delivery gate accepts or refuses it. IR-only opt-in
+does not extend a service window. The historical fixed-startup measurement above
+does not predict the duration of a current attempt.
 
 Matches and prepared credentials observed after expiry are discarded. Capture
 checks expiry before and after returned driver calls and at inference

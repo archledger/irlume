@@ -40,8 +40,8 @@ jobs:
       - name: build (release)
         run: cargo build --release --locked
 
-      # The production TFLite mesh, end to end and ENFORCED. The test is
-      # #[ignore]d because it needs the packaged runtime, so a rename or a
+      # The production TFLite mesh and owned-buffer lifetime, ENFORCED. These are
+      # #[ignore]d because they need the packaged runtime, so a rename or a
       # silent skip fails the --require guard instead of reading as green.
       # Both runners carry the pinned libtensorflowlite_c.so at the
       # resolver's first probe path.
@@ -51,7 +51,8 @@ jobs:
         run: |
           IRLUME_TFLITE_MESH_TEST_MODEL="$GITHUB_WORKSPACE/models/face_landmarks_detector.tflite" \
             ./scripts/run-tests-guarded.sh --require pinned_landmarker_mesh_serves_landmarks_via_facemesh \
-            -- cargo test -p irlume-vision --locked -- --ignored pinned_landmarker_mesh_serves_landmarks_via_facemesh
+            --require pinned_mesh_session_retains_the_owned_allocation \
+            -- cargo test -p irlume-vision --locked -- --ignored pinned_
 
       - name: test (TPM-gated, against the REAL TPM)
         run: |

@@ -19,6 +19,7 @@ pub mod gkr_wire;
 pub mod memlock;
 pub mod pam_service;
 pub mod platform;
+pub mod process;
 pub mod secureboot;
 
 use serde::{Deserialize, Serialize};
@@ -207,6 +208,12 @@ impl HashedModel {
     /// The weights themselves.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Consume the artifact and transfer its allocation to an owning loader.
+    /// The digest is discarded so later mutations cannot leave a stale pair.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
@@ -770,6 +777,11 @@ pub enum Request {
     /// Whether `user` has a sealed password armed (for status / CLI / the
     /// delete-erases-it warning). Unprivileged: root or `user`.
     HasSealedPassword { user: String },
+    /// Describe the sealed envelope without reading live PCRs or opening the
+    /// TPM. Returns `KeyringInfo` with `drifted: None`. Routine status clients
+    /// should use this and fall back to `HasSealedPassword` on old daemons.
+    /// Unprivileged: root or `user`.
+    KeyringMetadata { user: String },
     /// Describe `user`'s sealed-password envelope: whether one is armed and,
     /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer
     /// sibling of `HasSealedPassword` for status surfaces (the envelope file
@@ -1345,9 +1357,10 @@ pub enum Response {
     },
     /// Whether a sealed password exists (`HasSealedPassword`).
     HasPassword(bool),
-    /// Envelope detail (`KeyringInfo`). `policy` is `None` and `pcrs` empty
-    /// when nothing is armed (or the envelope is unreadable); `drifted` is
-    /// `None` when there is nothing to compare or the PCR replay failed.
+    /// Envelope detail (`KeyringInfo` or `KeyringMetadata`). `policy` is `None`
+    /// and `pcrs` empty when nothing is armed (or the envelope is unreadable); `drifted` is
+    /// `None` for metadata-only requests, when there is nothing to compare,
+    /// or when the PCR replay failed.
     KeyringInfo {
         armed: bool,
         #[serde(default)]
@@ -1839,6 +1852,20 @@ mod tests {
             assert_eq!(m.bytes(), &payload[..]);
             assert_eq!(m.sha256(), super::sha256_hex(&payload));
         }
+    }
+
+    #[test]
+    fn consuming_hashed_model_preserves_the_original_allocation() {
+        let model = super::HashedModel::new(b"owned model weights".to_vec());
+        let original = model.bytes().as_ptr();
+        let digest = model.sha256().to_owned();
+        let bytes = model.into_bytes();
+        assert_eq!(
+            bytes.as_ptr(),
+            original,
+            "transfer must not clone the weights"
+        );
+        assert_eq!(super::sha256_hex(&bytes), digest);
     }
     use std::path::{Path, PathBuf};
 

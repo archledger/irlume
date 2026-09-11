@@ -240,7 +240,7 @@ pub fn request_cancellable(
     rw_timeout: Duration,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Response> {
-    request_with_timeouts_inner(req, CONNECT_TIMEOUT, rw_timeout, Some(cancelled))
+    request_with_timeouts_inner(req, CONNECT_TIMEOUT, rw_timeout, Some(cancelled), None)
 }
 
 /// A short-budget poll: used by the TUI's periodic status refresh so a busy or
@@ -256,6 +256,37 @@ pub fn request_poll(req: &Request) -> io::Result<Response> {
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn request_with_timeout(req: &Request, rw_timeout: Duration) -> io::Result<Response> {
     request_with_timeouts(req, CONNECT_TIMEOUT, rw_timeout)
+}
+
+/// Send one observation within a deadline shared with other observations.
+///
+/// The same deadline covers connection, writing and reading; an expired
+/// observation never opens a connection. Existing authentication timeout APIs
+/// retain their separate connect/reply budgets.
+///
+/// # Errors
+/// Returns transport/decoding errors or `TimedOut` when the deadline expires.
+pub fn request_until(req: &Request, deadline: std::time::Instant) -> io::Result<Response> {
+    let remaining = observation_remaining(deadline)?;
+    request_with_timeouts_inner(
+        req,
+        remaining.min(POLL_CONNECT_TIMEOUT),
+        remaining,
+        None,
+        Some(deadline),
+    )
+}
+
+fn observation_remaining(deadline: std::time::Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "observation deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
 }
 
 /// Open a bounded-time connection for a protocol that keeps reading after its
@@ -428,7 +459,7 @@ fn request_with_timeouts(
     connect_timeout: Duration,
     rw_timeout: Duration,
 ) -> io::Result<Response> {
-    request_with_timeouts_inner(req, connect_timeout, rw_timeout, None)
+    request_with_timeouts_inner(req, connect_timeout, rw_timeout, None, None)
 }
 
 fn request_with_timeouts_inner(
@@ -436,6 +467,7 @@ fn request_with_timeouts_inner(
     connect_timeout: Duration,
     rw_timeout: Duration,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
+    observation_deadline: Option<std::time::Instant>,
 ) -> io::Result<Response> {
     let stream =
         connect_with_timeout(&socket_path(), connect_timeout).map_err(map_connect_failure)?;
@@ -453,8 +485,27 @@ fn request_with_timeouts_inner(
     // wiped after the writes: either one returns early, and the buffer holding
     // the serialized password would have been freed unwiped on exactly the
     // path the comment above says happens in the field.
-    (&stream).write_all(&line).map_err(map_connect_failure)?;
-    (&stream).flush().map_err(map_connect_failure)?;
+    if let Some(deadline) = observation_deadline {
+        let mut pending = line.as_slice();
+        while !pending.is_empty() {
+            stream.set_write_timeout(Some(observation_remaining(deadline)?))?;
+            match (&stream).write(pending) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "daemon write stalled",
+                    ))
+                }
+                Ok(n) => pending = &pending[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(map_connect_failure(e)),
+            }
+        }
+        observation_remaining(deadline)?;
+    } else {
+        (&stream).write_all(&line).map_err(map_connect_failure)?;
+        (&stream).flush().map_err(map_connect_failure)?;
+    }
 
     // SO_RCVTIMEO restarts on each read. One monotonic reply deadline must
     // cover every partial read, including ordinary PAM requests. Keep the
@@ -463,7 +514,7 @@ fn request_with_timeouts_inner(
     let mut reader = CancellableReply {
         stream: &stream,
         cancelled: cancelled.unwrap_or(&never_cancelled),
-        deadline: std::time::Instant::now() + rw_timeout,
+        deadline: observation_deadline.unwrap_or_else(|| std::time::Instant::now() + rw_timeout),
     };
     let buf = read_response_line(reader.by_ref().take(MAX_RESPONSE_BYTES))
         .map_err(map_connect_failure)?;
@@ -617,6 +668,50 @@ mod tests {
         let p = std::env::temp_dir().join(format!("irlume-cl-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn expired_observation_deadline_does_not_connect() {
+        let _guard = testenv::lock();
+        let path = sock("already-expired");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let result = request_until(&Request::Ping, std::time::Instant::now());
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn observation_deadline_is_shared_by_successive_requests() {
+        let _guard = testenv::lock();
+        let path = sock("shared-deadline");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            for delay in [300, 600] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                std::thread::sleep(Duration::from_millis(delay));
+                let _ = stream.write_all(b"\"Pong\"\n");
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_millis(800);
+        assert!(matches!(
+            request_until(&Request::Ping, deadline),
+            Ok(Response::Pong)
+        ));
+        let result = request_until(&Request::Ping, deadline);
+        server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

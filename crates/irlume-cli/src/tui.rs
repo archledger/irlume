@@ -600,11 +600,15 @@ struct App {
     sel: usize,
     profiles: Vec<ProfileSummary>,
     keyring_armed: Option<bool>,
-    /// Seal-tier label from `KeyringInfo` (e.g. "pcrlock NV 0x… (Tier 2)");
+    /// Seal-tier label from envelope metadata (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
     keyring_policy: Option<String>,
     /// Whether the bound PCRs drifted since sealing (`KeyringInfo`).
     keyring_drift: Option<bool>,
+    /// Explicit live diagnostic observation; ordinary polling never refreshes it.
+    keyring_checked_at: Option<std::time::Instant>,
+    keyring_load: Option<mpsc::Receiver<(u64, Result<Response, String>)>>,
+    keyring_generation: u64,
     /// What kind of secret is armed (`KeyringInfo`); `None` from an older
     /// daemon. Routes the disarm key: a token disarm needs the CLI's re-key
     /// flow, and a bare `ForgetPassword` on it would strand the keyring.
@@ -665,13 +669,12 @@ struct App {
     repair_sel: usize,
     /// Cameras-tab pair selection.
     cam_sel: usize,
-    /// Cached Bitwarden state for the DRAW path, with the moment it was
-    /// taken: `bitwarden::tui_state` forks `getent` to resolve the invoking
-    /// user's home, measured at ~37ms a call and called twice in one draw of
-    /// the login-wiring tab, while a redraw happens on every keypress and
-    /// tick. The key HANDLERS still read fresh: an action must act on the
-    /// current state, and it runs once per press rather than once per frame.
+    /// Cached Bitwarden observation. `heavy_known` distinguishes an unobserved
+    /// install from an observed absence. Periodic NSS lookups stay on the worker;
+    /// explicit setup actions still revalidate before changing anything.
     heavy: Option<crate::bitwarden::TuiState>,
+    heavy_known: bool,
+    heavy_load: Option<mpsc::Receiver<std::io::Result<Option<crate::bitwarden::TuiState>>>>,
     heavy_at: std::time::Instant,
     /// A prominent, dismissible error banner (e.g. "camera busy") so failures
     /// are never silently buried in the Activity log.
@@ -707,6 +710,7 @@ struct App {
     caps: irlume_camera::Caps,
     /// A fingerprint reader is present.
     fp_present: bool,
+    fp_known: bool,
     /// An in-flight background ListProfiles, drained by `poll()`. The listing
     /// decrypts every profile under the TPM template key: ~350ms on the
     /// reference Zenbook, MEASURED 10.8s on a ThinkPad X13 Yoga Gen 4 whose
@@ -727,7 +731,7 @@ struct App {
     /// An in-flight background probe sweep, drained by `poll()`.
     probes_load: Option<std::sync::mpsc::Receiver<Probes>>,
     /// At least one sweep has landed. Until then `probes` holds defaults,
-    /// and copying defaults over the capabilities `App::new` observed hides
+    /// and copying defaults over the capabilities from a light poll hides
     /// real hardware; recompute_checks gates its copies on this.
     probes_landed: bool,
     /// An in-flight background light poll (daemon reads), drained by `poll()`.
@@ -791,7 +795,8 @@ struct Probes {
     /// be streaming (#187); the caller must then take capabilities from the
     /// daemon's Health rather than believing this all-false default.
     caps_probed: bool,
-    fp_present: bool,
+    /// None is an unavailable observation, not a missing reader.
+    fp_present: Option<bool>,
     fp: FpInfo,
     pam_cache: PamCache,
     fp_coverage: Vec<(&'static str, &'static str, bool)>,
@@ -830,11 +835,18 @@ impl Probes {
             ir_pair: false,
             rgb: false,
         };
-        let fp_present = irlume_fingerprint::available();
+        let fp_observed = irlume_fingerprint::available_until(
+            std::time::Instant::now() + Duration::from_millis(1500),
+        );
+        let fp_present = fp_observed == Some(true);
         let fp = FpInfo {
             available: fp_present,
-            device: irlume_fingerprint::device_name(),
-            enrolled: irlume_fingerprint::enrolled_fingers(user),
+            device: fp_present.then(irlume_fingerprint::device_name).flatten(),
+            enrolled: if fp_present {
+                irlume_fingerprint::enrolled_fingers(user)
+            } else {
+                Vec::new()
+            },
             method: irlume_core::policy::method().as_str().to_string(),
         };
         let pam_cache = PamCache {
@@ -851,7 +863,7 @@ impl Probes {
         Probes {
             caps,
             caps_probed: false,
-            fp_present,
+            fp_present: fp_observed,
             reader_stuck: fp_present && irlume_fingerprint::reader_stuck(user),
             fp,
             fp_coverage: if fp_present {
@@ -898,7 +910,6 @@ struct LightState {
     preferences: Option<irlume_common::PreferencesState>,
     keyring_armed: Option<bool>,
     keyring_policy: Option<String>,
-    keyring_drift: Option<bool>,
     keyring_kind: Option<irlume_common::KeyringSecretKind>,
     recovery: Option<RecoveryInfo>,
 }
@@ -928,7 +939,6 @@ impl LightState {
             preferences: None,
             keyring_armed: prev_armed,
             keyring_policy: None,
-            keyring_drift: None,
             keyring_kind: None,
             recovery: None,
         };
@@ -962,21 +972,19 @@ impl LightState {
             }),
             _ => None, // older daemon / daemon down → Repair falls back to local probes
         };
-        // KeyringInfo adds the seal tier and PCR drift; an older daemon
-        // answers it with an error, so fall back to the plain armed bit.
-        match crate::daemon_poll(&Request::KeyringInfo {
+        // Routine status reads envelope metadata only. An older daemon falls
+        // back to the armed bit, never to implicit live PCR diagnosis.
+        match crate::daemon_poll(&Request::KeyringMetadata {
             user: user.to_string(),
         }) {
             Ok(Response::KeyringInfo {
                 armed,
                 policy,
-                drifted,
                 kind,
                 ..
             }) => {
                 out.keyring_armed = Some(armed);
                 out.keyring_policy = policy;
-                out.keyring_drift = drifted;
                 out.keyring_kind = kind;
             }
             _ => {
@@ -1054,21 +1062,13 @@ impl App {
         // unknown must not hide the camera screens on a machine that has
         // cameras, so the optimistic default stands until the first light
         // poll replaces it with the daemon's answer.
-        let caps = match crate::daemon_poll(&Request::Health) {
-            Ok(Response::Health {
-                ref tier,
-                ref rgb_dev,
-                ..
-            }) => irlume_camera::Caps {
-                ir_pair: tier == "secure",
-                rgb: rgb_dev.is_some() || tier == "secure",
-            },
-            _ => irlume_camera::Caps {
-                ir_pair: true,
-                rgb: true,
-            },
+        let caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
         };
-        let fp_present = irlume_fingerprint::available();
+        // Keep optional screens discoverable until the background observations
+        // land; construction must not wait for daemon, NSS, or fprintd replies.
+        let fp_present = true;
         let visible = Self::compute_visible(
             &caps,
             VisibilityInputs {
@@ -1086,6 +1086,9 @@ impl App {
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_checked_at: None,
+            keyring_load: None,
+            keyring_generation: 0,
             keyring_kind: None,
             // EMPTY at construction (#187 review caught this one): App::new
             // ran before any daemon contact, so probing here opened every
@@ -1118,7 +1121,9 @@ impl App {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
-            heavy: crate::bitwarden::tui_state(),
+            heavy: None,
+            heavy_known: false,
+            heavy_load: None,
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
@@ -1133,6 +1138,7 @@ impl App {
             visible,
             caps,
             fp_present,
+            fp_known: false,
             advanced: false,
             profiles_load: None,
             profiles_loaded: false,
@@ -1331,6 +1337,14 @@ impl App {
     /// Land a background light poll: the daemon reads plus the selection
     /// clamps the inline version used to apply.
     fn apply_light(&mut self, l: LightState) {
+        if (self.daemon_up && !l.daemon_up)
+            || (self.keyring_armed.is_some()
+                && (self.keyring_armed != l.keyring_armed
+                    || self.keyring_policy != l.keyring_policy
+                    || self.keyring_kind != l.keyring_kind))
+        {
+            self.invalidate_keyring_diagnostic();
+        }
         self.daemon_up = l.daemon_up;
         self.daemon_reach = l.reach;
         // Daemon down/unresponsive: show the down state; the local probes
@@ -1345,7 +1359,6 @@ impl App {
             self.keyring_armed = l.keyring_armed;
             self.keyring_policy = l.keyring_policy;
             self.keyring_kind = l.keyring_kind;
-            self.keyring_drift = l.keyring_drift;
             if l.recovery.is_some() {
                 self.recovery = l.recovery;
             }
@@ -1440,7 +1453,7 @@ impl App {
         // checklist. Everything here is in-memory: the machine was observed
         // by `Probes::gather` on the worker. Before the FIRST sweep lands the
         // snapshot holds defaults, and defaults are not observations: copying
-        // them would erase the capabilities `App::new` detected and hide the
+        // them would erase the capabilities from Health and hide the
         // camera screens until the sweep arrives.
         if self.probes_landed {
             // Only adopt probed capabilities. When the daemon was up the
@@ -1451,10 +1464,13 @@ impl App {
             if self.probes.caps_probed {
                 self.caps = self.probes.caps;
             }
-            self.fp_present = self.probes.fp_present;
-            self.fp = self.probes.fp.clone();
+            if let Some(present) = self.probes.fp_present {
+                self.fp_present = present;
+                self.fp_known = true;
+                self.fp = self.probes.fp.clone();
+                self.fp_coverage = self.probes.fp_coverage.clone();
+            }
             self.pam_cache = self.probes.pam_cache.clone();
-            self.fp_coverage = self.probes.fp_coverage.clone();
         }
         self.run_checks();
         // Visibility is state-driven (Repair appears when something fails);
@@ -1478,13 +1494,35 @@ impl App {
     /// Full refresh: request daemon state, enrollment state, and the complete
     /// machine snapshot. Existing landed state stays visible until the
     /// replacements arrive through `poll()`; recomputing here would copy a
-    /// default (unlanded) snapshot over real observations, which at startup
-    /// erased the capabilities `App::new` had just detected and hid whole
-    /// screens for the first ten seconds.
+    /// default (unlanded) snapshot over real observations and hide screens.
     fn refresh(&mut self) {
+        self.invalidate_keyring_diagnostic();
         self.refresh_light();
         self.refresh_profiles();
         self.request_probes();
+        self.refresh_heavy();
+    }
+
+    fn invalidate_keyring_diagnostic(&mut self) {
+        self.keyring_drift = None;
+        self.keyring_checked_at = None;
+        self.keyring_generation = self.keyring_generation.wrapping_add(1);
+    }
+
+    /// Explicit diagnostic only. The daemon keeps live PCR reads serialized
+    /// with authentication; this independent receiver cannot delay light status.
+    fn refresh_keyring_diagnostic(&mut self) {
+        if self.keyring_load.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let user = self.user.clone();
+        let generation = self.keyring_generation;
+        std::thread::spawn(move || {
+            let reply = crate::daemon_poll(&Request::KeyringInfo { user });
+            let _ = tx.send((generation, reply));
+        });
+        self.keyring_load = Some(rx);
     }
 
     /// Build the Repair-tab diagnostics from current state + quick local probes.
@@ -2115,15 +2153,18 @@ impl App {
             }
         }
 
-        // Keyring PCR-drift: the seal no longer matches the current PCRs (a
-        // firmware/Secure Boot update moved them), so face login silently stops
-        // opening the wallet until re-bound. Only the Keyring tab drew this;
-        // surface it here too, with the one-key fix (reseal, added to Keyring).
+        // Drift is an explicit historical observation. Metadata cannot detect
+        // external resealing with the same policy/kind, so never present the
+        // old result as a guarantee about the current wallet state.
         if self.keyring_drift == Some(true) {
+            let age = self
+                .keyring_checked_at
+                .map(|at| format!(" ({}s ago)", at.elapsed().as_secs()))
+                .unwrap_or_default();
             v.push(mk(
                 "Keyring seal",
                 Sev::Warn,
-                "PCRs drifted since sealing; the wallet won't auto-unlock until re-bound".into(),
+                format!("PCRs drifted since sealing at last explicit check{age}; [r] rechecks before repair"),
                 Fix::Goto(GotoFix::KeyringReseal),
             ));
         }
@@ -2498,21 +2539,50 @@ impl App {
         }
     }
 
-    /// How long the cached model/Bitwarden state may be reused before the poll
+    /// How long the cached Bitwarden state may be reused before the poll
     /// takes it again. Long enough that a redraw storm costs nothing, short
     /// enough that a change made outside the TUI shows up while the user is
     /// still looking at the screen.
     const HEAVY_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
     /// Re-read the state the draw path caches. Called on the poll's TTL, and
-    /// immediately after any step that can change it, so a model the user just
-    /// enabled does not sit invisible for up to the TTL.
+    /// immediately after any step that can change it.
     fn refresh_heavy(&mut self) {
-        self.heavy = crate::bitwarden::tui_state();
-        self.heavy_at = std::time::Instant::now();
+        self.refresh_heavy_with(crate::bitwarden::tui_observation);
+    }
+
+    fn refresh_heavy_with(
+        &mut self,
+        gather: impl FnOnce() -> std::io::Result<Option<crate::bitwarden::TuiState>> + Send + 'static,
+    ) {
+        if self.heavy_load.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(gather());
+        });
+        self.heavy_load = Some(rx);
     }
 
     fn poll(&mut self) {
+        if let Some(rx) = &self.heavy_load {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.heavy_load = None;
+                    self.heavy_at = std::time::Instant::now();
+                    if let Ok(state) = result {
+                        self.heavy = state;
+                        self.heavy_known = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.heavy_load = None;
+                    self.heavy_at = std::time::Instant::now();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.camera_load {
             match rx.try_recv() {
                 Ok(listing) => {
@@ -2551,6 +2621,24 @@ impl App {
                 self.probes = p;
                 self.probes_landed = true;
                 self.recompute_checks();
+            }
+        }
+        if let Some(rx) = &self.keyring_load {
+            match rx.try_recv() {
+                Ok((generation, reply)) => {
+                    self.keyring_load = None;
+                    if generation == self.keyring_generation {
+                        self.keyring_drift = match reply {
+                            Ok(Response::KeyringInfo { drifted, .. }) => drifted,
+                            _ => None,
+                        };
+                        self.keyring_checked_at = Some(std::time::Instant::now());
+                        self.run_checks();
+                        self.recompute_visible();
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.keyring_load = None,
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(rx) = &self.profiles_load {
@@ -2923,6 +3011,12 @@ impl App {
     /// prove rollback: a command can change state before exiting unsuccessfully.
     /// Suspend-return refreshes diagnostics; refresh the app cache here too.
     fn sudo_step(&mut self, what: &str, args: &[&str]) {
+        // SAFETY: geteuid() reads the caller's own credentials and cannot fail.
+        let already_root = unsafe { libc::geteuid() } == 0;
+        self.sudo_step_as(what, args, already_root);
+    }
+
+    fn sudo_step_as(&mut self, what: &str, args: &[&str], already_root: bool) {
         // Invoke OUR OWN binary as root, not whatever `irlume` PATH resolves
         // to. Resolve the first "irlume" arg to the current exe; leave
         // non-irlume commands (systemd-pcrlock, sh -c) as is.
@@ -2936,8 +3030,6 @@ impl App {
             })
             .collect();
         let args: Vec<&str> = resolved.iter().map(String::as_str).collect();
-        // SAFETY: geteuid() reads the caller's own credentials and cannot fail.
-        let already_root = unsafe { libc::geteuid() } == 0;
         eprintln!(
             "\n{what}; running: {}{}…",
             if already_root { "" } else { "sudo " },
@@ -3523,6 +3615,9 @@ impl App {
         } else if self.screen == SC_PROFILES {
             self.refresh_profiles();
         }
+        if self.screen == SC_REPAIR || self.screen == SC_KEYRING {
+            self.refresh_keyring_diagnostic();
+        }
     }
 
     fn move_sel(&mut self, d: i32) {
@@ -3634,6 +3729,7 @@ impl App {
             (SC_REPAIR, KeyCode::Char('r')) => {
                 self.log('·', "re-running diagnostics…");
                 self.refresh();
+                self.refresh_keyring_diagnostic();
             }
             (SC_REPAIR, KeyCode::Char('f')) | (SC_REPAIR, KeyCode::Enter) => {
                 self.apply_fix(self.repair_sel)
@@ -3736,6 +3832,7 @@ impl App {
                 map_identify,
             ),
             // Keyring: masked in-TUI entry (goes to the root daemon; no sudo).
+            (SC_KEYRING, KeyCode::Char('d')) => self.refresh_keyring_diagnostic(),
             (SC_KEYRING, KeyCode::Char('a')) => {
                 self.input = Some((
                     "Login password to seal (••):".into(),
@@ -5730,6 +5827,19 @@ impl App {
 
     fn draw_fingerprint(&self, f: &mut Frame, area: Rect) {
         let mut page_actions = Vec::new();
+        if !self.fp_known {
+            self.draw_action_paragraph(
+                f,
+                area,
+                vec![
+                    section("Fingerprint (companion factor)"),
+                    Line::raw("  reader   unknown (waiting for background observation)"),
+                    Line::raw("  enrolled unknown"),
+                ],
+                &page_actions,
+            );
+            return;
+        }
         let reader = match (&self.fp.device, self.fp.available) {
             (Some(n), _) => Span::styled(format!("● {n}"), Style::new().fg(th().ok)),
             (None, true) => Span::styled("● present (unnamed)", Style::new().fg(th().ok)),
@@ -5935,13 +6045,23 @@ impl App {
                 Span::styled(note.to_string(), Style::new().dim()),
             ]));
         }
-        if self.keyring_drift == Some(true) {
-            lines.push(Line::from(vec![
-                Span::raw("  PCRs     "),
-                Span::styled(
-                    "drifted since sealing; re-arm to rebind",
-                    Style::new().fg(th().warn),
+        if armed {
+            let drift = match (self.keyring_checked_at, self.keyring_drift) {
+                (_, _) if self.keyring_load.is_some() => "checking…".into(),
+                (Some(at), Some(drifted)) => format!(
+                    "{} at last explicit check ({}s ago); [d] checks again",
+                    if drifted {
+                        "drifted since sealing"
+                    } else {
+                        "matched"
+                    },
+                    at.elapsed().as_secs(),
                 ),
+                _ => "unknown; [d] checks current PCRs".into(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  PCR check "),
+                Span::styled(drift, Style::new().dim()),
             ]));
         }
         // Show the envelope's actual policy tier when the daemon reports it.
@@ -6043,6 +6163,7 @@ impl App {
                     ("a", "re-arm (new password)"),
                     ("r", "reseal (re-bind to current PCRs)"),
                     ("f", "forget"),
+                    ("d", "check current PCRs"),
                 ],
             );
         } else {
@@ -6675,6 +6796,12 @@ impl App {
         );
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
+        if !self.heavy_known {
+            lines.push(Line::from(Span::styled(
+                "  Bitwarden status unknown (background observation pending)",
+                Style::new().dim(),
+            )));
+        }
         if matches!(
             self.heavy.clone(),
             Some(crate::bitwarden::TuiState::NeedsSetup)
@@ -6977,8 +7104,14 @@ impl App {
                     ("r", "Reseal…"),
                     ("f", "Forget…"),
                     ("p", "Refresh PCR Policy…"),
+                    ("d", "Check Current PCRs"),
                 ],
-                (true, false) => &[("a", "Connect Wallet…"), ("r", "Reseal…"), ("f", "Forget…")],
+                (true, false) => &[
+                    ("a", "Connect Wallet…"),
+                    ("r", "Reseal…"),
+                    ("f", "Forget…"),
+                    ("d", "Check Current PCRs"),
+                ],
                 (false, true) => &[
                     ("a", "Connect Wallet…"),
                     ("f", "Forget…"),
@@ -9025,6 +9158,9 @@ mod tests {
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
+            keyring_checked_at: None,
+            keyring_load: None,
+            keyring_generation: 0,
             keyring_kind: None,
             nodes: Vec::new(),
             pairs: Vec::new(),
@@ -9053,7 +9189,9 @@ mod tests {
             repair: Vec::new(),
             repair_sel: 0,
             cam_sel: 0,
-            heavy: crate::bitwarden::tui_state(),
+            heavy: None,
+            heavy_known: true,
+            heavy_load: None,
             heavy_at: std::time::Instant::now(),
             error: None,
             daemon_up: false,
@@ -9068,6 +9206,7 @@ mod tests {
             advanced: false,
             caps,
             fp_present: false,
+            fp_known: true,
             profiles_load: None,
             profiles_loaded: false,
             probes: Probes::default(),
@@ -9187,7 +9326,9 @@ mod tests {
         while (app.light_load.is_some()
             || app.probes_load.is_some()
             || app.profiles_load.is_some()
-            || app.camera_load.is_some())
+            || app.camera_load.is_some()
+            || app.heavy_load.is_some()
+            || app.keyring_load.is_some())
             && std::time::Instant::now() < deadline
         {
             app.poll();
@@ -9197,7 +9338,9 @@ mod tests {
             app.light_load.is_none()
                 && app.probes_load.is_none()
                 && app.profiles_load.is_none()
-                && app.camera_load.is_none(),
+                && app.camera_load.is_none()
+                && app.heavy_load.is_none()
+                && app.keyring_load.is_none(),
             "background loads must finish before releasing the test socket"
         );
     }
@@ -10276,16 +10419,12 @@ mod tests {
         let fake = dir.join("sudo");
         std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut new_path = dir.into_os_string();
-        new_path.push(":");
-        new_path.push(&old_path);
-        std::env::set_var("PATH", &new_path);
         let mut app = test_app();
         app.resume_enroll = Some(ResumeEnroll::New);
-        // A root test process bypasses sudo. Keep that path harmless too.
-        app.sudo_step("start the daemon", &[fake.to_str().unwrap()]);
-        std::env::set_var("PATH", &old_path);
+        // Invoke only the harmless fixture. The privileged command builder has
+        // its own tests; this exercises the child-exit state transition.
+        app.sudo_step_as("start the daemon", &[fake.to_str().unwrap()], true);
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(
             app.resume_enroll.is_none(),
             "a failed sudo must drop the parked enrollment immediately"
@@ -10297,7 +10436,7 @@ mod tests {
     }
 
     /// Exercise the real child-process path with a harmless partial write.
-    /// The fake sudo only execs our temporary script, without elevation.
+    /// Execute the temporary script directly, without elevation or PATH changes.
     fn privileged_command_outcome(script: Option<&str>) -> (App, bool) {
         use std::os::unix::fs::PermissionsExt;
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -10309,9 +10448,6 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let command = dir.join("command");
         if let Some(script) = script {
-            let sudo = dir.join("sudo");
-            std::fs::write(&sudo, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::write(
                 &command,
                 format!("#!/bin/sh\nprintf applied > \"$1\"\n{script}\n"),
@@ -10320,18 +10456,13 @@ mod tests {
             std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let marker = dir.join("partial-change");
-        let old_path = std::env::var_os("PATH");
         let mut app = test_app();
         app.resume_enroll = Some(ResumeEnroll::New);
-        std::env::set_var("PATH", &dir);
-        app.sudo_step(
+        app.sudo_step_as(
             "test action",
             &[command.to_str().unwrap(), marker.to_str().unwrap()],
+            true,
         );
-        match old_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
         let changed = marker.exists();
         std::fs::remove_dir_all(&dir).unwrap();
         (app, changed)
@@ -12070,7 +12201,6 @@ mod tests {
             preferences: None,
             keyring_armed: None,
             keyring_policy: None,
-            keyring_drift: None,
             keyring_kind: None,
             recovery: None,
         });
@@ -12078,6 +12208,178 @@ mod tests {
             app.profiles_load.is_none(),
             "a valid observed empty enrollment must not trigger another listing"
         );
+    }
+
+    #[test]
+    fn light_polls_request_metadata_and_only_cheap_compatibility_fallback() {
+        use std::io::{BufRead, Write};
+        let _guard = dead_socket();
+        for legacy in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "irlume-tui-metadata-{}-{legacy}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::env::set_var("IRLUME_SOCKET", &path);
+            let server = std::thread::spawn(move || {
+                let mut requested = Vec::new();
+                loop {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(&socket)
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Request = serde_json::from_str(&line).unwrap();
+                    let last = matches!(request, Request::RecoveryStatus { .. });
+                    let response = match &request {
+                        Request::Ping => Response::Pong,
+                        Request::KeyringMetadata { .. } if !legacy => Response::KeyringInfo {
+                            armed: true,
+                            policy: Some("test policy".into()),
+                            pcrs: vec![7],
+                            drifted: None,
+                            kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
+                        },
+                        Request::HasSealedPassword { .. } => Response::HasPassword(true),
+                        _ => Response::Error("unsupported".into()),
+                    };
+                    requested.push(request);
+                    writeln!(socket, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                    if last {
+                        break;
+                    }
+                }
+                requested
+            });
+            let state = LightState::gather("testuser", None);
+            let requests = server.join().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(state.keyring_armed, Some(true));
+            assert!(requests
+                .iter()
+                .any(|r| matches!(r, Request::KeyringMetadata { user } if user == "testuser")));
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| matches!(r, Request::KeyringInfo { .. })),
+                "idle polling must never diagnose PCRs"
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .any(|r| matches!(r, Request::HasSealedPassword { .. })),
+                legacy
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_heavy_observation_is_singleflight_and_does_not_block_quit() {
+        let mut app = test_app();
+        app.heavy_known = false;
+        app.heavy_at = std::time::Instant::now() - App::HEAVY_TTL;
+        let (release, blocked) = mpsc::channel();
+        let started = std::time::Instant::now();
+        app.refresh_heavy_with(move || {
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(Some(crate::bitwarden::TuiState::Ready))
+        });
+        app.refresh_heavy_with(|| panic!("one observer at a time"));
+        app.poll();
+        app.on_key(KeyCode::Char('q'));
+        assert!(app.quit);
+        assert!(!app.heavy_known);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.heavy_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.heavy_load.is_none());
+        assert!(app.heavy_known);
+        assert!(matches!(app.heavy, Some(crate::bitwarden::TuiState::Ready)));
+        app.refresh_heavy_with(|| Err(std::io::ErrorKind::TimedOut.into()));
+        while app.heavy_load.is_some() && std::time::Instant::now() < deadline {
+            app.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.heavy_load.is_none());
+        assert!(
+            matches!(app.heavy, Some(crate::bitwarden::TuiState::Ready)),
+            "failed refresh must preserve the last observation"
+        );
+    }
+
+    #[test]
+    fn light_metadata_preserves_explicit_drift_until_invalidated() {
+        let mut app = test_app();
+        app.profiles_loaded = true;
+        app.daemon_up = true;
+        app.keyring_armed = Some(true);
+        app.keyring_drift = Some(true);
+        app.keyring_checked_at = Some(std::time::Instant::now());
+        app.apply_light(LightState {
+            daemon_up: true,
+            reach: crate::commands::DaemonReach::Running,
+            health: None,
+            preferences: None,
+            keyring_armed: Some(true),
+            keyring_policy: None,
+            keyring_kind: None,
+            recovery: None,
+        });
+        assert_eq!(app.keyring_drift, Some(true));
+        app.screen = SC_KEYRING;
+        assert!(draw_text(&app).contains("at last explicit check"));
+        app.invalidate_keyring_diagnostic();
+        assert_eq!(app.keyring_drift, None);
+        assert!(draw_text(&app).contains("unknown; [d]"));
+        let (tx, rx) = mpsc::channel();
+        app.keyring_load = Some(rx);
+        tx.send((
+            app.keyring_generation.wrapping_sub(1),
+            Ok(Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                pcrs: vec![7],
+                drifted: Some(true),
+                kind: None,
+            }),
+        ))
+        .unwrap();
+        app.poll();
+        assert_eq!(
+            app.keyring_drift, None,
+            "a reply begun before invalidation must be discarded"
+        );
+    }
+
+    #[test]
+    fn constructor_draws_unknown_state_without_waiting_for_daemon() {
+        let _guard = dead_socket();
+        let path = std::env::temp_dir().join(format!(
+            "irlume-tui-constructor-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let started = std::time::Instant::now();
+        let mut app = App::new("testuser".into());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "construction must not wait for observations"
+        );
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        app.screen = SC_FINGERPRINT;
+        assert!(draw_text(&app).contains("unknown"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -12095,7 +12397,7 @@ mod tests {
 
     #[test]
     fn full_refresh_does_not_replace_known_caps_with_unobserved_defaults() {
-        // App::new observed real hardware; a refresh before the first sweep
+        // Health observed real hardware; a refresh before the first sweep
         // lands must not overwrite that with Probes::default() and hide the
         // camera screens.
         let _guard = dead_socket();
@@ -12202,6 +12504,7 @@ mod tests {
         app.keyring_armed = Some(true);
         app.keyring_drift = Some(true);
         app.keyring_policy = Some("pcrlock NV 0x1a2b (Tier 2)".into());
+        app.keyring_checked_at = Some(std::time::Instant::now());
         let text = draw_text(&app);
         assert!(text.contains("● armed"));
         assert!(text.contains("drifted since sealing"));
@@ -12764,7 +13067,6 @@ mod tests {
             preferences: None,
             keyring_armed: None,
             keyring_policy: None,
-            keyring_drift: None,
             keyring_kind: None,
             recovery: None,
         });
@@ -13074,6 +13376,59 @@ mod tests {
             !text.contains("this row is fine") && !text.contains("no action needed"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn failed_fingerprint_observation_preserves_unknown_and_known_reader_state() {
+        let mut app = test_app();
+        app.screen = SC_FINGERPRINT;
+        app.fp_known = false;
+        app.fp_present = true;
+        app.probes_landed = true;
+        app.recompute_checks();
+        assert!(
+            app.fp_present,
+            "an unavailable observation cannot hide the reader screen"
+        );
+        assert!(!app.fp_known);
+        assert!(draw_text(&app).contains("unknown"));
+        app.probes.fp_present = Some(true);
+        app.probes.fp.available = true;
+        app.recompute_checks();
+        assert!(app.fp_known && app.fp.available);
+        app.probes = Probes::default();
+        app.recompute_checks();
+        assert!(
+            app.fp_known && app.fp.available,
+            "failure cannot erase a known reader"
+        );
+        app.probes.fp_present = Some(false);
+        app.recompute_checks();
+        assert!(app.fp_known && !app.fp.available && !app.fp_present);
+    }
+
+    #[test]
+    fn historical_pcr_drift_never_claims_current_wallet_failure() {
+        let mut app = test_app();
+        app.keyring_armed = Some(true);
+        app.keyring_drift = Some(true);
+        app.keyring_checked_at = Some(std::time::Instant::now() - Duration::from_secs(3600));
+        app.run_checks();
+        let index = app
+            .repair
+            .iter()
+            .position(|c| c.label == "Keyring seal")
+            .unwrap();
+        let row = app.repair.remove(index);
+        app.repair = vec![row];
+        for screen in [SC_REPAIR, SC_KEYRING] {
+            app.screen = screen;
+            let text = draw_text(&app);
+            assert!(text.contains("last explicit check"), "{text}");
+            assert!(text.contains("3600s ago"), "{text}");
+            assert!(!text.contains("won't auto-unlock"), "{text}");
+            assert!(!text.contains("re-arm to rebind"), "{text}");
+        }
     }
 
     #[test]

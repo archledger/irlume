@@ -816,16 +816,7 @@ mod onnx {
                     LANDMARKER_MESH_TFLITE_SHA256,
                     TFLITE_MESH_THREADS,
                 )?;
-                let shape = session.input_shape()?;
-                if shape.len() != 4 || shape[1] != shape[2] || shape[3] != 3 {
-                    return Err(err(format!(
-                        "tflite mesh: unexpected input shape {shape:?}"
-                    )));
-                }
-                return Ok(Self {
-                    backend: MeshBackend::Tflite(session),
-                    input: shape[1] as u32,
-                });
+                return Self::from_tflite_session(session);
             }
             let session = build(model)?;
             // NHWC [1, side, side, 3]: take the declared H when static.
@@ -848,7 +839,32 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_file(path: &str) -> irlume_common::Result<Self> {
             let bytes = std::fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+            if bytes.len() >= 8 && &bytes[4..8] == b"TFL3" {
+                // TFLite keeps the serialized model alive. Transfer the file's
+                // allocation instead of cloning it through the borrowed API.
+                let session = crate::tflite::TfliteSession::from_pinned_model(
+                    irlume_common::HashedModel::new(bytes),
+                    LANDMARKER_MESH_TFLITE_SHA256,
+                    TFLITE_MESH_THREADS,
+                )?;
+                return Self::from_tflite_session(session);
+            }
             Self::load_from_memory(&bytes)
+        }
+
+        fn from_tflite_session(
+            session: crate::tflite::TfliteSession,
+        ) -> irlume_common::Result<Self> {
+            let shape = session.input_shape()?;
+            if shape.len() != 4 || shape[1] != shape[2] || shape[3] != 3 {
+                return Err(err(format!(
+                    "tflite mesh: unexpected input shape {shape:?}"
+                )));
+            }
+            Ok(Self {
+                backend: MeshBackend::Tflite(session),
+                input: shape[1] as u32,
+            })
         }
 
         /// Run FaceMesh on the face at `bbox` (frame pixel coords) with `margin`
@@ -1994,6 +2010,29 @@ mod mesh_backend_tests {
         assert!(
             e.to_string().contains("sha256 mismatch"),
             "expected the pin refusal, got: {e}"
+        );
+    }
+
+    #[test]
+    fn file_tfl3_magic_preserves_the_specific_mesh_pin() {
+        let path = std::env::temp_dir().join(format!(
+            "irlume-unverified-mesh-{}.tflite",
+            std::process::id()
+        ));
+        let mut bytes = vec![0u8; 64];
+        bytes[4..8].copy_from_slice(b"TFL3");
+        std::fs::write(&path, bytes).unwrap();
+        let result = FaceMesh::load_from_file(path.to_str().unwrap());
+        std::fs::remove_file(path).unwrap();
+        let Err(error) = result else {
+            panic!("unverified mesh must refuse before parsing");
+        };
+        assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(super::onnx::LANDMARKER_MESH_TFLITE_SHA256),
+            "the file loader must enforce the mesh-specific pin: {error}"
         );
     }
 

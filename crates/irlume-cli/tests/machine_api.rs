@@ -1017,3 +1017,190 @@ fn auth_camera_busy_is_typed_retryable_and_does_not_repeat_capture() {
         assert!(request["Authenticate"]["service"].is_null());
     }
 }
+
+/// Every accepted connection gets a quick startup reply; status must not send
+/// worker operations until the daemon says it is ready.
+#[test]
+fn status_does_not_queue_observations_while_starting() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
+    let path = std::env::temp_dir().join(format!(
+        "irlume-status-starting-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_done = Arc::clone(&done);
+    let observed = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        while !server_done.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<Value>(&line).unwrap());
+                    let _ = stream.write_all(b"{\"Ok\":\"starting\"}\n");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["status", "--json"])
+        .env("IRLUME_SOCKET", &path)
+        .output()
+        .unwrap();
+    done.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(output.status.success());
+    let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["daemon"], "starting");
+    assert_eq!(doc["data"]["enrollment"]["known"], false);
+    assert_eq!(*requests.lock().unwrap(), vec![serde_json::json!("Ping")]);
+}
+
+#[test]
+fn status_returns_within_one_budget_when_daemon_is_silent() {
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let path =
+        std::env::temp_dir().join(format!("irlume-status-silent-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _listener = UnixListener::bind(&path).unwrap();
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["status", "--json"])
+        .env("IRLUME_SOCKET", &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let timed_out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        if start.elapsed() > Duration::from_secs(4) {
+            child.kill().unwrap();
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let output = child.wait_with_output().unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(
+        !timed_out,
+        "status restarted or exceeded its observation budget"
+    );
+    assert!(output.status.success());
+    let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["daemon"], "unreachable");
+    assert_eq!(doc["data"]["enrollment"]["known"], false);
+    assert_eq!(doc["data"]["keyring"]["known"], false);
+    assert_eq!(doc["data"]["recovery"]["known"], false);
+}
+
+/// Upgrade compatibility must not turn status polling into live PCR diagnosis.
+#[test]
+fn status_uses_one_health_and_cheap_old_daemon_fallback() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
+    let path =
+        std::env::temp_dir().join(format!("irlume-status-compat-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_done = Arc::clone(&done);
+    let observed = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        while !server_done.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let reply = if request == serde_json::json!("Ping") {
+                        serde_json::json!("Pong")
+                    } else if request.get("HasSealedPassword").is_some() {
+                        serde_json::json!({ "HasPassword": true })
+                    } else {
+                        serde_json::json!({ "Error": "unsupported observation" })
+                    };
+                    observed.lock().unwrap().push(request);
+                    let mut line = serde_json::to_vec(&reply).unwrap();
+                    line.push(b'\n');
+                    let _ = stream.write_all(&line);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_irlume"))
+        .args(["status", "--json"])
+        .env("IRLUME_SOCKET", &path)
+        .output()
+        .unwrap();
+    done.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert!(output.status.success());
+    let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["daemon"], "running");
+    assert_eq!(doc["data"]["enrollment"]["known"], false);
+    assert_eq!(
+        doc["data"]["keyring"],
+        serde_json::json!({"known":true,"armed":true,"policy":null})
+    );
+    let names: Vec<String> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| r.as_object().unwrap().keys().next().unwrap().clone())
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Ping",
+            "Health",
+            "KeyringMetadata",
+            "HasSealedPassword",
+            "RecoveryStatus",
+            "ListProfiles"
+        ]
+    );
+}

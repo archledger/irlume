@@ -146,8 +146,9 @@ asked about.
   "templates": "encrypted",
   "keyring": { "known": true, "armed": true, "policy": "…" },
   "recovery": { "known": true, "passphrase_set": true, "key_present": true },
-  "camera": { "rgb": true, "ir": true },
-  "fingerprint": false
+  "camera": { "known": true, "rgb": true, "ir": true },
+  "fingerprint": false,
+  "fingerprint_known": true
 }
 ```
 
@@ -161,6 +162,20 @@ Anything derived from the daemon carries `known`. **Unknown is not zero**: when
 `known` is false the counts are absent entirely rather than reported as `0`, so a
 consumer cannot mistake "we could not find out" for "this account has nothing
 enrolled".
+
+Status observations share a two-second deadline. A starting or unreachable
+daemon receives no follow-up queries; a slow response leaves remaining fields
+unknown. This bounds daemon/helper waiting, not arbitrary filesystem or process
+scheduling delays. Keyring status reads sealed-envelope metadata without reading
+live PCRs. On an older daemon it falls back to the armed bit with a null policy.
+Use explicit keyring diagnostics when checking PCR drift.
+
+`camera.known` says a daemon Health observation was obtained. Without one, the
+RGB/IR booleans use configured-path existence only, and status never opens camera
+nodes. `fingerprint_known` says the bounded tooling/reader probe completed; when
+false, the retained `fingerprint: false` boolean is an unobserved fallback rather
+than confirmed absence. These added fields are optional for older contract-1
+producers; consumers should not infer an observation when they are absent.
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 

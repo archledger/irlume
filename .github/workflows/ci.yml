@@ -211,6 +211,7 @@ jobs:
           else
             python3 -c "import jsonschema"
           fi
+          python3 scripts/test-machine-api-conformance.py
           python3 scripts/machine-api-conformance.py \
             --irlume "${CARGO_TARGET_DIR:-target}/release/irlume" --strict
 

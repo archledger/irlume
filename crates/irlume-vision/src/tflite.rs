@@ -195,14 +195,33 @@ impl TfliteSession {
         expected_sha256: &str,
         threads: i32,
     ) -> irlume_common::Result<Self> {
-        let actual = irlume_common::sha256_hex(bytes);
+        Self::from_pinned_model(
+            irlume_common::HashedModel::new(bytes.to_vec()),
+            expected_sha256,
+            threads,
+        )
+    }
+
+    /// Consume a hashed artifact, enforcing this backend's specific pin before
+    /// loading the runtime or parsing the bytes. The model retains the original
+    /// allocation for the lifetime of the interpreter, with no byte clone.
+    ///
+    /// # Errors
+    /// Returns an error for a pin mismatch, unavailable runtime, invalid model,
+    /// or interpreter/delegate initialization failure.
+    pub fn from_pinned_model(
+        model: irlume_common::HashedModel,
+        expected_sha256: &str,
+        threads: i32,
+    ) -> irlume_common::Result<Self> {
+        let actual = model.sha256();
         if actual != expected_sha256 {
             return Err(err_str(format!(
                 "model sha256 mismatch: expected {expected_sha256}, got {actual}"
             )));
         }
         let lib = tflite_runtime().map_err(err)?;
-        let model = Model::from_bytes(lib, bytes.to_vec()).map_err(err)?;
+        let model = Model::from_bytes(lib, model.into_bytes()).map_err(err)?;
         let xnnpack = Delegate::xnnpack(lib, threads).map_err(err)?;
         let mut interp = Interpreter::builder(lib)
             .map_err(err)?
@@ -362,6 +381,42 @@ mod tests {
             panic!("wrong pin must refuse");
         };
         assert!(e.to_string().contains("sha256 mismatch"), "{e}");
+    }
+
+    #[test]
+    fn a_wrong_owned_pin_is_refused_before_anything_parses_the_bytes() {
+        let model = irlume_common::HashedModel::new(b"not a model".to_vec());
+        let Err(error) = TfliteSession::from_pinned_model(model, &"0".repeat(64), 1) else {
+            panic!("wrong pin must refuse");
+        };
+        assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+    }
+
+    #[test]
+    #[cfg(feature = "onnx")]
+    #[ignore = "requires the packaged TFLite runtime and pinned mesh"]
+    fn pinned_mesh_session_retains_the_owned_allocation() {
+        let path = std::env::var("IRLUME_TFLITE_MESH_TEST_MODEL")
+            .expect("IRLUME_TFLITE_MESH_TEST_MODEL must name the pinned production mesh");
+        std::env::var(TFLITE_LIB_ENV).expect("IRLUME_TFLITE_LIB must name the runtime");
+        let model = irlume_common::HashedModel::new(std::fs::read(path).expect("mesh bytes"));
+        let original = model.bytes().as_ptr();
+        let mut session =
+            TfliteSession::from_pinned_model(model, crate::onnx::LANDMARKER_MESH_TFLITE_SHA256, 2)
+                .expect("pinned mesh session");
+        assert_eq!(
+            session._model.data().as_ptr(),
+            original,
+            "the runtime model must own the accepted allocation without a clone"
+        );
+        let shape = session.input_shape().expect("mesh input shape");
+        let output = session
+            .run_f32(&vec![0.0; shape.iter().product()])
+            .expect("invoke with the original artifact moved into the session");
+        assert!(!output.is_empty());
+        assert!(output
+            .iter()
+            .all(|(_, data)| data.iter().all(|v| v.is_finite())));
     }
 
     #[cfg(unix)]

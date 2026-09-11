@@ -94,6 +94,7 @@ pub fn classify(req: &Request) -> Class {
         | PreferencesStatus
         | FaceSensorStatus { user: None }
         | HasSealedPassword { .. }
+        | KeyringMetadata { .. }
         | RecoveryStatus { .. }
         | RetryStatus { .. }
         | RetryReset { .. } // connection-only operation; never a camera job

@@ -205,10 +205,12 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
 fn load_shipped_recognizer(
     det_path: &str,
     model_path: &str,
-    verified: Option<&irlume_common::HashedModel>,
+    verified: Option<irlume_common::HashedModel>,
 ) -> irlume_common::Result<irlume_auth::Engine> {
     match verified {
-        Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, weights),
+        // This function owns the serialized buffer: it is dropped on return,
+        // including errors, before the caller loads any auxiliary sessions.
+        Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, &weights),
         None => irlume_auth::Engine::load(det_path, model_path),
     }
 }
@@ -277,23 +279,26 @@ fn pad_model_status(
     }
 }
 
-fn pad_model_load_allowed(path: &str, strict: bool) -> bool {
+/// Return the accepted artifact so checksum policy and parsing use one read.
+/// A refused or unreadable PAD model degrades face authentication, never exits.
+fn verified_pad_model(path: &str, strict: bool) -> Option<irlume_common::HashedModel> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!(
                 "irlumed: PAD model {path} cannot be read ({error}); face authentication is password-only"
             );
-            return false;
+            return None;
         }
     };
-    let digest = irlume_common::sha256_hex(&bytes);
+    let model = irlume_common::HashedModel::new(bytes);
+    let digest = model.sha256();
     let known = MODEL_MANIFEST
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .any(|known| known == digest);
     if known {
-        return true;
+        return Some(model);
     }
 
     eprintln!(
@@ -303,12 +308,12 @@ fn pad_model_load_allowed(path: &str, strict: bool) -> bool {
         eprintln!(
             "irlumed: IRLUME_MODELS_STRICT=1: refusing this PAD model; daemon remains available and face authentication is password-only"
         );
-        false
+        None
     } else {
         eprintln!(
             "irlumed: continuing with unverified PAD weights; set IRLUME_MODELS_STRICT=1 to refuse them"
         );
-        true
+        Some(model)
     }
 }
 
@@ -327,11 +332,15 @@ fn load_pad_models(
     );
     let vit_enabled = vit_pad_enabled();
     let vit_present = std::path::Path::new(vit_path).exists();
-    let vit_allowed = vit_enabled && vit_present && pad_model_load_allowed(vit_path, strict);
-    let (engine, vit_error) = if vit_allowed {
-        engine.with_vit_pad_degraded(vit_path)
-    } else {
-        (engine, None)
+    let vit_weights = (vit_enabled && vit_present)
+        .then(|| verified_pad_model(vit_path, strict))
+        .flatten();
+    let vit_allowed = vit_weights.is_some();
+    // Each match owns its artifact. Release the serialized RGB model before
+    // reading or constructing the IR model, including on parse failure.
+    let (engine, vit_error) = match vit_weights {
+        Some(weights) => engine.with_vit_pad_weights_degraded(weights.bytes()),
+        None => (engine, None),
     };
     if let Some(error) = &vit_error {
         eprintln!("irlumed: RGB PAD did not load ({error}); face authentication is password-only");
@@ -345,11 +354,13 @@ fn load_pad_models(
 
     let ir_enabled = pad_ir_enabled();
     let ir_present = std::path::Path::new(ir_path).exists();
-    let ir_allowed = ir_enabled && ir_present && pad_model_load_allowed(ir_path, strict);
-    let (engine, ir_error) = if ir_allowed {
-        engine.with_pad_ir_degraded(ir_path)
-    } else {
-        (engine, None)
+    let ir_weights = (ir_enabled && ir_present)
+        .then(|| verified_pad_model(ir_path, strict))
+        .flatten();
+    let ir_allowed = ir_weights.is_some();
+    let (engine, ir_error) = match ir_weights {
+        Some(weights) => engine.with_pad_ir_weights_degraded(weights.bytes()),
+        None => (engine, None),
     };
     if let Some(error) = &ir_error {
         eprintln!(
@@ -451,7 +462,7 @@ struct EngineBuildConfig {
 
 fn build_engine_from_config(
     config: &EngineBuildConfig,
-    recognizer: Option<&irlume_common::HashedModel>,
+    recognizer: Option<irlume_common::HashedModel>,
 ) -> irlume_common::Result<(
     irlume_auth::Engine,
     irlume_common::PadModelStatus,
@@ -504,7 +515,7 @@ fn rebuild_engine_from_config(
         ),
         Some(&config.model),
     );
-    build_engine_from_config(config, recognizer.as_ref())
+    build_engine_from_config(config, recognizer)
 }
 
 fn main() {
@@ -727,8 +738,8 @@ fn main() {
             //
             // `recognizer` is what startup already read, hashed and verified
             // (#346); None requests a fresh manifest check for a post-panic
-            // rebuild. Verified bytes are released after each build instead of
-            // holding 260MB for the daemon's life.
+            // rebuild. Verified recognizer bytes are released as soon as its
+            // session is built, before constructing auxiliary model sessions.
             let engine_config = EngineBuildConfig {
                 det,
                 model,
@@ -741,7 +752,7 @@ fn main() {
                 rgb_dev,
                 ir_dev,
             };
-            let build_engine = move |recognizer: Option<&irlume_common::HashedModel>| {
+            let build_engine = move |recognizer: Option<irlume_common::HashedModel>| {
                 match recognizer {
                     Some(recognizer) => build_engine_from_config(&engine_config, Some(recognizer)),
                     None => rebuild_engine_from_config(&engine_config),
@@ -749,7 +760,7 @@ fn main() {
             };
             // Bits are published before the socket binds (bind happens after the
             // models load), so no connection can observe the default EngineBits.
-            let engine = match build_engine(verified_recognizer.as_ref()) {
+            let engine = match build_engine(verified_recognizer) {
                 Ok((e, rgb_pad_status, ir_pad_status)) => {
                     eprintln!(
                         "irlumed: IR adapter {}",
@@ -792,10 +803,6 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            // ORT copied the weights into its own session at commit time, so
-            // this buffer is 260MB of dead memory from here on: release it
-            // before the enrollment sweep rather than at the end of startup.
-            drop(verified_recognizer);
             let (engine, rgb_pad_status, ir_pad_status) = engine;
             publish_engine_bits(&engine, rgb_pad_status, ir_pad_status);
 
@@ -6544,10 +6551,81 @@ mod tests {
         let pad = dir.join("liveness_vit.onnx");
         std::fs::write(&pad, b"damaged PAD weights").unwrap();
 
-        assert!(pad_model_load_allowed(&pad.to_string_lossy(), false));
-        assert!(!pad_model_load_allowed(&pad.to_string_lossy(), true));
+        assert!(verified_pad_model(&pad.to_string_lossy(), false).is_some());
+        assert!(verified_pad_model(&pad.to_string_lossy(), true).is_none());
+        std::fs::remove_file(&pad).unwrap();
+        assert!(verified_pad_model(&pad.to_string_lossy(), false).is_none());
+        assert!(verified_pad_model(&pad.to_string_lossy(), true).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_pad_bytes_survive_path_replacement_and_removal() {
+        let _guard = env_lock();
+        ort_init();
+        let dir = std::env::temp_dir().join(format!("irlume-pad-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accepted.onnx");
+        // Session construction accepts this small, real shipped ONNX graph;
+        // inference contracts are exercised by the PAD model tests separately.
+        let original = std::fs::read(model_path("blaze_face_short_range.onnx")).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let accepted = verified_pad_model(path.to_str().unwrap(), true)
+            .expect("a manifest-matching model is accepted");
+        assert_eq!(accepted.bytes(), original);
+        assert_eq!(accepted.sha256(), irlume_common::sha256_hex(&original));
+
+        std::fs::write(&path, b"replacement is not ONNX").unwrap();
+        let base = irlume_auth::Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("base engine");
+        let (base, error) = base.with_vit_pad_weights_degraded(accepted.bytes());
+        assert!(
+            error.is_none(),
+            "the checked RGB bytes must reach ORT: {error:?}"
+        );
+        assert!(base.has_vit_pad());
+        std::fs::remove_file(&path).unwrap();
+        let (base, error) = base.with_pad_ir_weights_degraded(accepted.bytes());
+        assert!(
+            error.is_none(),
+            "the checked IR bytes must reach ORT: {error:?}"
+        );
+        assert!(base.has_pad_ir());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepted_malformed_pad_bytes_report_load_failure_without_losing_engine() {
+        let _guard = env_lock();
+        ort_init();
+        let base = irlume_auth::Engine::load(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &model_path("glintr100.onnx"),
+        )
+        .expect("base engine");
+        let (base, error) = base.with_vit_pad_weights_degraded(b"malformed RGB model");
+        assert!(error.is_some());
+        assert!(!base.has_vit_pad());
+        let (base, error) = base.with_pad_ir_weights_degraded(b"malformed IR model");
+        assert!(error.is_some());
+        assert!(!base.has_pad_ir());
+        assert!(base.embed_space().starts_with("embed:"));
+    }
+
+    #[test]
+    fn shipped_recognizer_loader_owns_the_transient_model() {
+        // Ownership at this return boundary releases the recognizer buffer
+        // before build_engine_from_config starts any auxiliary model sessions.
+        let _: fn(
+            &str,
+            &str,
+            Option<irlume_common::HashedModel>,
+        ) -> irlume_common::Result<irlume_auth::Engine> = load_shipped_recognizer;
     }
 
     #[test]
@@ -6580,11 +6658,26 @@ mod tests {
             ir_dev: "/dev/irlume-test-none-ir".into(),
         };
 
-        let (_, rgb_pad, ir_pad) = build_engine_from_config(&config, None)
+        let (engine, rgb_pad, ir_pad) = build_engine_from_config(&config, None)
             .expect("damaged PAD must not make the daemon engine unavailable");
         assert_eq!(rgb_pad, irlume_common::PadModelStatus::LoadFailed);
         assert_eq!(ir_pad, irlume_common::PadModelStatus::Missing);
 
+        // Permissive mode accepts custom bytes, but parse failure still keeps
+        // both cues unavailable and retains the base engine for repair.
+        std::env::set_var("IRLUME_MODELS_STRICT", "0");
+        let (engine, rgb_pad, ir_pad) = load_pad_models(engine, &config.vit_pad, &config.vit_pad);
+        assert_eq!(rgb_pad, irlume_common::PadModelStatus::LoadFailed);
+        assert_eq!(ir_pad, irlume_common::PadModelStatus::LoadFailed);
+        assert!(!engine.has_vit_pad() && !engine.has_pad_ir());
+
+        std::env::set_var("IRLUME_PAD_VIT", "0");
+        std::env::set_var("IRLUME_PAD_IR", "0");
+        let (_, rgb_pad, ir_pad) = load_pad_models(engine, &config.vit_pad, &config.pad_ir);
+        assert_eq!(rgb_pad, irlume_common::PadModelStatus::Disabled);
+        assert_eq!(ir_pad, irlume_common::PadModelStatus::Disabled);
+        std::env::remove_var("IRLUME_PAD_VIT");
+        std::env::remove_var("IRLUME_PAD_IR");
         std::env::remove_var("IRLUME_MODELS_STRICT");
         std::env::remove_var("IRLUME_FORCE_NO_IR");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6666,7 +6759,7 @@ mod tests {
             Err(e) => e.to_string(),
         };
         let weights = irlume_common::HashedModel::new(b"pinned recognizer weights".to_vec());
-        let err = why(load_shipped_recognizer(det, model, Some(&weights)));
+        let err = why(load_shipped_recognizer(det, model, Some(weights)));
         assert!(
             !err.contains(model),
             "the recognizer path was read despite bytes in hand: {err}"

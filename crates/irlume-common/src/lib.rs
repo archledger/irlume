@@ -208,6 +208,12 @@ impl HashedModel {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Consume the artifact and transfer its allocation to an owning loader.
+    /// The digest is discarded so later mutations cannot leave a stale pair.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Make every directory above `dir` durable, so the names leading to it survive
@@ -1839,6 +1845,20 @@ mod tests {
             assert_eq!(m.bytes(), &payload[..]);
             assert_eq!(m.sha256(), super::sha256_hex(&payload));
         }
+    }
+
+    #[test]
+    fn consuming_hashed_model_preserves_the_original_allocation() {
+        let model = super::HashedModel::new(b"owned model weights".to_vec());
+        let original = model.bytes().as_ptr();
+        let digest = model.sha256().to_owned();
+        let bytes = model.into_bytes();
+        assert_eq!(
+            bytes.as_ptr(),
+            original,
+            "transfer must not clone the weights"
+        );
+        assert_eq!(super::sha256_hex(&bytes), digest);
     }
     use std::path::{Path, PathBuf};
 

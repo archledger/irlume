@@ -3523,6 +3523,21 @@ impl Engine {
         (self, None)
     }
 
+    /// Attach the RGB PAD bytes already accepted by the caller's model policy.
+    /// Parsing failures return the unchanged engine and the error. The ONNX
+    /// session owns its parsed state when this returns; the bytes can be freed.
+    #[must_use]
+    pub fn with_vit_pad_weights_degraded(
+        mut self,
+        bytes: &[u8],
+    ) -> (Self, Option<irlume_common::Error>) {
+        match irlume_vision::PadVit::load_from_memory(bytes) {
+            Ok(pad) => self.vit_pad = Some(pad),
+            Err(error) => return (self, Some(error)),
+        }
+        (self, None)
+    }
+
     pub fn has_vit_pad(&self) -> bool {
         self.vit_pad.is_some()
     }
@@ -3546,6 +3561,21 @@ impl Engine {
                 Ok(pad) => self.pad_ir = Some(pad),
                 Err(e) => return (self, Some(e)),
             }
+        }
+        (self, None)
+    }
+
+    /// Attach the IR PAD bytes already accepted by the caller's model policy.
+    /// Parsing failures return the unchanged engine and the error. The ONNX
+    /// session owns its parsed state when this returns; the bytes can be freed.
+    #[must_use]
+    pub fn with_pad_ir_weights_degraded(
+        mut self,
+        bytes: &[u8],
+    ) -> (Self, Option<irlume_common::Error>) {
+        match irlume_vision::PadIr::load_from_memory(bytes) {
+            Ok(pad) => self.pad_ir = Some(pad),
+            Err(error) => return (self, Some(error)),
         }
         (self, None)
     }

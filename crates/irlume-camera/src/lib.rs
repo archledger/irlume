@@ -2597,7 +2597,11 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
 /// needs root to see other users' processes (the daemon runs as root). Returns
 /// e.g. "kamoso (pid 2567)", or `None` if it can't tell.
 fn camera_holder(device: &str) -> Option<String> {
-    match camera_holders(device) {
+    describe_camera_holder(camera_holders(device))
+}
+
+fn describe_camera_holder(holders: Holders) -> Option<String> {
+    match holders {
         Holders::Other(who) => Some(who),
         // Only our own handle, and the scan saw everything: nothing the user
         // can close, so say what it is.
@@ -2701,11 +2705,10 @@ fn camera_holders(device: &str) -> Holders {
 
 /// What a scan that found no OTHER holder concluded, as a value.
 ///
-/// Separated out because the interesting branch is unreachable in a test: only
-/// a process that can read every `/proc` entry, in practice root, can say the
-/// holder is nobody but itself. The decision is still a function of two
-/// booleans, so it is the decision that gets tested (see #187, where a wrong
-/// answer here cost the reporter days of restarting the daemon).
+/// Test the decision independently of `/proc` permissions and PID namespaces:
+/// even an unprivileged process can inspect every visible entry in a restricted
+/// namespace. See #187, where a wrong answer cost the reporter days of
+/// restarting the daemon.
 fn holder_verdict(saw_self: bool, blind: bool) -> Holders {
     match (saw_self, blind) {
         // A blind spot outranks everything: the holder may be a process this
@@ -15234,27 +15237,22 @@ mod tests {
     /// ever presented as something to close.
     #[test]
     fn only_another_process_is_presented_as_closeable() {
-        let dir = std::env::temp_dir().join(format!("irlume-cam-holder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("held");
-        std::fs::write(&path, b"x").unwrap();
-        let _held = std::fs::File::open(&path).unwrap();
-
-        // This test runs unprivileged, so the scan cannot read every process
-        // and must decline to name anyone rather than blame irlume.
-        let who = camera_holder(path.to_str().unwrap());
-        if let Some(who) = &who {
-            assert!(
-                !who.contains("bug in irlume"),
-                "a scan with blind spots must not accuse irlume: {who}"
-            );
-        }
+        assert_eq!(
+            describe_camera_holder(Holders::Other("kamoso (pid 2567)".into())),
+            Some("kamoso (pid 2567)".into())
+        );
+        let own = describe_camera_holder(Holders::SelfOnly).unwrap();
+        assert!(
+            own.contains("bug in irlume rather than another app"),
+            "{own}"
+        );
+        // A blind scan cannot name a holder, regardless of the test runner's
+        // privileges or which processes its PID namespace makes visible.
+        assert_eq!(describe_camera_holder(Holders::UnknownBlind), None);
+        assert_eq!(describe_camera_holder(Holders::None), None);
 
         // Nothing holds a nonexistent path.
         assert_eq!(camera_holder("/dev/irlume-test-missing"), None);
-        drop(_held);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Another process holding the node wins over our own handle, because that

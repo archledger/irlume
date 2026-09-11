@@ -1,6 +1,7 @@
 # ADR-0020: Service concurrent camera queues while collecting PAD evidence
 
-**Status:** Proposed; implementation and hardware validation in progress
+**Status:** Accepted and implemented in 0.12.0; bounded ASUS validation complete,
+without a general latency or hardware-qualification claim
 **Date:** 2026-09-11
 **Related:** [ADR-0013](0013-ship-pad-models-default-on.md),
 [ADR-0014](0014-schedule-aware-pairing-budget.md),

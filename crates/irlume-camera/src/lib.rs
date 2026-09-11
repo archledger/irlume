@@ -57,6 +57,8 @@ pub use ir_target::{configured_ir_target, IrCaptureTarget, IrTargetError};
 pub mod lease;
 mod lifecycle;
 mod media_graph;
+mod paired_processing;
+pub use paired_processing::process_pair_while_draining;
 mod rate_gate;
 mod sequential_batch;
 pub use sequential_batch::{
@@ -5774,6 +5776,25 @@ pub struct IrSession<'a> {
 }
 
 impl IrSession<'_> {
+    // Match capture_pair_with's tail service: discard pixels while retaining
+    // rate/continuity checks, metadata servicing and privacy teardown.
+    fn discard_frame(&mut self) -> irlume_common::Result<()> {
+        let result = drain_pair_frame(&mut self.stream, &self.cam.device);
+        let privacy_refused = self.stream.privacy_refused();
+        let result = finish_hidden_rate_fill(result, privacy_refused, || {
+            if let Some(log) = self.meta.as_mut() {
+                log.drain();
+            }
+        });
+        if self.stream.take_privacy_refusal() {
+            let refusal = result
+                .err()
+                .unwrap_or_else(|| Error::Hardware("IR privacy refused paired drain".into()));
+            return Err(self.stop_after_privacy_refusal(refusal));
+        }
+        result
+    }
+
     /// One IR capture: a burst, the gate frame, and the burst statistics.
     ///
     /// The gate frame is a lit strobe phase, and on a source whose ceiling is
@@ -6327,22 +6348,7 @@ pub fn capture_pair_with<R: Send, I: Send>(
         let ir_thread = scope.spawn(|| {
             let lease = ir.cam.lease.clone();
             lease.run_active(|| {
-                capture_and_drain(ir, &completed, capture_ir, |ir| {
-                    let result = drain_pair_frame(&mut ir.stream, &ir.cam.device);
-                    let privacy_refused = ir.stream.privacy_refused();
-                    let result = finish_hidden_rate_fill(result, privacy_refused, || {
-                        if let Some(log) = ir.meta.as_mut() {
-                            log.drain();
-                        }
-                    });
-                    if ir.stream.take_privacy_refusal() {
-                        let refusal = result.err().unwrap_or_else(|| {
-                            Error::Hardware("IR privacy refused paired drain".into())
-                        });
-                        return Err(ir.stop_after_privacy_refusal(refusal));
-                    }
-                    result
-                })
+                capture_and_drain(ir, &completed, capture_ir, |ir| ir.discard_frame())
             })
         });
         let lease = rgb.cam.lease.clone();
@@ -9681,6 +9687,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod paired_processing_tests {
+        include!("paired_processing_tests.rs");
+    }
     mod capture_cancellation_tests {
         include!("capture_cancellation_tests.rs");
     }

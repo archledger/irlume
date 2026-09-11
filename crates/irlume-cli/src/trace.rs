@@ -6,7 +6,8 @@
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
     parse_trace, TraceEventKind, TraceLimits, TraceRecord, TraceValidator,
-    DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
+    CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
+    MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
 };
 use irlume_common::{Request, Response};
 use std::collections::BTreeMap;
@@ -68,6 +69,7 @@ fn record(output: &Path, duration: Duration) -> Result<PathBuf, String> {
         .map_err(|error| format!("connect: {error}"))?;
     let mut request = serde_json::to_vec(&Request::TraceSubscribe {
         duration_ms: requested_ms,
+        trace_schema: Some(CURRENT_TRACE_SCHEMA_VERSION),
     })
     .map_err(|error| format!("encode request: {error}"))?;
     request.push(b'\n');
@@ -338,7 +340,16 @@ fn render_timeline(records: &[TraceRecord]) -> String {
     }
 
     let mut output = String::new();
-    writeln!(output, "Irlume diagnostic trace schema 1").unwrap();
+    if let Some(record) = records.first() {
+        writeln!(
+            output,
+            "Irlume diagnostic trace schema {}",
+            record.trace_schema
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "Irlume diagnostic trace (empty)").unwrap();
+    }
     writeln!(output, "Records: {}", records.len()).unwrap();
     writeln!(output, "Events dropped before recording: {dropped}").unwrap();
     for (operation_id, operation_records) in by_operation {
@@ -414,6 +425,11 @@ mod tests {
             serde_json::from_str::<Request>(&request_line).unwrap(),
             Request::TraceSubscribe { .. }
         ));
+        let requested: serde_json::Value = serde_json::from_str(&request_line).unwrap();
+        assert_eq!(
+            requested["TraceSubscribe"]["trace_schema"], 2,
+            "current CLI must negotiate the richer trace vocabulary"
+        );
         serde_json::to_writer(&mut stream, &Response::TraceAccepted { limits }).unwrap();
         stream.write_all(b"\n").unwrap();
         for record in records {
@@ -558,5 +574,158 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".partial."))
             .count();
         assert_eq!(partials, 1);
+    }
+
+    #[test]
+    fn new_recorder_accepts_legacy_daemon_and_current_daemon_streams() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for schema in [1, 2] {
+            let dir = sandbox("negotiated");
+            let socket = dir.join("daemon.sock");
+            let target = dir.join("capture.jsonl");
+            let limits = TraceLimits::bounded(10);
+            let mut records = vec![
+                fixture_record(
+                    0,
+                    TraceEventKind::TraceStarted {
+                        limits,
+                        warning: TraceWarning::PrivilegedDiagnosticOracle,
+                    },
+                    false,
+                ),
+                fixture_record(
+                    1,
+                    TraceEventKind::Finished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                    true,
+                ),
+            ];
+            for record in &mut records {
+                record.trace_schema = schema;
+            }
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || serve_fixture(listener, limits, records));
+            let previous = std::env::var_os("IRLUME_SOCKET");
+            std::env::set_var("IRLUME_SOCKET", &socket);
+            let published = record(&target, Duration::from_millis(10));
+            match previous {
+                Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+                None => std::env::remove_var("IRLUME_SOCKET"),
+            }
+            server.join().unwrap();
+            assert_eq!(published.unwrap(), target);
+            let parsed = parse_trace(
+                BufReader::new(std::fs::File::open(&target).unwrap()),
+                limits,
+            )
+            .unwrap();
+            assert!(parsed
+                .records()
+                .iter()
+                .all(|record| record.trace_schema == schema));
+            assert!(render_timeline(parsed.records())
+                .starts_with(&format!("Irlume diagnostic trace schema {schema}\n")));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_version_stream_never_publishes_or_persists_the_bad_record() {
+        use irlume_common::diagnostics::TraceRefusalReason;
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for mislabeled_event in [false, true] {
+            let dir = sandbox("schema-refusal");
+            let socket = dir.join("daemon.sock");
+            let target = dir.join("capture.jsonl");
+            let limits = TraceLimits::bounded(10);
+            let mut started = fixture_record(
+                0,
+                TraceEventKind::TraceStarted {
+                    limits,
+                    warning: TraceWarning::PrivilegedDiagnosticOracle,
+                },
+                false,
+            );
+            started.trace_schema = 1;
+            let mut invalid = fixture_record(
+                1,
+                if mislabeled_event {
+                    TraceEventKind::AuthenticationRefusal {
+                        reason: TraceRefusalReason::RgbPadPending,
+                    }
+                } else {
+                    TraceEventKind::Finished {
+                        outcome: CategoricalOutcome::Completed,
+                    }
+                },
+                !mislabeled_event,
+            );
+            invalid.trace_schema = if mislabeled_event { 1 } else { 2 };
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server =
+                std::thread::spawn(move || serve_fixture(listener, limits, vec![started, invalid]));
+            let previous = std::env::var_os("IRLUME_SOCKET");
+            std::env::set_var("IRLUME_SOCKET", &socket);
+            let result = record(&target, Duration::from_millis(10));
+            match previous {
+                Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+                None => std::env::remove_var("IRLUME_SOCKET"),
+            }
+            server.join().unwrap();
+            assert!(result.unwrap_err().contains("unsupported trace schema"));
+            assert!(!target.exists());
+            let partial = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().contains(".partial."))
+                .unwrap();
+            let bytes = std::fs::read_to_string(partial.path()).unwrap();
+            assert_eq!(
+                bytes.lines().count(),
+                1,
+                "only validated records may be persisted"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn explanation_renders_v2_refusal_and_stage_labels_without_raw_reason_text() {
+        use irlume_common::diagnostics::{TraceRefusalReason, TraceStage};
+        let records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::AuthenticationRefusal {
+                    reason: TraceRefusalReason::RgbPadPending,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IdentityInference,
+                    elapsed_us: 12,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::StreamOwnerRelease,
+                    elapsed_us: 13,
+                },
+                false,
+            ),
+        ];
+        let rendered = render_timeline(&records);
+        assert!(rendered.starts_with("Irlume diagnostic trace schema 2\n"));
+        assert!(rendered.contains("AuthenticationRefusal { reason: RgbPadPending }"));
+        assert!(rendered.contains("IdentityInference"));
+        assert!(rendered.contains("StreamOwnerRelease"));
     }
 }

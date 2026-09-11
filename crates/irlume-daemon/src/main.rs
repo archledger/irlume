@@ -2792,11 +2792,21 @@ fn serve_peer(
             // camera operation. Serve it on this connection thread before
             // model readiness and before the arbiter so subscribing can never
             // queue behind, cancel, or take ownership from authentication.
-            if let Request::TraceSubscribe { duration_ms } = &req {
+            if let Request::TraceSubscribe {
+                duration_ms,
+                trace_schema,
+            } = &req
+            {
                 if let Some(resp) = pregate(&req, &peer) {
                     return respond(stream, &resp);
                 }
-                return serve_trace(stream, diagnostic_state, peer.uid, *duration_ms);
+                return serve_trace(
+                    stream,
+                    diagnostic_state,
+                    peer.uid,
+                    *duration_ms,
+                    *trace_schema,
+                );
             }
             // The recent-event ring and saved sensor policy exist independently
             // of model/camera readiness. Keep those observations available during
@@ -2964,8 +2974,9 @@ fn serve_trace(
     diagnostic_state: &diagnostics::DiagnosticState,
     peer_uid: u32,
     duration_ms: u64,
+    trace_schema: Option<u32>,
 ) -> std::io::Result<()> {
-    let subscription = match diagnostic_state.subscribe_trace(peer_uid, duration_ms) {
+    let subscription = match diagnostic_state.subscribe_trace(peer_uid, duration_ms, trace_schema) {
         Ok(subscription) => subscription,
         Err(diagnostics::TraceSubscribeError::NotRoot) => {
             return respond(
@@ -2977,6 +2988,12 @@ fn serve_trace(
             return respond(
                 stream,
                 &Response::Error("a diagnostic trace is already active".into()),
+            );
+        }
+        Err(diagnostics::TraceSubscribeError::UnsupportedSchema) => {
+            return respond(
+                stream,
+                &Response::Error("unsupported diagnostic trace schema".into()),
             );
         }
     };
@@ -7662,7 +7679,7 @@ mod tests {
         CameraDiagnostics => Request::CameraDiagnostics,
         SupportSnapshot => Request::SupportSnapshot { since_ms: 60_000 },
         SupportProbe => Request::SupportProbe { since_ms: 60_000 },
-        TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000 },
+        TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000, trace_schema: None },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
         PositionSession => Request::PositionSession { user: Some(u()) },
@@ -9722,32 +9739,57 @@ mod tests {
 
     #[test]
     fn trace_stream_acknowledges_bounds_then_emits_a_complete_parseable_jsonl_trace() {
+        for (requested, expected) in [(None, 1), (Some(1), 1), (Some(2), 2)] {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let state = diagnostics::DiagnosticState::default();
+            let limits = irlume_common::diagnostics::TraceLimits::bounded(1);
+            let thread =
+                std::thread::spawn(move || serve_trace(server, &state, 0, 1, requested).unwrap());
+
+            let mut payload = String::new();
+            client.read_to_string(&mut payload).unwrap();
+            thread.join().unwrap();
+            let (accepted, trace) = payload.split_once('\n').unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Response>(accepted).unwrap(),
+                Response::TraceAccepted { limits: actual } if actual == limits
+            ));
+            let parsed = irlume_common::diagnostics::parse_trace(
+                std::io::BufReader::new(trace.as_bytes()),
+                limits,
+            )
+            .unwrap();
+            assert!(matches!(
+                parsed.records().first(),
+                Some(irlume_common::diagnostics::TraceRecord {
+                    event: irlume_common::diagnostics::TraceEventKind::TraceStarted { .. },
+                    ..
+                })
+            ));
+            assert!(parsed.records().last().unwrap().terminal);
+            assert!(parsed
+                .records()
+                .iter()
+                .all(|record| record.trace_schema == expected));
+        }
+    }
+
+    #[test]
+    fn trace_stream_rejects_unsupported_schema_before_acceptance() {
         let (server, mut client) = UnixStream::pair().unwrap();
         let state = diagnostics::DiagnosticState::default();
-        let limits = irlume_common::diagnostics::TraceLimits::bounded(1);
-        let thread = std::thread::spawn(move || serve_trace(server, &state, 0, 1).unwrap());
-
+        let thread = std::thread::spawn(move || {
+            serve_trace(server, &state, 0, 1, Some(99)).unwrap();
+            assert!(state.subscribe_trace(0, 1, Some(2)).is_ok());
+        });
         let mut payload = String::new();
         client.read_to_string(&mut payload).unwrap();
         thread.join().unwrap();
-        let (accepted, trace) = payload.split_once('\n').unwrap();
+        assert_eq!(payload.lines().count(), 1);
         assert!(matches!(
-            serde_json::from_str::<Response>(accepted).unwrap(),
-            Response::TraceAccepted { limits: actual } if actual == limits
+            serde_json::from_str::<Response>(payload.trim()).unwrap(),
+            Response::Error(message) if message == "unsupported diagnostic trace schema"
         ));
-        let parsed = irlume_common::diagnostics::parse_trace(
-            std::io::BufReader::new(trace.as_bytes()),
-            limits,
-        )
-        .unwrap();
-        assert!(matches!(
-            parsed.records().first(),
-            Some(irlume_common::diagnostics::TraceRecord {
-                event: irlume_common::diagnostics::TraceEventKind::TraceStarted { .. },
-                ..
-            })
-        ));
-        assert!(parsed.records().last().unwrap().terminal);
     }
 
     #[test]

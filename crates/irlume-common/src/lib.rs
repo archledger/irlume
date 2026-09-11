@@ -692,7 +692,13 @@ pub enum Request {
     /// Explicit root-only bounded camera probe for a support report.
     SupportProbe { since_ms: u64 },
     /// Root-only subscription to one bounded daemon-authored diagnostic trace.
-    TraceSubscribe { duration_ms: u64 },
+    TraceSubscribe {
+        duration_ms: u64,
+        /// Omission selects legacy trace schema 1. Unsupported explicit
+        /// versions are refused by the daemon before subscription.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_schema: Option<u32>,
+    },
     /// Liveness/health ping.
     Ping,
     /// Daemon self-report: what it actually has loaded and which camera tier it

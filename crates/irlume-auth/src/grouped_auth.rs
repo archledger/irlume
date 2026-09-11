@@ -284,7 +284,7 @@ impl Engine {
                     )
                     .map_err(CapturePathError::into_inner)
             },
-            |engine, evidence| engine.materialize_pair_identity(evidence),
+            |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
             Instant::now,
         )?;
         match prepared {

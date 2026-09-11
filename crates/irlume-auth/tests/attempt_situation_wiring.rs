@@ -19,8 +19,8 @@ fn every_failed_attempt_emits_exactly_one_situation_line() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
     let text = std::fs::read_to_string(&src).expect("read irlume-auth/src/lib.rs");
 
-    // The snapshot is set where the assessment binds, so every Outcome the
-    // attempt returns reads facts from THIS attempt, never a stale one.
+    // Every outcome-producing route stores this assessment's facts. Eager
+    // RGB/legacy, early PAD refusal, and prepared identity have separate binds.
     let once_start = text
         .find("    fn authenticate_once(")
         .expect("authenticate_once exists");
@@ -33,9 +33,52 @@ fn every_failed_attempt_emits_exactly_one_situation_line() {
         .find("last_attempt_facts")
         .expect("the attempt stores its facts snapshot");
     let assessment_bound = once
-        .find("Ok(assessment) => assessment")
+        .find("Ok(a) => a")
         .expect("the assessment binds before the snapshot");
     assert!(snapshot > assessment_bound);
+    assert!(snapshot < once.find("self.authenticate_assessment(").unwrap());
+
+    let preparation_start = text
+        .find("    fn prepare_pair_authentication_with(")
+        .unwrap();
+    let finish_start = text.find("    fn finish_pair_authentication(").unwrap();
+    let preparation = &text[preparation_start..finish_start];
+    let pending_snapshot = preparation
+        .find("self.last_attempt_facts = AttemptFacts::from_assessment(&evidence.assessment)")
+        .unwrap();
+    assert!(
+        preparation
+            .find("if let Some(outcome) = pad_policy_refusal(")
+            .unwrap()
+            < pending_snapshot
+    );
+    assert!(
+        pending_snapshot
+            < preparation
+                .find("return Ok(PreparedPairAuthentication::Refused(outcome))")
+                .unwrap()
+    );
+
+    let finish_end = text[finish_start..]
+        .find("    fn authenticate_assessment(")
+        .unwrap()
+        + finish_start;
+    let finish = &text[finish_start..finish_end];
+    let ready_snapshot = finish
+        .find("self.last_attempt_facts = AttemptFacts::from_assessment(&a)")
+        .unwrap();
+    assert!(
+        finish
+            .find("PreparedPairAuthentication::Ready(a) =>")
+            .unwrap()
+            < ready_snapshot
+    );
+    assert!(
+        ready_snapshot
+            < finish
+                .find("self.authenticate_qualified_assessment(")
+                .unwrap()
+    );
 
     // The emission lives in the retry loop, guarded by !out.granted, so a
     // grant never logs a situation and every failure logs exactly one.

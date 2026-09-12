@@ -81,6 +81,43 @@ order and repeat on the same build/runtime/device before interpreting a small
 difference. Tensor equivalence belongs in vision preprocessing tests; the
 benchmark no longer claims that a copied loop proves production equivalence.
 
+## IR acquisition timing
+
+The existing session example also exposes fixed numeric capture-stage timings:
+
+```sh
+cargo build --release --locked -p irlume-camera --features capture-timing --example session_bench
+# Authorized camera use, as root, on an otherwise idle camera pair:
+target/release/examples/session_bench --ir-target-timing 2
+target/release/examples/session_bench --ir-sequential-timing 2
+```
+
+Both modes read an explicitly configured pair (or the existing
+`IRLUME_RGB_DEVICE`/`IRLUME_IR_DEVICE` overrides), accept 1 through 10 rounds,
+use a 20-second per-capture deadline, and retain the complete production
+delivered-rate and ten-frame burst checks. No frame files are written. JSON
+records contain capture success, fixed failure categories, dimensions,
+illumination counts, wall time and nested stage durations. A failed round stops
+the command with a nonzero exit; it is not a successful timing sample.
+
+Target mode exercises the strict experimental IR-only target topology. A
+refusal there must not be treated as missing hardware or trigger an automatic
+fallback. Sequential mode explicitly selects the existing general sequential-IR
+capture path, with RGB stopped; keep its results separate. BRIO's shared-interface
+RGB/IR topology, for example, is supported by the general path but currently
+refused by the stricter target resolver.
+
+Adaptive startup can reuse one validated warm-up timestamp as the seed for its
+full 30-delta window. Warm-up pixels are still discarded. Slow startup can spend
+the saved dequeue sliding the window, retaining the original maximum work and
+latest reachable startup window. Fixed startup and paired startup are unchanged.
+The optimization does not reduce the required window, floor or burst size.
+
+Do not sum nested stages or call these acquisition-only measurements login
+latency. Retain exact source/binary/compiler/feature identities and interleave
+baseline/candidate order. Include restoration and post-cancellation camera
+usability when qualifying an authentication change.
+
 ## One live engine authentication trial
 
 `auth_timing --help` is safe to inspect without accessing cameras. Running a

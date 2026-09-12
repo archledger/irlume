@@ -2017,16 +2017,22 @@ impl<S: ValidatedStream> TrackedStream<S> {
         // floor remain unchanged. Warm-up pixels are still discarded.
         let flush = rate_gate::startup_flush(self.rate_config.role());
         let adaptive_ir = adaptive_ir && self.rate_config.role() == contracts::StreamRole::Ir;
+        // Warm-up already validated one successful timestamp. Adaptive IR can
+        // use it as the seed instead of discarding it and waiting for another
+        // seed frame. Pixels are still discarded; all 30 deltas remain owed.
+        let retained_seed = usize::from(adaptive_ir && self.rate_window.has_only_seed());
         if flush > 0 {
             if !adaptive_ir {
                 for _ in 0..flush {
                     self.next_discarded()?;
                 }
             }
-            self.rate_window.reset();
+            if retained_seed == 0 {
+                self.rate_window.reset();
+            }
         }
         let mut attempts = 0;
-        while !self.rate_window.ready() && attempts < MAX_RATE_FILL_ATTEMPTS {
+        while !self.rate_window.ready() && attempts < MAX_RATE_FILL_ATTEMPTS - retained_seed {
             self.next_discarded()?;
             attempts += 1;
         }
@@ -2037,11 +2043,13 @@ impl<S: ValidatedStream> TrackedStream<S> {
         }
         if adaptive_ir {
             // One-shot IR may settle before the fixed exclusion is needed.
-            // Keep the full window and spend at most the existing flush budget
-            // sliding past startup. Delivery still checks the next frame's
+            // A retained seed shifts the initial window back one frame. Give
+            // that saved dequeue to sliding when necessary, so the latest
+            // reachable window and total work cap match the original path.
+            // Delivery still checks the next frame's
             // updated window, including a typed BelowFloor refusal if needed.
             let policy = self.rate_config.policy();
-            for _ in 0..flush {
+            for _ in 0..flush + retained_seed {
                 if self.rate_window.meets_floor(
                     policy.floor_num(),
                     policy.floor_den(),
@@ -11554,10 +11562,28 @@ mod tests {
     }
 
     #[test]
-    fn individual_ir_startup_keeps_its_existing_rate_work() {
+    fn adaptive_ir_reuses_warmup_seed_without_reducing_the_rate_window() {
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        IrSessionStartup::Adaptive
+            .warm_up("ir", &mut stream, &no_progress())
+            .unwrap();
+        IrSessionStartup::Adaptive.fill(&mut stream).unwrap();
+        assert_eq!(
+            stream.observations, 31,
+            "one warmup seed plus thirty validated deltas"
+        );
+        let (_, facts, _, _, evidence) = stream.next().unwrap();
+        assert_eq!(facts.sequence_raw(), 32);
+        assert_eq!(evidence.window_count(), 30);
+        assert_eq!(evidence.window_span_us(), 30 * 66_667);
+        assert!(evidence.meets_floor());
+    }
+
+    #[test]
+    fn individual_ir_startup_keeps_full_windows_and_fixed_startup_work() {
         for (startup, expected_observations) in [
             (IrSessionStartup::Fixed, 42),
-            (IrSessionStartup::Adaptive, 32),
+            (IrSessionStartup::Adaptive, 31),
         ] {
             let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
             startup.warm_up("ir", &mut stream, &no_progress()).unwrap();
@@ -11565,6 +11591,89 @@ mod tests {
             assert_eq!(stream.observations, expected_observations);
             assert!(stream.rate_window.ready());
         }
+    }
+
+    #[test]
+    fn adaptive_ir_retained_seed_preserves_the_last_recoverable_startup_window() {
+        let make = || {
+            let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+            // The final long interval ends at sequence12. It leaves the full
+            // window at42, the old path's last allowed startup observation.
+            for metadata in stream.stream_mut().unwrap().metadata.iter_mut().skip(11) {
+                let micros = 1_800_000 + i64::from(metadata.sequence) * 66_667;
+                metadata.timestamp =
+                    v4l::timestamp::Timestamp::new(micros / 1_000_000, micros % 1_000_000);
+            }
+            stream
+        };
+        for discard_seed in [false, true] {
+            let mut stream = make();
+            IrSessionStartup::Adaptive
+                .warm_up("ir", &mut stream, &no_progress())
+                .unwrap();
+            if discard_seed {
+                stream.rate_window.reset();
+            }
+            IrSessionStartup::Adaptive.fill(&mut stream).unwrap();
+            assert_eq!(stream.observations, 42);
+            let (_, facts, _, _, evidence) = stream.next().unwrap();
+            assert_eq!(facts.sequence_raw(), 43);
+            assert_eq!(evidence.window_count(), 30);
+            assert!(evidence.meets_floor());
+        }
+    }
+
+    #[test]
+    fn adaptive_ir_retained_seed_keeps_the_total_work_cap_with_corrupt_dequeues() {
+        for discard_seed in [false, true] {
+            let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 150, 200_000);
+            // Warm-up is valid; the next33dequeues carry driver error flags.
+            // The old path needs its entire64attempt fill budget, then10slides.
+            for metadata in stream
+                .stream_mut()
+                .unwrap()
+                .metadata
+                .iter_mut()
+                .skip(1)
+                .take(33)
+            {
+                metadata.flags |= v4l::buffer::Flags::ERROR;
+            }
+            IrSessionStartup::Adaptive
+                .warm_up("ir", &mut stream, &no_progress())
+                .unwrap();
+            if discard_seed {
+                stream.rate_window.reset();
+            }
+            IrSessionStartup::Adaptive.fill(&mut stream).unwrap();
+            assert_eq!(stream.observations, 1 + MAX_RATE_FILL_ATTEMPTS as u64 + 10);
+            assert_eq!(stream.rate_window.count(), 30);
+            assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
+        }
+    }
+
+    #[test]
+    fn adaptive_ir_does_not_reuse_corrupt_warmup_or_partial_windows() {
+        let mut corrupt = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        corrupt.stream_mut().unwrap().metadata[0].flags |= v4l::buffer::Flags::ERROR;
+        IrSessionStartup::Adaptive
+            .warm_up("ir", &mut corrupt, &no_progress())
+            .unwrap();
+        assert!(!corrupt.rate_window.has_only_seed());
+        IrSessionStartup::Adaptive.fill(&mut corrupt).unwrap();
+        assert_eq!(corrupt.observations, 32);
+        assert_eq!(corrupt.rate_window.count(), 30);
+
+        let mut partial = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
+        partial.next_discarded().unwrap();
+        partial.next_discarded().unwrap();
+        assert!(!partial.rate_window.has_only_seed());
+        IrSessionStartup::Adaptive.fill(&mut partial).unwrap();
+        assert_eq!(
+            partial.observations, 33,
+            "pre-existing deltas must be reset"
+        );
+        assert_eq!(partial.rate_window.count(), 30);
     }
 
     #[test]

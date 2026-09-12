@@ -8,6 +8,7 @@ use irlume_common::diagnostics::{
     SanitizedCameraContext, ShareSafeEvent, ShareSafeEventKind, SupportSnapshot, TraceEventKind,
     TraceLimits, TraceRecord, TraceWarning, CURRENT_TRACE_SCHEMA_VERSION,
     LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS, MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES,
+    V2_TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
@@ -220,7 +221,7 @@ impl DiagnosticState {
         let trace_schema = trace_schema.unwrap_or(LEGACY_TRACE_SCHEMA_VERSION);
         if !matches!(
             trace_schema,
-            LEGACY_TRACE_SCHEMA_VERSION | CURRENT_TRACE_SCHEMA_VERSION
+            LEGACY_TRACE_SCHEMA_VERSION | V2_TRACE_SCHEMA_VERSION | CURRENT_TRACE_SCHEMA_VERSION
         ) {
             return Err(TraceSubscribeError::UnsupportedSchema);
         }
@@ -787,13 +788,13 @@ mod tests {
     #[test]
     fn trace_negotiation_defaults_to_legacy_and_rejects_unknown_versions_without_ownership() {
         let state = DiagnosticState::default();
-        for unsupported in [0, 3, u32::MAX] {
+        for unsupported in [0, 4, u32::MAX] {
             assert!(matches!(
                 state.subscribe_trace(0, 60_000, Some(unsupported)),
                 Err(TraceSubscribeError::UnsupportedSchema)
             ));
         }
-        for (requested, expected) in [(None, 1), (Some(1), 1), (Some(2), 2)] {
+        for (requested, expected) in [(None, 1), (Some(1), 1), (Some(2), 2), (Some(3), 3)] {
             let subscription = state.subscribe_trace(0, 60_000, requested).unwrap();
             let mut records: Vec<_> = subscription.receiver.try_iter().collect();
             records.extend(subscription.finish(CategoricalOutcome::Completed));

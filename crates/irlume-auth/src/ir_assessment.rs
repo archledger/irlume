@@ -960,13 +960,20 @@ impl Engine {
 
     // Retain the existing helper lifetime rule: a cancelled/expired caller
     // drains the loader before returning. No camera or lease is held here.
-    fn load_ir_enrollment(
+    pub(super) fn load_ir_enrollment(
         &self,
         user: &str,
         window: AuthenticationWindow,
         read_only: bool,
+        diagnostics: Option<&dyn irlume_common::diagnostics::DiagnosticSink>,
     ) -> irlume_common::Result<Option<irlume_core::storage::Enrollment>> {
         self.check_authentication_completion(window)?;
+        // This route dispatches before the dual-sensor loader's timing site.
+        // Include resolution and any cancellation drain, but not a request
+        // rejected before loading. Read-only readiness probes pass no sink.
+        let _timer = diagnostics.map(|sink| {
+            TraceStageTimer::new(sink, irlume_common::diagnostics::TraceStage::EnrollmentLoad)
+        });
         let (sender, receiver) = std::sync::mpsc::channel();
         let user = user.to_string();
         std::thread::Builder::new()
@@ -1021,7 +1028,7 @@ impl Engine {
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return refusal;
         }
-        let enrollment = match self.load_ir_enrollment(user, window, true) {
+        let enrollment = match self.load_ir_enrollment(user, window, true, None) {
             Ok(Some(enrollment)) => enrollment,
             _ => return Ready::EnrollmentUnavailable,
         };
@@ -1046,7 +1053,7 @@ impl Engine {
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return Ok(readiness_refusal(refusal));
         }
-        let enrollment = match self.load_ir_enrollment(user, window, false)? {
+        let enrollment = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
             Some(enrollment) => enrollment,
             None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
         };

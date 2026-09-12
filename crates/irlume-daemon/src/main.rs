@@ -951,7 +951,10 @@ fn main() {
                                 reply,
                                 link,
                                 scope,
+                                enqueued_at,
                             } = job.payload;
+                            // Queue-wait boundary: submission to this take.
+                            note_queue_wait(&scope, enqueued_at);
                             // The client left while this sat in the queue: never open
                             // the camera for an answer nobody is waiting for. Release
                             // the slot first, exactly as the normal path does, so the
@@ -1514,6 +1517,55 @@ struct WorkerReply {
     completion: Option<FaceCompletion>,
 }
 
+/// Report one daemon-side timing boundary as a closed-vocabulary trace
+/// event on the request's operation scope. Bound durations saturate rather
+/// than wrap.
+fn emit_stage_timing(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    stage: irlume_common::diagnostics::TraceStage,
+    started: std::time::Instant,
+) {
+    diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+        stage,
+        elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    });
+}
+
+/// The queue-wait boundary: from the connection thread's submission to the
+/// worker taking the job. Emitted by the worker loop from the submission
+/// instant carried on the queued job.
+fn note_queue_wait(scope: &diagnostics::OperationScope, enqueued_at: std::time::Instant) {
+    use irlume_common::diagnostics::TraceStage;
+    emit_stage_timing(scope, TraceStage::QueueWait, enqueued_at);
+}
+
+/// Emits a stage boundary when the guarded scope exits, so every return
+/// path (including early refusals) reports the same completed interval.
+struct StageExitTimer<'a> {
+    diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+    stage: irlume_common::diagnostics::TraceStage,
+    started: std::time::Instant,
+}
+
+impl<'a> StageExitTimer<'a> {
+    fn new(
+        diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
+        stage: irlume_common::diagnostics::TraceStage,
+    ) -> Self {
+        Self {
+            diagnostics,
+            stage,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for StageExitTimer<'_> {
+    fn drop(&mut self) {
+        emit_stage_timing(self.diagnostics, self.stage, self.started);
+    }
+}
+
 impl std::fmt::Debug for WorkerReply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WorkerReply")
@@ -1583,6 +1635,9 @@ struct Queued {
     /// Lets the worker learn that this request's client has gone away.
     link: std::sync::Arc<ClientLink>,
     scope: diagnostics::OperationScope,
+    /// Submission instant, from which the worker measures the queue-wait
+    /// boundary. Set immediately before `arbiter.submit`.
+    enqueued_at: std::time::Instant,
 }
 
 /// The handshake between one connection thread and the camera worker, so work a
@@ -2828,6 +2883,9 @@ fn serve_peer(
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(15)))?;
+    // Ingress boundary origin: the connection thread's work from here to the
+    // queued scope (read wait, parse, posture, authorization).
+    let ingress_started = std::time::Instant::now();
     match read_request(&stream)? {
         ReadOutcome::Closed => Ok(()),
         ReadOutcome::Bad => respond(stream, &Response::Error("bad request".into())),
@@ -2930,6 +2988,15 @@ fn serve_peer(
                     (None, None)
                 };
             let scope = diagnostic_state.begin(diagnostic_operation_class(&req));
+            // The ingress boundary covers the connection thread's work up to
+            // this scope: the read deadline wait, request parse, posture gate
+            // and authorization. Measured from before the read (the scope
+            // does not exist yet then) and reported inside the operation.
+            emit_stage_timing(
+                &scope,
+                irlume_common::diagnostics::TraceStage::IngressParse,
+                ingress_started,
+            );
             let (reply, answer) = std::sync::mpsc::channel();
             let activity = live::request_kind(&req).map(|(kind, changes_state)| {
                 diagnostic_state
@@ -2949,6 +3016,7 @@ fn serve_peer(
                 reply,
                 link: std::sync::Arc::clone(&link),
                 scope: scope.clone(),
+                enqueued_at: std::time::Instant::now(),
             };
             if let Err(refusal) = arbiter.submit(class, peer.uid, queued) {
                 // Refused, not queued: answer now so the client can retry rather
@@ -4951,14 +5019,22 @@ fn dispatch_scoped_session_inner(
             };
             let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            match engine.authenticate_for_in_window_with_policy(
+            let auth_result = engine.authenticate_for_in_window_with_policy(
                 &user,
                 service.as_deref(),
                 irlume_auth::AuthenticationPurpose::for_service(service.as_deref()),
                 window,
                 sensor_policy,
                 scope,
-            ) {
+            );
+            // Engine-call boundary: the daemon's wall time around the whole
+            // engine authentication (policy refusals above never reach it).
+            emit_stage_timing(
+                scope,
+                irlume_common::diagnostics::TraceStage::EngineAuthenticate,
+                t,
+            );
+            match auth_result {
                 Ok(o) => bounded_face_response(
                     o.granted,
                     || engine.check_authentication_completion(window),
@@ -5363,6 +5439,14 @@ fn dispatch_scoped_session_inner(
             }
         }
         Request::UnsealPassword { user, service } => {
+            // Credential-release boundary: the arm's whole daemon-side
+            // interval (policy gates, face authentication, release), on every
+            // exit including the refusals below. Nests the engine-call
+            // boundary when the request reaches the engine.
+            let _credential = StageExitTimer::new(
+                scope,
+                irlume_common::diagnostics::TraceStage::CredentialUnseal,
+            );
             // The sealed LOGIN password is released ONLY to a root peer (the
             // table's RootOnly), and the refusal explains itself in the journal
             // through `note_unseal_password_refusal`, which is where the
@@ -5448,7 +5532,15 @@ fn dispatch_scoped_session_inner(
             user,
             service,
             have_password,
-        } => unseal_keyring(&user, service.as_deref(), have_password, peer),
+        } => {
+            // Credential-release boundary, same vocabulary as the password
+            // unseal: the request's whole daemon-side interval, every exit.
+            let _credential = StageExitTimer::new(
+                scope,
+                irlume_common::diagnostics::TraceStage::CredentialUnseal,
+            );
+            unseal_keyring(&user, service.as_deref(), have_password, peer)
+        }
         Request::ForgetPassword { user } => match irlume_core::keyring::forget_password(&user) {
             Ok(()) => Response::PasswordForgotten,
             Err(e) => Response::Error(e.to_string()),
@@ -6030,14 +6122,21 @@ fn do_unseal_password_scoped(
         Ok(attempt) => attempt,
         Err(reason) => return retry_unseal_refusal(reason),
     };
-    let outcome = match engine.authenticate_for_in_window_with_policy(
+    let engine_result = engine.authenticate_for_in_window_with_policy(
         user,
         service,
         credential_release_purpose(),
         window,
         sensor_policy,
         diagnostics,
-    ) {
+    );
+    // Engine-call boundary, same closed vocabulary as the Authenticate arm.
+    emit_stage_timing(
+        diagnostics,
+        irlume_common::diagnostics::TraceStage::EngineAuthenticate,
+        t,
+    );
+    let outcome = match engine_result {
         Ok(o) => o,
         Err(e) => {
             // A PCR-drift here is the ENROLLED-TEMPLATE key failing to unseal (it
@@ -8538,6 +8637,7 @@ mod tests {
                     link: std::sync::Arc::new(ClientLink::default()),
                     scope: diagnostic_state
                         .begin(irlume_common::diagnostics::OperationClass::Authentication),
+                    enqueued_at: std::time::Instant::now(),
                 },
             )
             .unwrap();
@@ -8957,6 +9057,7 @@ mod tests {
                         reply,
                         link,
                         scope,
+                        enqueued_at: _,
                     } = job.payload;
                     assert!(link.claim());
                     let response = dispatch_scoped(req, &peer, &mut engine, &scope, authorization);
@@ -9860,6 +9961,7 @@ mod tests {
                     link: std::sync::Arc::new(ClientLink::default()),
                     scope: diagnostic_state
                         .begin(irlume_common::diagnostics::OperationClass::Authentication),
+                    enqueued_at: std::time::Instant::now(),
                 },
             )
             .unwrap();
@@ -10952,6 +11054,213 @@ mod tests {
         ) {
             Response::Error(msg) => assert_eq!(msg, "not authorized to authenticate 'carol'"),
             other => panic!("foreign peer must be refused, got {other:?}"),
+        }
+    }
+
+    /// The daemon-side timing boundaries are closed-vocabulary trace events
+    /// on the request's own operation scope, so an end-to-end attribution can
+    /// label ingress, queue, engine and credential intervals without reading
+    /// the journal.
+    mod daemon_stage_boundaries {
+        use super::*;
+        use irlume_common::diagnostics::{
+            TraceEventKind, TraceStage, CURRENT_TRACE_SCHEMA_VERSION,
+        };
+
+        fn stage_records(subscription: &diagnostics::TraceSubscription) -> Vec<(TraceStage, u64)> {
+            let mut records = Vec::new();
+            while let Ok(record) = subscription.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                records.push(record);
+            }
+            records
+                .into_iter()
+                .filter_map(|record| match record.event {
+                    TraceEventKind::StageTiming { stage, elapsed_us } => Some((stage, elapsed_us)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn authenticate_arm_reports_the_engine_call_boundary() {
+            let _g = env_lock();
+            let mut e = engine();
+            let sb = sandbox("auth-stage-trace");
+            let _ = &sb;
+            let state = diagnostics::DiagnosticState::default();
+            let subscription = state
+                .subscribe_trace(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+                .unwrap();
+            let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+            // A real local account, so the retry-throttle state is
+            // readable; it is not enrolled in the sandbox, so the engine
+            // call itself denies and still exercises the boundary.
+            // SAFETY: getuid reads only this process's own real uid and
+            // is specified as always succeeding.
+            let local_user =
+                users::name_for_uid(unsafe { libc::getuid() }).unwrap_or_else(|| "root".into());
+            let reply = dispatch_scoped_session(
+                Request::Authenticate {
+                    structured_errors: false,
+                    user: local_user,
+                    // A screen-unlock service so the convenience-tier engine
+                    // still reaches the engine call. This service class takes
+                    // no intent attestation; sending one would be refused by
+                    // the confirmation gate.
+                    service: Some("kde-fingerprint".into()),
+                    intent_confirmation: None,
+                },
+                &peer(0),
+                &mut e,
+                &scope,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                matches!(reply.response, Response::AuthResult { granted: false, .. }),
+                "{:?}",
+                reply.response
+            );
+            let stages = stage_records(&subscription);
+            assert!(
+                stages.iter().any(
+                    |(stage, elapsed)| *stage == TraceStage::EngineAuthenticate && *elapsed > 0
+                ),
+                "engine call boundary missing: {stages:?}"
+            );
+        }
+
+        #[test]
+        fn unseal_password_reports_the_credential_unseal_boundary() {
+            let _g = env_lock();
+            let mut e = engine();
+            let sb = sandbox("unseal-stage-trace");
+            let _ = &sb;
+            let state = diagnostics::DiagnosticState::default();
+            let subscription = state
+                .subscribe_trace(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+                .unwrap();
+            let scope = state.begin(irlume_common::diagnostics::OperationClass::Authentication);
+            let reply = dispatch_scoped_session(
+                Request::UnsealPassword {
+                    user: "carol".into(),
+                    service: None,
+                },
+                &peer(0),
+                &mut e,
+                &scope,
+                None,
+                None,
+                None,
+            );
+            // carol has no sealed password: the request exits early, and the
+            // boundary must still report the completed (refused) interval.
+            assert!(
+                matches!(reply.response, Response::UnsealUnavailable { .. }),
+                "{:?}",
+                reply.response
+            );
+            let stages = stage_records(&subscription);
+            assert!(
+                stages
+                    .iter()
+                    .any(|(stage, elapsed)| *stage == TraceStage::CredentialUnseal && *elapsed > 0),
+                "credential boundary missing: {stages:?}"
+            );
+        }
+
+        #[test]
+        fn queued_request_reports_the_ingress_parse_boundary() {
+            use std::io::{BufRead as _, BufReader, Write as _};
+            let arbiter = arbiter::Arbiter::<Queued>::new();
+            let ready = std::sync::atomic::AtomicBool::new(true);
+            let state = diagnostics::DiagnosticState::default();
+            let subscription = state
+                .subscribe_trace(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+                .unwrap();
+            // A stand-in worker that answers from the queue: this test pins
+            // the CONNECTION-side ingress boundary, which is emitted before
+            // submission, so the answer content is irrelevant.
+            let resp = std::thread::scope(|scope| {
+                let arb = &arbiter;
+                let worker = scope.spawn(move || {
+                    while let Some(job) = arb.take() {
+                        let job_class = job.class;
+                        let job_uid = job.uid;
+                        let Queued {
+                            reply,
+                            scope: job_scope,
+                            ..
+                        } = job.payload;
+                        let resp = WorkerReply {
+                            response: Response::Error("stand-in worker".into()),
+                            completion: None,
+                        };
+                        job_scope.finish(irlume_common::diagnostics::CategoricalOutcome::Failed);
+                        arb.finish(job_class, job_uid);
+                        let _ = reply.send(resp);
+                    }
+                });
+                let resp = with_serve_as_peer_and_diagnostics(
+                    &arbiter,
+                    &ready,
+                    &state,
+                    Peer {
+                        uid: 0,
+                        gid: 0,
+                        pid: 0,
+                    },
+                    |client: &UnixStream| {
+                        let mut client = client;
+                        client
+                            .write_all(
+                                b"{\"Authenticate\":{\"user\":\"carol\",\"service\":null,\"structured_errors\":false}}\n",
+                            )
+                            .unwrap();
+                        let mut line = String::new();
+                        client
+                            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .unwrap();
+                        BufReader::new(client)
+                            .read_line(&mut line)
+                            .expect("stand-in worker answers immediately");
+                        serde_json::from_str::<Response>(line.trim()).unwrap()
+                    },
+                );
+                arbiter.close();
+                worker.join().unwrap();
+                resp
+            });
+            assert!(matches!(resp, Response::Error(_)), "{resp:?}");
+            let stages = stage_records(&subscription);
+            assert!(
+                stages
+                    .iter()
+                    .any(|(stage, elapsed)| *stage == TraceStage::IngressParse && *elapsed > 0),
+                "ingress boundary missing: {stages:?}"
+            );
+        }
+
+        /// The real worker loop must measure queue wait from the submission
+        /// instant carried on the queued job. The loop itself needs a full
+        /// engine, so the wiring is pinned on source like other structural
+        /// guarantees, while the emission behavior is covered above.
+        #[test]
+        fn worker_loop_measures_queue_wait_from_submission() {
+            let src = include_str!("main.rs");
+            let call = concat!("note_queue_wait", "(&scope, enqueued_at)");
+            assert_eq!(
+                src.matches(call).count(),
+                1,
+                "exactly the worker loop reports the queue-wait boundary from \
+                 the job's submission instant; that call moved or vanished"
+            );
+            assert!(
+                src.contains(concat!("enqueued_at: std::time::Instant", "::now()")),
+                "the queued job must carry its submission instant"
+            );
         }
     }
 

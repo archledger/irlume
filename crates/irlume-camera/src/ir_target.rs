@@ -717,7 +717,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(stream.observations, 32);
+        assert_eq!(stream.observations, 31, "reuse the validated warmup seed");
         let (_, _, _, _, evidence) = stream.next().unwrap();
         assert_eq!(evidence.window_count(), 30);
         assert!(evidence.meets_floor());

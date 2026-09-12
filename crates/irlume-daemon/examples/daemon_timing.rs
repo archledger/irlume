@@ -11,10 +11,11 @@
 
 use irlume_common::diagnostics::{
     TraceEventKind, TraceRecord, TraceStage, TraceValidator, CURRENT_TRACE_SCHEMA_VERSION,
-    MAX_TRACE_LINE_BYTES,
+    MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
 };
 use irlume_common::{Request, Response};
-use std::io::{BufReader, Read, Write as _};
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 const HELP: &str = "Usage: daemon_timing <user> [--service NAME|none] [--trials N] [--cancel-after MS] [--no-trace]
@@ -23,7 +24,12 @@ With a trace subscription (root; default on unless --no-trace) it also prints th
 daemon-side stage boundaries (schema 3). Refused and cancelled trials are labeled,
 never pooled with grants. Stage intervals may overlap or nest and are never summed.
 Unmeasured boundaries (worker reply to socket write, PAM stack, desktop unlock) are
-printed explicitly. Attended, authorized use only: cameras may open.";
+printed explicitly. Replies have a 30s deadline; cancellation must be 0..=30000ms.
+Trace collection reserves a bounded window for the whole trial plan (at most 5min)
+and waits for its terminal record. Use --no-trace for longer trial plans or old daemons.
+Attended, authorized use only: cameras may open.";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const TRACE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Options {
@@ -73,22 +79,48 @@ impl Options {
         if positional.len() != 1 {
             return Err(HELP.into());
         }
-        Ok(Self {
+        if cancel_after_ms.is_some_and(|ms| ms > 30_000) {
+            return Err("cancel-after must be 0..=30000 ms".into());
+        }
+        let options = Self {
             user: positional.remove(0),
             service,
             trials,
             cancel_after_ms,
             trace,
-        })
+        };
+        if options.trace {
+            options.trace_duration_ms()?;
+        }
+        Ok(options)
+    }
+
+    fn trace_duration_ms(&self) -> Result<u64, String> {
+        let reply = self
+            .cancel_after_ms
+            .map(Duration::from_millis)
+            .unwrap_or(REPLY_TIMEOUT);
+        // Include each connection budget and leave cancellation cleanup time.
+        // Reject rather than silently letting the server clamp away coverage.
+        let duration = (CONNECT_TIMEOUT + reply + TRACE_DRAIN_TIMEOUT) * self.trials;
+        let ms = u64::try_from(duration.as_millis()).map_err(|_| "trace plan overflow")?;
+        if ms > MAX_TRACE_DURATION_MS {
+            return Err(
+                "trial plan exceeds the 5min trace limit; use fewer trials or --no-trace".into(),
+            );
+        }
+        Ok(ms)
     }
 }
 
 /// One client-measured trial. `wall_us` is the harness's own clock around
 /// request-to-reply; it shares no origin with daemon monotonic timestamps.
+#[derive(Debug)]
 struct TrialTiming {
     wall_us: Option<u64>,
     cancelled: bool,
     outcome: String,
+    reason: Option<String>,
 }
 
 fn outcome_label(response: &Response) -> &'static str {
@@ -139,6 +171,10 @@ fn render_report(trials: &[TrialTiming], stages: &[(TraceStage, u64)]) -> String
                 }
             )),
         }
+        if let Some(reason) = &trial.reason {
+            // Debug formatting escapes terminal controls and line breaks.
+            out.push_str(&format!("  reason: {reason:?}\n"));
+        }
     }
     let granted: Vec<u64> = trials
         .iter()
@@ -184,58 +220,83 @@ fn render_report(trials: &[TrialTiming], stages: &[(TraceStage, u64)]) -> String
     out
 }
 
-fn read_bounded_line<R: Read>(reader: &mut R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+fn read_bounded_line(
+    reader: &mut BufReader<UnixStream>,
+    limit: usize,
+    deadline: Instant,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    let mut byte = [0_u8; 1];
     loop {
-        match reader.read(&mut byte) {
-            Ok(0) => {
-                return if line.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(std::io::Error::other("truncated line"))
-                };
-            }
-            Ok(_) if byte[0] == b'\n' => {
-                if line.len() > limit {
-                    return Err(std::io::Error::other("line too long"));
-                }
-                return Ok(Some(line));
-            }
-            Ok(_) => {
-                line.push(byte[0]);
-                if line.len() > limit {
-                    return Err(std::io::Error::other("line too long"));
-                }
-            }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "line deadline",
+            ));
+        }
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::Error::other("truncated line"))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.unwrap_or(available.len());
+        if count > limit.saturating_sub(line.len()) {
+            return Err(std::io::Error::other("line too long"));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count + usize::from(newline.is_some()));
+        if newline.is_some() {
+            return Ok(Some(line));
         }
     }
+}
+
+fn encode_request(request: &Request) -> Result<Vec<u8>, String> {
+    let mut bytes =
+        serde_json::to_vec(request).map_err(|error| format!("encode request: {error}"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 struct TraceConnection {
     reader: BufReader<std::os::unix::net::UnixStream>,
     validator: TraceValidator,
+    deadline: Instant,
+    coverage_deadline: Instant,
 }
 
 impl TraceConnection {
     fn subscribe(duration_ms: u64) -> Result<Self, String> {
-        let timeout = Duration::from_secs(15);
-        let mut stream = irlume_common::client::connect_stream(timeout)
+        let stream = irlume_common::client::connect_stream(CONNECT_TIMEOUT)
             .map_err(|error| format!("connect: {error}"))?;
-        let mut request = serde_json::to_vec(&Request::TraceSubscribe {
+        Self::on_stream(stream, duration_ms)
+    }
+
+    fn on_stream(mut stream: UnixStream, duration_ms: u64) -> Result<Self, String> {
+        let request = encode_request(&Request::TraceSubscribe {
             duration_ms,
             trace_schema: Some(CURRENT_TRACE_SCHEMA_VERSION),
-        })
-        .map_err(|error| format!("encode request: {error}"))?;
-        request.push(b'\n');
+        })?;
+        stream
+            .set_write_timeout(Some(CONNECT_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        let subscription_sent = Instant::now();
         stream
             .write_all(&request)
             .and_then(|()| stream.flush())
             .map_err(|error| format!("send request: {error}"))?;
         let mut reader = BufReader::new(stream);
-        let header = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES)
+        let header_deadline = Instant::now() + CONNECT_TIMEOUT;
+        let header = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES, header_deadline)
             .map_err(|error| format!("read header: {error}"))?
             .ok_or_else(|| "daemon closed before accepting the trace".to_owned())?;
         let limits = match serde_json::from_slice::<Response>(&header)
@@ -245,18 +306,43 @@ impl TraceConnection {
             Response::Error(message) => return Err(format!("trace refused: {message}")),
             other => return Err(format!("unexpected daemon response: {other:?}")),
         };
-        let validator = TraceValidator::new(limits)
+        let mut validator = TraceValidator::new(limits)
             .map_err(|error| format!("invalid daemon limits: {error}"))?;
-        Ok(Self { reader, validator })
+        if limits.duration_ms < duration_ms {
+            return Err("accepted trace window is shorter than the trial plan".into());
+        }
+        // Subscription processing can only start after this instant. Using it
+        // is conservative even when delivery of the start record is delayed.
+        let coverage_deadline = subscription_sent + Duration::from_millis(limits.duration_ms);
+        let deadline = coverage_deadline + TRACE_DRAIN_TIMEOUT;
+        // Older daemons may ignore the requested schema. Verify it before any
+        // authentication request, rather than losing timing attribution later.
+        let first = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES, header_deadline)
+            .map_err(|error| format!("read trace start: {error}"))?
+            .ok_or("trace closed before its start record")?;
+        let first = validator
+            .push_line(&first)
+            .map_err(|e| format!("invalid trace start: {e}"))?;
+        if first.trace_schema != CURRENT_TRACE_SCHEMA_VERSION
+            || !matches!(first.event, TraceEventKind::TraceStarted { .. })
+            || first.terminal
+        {
+            return Err("daemon did not start the requested schema 3 trace; use --no-trace for an older daemon".into());
+        }
+        Ok(Self {
+            reader,
+            validator,
+            deadline,
+            coverage_deadline,
+        })
     }
 
     /// Drain until the terminal record (or a timeout), returning the stage
     /// boundaries of every operation observed.
     fn drain(mut self) -> Result<Vec<(TraceStage, u64)>, String> {
         let mut stages = Vec::new();
-        let deadline = Instant::now() + TRACE_DRAIN_TIMEOUT;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err("trace did not finish within the drain timeout".into());
             }
@@ -264,29 +350,36 @@ impl TraceConnection {
                 .get_ref()
                 .set_read_timeout(Some(remaining))
                 .map_err(|error| format!("set timeout: {error}"))?;
-            let line = match read_bounded_line(&mut self.reader, MAX_TRACE_LINE_BYTES) {
-                Ok(Some(line)) => line,
-                Ok(None) => {
-                    return Err("trace ended without a terminal record".into());
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err("trace did not finish within the drain timeout".into());
-                }
-                Err(e) => return Err(format!("read trace: {e}")),
-            };
+            let line =
+                match read_bounded_line(&mut self.reader, MAX_TRACE_LINE_BYTES, self.deadline) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        return Err("trace ended without a terminal record".into());
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err("trace did not finish within the drain timeout".into());
+                    }
+                    Err(e) => return Err(format!("read trace: {e}")),
+                };
             let record: TraceRecord = self
                 .validator
                 .push_line(&line)
                 .map_err(|error| format!("invalid trace record: {error}"))?;
+            if matches!(record.event, TraceEventKind::EventsDropped { count } if count != 0) {
+                return Err("trace dropped events; timing attribution is incomplete".into());
+            }
             if let TraceEventKind::StageTiming { stage, elapsed_us } = record.event {
                 stages.push((stage, elapsed_us));
             }
             if record.terminal {
+                self.validator
+                    .finish()
+                    .map_err(|e| format!("invalid trace end: {e}"))?;
                 return Ok(stages);
             }
         }
@@ -294,30 +387,36 @@ impl TraceConnection {
 }
 
 fn one_trial(options: &Options) -> Result<TrialTiming, String> {
-    let mut stream = irlume_common::client::connect_stream(Duration::from_secs(15))
+    let stream = irlume_common::client::connect_stream(CONNECT_TIMEOUT)
         .map_err(|error| format!("connect: {error}"))?;
-    let request = serde_json::to_vec(&Request::Authenticate {
+    trial_on_stream(stream, options, REPLY_TIMEOUT)
+}
+
+fn trial_on_stream(
+    mut stream: UnixStream,
+    options: &Options,
+    reply_timeout: Duration,
+) -> Result<TrialTiming, String> {
+    let request = encode_request(&Request::Authenticate {
         user: options.user.clone(),
         service: options.service.clone(),
         structured_errors: true,
         intent_confirmation: None,
-    })
-    .map_err(|error| format!("encode request: {error}"))?;
+    })?;
     let cancel = options.cancel_after_ms.map(Duration::from_millis);
     let started = Instant::now();
+    stream
+        .set_write_timeout(Some(reply_timeout))
+        .map_err(|e| e.to_string())?;
     stream
         .write_all(&request)
         .and_then(|()| stream.flush())
         .map_err(|error| format!("send request: {error}"))?;
-    // A cancelled trial closes its own socket mid-request: the daemon learns
-    // the client left and stops the capture (ClientLink), which is the
-    // production cancellation path this harness observes.
-    if let Some(delay) = cancel {
-        std::thread::sleep(delay);
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    }
+    // Read immediately so a reply that beats cancellation keeps its actual
+    // reply interval. A deadline-triggered disconnect has no reply interval.
     let mut reader = BufReader::new(stream);
-    let line = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES);
+    let deadline = started + cancel.unwrap_or(reply_timeout).min(reply_timeout);
+    let line = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES, deadline);
     let elapsed = started.elapsed();
     match line {
         Ok(Some(line)) => {
@@ -327,18 +426,41 @@ fn one_trial(options: &Options) -> Result<TrialTiming, String> {
                 wall_us: Some(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)),
                 cancelled: false,
                 outcome: outcome_label(&response).to_owned(),
+                reason: match response {
+                    Response::AuthResult {
+                        granted: false,
+                        reason,
+                        ..
+                    } => Some(reason),
+                    Response::Error(reason) => Some(reason),
+                    _ => None,
+                },
+            })
+        }
+        Err(e)
+            if cancel.is_some()
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+        {
+            reader
+                .get_ref()
+                .shutdown(std::net::Shutdown::Both)
+                .map_err(|e| format!("cancel request: {e}"))?;
+            Ok(TrialTiming {
+                wall_us: None,
+                cancelled: true,
+                outcome: "cancelled".into(),
+                reason: None,
             })
         }
         Err(e) => Err(format!("read reply: {e}")),
         Ok(None) => Ok(TrialTiming {
             wall_us: None,
-            cancelled: cancel.is_some(),
-            outcome: if cancel.is_some() {
-                "cancelled"
-            } else {
-                "no-reply"
-            }
-            .to_owned(),
+            cancelled: false,
+            outcome: "no-reply".into(),
+            reason: None,
         }),
     }
 }
@@ -357,26 +479,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "attended, authorized measurement only; cameras may open; refused outcomes are labeled"
     );
-    let trace = match if options.trace {
-        Some(TraceConnection::subscribe(60_000))
+    let (trace, coverage_deadline) = if options.trace {
+        let connection = TraceConnection::subscribe(options.trace_duration_ms()?)?;
+        let coverage_deadline = connection.coverage_deadline;
+        // Drain while trials run: an undrained subscriber can overflow its
+        // bounded queue and lose exactly the events this tool is measuring.
+        (
+            Some(std::thread::spawn(move || connection.drain())),
+            Some(coverage_deadline),
+        )
     } else {
-        None
-    } {
-        Some(Ok(connection)) => Some(connection),
-        Some(Err(message)) => {
-            eprintln!("daemon_timing: continuing without a trace ({message})");
-            None
-        }
-        None => None,
+        (None, None)
     };
-    let mut trials = Vec::new();
-    for _ in 0..options.trials {
-        trials.push(one_trial(&options)?);
-    }
+    let trials: Result<Vec<_>, _> = (0..options.trials).map(|_| one_trial(&options)).collect();
+    let coverage_overrun = coverage_deadline.is_some_and(|deadline| Instant::now() > deadline);
     let stages = match trace {
-        Some(connection) => connection.drain()?,
-        None => Vec::new(),
+        Some(worker) => worker.join().map_err(|_| "trace reader panicked")?,
+        None => Ok(Vec::new()),
     };
+    let trials = trials?;
+    let stages = stages?;
+    if coverage_overrun {
+        return Err(
+            "trials outlasted the reserved trace window; timing attribution is incomplete".into(),
+        );
+    }
     print!("{}", render_report(&trials, &stages));
     Ok(())
 }
@@ -384,12 +511,280 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irlume_common::diagnostics::{
+        CategoricalOutcome, OperationClass, OperationId, TraceLimits, TraceWarning,
+    };
+
+    const REFUSAL: &[u8] = b"{\"AuthResult\":{\"granted\":false,\"score\":0.0,\"live\":false,\"reason\":\"no face in IR\"}}\n";
+
+    fn options(cancel: Option<u64>) -> Options {
+        Options {
+            user: "synthetic-user".into(),
+            service: Some("kde-fingerprint".into()),
+            trials: 1,
+            cancel_after_ms: cancel,
+            trace: false,
+        }
+    }
+
+    fn fake_auth(reply: Option<&'static [u8]>) -> (UnixStream, std::thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server);
+            let request = read_bounded_line(
+                &mut reader,
+                MAX_TRACE_LINE_BYTES,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Request>(&request).unwrap(),
+                Request::Authenticate { .. }
+            ));
+            if let Some(reply) = reply {
+                reader.get_mut().write_all(reply).unwrap();
+            }
+        });
+        (client, worker)
+    }
+
+    #[test]
+    fn socket_trial_sends_a_complete_request_and_preserves_refusal_reason() {
+        let (client, worker) = fake_auth(Some(REFUSAL));
+        let result = trial_on_stream(client, &options(None), REPLY_TIMEOUT).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.outcome, "refused");
+        assert_eq!(result.reason.as_deref(), Some("no face in IR"));
+        assert!(result.wall_us.is_some());
+    }
+
+    #[test]
+    fn reply_winning_cancellation_keeps_its_reply_time() {
+        let (client, worker) = fake_auth(Some(REFUSAL));
+        let result = trial_on_stream(client, &options(Some(2_000)), REPLY_TIMEOUT).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.outcome, "refused");
+        assert!(!result.cancelled);
+        assert!(
+            result.wall_us.unwrap() < 1_500_000,
+            "must not sleep to the cancellation instant after a reply"
+        );
+    }
+
+    #[test]
+    fn cancellation_disconnects_without_inventing_a_reply_interval() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let result = trial_on_stream(client, &options(Some(30)), REPLY_TIMEOUT).unwrap();
+        assert!(result.cancelled);
+        assert_eq!(result.wall_us, None);
+        let mut reader = BufReader::new(server);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(
+            read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES, deadline)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES, deadline)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peer_eof_before_cancel_is_not_a_harness_cancellation() {
+        let (client, worker) = fake_auth(None);
+        let result = trial_on_stream(client, &options(Some(2_000)), REPLY_TIMEOUT).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.outcome, "no-reply");
+        assert!(!result.cancelled);
+    }
+
+    #[test]
+    fn reply_wait_uses_its_own_budget_and_a_partial_line_cannot_extend_it() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        // An inherited connect timeout must not become the reply timeout.
+        client
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            server.write_all(REFUSAL).unwrap();
+        });
+        let result = trial_on_stream(client, &options(None), Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.outcome, "refused");
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(b"{\"AuthResult\":").unwrap();
+        let result = trial_on_stream(client, &options(None), Duration::from_millis(30));
+        assert!(result.unwrap_err().contains("read reply"));
+    }
+
+    #[test]
+    fn socket_lines_reject_oversize_and_truncation() {
+        for (bytes, limit, expected) in [
+            (b"abc\n".as_slice(), 3, true),
+            (b"abcd\n", 3, false),
+            (b"abc", 3, false),
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server.write_all(bytes).unwrap();
+            server.shutdown(std::net::Shutdown::Write).unwrap();
+            let result = read_bounded_line(
+                &mut BufReader::new(client),
+                limit,
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert_eq!(result.is_ok(), expected);
+        }
+    }
+
+    fn trace_record(
+        schema: u32,
+        sequence: u64,
+        event: TraceEventKind,
+        terminal: bool,
+    ) -> TraceRecord {
+        TraceRecord {
+            trace_schema: schema,
+            sequence,
+            monotonic_us: sequence,
+            utc_unix_ms: 0,
+            operation_id: OperationId::from_bytes([0; 16]),
+            operation: OperationClass::Authentication,
+            event,
+            terminal,
+        }
+    }
+
+    fn send_record(stream: &mut UnixStream, record: &TraceRecord) {
+        let mut bytes = serde_json::to_vec(record).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+    }
+
+    fn trace_pair(schema: u32, duration: u64) -> (UnixStream, UnixStream) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let limits = TraceLimits::bounded(duration);
+        let mut header = serde_json::to_vec(&Response::TraceAccepted { limits }).unwrap();
+        header.push(b'\n');
+        server.write_all(&header).unwrap();
+        send_record(
+            &mut server,
+            &trace_record(
+                schema,
+                0,
+                TraceEventKind::TraceStarted {
+                    limits,
+                    warning: TraceWarning::PrivilegedDiagnosticOracle,
+                },
+                false,
+            ),
+        );
+        (client, server)
+    }
+
+    #[test]
+    fn trace_rejects_ignored_schema_and_clipped_coverage_before_trials() {
+        let (client, _server) = trace_pair(1, 100);
+        assert!(TraceConnection::on_stream(client, 100)
+            .err()
+            .unwrap()
+            .contains("schema 3"));
+        let (client, _server) = trace_pair(3, 50);
+        assert!(TraceConnection::on_stream(client, 100)
+            .err()
+            .unwrap()
+            .contains("shorter"));
+    }
+
+    #[test]
+    fn trace_requires_a_terminal_record_and_rejects_dropped_events() {
+        let (client, server) = trace_pair(3, 100);
+        let connection = TraceConnection::on_stream(client, 100).unwrap();
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(connection.drain().unwrap_err().contains("terminal"));
+        let (client, mut server) = trace_pair(3, 100);
+        let connection = TraceConnection::on_stream(client, 100).unwrap();
+        send_record(
+            &mut server,
+            &trace_record(3, 1, TraceEventKind::EventsDropped { count: 1 }, false),
+        );
+        assert!(connection.drain().unwrap_err().contains("dropped"));
+    }
+
+    #[test]
+    fn trace_waits_for_the_promised_window_instead_of_a_fixed_five_second_drain() {
+        let (client, mut server) = trace_pair(3, 6_000);
+        let connection = TraceConnection::on_stream(client, 6_000).unwrap();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            send_record(
+                &mut server,
+                &trace_record(
+                    3,
+                    1,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::QueueWait,
+                        elapsed_us: 12,
+                    },
+                    false,
+                ),
+            );
+            send_record(
+                &mut server,
+                &trace_record(
+                    3,
+                    2,
+                    TraceEventKind::Finished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                    true,
+                ),
+            );
+        });
+        let stages = connection.drain().unwrap();
+        worker.join().unwrap();
+        assert_eq!(stages, vec![(TraceStage::QueueWait, 12)]);
+    }
+
+    #[test]
+    fn trace_plan_and_cancellation_are_bounded_before_connecting() {
+        let parse =
+            |args: &[&str]| Options::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parse(&["user"]).unwrap().trace_duration_ms().unwrap(),
+            50_000
+        );
+        assert_eq!(
+            parse(&["user", "--trials", "6"])
+                .unwrap()
+                .trace_duration_ms()
+                .unwrap(),
+            300_000
+        );
+        assert!(parse(&["user", "--trials", "7"]).is_err());
+        assert!(parse(&["user", "--trials", "100", "--no-trace"]).is_ok());
+        assert!(parse(&["user", "--cancel-after", "30001"]).is_err());
+    }
+
+    #[test]
+    fn refusal_reason_is_visible_but_terminal_controls_are_escaped() {
+        let mut refused = trial(Some(1_000), "refused");
+        refused.reason = Some("no face\n\x1b[2J".into());
+        let report = render_report(&[refused], &[]);
+        assert!(report.contains("no face\\n\\u{1b}[2J"));
+        assert!(!report.contains('\x1b'));
+    }
 
     fn trial(wall_us: Option<u64>, outcome: &str) -> TrialTiming {
         TrialTiming {
             wall_us,
             cancelled: outcome == "cancelled",
             outcome: outcome.to_owned(),
+            reason: None,
         }
     }
 

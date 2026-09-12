@@ -137,6 +137,31 @@ may open and the emitter can fire. `--cancel-after MS` closes the harness's
 own socket mid-request, which exercises the production client-disconnect
 cancellation path; such trials are labeled `cancelled`, never pooled.
 
+Requests are newline-framed. The connection budget is 15 seconds; a separate
+30-second deadline covers request write and reply, including a partial reply.
+`--cancel-after` accepts 0 through 30000 milliseconds. The harness reads replies
+while waiting to cancel: a complete reply that arrives first keeps its actual
+request-to-reply interval. A peer that closes first is `no-reply`, not a successful
+harness cancellation. Refusal/error reasons are printed with escaped control
+characters; grant reasons and similarity scores are omitted.
+
+Trace collection runs concurrently with the trials to avoid filling an unread
+subscriber queue. Its reserved duration is the number of trials times the sum of
+the connection budget, reply/cancellation budget, and five seconds for cleanup.
+The plan must fit the daemon's five-minute trace maximum: six ordinary trials
+fit, while longer plans require fewer trials or explicit `--no-trace`. Invalid
+plans fail before connecting. Trace-enabled runs verify the schema-3 start
+record before sending authentication requests and reject a shortened accepted
+window, dropped events, malformed/truncated streams, a missing terminal record,
+or trials outlasting the reserved window. They do not silently fall back to
+untraced measurements. The run waits
+for the reserved trace window to finish, with five seconds of terminal-delivery
+grace; this reporting wait is outside each trial's reply interval.
+
+The subscription observes all daemon operations during its window. Run on an
+otherwise quiet daemon; the stage list alone does not establish a per-trial
+association when unrelated clients also use it.
+
 The boundary vocabulary and what each interval covers:
 
 * `IngressParse`: the connection thread from the start of its read through
@@ -150,6 +175,11 @@ The boundary vocabulary and what each interval covers:
   deliberately overlaps the camera preflight, so this interval is a
   spawn-to-join resolution interval, not isolated loader CPU time. A user
   with no store at all denies before any load and emits nothing here.
+  The experimental IR-only route has a separate loader: its interval includes
+  helper resolution and any cancellation drain, before camera acquisition.
+  Missing/corrupt stores still emit a boundary when that loader was attempted;
+  a request already expired before loading emits none. Read-only IR readiness
+  probes do not emit authentication load timings.
 * `EngineAuthenticate`: the daemon's wall time around the whole engine
   authentication call, including its nested engine stages (`CameraOpen`,
   `RateEstablishment`, captures, `Detection`, `Liveness`,

@@ -12833,6 +12833,72 @@ mod engine_tests {
     }
 
     #[test]
+    fn ir_enrollment_load_traces_success_absence_and_error_without_opening_cameras() {
+        use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+
+        #[derive(Default)]
+        struct Stages(Mutex<Vec<TraceEventKind>>);
+        impl DiagnosticSink for Stages {
+            fn emit_trace(&self, event: TraceEventKind) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let _g = env_guard();
+        let s = shared();
+        let dir = state_sandbox("ir-load-trace");
+        let sink = Stages::default();
+        let user = "irlume-test-ir-load";
+        write_enrollment(&dir, &Enrollment::new(user));
+        let loaded = s
+            .engine
+            .load_ir_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.user, user);
+        // Missing and corrupt stores retain their different return semantics,
+        // and each attempted load emits one completed boundary, no capture.
+        assert!(s
+            .engine
+            .load_ir_enrollment(
+                "irlume-test-missing",
+                AuthenticationWindow::new(10_000),
+                false,
+                Some(&sink),
+            )
+            .unwrap()
+            .is_none());
+        std::fs::write(dir.join(format!("{user}.json")), b"not json").unwrap();
+        assert!(s
+            .engine
+            .load_ir_enrollment(user, AuthenticationWindow::new(10_000), false, Some(&sink),)
+            .is_err());
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            TraceEventKind::StageTiming {
+                stage: TraceStage::EnrollmentLoad,
+                ..
+            }
+        )));
+        drop(events);
+
+        // A request already outside its window must never start the loader or
+        // invent a completed-load timing. Zero means legacy one-shot, not expiry.
+        let expired = AuthenticationWindow {
+            deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            milliseconds: 1,
+        };
+        assert!(matches!(
+            s.engine
+                .load_ir_enrollment(user, expired, false, Some(&sink)),
+            Err(irlume_common::Error::DeadlineExpired)
+        ));
+        assert_eq!(sink.0.lock().unwrap().len(), 3);
+        teardown_sandbox(&dir);
+    }
+
+    #[test]
     fn identify_respects_fingerprint_mode_and_needs_a_camera() {
         let _g = env_guard();
         let mut s = shared();

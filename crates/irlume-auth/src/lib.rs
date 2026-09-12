@@ -150,6 +150,12 @@ pub use irlume_vision::Detector;
 pub struct Assessment {
     pub verdict: Verdict,
     pub reason: String,
+    /// Typed origin of the liveness refusal, from the gate that produced it.
+    /// Overrides that replace `verdict`/`reason` after the gate (stale-pair
+    /// refusal, PAD downgrades) reset this to
+    /// [`irlume_liveness::DenyCause::Other`], so classification can never see
+    /// a cause the recorded verdict did not produce.
+    pub deny_cause: irlume_liveness::DenyCause,
     /// RGB-face embedding (visible light), the primary identity.
     pub embedding: Option<[f32; EMBED_DIM]>,
     /// IR-face embedding (for dark operation), if a face was found in IR:
@@ -1082,33 +1088,47 @@ pub fn presence_retryable(o: &Outcome) -> bool {
     )
 }
 
-/// Start of the reason irlume-liveness produces when the IR format defines no
-/// sensor ceiling. Pinned against that text by
-/// `an_unmeasurable_exposure_is_not_retryable`, the same way the `no face in IR`
-/// prefix below is pinned.
-const EXPOSURE_UNMEASURABLE_PREFIX: &str = "IR exposure unmeasurable";
-
 /// Kind of a non-Live cross-spectrum gate verdict on the RGB primary path.
-/// The `no face in IR` reason is singled out because it is the retryable
-/// RGB-yes/IR-no transient; the prefix is pinned against the string
-/// irlume-liveness produces by `grace_retries_only_presence_failures`.
-fn liveness_deny_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
-    match verdict {
+/// The retryable RGB-yes/IR-no transient and the unmeasurable-exposure
+/// refusal arrive as typed causes from irlume-liveness (see
+/// [`irlume_liveness::DenyCause`]), produced where the gate produces its
+/// refusal; the reason strings stay human-facing only. Parity with the
+/// prefix matching this replaced is pinned by
+/// `typed_cause_classification_matches_the_prefix_contract`.
+fn liveness_deny_kind(verdict: Verdict, cause: irlume_liveness::DenyCause) -> OutcomeKind {
+    use irlume_liveness::DenyCause;
+    match (verdict, cause) {
         // Uncertain normally means framing or quality, which the grace window
         // retries. An unmeasurable IR format is neither: it is a property of
         // the camera that will hold for every frame, so retrying spends the
         // whole window to reach the same answer while telling the user to
         // adjust something that cannot help (#358). Report unavailable,
         // preserving terminal fallback and the existing account strike.
-        Verdict::Uncertain if reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX) => {
-            OutcomeKind::RuntimeUnavailable
-        }
-        Verdict::Uncertain => OutcomeKind::Uncertain,
-        Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
-        Verdict::Spoof => OutcomeKind::Spoof,
+        (Verdict::Uncertain, DenyCause::ExposureUnmeasurable) => OutcomeKind::RuntimeUnavailable,
+        (Verdict::Uncertain, _) => OutcomeKind::Uncertain,
+        // `no face in IR` is the retryable RGB-yes/IR-no transient; the typed
+        // cause carries it, so the reason prose below stays free to evolve.
+        (Verdict::Spoof, DenyCause::NoIrFace) => OutcomeKind::SpoofNoIrFace,
+        (Verdict::Spoof, _) => OutcomeKind::Spoof,
         // Callers only classify rejections; a Live verdict never reaches here.
-        Verdict::Live => OutcomeKind::OtherDeny,
+        (Verdict::Live, _) => OutcomeKind::OtherDeny,
     }
+}
+
+/// Report the enrollment-load boundary for a completed load. On the
+/// synchronous path this is the store load itself; on the deferred path it
+/// is the spawn-to-join resolution interval, which deliberately overlaps the
+/// camera preflight the unseal was deferred behind (stages may nest; never
+/// sum them). Not emitted when no load was ever attempted (the pre-check
+/// instant deny for a user with no store).
+fn emit_enrollment_load_timing(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    started: std::time::Instant,
+) {
+    diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+        stage: irlume_common::diagnostics::TraceStage::EnrollmentLoad,
+        elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    });
 }
 
 fn emit_trace_stage_ms(
@@ -4073,7 +4093,8 @@ impl Engine {
             rgb_moire_score: rgb_moire,
         };
         let liveness_started = std::time::Instant::now();
-        let (verdict, _cues, reason) = self.gate.evaluate_rgb_only(&signals);
+        let (verdict, cues, reason) = self.gate.evaluate_rgb_only(&signals);
+        let deny_cause = cues.deny_cause;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Liveness,
             elapsed_us: u64::try_from(liveness_started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -4106,7 +4127,7 @@ impl Engine {
             _ => PadEvidence::NotApplicable,
         };
         self.check_request_active()?;
-        let (verdict, reason) = match rgb_pad {
+        let (verdict, reason, deny_cause) = match rgb_pad {
             PadEvidence::Score(p) => {
                 irlume_common::dlog!("pad-vit(rgb-only): p_spoof {p:.3}");
                 if self.vit_pad_votes_deny(p) {
@@ -4116,12 +4137,13 @@ impl Engine {
                     (
                         Verdict::Spoof,
                         "RGB PAD cue flags a spoof; use your password".into(),
+                        irlume_liveness::DenyCause::Other,
                     )
                 } else {
-                    (verdict, reason)
+                    (verdict, reason, deny_cause)
                 }
             }
-            _ => (verdict, reason),
+            _ => (verdict, reason, deny_cause),
         };
         self.check_request_active()?;
         let embedding = match &rgb_top {
@@ -4135,6 +4157,7 @@ impl Engine {
         Ok(Assessment {
             verdict,
             reason,
+            deny_cause,
             embedding,
             rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
             ir_embedding: None,
@@ -4944,6 +4967,9 @@ impl Engine {
                 });
                 return Ok(DeferredAssessment { assessment: Assessment {
                     verdict: Verdict::Uncertain,
+                    // Never reached the gate; the default cause classifies the
+                    // custom reason exactly as the prefix rule did.
+                    deny_cause: irlume_liveness::DenyCause::Other,
                     rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
                     reason: format!(
                         "RGB and IR frames are {}ms apart (limit {}ms); they may not show the same moment",
@@ -5048,10 +5074,13 @@ impl Engine {
             rgb_specular_frac: 0.0,
         };
         let liveness_started = std::time::Instant::now();
-        let (verdict, _cues, reason) = match stale_pair_reason {
+        let (verdict, cues, reason) = match stale_pair_reason {
+            // A stale pair never reached the gate; the default cues carry no
+            // typed cause, which is the correct classification for it.
             Some(reason) => (Verdict::Uncertain, Default::default(), reason),
             None => self.gate.evaluate(&signals),
         };
+        let deny_cause = cues.deny_cause;
         // Log the cue values on PASS too; a near-miss on a genuine user is
         // invisible in the outcome line but obvious here.
         irlume_common::dlog!(
@@ -5092,18 +5121,20 @@ impl Engine {
             PadEvidence::Score(p) => Some(p),
             _ => None,
         };
-        let (verdict, reason) = if pad_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD) {
-            let pf = shipped_ir_fake.unwrap_or(1.0);
-            irlume_common::dlog!(
-                "pad-ir: p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
-            );
-            (
-                Verdict::Spoof,
-                "IR PAD cue flags a spoof; use your password".into(),
-            )
-        } else {
-            (verdict, reason)
-        };
+        let (verdict, reason, deny_cause) =
+            if pad_downgrades(verdict, shipped_ir_fake, IR_PAD_THRESHOLD) {
+                let pf = shipped_ir_fake.unwrap_or(1.0);
+                irlume_common::dlog!(
+                    "pad-ir: p_fake {pf:.3} >= {IR_PAD_THRESHOLD:.2}; downgrading Live to Spoof"
+                );
+                (
+                    Verdict::Spoof,
+                    "IR PAD cue flags a spoof; use your password".into(),
+                    irlume_liveness::DenyCause::Other,
+                )
+            } else {
+                (verdict, reason, deny_cause)
+            };
         // Shipped ViT RGB PAD cue (ADR-0013, default-on): score the RGB face
         // only on frames the (already post-IR-PAD) verdict still calls Live —
         // deny-only cues never need to run on frames that already deny, and
@@ -5133,7 +5164,7 @@ impl Engine {
             _ => PadEvidence::NotApplicable,
         };
         self.check_request_active()?;
-        let (verdict, reason) = match rgb_pad {
+        let (verdict, reason, deny_cause) = match rgb_pad {
             PadEvidence::Score(p) => {
                 irlume_common::dlog!("pad-vit: p_spoof {p:.3}");
                 if self.vit_pad_votes_deny(p) {
@@ -5143,12 +5174,13 @@ impl Engine {
                     (
                         Verdict::Spoof,
                         "RGB PAD cue flags a spoof; use your password".into(),
+                        irlume_liveness::DenyCause::Other,
                     )
                 } else {
-                    (verdict, reason)
+                    (verdict, reason, deny_cause)
                 }
             }
-            _ => (verdict, reason),
+            _ => (verdict, reason, deny_cause),
         };
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
             stage: irlume_common::diagnostics::TraceStage::Liveness,
@@ -5161,6 +5193,7 @@ impl Engine {
         let assessment = Assessment {
             verdict,
             reason,
+            deny_cause,
             embedding: None,
             rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
             ir_embedding: None,
@@ -5479,7 +5512,11 @@ impl Engine {
         // path resolves `enr` at the join below, after camera setup.
         let loader_was_async = loader.receiver.is_some();
         let sync_enr = if loader.receiver.is_none() {
-            match irlume_core::storage::load(user)? {
+            let loaded = irlume_core::storage::load(user)?;
+            // Completed work boundary: the plaintext store load itself,
+            // before any policy decision on its content.
+            emit_enrollment_load_timing(diagnostics, load_started);
+            match loaded {
                 Some(enr) => match self.enrollment_policy_refusal(user, &enr) {
                     Some(outcome) => return Ok(outcome),
                     None => Some(enr),
@@ -5575,7 +5612,12 @@ impl Engine {
         let enr = match loader.receiver.take() {
             Some(rx) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                match resolve_loader(rx.recv_timeout(remaining)) {
+                let resolved = resolve_loader(rx.recv_timeout(remaining));
+                // The deferred store load just finished (or failed bounded):
+                // report the resolution interval, which by design overlaps
+                // the camera preflight it was deferred behind.
+                emit_enrollment_load_timing(diagnostics, load_started);
+                match resolved {
                     Ok(enr) => enr,
                     Err(LoaderExit::NotEnrolled) => {
                         return Ok(Outcome::deny(
@@ -6064,7 +6106,7 @@ impl Engine {
         // dark path's own retryability kinds.
         if uncertain_short_circuits(a.verdict, a.embedding.is_some(), a.ir_embedding.is_some()) {
             return Ok(Outcome::deny(
-                liveness_deny_kind(a.verdict, &a.reason),
+                liveness_deny_kind(a.verdict, a.deny_cause),
                 format!("liveness {:?}: {}", a.verdict, a.reason),
             ));
         }
@@ -6088,7 +6130,7 @@ impl Engine {
         if let Some(probe) = a.embedding {
             if a.verdict != Verdict::Live {
                 return Ok(Outcome::deny(
-                    liveness_deny_kind(a.verdict, &a.reason),
+                    liveness_deny_kind(a.verdict, a.deny_cause),
                     format!("liveness {:?}: {}", a.verdict, a.reason),
                 ));
             }
@@ -6302,7 +6344,7 @@ impl Engine {
                 };
                 return Ok(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
-            let (verdict, _cues, reason) = self.gate.evaluate_ir_only(&a.signals);
+            let (verdict, cues, reason) = self.gate.evaluate_ir_only(&a.signals);
             diagnostics.emit_trace(irlume_liveness::diagnostic_trace_decision(
                 verdict, &a.signals,
             ));
@@ -6326,13 +6368,14 @@ impl Engine {
                 // as Uncertain too, and an inline map would leave it in the
                 // retryable class on exactly the camera this gate exists for:
                 // six full captures reaching the identical answer, every dark
-                // login, forever. The classifier holds the one prefix rule
+                // login, forever. The classifier holds the typed-cause rule
                 // (#358 review).
                 //
                 // `reason` here is the raw liveness string; the "dark liveness"
-                // prefix is applied in the `format!` below, after this call, so
-                // the prefix match still sees what irlume-liveness produced.
-                let kind = liveness_deny_kind(verdict, &reason);
+                // prefix is applied in the `format!` below, after this call.
+                // Classification reads the typed cause the same evaluator
+                // produced, not the decorated reason.
+                let kind = liveness_deny_kind(verdict, cues.deny_cause);
                 return Ok(Outcome::deny(
                     kind,
                     format!("dark liveness {verdict:?}: {reason}"),
@@ -8858,14 +8901,21 @@ mod tests {
             ..Default::default()
         };
         sig.ir_ceiling_known = false;
-        let (verdict, _, reason) = irlume_liveness::LivenessGate::new().evaluate(&sig);
+        let (verdict, cues, reason) = irlume_liveness::LivenessGate::new().evaluate(&sig);
         assert_eq!(verdict, Verdict::Uncertain, "precondition for this test");
+        // The wording stays pinned even though routing no longer reads it: it
+        // must keep refusing to advise something that cannot help (#358).
         assert!(
             reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
-            "the prefix this routing keys on moved: {reason}"
+            "the pinned producer wording moved: {reason}"
+        );
+        assert_eq!(
+            cues.deny_cause,
+            irlume_liveness::DenyCause::ExposureUnmeasurable,
+            "the producer must type this refusal at its origin"
         );
 
-        let kind = liveness_deny_kind(verdict, &reason);
+        let kind = liveness_deny_kind(verdict, cues.deny_cause);
         assert_eq!(
             kind,
             OutcomeKind::RuntimeUnavailable,
@@ -8881,8 +8931,8 @@ mod tests {
         let mut blown = sig.clone();
         blown.ir_ceiling_known = true;
         blown.ir_saturated_frac = Some(0.9);
-        let (bv, _, br) = irlume_liveness::LivenessGate::new().evaluate(&blown);
-        let bk = liveness_deny_kind(bv, &br);
+        let (bv, bc, br) = irlume_liveness::LivenessGate::new().evaluate(&blown);
+        let bk = liveness_deny_kind(bv, bc.deny_cause);
         assert_eq!(bk, OutcomeKind::Uncertain, "{br}");
         assert!(presence_retryable(&denied(bk, &br, false)), "{br}");
 
@@ -8892,13 +8942,17 @@ mod tests {
         // site mapping inline, so on the one camera class this gate exists for
         // a dark login burned the whole grace window reaching this answer
         // repeatedly (#358 review).
-        let (dv, _, dr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&sig);
+        let (dv, dc, dr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&sig);
         assert_eq!(dv, Verdict::Uncertain, "precondition: {dr}");
         assert!(
             dr.starts_with(EXPOSURE_UNMEASURABLE_PREFIX),
-            "the dark evaluator stopped producing the pinned prefix: {dr}"
+            "the dark evaluator stopped producing the pinned wording: {dr}"
         );
-        let dk = liveness_deny_kind(dv, &dr);
+        assert_eq!(
+            dc.deny_cause,
+            irlume_liveness::DenyCause::ExposureUnmeasurable
+        );
+        let dk = liveness_deny_kind(dv, dc.deny_cause);
         assert_eq!(dk, OutcomeKind::RuntimeUnavailable, "{dr}");
         assert!(!presence_retryable(&denied(dk, &dr, false)), "{dr}");
 
@@ -8908,9 +8962,13 @@ mod tests {
         dark_flat.ir_ceiling_known = true;
         dark_flat.ir_saturated_frac = Some(0.0);
         dark_flat.ir_center_edge_ratio = 0.1;
-        let (fv, _, fr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&dark_flat);
+        let (fv, fc, fr) = irlume_liveness::LivenessGate::new().evaluate_ir_only(&dark_flat);
         assert_eq!(fv, Verdict::Spoof, "precondition: {fr}");
-        assert_eq!(liveness_deny_kind(fv, &fr), OutcomeKind::Spoof, "{fr}");
+        assert_eq!(
+            liveness_deny_kind(fv, fc.deny_cause),
+            OutcomeKind::Spoof,
+            "{fr}"
+        );
     }
 
     /// Every liveness verdict becomes an `OutcomeKind` through
@@ -8945,22 +9003,99 @@ mod tests {
             "these sites classify a liveness verdict by hand instead of calling \
              liveness_deny_kind, so they do not inherit its retryability rules: {offenders:?}"
         );
-        // Not vacuous: the call site must actually be there, or this test
-        // would pass by having nothing to look at. The needle is assembled
-        // from pieces so it does not appear verbatim in the file it scans;
-        // spelled inline, the assertion matched its own source and stayed
+        // Not vacuous: the call sites must actually be there, or this test
+        // would pass by having nothing to look at. The needles are assembled
+        // from pieces so they do not appear verbatim in the file they scan;
+        // spelled inline, an assertion matched its own source and stayed
         // green with the real call site deleted.
-        let needle = concat!("liveness_deny_kind", "(verdict, &reason)");
+        let stored = concat!("liveness_deny_kind", "(a.verdict, a.deny_cause)");
+        let fresh = concat!("liveness_deny_kind", "(verdict, cues.deny_cause)");
         assert!(
-            src.matches(needle).count() >= 2,
+            src.matches(stored).count() + src.matches(fresh).count() >= 5,
             "the deny sites that route through liveness_deny_kind are gone; \
              the rule this test pins has nothing left to hold"
         );
     }
 
+    /// Start of the reason irlume-liveness produces when the IR format
+    /// defines no sensor ceiling. Routing no longer keys on this prefix (the
+    /// typed [`irlume_liveness::DenyCause`] carries it); this literal keeps
+    /// pinning the producer's wording so the user-facing explanation cannot
+    /// silently drift into advice that cannot help (#358).
+    const EXPOSURE_UNMEASURABLE_PREFIX: &str = "IR exposure unmeasurable";
+
+    /// The prefix rules the typed classifier replaced, kept here as the
+    /// parity oracle: for every (verdict, cause, reason) triple the producers
+    /// emit, the typed classifier must agree with the prefix classifier it
+    /// replaced.
+    fn legacy_prefix_kind(verdict: Verdict, reason: &str) -> OutcomeKind {
+        match verdict {
+            Verdict::Uncertain if reason.starts_with(EXPOSURE_UNMEASURABLE_PREFIX) => {
+                OutcomeKind::RuntimeUnavailable
+            }
+            Verdict::Uncertain => OutcomeKind::Uncertain,
+            Verdict::Spoof if reason.starts_with("no face in IR") => OutcomeKind::SpoofNoIrFace,
+            Verdict::Spoof => OutcomeKind::Spoof,
+            Verdict::Live => OutcomeKind::OtherDeny,
+        }
+    }
+
+    #[test]
+    fn typed_cause_classification_matches_the_prefix_contract() {
+        use irlume_liveness::DenyCause;
+        let cases = [
+            (
+                Verdict::Uncertain,
+                DenyCause::ExposureUnmeasurable,
+                "IR exposure unmeasurable: this camera's IR format defines no sensor \
+                 ceiling, so clipping cannot be checked and the liveness cues cannot \
+                 be trusted. Report the camera so its format can be supported.",
+            ),
+            (
+                Verdict::Uncertain,
+                DenyCause::Other,
+                "IR frame blown out (90% of the face at the sensor ceiling); move \
+                 back or dim the light",
+            ),
+            (
+                Verdict::Uncertain,
+                DenyCause::Other,
+                "not facing the camera (yaw 0.50, pitch 0.10); look directly at it",
+            ),
+            (Verdict::Uncertain, DenyCause::NoIrFace, "no face in IR"),
+            (
+                Verdict::Spoof,
+                DenyCause::NoIrFace,
+                "no face in IR: a real face reflects 850nm; a screen/print does not",
+            ),
+            (
+                Verdict::Spoof,
+                DenyCause::Other,
+                "IR too flat (center/edge 0.90); looks 2D, not a 3D face",
+            ),
+            (
+                Verdict::Spoof,
+                DenyCause::Other,
+                "IR PAD cue flags a spoof; use your password",
+            ),
+            (
+                Verdict::Live,
+                DenyCause::Other,
+                "live: face in RGB+IR, co-located, frontal, IR-reflective, 3D",
+            ),
+        ];
+        for (verdict, cause, reason) in cases {
+            assert_eq!(
+                liveness_deny_kind(verdict, cause),
+                legacy_prefix_kind(verdict, reason),
+                "typed drift: {verdict:?} + {cause:?} ({reason})"
+            );
+        }
+    }
+
     #[test]
     fn grace_retries_only_presence_failures() {
-        use irlume_liveness::Verdict;
+        use irlume_liveness::{DenyCause, Verdict};
         // Retryable: the user simply was not usably in frame yet. Strings are
         // built exactly as the authenticate path builds them, and kinds come
         // from the same classifier the construction sites use, so this test
@@ -8972,7 +9107,7 @@ mod tests {
         );
         assert_retryable(
             &denied(
-                liveness_deny_kind(Verdict::Uncertain, "not facing the camera"),
+                liveness_deny_kind(Verdict::Uncertain, DenyCause::Other),
                 &format!("liveness {:?}: not facing the camera", Verdict::Uncertain),
                 false,
             ),
@@ -8990,7 +9125,7 @@ mod tests {
         // settling into frame (safe: a real screen never grows an IR face).
         assert_retryable(
             &denied(
-                liveness_deny_kind(Verdict::Spoof, "no face in IR: a real face reflects 850nm"),
+                liveness_deny_kind(Verdict::Spoof, DenyCause::NoIrFace),
                 &format!(
                     "liveness {:?}: no face in IR: a real face reflects 850nm",
                     Verdict::Spoof
@@ -9002,7 +9137,7 @@ mod tests {
         // NEVER retryable: a real spoof verdict (flat/2D, free attack retries)...
         assert_retryable(
             &denied(
-                liveness_deny_kind(Verdict::Spoof, "flat 2D surface"),
+                liveness_deny_kind(Verdict::Spoof, DenyCause::Other),
                 &format!("liveness {:?}: flat 2D surface", Verdict::Spoof),
                 false,
             ),
@@ -10766,7 +10901,7 @@ mod pad_cue_tests {
         }
         kinds.push(super::liveness_deny_kind(
             Verdict::Uncertain,
-            super::EXPOSURE_UNMEASURABLE_PREFIX,
+            irlume_liveness::DenyCause::ExposureUnmeasurable,
         ));
         for kind in kinds {
             for f in &facts {
@@ -11262,6 +11397,8 @@ mod engine_tests {
         });
         let a = Assessment {
             verdict: if deny { Verdict::Spoof } else { Verdict::Live },
+            // PAD-downgrade origin: never one of the specially routed causes.
+            deny_cause: irlume_liveness::DenyCause::Other,
             reason: if deny {
                 "RGB PAD cue flags a spoof"
             } else {
@@ -12540,7 +12677,6 @@ mod engine_tests {
         assert!(!o.granted);
         assert_eq!(o.reason, "'irlume-test-empty' has no face scans enrolled");
         assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
-
         // Camera binding mismatch: anti-swap refusal before any capture.
         let mut e = Enrollment::new("irlume-test-bound");
         e.profiles.push(FaceProfile {
@@ -12604,6 +12740,94 @@ mod engine_tests {
         write_enrollment(&dir, &e);
         let err = s.engine.authenticate("irlume-test-cam", None).unwrap_err();
         assert!(err.to_string().contains("no camera found"), "{err}");
+
+        teardown_sandbox(&dir);
+    }
+
+    /// The enrollment-load boundary is a completed-work interval: it is
+    /// emitted exactly when a load (or deferred unseal join) finishes, never
+    /// for the pre-check instant deny of a user with no store at all.
+    #[test]
+    fn enrollment_load_boundary_is_traced_where_the_load_completes() {
+        use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct StageSink(Mutex<Vec<TraceEventKind>>);
+
+        impl DiagnosticSink for StageSink {
+            fn emit_trace(&self, kind: TraceEventKind) {
+                self.0.lock().unwrap().push(kind);
+            }
+        }
+
+        let _g = env_guard();
+        let mut s = shared();
+        let dir = state_sandbox("auth-load-trace");
+
+        // A user with no store at all denies before any load starts, so no
+        // enrollment-load interval may appear.
+        let ghost = StageSink::default();
+        let o = s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-ghost",
+                None,
+                AuthenticationPurpose::Verify,
+                &ghost,
+            )
+            .unwrap();
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
+        assert!(!ghost.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            TraceEventKind::StageTiming {
+                stage: TraceStage::EnrollmentLoad,
+                ..
+            }
+        )));
+
+        // An enrolled store that loads and then denies on policy still
+        // reports the completed load interval exactly once.
+        let mut e = Enrollment::new("irlume-test-empty");
+        e.profiles.push(FaceProfile {
+            name: "P1".into(),
+            scans: vec![],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&dir, &e);
+        let loaded = StageSink::default();
+        let o = s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-empty",
+                None,
+                AuthenticationPurpose::Verify,
+                &loaded,
+            )
+            .unwrap();
+        assert_eq!(o.kind, OutcomeKind::SetupUnavailable);
+        let timings: Vec<_> = loaded
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::EnrollmentLoad,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(timings.len(), 1, "{:?}", loaded.0.lock().unwrap());
+        assert!(
+            matches!(&timings[0], TraceEventKind::StageTiming { elapsed_us, .. } if *elapsed_us > 0),
+            "the boundary must carry a real duration"
+        );
 
         teardown_sandbox(&dir);
     }
@@ -13161,6 +13385,7 @@ mod engine_tests {
         use irlume_liveness::{FaceBox, Signals, Verdict};
         let a = super::Assessment {
             verdict: Verdict::Uncertain,
+            deny_cause: irlume_liveness::DenyCause::Other,
             reason: "test".into(),
             embedding: None,
             ir_embedding: None,
@@ -13240,6 +13465,7 @@ mod engine_tests {
             let ir_brightness = signals.ir_face_brightness;
             let assessment = Assessment {
                 verdict: Verdict::Spoof,
+                deny_cause: irlume_liveness::DenyCause::Other,
                 reason: "failed liveness assessment".into(),
                 embedding: None,
                 ir_embedding: None,
@@ -13267,9 +13493,9 @@ mod engine_tests {
                 "flat" => thinkpad.ir_center_edge_ratio = 1.0,
                 _ => unreachable!(),
             }
-            let (verdict, _, reason) = LivenessGate::new().evaluate(&thinkpad);
+            let (verdict, cues, reason) = LivenessGate::new().evaluate(&thinkpad);
             assert_eq!(verdict, Verdict::Spoof, "{cue}: {reason}");
-            let kind = liveness_deny_kind(verdict, &reason);
+            let kind = liveness_deny_kind(verdict, cues.deny_cause);
             assert_eq!(kind, OutcomeKind::Spoof, "{cue}: {reason}");
             assert_eq!(
                 situation(thinkpad.clone(), kind),
@@ -13290,9 +13516,9 @@ mod engine_tests {
             let mut dark = base.clone();
             dark.ir_face_brightness = 20.0;
             dark.ir_persistent_saturated_frac = fraction;
-            let (verdict, _, reason) = LivenessGate::new().evaluate(&dark);
+            let (verdict, cues, reason) = LivenessGate::new().evaluate(&dark);
             assert_eq!(verdict, Verdict::Spoof, "fraction {fraction:?}: {reason}");
-            let kind = liveness_deny_kind(verdict, &reason);
+            let kind = liveness_deny_kind(verdict, cues.deny_cause);
             assert_eq!(
                 situation(dark, kind),
                 AttemptSituation::Spoof,
@@ -13342,18 +13568,18 @@ mod engine_tests {
         reworded.ir_persistent_saturated_frac = Some(0.1702);
 
         let gate = LivenessGate::new();
-        let (old_verdict, _, old_reason) = gate.evaluate(&old);
-        let (new_verdict, _, new_reason) = gate.evaluate(&reworded);
+        let (old_verdict, old_cues, old_reason) = gate.evaluate(&old);
+        let (new_verdict, new_cues, new_reason) = gate.evaluate(&reworded);
         assert_eq!(old_verdict, Verdict::Spoof, "{old_reason}");
         assert_eq!(new_verdict, Verdict::Spoof, "{new_reason}");
         assert!(!old_reason.contains("IR-bright source"), "{old_reason}");
         assert!(new_reason.contains("IR-bright source"), "{new_reason}");
         assert_eq!(
-            super::liveness_deny_kind(old_verdict, &old_reason),
-            super::liveness_deny_kind(new_verdict, &new_reason)
+            super::liveness_deny_kind(old_verdict, old_cues.deny_cause),
+            super::liveness_deny_kind(new_verdict, new_cues.deny_cause)
         );
         assert_eq!(
-            super::liveness_deny_kind(new_verdict, &new_reason),
+            super::liveness_deny_kind(new_verdict, new_cues.deny_cause),
             super::OutcomeKind::Spoof
         );
     }

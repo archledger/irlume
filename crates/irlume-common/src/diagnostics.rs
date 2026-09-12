@@ -14,8 +14,13 @@ pub const MAX_UNAVAILABLE_SECTIONS: usize = 16;
 pub const MAX_HISTORY_MS: u64 = 30 * 60 * 1_000;
 /// The schema selected when a subscriber does not request a version.
 pub const LEGACY_TRACE_SCHEMA_VERSION: u32 = 1;
+/// The schema tier between the legacy vocabulary and the current one: it
+/// added the typed authentication refusals and the identity/release timing
+/// stages, but not the end-to-end timing stages of the current tier. Kept
+/// addressable so an older client that negotiated it keeps working.
+pub const V2_TRACE_SCHEMA_VERSION: u32 = 2;
 /// Latest trace vocabulary, requested explicitly by current clients.
-pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 3;
 /// Current schema for callers constructing new records, not a subscription default.
 pub const TRACE_SCHEMA_VERSION: u32 = CURRENT_TRACE_SCHEMA_VERSION;
 pub const DEFAULT_TRACE_DURATION_MS: u64 = 60_000;
@@ -703,6 +708,11 @@ diagnostic_enum!(TraceStage {
     StreamOwnerRelease,
     Matching,
     EmitterRestore,
+    EnrollmentLoad,
+    IngressParse,
+    QueueWait,
+    EngineAuthenticate,
+    CredentialUnseal,
 });
 diagnostic_enum!(TraceRefusalReason {
     RgbPadPending,
@@ -848,17 +858,37 @@ pub enum TraceEventKind {
 
 impl TraceEventKind {
     /// Whether this closed event vocabulary is available in the selected
-    /// schema. Legacy subscribers omit newer events before queue accounting.
+    /// schema. Legacy subscribers omit newer events before queue accounting:
+    /// an older parser rejects an unknown enum variant at deserialization,
+    /// so a stage or event a tier did not define must never reach it.
     #[must_use]
     pub const fn supports_schema(&self, schema: u32) -> bool {
+        macro_rules! end_to_end_timing_stage {
+            () => {
+                TraceStage::EnrollmentLoad
+                    | TraceStage::IngressParse
+                    | TraceStage::QueueWait
+                    | TraceStage::EngineAuthenticate
+                    | TraceStage::CredentialUnseal
+            };
+        }
         match schema {
             LEGACY_TRACE_SCHEMA_VERSION => !matches!(
                 self,
                 Self::AuthenticationRefusal { .. }
                     | Self::StageTiming {
-                        stage: TraceStage::IdentityInference | TraceStage::StreamOwnerRelease,
+                        stage: TraceStage::IdentityInference
+                            | TraceStage::StreamOwnerRelease
+                            | end_to_end_timing_stage!(),
                         ..
                     }
+            ),
+            V2_TRACE_SCHEMA_VERSION => !matches!(
+                self,
+                Self::StageTiming {
+                    stage: end_to_end_timing_stage!(),
+                    ..
+                }
             ),
             CURRENT_TRACE_SCHEMA_VERSION => true,
             _ => false,
@@ -1496,7 +1526,7 @@ mod tests {
                 true,
             ),
         ];
-        for schema in [1, 2] {
+        for schema in [1, 2, 3] {
             for record in &mut records {
                 record.trace_schema = schema;
             }
@@ -1510,7 +1540,7 @@ mod tests {
                 Err(TraceParseError::Schema)
             ));
         }
-        for schema in [0, 3, u32::MAX] {
+        for schema in [0, 4, u32::MAX] {
             records[0].trace_schema = schema;
             assert!(matches!(
                 parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits),
@@ -1564,6 +1594,50 @@ mod tests {
                 "event":"authentication_refusal", "reason":reason,
             }))
             .is_err());
+        }
+    }
+
+    /// The schema-3 end-to-end timing stages are a closed vocabulary tier of
+    /// their own: an older parser (schema 1 or 2 subscriber) fails
+    /// deserialization on an unknown enum variant, so the daemon must never
+    /// send one down those subscriptions, which is what `supports_schema`
+    /// encodes and this test pins.
+    #[test]
+    fn trace_v3_timing_stages_are_not_valid_v1_or_v2_records() {
+        let limits = TraceLimits::bounded(1000);
+        for stage in [
+            "enrollment_load",
+            "ingress_parse",
+            "queue_wait",
+            "engine_authenticate",
+            "credential_unseal",
+        ] {
+            let event = serde_json::json!({
+                "event":"stage_timing", "stage":stage, "elapsed_us":12
+            });
+            let typed = serde_json::from_value::<TraceEventKind>(event.clone())
+                .expect("schema 3 closed event vocabulary must deserialize");
+            assert_eq!(serde_json::to_value(&typed).unwrap(), event);
+            // Every pre-existing stage stays valid at every tier it already
+            // was, and the new tier accepts all of them.
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            assert!(!typed.supports_schema(V2_TRACE_SCHEMA_VERSION), "{event}");
+            assert!(
+                !typed.supports_schema(LEGACY_TRACE_SCHEMA_VERSION),
+                "{event}"
+            );
+            for schema in [1, 2] {
+                let mut record = trace_record(0, typed.clone(), false);
+                record.trace_schema = schema;
+                let mut validator = TraceValidator::new(limits).unwrap();
+                assert!(
+                    matches!(
+                        validator.push_line(&serde_json::to_vec(&record).unwrap()),
+                        Err(TraceParseError::Schema)
+                    ),
+                    "{event} under schema {schema}"
+                );
+            }
         }
     }
 

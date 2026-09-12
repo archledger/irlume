@@ -121,6 +121,77 @@ credential-release request. Stage diagnostics can overlap or nest, and
 `Liveness` covers different work in paired versus RGB-only paths. Never add the
 stage lines together or compare those labels as equivalent work across modes.
 
+## Daemon request boundaries
+
+```sh
+cargo run --release --locked -p irlume-daemon --example daemon_timing -- \
+  <user> [--service NAME|none] [--trials N] [--cancel-after MS] [--no-trace]
+```
+
+This example talks to the RUNNING daemon over its socket; it performs no
+inference itself. Each trial is one real `Authenticate` request measured
+request-to-reply on the harness's own clock. With a diagnostic trace
+subscription (root; schema 3) it also prints the daemon-side stage boundaries
+the daemon emitted for those requests. Attended, authorized use only: cameras
+may open and the emitter can fire. `--cancel-after MS` closes the harness's
+own socket mid-request, which exercises the production client-disconnect
+cancellation path; such trials are labeled `cancelled`, never pooled.
+
+The boundary vocabulary and what each interval covers:
+
+* `IngressParse`: the connection thread from the start of its read through
+  request parse, posture gate and authorization, up to the creation of the
+  operation scope. Measured from before the read (the scope does not exist
+  yet) and reported inside the operation.
+* `QueueWait`: from the connection thread's submission instant to the worker
+  taking the job.
+* `EnrollmentLoad`: engine-side, emitted exactly where a store load (or the
+  deferred TPM unseal join) completes. On encrypted stores the deferred load
+  deliberately overlaps the camera preflight, so this interval is a
+  spawn-to-join resolution interval, not isolated loader CPU time. A user
+  with no store at all denies before any load and emits nothing here.
+* `EngineAuthenticate`: the daemon's wall time around the whole engine
+  authentication call, including its nested engine stages (`CameraOpen`,
+  `RateEstablishment`, captures, `Detection`, `Liveness`,
+  `IdentityInference`, `Matching`, `StreamOwnerRelease`, `EmitterRestore`).
+* `CredentialUnseal`: an unseal request's whole daemon-side handling
+  (policy gates, face authentication when reached, release), on every exit
+  including policy refusals; nests `EngineAuthenticate` when the engine is
+  reached.
+
+Stage intervals may overlap or nest by design; the report lists them and
+never sums them. Trials are separated by categorical outcome (granted,
+refused, cancelled) and medians use the nearest-rank convention over observed
+values only; refused trials are never pooled with grants.
+
+### Explicitly unmeasured boundaries
+
+The harness prints these gaps in every report because they are real parts of
+perceived login latency that no current Irlume diagnostic observes:
+
+* worker reply to socket write (the reply channel and the connection
+  thread's write are outside the operation scope);
+* the PAM stack around the daemon calls;
+* desktop/greeter unlock completion.
+
+No trustworthy desktop-unlock completion signal is established: a brief
+review (September 2026) of KScreenLocker documentation and community logs
+found failure-side journal lines (for example `pam_unix` authentication
+failures from `kscreenlocker_greet`) but no documented, stable positive
+completion event for a PAM-driven unlock. Candidate mechanisms such as
+logind session `Unlock` signals were not verified to fire on normal
+PAM-authenticated unlocks, so the boundary stays explicitly unmeasured
+rather than approximated. Establishing such a signal would be its own
+verified investigation before any report claims desktop-unlock latency.
+
+Cold/warm operation and route labeling: a cold trial requires a freshly
+started daemon and is a session-level protocol decision, not a harness flag.
+The active capture schedule comes from the trace's stream-contract and
+capture-schedule events, never from the service name alone; do not describe
+a trial by an assumed schedule. Loaded-system behavior is observed by
+running concurrent camera-class requests during a trial, and belongs in the
+session notes rather than the tool.
+
 ## Deterministic checks
 
 ```sh
@@ -128,10 +199,15 @@ cargo test --locked -p irlume-auth \
   --example stage_bench --example letterbox_bench --example auth_timing
 cargo clippy --locked -p irlume-auth \
   --example stage_bench --example letterbox_bench --example auth_timing -- -D warnings
+cargo test --locked -p irlume-daemon --example daemon_timing
+cargo clippy --locked -p irlume-daemon --example daemon_timing -- -D warnings
 ```
 
 The shared sampler tests reject zero samples before any work, stop on warmup
 and measured failures, verify valid counts/output observation, and check known
 nearest-rank percentiles including empty and singleton inputs. Auth option
 tests exercise service-based default purpose, explicit credential purpose and
-malformed input without loading models or authenticating.
+malformed input without loading models or authenticating. The daemon_timing
+tests cover option validation, report labeling (cancelled/refused trials,
+unmeasured gaps always present, stages never summed) and nearest-rank medians
+without contacting a daemon.

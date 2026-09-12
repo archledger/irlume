@@ -30,6 +30,13 @@ jobs:
     enable_net: true
     targets:
       - fedora-stable
+      # The branched pre-release (fedora-45 until it goes stable) is in the
+      # gap between fedora-stable and fedora-rawhide; without this target its
+      # Copr chroot keeps serving the last old result. 0.12.0 needed a manual
+      # fedora-45 SRPM rebuild (Copr build 10977555) because of that gap.
+      # The alias also carries rawhide; the explicit entry below is kept as a
+      # guard and the duplicate is deduplicated by Packit.
+      - fedora-development
       - fedora-rawhide
     # onnxruntime is bundled in the RPM (Source1); no external Copr needed.
 

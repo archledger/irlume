@@ -437,14 +437,20 @@ fn permits_background_requalification(
 
 fn sensor_preflight_with(
     policy: irlume_common::config::FaceSensorPolicyObservation,
-    preflight: impl FnOnce() -> irlume_common::IrOnlyReadiness,
-) -> irlume_common::IrOnlyReadiness {
+    preflight: impl FnOnce() -> (
+        irlume_common::IrOnlyReadiness,
+        Option<irlume_common::IrTargetIssue>,
+    ),
+) -> (
+    irlume_common::IrOnlyReadiness,
+    Option<irlume_common::IrTargetIssue>,
+) {
     match policy.resolve() {
         Ok(irlume_common::config::FaceSensorPolicy::IrOnlyExperimental) => preflight(),
         Ok(irlume_common::config::FaceSensorPolicy::Dual) => {
-            irlume_common::IrOnlyReadiness::Unavailable
+            (irlume_common::IrOnlyReadiness::Unavailable, None)
         }
-        Err(_) => irlume_common::IrOnlyReadiness::InvalidPolicy,
+        Err(_) => (irlume_common::IrOnlyReadiness::InvalidPolicy, None),
     }
 }
 
@@ -2795,6 +2801,7 @@ fn dispatch_before_engine(req: Request, peer: &Peer) -> Response {
         Request::FaceSensorStatus { user } => Response::FaceSensorStatus {
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: user.map(|_| irlume_common::IrOnlyReadiness::Unavailable),
+            ir_target_issue: None,
         },
         _ => Response::Error(
             "irlumed is still starting (loading models); retry, or use your password".into(),
@@ -3888,6 +3895,7 @@ fn dispatch_status_with_diagnostics(
         Request::FaceSensorStatus { user: None } => Response::FaceSensorStatus {
             policy: irlume_common::config::observe_face_sensor_policy(),
             ir_readiness: None,
+            ir_target_issue: None,
         },
         Request::Ping => Response::Pong,
         Request::Health => {
@@ -4771,10 +4779,12 @@ fn dispatch_scoped_session_inner(
         },
         Request::FaceSensorStatus { user: Some(user) } => {
             let policy = irlume_common::config::observe_face_sensor_policy();
-            let readiness = sensor_preflight_with(policy, || engine.ir_only_preflight(&user));
+            let (readiness, ir_target_issue) =
+                sensor_preflight_with(policy, || engine.ir_only_preflight_details(&user));
             Response::FaceSensorStatus {
                 policy,
                 ir_readiness: Some(readiness),
+                ir_target_issue,
             }
         }
         Request::KeyringInfo { user } => keyring_info(&user, |env| {
@@ -9629,8 +9639,9 @@ mod tests {
         ));
         let wire = serde_json::to_value(response).unwrap();
         let body = wire.get("FaceSensorStatus").unwrap().as_object().unwrap();
-        assert_eq!(body.len(), 2);
+        assert_eq!(body.len(), 3);
         assert!(body.contains_key("policy") && body.contains_key("ir_readiness"));
+        assert_eq!(body["ir_target_issue"], "unavailable");
     }
 
     #[test]
@@ -9686,6 +9697,49 @@ mod tests {
     }
 
     #[test]
+    fn sensor_preflight_preserves_unconfigured_cause_from_worker() {
+        let _guard = env_lock();
+        let sb = sandbox("sensor-unconfigured-detail");
+        std::fs::write(
+            sb.dir.join("config/settings.conf"),
+            "face_sensor_policy=ir-only-experimental\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sb.dir.join("config/cameras.conf"),
+            "capture_mode.synthetic=sequential\n",
+        )
+        .unwrap();
+        let mut e = engine();
+        let saved =
+            ["IRLUME_RGB_DEVICE", "IRLUME_IR_DEVICE"].map(|key| (key, std::env::var_os(key)));
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        let response = dispatch(
+            Request::FaceSensorStatus {
+                user: Some(users::name_for_uid(0).unwrap()),
+            },
+            &peer(0),
+            &mut e,
+        );
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(matches!(
+            response,
+            Response::FaceSensorStatus {
+                ir_readiness: Some(irlume_common::IrOnlyReadiness::TargetUnavailable),
+                ir_target_issue: Some(irlume_common::IrTargetIssue::Unconfigured),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn sensor_preflight_requires_selected_ir_policy_before_user_access() {
         use irlume_common::config::{
             FaceSensorPolicy as Policy, FaceSensorPolicyObservation as Seen,
@@ -9701,12 +9755,12 @@ mod tests {
             let calls = std::cell::Cell::new(0);
             let readiness = sensor_preflight_with(policy, || {
                 calls.set(calls.get() + 1);
-                Ready::ReadyForExperimentalAttempt
+                (Ready::ReadyForExperimentalAttempt, None)
             });
             let selected = policy == Seen::Explicit(Policy::IrOnlyExperimental);
             assert_eq!(calls.get(), usize::from(selected));
             assert_eq!(
-                readiness,
+                readiness.0,
                 if selected {
                     Ready::ReadyForExperimentalAttempt
                 } else if policy.resolve().is_err() {

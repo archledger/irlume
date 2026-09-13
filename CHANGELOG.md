@@ -5,6 +5,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Experimental IR-only preflight now distinguishes an unconfigured camera pair
+  from unavailable endpoints, identity failures, changed targets and unsupported
+  layouts. Missing-pair guidance names `set-cameras`; unsupported-layout guidance
+  does not suggest an impossible reconfiguration. The optional diagnostic field
+  preserves older wire readers and adds no discovery, capture or grant authority.
+- Human camera census and doctor output clarify that paired-camera support does
+  not establish experimental IR-only readiness.
+
 ## [0.12.0] - 2026-09-11
 
 ### Added

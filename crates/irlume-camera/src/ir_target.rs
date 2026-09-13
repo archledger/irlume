@@ -573,6 +573,70 @@ mod tests {
             Err(IrTargetError::UnsupportedTopology(_))
         ));
     }
+
+    #[test]
+    fn issue701_legacy_schedule_keys_do_not_configure_an_ir_target() {
+        use crate::testenv::{env_lock, EnvGuard};
+        let _lock = env_lock();
+        let _rgb = EnvGuard::unset("IRLUME_RGB_DEVICE");
+        let _ir = EnvGuard::unset("IRLUME_IR_DEVICE");
+        let f = Fixture::new("issue701-config");
+        let config = f.root.join("config");
+        std::fs::create_dir(&config).unwrap();
+        let _config = EnvGuard::set("IRLUME_CONFIG_DIR", &config);
+        let legacy = "capture_mode.synthetic=sequential\ncapture_mode_origin.synthetic=measured camera-tune 1 - -\n";
+        std::fs::write(config.join("cameras.conf"), legacy).unwrap();
+        assert_eq!(crate::configured_pair_no_probe(), None);
+        assert_eq!(
+            f.resolve(crate::configured_pair_no_probe()),
+            Err(IrTargetError::Unconfigured)
+        );
+
+        let rgb_if = f.interface("1-1:1.0", None);
+        let ir_if = f.interface("1-1:1.2", Some("2b7e\n"));
+        std::fs::write(ir_if.parent().unwrap().join("idProduct"), "55c0\n").unwrap();
+        let rgb = f.node("video0", &rgb_if, "0\n", "RGB fixture\n");
+        let ir = f.node("video2", &ir_if, "0\n", "IR fixture\n");
+        let _metadata = f.node("video3", &ir_if, "1\n", "IR fixture\n");
+        std::fs::write(
+            config.join("cameras.conf"),
+            format!("{legacy}rgb={rgb}\nir={ir}\n"),
+        )
+        .unwrap();
+        let pair = crate::configured_pair_no_probe().unwrap();
+        assert_eq!(pair, (rgb, ir));
+        assert!(f.resolve(Some(pair)).is_ok());
+        assert!(std::fs::read_to_string(config.join("cameras.conf"))
+            .unwrap()
+            .starts_with(legacy));
+    }
+
+    #[test]
+    fn issue701_explicit_environment_pair_also_satisfies_configuration() {
+        use crate::testenv::{env_lock, EnvGuard};
+        let _lock = env_lock();
+        let f = Fixture::new("issue701-env");
+        let config = f.root.join("config");
+        std::fs::create_dir(&config).unwrap();
+        let _config = EnvGuard::set("IRLUME_CONFIG_DIR", &config);
+        std::fs::write(
+            config.join("cameras.conf"),
+            "capture_mode.synthetic=sequential\n",
+        )
+        .unwrap();
+        let _rgb = EnvGuard::set("IRLUME_RGB_DEVICE", "/dev/explicit-rgb");
+        let _ir = EnvGuard::set("IRLUME_IR_DEVICE", "/dev/explicit-ir");
+        assert_eq!(
+            crate::configured_pair_no_probe(),
+            Some(("/dev/explicit-rgb".into(), "/dev/explicit-ir".into()))
+        );
+        let _blank_ir = EnvGuard::set("IRLUME_IR_DEVICE", " ");
+        assert_eq!(
+            crate::configured_pair_no_probe(),
+            None,
+            "a partial/blank override is not an explicit pair"
+        );
+    }
     #[test]
     fn revalidation_detects_renumbering_and_replacement() {
         let f = Fixture::new("changed");

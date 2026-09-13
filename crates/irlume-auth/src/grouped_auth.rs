@@ -27,11 +27,17 @@ pub(super) fn eligible(
             window,
             purpose,
             service,
+            irlume_common::config::privileged_grouped_pad_evidence_enabled(),
         )
 }
 
 // Keep exact runtime authority in the outer gate; this policy decision is
 // testable without manufacturing camera contracts or widening their API.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the owner opt-in is read by the caller so this stays a pure policy \
+              decision, testable without a config file on the test host"
+)]
 pub(super) fn eligible_configuration(
     mode: &CaptureModeSelection,
     has_ir: bool,
@@ -40,6 +46,7 @@ pub(super) fn eligible_configuration(
     window: u64,
     purpose: AuthenticationPurpose,
     service: Option<&str>,
+    privileged_opt_in: bool,
 ) -> bool {
     let local_session = matches!(
         service.and_then(irlume_common::pam_service::classify),
@@ -48,17 +55,33 @@ pub(super) fn eligible_configuration(
                 | irlume_common::pam_service::ServiceKind::ScreenUnlock
         )
     );
+    // The machine owner's opt-in (`privileged_grouped_pad_evidence`) lets the
+    // privileged surfaces reach this collector. Without it nothing below moves.
+    // It widens SCOPE only: every sample, threshold and vote count downstream is
+    // the greeter's, so a privileged grant still closes the whole vote window.
+    // Credential release stays out either way — a wallet secret must name a
+    // recognized local login/lock service, and an owner preference is not a
+    // reason to widen that.
+    let privileged = privileged_opt_in
+        && matches!(
+            service.and_then(irlume_common::pam_service::classify),
+            Some(
+                irlume_common::pam_service::ServiceKind::Elevation
+                    | irlume_common::pam_service::ServiceKind::AppConsent
+            )
+        );
     // Preserve Verify's unknown-service default. Credential release must name
     // a recognized local login/lock service; budgets cannot widen this scope.
     let in_scope = match purpose {
         AuthenticationPurpose::Verify => {
             local_session
+                || privileged
                 || service
                     .and_then(irlume_common::pam_service::classify)
                     .is_none()
         }
         AuthenticationPurpose::CredentialRelease => local_session,
-        AuthenticationPurpose::AppConsent => false,
+        AuthenticationPurpose::AppConsent => privileged,
     };
     in_scope
         && mode.is_sequential()

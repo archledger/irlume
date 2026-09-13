@@ -935,7 +935,20 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
     // missing `doas`, which is Elevation for the policy, so a doas prompt held
     // the camera for the 15s login window instead of the 5s one (#362).
     match service.and_then(irlume_common::pam_service::classify) {
-        Some(kind) if kind.wants_short_grace() => SUDO_GRACE_WINDOW_MS,
+        // The short window is sized for an attempt that casts the whole ViT vote
+        // window in one capture session. A pair that can only capture
+        // sequentially casts one vote per attempt, so the owner who opts into
+        // `privileged_grouped_pad_evidence` needs the grouped collector, and that
+        // collector is itself gated on `window >= GRACE_WINDOW_MS`: leaving the
+        // short window here would make the opt-in a no-op. The cost is the one
+        // #362 measured in the other direction — a refused privileged attempt now
+        // holds the camera for the login window before the password prompt.
+        Some(kind)
+            if kind.wants_short_grace()
+                && !irlume_common::config::privileged_grouped_pad_evidence_enabled() =>
+        {
+            SUDO_GRACE_WINDOW_MS
+        }
         _ => GRACE_WINDOW_MS,
     }
 }
@@ -8822,6 +8835,10 @@ mod tests {
         // Env override off for this check (guarded: another test sets it).
         let _g = env_guard();
         std::env::remove_var("IRLUME_GRACE_MS");
+        // The privileged opt-in lengthens these windows, and this asserts the
+        // default: pin it here rather than inheriting the build host's
+        // settings.conf, which a developer's own machine may have turned on.
+        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "0");
         assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
         assert_eq!(grace_window_ms(Some("su")), SUDO_GRACE_WINDOW_MS);
         // Login/lock services and an unknown/absent service get the full window.
@@ -8834,6 +8851,33 @@ mod tests {
             GRACE_WINDOW_MS,
             "an unrecognised service takes the long window, not a shortcut"
         );
+        std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
+    }
+
+    /// With the owner's opt-in, the privileged surfaces take the login window,
+    /// because the grouped collector they now reach is itself gated on
+    /// `window >= GRACE_WINDOW_MS`: the short window would make the key a no-op.
+    /// Login and lock services are already on the long window and must not move.
+    #[test]
+    fn privileged_opt_in_lengthens_only_the_short_windows() {
+        let _g = env_guard();
+        std::env::remove_var("IRLUME_GRACE_MS");
+        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "1");
+        use irlume_common::pam_service::SERVICES;
+        for (name, _kind) in SERVICES {
+            assert_eq!(
+                grace_window_ms(Some(name)),
+                GRACE_WINDOW_MS,
+                "{name}: the opt-in puts every wired service on the login window"
+            );
+        }
+        // The explicit numeric override still outranks the key.
+        std::env::set_var("IRLUME_GRACE_MS", "8000");
+        assert_eq!(grace_window_ms(Some("sudo")), 8000);
+        std::env::remove_var("IRLUME_GRACE_MS");
+        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "0");
+        assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
+        std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
     }
 
     /// Every service the policy calls Elevation must also take the SHORT

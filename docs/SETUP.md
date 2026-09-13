@@ -410,6 +410,27 @@ word. Do it only if you accept what follows: every
 and one run from a script. Passive PAD still applies, and the password still
 works.
 
+### When a privileged face attempt always answers "collecting RGB PAD evidence"
+
+On a camera pair that cannot capture RGB and IR at the same time, a single
+attempt scores one RGB frame, so it casts one of the five ViT votes the RGB PAD
+decision needs. The greeter and the lock screen finish that vote inside one
+transaction; privileged services did not, so every `sudo` or polkit attempt
+settled as `collecting RGB PAD evidence` with no score, however long the window
+was. Check for `camera-tune` reporting `MeasuredSequential` and for that phrase
+in `irlume logs`.
+
+`privileged_grouped_pad_evidence=1` in `/etc/irlume/settings.conf` (or
+`IRLUME_PRIVILEGED_GROUPED_PAD=1`) puts `sudo`, `su`, `doas` and polkit on the
+same collection, and gives them the login grace window it requires. Evidence
+requirements do not move: the full vote window still has to close before a
+grant, and every PAD and liveness threshold is unchanged. Two costs are real. A
+privileged authentication now takes as long as that collection (measured at
+~7.3s on a sequential pair), and a *refused* attempt holds the camera for the
+login window rather than the short one before the password prompt appears.
+Credential release is not widened: a sealed secret still requires a recognized
+local login or lock service.
+
 ### Choosing privileged face confirmation
 
 Use the same control from the CLI or **TUI Settings > Privileged consent [p]**:
@@ -583,7 +604,7 @@ live in them; sealed envelopes are stored separately (see
 
 | File | Holds | Written by |
 |---|---|---|
-| `/etc/irlume/settings.conf` | `face_sensor_policy=ir-only-experimental` is the explicit experimental IR-only opt-in; absence selects dual, while malformed or unreadable policy fails closed. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | `sudo irlume auth sensor ...` for the sensor policy; TUI Settings for the other listed settings |
+| `/etc/irlume/settings.conf` | `face_sensor_policy=ir-only-experimental` is the explicit experimental IR-only opt-in; absence selects dual, while malformed or unreadable policy fails closed. `privileged_face_consent=0` is the machine owner's waiver of the literal `yes` on privileged services, so the scan starts when the privileged PAM prompt appears, with no per-attempt word (default on: the confirmation is required, and an unreadable settings file keeps it). `privileged_grouped_pad_evidence=1` lets privileged services (`sudo`/`su`/`doas` and polkit) use the bounded sequential PAD collection the greeter and lock screen already use, with the login grace window that collection requires, for a camera pair that cannot capture RGB and IR concurrently (default off; it widens which services may collect the evidence, never how much evidence a grant needs, and credential release is unchanged). `enforce_biopolicy=1` opts into operation-class gating; `forbid_external_cameras=1` restricts face authentication to cameras the kernel reports as `removable: fixed` (internal only; `removable: unknown` fails closed to the password, mirroring Windows ShouldForbidExternalCameras post-CVE-2021-34466); the legacy `third_party_pad` / `third_party_recognizer` keys are ignored with a startup notice (the third-party lane was removed, ADR-0015). Head-gesture settings are retired and ignored; see [migration notes](HEAD-GESTURE-REMOVAL.md) | `sudo irlume auth sensor ...` for the sensor policy; TUI Settings for the other listed settings |
 | `/etc/irlume/cameras.conf` | `rgb=` / `ir=` device nodes of the active camera pair | TUI camera picker, or `sudo irlume set-cameras <rgb> <ir>` |
 | `/etc/irlume/method` | one line: the active auth method (`auto`, `face`, `fingerprint`, or `both` = face OR fingerprint) | `irlume fingerprint enable/disable` |
 | `/var/lib/irlume/ir_emitter.conf` | the UVC extension-unit control that lights the emitter | `irlume ir-setup` |

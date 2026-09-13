@@ -714,6 +714,7 @@ fn grouped_eligibility_keeps_service_and_purpose_scope_despite_long_override() {
                 grace_window_ms(service),
                 purpose,
                 service,
+                false,
             );
             results.push((
                 service,
@@ -760,11 +761,69 @@ fn grouped_cold_login_release_uses_complete_collection_only_for_known_local_serv
                 15_000,
                 AuthenticationPurpose::CredentialRelease,
                 service,
+                false,
             ),
             expected,
             "service={service:?}"
         );
     }
+}
+
+/// The owner's opt-in widens the collector to the privileged surfaces and to
+/// nothing else. Credential release keeps its own rule (a wallet secret must
+/// name a known local login/lock service), a remote service stays out, and every
+/// runtime requirement below the scope check still binds.
+#[test]
+fn privileged_opt_in_widens_scope_without_touching_credential_release() {
+    let mode = measured_sequential_configuration();
+    let check = |purpose, service, opt_in| {
+        crate::grouped_auth::eligible_configuration(
+            &mode, true, true, true, 15_000, purpose, service, opt_in,
+        )
+    };
+    for service in [Some("sudo"), Some("su"), Some("doas")] {
+        assert!(
+            !check(AuthenticationPurpose::Verify, service, false),
+            "{service:?} without the opt-in"
+        );
+        assert!(
+            check(AuthenticationPurpose::Verify, service, true),
+            "{service:?} with the opt-in"
+        );
+        assert!(
+            !check(AuthenticationPurpose::CredentialRelease, service, true),
+            "{service:?} must not reach a wallet secret"
+        );
+    }
+    // polkit reaches the daemon as AppConsent, the arm that was a hard false.
+    assert!(!check(
+        AuthenticationPurpose::AppConsent,
+        Some("polkit-1"),
+        false
+    ));
+    assert!(check(
+        AuthenticationPurpose::AppConsent,
+        Some("polkit-1"),
+        true
+    ));
+    assert!(!check(
+        AuthenticationPurpose::CredentialRelease,
+        Some("polkit-1"),
+        true
+    ));
+    // Remote is neither privileged nor local, so the opt-in cannot reach it.
+    assert!(!check(AuthenticationPurpose::Verify, Some("sshd"), true));
+    // Scope only: the budget requirement is unchanged by the opt-in.
+    assert!(!crate::grouped_auth::eligible_configuration(
+        &mode,
+        true,
+        true,
+        true,
+        14_999,
+        AuthenticationPurpose::Verify,
+        Some("sudo"),
+        true,
+    ));
 }
 
 #[test]
@@ -783,6 +842,7 @@ fn grouped_eligibility_requires_qualification_models_budget_and_exact_contract()
                 window,
                 purpose,
                 Some("login"),
+                false,
             )
         };
         let mut mode = measured_sequential_configuration();

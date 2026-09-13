@@ -5022,7 +5022,15 @@ fn dispatch_scoped_session_inner(
                     };
                 }
             }
-            let window = irlume_auth::AuthenticationWindow::for_service(service.as_deref());
+            // The engine decides this, not the service name alone: a privileged
+            // request that can reach grouped collection needs that collector's
+            // budget, and this same window admits the response, so it has to be
+            // right before capture starts rather than widened during it.
+            let window = engine.authentication_window_for(
+                service.as_deref(),
+                irlume_auth::AuthenticationPurpose::for_service(service.as_deref()),
+                sensor_policy,
+            );
             let retry_attempt = match retry_throttle::FaceAttempt::for_user(&user) {
                 Ok(attempt) => attempt,
                 Err(reason) => return retry_verify_refusal(reason),

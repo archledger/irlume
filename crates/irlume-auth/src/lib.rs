@@ -947,19 +947,64 @@ fn grace_window_ms(service: Option<&str>) -> u64 {
 /// collector — and that collector is itself gated on
 /// `window >= GRACE_WINDOW_MS`, so nothing would change without this.
 ///
-/// `grouped_ready` is grouped eligibility with its budget term removed, so a
-/// request that cannot use the collector keeps the short window: a concurrent
-/// pair, an unqualified or runtime-demoted one, a request whose models are
-/// missing, credential release, and experimental IR-only (which returns on its
-/// own route before grouped collection is ever consulted).
+/// `grouped_ready` is [`Engine::grouped_route_possible`], so a request that
+/// cannot use the collector keeps the short window: a concurrent or unqualified
+/// pair, a request whose PAD models are missing, credential release, and
+/// experimental IR-only.
 ///
 /// Only the DEFAULT short window is replaced. An explicit `IRLUME_GRACE_MS`
 /// still decides the budget on its own, including a smaller one and the legacy
 /// one-shot zero, because an operator who names a number has named it for every
 /// service.
+///
+/// This is answered before the request starts, because the budget IS the
+/// request's deadline: the daemon admits the response against the same window
+/// it hands the engine, so a window widened mid-request would be widened for
+/// capture and not for admission, and the request would die at the original
+/// deadline with no outcome at all.
 fn privileged_budget_for_route(window_ms: u64, grouped_ready: bool) -> Option<u64> {
     (grouped_ready && grace_window_override_ms().is_none() && window_ms == SUDO_GRACE_WINDOW_MS)
         .then_some(GRACE_WINDOW_MS)
+}
+
+/// The route decision itself, as a value: testable without a qualification
+/// store, a models directory or a process-wide config file.
+///
+/// IR-only is excluded because it returns on its own route before grouped
+/// collection is ever consulted, and credential release because its scope is
+/// the recognized local login and lock services either way.
+fn grouped_route_possible_from(
+    service: Option<&str>,
+    purpose: AuthenticationPurpose,
+    policy: irlume_common::config::FaceSensorPolicy,
+    models_ready: bool,
+    stored_sequential: bool,
+    opt_in: bool,
+) -> bool {
+    use irlume_common::pam_service::ServiceKind;
+    opt_in
+        && policy != irlume_common::config::FaceSensorPolicy::IrOnlyExperimental
+        && !matches!(purpose, AuthenticationPurpose::CredentialRelease)
+        && matches!(
+            service.and_then(irlume_common::pam_service::classify),
+            Some(ServiceKind::Elevation | ServiceKind::AppConsent)
+        )
+        && models_ready
+        && stored_sequential
+}
+
+/// Does the configured pair's STORED qualification say sequential capture?
+///
+/// Camera-free, and deliberately the same stored verdict `grouped_auth`
+/// requires: read from the qualification store by device path, so the budget
+/// decision can precede the request without opening anything.
+fn stored_pair_requires_sequential() -> bool {
+    irlume_camera::configured_pair_no_probe().is_some_and(|(rgb, ir)| {
+        matches!(
+            irlume_camera::stored_capture_qualification(&rgb, &ir),
+            Ok(QualificationResolution::SequentialRequired(_))
+        )
+    })
 }
 
 /// The operator's explicit window, when set and within bounds.
@@ -5388,6 +5433,58 @@ impl Engine {
         self.authenticate_for_with_diagnostics(user, service, purpose, &())
     }
 
+    /// The window this request must run under, chosen before it starts.
+    ///
+    /// The budget IS the request's deadline: the daemon admits the response
+    /// against the same window it hands this engine, so it cannot be widened
+    /// once capture is under way — a request whose capture believed in a longer
+    /// window than its admission would simply die at the original deadline with
+    /// no outcome. Callers that build a window for an authentication should use
+    /// this rather than [`AuthenticationWindow::for_service`], which knows only
+    /// the service name.
+    #[must_use]
+    pub fn authentication_window_for(
+        &self,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        policy: irlume_common::config::FaceSensorPolicy,
+    ) -> AuthenticationWindow {
+        let base = grace_window_ms(service);
+        AuthenticationWindow::new(
+            privileged_budget_for_route(
+                base,
+                self.grouped_route_possible(service, purpose, policy),
+            )
+            .unwrap_or(base),
+        )
+    }
+
+    /// Could this request reach grouped collection, on the facts available
+    /// before it starts?
+    ///
+    /// Every fact here is re-checked by [`grouped_auth::eligible`] once the pair
+    /// is open, so a yes only ever buys the budget that collector needs and
+    /// never admits evidence. The runtime facts that can still refuse it — the
+    /// pair's live contract and a runtime demotion — are unknowable at entry and
+    /// can only narrow eligibility, so such a request spends the longer budget
+    /// on the ordinary path. That is the one over-grant this shape keeps, and it
+    /// is the price of one deadline per request.
+    fn grouped_route_possible(
+        &self,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        policy: irlume_common::config::FaceSensorPolicy,
+    ) -> bool {
+        grouped_route_possible_from(
+            service,
+            purpose,
+            policy,
+            self.ir_available && self.has_vit_pad() && self.has_pad_ir(),
+            stored_pair_requires_sequential(),
+            irlume_common::config::privileged_grouped_pad_evidence_enabled(),
+        )
+    }
+
     /// [`Self::authenticate_for`] while publishing bounded, structurally
     /// share-safe capture decisions to the caller-owned operation scope.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
@@ -5621,39 +5718,6 @@ impl Engine {
             );
         }
         let sequential = capture_mode.is_sequential();
-        // A privileged request that can use grouped collection needs the
-        // collector's own budget, and only such a request: decide that here,
-        // where the capture route is known, rather than in `grace_window_ms`,
-        // where it is not. The replacement window is measured from this
-        // request's entry instant (`deadline - window`), never from now, so the
-        // request still has exactly one deadline and time already spent still
-        // counts against it.
-        let (window, deadline) = match privileged_budget_for_route(
-            window,
-            capture_mode.runtime_contract.is_some()
-                && grouped_auth::eligible_configuration_ignoring_budget(
-                    &capture_mode,
-                    self.ir_available,
-                    self.has_vit_pad(),
-                    self.has_pad_ir(),
-                    purpose,
-                    service,
-                    irlume_common::config::privileged_grouped_pad_evidence_enabled(),
-                ),
-        ) {
-            Some(extended) => {
-                irlume_common::dlog!(
-                    "grace: privileged grouped collection admitted; window {window}ms -> \
-                     {extended}ms from request entry"
-                );
-                (
-                    extended,
-                    deadline - std::time::Duration::from_millis(window)
-                        + std::time::Duration::from_millis(extended),
-                )
-            }
-            None => (window, deadline),
-        };
         let grouped = grouped_auth::eligible(
             &capture_mode,
             self.ir_available,
@@ -8897,6 +8961,88 @@ mod tests {
             GRACE_WINDOW_MS,
             "an unrecognised service takes the long window, not a shortcut"
         );
+    }
+
+    /// The route decision admits exactly the privileged services whose stored
+    /// verdict is sequential, with the models loaded and the owner's opt-in on.
+    /// Everything else keeps the short window, which is what the daemon also
+    /// admits the response against.
+    #[test]
+    fn grouped_route_possible_admits_only_privileged_sequential_requests() {
+        use irlume_common::config::FaceSensorPolicy;
+        let dual = FaceSensorPolicy::Dual;
+        let ready = |service, purpose, policy, models, stored, opt_in| {
+            grouped_route_possible_from(service, purpose, policy, models, stored, opt_in)
+        };
+        // The admitted shape, for each privileged service and its own purpose.
+        for (service, purpose) in [
+            (Some("sudo"), AuthenticationPurpose::Verify),
+            (Some("su"), AuthenticationPurpose::Verify),
+            (Some("doas"), AuthenticationPurpose::Verify),
+            (Some("polkit-1"), AuthenticationPurpose::AppConsent),
+        ] {
+            assert!(
+                ready(service, purpose, dual, true, true, true),
+                "{service:?} with a sequential verdict and models loaded"
+            );
+            // Every single requirement is load-bearing.
+            assert!(
+                !ready(service, purpose, dual, true, true, false),
+                "opt-in off"
+            );
+            assert!(
+                !ready(service, purpose, dual, true, false, true),
+                "a concurrent or unqualified stored verdict"
+            );
+            assert!(
+                !ready(service, purpose, dual, false, true, true),
+                "PAD models absent"
+            );
+            assert!(
+                !ready(
+                    service,
+                    purpose,
+                    FaceSensorPolicy::IrOnlyExperimental,
+                    true,
+                    true,
+                    true
+                ),
+                "IR-only takes its own route before this collector"
+            );
+            assert!(
+                !ready(
+                    service,
+                    AuthenticationPurpose::CredentialRelease,
+                    dual,
+                    true,
+                    true,
+                    true
+                ),
+                "credential release keeps its own scope"
+            );
+        }
+        // Login, lock, remote and unknown services are untouched by the key:
+        // they either hold the long window already or must not gain one.
+        for service in [
+            Some("login"),
+            Some("sddm"),
+            Some("omarchy-lock-face"),
+            Some("sshd"),
+            Some("service-invented-tomorrow"),
+            None,
+        ] {
+            assert!(
+                !ready(
+                    service,
+                    AuthenticationPurpose::Verify,
+                    dual,
+                    true,
+                    true,
+                    true
+                ),
+                "{service:?} is not a privileged surface"
+            );
+        }
     }
 
     /// The privileged budget replacement is keyed on the request's own capture

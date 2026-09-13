@@ -598,11 +598,12 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tflite"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b859e745ea8d0e0c5bbbd00eb3434dd3b264cf12408bc0e89d59b41326621d96"
+checksum = "d1ad179564e9705f067a9835b39ad9af13e6d04e102b9abd240a22d0a954d1d8"
 dependencies = [
  "edgefirst-tflite-sys",
+ "flatbuffers",
  "libloading 0.9.0",
  "log",
  "num-derive",
@@ -611,9 +612,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tflite-sys"
-version = "0.9.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d0d6ff98364f8cc53c349319b238f435551ced0499e21e70d427a9bd7a2791b"
+checksum = "a73bebc09b5eb609ccc976bfb944f882bee016fb6e7cc54e54d470e01026a277"
 dependencies = [
  "flate2",
  "libloading 0.9.0",
@@ -743,6 +744,16 @@ name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
+
+[[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.13.0",
+ "rustc_version",
+]
 
 [[package]]
 name = "flate2"

@@ -569,13 +569,17 @@ pub fn privileged_face_consent_required() -> bool {
 /// Defaults **off**, and an unreadable settings.conf reads as off, so without the
 /// key privileged surfaces behave exactly as they do upstream.
 ///
-/// It exists for a camera pair that cannot capture RGB and IR concurrently. There
-/// one authentication attempt scores exactly one RGB frame, so it casts one ViT
-/// vote, and `VIT_PAD_VOTE_N` votes never accumulate inside a privileged window:
-/// every attempt settles as `RgbPadPending` however long that window is. The
-/// greeter and lock screen escape this because the grouped collector gathers the
-/// whole vote window inside one transaction; this key lets `sudo` and polkit use
-/// the same collector.
+/// It exists for a camera pair that cannot capture RGB and IR concurrently.
+/// There one authentication attempt scores exactly one RGB frame, so it casts
+/// one ViT vote, and the retry loop needs `VIT_PAD_VOTE_N` observed-cost
+/// attempts to fill the vote ring. That fits a budget large enough for them —
+/// the ordinary path does complete when it fits — but not the privileged
+/// default, and not the login window either on a pair whose attempt costs
+/// several seconds: the request settles as `RgbPadPending` with the ring part
+/// filled. The greeter and lock screen avoid the arithmetic entirely because the
+/// grouped collector gathers the whole vote window inside one transaction, at
+/// one attempt's cost; this key lets `sudo` and polkit use the same collector
+/// rather than pay for five.
 ///
 /// Turning it on changes WHICH SERVICES may collect the evidence, never how much
 /// evidence a grant needs: the full vote window still has to close, and every

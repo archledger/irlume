@@ -826,6 +826,192 @@ fn privileged_opt_in_widens_scope_without_touching_credential_release() {
     ));
 }
 
+/// The newly eligible privileged services behave like the greeter inside the
+/// collector: a complete vote window grants, an incomplete one never reaches
+/// identity, and a deadline or a cancellation is terminal with the evidence
+/// discarded.
+#[test]
+fn privileged_grouped_collection_grants_refuses_and_expires_like_a_greeter() {
+    let _guard = env_guard();
+    let mut s = shared();
+    for (service, purpose) in [
+        (Some("sudo"), AuthenticationPurpose::Verify),
+        (Some("polkit-1"), AuthenticationPurpose::AppConsent),
+    ] {
+        // Complete evidence: identity runs once, on the final sample, and grants.
+        let e = &mut s.engine;
+        let calls = Cell::new(0);
+        let result = e
+            .evaluate_grouped_samples_with(
+                (0..5).collect(),
+                Instant::now() + Duration::from_secs(15),
+                |e, i| Ok(sample(e, i, 0.2)),
+                |_, mut evidence| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(evidence.identity.0, 4);
+                    evidence.assessment.embedding = Some(evidence.identity.1);
+                    evidence.assessment.ir_embedding = Some(evidence.identity.1.to_vec());
+                    Ok(evidence.assessment)
+                },
+                Instant::now,
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1, "{service:?}");
+        let PreparedGroup::Ready(a) = result else {
+            panic!("{service:?}: complete live group refused")
+        };
+        let (mut enr, _) = pad_matching_fixture(0.2, false);
+        enr.profiles[0].scans[0].ir = Some(enr.profiles[0].scans[0].rgb.clone());
+        enr.profiles[0].scans[0].ir_space = Some("raw".into());
+        let prior_ir = e.ir_available;
+        e.ir_available = true;
+        let out = e
+            .authenticate_qualified_assessment(&enr, purpose, service, *a, &())
+            .unwrap();
+        e.vit_scores.clear();
+        e.ir_available = prior_ir;
+        assert!(out.granted, "{service:?}: {}", out.reason);
+
+        // Incomplete evidence: no identity, no grant, ring cleared.
+        let calls = Cell::new(0);
+        let result = e.evaluate_grouped_samples_with(
+            (0..4).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, i| Ok(sample(e, i, 0.2)),
+            |_, evidence| {
+                calls.set(calls.get() + 1);
+                Ok(evidence.assessment)
+            },
+            Instant::now,
+        );
+        assert_eq!(calls.get(), 0, "{service:?}");
+        assert!(!matches!(result, Ok(PreparedGroup::Ready(_))));
+        assert!(e.vit_scores.is_empty(), "{service:?}");
+
+        // Deadline: terminal, not retryable, nothing retained.
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(15);
+        let clock = Cell::new(start);
+        let result = e
+            .evaluate_grouped_samples_with(
+                (0..5).collect(),
+                deadline,
+                |e, i| {
+                    let v = sample(e, i, 0.2);
+                    if i == 1 {
+                        clock.set(deadline);
+                    }
+                    Ok(v)
+                },
+                |_, v| Ok(v.assessment),
+                || clock.get(),
+            )
+            .unwrap();
+        let PreparedGroup::Refused(out) = result else {
+            panic!("{service:?}: expired group admitted")
+        };
+        assert_eq!(out.kind, OutcomeKind::DeadlineExpired);
+        assert!(!presence_retryable(&out), "{service:?}");
+        assert!(e.vit_scores.is_empty(), "{service:?}");
+
+        // Cancellation: preempted, evidence discarded.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let signal = std::sync::Arc::clone(&cancelled);
+        e.set_request_cancel_signal(std::sync::Arc::new(move || signal.load(Ordering::SeqCst)));
+        let result = e.evaluate_grouped_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, i| {
+                let v = sample(e, i, 0.2);
+                if i == 1 {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+                Ok(v)
+            },
+            |_, v| Ok(v.assessment),
+            Instant::now,
+        );
+        e.request_cancelled = None;
+        let cleared = e.vit_scores.is_empty();
+        e.vit_scores.clear();
+        assert!(
+            matches!(result, Err(irlume_common::Error::Preempted(_))),
+            "{service:?}"
+        );
+        assert!(
+            cleared,
+            "{service:?}: cancelled group must discard evidence"
+        );
+    }
+}
+
+/// With the opt-in on, the budget replacement follows the request's capture
+/// route: a privileged request that could use the collector gets the login
+/// window, and one that could not keeps the short one. This is the invariant
+/// that a flag applied inside `grace_window_ms` broke — there the route is not
+/// known yet, so concurrent, unqualified, runtime-demoted and IR-only requests
+/// were handed a longer failure budget they cannot spend.
+#[test]
+fn privileged_budget_follows_the_capture_route_not_the_service_name() {
+    use irlume_common::diagnostics::QualificationState;
+    let ready = |mode: &CaptureModeSelection, ir, rgb_pad, ir_pad, service| {
+        crate::grouped_auth::eligible_configuration_ignoring_budget(
+            mode,
+            ir,
+            rgb_pad,
+            ir_pad,
+            AuthenticationPurpose::Verify,
+            service,
+            true,
+        )
+    };
+    let mode = measured_sequential_configuration();
+    assert!(ready(&mode, true, true, true, Some("sudo")));
+    assert_eq!(
+        crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, true),
+        Some(crate::GRACE_WINDOW_MS)
+    );
+
+    // Each non-grouped route, with the flag still on: no replacement.
+    for (label, broken) in [
+        ("models absent", None),
+        ("concurrent", Some(QualificationState::QualifiedConcurrent)),
+        (
+            "unqualified",
+            Some(QualificationState::UnqualifiedNoAuthority),
+        ),
+    ] {
+        let mut m = mode.clone();
+        let ir_pad = match broken {
+            Some(state) => {
+                m.qualification_state = state;
+                true
+            }
+            None => false,
+        };
+        let route_ready = ready(&m, true, true, ir_pad, Some("sudo"));
+        assert!(!route_ready, "{label} must not reach grouped collection");
+        assert_eq!(
+            crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, route_ready),
+            None,
+            "{label} must keep the short privileged window"
+        );
+    }
+    let demoted = mode.clone();
+    demoted.operation_demoted.set(true);
+    assert!(!ready(&demoted, true, true, true, Some("sudo")));
+
+    // Experimental IR-only never consults this collector: it returns on its own
+    // route before the decision, so the short window stands whatever the flag
+    // says. Asserted as the sensor policy's own early return in
+    // `authenticate_in_window_inner`; here we pin the budget half.
+    assert_eq!(
+        crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, false),
+        None
+    );
+}
+
 #[test]
 fn grouped_eligibility_requires_qualification_models_budget_and_exact_contract() {
     use irlume_common::diagnostics::QualificationState;

@@ -924,33 +924,50 @@ fn pair_admitted_sequentially(skew: std::time::Duration, paired: bool) -> bool {
 /// every login/lock service (and an unknown/absent service) gets the full
 /// login window.
 fn grace_window_ms(service: Option<&str>) -> u64 {
-    if let Some(v) = std::env::var("IRLUME_GRACE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v <= MAX_GRACE_OVERRIDE_MS)
-    {
+    if let Some(v) = grace_window_override_ms() {
         return v;
     }
     // From the shared table, not a local list. The list this replaced was
     // missing `doas`, which is Elevation for the policy, so a doas prompt held
     // the camera for the 15s login window instead of the 5s one (#362).
     match service.and_then(irlume_common::pam_service::classify) {
-        // The short window is sized for an attempt that casts the whole ViT vote
-        // window in one capture session. A pair that can only capture
-        // sequentially casts one vote per attempt, so the owner who opts into
-        // `privileged_grouped_pad_evidence` needs the grouped collector, and that
-        // collector is itself gated on `window >= GRACE_WINDOW_MS`: leaving the
-        // short window here would make the opt-in a no-op. The cost is the one
-        // #362 measured in the other direction — a refused privileged attempt now
-        // holds the camera for the login window before the password prompt.
-        Some(kind)
-            if kind.wants_short_grace()
-                && !irlume_common::config::privileged_grouped_pad_evidence_enabled() =>
-        {
-            SUDO_GRACE_WINDOW_MS
-        }
+        Some(kind) if kind.wants_short_grace() => SUDO_GRACE_WINDOW_MS,
         _ => GRACE_WINDOW_MS,
     }
+}
+
+/// The privileged budget a request actually needs, once its capture route is
+/// known: `Some(ms)` to replace a short privileged window, `None` to keep it.
+///
+/// The short window is sized for an attempt that casts the whole ViT vote window
+/// in one capture session (#362 measured what a needlessly long one costs: a
+/// refused attempt holds the camera and the worker before the password prompt).
+/// A pair that can only capture sequentially casts one vote per attempt, so the
+/// owner who opts into `privileged_grouped_pad_evidence` needs the grouped
+/// collector — and that collector is itself gated on
+/// `window >= GRACE_WINDOW_MS`, so nothing would change without this.
+///
+/// `grouped_ready` is grouped eligibility with its budget term removed, so a
+/// request that cannot use the collector keeps the short window: a concurrent
+/// pair, an unqualified or runtime-demoted one, a request whose models are
+/// missing, credential release, and experimental IR-only (which returns on its
+/// own route before grouped collection is ever consulted).
+///
+/// Only the DEFAULT short window is replaced. An explicit `IRLUME_GRACE_MS`
+/// still decides the budget on its own, including a smaller one and the legacy
+/// one-shot zero, because an operator who names a number has named it for every
+/// service.
+fn privileged_budget_for_route(window_ms: u64, grouped_ready: bool) -> Option<u64> {
+    (grouped_ready && grace_window_override_ms().is_none() && window_ms == SUDO_GRACE_WINDOW_MS)
+        .then_some(GRACE_WINDOW_MS)
+}
+
+/// The operator's explicit window, when set and within bounds.
+fn grace_window_override_ms() -> Option<u64> {
+    std::env::var("IRLUME_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v <= MAX_GRACE_OVERRIDE_MS)
 }
 
 /// What this authentication is FOR, which decides what has to happen on top of
@@ -5604,6 +5621,39 @@ impl Engine {
             );
         }
         let sequential = capture_mode.is_sequential();
+        // A privileged request that can use grouped collection needs the
+        // collector's own budget, and only such a request: decide that here,
+        // where the capture route is known, rather than in `grace_window_ms`,
+        // where it is not. The replacement window is measured from this
+        // request's entry instant (`deadline - window`), never from now, so the
+        // request still has exactly one deadline and time already spent still
+        // counts against it.
+        let (window, deadline) = match privileged_budget_for_route(
+            window,
+            capture_mode.runtime_contract.is_some()
+                && grouped_auth::eligible_configuration_ignoring_budget(
+                    &capture_mode,
+                    self.ir_available,
+                    self.has_vit_pad(),
+                    self.has_pad_ir(),
+                    purpose,
+                    service,
+                    irlume_common::config::privileged_grouped_pad_evidence_enabled(),
+                ),
+        ) {
+            Some(extended) => {
+                irlume_common::dlog!(
+                    "grace: privileged grouped collection admitted; window {window}ms -> \
+                     {extended}ms from request entry"
+                );
+                (
+                    extended,
+                    deadline - std::time::Duration::from_millis(window)
+                        + std::time::Duration::from_millis(extended),
+                )
+            }
+            None => (window, deadline),
+        };
         let grouped = grouped_auth::eligible(
             &capture_mode,
             self.ir_available,
@@ -8835,10 +8885,6 @@ mod tests {
         // Env override off for this check (guarded: another test sets it).
         let _g = env_guard();
         std::env::remove_var("IRLUME_GRACE_MS");
-        // The privileged opt-in lengthens these windows, and this asserts the
-        // default: pin it here rather than inheriting the build host's
-        // settings.conf, which a developer's own machine may have turned on.
-        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "0");
         assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
         assert_eq!(grace_window_ms(Some("su")), SUDO_GRACE_WINDOW_MS);
         // Login/lock services and an unknown/absent service get the full window.
@@ -8851,33 +8897,40 @@ mod tests {
             GRACE_WINDOW_MS,
             "an unrecognised service takes the long window, not a shortcut"
         );
-        std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
     }
 
-    /// With the owner's opt-in, the privileged surfaces take the login window,
-    /// because the grouped collector they now reach is itself gated on
-    /// `window >= GRACE_WINDOW_MS`: the short window would make the key a no-op.
-    /// Login and lock services are already on the long window and must not move.
+    /// The privileged budget replacement is keyed on the request's own capture
+    /// route, so the service table and every window that was not the default
+    /// short one are left exactly as they were.
     #[test]
-    fn privileged_opt_in_lengthens_only_the_short_windows() {
+    fn privileged_budget_replaces_only_the_default_short_window() {
         let _g = env_guard();
         std::env::remove_var("IRLUME_GRACE_MS");
-        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "1");
-        use irlume_common::pam_service::SERVICES;
-        for (name, _kind) in SERVICES {
+        // Ready for the collector: the default short window is replaced.
+        assert_eq!(
+            privileged_budget_for_route(SUDO_GRACE_WINDOW_MS, true),
+            Some(GRACE_WINDOW_MS)
+        );
+        // Not ready (concurrent, unqualified, demoted, models absent,
+        // credential release, IR-only): nothing moves.
+        assert_eq!(
+            privileged_budget_for_route(SUDO_GRACE_WINDOW_MS, false),
+            None
+        );
+        // A login/lock request is already on the long window.
+        assert_eq!(privileged_budget_for_route(GRACE_WINDOW_MS, true), None);
+        // An explicit override decides on its own, in both directions, and the
+        // legacy one-shot zero is only reachable that way.
+        for value in ["8000", "0", "30000"] {
+            std::env::set_var("IRLUME_GRACE_MS", value);
+            let named = grace_window_ms(Some("sudo"));
             assert_eq!(
-                grace_window_ms(Some(name)),
-                GRACE_WINDOW_MS,
-                "{name}: the opt-in puts every wired service on the login window"
+                privileged_budget_for_route(named, true),
+                None,
+                "IRLUME_GRACE_MS={value} must keep deciding the budget"
             );
         }
-        // The explicit numeric override still outranks the key.
-        std::env::set_var("IRLUME_GRACE_MS", "8000");
-        assert_eq!(grace_window_ms(Some("sudo")), 8000);
         std::env::remove_var("IRLUME_GRACE_MS");
-        std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "0");
-        assert_eq!(grace_window_ms(Some("sudo")), SUDO_GRACE_WINDOW_MS);
-        std::env::remove_var("IRLUME_PRIVILEGED_GROUPED_PAD");
     }
 
     /// Every service the policy calls Elevation must also take the SHORT

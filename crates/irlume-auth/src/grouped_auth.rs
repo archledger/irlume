@@ -95,6 +95,38 @@ pub(super) fn eligible_configuration(
         && window >= GRACE_WINDOW_MS
 }
 
+/// [`eligible_configuration`] without its budget term, for deciding what budget
+/// the request needs in the first place. Every other configuration requirement —
+/// the capture route, its qualification and runtime standing, the models, and
+/// the purpose/service scope — is already decided by then, so this answers
+/// "could this configuration use the collector, given enough window?" and
+/// nothing else. Exact runtime authority stays in the outer gate, as in
+/// [`eligible`], so the caller ANDs this with the runtime contract.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors eligible_configuration, whose arguments it shares"
+)]
+pub(super) fn eligible_configuration_ignoring_budget(
+    mode: &CaptureModeSelection,
+    has_ir: bool,
+    has_rgb_pad: bool,
+    has_ir_pad: bool,
+    purpose: AuthenticationPurpose,
+    service: Option<&str>,
+    privileged_opt_in: bool,
+) -> bool {
+    eligible_configuration(
+        mode,
+        has_ir,
+        has_rgb_pad,
+        has_ir_pad,
+        GRACE_WINDOW_MS,
+        purpose,
+        service,
+        privileged_opt_in,
+    )
+}
+
 fn expired() -> Outcome {
     Outcome::deny(
         OutcomeKind::DeadlineExpired,

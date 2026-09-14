@@ -16,6 +16,7 @@ pub mod config;
 pub mod dbglog;
 pub mod diagnostics;
 pub mod gkr_wire;
+pub mod journal_out;
 pub mod live;
 pub mod live_camera;
 pub mod memlock;

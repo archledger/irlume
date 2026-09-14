@@ -5,6 +5,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Daemon journal lines now carry real syslog priorities: failures are logged
+  at err, degradations and configuration fallbacks at warning, significant
+  but expected events at notice, routine operation at info, and the opt-in
+  `IRLUME_LOG=debug` trace lines at debug. Message texts are unchanged, so
+  existing searches keep working; `journalctl -p err` and level filters now
+  find the right lines. Priorities are emitted through the journald stream
+  prefix protocol and only when stderr is the journal stream systemd
+  connected (`JOURNAL_STREAM`), so terminal output stays byte-identical.
+
 ### Added
 
 - Scheduled CI health alert: a daily check of the nightly hardware suite and

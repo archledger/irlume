@@ -17,6 +17,7 @@
 //! the worker, not the process.
 
 use irlume_common::pam_service::ServiceKind;
+use irlume_common::{jout_err, jout_info, jout_notice, jout_warn};
 use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -142,7 +143,7 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 // Strict must also catch a *deleted* model: silently skipping
                 // would let removal (not just tampering) downgrade liveness.
                 if strict {
-                    eprintln!(
+                    jout_err!(
                         "irlumed: IRLUME_MODELS_STRICT: cannot read model {path} ({e}); refusing to start"
                     );
                     std::process::exit(1);
@@ -156,7 +157,7 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
         let model = irlume_common::HashedModel::new(bytes);
         let digest = model.sha256();
         if !known.contains(digest) {
-            eprintln!(
+            jout_warn!(
                 "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
             );
             if strict {
@@ -169,14 +170,14 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
                 // full digest changes the `embed:<sha256>` space tag, so
                 // `recognizer_space_matches` excludes every stored scan from the
                 // old space. That argument does not cover the other artifacts.
-                eprintln!(
+                jout_err!(
                     "irlumed: IRLUME_MODELS_STRICT=1: refusing to start with unverified models \
                      (verification runs before startup and post-panic rebuilds; only the recognizer \
                      bytes are carried from this check into the loader)"
                 );
                 std::process::exit(1);
             }
-            eprintln!(
+            jout_notice!(
                 "irlumed: continuing with unverified weights (expected for custom or \
                  self-trained models; set IRLUME_MODELS_STRICT=1 to refuse instead)"
             );
@@ -286,7 +287,7 @@ fn verified_pad_model(path: &str, strict: bool) -> Option<irlume_common::HashedM
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!(
+            jout_warn!(
                 "irlumed: PAD model {path} cannot be read ({error}); face authentication is password-only"
             );
             return None;
@@ -302,16 +303,16 @@ fn verified_pad_model(path: &str, strict: bool) -> Option<irlume_common::HashedM
         return Some(model);
     }
 
-    eprintln!(
+    jout_warn!(
         "irlumed: WARNING: {path} does not match any release model checksum (sha256 {digest})"
     );
     if strict {
-        eprintln!(
+        jout_warn!(
             "irlumed: IRLUME_MODELS_STRICT=1: refusing this PAD model; daemon remains available and face authentication is password-only"
         );
         None
     } else {
-        eprintln!(
+        jout_notice!(
             "irlumed: continuing with unverified PAD weights; set IRLUME_MODELS_STRICT=1 to refuse them"
         );
         Some(model)
@@ -344,7 +345,7 @@ fn load_pad_models(
         None => (engine, None),
     };
     if let Some(error) = &vit_error {
-        eprintln!("irlumed: RGB PAD did not load ({error}); face authentication is password-only");
+        jout_warn!("irlumed: RGB PAD did not load ({error}); face authentication is password-only");
     }
     let rgb_status = pad_model_status(
         vit_enabled,
@@ -364,7 +365,7 @@ fn load_pad_models(
         None => (engine, None),
     };
     if let Some(error) = &ir_error {
-        eprintln!(
+        jout_warn!(
             "irlumed: IR PAD did not load ({error}); secure and dark face authentication are password-only"
         );
     }
@@ -492,7 +493,7 @@ fn build_engine_from_config(
             }
             let (engine, error) = engine.with_mesh_degraded(&config.mesh);
             if let Some(error) = error {
-                eprintln!(
+                jout_warn!(
                     "irlumed: FaceMesh did not load ({error}); continuing WITHOUT \
                      the mesh: BlazeFace detection-rescue alignment is unavailable; \
                      head nod approval and head-shake decline still work. Fix the \
@@ -567,7 +568,7 @@ fn main() {
     // somewhere else in a test).
     let listener = match inherited_listener() {
         Some(l) => {
-            eprintln!("irlumed: using the socket systemd bound (socket activation)");
+            jout_info!("irlumed: using the socket systemd bound (socket activation)");
             l
         }
         None => {
@@ -575,7 +576,7 @@ fn main() {
             match UnixListener::bind(&socket) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("irlumed: cannot bind {socket}: {e}");
+                    jout_err!("irlumed: cannot bind {socket}: {e}");
                     std::process::exit(1);
                 }
             }
@@ -592,10 +593,10 @@ fn main() {
             // Silent failure here would leave the socket at the umask mode
             // with no trace, and face auth would just stop working for part
             // of the fleet (2026-08-29 audit: the error was discarded).
-            eprintln!("irlumed: WARNING: could not set {DAEMON_SOCKET_MODE:o} on {socket}: {e}");
+            jout_warn!("irlumed: WARNING: could not set {DAEMON_SOCKET_MODE:o} on {socket}: {e}");
         }
     }
-    eprintln!("irlumed: socket ready at {socket}; requests queue while startup finishes");
+    jout_info!("irlumed: socket ready at {socket}; requests queue while startup finishes");
 
     // The engine is built OFF the startup path, so the socket is not merely
     // bound early but SERVED early.
@@ -624,7 +625,7 @@ fn main() {
             // initialization must not delay the already-bound accept loop.
             // LiveStatus only copies an existing publication; it never starts it.
             irlume_auth::initialize_camera_monitor();
-            eprintln!("irlumed: loading models (det={det}, model={model})…");
+            jout_info!("irlumed: loading models (det={det}, model={model})…");
             // The recognizer's verified bytes come back and go straight into the
             // engine below (#346), so the 260MB file is read and hashed once per
             // start rather than once here and once again inside the loader.
@@ -640,15 +641,15 @@ fn main() {
             let devices = select_engine_devices(startup_policy);
             let (rgb_dev, ir_dev) = (devices.rgb, devices.ir);
             if !permits_background_requalification(startup_policy) {
-                eprintln!("irlumed: camera discovery disabled by sensor policy; IR readiness is checked on request");
+                jout_info!("irlumed: camera discovery disabled by sensor policy; IR readiness is checked on request");
             } else if !ir_dev.is_empty() {
-                eprintln!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)");
+                jout_info!("irlumed: cameras rgb={rgb_dev} ir={ir_dev} (secure tier)");
             } else if devices.rgb_available {
-                eprintln!(
+                jout_info!(
                     "irlumed: RGB-only camera, no IR pair (convenience tier: screen unlock only)"
                 );
             } else {
-                eprintln!(
+                jout_warn!(
                     "irlumed: no camera found (face auth unavailable; password/fingerprint only)"
                 );
             }
@@ -668,7 +669,7 @@ fn main() {
             // produces exactly the same measurement. Discovery now happens only when
             // someone runs `irlume ir-setup` and accepts the warning.
             if !ir_dev.is_empty() {
-                eprintln!(
+                jout_info!(
                     "irlumed: IR emitter verification deferred to the first authentication \
                      (capture re-applies the known control)"
                 );
@@ -700,7 +701,7 @@ fn main() {
                             Ok(irlume_auth::QualificationResolution::Unqualified(
                                 irlume_auth::QualificationMismatch::ContextChanged,
                             )) => {
-                                eprintln!(
+                                jout_notice!(
                                     "irlumed: camera context changed since the last \\
                                      qualification; running a background requalification \\
                                      (the IR emitter fires for up to a minute)"
@@ -715,10 +716,10 @@ fn main() {
                                     TUNE_DEFAULT_ROUNDS,
                                     ProbeStore::AutomaticIfAbsent,
                                 ) {
-                                    Ok(note) => eprintln!(
+                                    Ok(note) => jout_notice!(
                                         "irlumed: background requalification complete: {note}"
                                     ),
-                                    Err(e) => eprintln!(
+                                    Err(e) => jout_warn!(
                                         "irlumed: background requalification failed ({e}); \\
                                          run `sudo irlume camera-tune` to requalify manually"
                                     ),
@@ -742,7 +743,7 @@ fn main() {
                 "third_party_detector",
             ] {
                 if let Some(name) = irlume_common::config::read_kv("settings.conf", legacy_key) {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: NOTICE: settings.conf key '{legacy_key}={name}' is ignored: \
                          third-party model support was removed; the shipped models-v1 \
                          stack is the only supported set (re-enroll if you enrolled under \
@@ -782,7 +783,7 @@ fn main() {
             // models load), so no connection can observe the default EngineBits.
             let engine = match build_engine(verified_recognizer) {
                 Ok((e, rgb_pad_status, ir_pad_status)) => {
-                    eprintln!(
+                    jout_info!(
                         "irlumed: IR adapter {}",
                         if e.has_ir_adapter() {
                             "loaded"
@@ -790,11 +791,11 @@ fn main() {
                             "absent (raw IR)"
                         }
                     );
-                    eprintln!(
+                    jout_info!(
                         "irlumed: FaceMesh (passive liveness) {}",
                         if e.has_mesh() { "loaded" } else { "absent" }
                     );
-                    eprintln!(
+                    jout_info!(
                         "irlumed: rescue detector {}",
                         if e.has_blaze_rescue() {
                             "BlazeFace short-range (shipped)"
@@ -806,12 +807,12 @@ fn main() {
                     // with their measured species coverage named so an
                     // operator reading the journal knows what each one does
                     // and does not stop.
-                    eprintln!(
+                    jout_info!(
                         "irlumed: RGB PAD cue (ViT) {} — catches print/banner species; \
                          does NOT stop a phone at login distance; password-only switch: IRLUME_PAD_VIT=0",
                         if e.has_vit_pad() { "loaded" } else { "UNAVAILABLE (face authentication is password-only)" }
                     );
-                    eprintln!(
+                    jout_info!(
                         "irlumed: IR PAD cue (flir) {} — screens/phones present no face \
                          in IR; print species; password-only switch: IRLUME_PAD_IR=0",
                         if e.has_pad_ir() { "loaded" } else { "UNAVAILABLE (secure and dark face authentication are password-only)" }
@@ -819,7 +820,7 @@ fn main() {
                     (e, rgb_pad_status, ir_pad_status)
                 }
                 Err(e) => {
-                    eprintln!("irlumed: failed to load models: {e}");
+                    jout_err!("irlumed: failed to load models: {e}");
                     std::process::exit(1);
                 }
             };
@@ -839,7 +840,7 @@ fn main() {
                         Ok(Some(enr)) => {
                             let stale = enr.stale_ir_scans(ir_space);
                             if stale > 0 && enr.usable_ir_scans(ir_space) == 0 {
-                                eprintln!(
+                                jout_notice!(
                                     "irlumed: NOTE for '{user}': {stale} IR template(s) have an \
                                      unknown or different IR pipeline and cannot match. \
                                      RGB templates are preserved; run `irlume enroll` to capture \
@@ -849,7 +850,7 @@ fn main() {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            eprintln!(
+                            jout_warn!(
                                 "irlumed: could not read '{user}' during the IR compatibility \
                                  sweep ({e}); leaving the sweep owed"
                             );
@@ -860,7 +861,7 @@ fn main() {
                 if all_swept {
                     irlume_core::storage::mark_retag_done(ir_space);
                 } else {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: the IR compatibility sweep did not complete for every user; \
                          it will run again next start"
                     );
@@ -906,9 +907,9 @@ fn main() {
             // deadlines, each connection is isolated behind catch_unwind, and camera
             // work carries a per-uid throttle. On Fedora the SELinux module remains the
             // mandatory-access layer.
-            eprintln!("irlumed: serving on {socket} (0666; SO_PEERCRED authorizes every request)");
+            jout_info!("irlumed: serving on {socket} (0666; SO_PEERCRED authorizes every request)");
             if irlume_common::dbglog::on() {
-                eprintln!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
+                jout_info!("irlumed: diagnostic tracing ON (IRLUME_LOG=debug): per-stage pipeline lines follow; numbers only, never frames/embeddings");
             }
 
             // Socket watchdog: if our socket file is deleted/replaced out from under us
@@ -921,7 +922,7 @@ fn main() {
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     if !std::path::Path::new(&socket).exists() {
-                        eprintln!("irlumed: socket {socket} vanished; exiting for a clean re-bind");
+                        jout_err!("irlumed: socket {socket} vanished; exiting for a clean re-bind");
                         std::process::exit(1);
                     }
                 });
@@ -997,7 +998,7 @@ fn main() {
                                 Ok(resp) => resp,
                                 Err(_) => {
                                     diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Rebuilding);
-                                    eprintln!(
+                                    jout_err!(
                                         "irlumed: request handler PANICKED; this request was denied \
                                          (PAM falls back to the password). Rebuilding the engine for a \
                                          clean state; please report this with the backtrace above."
@@ -1037,9 +1038,9 @@ fn main() {
                                                 rgb_pad_status,
                                                 ir_pad_status,
                                             );
-                                            eprintln!("irlumed: engine rebuilt after panic");
+                                            jout_notice!("irlumed: engine rebuilt after panic");
                                         }
-                                        Err(e) => eprintln!(
+                                        Err(e) => jout_err!(
                                             "irlumed: engine rebuild after panic FAILED ({e}); continuing \
                                              with the existing engine"
                                         ),
@@ -1062,7 +1063,7 @@ fn main() {
                         // Without the worker nothing can be served, and a daemon that
                         // accepts connections it can never answer is worse than one that
                         // exits and lets systemd restart it.
-                        eprintln!("irlumed: could not start the camera worker: {e}");
+                        jout_err!("irlumed: could not start the camera worker: {e}");
                         std::process::exit(1);
                     })
             };
@@ -1073,7 +1074,7 @@ fn main() {
                 diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Ready);
             })
             .unwrap_or_else(|e| {
-                eprintln!("irlumed: could not start the startup thread: {e}");
+                jout_err!("irlumed: could not start the startup thread: {e}");
                 std::process::exit(1);
             });
     }
@@ -1194,14 +1195,14 @@ fn main() {
                     .spawn(move || {
                         let _slot = slot;
                         if let Err(e) = serve(stream, &arbiter, &engine_ready, &diagnostic_state) {
-                            eprintln!("irlumed: connection error: {e}");
+                            jout_warn!("irlumed: connection error: {e}");
                         }
                     })
                 {
-                    eprintln!("irlumed: could not start a connection thread: {e}");
+                    jout_err!("irlumed: could not start a connection thread: {e}");
                 }
             }
-            Err(e) => eprintln!("irlumed: accept error: {e}"),
+            Err(e) => jout_warn!("irlumed: accept error: {e}"),
         }
     }
     diagnostic_state
@@ -1625,7 +1626,7 @@ impl WorkerReply {
         if result.is_ok() && completion.attempt.delivered().is_err() {
             // The admitted response cannot be retracted. Disk stays authoritative;
             // retain conservative accounting and never send a second response.
-            eprintln!("irlumed: delivered face response; retry reset was not confirmed");
+            jout_warn!("irlumed: delivered face response; retry reset was not confirmed");
         }
         result
     }
@@ -2556,7 +2557,7 @@ fn spawn_watchdog() {
                 std::thread::sleep(interval);
                 if worker_wedged(interval) {
                     if !complained {
-                        eprintln!(
+                        jout_err!(
                             "irlumed: the camera worker has made no progress for {}s; \
                              withholding the systemd watchdog ping so this is restarted \
                              rather than left hung (face auth falls back to the password \
@@ -2569,7 +2570,7 @@ fn spawn_watchdog() {
                 }
                 complained = false;
                 if let Err(e) = notify_watchdog(&socket) {
-                    eprintln!("irlumed: watchdog ping failed: {e}");
+                    jout_err!("irlumed: watchdog ping failed: {e}");
                 }
             }
         })
@@ -2710,7 +2711,7 @@ fn inherited_listener() -> Option<UnixListener> {
     }
     let n = fds?;
     if n != 1 {
-        eprintln!("irlumed: LISTEN_FDS={n}, expected exactly 1; binding our own socket instead");
+        jout_warn!("irlumed: LISTEN_FDS={n}, expected exactly 1; binding our own socket instead");
         return None;
     }
     SOCKET_ACTIVATED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2781,7 +2782,7 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
         use irlume_core::biopolicy::{classify, OperationClass, SessionState};
         let class = classify(service.as_deref().unwrap_or(""), SessionState::Warm);
         if !matches!(class, OperationClass::ScreenUnlock | OperationClass::Login) {
-            eprintln!(
+            jout_notice!(
                 "irlumed: UnsealKeyring refused for service '{}' ({class:?})",
                 journal_safe(service.as_deref().unwrap_or("?"))
             );
@@ -2810,7 +2811,7 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
     // cannot tag one envelope's secret with another's kind.
     match irlume_core::keyring::unseal_secret(&user) {
         Ok(unsealed) => {
-            eprintln!(
+            jout_info!(
                 "irlumed: UnsealKeyring: OK for '{user}' (fingerprint-authenticated), {} unsealed",
                 unsealed.kind.describe()
             );
@@ -2820,7 +2821,7 @@ fn unseal_keyring(user: &str, service: Option<&str>, have_password: bool, peer: 
             }
         }
         Err(e) => {
-            eprintln!("irlumed: UnsealKeyring: TPM unseal FAILED for '{user}': {e}");
+            jout_err!("irlumed: UnsealKeyring: TPM unseal FAILED for '{user}': {e}");
             Response::Error(e.to_string())
         }
     }
@@ -3895,7 +3896,7 @@ fn pregate(req: &Request, peer: &Peer) -> Option<Response> {
 /// will be refused.
 fn note_unseal_password_refusal(uid: u32) {
     if first_nonroot_unseal(uid) {
-        eprintln!(
+        jout_notice!(
             "irlumed: UnsealPassword refused for uid {uid} (not root): no sealed \
              credential is released to a user-context caller. A greeter that runs \
              PAM as the user, notably the KDE lock screen, gets identity \
@@ -4477,11 +4478,11 @@ fn prepare_enrollment_ir(device: &str, det: &mut irlume_auth::Detector) -> bool 
     let emitter = irlume_auth::apply_known_ir_emitter_subject_region(device, det);
     match &emitter {
         Ok(true) => {}
-        Ok(false) => eprintln!(
+        Ok(false) => jout_notice!(
             "irlumed: IR is dark; enrolling RGB (dark unlock unavailable). \
              If this camera needs an emitter control, run `sudo irlume ir-setup`."
         ),
-        Err(error) => eprintln!("irlumed: IR emitter check skipped: {error}"),
+        Err(error) => jout_warn!("irlumed: IR emitter check skipped: {error}"),
     }
     enrollment_capture_uses_ir(&emitter)
 }
@@ -4520,7 +4521,7 @@ fn enroll_with_capture_probe(
     enroll: impl FnOnce() -> Response,
 ) -> Response {
     if let Some(note) = enroll_capture_probe_note(identifiable, stored, probe) {
-        eprintln!("irlumed: {note}");
+        jout_info!("irlumed: {note}");
     }
     enroll()
 }
@@ -4650,7 +4651,7 @@ fn set_camera_devices(rgb: &str, ir: &str, engine: &mut irlume_auth::Engine) -> 
     if let Err(e) = irlume_common::config::write_camera_pin(rgb, ir, &rgb_id, &ir_id) {
         msg = format!("{msg} (live only; could not persist: {e})");
     }
-    eprintln!("irlumed: {msg}");
+    jout_info!("irlumed: {msg}");
     Response::Ok(msg)
 }
 
@@ -4978,7 +4979,7 @@ fn dispatch_scoped_session_inner(
                     .unwrap_or(SessionState::Cold);
                 let class = classify(service.as_deref().unwrap_or(""), session);
                 if class != OperationClass::ScreenUnlock {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password",
                         journal_safe(service.as_deref().unwrap_or("?"))
                     );
@@ -5007,7 +5008,7 @@ fn dispatch_scoped_session_inner(
                 use irlume_core::biopolicy::{classify, decide, Action, SessionState, Tier};
                 let svc = service.as_deref().unwrap_or("");
                 if decide(classify(svc, SessionState::Cold), Tier::Secure) == Action::Deny {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: biopolicy denies verify for service '{}' -> password",
                         journal_safe(svc)
                     );
@@ -5065,7 +5066,7 @@ fn dispatch_scoped_session_inner(
                             } else {
                                 (deny_score(o.score), deny_reason(&o.reason))
                             };
-                            eprintln!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
+                            jout_info!("irlumed: face auth '{user}': granted={} live={} score={score} ({reason})",
                             o.granted, o.live);
                         }
                         irlume_common::dlog!("verify '{user}' total {}ms", t.elapsed().as_millis());
@@ -5193,7 +5194,7 @@ fn dispatch_scoped_session_inner(
                 identifiable,
                 qualified_mode,
                 || {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: enroll: no measured capture mode for this camera pair; \
                          running the one-time contention probe before the scans (up to a \
                          minute; the IR emitter fires)"
@@ -5241,7 +5242,7 @@ fn dispatch_scoped_session_inner(
             );
             match run_capture_mode_probe(&rgb_dev, &ir_dev, rounds, ProbeStore::ExplicitReplace) {
                 Ok(msg) => {
-                    eprintln!("irlumed: {msg}");
+                    jout_info!("irlumed: {msg}");
                     Response::Ok(msg)
                 }
                 Err(e) => Response::Error(e),
@@ -5273,7 +5274,7 @@ fn dispatch_scoped_session_inner(
                 // same `dry_run` field this branch reads.
                 match irlume_auth::setup_ir_emitter(engine.ir_device()) {
                     Ok(msg) => {
-                        eprintln!("irlumed: {msg}");
+                        jout_info!("irlumed: {msg}");
                         Response::Ok(msg)
                     }
                     Err(e) => Response::Error(e.to_string()),
@@ -5411,7 +5412,7 @@ fn dispatch_scoped_session_inner(
                 };
                 return match armed {
                     Ok(token) => {
-                        eprintln!(
+                        jout_notice!(
                             "irlumed: SealPassword: sealed a GNOME keyring token for '{user}' \
                              ({}); caller must now re-key the login keyring",
                             if already_token {
@@ -5447,7 +5448,7 @@ fn dispatch_scoped_session_inner(
             };
             match irlume_core::keyring::seal_secret(&user, &secret, core_kind) {
                 Ok(()) => {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: SealPassword: armed keyring unlock for '{user}' ({})",
                         core_kind.describe()
                     );
@@ -5493,7 +5494,7 @@ fn dispatch_scoped_session_inner(
                 use irlume_core::biopolicy::{classify, OperationClass, SessionState};
                 let svc = service.as_deref().unwrap_or("");
                 if classify(svc, SessionState::Cold) == OperationClass::AppConsent {
-                    eprintln!(
+                    jout_notice!(
                     "irlumed: UnsealPassword refused for polkit service '{}' (verify-only class)",
                     journal_safe(svc)
                 );
@@ -5505,7 +5506,7 @@ fn dispatch_scoped_session_inner(
             // Smart-Auto: an RGB-only (convenience) device NEVER releases the
             // sealed credential: no cold-login / keyring unlock by RGB-only face.
             if tier == irlume_core::biopolicy::Tier::Convenience {
-                eprintln!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
+                jout_notice!("irlumed: convenience(RGB-only) refuses credential release for '{user}' -> password");
                 return Response::UnsealUnavailable {
                     reason: "RGB-only convenience: face cannot release the login credential".into(),
                 };
@@ -5528,7 +5529,7 @@ fn dispatch_scoped_session_inner(
                 // is Secure tier.
                 let action = decide(classify(svc, SessionState::Cold), Tier::Secure);
                 if action != Action::Unseal {
-                    eprintln!(
+                    jout_notice!(
                     "irlumed: biopolicy denies unseal for service '{}' ({action:?}) -> password",
                     journal_safe(svc)
                 );
@@ -5570,7 +5571,7 @@ fn dispatch_scoped_session_inner(
             // password. `password` zeroizes on drop.
             match irlume_core::keyring::release_token_with_password(&user, password.expose()) {
                 Ok(token) => {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: ReleaseTokenForDisarm: released '{user}'s keyring token \
                          (password verified against the recovery wrap)"
                     );
@@ -5611,11 +5612,11 @@ fn dispatch_scoped_session_inner(
                 Ok(outcome) => {
                     use irlume_core::keyring::Reseal;
                     if outcome == Reseal::Resealed {
-                        eprintln!(
+                        jout_notice!(
                             "irlumed: ResealPassword: re-bound '{user}' to current PCRs (self-heal after PCR/password change)"
                         );
                     } else if outcome == Reseal::Upgraded {
-                        eprintln!(
+                        jout_notice!(
                             "irlumed: ResealPassword: upgraded '{user}' keyring seal to a stronger TPM policy tier (no re-arm needed)"
                         );
                     }
@@ -5642,12 +5643,14 @@ fn dispatch_scoped_session_inner(
                             "could not encrypt existing templates: {e}"
                         ));
                     }
-                    eprintln!("irlumed: RecoverySetup: encrypted existing templates for '{user}'");
+                    jout_notice!(
+                        "irlumed: RecoverySetup: encrypted existing templates for '{user}'"
+                    );
                 }
             }
             match irlume_core::template_key::setup_recovery(&user, passphrase.expose()) {
                 Ok(()) => {
-                    eprintln!("irlumed: RecoverySetup: recovery passphrase set for '{user}'");
+                    jout_notice!("irlumed: RecoverySetup: recovery passphrase set for '{user}'");
                     Response::Ok(format!("recovery passphrase set for '{user}'"))
                 }
                 Err(e) => Response::Error(e.to_string()),
@@ -5656,7 +5659,7 @@ fn dispatch_scoped_session_inner(
         Request::RecoveryRestore { user, passphrase } => {
             match irlume_core::template_key::restore_from_recovery(&user, passphrase.expose()) {
                 Ok(()) => {
-                    eprintln!(
+                    jout_notice!(
                         "irlumed: RecoveryRestore: re-sealed '{user}' template key to current PCRs"
                     );
                     Response::Ok(format!("template key restored and re-sealed for '{user}'"))
@@ -6128,7 +6131,7 @@ fn do_unseal_password_scoped(
     completion: &mut Option<FaceCompletion>,
     sensor_policy: irlume_common::config::FaceSensorPolicy,
 ) -> Response {
-    eprintln!("irlumed: UnsealPassword: attempt for '{user}'");
+    jout_info!("irlumed: UnsealPassword: attempt for '{user}'");
     let t = std::time::Instant::now();
     if !irlume_core::keyring::has_sealed_password(user) {
         return Response::UnsealUnavailable {
@@ -6167,7 +6170,7 @@ fn do_unseal_password_scoped(
             } else {
                 ""
             };
-            eprintln!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}{hint}");
+            jout_warn!("irlumed: UnsealPassword: capture/auth failed for '{user}': {e}{hint}");
             return Response::Error(e.to_string());
         }
     };
@@ -6200,7 +6203,7 @@ fn finish_unseal_password(
         // on: a 4-decimal score after every try is a gradient a journal-reading
         // attacker could climb to tune a spoof. One decimal still separates
         // "borderline" from "not even close" for false-reject diagnosis.
-        eprintln!(
+        jout_notice!(
             "irlumed: UnsealPassword: denied for '{user}' (live={}, score {}: {}) -> password",
             outcome.live,
             deny_score(outcome.score),
@@ -6212,7 +6215,7 @@ fn finish_unseal_password(
     // come from the same envelope.
     match irlume_core::keyring::unseal_secret(user) {
         Ok(unsealed) => {
-            eprintln!(
+            jout_info!(
                 "irlumed: UnsealPassword: OK for '{user}' (score {:.4}), {} unsealed",
                 outcome.score,
                 unsealed.kind.describe()
@@ -6238,7 +6241,7 @@ fn finish_unseal_password(
             } else {
                 ""
             };
-            eprintln!(
+            jout_err!(
                 "irlumed: UnsealPassword: face matched for '{user}' (score {:.4}) but TPM unseal FAILED: {e}{hint}",
                 outcome.score
             );
@@ -6308,6 +6311,44 @@ fn journal_safe(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irlume_common::jout_debug;
+
+    /// Ratchet: daemon source must emit through the leveled jout_* macros (or
+    /// the shared dlog!) only, so a new line cannot silently regress to an
+    /// unprioritized journal entry. The needle is split so this test does not
+    /// match its own source.
+    #[test]
+    fn daemon_sources_have_no_bare_eprintln_left() {
+        let needle = concat!("eprint", "ln!(");
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let src = std::path::Path::new(manifest).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    for (no, line) in std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                        .lines()
+                        .enumerate()
+                    {
+                        if line.contains(needle) {
+                            offenders.push(format!("{}:{}", path.display(), no + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "daemon source still writes unprioritized lines; route them through a jout_* macro: {offenders:#?}"
+        );
+    }
 
     #[test]
     fn authentication_budget_finalization_refuses_late_engine_tpm_and_persistence() {
@@ -12073,7 +12114,7 @@ mod tests {
         // would seal a real template key, so this runs on no-TPM hosts (CI,
         // the container suite). Same convention as the other mutation tests.
         if irlume_core::template_key::tpm_available() {
-            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
             return;
         }
         let _g = env_lock();
@@ -12154,7 +12195,7 @@ mod tests {
     #[test]
     fn forget_recognizer_clears_a_calibration_that_outlived_its_scans() {
         if irlume_core::template_key::tpm_available() {
-            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
             return;
         }
         let _g = env_lock();
@@ -12416,7 +12457,7 @@ mod tests {
         // because the off arm ends in storage::save. Same convention as the
         // other save-touching tests here.
         if irlume_core::template_key::tpm_available() {
-            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
             return;
         }
         let _g = env_lock();
@@ -12503,7 +12544,7 @@ mod tests {
         // seal a real template key, so this test only runs on no-TPM hosts
         // (CI runners). Same convention as irlume-core's storage tests.
         if irlume_core::template_key::tpm_available() {
-            eprintln!("skipping: TPM present; storage::save would touch real hardware");
+            jout_debug!("skipping: TPM present; storage::save would touch real hardware");
             return;
         }
         let _g = env_lock();

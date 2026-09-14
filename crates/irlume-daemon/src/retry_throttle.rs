@@ -5,6 +5,7 @@
 //! keeps its charge; only an admitted response or verified recovery resets it.
 //! Disk is authoritative: no cached counter can disagree with a visible rename.
 
+use irlume_common::jout_warn;
 use irlume_common::{write_atomic_reporting, AtomicWrite};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -45,7 +46,7 @@ impl Policy {
             &crate::env_or("IRLUME_RATE_COOLDOWN_SECS", "30"),
         );
         if invalid {
-            eprintln!("irlumed: invalid face retry configuration; using safe defaults for invalid settings");
+            jout_warn!("irlumed: invalid face retry configuration; using safe defaults for invalid settings");
         }
         policy
     }
@@ -706,7 +707,7 @@ pub(crate) fn record_if(
         )
     });
     result.map_err(|e| {
-        eprintln!("irlumed: face retry recording failed: {e}");
+        jout_warn!("irlumed: face retry recording failed: {e}");
         UNAVAILABLE
     })
 }

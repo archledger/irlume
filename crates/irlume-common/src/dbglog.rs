@@ -26,7 +26,12 @@ pub fn on() -> bool {
 #[macro_export]
 macro_rules! dlog {
     ($($t:tt)*) => {
-        if $crate::dbglog::on() { eprintln!("irlume[debug]: {}", format_args!($($t)*)); }
+        if $crate::dbglog::on() {
+            $crate::journal_out::line(
+                $crate::journal_out::Level::Debug,
+                format_args!("irlume[debug]: {}", format_args!($($t)*)),
+            );
+        }
     };
 }
 

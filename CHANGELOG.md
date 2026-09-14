@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-14
+
 ### Changed
 
 - Update the audited native TFLite binding to 0.10.1. Reject offset-stored model
@@ -14,6 +16,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Shared-interface IR targets retain all four nodes' evidence so replacement of
+  the RGB metadata companion also invalidates the target before capture.
+- Authentication reports typed liveness refusal causes and additional timing
+  boundaries, including model-load failures (#700).
+- IR capture reuses a validated warmup frame without reducing the delivered-rate
+  observation window (#702). This is not a general login-speed improvement claim.
+- Fedora Packit targets include the branched development release (#699).
 - Experimental IR-only target resolution accepts the exact four-node
   shared-interface layout (RGB image at index 0, its same-name metadata at
   index 1, IR image at index 2, its same-name metadata at index 3), reported

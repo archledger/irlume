@@ -60,6 +60,9 @@ pub struct IrCaptureTarget {
     image_name: String,
     image_device: DeviceNumber,
     metadata_device: Option<DeviceNumber>,
+    // Shared-layout revalidation must also bind the RGB-side members, even
+    // though those endpoints are never leased or opened by IR-only capture.
+    shared_members: Option<Vec<NodeEvidence>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,7 +244,7 @@ pub fn configured_ir_target() -> Result<IrCaptureTarget, IrTargetError> {
     )
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct NodeEvidence {
     endpoint: String,
     interface: PathBuf,
@@ -425,6 +428,7 @@ fn resolve_configured_pair_with(
         image_name: ir.name,
         image_device: ir.device,
         metadata_device: members.get(1).map(|node| node.device),
+        shared_members: None,
     })
 }
 
@@ -471,6 +475,7 @@ fn resolve_shared_interface(
         image_name: ir.name,
         image_device: ir.device,
         metadata_device: Some(ir_metadata.device),
+        shared_members: Some(members),
     })
 }
 
@@ -859,6 +864,27 @@ mod tests {
     }
 
     #[test]
+    fn shared_target_revalidation_binds_rgb_metadata_evidence() {
+        let f = Fixture::new("shared-member-binding");
+        let shared = f.interface("1-1:1.0", Some("046d\n"));
+        std::fs::write(shared.parent().unwrap().join("idProduct"), "085e\n").unwrap();
+        let rgb = f.node("video0", &shared, "0\n", "Logitech BRIO\n");
+        let _ = f.node("video1", &shared, "1\n", "Logitech BRIO\n");
+        let ir = f.node("video2", &shared, "2\n", "Logitech BRIO\n");
+        let _ = f.node("video3", &shared, "3\n", "Logitech BRIO\n");
+        let target = f.resolve(Some((rgb.clone(), ir.clone()))).unwrap();
+        // The new member is structurally valid, but must invalidate the old
+        // target even though the IR image and its metadata did not change.
+        std::fs::remove_dir_all(f.sysfs.join("video1")).unwrap();
+        let _ = f.node("video7", &shared, "1\n", "Logitech BRIO\n");
+        let replaced = f.resolve(Some((rgb, ir))).unwrap();
+        assert_ne!(
+            target, replaced,
+            "RGB metadata replacement must change the binding"
+        );
+    }
+
+    #[test]
     fn canonical_aliases_bind_to_the_sysfs_device_number() {
         let f = Fixture::new("alias");
         let rgb_if = f.interface("1-1:1.0", None);
@@ -1042,6 +1068,7 @@ mod tests {
             image_name: "fixture IR".into(),
             image_device: DeviceNumber(81, 2),
             metadata_device: None,
+            shared_members: None,
         }
     }
 

@@ -27,6 +27,11 @@ use std::sync::OnceLock;
 
 use edgefirst_tflite::{Delegate, Interpreter, Library, Model, TensorType};
 
+mod model_buffer;
+
+#[cfg(all(test, target_os = "linux", feature = "onnx"))]
+mod buffer_runtime_tests;
+
 /// Explicit runtime override for the TFLite C library path.
 pub const TFLITE_LIB_ENV: &str = "IRLUME_TFLITE_LIB";
 
@@ -205,14 +210,27 @@ impl TfliteSession {
     /// Consume a hashed artifact, enforcing this backend's specific pin before
     /// loading the runtime or parsing the bytes. The model retains the original
     /// allocation for the lifetime of the interpreter, with no byte clone.
+    /// Offset-stored buffers are refused after the pin check and before runtime
+    /// loading, so the upstream loader cannot silently repack the checked bytes.
     ///
     /// # Errors
-    /// Returns an error for a pin mismatch, unavailable runtime, invalid model,
-    /// or interpreter/delegate initialization failure.
+    /// Returns an error for a pin mismatch, unsupported buffer layout,
+    /// unavailable runtime, invalid model, or interpreter/delegate failure.
     pub fn from_pinned_model(
         model: irlume_common::HashedModel,
         expected_sha256: &str,
         threads: i32,
+    ) -> irlume_common::Result<Self> {
+        Self::from_pinned_model_with_runtime(model, expected_sha256, threads, || {
+            tflite_runtime().map_err(err)
+        })
+    }
+
+    fn from_pinned_model_with_runtime(
+        model: irlume_common::HashedModel,
+        expected_sha256: &str,
+        threads: i32,
+        runtime: impl FnOnce() -> irlume_common::Result<&'static Library>,
     ) -> irlume_common::Result<Self> {
         let actual = model.sha256();
         if actual != expected_sha256 {
@@ -220,7 +238,8 @@ impl TfliteSession {
                 "model sha256 mismatch: expected {expected_sha256}, got {actual}"
             )));
         }
-        let lib = tflite_runtime().map_err(err)?;
+        model_buffer::require_inline_buffers(model.bytes()).map_err(err_str)?;
+        let lib = runtime()?;
         let model = Model::from_bytes(lib, model.into_bytes()).map_err(err)?;
         let xnnpack = Delegate::xnnpack(lib, threads).map_err(err)?;
         let mut interp = Interpreter::builder(lib)
@@ -238,11 +257,10 @@ impl TfliteSession {
 
     /// Shape of the single Float32 input tensor.
     ///
-    /// Exactly one input, and it must be Float32: the crate's typed slice
-    /// views check only that `T` FITS the buffer, so an f32 view of an
-    /// Int64 tensor would silently write half of each element and read
-    /// garbage as numbers (#296 review). A model with a different contract
-    /// is refused by name, not reinterpreted.
+    /// Exactly one input, and it must be Float32. The upstream typed views check
+    /// element width and allocation size, but equal widths do not establish an
+    /// equal type (Int32 and Float32 both occupy four bytes). A model with a
+    /// different contract is refused by name, not reinterpreted.
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn input_shape(&self) -> irlume_common::Result<Vec<usize>> {
         let inputs = self.interp.inputs().map_err(err)?;
@@ -393,6 +411,48 @@ mod tests {
     }
 
     #[test]
+    fn offset_buffers_are_refused_before_runtime_loading() {
+        let model = irlume_common::HashedModel::new(model_buffer::tests::fixture(128));
+        let pin = model.sha256().to_string();
+        let called = std::cell::Cell::new(false);
+        let result = TfliteSession::from_pinned_model_with_runtime(model, &pin, 1, || {
+            called.set(true);
+            Err(err_str("synthetic runtime must not load"))
+        });
+        let Err(error) = result else {
+            panic!("offset buffers must be refused")
+        };
+        assert!(!called.get(), "layout refusal must precede runtime loading");
+        assert!(error.to_string().contains("offset-stored TFLite buffers"));
+    }
+
+    #[test]
+    fn pin_then_layout_are_checked_before_the_runtime_provider() {
+        let called = std::cell::Cell::new(false);
+        for correct_pin in [false, true] {
+            let model = irlume_common::HashedModel::new(b"malformed synthetic model".to_vec());
+            let pin = if correct_pin {
+                model.sha256().to_string()
+            } else {
+                "0".repeat(64)
+            };
+            let result = TfliteSession::from_pinned_model_with_runtime(model, &pin, 1, || {
+                called.set(true);
+                Err(err_str("synthetic runtime must not load"))
+            });
+            let Err(error) = result else {
+                panic!("invalid model must be refused")
+            };
+            assert!(!called.get());
+            assert!(error.to_string().contains(if correct_pin {
+                "invalid TFLite model-buffer layout"
+            } else {
+                "sha256 mismatch"
+            }));
+        }
+    }
+
+    #[test]
     #[cfg(feature = "onnx")]
     #[ignore = "requires the packaged TFLite runtime and pinned mesh"]
     fn pinned_mesh_session_retains_the_owned_allocation() {
@@ -407,7 +467,7 @@ mod tests {
         assert_eq!(
             session._model.data().as_ptr(),
             original,
-            "the runtime model must own the accepted allocation without a clone"
+            "the source view must retain the accepted allocation without a clone"
         );
         let shape = session.input_shape().expect("mesh input shape");
         let output = session

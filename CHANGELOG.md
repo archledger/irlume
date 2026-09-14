@@ -5,6 +5,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- Update the audited native TFLite binding to 0.10.1. Reject offset-stored model
+  buffers after SHA verification and before runtime loading, preserving the
+  unchanged-buffer contract. Real-runtime regression tests observe the allocation
+  passed to the C API and interpreter/model deletion order.
+
 ### Fixed
 
 - Experimental IR-only preflight now distinguishes an unconfigured camera pair

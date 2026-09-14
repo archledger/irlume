@@ -30,11 +30,16 @@ libc.workspace = true   # dlopen/dlsym probe: prove a library is loadable ort BE
 irlume-common.workspace = true
 thiserror.workspace = true
 ort = { workspace = true, optional = true }
-# Pinned EXACTLY: the 0.9.0 sources were audited (loader + discovery) before
-# adoption, and the audit covers only those bytes. default-features = false
-# drops zip/flatbuffers pulls irlume does not use.
+# Pinned EXACTLY: wrapper 0.10.1 and locked sys 0.10.2 are reviewed in
+# docs/research/tflite-0.10.1-audit.md. Default-off drops ZIP/metadata features,
+# but FlatBuffers is now unconditional. Our post-hash layout guard refuses
+# offset-stored buffers before the loader can repack the verified allocation.
 edgefirst-tflite = { version = "=0.10.1", optional = true, default-features = false }
 rustfft.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
 
 [[example]]
 name = "tflite_runtime_probe"

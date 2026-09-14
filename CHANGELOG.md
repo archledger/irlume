@@ -48,8 +48,9 @@ All notable changes to irlume are documented here. This project adheres to
 - `privileged_grouped_pad_evidence=1` in `/etc/irlume/settings.conf` (or
   `IRLUME_PRIVILEGED_GROUPED_PAD=1`) lets `sudo`, `su`, `doas` and polkit use the
   bounded sequential PAD collection the greeter and lock screen already use, and
-  gives those services the login grace window that collection requires, and only
-  when the request can actually use that collection. Default off, so privileged
+  reserves that collection's login grace window only after cheap eligibility
+  checks and a matching stored sequential budget hint, without opening cameras.
+  Live capture qualification remains mandatory. Default off, so privileged
   surfaces are unchanged without it. On a camera pair that cannot capture RGB and
   IR concurrently one attempt casts a single ViT vote, so filling the five-vote
   RGB PAD ring takes five observed-cost attempts: affordable for the ordinary

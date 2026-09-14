@@ -285,6 +285,30 @@ pub(crate) fn identity_and_connection_from_fd(
 
 fn fd_usb_dirs(fd: std::os::raw::c_int) -> std::io::Result<(PathBuf, PathBuf)> {
     let (major, minor) = device_numbers(fd)?;
+    usb_dirs_for_numbers(major, minor)
+}
+
+/// Metadata-only observation for a non-authoritative time-budget hint.
+/// Unlike the fd collector, this never opens the video node or issues ioctls.
+/// Path/stat/sysfs races are acceptable only because capture revalidates its
+/// own fd-derived contract; this observation must never authorize capture.
+pub(crate) fn identity_and_connection_for_budget_hint(
+    path: &str,
+) -> std::io::Result<(CameraIdentity, UsbConnectionFacts)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_char_device() {
+        return Err(bad("budget hint requires a character-device path".into()));
+    }
+    let (iface_dir, dev_dir) =
+        usb_dirs_for_numbers(libc::major(metadata.rdev()), libc::minor(metadata.rdev()))?;
+    Ok((
+        identity_from_dirs(&iface_dir, &dev_dir)?,
+        connection_facts_from_dirs(&dev_dir, &iface_dir, Path::new("/sys"))?,
+    ))
+}
+
+fn usb_dirs_for_numbers(major: u32, minor: u32) -> std::io::Result<(PathBuf, PathBuf)> {
     let node = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}"))?;
 
     let iface_dir = ancestor_with(&node, "bInterfaceNumber").ok_or_else(|| {
@@ -540,6 +564,20 @@ fn bad(msg: String) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn budget_hint_metadata_rejects_non_usb_paths_without_opening_them() {
+        assert!(super::identity_and_connection_for_budget_hint("/dev/null").is_err());
+        assert!(
+            super::identity_and_connection_for_budget_hint("/dev/irlume-missing-budget-hint")
+                .is_err()
+        );
+        let path =
+            std::env::temp_dir().join(format!("irlume-budget-regular-{}", std::process::id()));
+        std::fs::write(&path, b"not a camera").unwrap();
+        assert!(super::identity_and_connection_for_budget_hint(path.to_str().unwrap()).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn connection_facts_bind_controller_speed_and_driver_without_bus_numbers() {

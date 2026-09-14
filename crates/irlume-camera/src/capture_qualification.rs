@@ -221,6 +221,33 @@ pub struct CameraEndpoint {
 }
 
 impl CameraEndpoint {
+    // Private: a path observation may supply filename/identity hints, never an
+    // fd-derived runtime contract. Only a boolean escapes sequential_budget_hint.
+    fn for_budget_hint(path: &str, role: QualifiedStreamRole) -> Option<Self> {
+        let (identity, connection) =
+            crate::uvc_descriptor::identity_and_connection_for_budget_hint(path).ok()?;
+        if connection.driver != "uvcvideo" {
+            return None;
+        }
+        Self::new(
+            irlume_common::sha256_hex(&identity.descriptors),
+            identity.vid,
+            identity.pid,
+            identity.serial,
+            identity.interface_number,
+            identity.usb_devpath,
+            role,
+            ConnectionContext::new(
+                connection.controller_devpath,
+                connection.speed_millimbps,
+                connection.driver,
+                "uvc-v4l2".into(),
+            )
+            .ok()?,
+        )
+        .ok()
+    }
+
     /// Construct one fd-derived endpoint identity.
     ///
     /// # Errors
@@ -1382,7 +1409,64 @@ pub struct QualificationStore {
     dir: PathBuf,
 }
 
+/// Non-authoritative hint for reserving a sequential-collection time budget.
+/// Reads path metadata, sysfs and one bounded validated v2 record; never opens
+/// a camera, negotiates a format, or acquires a camera lease. Missing, changed,
+/// malformed or unreadable evidence returns false. Stream contracts are NOT
+/// observed here: live qualification remains mandatory before grouped capture.
+#[must_use]
+pub fn sequential_budget_hint(rgb_path: &str, ir_path: &str) -> bool {
+    let Some(rgb) = CameraEndpoint::for_budget_hint(rgb_path, QualifiedStreamRole::Rgb) else {
+        return false;
+    };
+    let Some(ir) = CameraEndpoint::for_budget_hint(ir_path, QualifiedStreamRole::Ir) else {
+        return false;
+    };
+    QualificationStore::system().sequential_budget_hint_for_endpoints(&rgb, &ir)
+}
+
 impl QualificationStore {
+    fn sequential_budget_hint_for_endpoints(
+        &self,
+        rgb: &CameraEndpoint,
+        ir: &CameraEndpoint,
+    ) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        let read = || -> Option<bool> {
+            if rgb.role != QualifiedStreamRole::Rgb || ir.role != QualifiedStreamRole::Ir {
+                return None;
+            }
+            rgb.validate().ok()?;
+            ir.validate().ok()?;
+            let path = self
+                .dir
+                .join(format!("{}.json", pair_endpoint_filing_key(rgb, ir)));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .ok()?;
+            if !file.metadata().ok()?.is_file() {
+                return None;
+            }
+            let mut body = Vec::new();
+            file.take((MAX_RECORD_BYTES + 1) as u64)
+                .read_to_end(&mut body)
+                .ok()?;
+            let record = CaptureQualificationRecord::from_json(&body).ok()?;
+            let authoritative = record.authoritative()?;
+            Some(
+                authoritative.context().rgb_endpoint == *rgb
+                    && authoritative.context().ir_endpoint == *ir
+                    && matches!(
+                        authoritative.outcome(),
+                        AttemptOutcome::SequentialRequired(_)
+                    ),
+            )
+        };
+        read().unwrap_or(false)
+    }
+
     /// The production machine-state store.
     #[must_use]
     pub fn system() -> Self {
@@ -1479,8 +1563,12 @@ impl QualificationStore {
 }
 
 fn pair_filing_key(context: &QualificationContext) -> String {
-    let rgb = context.rgb_endpoint.filing_key();
-    let ir = context.ir_endpoint.filing_key();
+    pair_endpoint_filing_key(&context.rgb_endpoint, &context.ir_endpoint)
+}
+
+fn pair_endpoint_filing_key(rgb_endpoint: &CameraEndpoint, ir_endpoint: &CameraEndpoint) -> String {
+    let rgb = rgb_endpoint.filing_key();
+    let ir = ir_endpoint.filing_key();
     irlume_common::sha256_hex(format!("rgb:{}:{rgb}|ir:{}:{ir}", rgb.len(), ir.len()).as_bytes())
 }
 
@@ -1868,6 +1956,106 @@ mod tests {
 
     fn concurrent_attempt(port: &str) -> QualificationAttempt {
         concurrent_attempt_with_presence(port, None)
+    }
+
+    fn sequential_hint_attempt() -> QualificationAttempt {
+        let mut attempt = concurrent_attempt("/devices/pci0000:00/usb3/3-2");
+        attempt.concurrent.rgb_mean = 1.0;
+        attempt.outcome = AttemptOutcome::SequentialRequired(SequentialReason::SignalLoss);
+        attempt.validate().unwrap();
+        attempt
+    }
+
+    #[test]
+    fn budget_hint_uses_only_matching_conclusive_sequential_record() {
+        let dir = TempStore::new("budget-hint");
+        let store = dir.store();
+        let seq = sequential_hint_attempt();
+        let c = seq.context();
+        assert!(!store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+        store
+            .save_attempt(concurrent_attempt("/devices/pci0000:00/usb3/3-2"), None)
+            .unwrap();
+        assert!(!store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+        store.save_attempt(seq.clone(), Some(1)).unwrap();
+        assert!(store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+        let mut later = seq.clone();
+        later.outcome = AttemptOutcome::Inconclusive(InconclusiveReason::IncompleteRounds);
+        store.save_attempt(later, Some(2)).unwrap();
+        assert!(
+            store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint),
+            "last attempt must not replace retained conclusive evidence"
+        );
+        for change in 0..7 {
+            let mut rgb = c.rgb_endpoint.clone();
+            match change {
+                0 => rgb.connection.speed_millimbps /= 2,
+                1 => rgb.connection.driver = "different".into(),
+                2 => rgb.connection.backend = "different".into(),
+                3 => rgb.descriptor_sha256 = "cd".repeat(32),
+                4 => rgb.serial = Some("different".into()),
+                5 => rgb.usb_devpath = "/devices/pci0000:00/usb3/3-9".into(),
+                _ => rgb.interface_number += 1,
+            }
+            assert!(
+                !store.sequential_budget_hint_for_endpoints(&rgb, &c.ir_endpoint),
+                "change={change}"
+            );
+        }
+        assert!(!store.sequential_budget_hint_for_endpoints(&c.ir_endpoint, &c.rgb_endpoint));
+    }
+
+    #[test]
+    fn budget_hint_fails_closed_for_bad_or_nonregular_records() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempStore::new("budget-hint-errors");
+        let store = dir.store();
+        let seq = sequential_hint_attempt();
+        let c = seq.context();
+        store.save_attempt(seq.clone(), None).unwrap();
+        let path = store.record_path(c);
+        for body in [
+            b"{".to_vec(),
+            vec![b' '; MAX_RECORD_BYTES + 1],
+            b"{}".to_vec(),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert!(!store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        assert!(!store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+        std::fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo is a live NUL-terminated path inside this test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(!store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+        std::fs::remove_file(&path).unwrap();
+        let mut record =
+            CaptureQualificationRecord::new(1, seq.clone(), Some(seq.clone())).unwrap();
+        record.policy_version += 1;
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(!store.sequential_budget_hint_for_endpoints(&c.rgb_endpoint, &c.ir_endpoint));
+    }
+
+    #[test]
+    fn budget_hint_is_not_stream_qualification() {
+        let dir = TempStore::new("budget-hint-not-authority");
+        let store = dir.store();
+        let seq = sequential_hint_attempt();
+        let mut changed = seq.context().clone();
+        let record = store.save_attempt(seq, None).unwrap();
+        changed.ir_stream.requested.width += 1;
+        assert!(
+            store.sequential_budget_hint_for_endpoints(&changed.rgb_endpoint, &changed.ir_endpoint)
+        );
+        assert!(
+            matches!(
+                record.resolve(&changed),
+                QualificationResolution::Unqualified(_)
+            ),
+            "the hint must not replace the exact live stream gate"
+        );
     }
 
     fn concurrent_attempt_with_presence(

@@ -425,10 +425,15 @@ that phrase in `irlume logs`.
 
 `privileged_grouped_pad_evidence=1` in `/etc/irlume/settings.conf` (or
 `IRLUME_PRIVILEGED_GROUPED_PAD=1`) puts `sudo`, `su`, `doas` and polkit on the
-same collection, and gives them the login grace window it requires — only for a
-request that can actually use it, so a concurrent, unqualified or
-runtime-demoted pair, and experimental IR-only, keep the short window they have
-today. An explicit `IRLUME_GRACE_MS` still decides the budget on its own.
+same collection. Eligible privileged dual-camera requests may reserve its login
+grace window using a metadata-only hint from the pair's validated stored
+sequential record. No camera is opened for that hint. Opt-out, experimental
+IR-only, missing-model, forced-schedule and explicit-window cases skip it;
+missing, mismatched or invalid records keep the short default. The window starts
+before configuration/hint reads, and an explicit `IRLUME_GRACE_MS` still decides
+the budget on its own. The hint is not capture qualification: a changed live
+stream contract or later runtime demotion can still prevent grouped collection
+while that request retains its already chosen deadline.
 Evidence requirements do not move: the full vote window still has to close
 before a grant, and every PAD and liveness threshold is unchanged. Two costs are
 real. A privileged authentication now takes as long as that collection (measured

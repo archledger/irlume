@@ -15,8 +15,12 @@ impl AuthenticationWindow {
     }
 
     pub(crate) fn new(milliseconds: u64) -> Self {
+        Self::from_started(Instant::now(), milliseconds)
+    }
+
+    pub(crate) fn from_started(started: Instant, milliseconds: u64) -> Self {
         Self {
-            deadline: Instant::now() + Duration::from_millis(milliseconds),
+            deadline: started + Duration::from_millis(milliseconds),
             milliseconds,
         }
     }

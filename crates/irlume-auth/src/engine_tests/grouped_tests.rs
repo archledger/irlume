@@ -956,11 +956,12 @@ fn privileged_grouped_collection_grants_refuses_and_expires_like_a_greeter() {
 fn privileged_budget_follows_the_capture_route_not_the_service_name() {
     use irlume_common::diagnostics::QualificationState;
     let ready = |mode: &CaptureModeSelection, ir, rgb_pad, ir_pad, service| {
-        crate::grouped_auth::eligible_configuration_ignoring_budget(
+        crate::grouped_auth::eligible_configuration(
             mode,
             ir,
             rgb_pad,
             ir_pad,
+            crate::GRACE_WINDOW_MS,
             AuthenticationPurpose::Verify,
             service,
             true,
@@ -969,7 +970,7 @@ fn privileged_budget_follows_the_capture_route_not_the_service_name() {
     let mode = measured_sequential_configuration();
     assert!(ready(&mode, true, true, true, Some("sudo")));
     assert_eq!(
-        crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, true),
+        crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, false, true, || true),
         Some(crate::GRACE_WINDOW_MS)
     );
 
@@ -993,7 +994,12 @@ fn privileged_budget_follows_the_capture_route_not_the_service_name() {
         let route_ready = ready(&m, true, true, ir_pad, Some("sudo"));
         assert!(!route_ready, "{label} must not reach grouped collection");
         assert_eq!(
-            crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, route_ready),
+            crate::privileged_budget_for_route(
+                crate::SUDO_GRACE_WINDOW_MS,
+                false,
+                route_ready,
+                || true
+            ),
             None,
             "{label} must keep the short privileged window"
         );
@@ -1007,7 +1013,7 @@ fn privileged_budget_follows_the_capture_route_not_the_service_name() {
     // says. Asserted as the sensor policy's own early return in
     // `authenticate_in_window_inner`; here we pin the budget half.
     assert_eq!(
-        crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, false),
+        crate::privileged_budget_for_route(crate::SUDO_GRACE_WINDOW_MS, false, false, || true),
         None
     );
 }

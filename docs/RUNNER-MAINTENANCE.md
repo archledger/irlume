@@ -77,7 +77,17 @@ grep ^Groups /proc/$(pgrep -u <runner-user> Runner.Listener | head -1)/status
 id <runner-user>   # the two lists must agree
 ```
 
-## Watching for both
+## 3. Release-build memory on minihost
+
+The PR hardware-checks lane builds with LTO and can need several gigabytes
+at link time; minihost has 7.5 GiB total and routinely has only a few
+hundred MiB available. A link there dies as `signal: 9, SIGKILL` from the
+OOM killer while the same job passes on archhost. If that signature appears
+in a hardware-checks or hardware-suite log, free memory on minihost or let
+the job land on archhost (briefly stopping the minihost runner service moves
+the next queued job there), then rerun the failed job.
+
+## Watching for all three
 
 The `ci-alert` workflow (`.github/workflows/ci-alert.yml`) checks the nightly
 hardware suite and the weekly install matrix once a day and keeps a single

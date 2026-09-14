@@ -146,8 +146,11 @@ settings select dual; malformed or unreadable settings make face authentication
 unavailable until repaired. IR-only opens only the configured, enrollment-bound IR
 image endpoint and its exact optional metadata companion. It does not probe RGB or
 fall back to RGB, and it adds no startup or background camera opens. The currently
-supported scope requires the enrolled isolated USB IR interface, compatible IR
-templates and mandatory FLIR PAD. Startup measures the full 30-interval rate window
+supported scope requires the enrolled IR image node on an isolated USB IR
+interface, or the exact four-node shared-interface layout (RGB image at index 0,
+its same-name metadata at index 1, IR image at index 2, its same-name metadata at
+index 3, as reported for the Logitech BRIO), plus compatible IR templates and
+mandatory FLIR PAD. Any other shared-interface layout is refused. Startup measures the full 30-interval rate window
 before spending up to ten additional dequeues on a slow-starting stream. The rate
 floor and continuity checks still apply; this does not qualify the device or
 guarantee that an attempt will finish within its service window.

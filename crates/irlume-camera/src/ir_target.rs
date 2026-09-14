@@ -394,16 +394,14 @@ fn resolve_configured_pair_with(
     let rgb = evidence(rgb_resolved, sysfs)?;
     let ir = evidence(ir_resolved, sysfs)?;
     if rgb.interface == ir.interface {
-        return Err(IrTargetError::UnsupportedTopology(
-            "configured RGB shares the IR interface".into(),
-        ));
+        return resolve_shared_interface(rgb, ir, sysfs, devices);
     }
+    let members = siblings(&ir.interface, sysfs, devices)?;
     if ir.index != 0 {
         return Err(IrTargetError::UnsupportedTopology(
             "selected IR image node is not sysfs index 0".into(),
         ));
     }
-    let members = siblings(&ir.interface, sysfs, devices)?;
     if members.first().is_none_or(|node| {
         node.endpoint != ir.endpoint || node.device != ir.device || node.index != 0
     }) {
@@ -427,6 +425,52 @@ fn resolve_configured_pair_with(
         image_name: ir.name,
         image_device: ir.device,
         metadata_device: members.get(1).map(|node| node.device),
+    })
+}
+
+/// Resolve the single-interface four-node layout reported for the Logitech
+/// BRIO 046d:085e (`#704`): one UVC interface exposing the RGB image at sysfs
+/// index 0, its same-name metadata companion at index 1, the IR image at
+/// index 2, and its same-name metadata companion at index 3.
+///
+/// Acceptance is deliberately exact. A shared interface with any other member
+/// set, index assignment, or name pairing is refused: this validates that one
+/// mapping and does not imply support for arbitrary shared-interface devices.
+/// Resolution still reads configuration and sysfs only; capture opens only the
+/// configured IR image endpoint and its exact metadata companion.
+fn resolve_shared_interface(
+    rgb: NodeEvidence,
+    ir: NodeEvidence,
+    sysfs: &Path,
+    devices: &impl DeviceAccess,
+) -> Result<IrCaptureTarget, IrTargetError> {
+    const REASON: &str = "shared RGB and IR interface must present exactly four nodes: the RGB image at index 0, its same-name metadata at index 1, the IR image at index 2, and its same-name metadata at index 3";
+    let members = siblings(&ir.interface, sysfs, devices)?;
+    let [rgb_image, rgb_metadata, ir_image, ir_metadata] = members.as_slice() else {
+        return Err(IrTargetError::UnsupportedTopology(REASON.into()));
+    };
+    let exact = rgb_image.index == 0
+        && rgb_image.endpoint == rgb.endpoint
+        && rgb_image.device == rgb.device
+        && rgb_metadata.index == 1
+        && rgb_metadata.name == rgb_image.name
+        && ir_image.index == 2
+        && ir_image.endpoint == ir.endpoint
+        && ir_image.device == ir.device
+        && ir_metadata.index == 3
+        && ir_metadata.name == ir_image.name;
+    if !exact {
+        return Err(IrTargetError::UnsupportedTopology(REASON.into()));
+    }
+    Ok(IrCaptureTarget {
+        rgb_endpoint: rgb.endpoint,
+        endpoint: ir.endpoint,
+        metadata_endpoint: Some(ir_metadata.endpoint.clone()),
+        identity: identity(&ir.interface)?,
+        interface: ir.interface,
+        image_name: ir.name,
+        image_device: ir.device,
+        metadata_device: Some(ir_metadata.device),
     })
 }
 
@@ -696,6 +740,122 @@ mod tests {
                 Err(IrTargetError::UnsupportedTopology(_))
             ));
         }
+    }
+
+    #[test]
+    fn issue704_brio_shared_four_node_layout_resolves() {
+        let f = Fixture::new("issue704-shared");
+        let shared = f.interface("1-1:1.0", Some("046d\n"));
+        let rgb = f.node("video0", &shared, "0\n", "Logitech BRIO\n");
+        let _rgb_meta = f.node("video1", &shared, "1\n", "Logitech BRIO\n");
+        let ir = f.node("video2", &shared, "2\n", "Logitech BRIO\n");
+        let ir_meta = f.node("video3", &shared, "3\n", "Logitech BRIO\n");
+        let t = f.resolve(Some((rgb, ir.clone()))).unwrap();
+        let canonical_ir = std::fs::canonicalize(&ir).unwrap();
+        let canonical_meta = std::fs::canonicalize(&ir_meta).unwrap();
+        assert_eq!(t.endpoint(), canonical_ir.to_str().unwrap());
+        assert_eq!(t.metadata_endpoint(), canonical_meta.to_str());
+        assert_eq!(t.identity(), "046d:1234:fixture");
+        assert_eq!(
+            t.lease_endpoints(),
+            vec![
+                canonical_ir.to_str().unwrap(),
+                canonical_meta.to_str().unwrap()
+            ]
+        );
+        assert_eq!(
+            resolve_configured_pair_with(
+                Some((t.rgb_endpoint.clone(), t.endpoint.clone())),
+                &f.sysfs,
+                &f
+            )
+            .unwrap(),
+            t,
+            "revalidation must reproduce the shared-layout target unchanged"
+        );
+    }
+
+    #[test]
+    fn issue704_shared_layout_accepts_only_the_exact_four_node_mapping() {
+        let shared = |tag: &str| {
+            let f = Fixture::new(tag);
+            let shared = f.interface("1-1:1.0", Some("046d\n"));
+            (f, shared)
+        };
+        {
+            let (f, interface) = shared("issue704-five");
+            let rgb = f.node("video0", &interface, "0\n", "Logitech BRIO\n");
+            let _ = f.node("video1", &interface, "1\n", "Logitech BRIO\n");
+            let ir = f.node("video2", &interface, "2\n", "Logitech BRIO\n");
+            let _ = f.node("video3", &interface, "3\n", "Logitech BRIO\n");
+            let _ = f.node("video5", &interface, "4\n", "Logitech BRIO\n");
+            assert!(matches!(
+                f.resolve(Some((rgb, ir))),
+                Err(IrTargetError::UnsupportedTopology(_))
+            ));
+        }
+        {
+            let (f, interface) = shared("issue704-three");
+            let rgb = f.node("video0", &interface, "0\n", "Logitech BRIO\n");
+            let _ = f.node("video1", &interface, "1\n", "Logitech BRIO\n");
+            let ir = f.node("video2", &interface, "2\n", "Logitech BRIO\n");
+            assert!(matches!(
+                f.resolve(Some((rgb, ir))),
+                Err(IrTargetError::UnsupportedTopology(_))
+            ));
+        }
+        {
+            let (f, interface) = shared("issue704-wrong-ir-slot");
+            let rgb = f.node("video0", &interface, "0\n", "Logitech BRIO\n");
+            let rgb_meta = f.node("video1", &interface, "1\n", "Logitech BRIO\n");
+            let ir = f.node("video2", &interface, "2\n", "Logitech BRIO\n");
+            let _ = f.node("video3", &interface, "3\n", "Logitech BRIO\n");
+            assert!(
+                matches!(
+                    f.resolve(Some((rgb.clone(), rgb_meta))),
+                    Err(IrTargetError::UnsupportedTopology(_))
+                ),
+                "IR at the RGB-metadata slot must be refused"
+            );
+            assert!(
+                matches!(
+                    f.resolve(Some((ir, rgb))),
+                    Err(IrTargetError::UnsupportedTopology(_))
+                ),
+                "a swapped RGB/IR assignment must be refused"
+            );
+        }
+        {
+            let (f, interface) = shared("issue704-wrong-meta-name");
+            let rgb = f.node("video0", &interface, "0\n", "Logitech BRIO\n");
+            let _ = f.node("video1", &interface, "1\n", "Logitech BRIO\n");
+            let ir = f.node("video2", &interface, "2\n", "Logitech BRIO\n");
+            let _ = f.node("video3", &interface, "3\n", "Other Node\n");
+            assert!(matches!(
+                f.resolve(Some((rgb, ir))),
+                Err(IrTargetError::UnsupportedTopology(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn issue704_shared_target_revalidation_refuses_member_changes() {
+        let f = Fixture::new("issue704-changed");
+        let shared = f.interface("1-1:1.0", Some("046d\n"));
+        let rgb = f.node("video0", &shared, "0\n", "Logitech BRIO\n");
+        let _ = f.node("video1", &shared, "1\n", "Logitech BRIO\n");
+        let ir = f.node("video2", &shared, "2\n", "Logitech BRIO\n");
+        let _ = f.node("video3", &shared, "3\n", "Logitech BRIO\n");
+        let t = f.resolve(Some((rgb, ir))).unwrap();
+        std::fs::write(f.sysfs.join("video3/index"), "4\n").unwrap();
+        assert!(matches!(
+            resolve_configured_pair_with(
+                Some((t.rgb_endpoint.clone(), t.endpoint.clone())),
+                &f.sysfs,
+                &f
+            ),
+            Err(IrTargetError::Changed) | Err(IrTargetError::UnsupportedTopology(_))
+        ));
     }
 
     #[test]

@@ -14,6 +14,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Experimental IR-only target resolution accepts the exact four-node
+  shared-interface layout (RGB image at index 0, its same-name metadata at
+  index 1, IR image at index 2, its same-name metadata at index 3), reported
+  for the Logitech BRIO 046d:085e. Any other shared-interface member set,
+  index assignment, or name pairing remains refused, and resolution still
+  opens no device node (#704).
 - Experimental IR-only preflight now distinguishes an unconfigured camera pair
   from unavailable endpoints, identity failures, changed targets and unsupported
   layouts. Missing-pair guidance names `set-cameras`; unsupported-layout guidance

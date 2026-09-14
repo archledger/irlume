@@ -2432,6 +2432,7 @@ fn auth_sensor_preflight_accepts_selected_user_flag() {
     let requests = serve(&sock(&sb), |_| Response::FaceSensorStatus {
         policy: irlume_common::config::FaceSensorPolicyObservation::DefaultDual,
         ir_readiness: Some(irlume_common::IrOnlyReadiness::Unavailable),
+        ir_target_issue: None,
     });
     let (_, _, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "--user", "alice"]));
     let requests = requests.lock().unwrap();
@@ -2449,6 +2450,7 @@ fn auth_sensor_status_uses_daemon_observation_and_preflight_is_explicit() {
     let requests = serve(&sock(&sb), |req| match req {
         Request::FaceSensorStatus { user } => Response::FaceSensorStatus {
             policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
+            ir_target_issue: None,
             ir_readiness: user
                 .as_ref()
                 .map(|_| irlume_common::IrOnlyReadiness::Unavailable),
@@ -2506,6 +2508,7 @@ fn auth_sensor_preflight_renders_each_readiness_without_exposing_the_account() {
         Response::FaceSensorStatus {
             policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
             ir_readiness: Some(ir_readiness),
+            ir_target_issue: None,
         }
     });
 
@@ -2561,6 +2564,7 @@ fn auth_sensor_preflight_fails_closed_for_missing_or_future_readiness() {
     let requests = serve(&sock(&sb), |_| Response::FaceSensorStatus {
         policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
         ir_readiness: None,
+        ir_target_issue: None,
     });
     let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", "missing-account"]));
     assert_ne!(code, 0, "{out} {err}");
@@ -2579,6 +2583,7 @@ fn auth_sensor_preflight_fails_closed_for_missing_or_future_readiness() {
         let reply = serde_json::to_string(&Response::FaceSensorStatus {
             policy: FaceSensorPolicyObservation::Explicit(FaceSensorPolicy::IrOnlyExperimental),
             ir_readiness: Some(irlume_common::IrOnlyReadiness::Unavailable),
+            ir_target_issue: None,
         })
         .unwrap()
         .replace("unavailable", "future_readiness");
@@ -2617,6 +2622,53 @@ fn auth_sensor_owner_change_requires_ack_and_preserves_unrelated_settings() {
         assert!(out.contains("Readiness is not established"), "{out}");
         assert!(!sb.path("cfg/cameras.conf").exists());
         assert!(!sb.path("state/retry").exists());
+    }
+}
+
+#[test]
+fn auth_sensor_target_details_are_actionable_and_do_not_upgrade_readiness() {
+    use irlume_common::config::{FaceSensorPolicy as Policy, FaceSensorPolicyObservation as Seen};
+    use irlume_common::{IrOnlyReadiness as Ready, IrTargetIssue as Issue};
+    let sb = Sandbox::new("sensor-target-detail");
+    let _requests = serve(&sock(&sb), |req| {
+        let Request::FaceSensorStatus { user: Some(user) } = req else {
+            return Response::Error("unexpected fixture request".into());
+        };
+        let (readiness, issue) = match user.as_str() {
+            "missing" => (Ready::TargetUnavailable, Some(Issue::Unconfigured)),
+            "topology" => (Ready::TargetUnavailable, Some(Issue::UnsupportedTopology)),
+            "endpoint" => (Ready::TargetUnavailable, Some(Issue::Unavailable)),
+            "identity" => (Ready::TargetUnavailable, Some(Issue::BindingUnavailable)),
+            "changed" => (Ready::TargetUnavailable, Some(Issue::Changed)),
+            "future" => (Ready::TargetUnavailable, Some(Issue::Unknown)),
+            "contradiction" => (
+                Ready::ReadyForExperimentalAttempt,
+                Some(Issue::Unconfigured),
+            ),
+            _ => unreachable!(),
+        };
+        Response::FaceSensorStatus {
+            policy: Seen::Explicit(Policy::IrOnlyExperimental),
+            ir_readiness: Some(readiness),
+            ir_target_issue: issue,
+        }
+    });
+    for (account, expected) in [
+        ("missing", "sudo irlume set-cameras"),
+        ("topology", "layout is unsupported"),
+        ("endpoint", "missing, unreadable"),
+        ("identity", "identity could not be established"),
+        ("changed", "changed during validation"),
+        ("future", "unavailable or unsupported"),
+        ("contradiction", "inconsistent target readiness"),
+    ] {
+        let (code, out, err) = run(&mut sb.cmd(&["auth", "sensor", "preflight", account]));
+        assert_ne!(code, 0);
+        assert!(err.contains(expected), "{out} {err}");
+        assert!(!out.contains("prerequisites are ready"));
+        if account == "topology" {
+            assert!(!err.contains("sudo irlume set-cameras"));
+        }
     }
 }
 
@@ -3237,6 +3289,7 @@ fn auth_sensor_preflight_requires_ir_policy_even_if_readiness_claims_ready() {
         Response::FaceSensorStatus {
             policy,
             ir_readiness: Some(irlume_common::IrOnlyReadiness::ReadyForExperimentalAttempt),
+            ir_target_issue: None,
         }
     });
     for (account, expected) in [

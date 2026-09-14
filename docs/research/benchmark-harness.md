@@ -180,7 +180,8 @@ Requests are newline-framed. The connection budget is 15 seconds; a separate
 while waiting to cancel: a complete reply that arrives first keeps its actual
 request-to-reply interval. A peer that closes first is `no-reply`, not a successful
 harness cancellation. Refusal/error reasons are printed with escaped control
-characters; grant reasons and similarity scores are omitted.
+characters; grant reasons and similarity scores are omitted. An unexpected
+trace-handshake response is reported without printing its payload.
 
 Trace collection runs concurrently with the trials to avoid filling an unread
 subscriber queue. Its reserved duration is the number of trials times the sum of
@@ -208,7 +209,8 @@ The boundary vocabulary and what each interval covers:
 * `QueueWait`: from the connection thread's submission instant to the worker
   taking the job.
 * `EnrollmentLoad`: engine-side, emitted exactly where a store load (or the
-  deferred TPM unseal join) completes. On encrypted stores the deferred load
+  deferred TPM unseal join) completes, including a synchronous load error.
+  On encrypted stores the deferred load
   deliberately overlaps the camera preflight, so this interval is a
   spawn-to-join resolution interval, not isolated loader CPU time. A user
   with no store at all denies before any load and emits nothing here.

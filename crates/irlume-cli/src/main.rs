@@ -815,6 +815,7 @@ fn camera_census(_args: &[String]) -> std::process::ExitCode {
     for entry in irlume_camera::census::census_from(&scan) {
         println!("{}", irlume_camera::census::render_line(&entry));
     }
+    println!("{}", sensor_policy::PAIRED_SUPPORT_NOTE);
     std::process::ExitCode::SUCCESS
 }
 
@@ -3730,6 +3731,7 @@ fn doctor_run(
     for entry in irlume_camera::census::census_from(&scan) {
         dout!(report, "  {}", irlume_camera::census::render_line(&entry));
     }
+    dout!(report, "[doctor] {}", sensor_policy::PAIRED_SUPPORT_NOTE);
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------
     {

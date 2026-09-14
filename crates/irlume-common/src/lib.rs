@@ -995,6 +995,23 @@ pub enum IrOnlyReadiness {
     IncompatibleEnrollment,
 }
 
+/// Camera-free explanation of a target refusal. This is diagnostic information,
+/// never readiness or authority. Unknown future labels keep generic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrTargetIssue {
+    Unconfigured,
+    Unavailable,
+    UnsupportedTopology,
+    BindingUnavailable,
+    Changed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod sensor_target_wire_tests;
+
 /// Runtime state of one shipped presentation-attack-detection model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1117,6 +1134,8 @@ pub enum Response {
     FaceSensorStatus {
         policy: config::FaceSensorPolicyObservation,
         ir_readiness: Option<IrOnlyReadiness>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ir_target_issue: Option<IrTargetIssue>,
     },
     /// Retry recovery capability and current per-account state.
     RetryStatus {

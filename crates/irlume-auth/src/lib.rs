@@ -5512,11 +5512,11 @@ impl Engine {
         // path resolves `enr` at the join below, after camera setup.
         let loader_was_async = loader.receiver.is_some();
         let sync_enr = if loader.receiver.is_none() {
-            let loaded = irlume_core::storage::load(user)?;
+            let loaded = irlume_core::storage::load(user);
             // Completed work boundary: the plaintext store load itself,
             // before any policy decision on its content.
             emit_enrollment_load_timing(diagnostics, load_started);
-            match loaded {
+            match loaded? {
                 Some(enr) => match self.enrollment_policy_refusal(user, &enr) {
                     Some(outcome) => return Ok(outcome),
                     None => Some(enr),
@@ -12827,6 +12827,37 @@ mod engine_tests {
         assert!(
             matches!(&timings[0], TraceEventKind::StageTiming { elapsed_us, .. } if *elapsed_us > 0),
             "the boundary must carry a real duration"
+        );
+
+        // A synchronous store read that fails is still attempted work. Its
+        // error must not escape before the completed-load timing is emitted.
+        std::fs::write(dir.join("irlume-test-empty.json"), b"not json").unwrap();
+        let failed = StageSink::default();
+        assert!(s
+            .engine
+            .authenticate_for_with_diagnostics(
+                "irlume-test-empty",
+                None,
+                AuthenticationPurpose::Verify,
+                &failed,
+            )
+            .is_err());
+        assert_eq!(
+            failed
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::EnrollmentLoad,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "failed synchronous load must retain its timing boundary"
         );
 
         teardown_sandbox(&dir);

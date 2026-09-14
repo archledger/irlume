@@ -304,7 +304,7 @@ impl TraceConnection {
         {
             Response::TraceAccepted { limits } => limits,
             Response::Error(message) => return Err(format!("trace refused: {message}")),
-            other => return Err(format!("unexpected daemon response: {other:?}")),
+            _ => return Err("unexpected daemon response while starting trace".into()),
         };
         let mut validator = TraceValidator::new(limits)
             .map_err(|error| format!("invalid daemon limits: {error}"))?;
@@ -698,6 +698,18 @@ mod tests {
             .err()
             .unwrap()
             .contains("shorter"));
+    }
+
+    #[test]
+    fn unexpected_trace_reply_does_not_export_grant_payload() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .write_all(b"{\"AuthResult\":{\"granted\":true,\"score\":0.987654,\"live\":true,\"reason\":\"synthetic-private-grant\"}}\n")
+            .unwrap();
+        let error = TraceConnection::on_stream(client, 1000).err().unwrap();
+        assert!(error.contains("unexpected daemon response"));
+        assert!(!error.contains("synthetic-private-grant"));
+        assert!(!error.contains("0.987654"));
     }
 
     #[test]

@@ -5,6 +5,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Scheduled CI health alert: a daily check of the nightly hardware suite and
+  the weekly install matrix that opens, comments and closes a single
+  `ci-alert`-labeled tracking issue, so a red or stale watch never again waits
+  for a release day to be noticed. Runner maintenance runbook added covering
+  capture-helper promotion and runner restarts after host group changes.
+
 ## [0.12.1] - 2026-09-14
 
 ### Changed

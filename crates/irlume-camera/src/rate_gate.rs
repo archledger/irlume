@@ -208,6 +208,12 @@ impl RateWindow {
         self.len
     }
 
+    /// One validated successful timestamp, with no deltas yet. Reusing only
+    /// this seed cannot import a partial or pre-recovery rate window.
+    pub(crate) const fn has_only_seed(&self) -> bool {
+        self.len == 0 && self.last_successful_timestamp_micros.is_some()
+    }
+
     /// Whether the window holds its configured number of deltas.
     #[must_use]
     pub(crate) const fn ready(&self) -> bool {

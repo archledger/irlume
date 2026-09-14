@@ -338,6 +338,24 @@ pub fn rgb_moire_max() -> f32 {
     env_override("IRLUME_RGB_MOIRE_MAX", RGB_MOIRE_MAX, |v| v > 0.0)
 }
 
+/// Typed origin of a non-Live gate decision, produced where the refusal is
+/// produced, so downstream routing (retry eligibility, runtime availability)
+/// branches on a value instead of pinning reason prefixes. `Other` covers
+/// every refusal without special routing and every Live result, where the
+/// field carries no information.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DenyCause {
+    #[default]
+    Other,
+    /// RGB saw a face the IR stream did not: at once the retryable settling
+    /// transient of a genuine user and the persistent signature of a
+    /// screen/print, which never grows an IR face.
+    NoIrFace,
+    /// The negotiated IR format defines no sensor ceiling, so exposure
+    /// cannot be checked (#358). A property of the camera, not the frame.
+    ExposureUnmeasurable,
+}
+
 /// Per-cue evidence, surfaced for logging/self-test (never raw image data).
 #[derive(Debug, Default, Clone)]
 pub struct Cues {
@@ -384,6 +402,9 @@ pub struct Cues {
     /// negotiated IR format defines no sensor ceiling, so nothing was read and
     /// `ir_exposure_ok` carries no information.
     pub ir_exposure_measured: bool,
+    /// Typed origin of this decision; see [`DenyCause`]. `Other` unless the
+    /// evaluator named a cause where it produced its refusal.
+    pub deny_cause: DenyCause,
 }
 
 /// IR face region must be at least this bright (0..255). A lit live face ran ~83
@@ -565,6 +586,7 @@ impl LivenessGate {
         // Core anti-screen cue: a real face reflects the IR emitter and is
         // detectable in IR; a phone/print does not.
         let Some(ir) = s.ir_face.filter(|f| f.score >= MIN_FACE_SCORE) else {
+            cues.deny_cause = DenyCause::NoIrFace;
             return (
                 Verdict::Spoof,
                 cues,
@@ -717,6 +739,7 @@ impl LivenessGate {
     pub fn evaluate_ir_only(&self, s: &Signals) -> (Verdict, Cues, String) {
         let mut cues = Cues::default();
         if s.ir_face.filter(|f| f.score >= MIN_FACE_SCORE).is_none() {
+            cues.deny_cause = DenyCause::NoIrFace;
             return (Verdict::Uncertain, cues, "no face in IR".into());
         }
         cues.face_in_ir = true;
@@ -867,6 +890,7 @@ fn exposure_refusal(s: &Signals, cues: &mut Cues) -> Option<(Verdict, String)> {
     cues.ir_exposure_measured = s.ir_ceiling_known;
     if !s.ir_ceiling_known {
         cues.ir_exposure_ok = false;
+        cues.deny_cause = DenyCause::ExposureUnmeasurable;
         return Some((
             Verdict::Uncertain,
             "IR exposure unmeasurable: this camera's IR format defines no sensor \
@@ -1212,6 +1236,44 @@ mod tests {
             ir_persistent_saturated_frac: None,
             ..Default::default() // frontal pose
         }
+    }
+
+    /// The typed cause is produced at the refusal origin, not re-derived from
+    /// wording downstream: each arm below pins the cause for one producer, so
+    /// irlume-auth can branch on a value instead of a reason prefix.
+    #[test]
+    fn deny_causes_are_typed_at_their_origin() {
+        let gate = LivenessGate::new();
+        // RGB present, IR absent: the retryable cross-spectrum transient and
+        // the persistent screen/print signature at once.
+        let mut s = live_signals();
+        s.ir_face = None;
+        let (verdict, cues, reason) = gate.evaluate(&s);
+        assert_eq!(verdict, Verdict::Spoof, "{reason}");
+        assert_eq!(cues.deny_cause, DenyCause::NoIrFace);
+        // The dark evaluator's own no-face arm carries the same cause; its
+        // verdict stays Uncertain and classification stays with the verdict.
+        let (verdict, cues, reason) = gate.evaluate_ir_only(&s);
+        assert_eq!(verdict, Verdict::Uncertain, "{reason}");
+        assert_eq!(cues.deny_cause, DenyCause::NoIrFace);
+        // Unmeasurable exposure, on both evaluators (shared exposure_refusal).
+        let mut un = live_signals();
+        un.ir_ceiling_known = false;
+        let (verdict, cues, reason) = gate.evaluate(&un);
+        assert_eq!(verdict, Verdict::Uncertain, "{reason}");
+        assert_eq!(cues.deny_cause, DenyCause::ExposureUnmeasurable);
+        let (verdict, cues, reason) = gate.evaluate_ir_only(&un);
+        assert_eq!(verdict, Verdict::Uncertain, "{reason}");
+        assert_eq!(cues.deny_cause, DenyCause::ExposureUnmeasurable);
+        // Every other refusal, and every Live result, stays Other.
+        let mut flat = live_signals();
+        flat.ir_center_edge_ratio = 0.1;
+        let (verdict, cues, reason) = gate.evaluate(&flat);
+        assert_eq!(verdict, Verdict::Spoof, "{reason}");
+        assert_eq!(cues.deny_cause, DenyCause::Other);
+        let (verdict, cues, reason) = gate.evaluate(&live_signals());
+        assert_eq!(verdict, Verdict::Live, "{reason}");
+        assert_eq!(cues.deny_cause, DenyCause::Other);
     }
 
     #[test]

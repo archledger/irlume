@@ -112,7 +112,7 @@ impl Engine {
         }
         if uncertain_short_circuits(a.verdict, rgb, ir) || (rgb && a.verdict != Verdict::Live) {
             return Some(Outcome::deny(
-                liveness_deny_kind(a.verdict, &a.reason),
+                liveness_deny_kind(a.verdict, a.deny_cause),
                 format!("liveness {:?}: {}", a.verdict, a.reason),
             ));
         }
@@ -130,10 +130,10 @@ impl Engine {
                 "the room is lit but no face is visible to the RGB camera; dark (IR-only) authentication requires a dark room — add light so the RGB camera can see you, or use your password",
             ));
         }
-        let (verdict, _, reason) = self.gate.evaluate_ir_only(&a.signals);
+        let (verdict, cues, reason) = self.gate.evaluate_ir_only(&a.signals);
         if verdict != Verdict::Live {
             return Some(Outcome::deny(
-                liveness_deny_kind(verdict, &reason),
+                liveness_deny_kind(verdict, cues.deny_cause),
                 format!("dark liveness {verdict:?}: {reason}"),
             ));
         }

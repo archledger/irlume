@@ -165,6 +165,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn target_issue_mapping_is_closed_and_never_exports_error_prose() {
+        use irlume_camera::IrTargetError as Error;
+        use irlume_common::IrTargetIssue as Issue;
+        for (error, expected) in [
+            (Error::Unconfigured, Issue::Unconfigured),
+            (
+                Error::InvalidEndpoint("private endpoint".into()),
+                Issue::Unavailable,
+            ),
+            (
+                Error::UnsupportedTopology("private topology".into()),
+                Issue::UnsupportedTopology,
+            ),
+            (
+                Error::BindingUnavailable("private binding".into()),
+                Issue::BindingUnavailable,
+            ),
+            (Error::Changed, Issue::Changed),
+        ] {
+            assert_eq!(target_issue(&error), expected);
+            assert!(!serde_json::to_string(&target_issue(&error))
+                .unwrap()
+                .contains("private"));
+        }
+    }
+
+    #[test]
     fn production_ir_model_readiness_requires_pad_and_explicit_adapter() {
         use irlume_common::IrOnlyReadiness as Ready;
         for available in [false, true] {
@@ -926,6 +953,18 @@ fn readiness_refusal(readiness: irlume_common::IrOnlyReadiness) -> Outcome {
     Outcome::deny(OutcomeKind::SetupUnavailable, reason)
 }
 
+fn target_issue(error: &irlume_camera::IrTargetError) -> irlume_common::IrTargetIssue {
+    use irlume_camera::IrTargetError as Error;
+    use irlume_common::IrTargetIssue as Issue;
+    match error {
+        Error::Unconfigured => Issue::Unconfigured,
+        Error::InvalidEndpoint(_) => Issue::Unavailable,
+        Error::UnsupportedTopology(_) => Issue::UnsupportedTopology,
+        Error::BindingUnavailable(_) => Issue::BindingUnavailable,
+        Error::Changed => Issue::Changed,
+    }
+}
+
 impl Engine {
     /// Require an explicitly configured adapter for experimental IR assessment.
     /// An absent optional default adapter still selects the existing raw space.
@@ -960,13 +999,20 @@ impl Engine {
 
     // Retain the existing helper lifetime rule: a cancelled/expired caller
     // drains the loader before returning. No camera or lease is held here.
-    fn load_ir_enrollment(
+    pub(super) fn load_ir_enrollment(
         &self,
         user: &str,
         window: AuthenticationWindow,
         read_only: bool,
+        diagnostics: Option<&dyn irlume_common::diagnostics::DiagnosticSink>,
     ) -> irlume_common::Result<Option<irlume_core::storage::Enrollment>> {
         self.check_authentication_completion(window)?;
+        // This route dispatches before the dual-sensor loader's timing site.
+        // Include resolution and any cancellation drain, but not a request
+        // rejected before loading. Read-only readiness probes pass no sink.
+        let _timer = diagnostics.map(|sink| {
+            TraceStageTimer::new(sink, irlume_common::diagnostics::TraceStage::EnrollmentLoad)
+        });
         let (sender, receiver) = std::sync::mpsc::channel();
         let user = user.to_string();
         std::thread::Builder::new()
@@ -1012,23 +1058,47 @@ impl Engine {
     /// changing enrollment. Template-key unseal may be needed for protected data.
     /// Readiness does not establish capture latency, identity or qualification.
     pub fn ir_only_preflight(&self, user: &str) -> irlume_common::IrOnlyReadiness {
+        self.ir_only_preflight_details(user).0
+    }
+
+    /// Preserve the closed target-refusal cause without repeating resolution or
+    /// exposing driver/path error strings. This never discovers or opens a camera.
+    pub fn ir_only_preflight_details(
+        &self,
+        user: &str,
+    ) -> (
+        irlume_common::IrOnlyReadiness,
+        Option<irlume_common::IrTargetIssue>,
+    ) {
         use irlume_common::IrOnlyReadiness as Ready;
+        use irlume_common::IrTargetIssue as Issue;
         let window = AuthenticationWindow::new(GRACE_WINDOW_MS);
         let target = match irlume_camera::configured_ir_target() {
             Ok(target) => target,
-            Err(_) => return Ready::TargetUnavailable,
+            Err(error) => return (Ready::TargetUnavailable, Some(target_issue(&error))),
         };
-        if let Some(refusal) = self.ir_model_readiness(&target) {
-            return refusal;
+        if !selected_ir_available(target.endpoint()) {
+            return (Ready::TargetUnavailable, Some(Issue::Unavailable));
         }
-        let enrollment = match self.load_ir_enrollment(user, window, true) {
+        if let Err(error) = target.validate() {
+            return (Ready::TargetUnavailable, Some(target_issue(&error)));
+        }
+        if let Some(refusal) = model_readiness(
+            true,
+            self.ir_adapter_required,
+            self.has_ir_adapter(),
+            self.has_pad_ir(),
+        ) {
+            return (refusal, None);
+        }
+        let enrollment = match self.load_ir_enrollment(user, window, true, None) {
             Ok(Some(enrollment)) => enrollment,
-            _ => return Ready::EnrollmentUnavailable,
+            _ => return (Ready::EnrollmentUnavailable, None),
         };
         if self.check_authentication_completion(window).is_err() {
-            return Ready::Unavailable;
+            return (Ready::Unavailable, None);
         }
-        self.ir_enrollment_readiness(&enrollment, &target)
+        (self.ir_enrollment_readiness(&enrollment, &target), None)
     }
 
     pub(super) fn authenticate_ir_in_window(
@@ -1046,7 +1116,7 @@ impl Engine {
         if let Some(refusal) = self.ir_model_readiness(&target) {
             return Ok(readiness_refusal(refusal));
         }
-        let enrollment = match self.load_ir_enrollment(user, window, false)? {
+        let enrollment = match self.load_ir_enrollment(user, window, false, Some(diagnostics))? {
             Some(enrollment) => enrollment,
             None => return Ok(readiness_refusal(Ready::EnrollmentUnavailable)),
         };

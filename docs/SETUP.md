@@ -127,6 +127,20 @@ sudo irlume auth sensor ir-only --yes
 sudo irlume auth sensor dual       # restore the default
 ```
 
+IR-only also needs an explicit camera pair: the daemon's `IRLUME_RGB_DEVICE`
+and `IRLUME_IR_DEVICE` overrides, or saved `rgb`/`ir` entries in `cameras.conf`.
+An auto-discovered pair used by dual authentication, or legacy `capture_mode.*`
+preferences alone, does not satisfy this requirement. To persist the pair, use
+`sudo irlume set-cameras RGB_NODE IR_NODE`, replacing both placeholders with the
+verified image-node paths for your machine, then rerun preflight. Do not guess
+device numbers or confuse metadata nodes with image nodes.
+
+Preflight distinguishes missing configuration from missing endpoints, unavailable
+identity metadata, changed targets, and unsupported interface layouts. An
+unsupported layout cannot be repaired merely by repeating `set-cameras`.
+Paired-device support in `doctor` or camera census is separate from experimental
+IR-only readiness. Older daemons retain the generic target-unavailable message.
+
 This writes the exact setting `face_sensor_policy=ir-only-experimental`. Missing
 settings select dual; malformed or unreadable settings make face authentication
 unavailable until repaired. IR-only opens only the configured, enrollment-bound IR

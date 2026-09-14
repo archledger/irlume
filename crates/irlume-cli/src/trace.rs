@@ -427,8 +427,9 @@ mod tests {
         ));
         let requested: serde_json::Value = serde_json::from_str(&request_line).unwrap();
         assert_eq!(
-            requested["TraceSubscribe"]["trace_schema"], 2,
-            "current CLI must negotiate the richer trace vocabulary"
+            requested["TraceSubscribe"]["trace_schema"],
+            serde_json::json!(CURRENT_TRACE_SCHEMA_VERSION),
+            "current CLI must negotiate the current trace vocabulary"
         );
         serde_json::to_writer(&mut stream, &Response::TraceAccepted { limits }).unwrap();
         stream.write_all(b"\n").unwrap();
@@ -581,7 +582,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        for schema in [1, 2] {
+        for schema in [1, CURRENT_TRACE_SCHEMA_VERSION] {
             let dir = sandbox("negotiated");
             let socket = dir.join("daemon.sock");
             let target = dir.join("capture.jsonl");
@@ -665,7 +666,11 @@ mod tests {
                 },
                 !mislabeled_event,
             );
-            invalid.trace_schema = if mislabeled_event { 1 } else { 2 };
+            invalid.trace_schema = if mislabeled_event {
+                1
+            } else {
+                CURRENT_TRACE_SCHEMA_VERSION
+            };
             let listener = UnixListener::bind(&socket).unwrap();
             let server =
                 std::thread::spawn(move || serve_fixture(listener, limits, vec![started, invalid]));
@@ -695,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn explanation_renders_v2_refusal_and_stage_labels_without_raw_reason_text() {
+    fn explanation_renders_refusal_and_stage_labels_without_raw_reason_text() {
         use irlume_common::diagnostics::{TraceRefusalReason, TraceStage};
         let records = vec![
             fixture_record(
@@ -723,7 +728,9 @@ mod tests {
             ),
         ];
         let rendered = render_timeline(&records);
-        assert!(rendered.starts_with("Irlume diagnostic trace schema 2\n"));
+        assert!(rendered.starts_with(&format!(
+            "Irlume diagnostic trace schema {TRACE_SCHEMA_VERSION}\n"
+        )));
         assert!(rendered.contains("AuthenticationRefusal { reason: RgbPadPending }"));
         assert!(rendered.contains("IdentityInference"));
         assert!(rendered.contains("StreamOwnerRelease"));

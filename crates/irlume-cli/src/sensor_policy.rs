@@ -11,6 +11,20 @@ use std::process::ExitCode;
 
 pub(crate) const WARNING: &str = "EXPERIMENTAL: IR-only omits RGB and cross-spectrum evidence. It is not qualified for authentication assurance. Missing prerequisites use password fallback; no silent RGB fallback is permitted.";
 
+pub(crate) const PAIRED_SUPPORT_NOTE: &str = "Paired camera support does not establish experimental IR-only readiness; check `irlume auth sensor preflight`.";
+
+fn target_issue_message(issue: Option<irlume_common::IrTargetIssue>) -> &'static str {
+    use irlume_common::IrTargetIssue as Issue;
+    match issue {
+        Some(Issue::Unconfigured) => "no explicit RGB and IR camera pair is configured; persist your verified pair with `sudo irlume set-cameras <RGB> <IR>`, then rerun preflight. Use your password until ready",
+        Some(Issue::UnsupportedTopology) => "the configured camera layout is unsupported by experimental IR-only; changing the saved pair cannot make an unsupported layout compatible. Paired-camera support is a separate capability; use your password",
+        Some(Issue::Unavailable) => "a configured camera endpoint is missing, unreadable, or unavailable; check the connection and saved pair, then rerun preflight and use your password",
+        Some(Issue::BindingUnavailable) => "the configured IR camera identity could not be established from device metadata; check the device and configuration, then rerun preflight and use your password",
+        Some(Issue::Changed) => "the configured IR target changed during validation; check the connection and saved pair, rerun preflight, and use your password",
+        Some(Issue::Unknown) | None => "configured IR target is unavailable or unsupported; configure a supported IR target and use your password",
+    }
+}
+
 pub(crate) fn state_label(state: State) -> &'static str {
     match state {
         State::DefaultDual => "dual (default)",
@@ -117,6 +131,7 @@ fn preflight_for(user: String) -> ExitCode {
         Ok(Response::FaceSensorStatus {
             policy,
             ir_readiness: Some(readiness),
+            ir_target_issue,
         }) => {
             println!("[sensor] daemon observed: {}", state_label(policy));
             match policy.resolve() {
@@ -131,6 +146,10 @@ fn preflight_for(user: String) -> ExitCode {
                 }
             }
             use irlume_common::IrOnlyReadiness as Readiness;
+            if ir_target_issue.is_some() && readiness != Readiness::TargetUnavailable {
+                eprintln!("[sensor] daemon returned inconsistent target readiness; rerun preflight and use your password");
+                return ExitCode::FAILURE;
+            }
             let refusal = match readiness {
                 Readiness::ReadyForExperimentalAttempt => {
                     println!("[sensor] EXPERIMENTAL IR-only prerequisites are ready for an attempt. This does not prove capture success or a usable login and is not qualified for authentication assurance; the service deadline still applies.");
@@ -143,7 +162,7 @@ fn preflight_for(user: String) -> ExitCode {
                     "sensor policy is invalid; inspect and select dual or IR-only again, then use your password"
                 }
                 Readiness::TargetUnavailable => {
-                    "configured IR target is unavailable or unsupported; configure a supported IR target and use your password"
+                    target_issue_message(ir_target_issue)
                 }
                 Readiness::BindingUnavailable => {
                     "IR enrollment has no camera binding; add fresh scans with the configured camera and use your password"

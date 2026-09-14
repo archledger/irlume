@@ -658,11 +658,27 @@ fn managed_preparation_non_live_precedence_matches_eager_admission() {
     let engine = &mut state.engine;
     let previous_ir = engine.ir_available;
     engine.ir_available = true;
-    for (verdict, reason) in [
-        (Verdict::Uncertain, "framing fixture"),
-        (Verdict::Uncertain, "IR exposure unmeasurable fixture"),
-        (Verdict::Spoof, "no face in IR fixture"),
-        (Verdict::Spoof, "spoof fixture"),
+    for (verdict, cause, reason) in [
+        (
+            Verdict::Uncertain,
+            irlume_liveness::DenyCause::Other,
+            "framing fixture",
+        ),
+        (
+            Verdict::Uncertain,
+            irlume_liveness::DenyCause::ExposureUnmeasurable,
+            "IR exposure unmeasurable fixture",
+        ),
+        (
+            Verdict::Spoof,
+            irlume_liveness::DenyCause::NoIrFace,
+            "no face in IR fixture",
+        ),
+        (
+            Verdict::Spoof,
+            irlume_liveness::DenyCause::Other,
+            "spoof fixture",
+        ),
     ] {
         for (rgb, ir) in [(true, true), (true, false), (false, true), (false, false)] {
             let make = |engine: &mut Engine| {
@@ -670,6 +686,7 @@ fn managed_preparation_non_live_precedence_matches_eager_admission() {
                 let mut sample = visible_pair_sample(engine, 0, 0.2, false);
                 sample.assessment.verdict = verdict;
                 sample.assessment.reason = reason.into();
+                sample.assessment.deny_cause = cause;
                 sample.assessment.ir_pad = PadEvidence::InferenceFailed;
                 if !rgb {
                     sample.identity.0 = None;

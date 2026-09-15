@@ -3867,6 +3867,18 @@ impl Engine {
         // ViT vote ring, so repeated assess() calls must not accumulate a
         // cross-presentation vote (GLM review finding 2).
         self.vit_scores.clear();
+        // Resolve the capture-mode selection through the qualification store
+        // BEFORE acquiring the streaming operation, exactly as
+        // authenticate_for does at its own entry: without this the one-shot
+        // path silently runs the sequential default and a stored
+        // qualified_concurrent verdict never applies (#719). The diagnostic
+        // open inside standalone_capture_mode_selection closes fully before
+        // the streaming operation below acquires the pair.
+        let selection = if self.ir_available {
+            standalone_capture_mode_selection(&self.rgb_dev, &self.ir_dev)
+        } else {
+            unavailable_capture_mode_selection()
+        };
         let endpoints: Vec<&str> = if self.ir_available {
             vec![self.rgb_dev.as_str(), self.ir_dev.as_str()]
         } else {
@@ -3881,7 +3893,7 @@ impl Engine {
         operation
             .run(|| {
                 if self.ir_available {
-                    self.assess_full(&operation)
+                    self.assess_full(&selection, &operation)
                 } else {
                     self.assess_rgb_only()
                 }
@@ -4242,9 +4254,10 @@ impl Engine {
     /// Assess one pair using the selected per-capture strategy.
     fn assess_full(
         &mut self,
+        selection: &CaptureModeSelection,
         operation: &irlume_camera::lease::CameraOperationSession,
     ) -> irlume_common::Result<Assessment> {
-        self.assess_full_with(None, None, operation, &())
+        self.assess_full_with(None, Some(selection), operation, &())
             .map_err(CapturePathError::into_inner)
     }
 
@@ -13193,6 +13206,27 @@ mod engine_tests {
         ));
         assert_eq!(sink.0.lock().unwrap().len(), 3);
         teardown_sandbox(&dir);
+    }
+
+    #[test]
+    fn one_shot_assess_resolves_capture_mode_through_the_qualification_store() {
+        // Ratchet for issue 719: the one-shot assess path (identify and the
+        // legacy operationless authenticate fallback) used to run the hardcoded
+        // sequential default and never consult the stored capture
+        // qualification, so a measured concurrent verdict silently never
+        // applied. Structural test, in the style of the daemon eprintln
+        // ratchet: assess() must resolve its selection through
+        // standalone_capture_mode_selection, the same qualification-store
+        // lookup authenticate_for uses, before starting its capture.
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub fn assess(&mut self)")
+            .expect("assess entry exists");
+        let body = &src[start..start + 2500];
+        assert!(
+            body.contains("standalone_capture_mode_selection"),
+            "assess() must resolve its capture-mode selection through the qualification store"
+        );
     }
 
     #[test]

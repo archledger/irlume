@@ -5,6 +5,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- The one-shot assessment path (used by `irlume identify` and the legacy
+  operationless authenticate fallback) now resolves its capture-mode selection
+  through the stored camera qualification before capture, exactly like the
+  main authenticate path. Previously it silently ran the sequential default,
+  so a stored `qualified_concurrent` verdict from `irlume camera-tune`
+  never applied to these captures (#719).
+
 ### Changed
 
 - Sequential captures reuse delivered-rate evidence within bounds (ADR-0021):
@@ -1627,7 +1636,7 @@ working. The upgrade was tested both ways with fixtures produced by real
   the line lands above `pam_kwallet5.so` on every upstream plasmalogin layout.
 
 - **A stack using backslash line continuations is refused, not corrupted.**
-  libpam's line assembler joins a directive ending in `\` with the next
+  libpam's line assembler joins a directive ending in `` with the next
   physical line before tokenizing (whitespace after the backslash does not
   defuse it; a backslash ending a comment does not continue; all three pinned
   by experiment against `pam_exec.so`). irlume edits stacks line-by-line, so

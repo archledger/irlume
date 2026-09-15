@@ -2245,9 +2245,13 @@ mod tests {
     /// at the first same-model record survived under a test named for
     /// directory order.
     ///
-    /// The foreign record is given a name this directory really does hand back
-    /// first, discovered by asking rather than assumed, so the ordering the test
-    /// is named for is the ordering it runs against.
+    /// The foreign records are planted FIRST and MY misfiled name is the one
+    /// discovered by asking: a name is kept only when the directory really does
+    /// hand back a foreign record before it. Creation-order enumerations
+    /// (tmpfs, single-block ext4) then satisfy the precondition on the first
+    /// try, because mine is created after the foreigns; hash-order
+    /// enumerations still find a name that lands late. The ordering the test
+    /// is named for is the ordering it runs against, on every filesystem.
     #[test]
     fn this_cameras_record_is_found_whatever_the_directory_order() {
         let _lock = env_lock();
@@ -2258,14 +2262,14 @@ mod tests {
 
         let mine = identity();
         let my_record = record_for(&mine);
-        let misfiled = store_dir().join(format!("{}.json", "f".repeat(64)));
-        std::fs::write(
-            &misfiled,
-            serde_json::to_string(&my_record).expect("serialize"),
-        )
-        .expect("plant mine misfiled");
-
         let other = record_for(&identical_unit_elsewhere());
+        // Foreigns first, so creation-order enumerations hand one back before
+        // mine without any hunting at all.
+        for n in 0..8u32 {
+            let foreign = store_dir().join(format!("foreign-{n:03x}.json"));
+            std::fs::write(&foreign, serde_json::to_string(&other).expect("serialize"))
+                .expect("plant foreign");
+        }
         let first_entry = || {
             std::fs::read_dir(store_dir())
                 .expect("read store")
@@ -2274,24 +2278,26 @@ mod tests {
                 .next()
                 .expect("an entry")
         };
-        let mut foreign = None;
+        // MY name is the hunted one: keep the first whose enumeration is
+        // preceded by a foreign record, which is the arrangement that kills
+        // a scan stopping at the first same-model record.
+        let mut misfiled = None;
         for n in 0..64u32 {
             let candidate = store_dir().join(format!("{n:064x}.json"));
             std::fs::write(
                 &candidate,
-                serde_json::to_string(&other).expect("serialize"),
+                serde_json::to_string(&my_record).expect("serialize"),
             )
-            .expect("plant foreign");
-            if first_entry() == candidate {
-                foreign = Some(candidate);
+            .expect("plant mine misfiled");
+            if first_entry() != candidate {
+                misfiled = Some(candidate);
                 break;
             }
             std::fs::remove_file(&candidate).expect("try another name");
         }
-        assert!(
-            foreign.is_some(),
-            "no name came back before mine in 64 tries, so the ordering this \
-             test is named for was never established"
+        let misfiled = misfiled.expect(
+            "no name of mine enumerated after a foreign record in 64 tries, so \
+             the ordering this test is named for was never established",
         );
 
         assert_eq!(

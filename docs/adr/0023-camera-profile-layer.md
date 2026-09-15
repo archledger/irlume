@@ -83,6 +83,18 @@ accuracy contract is part of this decision:
   p50, p95 over N configurable rounds) with minimum-round and
   variance-threshold refusals, extending camera-tune's existing
   refuse-weak-evidence behavior (for example the lit-room refusal).
+  Measured motivation: the NexiGo N930W's IR window fills in 2172-2176 ms
+  (effective ~13.8 fps delivered against a nominal 30 fps, worst observed
+  in-window gap ~625 ms) while presenting as a healthy 30 fps camera
+  otherwise; a single point estimate would have hidden it.
+- Both baselines: a concurrent-versus-sequential verdict must be computed
+  against the amortized-sequential path (ADR-0021 evidence reuse in force),
+  not only the unamortized sequential fill. Measured motivation: the
+  N930W's tune advertises a 5.7-6.3 s concurrent saving over unamortized
+  sequential, but amortized-sequential identify wall time beat the
+  concurrent path in practice on the same host; a verdict that ignores
+  amortization can pick the slower mode (2026-09-15 archhost session,
+  evidence in the issue 719 investigation).
 - Isolation: emission is refused while other holders or pending claims
   exist on the device, while identity is unstable, or when access is not
   exclusive to the probe.

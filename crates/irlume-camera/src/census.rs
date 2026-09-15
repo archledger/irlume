@@ -156,6 +156,13 @@ pub(crate) fn node_entry_from_facts(facts: &NodeFacts) -> CensusEntry {
         evidence.insert(1, format!("USB {id}"));
     }
 
+    // A software-created node can never be the face camera, so whether its
+    // formats were probeable answers a question nobody has; dropping the
+    // formats claim keeps dummy rows to driver and placement facts.
+    if DUMMY_DRIVERS.contains(&facts.driver.as_str()) {
+        evidence.retain(|e| !e.starts_with("formats "));
+    }
+
     let y8_only = |fourccs: &Option<Vec<[u8; 4]>>| match fourccs {
         None => false,
         Some(list) => {
@@ -688,6 +695,28 @@ mod tests {
             assert!(
                 entry.evidence.join(" | ").contains(driver),
                 "the driver/class name is the whole evidence for this class"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dummy_node_with_unprobed_formats_drops_the_probe_noise() {
+        // The verdict already says a software node can never be the face
+        // camera, so "formats not probed (could not be opened)" answers a
+        // question nobody has about a device that does not exist.
+        for driver in ["v4l2loopback", "vivid", "virtual-device"] {
+            let mut f = facts("/dev/video9", Role::Rgb, &[b"YUYV"]);
+            f.driver = driver.into();
+            f.on_usb = false;
+            f.usb_id = None;
+            f.paired = false;
+            f.fourccs = None;
+            let entry = node_entry_from_facts(&f);
+            assert_eq!(entry.class, CensusClass::DummyNode, "driver {driver}");
+            let evidence = entry.evidence.join(" | ");
+            assert!(
+                !evidence.contains("formats"),
+                "a dummy row carries no formats claim: {evidence}"
             );
         }
     }

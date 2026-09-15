@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume doctor --check` turns the health report into a scriptable verdict:
+  exit 0 clean, 1 warnings only, 2 any failure. The default informational
+  run is unchanged and still exits 0, and the human report closes with a
+  warning/failure count when there is anything to act on. Dummy (software
+  created) camera nodes no longer carry a formats claim in the census,
+  because a probe answer about a device that does not exist was noise.
 - The machine error envelope now carries one action line for every published
   failure code (previously only camera-busy had one), so a consumer can tell a
   user what to do next without interpreting prose, and a new

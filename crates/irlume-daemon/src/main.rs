@@ -6328,6 +6328,49 @@ mod tests {
     use irlume_common::jout_debug;
 
     #[test]
+    fn one_refused_authentication_emits_at_most_two_journal_lines() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let _g = env_lock();
+        let diagnostic_state = diagnostics::DiagnosticState::default();
+        let ready = std::sync::atomic::AtomicBool::new(true);
+        let refused = arbiter::Arbiter::<Queued>::new();
+        refused.close();
+        let request = Request::Authenticate {
+            structured_errors: false,
+            user: "root".into(),
+            service: Some("sudo".into()),
+            intent_confirmation: None,
+        };
+        let mut wire = serde_json::to_string(&request).unwrap();
+        wire.push('\n');
+        let before = irlume_common::journal_out::emitted_lines();
+        let response = with_serve_as_peer_and_diagnostics(
+            &refused,
+            &ready,
+            &diagnostic_state,
+            peer(0),
+            |client| {
+                (&*client).write_all(wire.as_bytes()).unwrap();
+                let mut line = String::new();
+                BufReader::new(client).read_line(&mut line).unwrap();
+                serde_json::from_str::<Response>(line.trim()).unwrap()
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::AuthResult {
+                refused_by_policy: true,
+                ..
+            }
+        ));
+        let delta = irlume_common::journal_out::emitted_lines() - before;
+        assert!(
+            delta <= 2,
+            "journal volume regressed: {delta} lines for one refused authentication"
+        );
+    }
+
+    #[test]
     fn authentication_error_publishes_typed_codes_only_when_requested() {
         use irlume_common::OperationErrorCode;
         let resp = authentication_error(irlume_common::Error::DeadlineExpired, true);

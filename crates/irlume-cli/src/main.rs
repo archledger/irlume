@@ -3407,9 +3407,29 @@ fn report_polkit_sandbox(report: &mut crate::doctor_report::Report) {
     }
 }
 
+/// `--check` turns the report into a scriptable verdict; see `Summary`.
+fn doctor_wants_check(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--check")
+}
+
 fn doctor(args: &[String]) -> std::process::ExitCode {
+    let wants_check = doctor_wants_check(args);
     let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Human);
-    doctor_run(&mut report, args)
+    let run = doctor_run(&mut report, args);
+    let summary = report.summary();
+    if summary.warnings + summary.failures > 0 {
+        dout!(
+            report,
+            "[doctor] summary: {} warning(s), {} failure(s). Scripts: `irlume doctor --check` exits 1 on warnings, 2 on failures.",
+            summary.warnings,
+            summary.failures
+        );
+    }
+    if wants_check {
+        std::process::ExitCode::from(summary.check_exit_code())
+    } else {
+        run
+    }
 }
 
 /// The negotiated streams against the Windows Hello minimums (#223).
@@ -4445,6 +4465,18 @@ fn selftest_align(args: &[String]) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn doctor_check_flag_is_an_expact_match_not_a_prefix() {
+        assert!(doctor_wants_check(&["--check".to_string()]));
+        assert!(doctor_wants_check(&[
+            "doctor".to_string(),
+            "--check".to_string()
+        ]));
+        assert!(!doctor_wants_check(&[]));
+        assert!(!doctor_wants_check(&["--checkout".to_string()]));
+        assert!(!doctor_wants_check(&["--check=1".to_string()]));
+    }
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {

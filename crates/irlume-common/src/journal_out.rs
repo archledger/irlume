@@ -22,6 +22,7 @@
 
 use std::fmt;
 use std::io::Write as _;
+use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
 pub enum Level {
@@ -95,11 +96,21 @@ pub fn stderr_is_journal() -> bool {
     })
 }
 
+/// Total lines emitted through this module. One relaxed load per line keeps a
+/// volume contract testable: a request path that starts spamming the journal
+/// fails a bound instead of waiting for a user to notice the noise.
+pub fn emitted_lines() -> u64 {
+    EMITTED.load(Ordering::Relaxed)
+}
+
+static EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Emit one leveled line to stderr, journal-prefixed when applicable.
 pub fn line(level: Level, args: fmt::Arguments<'_>) {
     let out = format_line(level, stderr_is_journal(), &args.to_string());
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(out.as_bytes());
+    EMITTED.fetch_add(1, Ordering::Relaxed);
 }
 
 #[macro_export]
@@ -187,6 +198,14 @@ mod tests {
         assert!(journal_stream_matches(Some("10:2089833"), 10, 2_089_833));
         assert!(!journal_stream_matches(Some("10:2089833"), 10, 9));
         assert!(!journal_stream_matches(Some("10:2089833"), 11, 2_089_833));
+    }
+
+    #[test]
+    fn emitted_lines_counts_every_line_emission() {
+        let before = emitted_lines();
+        line(Level::Info, format_args!("volume-probe {}", 1));
+        line(Level::Warning, format_args!("volume-probe {}", 2));
+        assert_eq!(emitted_lines(), before + 2);
     }
 
     #[test]

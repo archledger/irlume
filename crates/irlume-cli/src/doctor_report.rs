@@ -94,6 +94,43 @@ impl Report {
     pub fn into_checks(self) -> Vec<Check> {
         self.checks
     }
+
+    /// How the run ended: warnings and failures, the two states a script or a
+    /// human closing thought should act on. Pass, Info and Unknown are not
+    /// counted; they are facts, not findings.
+    pub fn summary(&self) -> Summary {
+        let mut summary = Summary::default();
+        for check in &self.checks {
+            match check.state {
+                State::Warn => summary.warnings += 1,
+                State::Fail => summary.failures += 1,
+                State::Pass | State::Info | State::Unknown => {}
+            }
+        }
+        summary
+    }
+}
+
+/// The closing count of a doctor run.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct Summary {
+    pub warnings: usize,
+    pub failures: usize,
+}
+
+impl Summary {
+    /// Scriptable verdict for `doctor --check`: 0 clean, 1 warnings only,
+    /// 2 any failure. Failure outranks warning so a script that only checks
+    /// for nonzero still behaves correctly.
+    pub fn check_exit_code(self) -> u8 {
+        if self.failures > 0 {
+            2
+        } else if self.warnings > 0 {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// Print a `doctor` line, unless this run is collecting for the machine report.
@@ -104,4 +141,50 @@ macro_rules! dout {
             println!($($arg)*);
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_counts_warnings_and_failures_but_not_info_or_pass() {
+        let mut r = Report::new(Mode::Human);
+        r.check("a", State::Pass);
+        r.check("b", State::Info);
+        r.check("c", State::Warn);
+        r.check_detail("d", State::Fail, "boom");
+        let s = r.summary();
+        assert_eq!(s.warnings, 1);
+        assert_eq!(s.failures, 1);
+    }
+
+    #[test]
+    fn check_exit_codes_separate_clean_warning_and_failure() {
+        assert_eq!(Summary::default().check_exit_code(), 0);
+        assert_eq!(
+            Summary {
+                warnings: 2,
+                failures: 0
+            }
+            .check_exit_code(),
+            1
+        );
+        assert_eq!(
+            Summary {
+                warnings: 0,
+                failures: 1
+            }
+            .check_exit_code(),
+            2
+        );
+        assert_eq!(
+            Summary {
+                warnings: 3,
+                failures: 2
+            }
+            .check_exit_code(),
+            2
+        );
+    }
 }

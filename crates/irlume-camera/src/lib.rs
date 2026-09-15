@@ -2033,6 +2033,14 @@ impl<S: ValidatedStream> TrackedStream<S> {
         if self.rate_window.ready() || self.health_admitted {
             return Ok(());
         }
+        // A probe-eligible stream always measures post-flush, so it takes the
+        // fixed-flush path even when the caller asked for adaptive startup:
+        // the probe cannot distinguish a STREAMON transient from degradation.
+        let probe_eligible = self
+            .amort_key
+            .as_ref()
+            .is_some_and(rate_amortization::amortizable);
+        let adaptive_ir = adaptive_ir && !probe_eligible;
         // Exclude a role's measured STREAMON transient. With no exclusion
         // (RGB), retain successful timing observations from AE warm-up: they
         // already belong to this stream's rate window, whose full size and
@@ -2059,7 +2067,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
         // same exact floor arithmetic may admit the session. The per-frame
         // sliding judgment below keeps running for the whole burst either
         // way, and any probe failure falls back to the full fill.
-        if !adaptive_ir {
+        if probe_eligible {
             if let Some(key) = self
                 .amort_key
                 .clone()
@@ -4262,6 +4270,7 @@ impl RgbCamera {
                     self.accepted_interval,
                 ),
             )
+            .with_rate_amortization(&self.device)
             .with_control(control),
             warmed: false,
             progress: control.progress.clone(),
@@ -6953,7 +6962,8 @@ pub fn capture_ir_streaming<B>(
             interval.requested,
             interval.accepted,
         ),
-    );
+    )
+    .with_rate_amortization(device);
     // Metadata must STREAMON before the image queue's first dequeue.
     let mut meta = ir_metadata::IlluminationLog::open(device);
     _mode = enable_ir_emitter_privacy_bounded(
@@ -7094,7 +7104,8 @@ pub fn capture_ir_sequence(
             interval.requested,
             interval.accepted,
         ),
-    );
+    )
+    .with_rate_amortization(device);
     // Metadata must STREAMON before the image queue's first dequeue.
     let mut meta = ir_metadata::IlluminationLog::open(device);
     _mode = enable_ir_emitter_privacy_bounded(
@@ -11369,6 +11380,32 @@ mod tests {
             "kill switch re-pays the full window: {discarded}"
         );
         std::env::remove_var("IRLUME_RATE_AMORTIZATION");
+    }
+
+    #[test]
+    fn an_adaptive_startup_still_admits_on_a_probe_when_amortizable() {
+        // The sequential auth path runs IR with Adaptive startup; the probe
+        // must win over the adaptive fill when evidence is amortizable, and a
+        // probe-eligible stream must pay the fixed flush first (the probe
+        // cannot tell a STREAMON transient from degradation).
+        let node = "/dev/video-amort-adaptive";
+        let key = rate_amortization::Key::new(node, contracts::StreamRole::Ir);
+        rate_amortization::test_support::force_completion(key.clone(), None);
+        let mut first =
+            rate_fill_fixture(contracts::StreamRole::Ir, 60, 66_667).with_rate_amortization(node);
+        first
+            .fill_rate_evidence_with_startup(false)
+            .expect("cold full fill");
+        assert!(rate_amortization::amortizable(&key));
+        let mut second =
+            rate_fill_fixture(contracts::StreamRole::Ir, 60, 66_667).with_rate_amortization(node);
+        second
+            .fill_rate_evidence_with_startup(true)
+            .expect("probe admission on the adaptive path");
+        let (_, discarded, _) = second.accounting();
+        // IR flush is 10, then seed + 5 probe deltas: never the adaptive
+        // full-window walk.
+        assert_eq!(discarded, 16, "adaptive probe pays flush + seed + 5");
     }
 
     #[test]

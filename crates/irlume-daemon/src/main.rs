@@ -7896,15 +7896,20 @@ mod tests {
             Response::Error(message) => assert_eq!(message, "hardware: legacy detail"),
             other => panic!("legacy client got {other:?}"),
         }
-        for error in [
-            Error::Hardware("camera busy".into()),
-            Error::NotAuthorized("camera busy".into()),
-        ] {
-            assert!(matches!(
-                authentication_error(error, true),
-                Response::Error(_)
-            ));
-        }
+        // Prose that merely SAYS busy inside a non-busy variant is never
+        // classified into a code: typing follows the variant, never words.
+        assert!(matches!(
+            authentication_error(Error::Hardware("camera busy".into()), true),
+            Response::Error(_)
+        ));
+        // The variant itself, not its wording, selects the code.
+        assert!(matches!(
+            authentication_error(Error::NotAuthorized("camera busy".into()), true),
+            Response::OperationError {
+                code: OperationErrorCode::NotAuthorized,
+                retryable: false
+            }
+        ));
     }
 
     request_catalog! {

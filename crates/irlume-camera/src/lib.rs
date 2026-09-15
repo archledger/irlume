@@ -73,6 +73,7 @@ pub fn initialize_camera_monitor() {
 mod media_graph;
 mod paired_processing;
 pub use paired_processing::process_pair_while_draining;
+mod rate_amortization;
 mod rate_gate;
 mod sequential_batch;
 pub use sequential_batch::{
@@ -1675,6 +1676,10 @@ fn rate_evidence_to_common(
 /// 30 deltas, ~2 s at 15 fps); 64 gives >2x headroom for timeouts and corrupt frames.
 const MAX_RATE_FILL_ATTEMPTS: usize = 64;
 
+/// Bounded dequeue attempts for the ADR-0021 continuity probe: nominal is one
+/// seed plus five deltas; 16 gives generous headroom for corrupt frames.
+const MAX_PROBE_FILL_ATTEMPTS: usize = 16;
+
 struct TrackedStream<S> {
     stream: Option<S>,
     control: CaptureControl,
@@ -1686,6 +1691,12 @@ struct TrackedStream<S> {
     discarded_observations: u64,
     sequence_span_sum: u64,
     recovery_epoch_pending: bool,
+    /// ADR-0021 amortization identity for this stream, when the session was
+    /// created with one.
+    amort_key: Option<rate_amortization::Key>,
+    /// Set when a continuity probe admitted this session; the per-frame
+    /// sliding judgment keeps running either way.
+    health_admitted: bool,
 }
 
 impl<S> TrackedStream<S> {
@@ -1701,7 +1712,15 @@ impl<S> TrackedStream<S> {
             discarded_observations: 0,
             sequence_span_sum: 0,
             recovery_epoch_pending: false,
+            amort_key: None,
+            health_admitted: false,
         }
+    }
+
+    /// Enable ADR-0021 rate-evidence amortization for this stream session.
+    fn with_rate_amortization(mut self, node: &str) -> Self {
+        self.amort_key = Some(rate_amortization::Key::new(node, self.rate_config.role()));
+        self
     }
 
     fn with_control(mut self, control: &CaptureControl) -> Self {
@@ -1734,6 +1753,9 @@ impl<S> TrackedStream<S> {
         }
         self.stream = Some(stream);
         self.recovery_epoch_pending = true;
+        if let Some(key) = &self.amort_key {
+            rate_amortization::invalidate(key);
+        }
         // Drop the pre-recovery rate window immediately. The recovered stream
         // has its own STREAMON transient and its timestamps may move to a new
         // domain (the recovery epoch resets both trackers), so a stale "ready"
@@ -2008,7 +2030,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
 
     fn fill_rate_evidence_with_startup(&mut self, adaptive_ir: bool) -> std::io::Result<()> {
         self.control.check_io()?;
-        if self.rate_window.ready() {
+        if self.rate_window.ready() || self.health_admitted {
             return Ok(());
         }
         // Exclude a role's measured STREAMON transient. With no exclusion
@@ -2031,6 +2053,43 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 self.rate_window.reset();
             }
         }
+        // ADR-0021 continuity probe: when this node and role completed a full
+        // floor-passing window recently in this process and nothing
+        // invalidating happened since, seed + a handful of deltas through the
+        // same exact floor arithmetic may admit the session. The per-frame
+        // sliding judgment below keeps running for the whole burst either
+        // way, and any probe failure falls back to the full fill.
+        if !adaptive_ir {
+            if let Some(key) = self
+                .amort_key
+                .clone()
+                .filter(rate_amortization::amortizable)
+            {
+                let mut attempts = 0;
+                while self.rate_window.count() < rate_amortization::CONTINUITY_PROBE_DELTAS
+                    && attempts < MAX_PROBE_FILL_ATTEMPTS
+                {
+                    self.next_discarded()?;
+                    attempts += 1;
+                }
+                let policy = self.rate_config.policy();
+                if self.rate_window.count() >= rate_amortization::CONTINUITY_PROBE_DELTAS
+                    && self.rate_window.meets_floor(
+                        policy.floor_num(),
+                        policy.floor_den(),
+                        policy.tolerance_percent(),
+                    )
+                {
+                    self.health_admitted = true;
+                    return Ok(());
+                }
+                // The probe missed: the current session is not delivering at
+                // floor, so the cached evidence is stale in the harmful
+                // direction. Drop it and re-establish from scratch.
+                rate_amortization::invalidate(&key);
+                self.rate_window.reset();
+            }
+        }
         let mut attempts = 0;
         while !self.rate_window.ready() && attempts < MAX_RATE_FILL_ATTEMPTS - retained_seed {
             self.next_discarded()?;
@@ -2040,6 +2099,19 @@ impl<S: ValidatedStream> TrackedStream<S> {
             return Err(std::io::Error::other(
                 CaptureEvidenceError::IncompleteWindow,
             ));
+        }
+        // A completed window only becomes reusable evidence when it met its
+        // floor (ADR-0021: "completed a full 30-delta window that met its
+        // floor").
+        if let Some(key) = &self.amort_key {
+            let policy = self.rate_config.policy();
+            if self.rate_window.meets_floor(
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+            ) {
+                rate_amortization::record_completion(key.clone());
+            }
         }
         if adaptive_ir {
             // One-shot IR may settle before the fixed exclusion is needed.
@@ -2088,6 +2160,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
             discarded_observations,
             sequence_span_sum,
             recovery_epoch_pending,
+            amort_key,
             ..
         } = self;
         let dequeued = stream
@@ -2099,6 +2172,9 @@ impl<S: ValidatedStream> TrackedStream<S> {
         let (payload, facts) = match dequeued {
             Ok(frame) => frame,
             Err(ValidatedDequeueError::Corrupt(facts)) => {
+                if let Some(key) = amort_key.as_ref() {
+                    rate_amortization::invalidate(key);
+                }
                 observe_continuity_facts(
                     sequence,
                     timestamp,
@@ -2114,6 +2190,9 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 ));
             }
             Err(error) => {
+                if let Some(key) = amort_key.as_ref() {
+                    rate_amortization::invalidate(key);
+                }
                 if error.invalidates_timestamp_epoch() {
                     timestamp.fail_current_epoch();
                 }
@@ -2135,6 +2214,11 @@ impl<S: ValidatedStream> TrackedStream<S> {
 
         rate_window
             .observe_success(facts.timestamp_micros())
+            .inspect_err(|_| {
+                if let Some(key) = amort_key.as_ref() {
+                    rate_amortization::invalidate(key);
+                }
+            })
             .map_err(|error| DeliveryError::Io(std::io::Error::other(error)))?;
 
         let policy = rate_config.policy();
@@ -5674,6 +5758,7 @@ impl IrCamera {
                     self.accepted_interval,
                 ),
             )
+            .with_rate_amortization(&self.device)
         };
         stream.control = control.clone();
         if let Some(inner) = stream.stream.as_mut() {
@@ -11220,6 +11305,70 @@ mod tests {
             },
             rate_gate::StreamRateConfig::new(role, interval, interval),
         )
+    }
+
+    #[test]
+    fn second_session_admits_on_a_probe_after_a_full_window() {
+        // Session one pays the full fill and records completion; session two
+        // on the same node and role admits on seed + 5 probe deltas.
+        let node = "/dev/video-amort-probe";
+        let mut first =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 40, 66_667).with_rate_amortization(node);
+        rate_amortization::test_support::force_completion(
+            rate_amortization::Key::new(node, contracts::StreamRole::Rgb),
+            None,
+        );
+        first.fill_rate_evidence().expect("full fill");
+        assert!(rate_amortization::amortizable(
+            &rate_amortization::Key::new(node, contracts::StreamRole::Rgb)
+        ));
+        let mut second =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 40, 66_667).with_rate_amortization(node);
+        second.fill_rate_evidence().expect("probe admission");
+        let (_, discarded, _) = second.accounting();
+        assert_eq!(
+            discarded, 6,
+            "probe admission discards seed + 5 deltas, not a full window"
+        );
+        // The per-frame judgment still runs on the next delivered frame.
+        second.next().expect("next frame after probe admission");
+    }
+
+    #[test]
+    fn a_stream_that_cannot_clear_the_probe_re_pays_the_full_window() {
+        let node = "/dev/video-amort-slow";
+        let key = rate_amortization::Key::new(node, contracts::StreamRole::Ir);
+        rate_amortization::test_support::force_completion(key.clone(), None);
+        // IR at 10 fps: below the 14.55 fps floor, so the probe fails and the
+        // full fill cannot complete either.
+        let mut slow =
+            rate_fill_fixture(contracts::StreamRole::Ir, 80, 100_000).with_rate_amortization(node);
+        // The fill completes (readiness is what it establishes); the floor is
+        // judged per delivered frame, and that judgment refuses this stream.
+        slow.fill_rate_evidence().expect("window fills regardless");
+        assert!(matches!(
+            slow.next().map(|_| ()),
+            Err(DeliveryError::BelowFloor(_))
+        ));
+        assert!(
+            !rate_amortization::amortizable(&key),
+            "a failed probe invalidates, and a below-floor window never records"
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_forces_the_full_fill_despite_a_fresh_completion() {
+        let node = "/dev/video-amort-off";
+        std::env::set_var("IRLUME_RATE_AMORTIZATION", "0");
+        let mut stream =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 40, 66_667).with_rate_amortization(node);
+        stream.fill_rate_evidence().expect("full fill");
+        let (_, discarded, _) = stream.accounting();
+        assert!(
+            discarded >= 31,
+            "kill switch re-pays the full window: {discarded}"
+        );
+        std::env::remove_var("IRLUME_RATE_AMORTIZATION");
     }
 
     #[test]

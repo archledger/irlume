@@ -7,6 +7,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Sequential captures reuse delivered-rate evidence within bounds (ADR-0021):
+  when the same camera node and role completed a full floor-passing
+  30-delta window in this process within five minutes and no stream error,
+  recovery or failed probe intervened, a new session may admit on a five
+  delta continuity probe through the same exact floor arithmetic instead of
+  re-paying the ~2 second observation window per stream. Per-frame sliding
+  floor judgment over the whole burst is unchanged, probe failure falls
+  back to the full fill, and `IRLUME_RATE_AMORTIZATION=0` restores the old
+  behavior. Expected effect on the second and later sequential attempts:
+  several seconds shorter authentication; the first attempt per process is
+  unchanged.
 - `irlume doctor --check` turns the health report into a scriptable verdict:
   exit 0 clean, 1 warnings only, 2 any failure. The default informational
   run is unchanged and still exits 0, and the human report closes with a

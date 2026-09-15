@@ -3748,10 +3748,24 @@ fn not_authorized(req: &Request, verb: &str, user: &str) -> Response {
 
 /// Preserve legacy replies unless the caller can understand typed errors.
 fn authentication_error(error: irlume_common::Error, structured: bool) -> Response {
-    if structured && matches!(error, irlume_common::Error::CameraBusy(_)) {
-        Response::OperationError {
-            code: irlume_common::OperationErrorCode::CameraBusy,
-            retryable: true,
+    if structured {
+        match error {
+            irlume_common::Error::CameraBusy(_) => Response::OperationError {
+                code: irlume_common::OperationErrorCode::CameraBusy,
+                retryable: true,
+            },
+            // The budget ending is a normal outcome with the OPPOSITE retry
+            // decision of a failure, and the fixed Display string carries no
+            // cause a client could branch on.
+            irlume_common::Error::DeadlineExpired => Response::OperationError {
+                code: irlume_common::OperationErrorCode::DeadlineExpired,
+                retryable: false,
+            },
+            irlume_common::Error::NotAuthorized(_) => Response::OperationError {
+                code: irlume_common::OperationErrorCode::NotAuthorized,
+                retryable: false,
+            },
+            error => Response::Error(error.to_string()),
         }
     } else {
         Response::Error(error.to_string())
@@ -6312,6 +6326,31 @@ fn journal_safe(s: &str) -> String {
 mod tests {
     use super::*;
     use irlume_common::jout_debug;
+
+    #[test]
+    fn authentication_error_publishes_typed_codes_only_when_requested() {
+        use irlume_common::OperationErrorCode;
+        let resp = authentication_error(irlume_common::Error::DeadlineExpired, true);
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::DeadlineExpired,
+                retryable: false
+            }
+        ));
+        let resp = authentication_error(irlume_common::Error::NotAuthorized("peer".into()), true);
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::NotAuthorized,
+                retryable: false
+            }
+        ));
+        let resp = authentication_error(irlume_common::Error::DeadlineExpired, false);
+        assert!(matches!(resp, Response::Error(_)));
+        let resp = authentication_error(irlume_common::Error::Io("boom".into()), true);
+        assert!(matches!(resp, Response::Error(_)));
+    }
 
     /// Ratchet: daemon source must emit through the leveled jout_* macros (or
     /// the shared dlog!) only, so a new line cannot silently regress to an

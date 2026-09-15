@@ -145,7 +145,7 @@ fn failure(command: &'static str, code: &'static str, retryable: bool, contract:
         error: Some(MachineError {
             code,
             retryable,
-            message: (code == "camera-busy").then_some(CAMERA_BUSY_MESSAGE),
+            message: error_message(code),
         }),
     }
 }
@@ -157,8 +157,27 @@ fn error_code(code: OperationErrorCode) -> &'static str {
     match code {
         OperationErrorCode::CameraBusy => "camera-busy",
         OperationErrorCode::NotAuthorized => "not-authorized",
+        OperationErrorCode::DeadlineExpired => "deadline-expired",
         OperationErrorCode::OperationFailed | OperationErrorCode::Unknown => "operation-failed",
     }
+}
+
+/// The one action line every published failure code carries, so a machine
+/// consumer never has to interpret prose to tell a user what to do next. An
+/// unknown code deliberately carries none: inventing guidance for a code this
+/// build does not know would be a guess, and `Unknown` maps to
+/// operation-failed, which has its own line.
+fn error_message(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "camera-busy" => CAMERA_BUSY_MESSAGE,
+        "not-authorized" => "Not authorized. Run as the account owner or as root.",
+        "operation-failed" => "Operation failed. Run irlume doctor for a health check.",
+        "deadline-expired" => "Authentication window expired. Use your password; do not retry face.",
+        "usage-error" => "Usage error. Run the command with --help.",
+        "protocol-error" => "The daemon sent an unexpected response; it may be older than this CLI. Run irlume doctor.",
+        "daemon-unavailable" => "irlumed is not running; start it with: sudo systemctl enable --now irlumed.",
+        _ => return None,
+    })
 }
 
 /// One line of an NDJSON event stream.
@@ -270,7 +289,7 @@ impl EventStream {
             Some(MachineError {
                 code,
                 retryable,
-                message: (code == "camera-busy").then_some(CAMERA_BUSY_MESSAGE),
+                message: error_message(code),
             }),
         );
         ExitCode::FAILURE
@@ -2374,6 +2393,38 @@ fn profiles_data(profiles: Vec<ProfileSummary>, _require_eyes_open: bool) -> Val
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deadline_expired_maps_to_its_published_code() {
+        assert_eq!(
+            error_code(OperationErrorCode::DeadlineExpired),
+            "deadline-expired"
+        );
+    }
+
+    #[test]
+    fn every_published_error_code_carries_an_action_message() {
+        let published = [
+            "camera-busy",
+            "not-authorized",
+            "operation-failed",
+            "deadline-expired",
+            "usage-error",
+            "protocol-error",
+            "daemon-unavailable",
+        ];
+        for code in published {
+            let msg = error_message(code);
+            assert!(
+                msg.is_some_and(|m| !m.is_empty() && m.ends_with('.')),
+                "code {code} needs a non-empty action message ending with a period"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_codes_carry_no_message_rather_than_a_wrong_one() {
+        assert!(error_message("some-future-code").is_none());
+    }
 
     #[test]
     fn profile_ir_machine_data_preserves_reported_counts_and_omits_unknown() {

@@ -894,6 +894,11 @@ pub enum OperationErrorCode {
     OperationFailed,
     /// The camera driver reports contention. Retry once the camera is free.
     CameraBusy,
+    /// The authentication budget ended; this is neither biometric evidence nor
+    /// a camera fault. Callers must fall back without retrying or recording a
+    /// match attempt. Distinct from OperationFailed because the prose says
+    /// nothing a client can branch on and the retry decision is the opposite.
+    DeadlineExpired,
     /// A code this build does not know. Present so a client compiled against an
     /// older contract can still decode a response from a newer daemon rather
     /// than failing the whole message.
@@ -1607,6 +1612,15 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operation_error_code_wire_is_kebab_case_and_forward_compatible() {
+        let d = serde_json::to_value(super::OperationErrorCode::DeadlineExpired).unwrap();
+        assert_eq!(d, serde_json::json!("deadline-expired"));
+        let future: super::OperationErrorCode =
+            serde_json::from_str("\"some-future-code\"").unwrap();
+        assert_eq!(future, super::OperationErrorCode::Unknown);
+    }
+
     #[test]
     fn wallet_salt_wire_is_optional_fixed_length_and_redacted() {
         use super::{kwallet_wire::SALT_LEN, Request, WalletSalt};

@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The machine error envelope now carries one action line for every published
+  failure code (previously only camera-busy had one), so a consumer can tell a
+  user what to do next without interpreting prose, and a new
+  `deadline-expired` code distinguishes an expired authentication budget from
+  a failure. The daemon publishes it, and `not-authorized`, when the client
+  asks for structured errors; older clients keep decoding unknown codes as
+  `operation-failed`.
 - Daemon journal lines now carry real syslog priorities: failures are logged
   at err, degradations and configuration fallbacks at warning, significant
   but expected events at notice, routine operation at info, and the opt-in

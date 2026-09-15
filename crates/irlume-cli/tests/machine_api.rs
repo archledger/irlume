@@ -941,7 +941,7 @@ fn an_unconfirmed_record_needs_the_acknowledgement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A busy camera is actionable, but arbitrary daemon prose must stay private.
+/// Every published failure code is actionable; daemon prose stays private.
 #[test]
 fn auth_camera_busy_is_typed_retryable_and_does_not_repeat_capture() {
     use std::io::{BufRead, Write};
@@ -1001,13 +1001,12 @@ fn auth_camera_busy_is_typed_retryable_and_does_not_repeat_capture() {
         assert_eq!(events[2]["terminal"], true);
         assert_eq!(events[2]["error"]["code"], code);
         assert_eq!(events[2]["error"]["retryable"], retryable);
+        // Every published failure code carries exactly one action line
+        // (daemon prose stays private), so both cases must have a message.
+        let message = events[2]["error"]["message"].as_str().unwrap();
+        assert!(!message.is_empty(), "code {code} lost its action line");
         if code == "camera-busy" {
-            assert!(events[2]["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Close any app"));
-        } else {
-            assert!(events[2]["error"].get("message").is_none());
+            assert!(message.contains("Close any app"));
         }
         assert!(!serde_json::to_string(&events)
             .unwrap()

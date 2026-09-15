@@ -5,6 +5,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Evidence-grade measurement records for camera tuning (ADR-0023): a
+  bounded, strictly parsed data model that keeps wall-clock fill duration,
+  delivered delta count and timestamp span, and the production
+  \`meets_floor\` verdict as three distinct facts, aggregates round-level
+  rate distributions (nearest-rank percentiles, exact rational arithmetic,
+  maximum inter-frame gaps, continuity errors), and evaluates acceptance
+  against a versioned policy recorded with the evidence so thresholds
+  cannot be relaxed after the fact. Data only: nothing here influences
+  admission, amortization, or capture scheduling.
+
 ### Fixed
 
 - The one-shot assessment path (used by `irlume identify` and the legacy

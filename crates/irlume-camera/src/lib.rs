@@ -70,6 +70,7 @@ pub fn camera_inventory_snapshot() -> irlume_common::live_camera::CameraInventor
 pub fn initialize_camera_monitor() {
     let _ = backend::default_camera_supervisor();
 }
+pub mod measurement;
 mod media_graph;
 mod paired_processing;
 pub use paired_processing::process_pair_while_draining;

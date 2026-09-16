@@ -675,6 +675,12 @@ pub enum Request {
     TuneCaptureMode {
         #[serde(default)]
         rounds: Option<usize>,
+        /// Where the daemon should write the ADR-0023 measurement-record
+        /// evidence artifact (JSON array, one record per completed arm).
+        /// Root-only command; the file is created with 0600. Evidence only:
+        /// writing it changes no capture behavior.
+        #[serde(default)]
+        emit_record_path: Option<String>,
     },
     /// Resolve the daemon's active capture schedule from the exact camera pair
     /// it owns, including process-local safety degradation. CAMERA-CLASS.
@@ -2814,5 +2820,36 @@ mod live_status_request_tests {
             serde_json::to_value(request.unwrap()).unwrap(),
             "LiveStatus"
         );
+    }
+
+    #[test]
+    fn tune_request_carries_the_evidence_path_optionally() {
+        // Newer CLI, older field absent: defaults to None (no emission).
+        let absent: super::Request =
+            serde_json::from_str(r#"{"TuneCaptureMode":{"rounds":6}}"#).expect("absent path");
+        match absent {
+            super::Request::TuneCaptureMode {
+                rounds,
+                emit_record_path,
+            } => {
+                assert_eq!(rounds, Some(6));
+                assert_eq!(emit_record_path, None);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let present: super::Request = serde_json::from_str(
+            r#"{"TuneCaptureMode":{"rounds":6,"emit_record_path":"/tmp/evidence.json"}}"#,
+        )
+        .expect("present path");
+        match present {
+            super::Request::TuneCaptureMode {
+                rounds,
+                emit_record_path,
+            } => {
+                assert_eq!(rounds, Some(6));
+                assert_eq!(emit_record_path.as_deref(), Some("/tmp/evidence.json"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 }

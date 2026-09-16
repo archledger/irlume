@@ -23,6 +23,11 @@ All notable changes to irlume are documented here. This project adheres to
   longer hide a single long stall; the v1 tune policy still declines to
   judge gaps, so no behavior changes.
 
+- `irlume camera-tune --emit-record FILE` writes the completed arms'
+  measurement records as a JSON evidence artifact (0600, never overwriting),
+  for attaching to a camera-profile PR. Evidence only: nothing reads it
+  back and no capture behavior changes.
+
 ### Fixed
 
 - The one-shot assessment path (used by `irlume identify` and the legacy

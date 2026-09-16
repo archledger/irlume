@@ -7369,6 +7369,11 @@ pub struct ContentionReport {
     pub concurrent: PairSample,
     /// A fresh RGB-then-IR pair captured after an all-error concurrent arm.
     pub trailing_sequential_control: bool,
+    /// The arms' ADR-0023 measurement records (evidence only; never a
+    /// capture preference), populated when an arm completed at least one
+    /// round, `None` otherwise.
+    pub sequential_measurement: Option<measurement::MeasurementRecord>,
+    pub concurrent_measurement: Option<measurement::MeasurementRecord>,
 }
 
 /// Fraction of the sequential brightness the concurrent path must retain.
@@ -8610,8 +8615,10 @@ where
         }
         report.trailing_sequential_control = true;
     }
-    journal_measurement_record("sequential", &report.sequential, rounds);
-    journal_measurement_record("concurrent", &report.concurrent, rounds);
+    report.sequential_measurement =
+        journal_measurement_record("sequential", &report.sequential, rounds);
+    report.concurrent_measurement =
+        journal_measurement_record("concurrent", &report.concurrent, rounds);
     Ok(report)
 }
 
@@ -9060,13 +9067,36 @@ pub fn pair_sample_measurement_record(
 /// Journals one arm's measurement record under debug: the acceptance verdict
 /// summary always, and the full deterministic serialization beside it so a
 /// support reader can audit every round. Journal-only by design in this
-/// slice: no wire or persistence changes.
-fn journal_measurement_record(arm: &'static str, sample: &PairSample, requested_rounds: usize) {
+/// Builds one arm's measurement record when the arm completed rounds.
+/// Returns `None` for an arm with no completed rounds.
+fn build_measurement_record(
+    arm: &'static str,
+    sample: &PairSample,
+    requested_rounds: usize,
+) -> Option<irlume_common::Result<measurement::MeasurementRecord>> {
     if sample.rounds == 0 {
-        return;
+        return None;
     }
-    match pair_sample_measurement_record(arm, sample, requested_rounds, "irlume camera-tune") {
-        Ok(record) => {
+    Some(pair_sample_measurement_record(
+        arm,
+        sample,
+        requested_rounds,
+        "irlume camera-tune",
+    ))
+}
+
+/// Journals one arm's measurement record under debug: the acceptance verdict
+/// summary always, and the full deterministic serialization beside it so a
+/// support reader can audit every round. Returns the record for the caller
+/// to surface through the report.
+fn journal_measurement_record(
+    arm: &'static str,
+    sample: &PairSample,
+    requested_rounds: usize,
+) -> Option<measurement::MeasurementRecord> {
+    match build_measurement_record(arm, sample, requested_rounds) {
+        None => None,
+        Some(Ok(record)) => {
             irlume_common::dlog!(
                 "tune measurement record ({}): accepted={} failures={} rounds=({} rgb, {} ir)",
                 arm,
@@ -9078,11 +9108,14 @@ fn journal_measurement_record(arm: &'static str, sample: &PairSample, requested_
             if let Ok(serialized) = serde_json::to_string(&record) {
                 irlume_common::dlog!("tune measurement record ({arm}): {serialized}");
             }
+            Some(record)
         }
-        Err(error) => {
+        Some(Err(error)) => {
             irlume_common::dlog!(
-                "tune measurement record ({arm}): not built ({error}); the arm's                  counters above remain authoritative"
+                "tune measurement record ({arm}): not built ({error}); the arm's \
+                 counters above remain authoritative"
             );
+            None
         }
     }
 }
@@ -13911,6 +13944,8 @@ mod tests {
                 ..Default::default()
             },
             trailing_sequential_control: false,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         };
 
         // NexiGo HelloCam N930W: RGB collapses when its own IR sibling streams.
@@ -13998,6 +14033,8 @@ mod tests {
                 sequential: sample(seq),
                 concurrent: sample(concurrent),
                 trailing_sequential_control: concurrent.0 == 0 && concurrent.1 > 0,
+                sequential_measurement: None,
+                concurrent_measurement: None,
             }
         };
 
@@ -14039,6 +14076,8 @@ mod tests {
         );
         let no_control = ContentionReport {
             trailing_sequential_control: false,
+            sequential_measurement: None,
+            concurrent_measurement: None,
             ..unavailable.clone()
         };
         assert_eq!(
@@ -14068,6 +14107,8 @@ mod tests {
                 sequential: healthy.sequential.clone(),
                 concurrent: missing,
                 trailing_sequential_control: false,
+                sequential_measurement: None,
+                concurrent_measurement: None,
             };
             assert_eq!(
                 qualification_outcome(&report, 6, true),
@@ -14217,6 +14258,8 @@ mod tests {
                 ..Default::default()
             },
             trailing_sequential_control: true,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         };
         assert!(brio.concurrent_impossible());
         assert_eq!(brio.recommended_mode(), CaptureMode::Sequential);
@@ -14231,6 +14274,8 @@ mod tests {
             sequential: brio.sequential,
             concurrent: PairSample::default(),
             trailing_sequential_control: false,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         };
         assert!(!unattempted.concurrent_impossible());
     }
@@ -14377,6 +14422,26 @@ mod tests {
             .find(|(role, _)| *role == measurement::MeasuredRole::Ir)
             .expect("ir evidence");
         assert_eq!(ir.continuity_errors, 3);
+    }
+
+    #[test]
+    fn contention_report_carries_each_arms_measurement_record() {
+        let rgb = || Ok(frame(&[120; 4]));
+        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let report =
+            measure_contention_impl(rgb, ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("probe");
+        let sequential = report
+            .sequential_measurement
+            .as_ref()
+            .expect("sequential record");
+        assert_eq!(sequential.method, "sequential");
+        assert!(report.concurrent_measurement.is_some());
+        // Deterministic serialization of the same completed record.
+        assert_eq!(
+            serde_json::to_string(sequential).unwrap(),
+            serde_json::to_string(sequential).unwrap()
+        );
     }
 
     #[test]

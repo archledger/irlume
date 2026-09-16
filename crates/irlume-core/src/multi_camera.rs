@@ -390,6 +390,7 @@ pub fn save_secondary(path: &Path, store: &SecondaryStore) -> Result<(), Seconda
 
 pub mod authz;
 pub mod commit;
+pub mod coordinator;
 pub mod views;
 
 #[cfg(test)]

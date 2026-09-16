@@ -112,6 +112,22 @@ account deletion, profile deletion, replacement, backup, or recovery. Those
 operations must use the new lifecycle implementation, or an explicitly
 documented migration/reset procedure covering both stores.
 
+Concurrent use of a legacy mutation operation is supported only when that
+operation participates in the same account-state locking and publication
+protocol. Locks such as `flock` are advisory: a legacy writer with
+sufficient permissions can perform I/O without honoring them, so a new
+daemon holding its lock does not by itself establish coordination with an
+older writer. Legacy operations that do not meet this requirement are
+unsupported while the new daemon is authenticating the account and require
+a documented maintenance procedure with authentication stopped. The
+compatibility matrix distinguishes concurrent-operation support from
+offline downgrade read/write compatibility; an offline round-trip test
+does not prove concurrent safety. The account-state lock object must also
+remain stable across enrollment replacement and deletion (an `flock` lock
+belongs to the open file description): publication must not replace or
+recreate its synchronization object. Phase 1 verifies the actual legacy
+entry points' locking behavior, not just the new implementation's.
+
 A primary digest detects a different snapshot, not every historical write.
 Restoring byte-identical old snapshots is not detectable from that digest
 alone. This ADR does not promise irreversible revocation against external
@@ -256,10 +272,22 @@ It is not exposed unless its migration and interruption semantics are
 tested; it is not required to implement secondary addition and removal.
 
 Authentication validates its pinned enrollment generation at the final
-grant-decision boundary, serialized with revocation. Once removal commits,
-no subsequent grant decision may use the removed group or stale cached
-state. Removal cancels or invalidates in-flight use; it does not claim to
-undo a grant already issued or terminate an existing login session.
+grant-decision boundary, serialized with revocation. For secondary
+authentication, that final validation covers BOTH the secondary
+authorization generation AND its binding to the currently published
+primary snapshot. Checking the secondary generation alone is
+insufficient: a supported legacy writer may change the primary without
+updating any secondary state, and an open file descriptor retained from
+the attempt's start does not establish the currently published snapshot
+(replacing a pathname with `rename(2)` leaves existing descriptors
+unaffected). The final check must therefore establish the current
+authoritative primary snapshot; a changed, missing, unreadable, or
+otherwise invalid primary invalidates the attempt before a grant
+decision - including for an attempt already in progress. Once removal
+commits, no subsequent grant decision may use the removed group or stale
+cached state. Removal cancels or invalidates in-flight use; it does not
+claim to undo a grant already issued or terminate an existing login
+session.
 
 #### 4.3 Backup, recovery, and keys
 
@@ -355,7 +383,7 @@ alone does not authorize shipment.
 | Boundary | Required result |
 |---|---|
 | Actual supported legacy readers and writers | Secondary data never enters legacy matching, calibration, or discovery; primary round trips cannot erase secondary provenance |
-| Legacy primary mutation | Changed, deleted, replaced, or incompatible primary state cannot leave secondary groups implicitly authorized; equivalent rewrites may conservatively mark them stale |
+| Legacy primary mutation | Changed, deleted, replaced, or incompatible primary state cannot leave secondary groups implicitly authorized; equivalent rewrites may conservatively mark them stale. A primary rewrite DURING secondary authentication, with the secondary generation unchanged, prevents a subsequent grant from that attempt |
 | Version, protection, and activation binding | Missing keys, wrong owner/context, unsupported versions, invalid references, corrupt records, or snapshot mismatch never activate secondary data or trigger destructive automatic repair |
 | Exact pair membership | Enrolling pairs A and B never authorizes a hybrid; shared endpoints never merge calibration groups |
 | Camera and pipeline isolation | Foreign-group data cannot influence scores, centroids, calibration, ratio floors, pitch, readiness, or threshold counts |

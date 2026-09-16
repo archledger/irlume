@@ -111,6 +111,9 @@ pub fn classify(req: &Request) -> Class {
         | Enroll { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
+        // An added camera group is an attended capture on the live pair
+        // (ADR-0024 §4): same camera class as enrollment.
+        | AddCameraGroup { .. }
         | SetupIrEmitter { .. }
         | TuneCaptureMode { .. }
         | CaptureModeStatus
@@ -141,6 +144,9 @@ pub fn classify(req: &Request) -> Class {
         | RenameProfile { .. }
         | RenameScan { .. }
         | SetRequireEyesOpen { .. }
+        // A group removal rewrites only the secondary store: a storage
+        // write, never a capture (ADR-0024 §4.2).
+        | RemoveCameraGroup { .. }
         // Retired calibration requests keep their privilege gates and worker
         // ordering, but the tombstones open no camera and write no storage.
         | CaptureEarMedian { .. }

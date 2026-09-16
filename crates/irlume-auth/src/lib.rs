@@ -104,6 +104,13 @@ pub struct Engine {
     /// RGB-only device → face runs in CONVENIENCE tier (lock-screen unlock only,
     /// RGB-only liveness, never releases credentials / logs in / elevates).
     ir_available: bool,
+    /// The pinned secondary-camera context for the CURRENT attempt only
+    /// (ADR-0024 §5): set by `resolve_attempt_enrollment` when the live pair
+    /// resolves to an active secondary group, reset by `begin_attempt` at
+    /// every attempt entry. Read solely at the grant-decision boundary in
+    /// `authenticate_qualified_assessment` - primary attempts never touch
+    /// it, and a value here can only belong to the attempt in flight.
+    secondary_attempt: Option<irlume_core::multi_camera::coordinator::SecondaryAuthContext>,
     /// The facts snapshot of the most recent authentication attempt's
     /// assessment. Set where the assessment binds in `authenticate_once`,
     /// read by the retry loop to write the situation line of a FAILED
@@ -360,6 +367,28 @@ struct CapturedScan {
 /// Physical IR presence alone must not undo that request-scoped decision.
 fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
     ir_available && !force_rgb_only
+}
+
+/// The anti-swap binding check over caller-supplied live identities (the
+/// engine method resolves the same identities from its devices; the
+/// attempt-resolution path passes its own so pin and binding check agree).
+fn binding_mismatch_for(
+    bind: &irlume_core::storage::CameraBinding,
+    live: &(Option<String>, Option<String>),
+) -> Option<String> {
+    if let Some(want) = &bind.rgb {
+        if live.0.as_ref() != Some(want) {
+            return Some("camera changed since enrollment (RGB device identity differs); re-enroll on this camera".into());
+        }
+    }
+    if let Some(want) = &bind.ir {
+        if live.1.as_ref() != Some(want) {
+            return Some(
+                "IR camera changed or absent since enrollment; re-enroll on this camera".into(),
+            );
+        }
+    }
+    None
 }
 
 /// One failed authentication attempt's situation, in the stable vocabulary a
@@ -3344,6 +3373,7 @@ impl Engine {
             // source #281 removed everywhere else. Same helper as
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
+            secondary_attempt: None,
             stop_requested: None,
             request_cancelled: None,
             authentication_deadline: None,
@@ -5611,6 +5641,10 @@ impl Engine {
         // The daemon reuses this engine across requests. Setup refusals and
         // errors can return before the attempt loop publishes a new situation.
         self.last_attempt_situation = None;
+        // A pinned secondary context belongs to exactly one attempt
+        // (ADR-0024 §5): nothing from a previous attempt may influence
+        // this one's grant boundary.
+        self.begin_attempt();
         // Fresh ViT PAD vote ring per authentication: votes must not mix
         // presentations across requests (ADR-0013 protocol).
         self.vit_scores.clear();
@@ -5671,15 +5705,22 @@ impl Engine {
         // The synchronous-path enrollment (plaintext stores). The encrypted
         // path resolves `enr` at the join below, after camera setup.
         let loader_was_async = loader.receiver.is_some();
+        // The live pair the whole attempt is scoped to: the secondary-pin
+        // decision and the binding check consume the SAME identities, so
+        // they can never disagree about which cameras are present.
+        let live_pair = (
+            irlume_camera::device_identity(&self.rgb_dev),
+            irlume_camera::device_identity(&self.ir_dev),
+        );
         let sync_enr = if loader.receiver.is_none() {
             let loaded = irlume_core::storage::load(user);
             // Completed work boundary: the plaintext store load itself,
             // before any policy decision on its content.
             emit_enrollment_load_timing(diagnostics, load_started);
             match loaded? {
-                Some(enr) => match self.enrollment_policy_refusal(user, &enr) {
-                    Some(outcome) => return Ok(outcome),
-                    None => Some(enr),
+                Some(enr) => match self.resolve_attempt_enrollment(user, enr, &live_pair) {
+                    Err(outcome) => return Ok(outcome),
+                    Ok(scoped) => Some(scoped),
                 },
                 None => {
                     return Ok(Outcome::deny(
@@ -5769,7 +5810,7 @@ impl Engine {
         // Resolve enrollment before streaming. A loader wait can exceed a
         // camera queue's capacity; no stream may be armed across this wait.
         // The wait remains bounded by the authentication deadline.
-        let enr = match loader.receiver.take() {
+        let mut enr = match loader.receiver.take() {
             Some(rx) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 let resolved = resolve_loader(rx.recv_timeout(remaining));
@@ -5811,9 +5852,10 @@ impl Engine {
             }
         );
         if loader_was_async {
-            if let Some(outcome) = self.enrollment_policy_refusal(user, &enr) {
-                return Ok(outcome);
-            }
+            enr = match self.resolve_attempt_enrollment(user, enr, &live_pair) {
+                Err(outcome) => return Ok(outcome),
+                Ok(scoped) => scoped,
+            };
         }
         if let Some(cameras) = grouped_cams {
             let mut costliest_attempt = std::time::Duration::ZERO;
@@ -6250,6 +6292,29 @@ impl Engine {
         a: Assessment,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
+        // The serialized grant-decision boundary (ADR-0024 §4.2): a pinned
+        // secondary attempt must still find BOTH stores in their pinned
+        // state at the moment of the decision. A readable-but-drifted state
+        // invalidates the whole attempt before any arm can grant - including
+        // a legacy primary rewrite that never touched the secondary
+        // generation. Primary attempts never pay this check.
+        if let Some(context) = &self.secondary_attempt {
+            match context.boundary_check_now() {
+                Ok(irlume_core::multi_camera::commit::GrantDecision::Grant) => {}
+                Ok(irlume_core::multi_camera::commit::GrantDecision::Refuse(clause)) => {
+                    return Ok(Outcome::deny(
+                        OutcomeKind::OtherDeny,
+                        format!("secondary grant refused at the boundary: {clause}"),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(Outcome::deny(
+                        OutcomeKind::SetupUnavailable,
+                        format!("secondary grant boundary unreadable: {error}"),
+                    ));
+                }
+            }
+        }
         // An unreadable frame is reported as unreadable before anything derived
         // from it is consulted. Uncertain is the only verdict this promotes; a
         // Spoof still reaches its own branch below with its own reason.
@@ -7667,10 +7732,15 @@ impl Engine {
     /// binding); runs synchronously for plaintext stores (before the camera)
     /// and at the loader join for encrypted stores (see
     /// `authenticate_for_with_diagnostics` for the precedence note).
-    fn enrollment_policy_refusal(
+    /// The enrollment policy refusal over caller-supplied live device
+    /// identities: the sequencing core resolves them once per attempt and
+    /// hands the SAME pair to the secondary-pin decision, so the binding
+    /// check and the pin can never disagree about which cameras are live.
+    fn enrollment_policy_refusal_for(
         &self,
         user: &str,
         enr: &irlume_core::storage::Enrollment,
+        live: &(Option<String>, Option<String>),
     ) -> Option<Outcome> {
         if let Err(reason) = legacy_eye_policy(enr) {
             return Some(Outcome::deny(OutcomeKind::SetupUnavailable, reason));
@@ -7682,7 +7752,7 @@ impl Engine {
             ));
         }
         if let Some(bind) = &enr.camera_binding {
-            if let Some(reason) = self.binding_mismatch(bind) {
+            if let Some(reason) = binding_mismatch_for(bind, live) {
                 return Some(Outcome::deny(OutcomeKind::OtherDeny, reason));
             }
         }
@@ -7702,25 +7772,80 @@ impl Engine {
         None
     }
 
+    /// Resets per-attempt state at the entry of every authentication
+    /// attempt. Today that is only the pinned secondary context
+    /// (ADR-0024 §5): a pin belongs to exactly one attempt and can never
+    /// leak into the next.
+    fn begin_attempt(&mut self) {
+        self.secondary_attempt = None;
+    }
+
+    /// Decides which enrollment data THIS attempt may use (ADR-0024 §5),
+    /// called by the sequencing core right after the enrollment load with
+    /// the live pair identities:
+    ///
+    /// - the live pair matches the primary binding (or the enrollment is
+    ///   unbound): today's path, the primary enrollment unchanged;
+    /// - otherwise the live pair is offered to the secondary coordinator:
+    ///   an ACTIVE group pinning succeeds and the attempt runs on that
+    ///   group's scoped bridge (its complete pair as the binding, its
+    ///   scans and its calibrations as the only candidates);
+    /// - no active group matches: today's primary policy refusal decides
+    ///   (the binding-mismatch UX), never a guess.
+    ///
+    /// Returns the enrollment the attempt must consume, or a refusal
+    /// outcome. On success `self.secondary_attempt` holds the pin exactly
+    /// when the returned enrollment is a secondary group's bridge.
+    fn resolve_attempt_enrollment(
+        &mut self,
+        user: &str,
+        enr: irlume_core::storage::Enrollment,
+        live: &(Option<String>, Option<String>),
+    ) -> Result<irlume_core::storage::Enrollment, Outcome> {
+        // Self-clearing: whatever a previous attempt left here can never
+        // survive this resolution (the entry-point `begin_attempt` is the
+        // first line of defense; this is the second).
+        self.secondary_attempt = None;
+        let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
+        let primary_matches = enr.camera_binding.as_ref().is_none_or(|bind| {
+            irlume_core::multi_camera::GroupPair {
+                rgb: bind.rgb.clone(),
+                ir: bind.ir.clone(),
+            }
+            .matches(live.0.as_deref(), live.1.as_deref())
+        });
+        if !primary_matches {
+            let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+            match irlume_core::multi_camera::coordinator::SecondaryAuthContext::pin(
+                &secondary_path,
+                &primary_path,
+                live.0.as_deref(),
+                live.1.as_deref(),
+            ) {
+                Ok(context) => {
+                    let scoped = context.group_view().matching_enrollment(user);
+                    if let Some(refusal) = self.enrollment_policy_refusal_for(user, &scoped, live) {
+                        return Err(refusal);
+                    }
+                    self.secondary_attempt = Some(context);
+                    return Ok(scoped);
+                }
+                Err(error) => {
+                    // A pin failure is a first-class diagnostic (§1.2), but
+                    // never a bypass: the primary policy refusal answers.
+                    irlume_common::dlog!("auth: secondary pin refused: {error}");
+                }
+            }
+        }
+        match self.enrollment_policy_refusal_for(user, &enr, live) {
+            Some(refusal) => Err(refusal),
+            None => Ok(enr),
+        }
+    }
+
     /// If the live cameras no longer match the enrolled binding, return a reason
     /// to refuse (anti-swap). A bound device that now reads differently, or an
     /// enrolled IR camera that's gone, fails; an unbound side is not checked.
-    fn binding_mismatch(&self, bind: &irlume_core::storage::CameraBinding) -> Option<String> {
-        if let Some(want) = &bind.rgb {
-            if irlume_camera::device_identity(&self.rgb_dev).as_ref() != Some(want) {
-                return Some("camera changed since enrollment (RGB device identity differs); re-enroll on this camera".into());
-            }
-        }
-        if let Some(want) = &bind.ir {
-            if irlume_camera::device_identity(&self.ir_dev).as_ref() != Some(want) {
-                return Some(
-                    "IR camera changed or absent since enrollment; re-enroll on this camera".into(),
-                );
-            }
-        }
-        None
-    }
-
     /// Add scans to an existing profile ("improve recognition"). Errors if the
     /// profile is missing or already at MAX_SCANS_PER_PROFILE.
     /// Add `count` scans (at least one) to an existing profile, in the LOADED recognizer's
@@ -8868,7 +8993,7 @@ mod tests {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn unit(mut v: Vec<f32>) -> Vec<f32> {
+    pub(crate) fn unit(mut v: Vec<f32>) -> Vec<f32> {
         let n = v.iter().map(|x| x * x).sum::<f32>().sqrt() + 1e-9;
         v.iter_mut().for_each(|x| *x /= n);
         v
@@ -11475,6 +11600,7 @@ mod engine_tests {
     mod grouped_tests;
     mod managed_pad_tests;
     mod pair_identity_tests;
+    mod secondary_camera_tests;
     use super::tests::env_guard;
     use super::*;
     use irlume_core::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
@@ -11506,7 +11632,7 @@ mod engine_tests {
         }
     }
 
-    struct Shared {
+    pub(crate) struct Shared {
         engine: Engine,
         /// `ir_space()` observed right after loading a real adapter file, for
         /// the digest-naming assertion (the shared engine then reverts to raw).
@@ -11517,7 +11643,7 @@ mod engine_tests {
     /// The initializer itself must NOT lock (the caller already holds the env
     /// guard, and std Mutex is not reentrant); it only touches env vars no
     /// other test reads (`IRLUME_FORCE_NO_IR`, `ORT_DYLIB_PATH`).
-    fn shared() -> MutexGuard<'static, Shared> {
+    pub(crate) fn shared() -> MutexGuard<'static, Shared> {
         static S: OnceLock<Mutex<Shared>> = OnceLock::new();
         S.get_or_init(|| {
             ort_init();
@@ -11660,7 +11786,7 @@ mod engine_tests {
 
     // Synthetic matching inputs: no camera or biometric payloads. Only capture
     // and inference are substituted; voting and the real grant decision run.
-    fn pad_matching_fixture(p: f32, deny: bool) -> (Enrollment, Assessment) {
+    pub(crate) fn pad_matching_fixture(p: f32, deny: bool) -> (Enrollment, Assessment) {
         let mut embedding = [0.0; EMBED_DIM];
         embedding[0] = 1.0;
         let mut enr = Enrollment::new("pad-contract");
@@ -12859,20 +12985,20 @@ mod engine_tests {
             }
         );
         // Unbound sides are not checked (pre-binding enrollments keep working).
-        assert_eq!(s.engine.binding_mismatch(&bind), None);
+        assert_eq!(binding_mismatch_for(&bind, &(None, None)), None);
         // A bound RGB identity that no longer matches (or is gone) refuses.
         let bind = CameraBinding {
             rgb: Some("dead:beef".into()),
             ir: None,
         };
-        let msg = s.engine.binding_mismatch(&bind).expect("must refuse");
+        let msg = binding_mismatch_for(&bind, &(None, None)).expect("must refuse");
         assert!(msg.contains("RGB device identity differs"), "{msg}");
         // Same for a bound IR camera that is absent now.
         let bind = CameraBinding {
             rgb: None,
             ir: Some("dead:beef".into()),
         };
-        let msg = s.engine.binding_mismatch(&bind).expect("must refuse");
+        let msg = binding_mismatch_for(&bind, &(None, None)).expect("must refuse");
         assert!(msg.contains("IR camera changed or absent"), "{msg}");
     }
 
@@ -12884,7 +13010,7 @@ mod engine_tests {
         // Untagged historical scans remain usable with the shipped recognizer.
         assert!(s
             .engine
-            .enrollment_policy_refusal("fixture", &enrollment)
+            .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
             .is_none());
         enrollment.profiles[0].scans[0].embed_space = Some("embed:retired-fixture".into());
         for index in 1..3 {
@@ -12894,7 +13020,7 @@ mod engine_tests {
         }
         let refusal = s
             .engine
-            .enrollment_policy_refusal("fixture", &enrollment)
+            .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
             .expect("foreign-model scans cannot justify starting capture");
         assert!(!refusal.granted && !refusal.live);
         assert_eq!(refusal.kind, OutcomeKind::SetupUnavailable);
@@ -12909,7 +13035,7 @@ mod engine_tests {
         });
         assert_eq!(
             s.engine
-                .enrollment_policy_refusal("fixture", &enrollment)
+                .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
                 .unwrap()
                 .kind,
             OutcomeKind::OtherDeny
@@ -12922,7 +13048,7 @@ mod engine_tests {
             enrollment.profiles[index].scans[0].embed_space = Some(s.engine.embed_space().into());
             assert!(s
                 .engine
-                .enrollment_policy_refusal("fixture", &enrollment)
+                .enrollment_policy_refusal_for("fixture", &enrollment, &(None, None))
                 .is_none());
             enrollment.profiles[index].scans[0].embed_space = Some("embed:retired-fixture".into());
         }

@@ -41,6 +41,15 @@ pub fn secondary_store_path(user: &str) -> PathBuf {
         .join(format!("{user}.json"))
 }
 
+/// The primary enrollment's on-disk path for `user` - the exact file whose
+/// bytes the secondary store's activation digest is taken over. Exposed so
+/// the coordinator's pin and grant boundary read the same authoritative
+/// snapshot the legacy loader resolves.
+#[must_use]
+pub fn primary_enrollment_path(user: &str) -> PathBuf {
+    irlume_common::state_dir().join(format!("{user}.json"))
+}
+
 /// The only secondary-store format version this code reads and writes.
 pub const SECONDARY_STORE_VERSION: u32 = 1;
 
@@ -403,6 +412,9 @@ pub fn save_secondary(path: &Path, store: &SecondaryStore) -> Result<(), Seconda
         ));
     }
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // Writers create the store's directory before publication (the fixed
+    // location sits in a `cameras/` subdirectory legacy code never made).
+    std::fs::create_dir_all(dir).map_err(|error| SecondaryStoreError::Io(error.to_string()))?;
     let temp = dir.join(format!(
         ".{}.tmp-{}",
         path.file_name()

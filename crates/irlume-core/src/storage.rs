@@ -748,6 +748,39 @@ fn load_with(
     deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
 }
 
+/// Parses the enrollment at an explicit path WITHOUT acquiring the user
+/// state lock (ADR-0024 §1.1 note: the coordinator's pin and grant
+/// boundary run after the authentication-flow loader, which held the
+/// lock; a concurrent legacy write can at worst change the file's bytes,
+/// which the snapshot-digest binding treats as a change - fail-closed).
+///
+/// Same parse semantics as [`load`]: legacy-format files migrate in
+/// memory, sealed envelopes require a loadable template key for `user`.
+/// A missing file is `Ok(None)`.
+///
+/// # Errors
+/// Returns an error on read, envelope-version, key-load, or parse
+/// failure - never a plaintext fallback for an encrypted store.
+pub fn load_path_unlocked(
+    user: &str,
+    path: &std::path::Path,
+) -> irlume_common::Result<Option<Enrollment>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read(path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    let is_enc = match serde_json::from_slice::<serde_json::Value>(&data) {
+        Ok(value) => is_encrypted_enrollment(&value)?,
+        Err(_) => false,
+    };
+    let key = if is_enc {
+        Some(template_key::load_key_read_only_unlocked(user)?)
+    } else {
+        None
+    };
+    deserialize_enrollment(&data, key.as_ref().map(|k| k.as_slice())).map(Some)
+}
+
 /// Whether the on-disk store for `user` is encrypted, `Ok(None)` when there
 /// is no store at all, and `Err` when a store exists but cannot be read.
 ///

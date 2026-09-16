@@ -78,8 +78,13 @@ impl SecondaryAuthContext {
             load(secondary_path).map_err(|error| PinError::Secondary(error.to_string()))?;
         let primary_bytes = std::fs::read(primary_path)
             .map_err(|error| PinError::Secondary(format!("primary unreadable: {error}")))?;
-        let primary: crate::storage::Enrollment = serde_json::from_slice(&primary_bytes)
-            .map_err(|error| PinError::Secondary(format!("primary unparseable: {error}")))?;
+        // Parse through the SAME loader authentication uses: legacy-format
+        // primaries migrate in memory and TPM-sealed envelopes unseal here.
+        // A raw serde parse of the bytes would silently refuse every legacy
+        // or encrypted account's secondary cameras.
+        let primary = crate::storage::load_path_unlocked(&secondary.owner, primary_path)
+            .map_err(|error| PinError::Secondary(format!("primary unloadable: {error}")))?
+            .ok_or_else(|| PinError::Secondary("primary absent".into()))?;
         let views = CameraScopedViews::compose(&primary, &primary_bytes, Some(&secondary))
             .map_err(|error| PinError::Secondary(error.to_string()))?;
         let Some(group) = secondary.group_for_pair(live_rgb, live_ir) else {
@@ -273,6 +278,90 @@ mod integration {
         assert_eq!(view.rgb_candidates("embed:test").count(), 3);
         // The serialized boundary grants on the unchanged state.
         assert!(matches!(context.boundary_check_now(), Ok(Boundary::Grant)));
+    }
+
+    #[test]
+    fn a_legacy_primary_parses_through_the_real_loader_and_pins() {
+        // Production primaries are not guaranteed to be current-format
+        // plaintext: legacy-format files migrate in memory inside the real
+        // loader, and TPM hosts write sealed envelopes. The pin must parse
+        // through the SAME loader authentication uses - a raw serde parse
+        // of the file bytes would silently break secondary auth for every
+        // legacy or encrypted account.
+        let rig = Rig::new("legacy-primary");
+        let legacy = br#"{"user":"alice","templates":[[0.5,0.5]]}"#;
+        std::fs::write(rig.primary_path(), legacy).expect("write legacy primary");
+        let digest = irlume_common::sha256_hex(legacy);
+        let store = SecondaryStore {
+            format_version: super::super::SECONDARY_STORE_VERSION,
+            owner: "alice".into(),
+            generation: 1,
+            primary_snapshot_sha256: digest.clone(),
+            groups: vec![SecondaryGroup {
+                id: CameraGroupId::new("desk".into()).unwrap(),
+                pair: GroupPair {
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                },
+                profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "Face Profile 1".into(),
+                    scans: vec![scan(0.5), scan(0.52), scan(0.54)],
+                }],
+            }],
+        };
+        publish_with_intent(&rig.secondary_path(), &store, &digest).expect("publish");
+        let context = SecondaryAuthContext::pin(
+            &rig.secondary_path(),
+            &rig.primary_path(),
+            Some("3443:c803"),
+            Some("3443:c803"),
+        )
+        .expect("a legacy primary pins through the real loader");
+        // The migrated primary contributes its own view; the desk group's
+        // scoped data is untouched by the migration.
+        assert_eq!(context.group_view().profiles[0].scans.len(), 3);
+    }
+
+    #[test]
+    fn an_envelope_primary_without_a_key_fails_closed() {
+        // An encrypted primary whose key cannot load (lost/recovery state)
+        // must refuse the pin outright - never a plaintext fallback parse,
+        // never a grant. The digest still binds to the exact file bytes.
+        let rig = Rig::new("envelope-primary");
+        let envelope = br#"{"version":3,"enc":{"nonce":"AAAA","blob":"AAAA"},"key_id":"deadbeef"}"#;
+        std::fs::write(rig.primary_path(), envelope).expect("write envelope primary");
+        let digest = irlume_common::sha256_hex(envelope);
+        let store = SecondaryStore {
+            format_version: super::super::SECONDARY_STORE_VERSION,
+            owner: "no-such-key-user".into(),
+            generation: 1,
+            primary_snapshot_sha256: digest.clone(),
+            groups: vec![SecondaryGroup {
+                id: CameraGroupId::new("desk".into()).unwrap(),
+                pair: GroupPair {
+                    rgb: Some("3443:c803".into()),
+                    ir: Some("3443:c803".into()),
+                },
+                profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "main".into(),
+                    scans: vec![scan(0.5)],
+                }],
+            }],
+        };
+        publish_with_intent(&rig.secondary_path(), &store, &digest).expect("publish");
+        let refused = SecondaryAuthContext::pin(
+            &rig.secondary_path(),
+            &rig.primary_path(),
+            Some("3443:c803"),
+            Some("3443:c803"),
+        )
+        .expect_err("no key -> no parse -> no pin");
+        assert!(
+            refused.to_string().contains("secondary store unusable"),
+            "{refused}"
+        );
     }
 
     #[test]

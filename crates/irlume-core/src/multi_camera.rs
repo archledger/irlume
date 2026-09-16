@@ -42,12 +42,11 @@ pub fn secondary_store_path(user: &str) -> PathBuf {
 }
 
 /// The primary enrollment's on-disk path for `user` - the exact file whose
-/// bytes the secondary store's activation digest is taken over. Exposed so
-/// the coordinator's pin and grant boundary read the same authoritative
-/// snapshot the legacy loader resolves.
+/// bytes the secondary store's activation digest is taken over. Delegates
+/// to the loader's own resolution so the two can never drift apart.
 #[must_use]
 pub fn primary_enrollment_path(user: &str) -> PathBuf {
-    irlume_common::state_dir().join(format!("{user}.json"))
+    crate::storage::profile_path(user)
 }
 
 /// The only secondary-store format version this code reads and writes.

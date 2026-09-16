@@ -27,7 +27,19 @@
 
 use crate::storage::FaceScan;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The secondary store's location for `user`: a `cameras/` subdirectory of
+/// the state dir, deliberately outside the legacy enrollment namespace
+/// (`{state_dir}/{user}.json` exact-name lookups, ADR-0024 §1). Legacy
+/// readers never enumerate this subdirectory, so they can neither discover
+/// nor open the store. Writers create the directory before publication.
+#[must_use]
+pub fn secondary_store_path(user: &str) -> PathBuf {
+    irlume_common::state_dir()
+        .join("cameras")
+        .join(format!("{user}.json"))
+}
 
 /// The only secondary-store format version this code reads and writes.
 pub const SECONDARY_STORE_VERSION: u32 = 1;
@@ -40,6 +52,11 @@ pub const MAX_TOTAL_SCANS: usize = 64;
 pub const MAX_STORE_BYTES: usize = 8 * 1024 * 1024;
 /// Bound on identifier and identity strings.
 pub const MAX_ID_BYTES: usize = 256;
+/// Recognizer spaces with a fitted calibration per (group, profile). Real
+/// accounts carry one or two recognizers; the bound exists so a hostile
+/// store cannot balloon structure beyond the byte ceiling's control of
+/// template data.
+pub const MAX_CALIB_SPACES_PER_PROFILE_GROUP: usize = 4;
 
 /// Why a secondary store is unusable. The kinds are distinct diagnostics
 /// (ADR-0024 §1.2): a support reader must be able to tell absent from
@@ -150,6 +167,13 @@ impl GroupPair {
 pub struct SecondaryProfileScans {
     pub profile: String,
     pub scans: Vec<FaceScan>,
+    /// This group's OWN per-recognizer IR calibrations, fitted from this
+    /// group's scan pairs at add-camera time (ADR-0024 §3: a group borrows
+    /// no primary calibration). Keyed like `FaceProfile::ir_calibs`; NOT
+    /// mirrored into any legacy slot - legacy readers never open this
+    /// store. Defaulted so Phase 1 fixtures (no field) still parse.
+    #[serde(default)]
+    pub ir_calibs: std::collections::BTreeMap<String, crate::calib::IrCalibration>,
 }
 
 /// One secondary camera group: immutable id, complete pair, and the
@@ -241,6 +265,7 @@ impl SecondaryStore {
                     group.id.as_str()
                 )));
             }
+            let mut profile_refs = std::collections::BTreeSet::new();
             for scans in &group.profiles {
                 if scans.profile.is_empty() || scans.profile.len() > MAX_ID_BYTES {
                     return Err(SecondaryStoreError::Invalid(
@@ -250,6 +275,23 @@ impl SecondaryStore {
                 if scans.scans.is_empty() || scans.scans.len() > MAX_SCANS_PER_PROFILE_GROUP {
                     return Err(SecondaryStoreError::Invalid(format!(
                         "group {} profile {} has an invalid scan count",
+                        group.id.as_str(),
+                        scans.profile
+                    )));
+                }
+                if scans.ir_calibs.len() > MAX_CALIB_SPACES_PER_PROFILE_GROUP {
+                    return Err(SecondaryStoreError::Invalid(format!(
+                        "group {} profile {} exceeds {} calibration spaces",
+                        group.id.as_str(),
+                        scans.profile,
+                        MAX_CALIB_SPACES_PER_PROFILE_GROUP
+                    )));
+                }
+                // The profile reference names the primary store's profile;
+                // duplicates would alias in every scoped consumer.
+                if !profile_refs.insert(scans.profile.as_str()) {
+                    return Err(SecondaryStoreError::Invalid(format!(
+                        "group {} repeats profile {}",
                         group.id.as_str(),
                         scans.profile
                     )));
@@ -423,6 +465,7 @@ mod tests {
                     ir: Some("046d:085e:e179cb54".into()),
                 },
                 profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
                     profile: "main".into(),
                     scans: vec![scan(); 10],
                 }],
@@ -523,6 +566,84 @@ mod tests {
     }
 
     #[test]
+    fn secondary_store_path_sits_outside_the_legacy_enrollment_namespace() {
+        let _guard = crate::testenv::ENV_LOCK.lock().expect("env lock");
+        let dir = std::env::temp_dir().join(format!("irlume-sec-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let path = secondary_store_path("alice");
+        assert_eq!(path, dir.join("cameras").join("alice.json"));
+        // Non-discovery: a planted secondary store must not make the user
+        // enrolled through the legacy per-user loader (ADR-0024 §1).
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        save_secondary(&path, &store()).expect("save");
+        assert!(
+            matches!(crate::storage::load("alice"), Ok(None)),
+            "legacy load must never discover the secondary store"
+        );
+        std::env::remove_var("IRLUME_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_group_calibrations_round_trip_and_phase1_fixtures_still_load() {
+        let calib = crate::calib::IrCalibration {
+            m: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            n_rows: vec![vec![0.0; 2], vec![0.0; 2]],
+            lambda: 0.5,
+            fitted_pairs: 3,
+        };
+        let mut with_calib = store();
+        with_calib.groups[0].profiles[0]
+            .ir_calibs
+            .insert("embed:test".into(), calib.clone());
+        let path = temp_path("calib");
+        let _ = std::fs::remove_file(&path);
+        save_secondary(&path, &with_calib).expect("save");
+        let loaded = load_secondary(&path).expect("load").expect("present");
+        assert_eq!(
+            serde_json::to_vec(&loaded.groups[0].profiles[0].ir_calibs.get("embed:test")).unwrap(),
+            serde_json::to_vec(&Some(&calib)).unwrap()
+        );
+        // A Phase 1 fixture (no ir_calibs field) parses with empty calibs:
+        // the field is defaulted, never required.
+        let phase1 = r#"{"format_version":1,"owner":"alice","generation":1,
+            "primary_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "groups":[{"id":"g1","pair":{"rgb":"046d:085e:e179cb54","ir":"046d:085e:e179cb54"},
+            "profiles":[{"profile":"main","scans":[{"name":"s","rgb":[0.0]}]}]}]}"#;
+        std::fs::write(&path, phase1).expect("write fixture");
+        let legacy = load_secondary(&path).expect("parse").expect("present");
+        assert!(legacy.groups[0].profiles[0].ir_calibs.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn calib_spaces_per_profile_group_are_bounded() {
+        let mut crowded = store();
+        let scans = &mut crowded.groups[0].profiles[0];
+        for n in 0..=MAX_CALIB_SPACES_PER_PROFILE_GROUP {
+            scans.ir_calibs.insert(
+                format!("embed:{n}"),
+                crate::calib::IrCalibration {
+                    m: vec![vec![1.0]],
+                    n_rows: vec![vec![0.0]],
+                    lambda: 0.5,
+                    fitted_pairs: 1,
+                },
+            );
+        }
+        assert!(crowded.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_profile_references_within_a_group_are_invalid() {
+        let mut doubled = store();
+        let first = doubled.groups[0].profiles[0].clone();
+        doubled.groups[0].profiles.push(first);
+        assert!(doubled.validate().is_err());
+    }
+
+    #[test]
     fn bounds_are_enforced_and_invalid_stores_never_persist() {
         let mut many = store();
         many.groups = (0..MAX_GROUPS + 1)
@@ -533,6 +654,7 @@ mod tests {
                     ir: None,
                 },
                 profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
                     profile: "main".into(),
                     scans: vec![scan()],
                 }],

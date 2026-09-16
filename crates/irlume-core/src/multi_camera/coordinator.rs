@@ -238,6 +238,7 @@ mod integration {
                         ir: Some(ir.into()),
                     },
                     profiles: vec![SecondaryProfileScans {
+                        ir_calibs: Default::default(),
                         profile: "main".into(),
                         scans: vec![scan(0.5), scan(0.52), scan(0.54)],
                     }],

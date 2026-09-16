@@ -14,9 +14,10 @@
 //! is a pure restriction and cannot change behavior for the primary
 //! group's existing single-camera results.
 
-use super::{Activation, SecondaryStore};
-use crate::storage::{Enrollment, FaceScan};
+use super::{Activation, GroupPair, SecondaryStore};
+use crate::storage::{CameraBinding, Enrollment, FaceProfile, FaceScan};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The camera scope a view is bound to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +36,11 @@ pub enum GroupScope {
 pub struct ScopedProfileView {
     pub profile: String,
     pub scans: Vec<FaceScan>,
+    /// This group's own per-recognizer IR calibrations (primary view: the
+    /// primary profile's map; secondary view: the group's map). Carried so
+    /// the matching bridge can hand the engine calibrated IR without any
+    /// cross-group borrowing.
+    pub ir_calibs: BTreeMap<String, crate::calib::IrCalibration>,
 }
 
 impl ScopedProfileView {
@@ -141,7 +147,46 @@ pub struct GroupReadiness {
 #[derive(Clone, Debug)]
 pub struct CameraGroupView {
     pub scope: GroupScope,
+    /// The complete role-labelled pair this group authorizes (the primary
+    /// view carries the legacy binding, restated as a pair).
+    pub pair: GroupPair,
     pub profiles: Vec<ScopedProfileView>,
+}
+
+impl CameraGroupView {
+    /// The engine-facing bridge: ONE group's view as a scoped `Enrollment`
+    /// whose pooled accessors then compute over exactly this group's data
+    /// (the engine's own arithmetic, narrowed inputs - so primary results
+    /// are unchanged and secondary results are the scoped arithmetic by
+    /// construction). The camera binding is the group's complete pair, so
+    /// the engine's anti-swap check verifies the group pair. Secondary
+    /// calibrations ride in `ir_calibs`; the legacy single slot stays
+    /// `None` because this enrollment is never shown to a legacy reader.
+    ///
+    /// Primary-path attempts do NOT use this bridge: they consume the real
+    /// enrollment unchanged. Only a pinned secondary group substitutes the
+    /// bridge (ADR-0024 §3: the view is the only door).
+    #[must_use]
+    pub fn matching_enrollment(&self, user: &str) -> Enrollment {
+        Enrollment {
+            user: user.to_owned(),
+            profiles: self
+                .profiles
+                .iter()
+                .map(|view| FaceProfile {
+                    name: view.profile.clone(),
+                    scans: view.scans.clone(),
+                    ir_calib: None,
+                    ir_calibs: view.ir_calibs.clone(),
+                })
+                .collect(),
+            camera_binding: Some(CameraBinding {
+                rgb: self.pair.rgb.clone(),
+                ir: self.pair.ir.clone(),
+            }),
+            ..Enrollment::default()
+        }
+    }
 }
 
 /// Why composition refused to produce views. Composition never guesses
@@ -199,12 +244,17 @@ impl CameraScopedViews {
         }
         let mut groups = vec![CameraGroupView {
             scope: GroupScope::Primary,
+            pair: GroupPair {
+                rgb: primary.camera_binding.as_ref().and_then(|b| b.rgb.clone()),
+                ir: primary.camera_binding.as_ref().and_then(|b| b.ir.clone()),
+            },
             profiles: primary
                 .profiles
                 .iter()
                 .map(|profile| ScopedProfileView {
                     profile: profile.name.clone(),
                     scans: profile.scans.clone(),
+                    ir_calibs: profile.ir_calibs.clone(),
                 })
                 .collect(),
         }];
@@ -218,12 +268,14 @@ impl CameraScopedViews {
                 for group in &store.groups {
                     groups.push(CameraGroupView {
                         scope: GroupScope::Secondary(group.id.as_str().to_owned()),
+                        pair: group.pair.clone(),
                         profiles: group
                             .profiles
                             .iter()
                             .map(|scans| ScopedProfileView {
                                 profile: scans.profile.clone(),
                                 scans: scans.scans.clone(),
+                                ir_calibs: scans.ir_calibs.clone(),
                             })
                             .collect(),
                     });
@@ -309,6 +361,7 @@ mod tests {
                     ir: Some("3443:c803".into()),
                 },
                 profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
                     profile: "main".into(),
                     scans: vec![
                         scan(0.50, 1.2, true),
@@ -399,6 +452,49 @@ mod tests {
         assert!(readiness.calibration_fittable);
         assert_eq!(readiness.compatible_rgb_candidates, 3);
         assert_eq!(readiness.compatible_ir_pairs, 3);
+    }
+
+    #[test]
+    fn matching_enrollment_bridges_one_group_into_a_scoped_enrollment() {
+        let (enrollment, bytes) = primary();
+        let mut secondary = secondary_for(&bytes);
+        secondary.groups[0].profiles[0].ir_calibs.insert(
+            "embed:test".into(),
+            crate::calib::IrCalibration {
+                m: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                n_rows: vec![vec![0.0; 2], vec![0.0; 2]],
+                lambda: 0.5,
+                fitted_pairs: 3,
+            },
+        );
+        let views =
+            CameraScopedViews::compose(&enrollment, &bytes, Some(&secondary)).expect("compose");
+        let desk = views.secondary_view("desk").expect("desk view");
+        let bridged = desk.matching_enrollment("alice");
+        // Structure: exactly the desk group's pair, profile, scans, calibs.
+        assert_eq!(bridged.user, "alice");
+        assert_eq!(
+            bridged.camera_binding,
+            Some(crate::storage::CameraBinding {
+                rgb: Some("3443:c803".into()),
+                ir: Some("3443:c803".into())
+            })
+        );
+        assert_eq!(bridged.profiles.len(), 1);
+        assert_eq!(bridged.profiles[0].name, "main");
+        assert_eq!(bridged.profiles[0].scans.len(), 3);
+        assert_eq!(
+            serde_json::to_vec(&bridged.profiles[0].ir_calibs).unwrap(),
+            serde_json::to_vec(&secondary.groups[0].profiles[0].ir_calibs).unwrap()
+        );
+        // No legacy-slot mirror: old readers must never see group calibs.
+        assert!(bridged.profiles[0].ir_calib.is_none());
+        // The engine's own pooled accessors, narrowed to the group through
+        // the bridge, reproduce the scoped derived state exactly.
+        assert!((bridged.pitch_neutral().unwrap() - 0.52).abs() < f32::EPSILON);
+        assert!((bridged.ir_center_edge_ratio_floor().unwrap() - 0.9).abs() < f32::EPSILON);
+        assert_eq!(bridged.rgb_scans_in("embed:test").len(), 3);
+        assert_eq!(bridged.ir_scans_for("adapter:test", 4).len(), 3);
     }
 
     #[test]

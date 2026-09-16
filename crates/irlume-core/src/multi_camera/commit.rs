@@ -342,6 +342,7 @@ mod tests {
                     ir: Some("3443:c803".into()),
                 },
                 profiles: vec![SecondaryProfileScans {
+                    ir_calibs: Default::default(),
                     profile: "main".into(),
                     scans: vec![scan()],
                 }],

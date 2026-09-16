@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Multi-camera storage completion (ADR-0024 Phase 2): secondary groups
+  carry their own per-recognizer IR calibrations (a group borrows no
+  primary calibration), the secondary store has a fixed location outside
+  the legacy enrollment namespace (`cameras/{user}.json`, never discovered
+  by legacy per-user loaders), and a camera group's validated view can
+  bridge into a scoped enrollment so the matching engine consumes exactly
+  one group's data. Storage and views only: no authentication behavior
+  changes yet.
+
 - Evidence-grade measurement records for camera tuning (ADR-0023): a
   bounded, strictly parsed data model that keeps wall-clock fill duration,
   delivered delta count and timestamp span, and the production

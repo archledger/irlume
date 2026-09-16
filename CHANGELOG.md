@@ -5,6 +5,27 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Evidence-grade measurement records for camera tuning (ADR-0023): a
+  bounded, strictly parsed data model that keeps wall-clock fill duration,
+  delivered delta count and timestamp span, and the production
+  `meets_floor` verdict as three distinct facts, aggregates round-level
+  rate distributions (nearest-rank percentiles, exact rational arithmetic,
+  maximum inter-frame gaps, continuity errors), and evaluates acceptance
+  against a versioned policy recorded with the evidence so thresholds
+  cannot be relaxed after the fact. Data only: nothing here influences
+  admission, amortization, or capture scheduling.
+
+### Fixed
+
+- The one-shot assessment path (used by `irlume identify` and the legacy
+  operationless authenticate fallback) now resolves its capture-mode selection
+  through the stored camera qualification before capture, exactly like the
+  main authenticate path. Previously it silently ran the sequential default,
+  so a stored `qualified_concurrent` verdict from `irlume camera-tune`
+  never applied to these captures (#719).
+
 ### Changed
 
 - Sequential captures reuse delivered-rate evidence within bounds (ADR-0021):
@@ -1627,7 +1648,7 @@ working. The upgrade was tested both ways with fixtures produced by real
   the line lands above `pam_kwallet5.so` on every upstream plasmalogin layout.
 
 - **A stack using backslash line continuations is refused, not corrupted.**
-  libpam's line assembler joins a directive ending in `\` with the next
+  libpam's line assembler joins a directive ending in `` with the next
   physical line before tokenizing (whitespace after the backslash does not
   defuse it; a backslash ending a comment does not continue; all three pinned
   by experiment against `pam_exec.so`). irlume edits stacks line-by-line, so

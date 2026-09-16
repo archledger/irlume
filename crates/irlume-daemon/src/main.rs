@@ -1967,6 +1967,8 @@ mod worker_engine {
                     continuity_facts: Default::default(),
                     capture_failure_facts: Default::default(),
                     ir_camera_classified_frames: 0,
+                    rgb_rate_rounds: Vec::new(),
+                    ir_rate_rounds: Vec::new(),
                 },
                 concurrent: PairSample {
                     rgb_mean: 140.0,
@@ -1990,6 +1992,8 @@ mod worker_engine {
                     continuity_facts: Default::default(),
                     capture_failure_facts: Default::default(),
                     ir_camera_classified_frames: 0,
+                    rgb_rate_rounds: Vec::new(),
+                    ir_rate_rounds: Vec::new(),
                 },
                 trailing_sequential_control: true,
             }

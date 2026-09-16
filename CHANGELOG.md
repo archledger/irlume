@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Daemon camera-group surface (ADR-0024 Phase 2): the wire gains
+  `AddCameraGroup` (enroll the CURRENT camera pair as a secondary group
+  through the engine's attended capture; absent `scans` means the
+  ten-scan add-camera target) and `RemoveCameraGroup`. Both are
+  root-or-target gated, PolicyKit-approved enrollment operations whose
+  daemon-side authorization is minted from the approved peer (uid) and
+  scoped to the exact derived group and pair, revalidated by the engine
+  at publication. Additions get the same one-time capture-mode
+  measurement enroll gets; removals open no camera.
+
 - Camera-group lifecycle in the engine (ADR-0024 Phase 2):
   `irlume enroll`-style attended capture can now enroll the CURRENT
   camera pair as a secondary group (`add_camera_group_observed`) - the

@@ -38,6 +38,11 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
         Request::Enroll { .. } | Request::EnrollmentSession { improve: false, .. } => {
             (ACTION, "enroll a face")
         }
+        // A camera-group addition adds trusted templates on a new camera
+        // (ADR-0024 §4): the same enrollment-trust approval class.
+        Request::AddCameraGroup { .. } => (ACTION, "enroll a face on another camera"),
+        // Removal deletes that camera's templates and binding together.
+        Request::RemoveCameraGroup { .. } => (ACTION, "remove an enrolled camera"),
         Request::AddScan { .. } | Request::EnrollmentSession { improve: true, .. } => {
             (ACTION, "add face scans")
         }

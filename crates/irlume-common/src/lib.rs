@@ -600,6 +600,30 @@ pub enum Request {
         #[serde(default)]
         report_enrollment: bool,
     },
+    /// Enroll the CURRENT camera pair as a secondary camera group
+    /// (ADR-0024 §4): an attended, credential-management-authorized
+    /// addition - the new camera never authorizes its own addition. The
+    /// captured face must match the named primary profile. PRIVILEGED and
+    /// PolicyKit-approved like every enrollment addition.
+    AddCameraGroup {
+        user: String,
+        /// The primary profile the captured scans belong to. `None` uses
+        /// the enrollment's only profile; an ambiguous set must name one.
+        profile: Option<String>,
+        /// Capture target for the new group. Absent (an older CLI) means
+        /// DEFAULT_ENROLL_SCANS, the add-camera target (ADR-0024 §3).
+        #[serde(default)]
+        scans: Option<usize>,
+    },
+    /// Remove one secondary camera group (ADR-0024 §4.2): its binding,
+    /// scans, and derived state go together under the same
+    /// credential-management authorization; in-flight authentication on
+    /// the group refuses at its grant boundary. PRIVILEGED.
+    RemoveCameraGroup {
+        user: String,
+        /// The immutable group id (as reported when it was enrolled).
+        group: String,
+    },
     /// List enrolled profiles + their scans for `user`.
     ListProfiles {
         user: String,
@@ -1618,6 +1642,56 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn camera_group_requests_round_trip_with_defaulted_fields() {
+        use super::Request;
+        // An older CLI omits `scans`: it decodes to the default and
+        // re-encodes without the field, so both directions stay wire-stable.
+        let legacy = serde_json::json!({"AddCameraGroup": {
+            "user": "alice", "profile": null
+        }});
+        let decoded: Request = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            &decoded,
+            Request::AddCameraGroup {
+                user,
+                profile: None,
+                scans: None
+            } if user == "alice"
+        ));
+        // `#[serde(default)]` deserializes the absent field and serializes
+        // it back as an explicit null: the re-encoded form CARRIES
+        // "scans": null, which the same reader accepts.
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::json!({"AddCameraGroup": {"user": "alice", "profile": null, "scans": null}})
+        );
+        let full: Request = serde_json::from_value(serde_json::json!({
+            "AddCameraGroup": {"user": "alice", "profile": "Face Profile 1", "scans": 10}
+        }))
+        .unwrap();
+        assert!(matches!(
+            full,
+            Request::AddCameraGroup {
+                scans: Some(10),
+                ..
+            }
+        ));
+        let removal: Request = serde_json::from_value(serde_json::json!({
+            "RemoveCameraGroup": {"user": "alice", "group": "cam-046d-desk"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            &removal,
+            Request::RemoveCameraGroup { user, group }
+                if user == "alice" && group == "cam-046d-desk"
+        ));
+        assert_eq!(
+            serde_json::to_value(&removal).unwrap(),
+            serde_json::json!({"RemoveCameraGroup": {"user": "alice", "group": "cam-046d-desk"}})
+        );
+    }
+
     #[test]
     fn operation_error_code_wire_is_kebab_case_and_forward_compatible() {
         let d = serde_json::to_value(super::OperationErrorCode::DeadlineExpired).unwrap();

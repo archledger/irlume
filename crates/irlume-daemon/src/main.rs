@@ -3328,6 +3328,20 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             user: Some(user.as_str()),
             enrollment: AddsTrust,
         },
+        // A camera-group addition is an enrollment addition on another
+        // camera (ADR-0024 §4): same trust, same approval class. Removal
+        // rewrites the secondary store only; the primary summary stays
+        // valid until group reporting ships.
+        AddCameraGroup { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "enroll" },
+            user: Some(user.as_str()),
+            enrollment: AddsTrust,
+        },
+        RemoveCameraGroup { user, .. } => RequestPosture {
+            privilege: RootOrTarget { verb: "modify" },
+            user: Some(user.as_str()),
+            enrollment: Reads,
+        },
         // Recovery counts as a mutation: it changes the key material the
         // enrollment is sealed under.
         RecoverySetup { user, .. } => RequestPosture {
@@ -4648,6 +4662,8 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         Enroll { .. }
         | EnrollmentSession { .. }
         | AddScan { .. }
+        | AddCameraGroup { .. }
+        | RemoveCameraGroup { .. }
         | PositionSample { .. }
         | PositionSession { .. } => OperationClass::Enrollment,
         Identify => OperationClass::Identification,
@@ -5336,6 +5352,22 @@ fn dispatch_scoped_session_inner(
                     }
                 },
             )
+        }
+        Request::AddCameraGroup {
+            user,
+            profile,
+            scans,
+        } => {
+            let want = scans.unwrap_or(irlume_core::storage::DEFAULT_ENROLL_SCANS);
+            add_camera_group(engine, peer, &user, profile, want, scope)
+        }
+        Request::RemoveCameraGroup { user, group } => {
+            match remove_camera_group(engine, peer, &user, &group) {
+                Ok(()) => Response::Ok(format!(
+                    "camera group '{group}' removed; in-flight use refuses at its boundary"
+                )),
+                Err(e) => Response::Error(e.to_string()),
+            }
         }
         Request::TuneCaptureMode {
             rounds,
@@ -6111,6 +6143,156 @@ fn mutate_enrollment(
         }
         Err(e) => Response::Error(e),
     }
+}
+
+/// Mints the credential-management authorization for one camera-group
+/// operation (ADR-0024 §4) from an ALREADY-authorized peer: the pregate
+/// plus the PolicyKit approval judged this peer sufficient to modify the
+/// account's enrollment, which is exactly what
+/// [`AuthorizationVia`](irlume_core::multi_camera::authz::AuthorizationVia)
+/// records. Scoped to the EXACT derived operation, valid for a short
+/// window, one publication wide.
+fn mint_group_authorization(
+    peer: &Peer,
+    user: &str,
+    operation: irlume_core::multi_camera::authz::EnrollmentOperation,
+) -> irlume_common::Result<irlume_core::multi_camera::authz::EnrollmentAuthorization> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    // Unique per mint: monotonic nanos under this daemon's pid. The id's
+    // one-shot consumption is the publication itself; uniqueness is what
+    // stops a replayed token from publishing twice.
+    let id = format!("daemon-{}-{}", std::process::id(), now.as_nanos());
+    irlume_core::multi_camera::authz::EnrollmentAuthorization::mint(
+        user.to_owned(),
+        operation,
+        now.as_secs(),
+        900,
+        id,
+        irlume_core::multi_camera::authz::AuthorizationVia::ElevatedPeer { uid: peer.uid },
+    )
+    .map_err(|e| irlume_common::Error::Policy(e.to_string()))
+}
+
+/// The daemon side of `irlume enroll --add-camera`: derive the EXACT
+/// operation scope from the current state (live pair + the id it derives
+/// in the store as it exists now), authorize it, and hand the minted
+/// authorization to the engine, which revalidates the same scope at
+/// publication (ADR-0024 §4.1) - any drift refuses.
+fn add_camera_group(
+    engine: &mut irlume_auth::Engine,
+    peer: &Peer,
+    user: &str,
+    profile: Option<String>,
+    want: usize,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) -> Response {
+    // The enrollment gate first (the engine re-checks; this is the UX
+    // order): an account with no primary enrollment has nothing to extend.
+    if matches!(irlume_core::storage::load(user), Ok(None)) {
+        return Response::Error(format!("'{user}' is not enrolled"));
+    }
+    let pair = engine.live_pair();
+    if pair.rgb.is_none() && pair.ir.is_none() {
+        return Response::Error(
+            "the current cameras expose no USB identity; a camera group cannot bind to them".into(),
+        );
+    }
+    let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+    let store = match irlume_core::multi_camera::load_secondary(&secondary_path) {
+        Ok(store) => store.unwrap_or(irlume_core::multi_camera::SecondaryStore {
+            format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+            owner: user.to_owned(),
+            generation: 0,
+            primary_snapshot_sha256: String::new(),
+            groups: Vec::new(),
+        }),
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    let group =
+        irlume_core::multi_camera::derive_group_id(&store, pair.rgb.as_deref(), pair.ir.as_deref())
+            .as_str()
+            .to_owned();
+    let operation = irlume_core::multi_camera::authz::EnrollmentOperation::AddGroup {
+        group,
+        pair: irlume_core::multi_camera::authz::GroupPairRef {
+            rgb: pair.rgb.clone(),
+            ir: pair.ir.clone(),
+        },
+    };
+    let authorization = match mint_group_authorization(peer, user, operation) {
+        Ok(authz) => authz,
+        Err(e) => return Response::Error(e.to_string()),
+    };
+    let (rgb_dev, ir_dev) = (
+        engine.rgb_device().to_string(),
+        engine.ir_device().to_string(),
+    );
+    // The same one-time capture-mode measurement enroll gets (#340): the
+    // new pair should authenticate concurrently if it qualifies.
+    let identifiable = irlume_auth::device_identity(&rgb_dev).is_some()
+        && irlume_auth::device_identity(&ir_dev).is_some();
+    let qualified_mode = match irlume_auth::stored_capture_qualification(&rgb_dev, &ir_dev) {
+        Ok(irlume_auth::QualificationResolution::ConcurrentQualified) => {
+            Some(irlume_auth::CaptureMode::Concurrent)
+        }
+        Ok(irlume_auth::QualificationResolution::SequentialRequired(_)) => {
+            Some(irlume_auth::CaptureMode::Sequential)
+        }
+        Ok(irlume_auth::QualificationResolution::Unqualified(_)) | Err(_) => None,
+    };
+    let user = user.to_owned();
+    enroll_with_capture_probe(
+        identifiable,
+        qualified_mode,
+        || {
+            jout_notice!(
+                "irlumed: add-camera: no measured capture mode for this camera pair; \
+                 running the one-time contention probe before the scans (up to a \
+                 minute; the IR emitter fires)"
+            );
+            run_capture_mode_probe(
+                &rgb_dev,
+                &ir_dev,
+                TUNE_DEFAULT_ROUNDS,
+                ProbeStore::AutomaticIfAbsent,
+                None,
+            )
+        },
+        || {
+            let preflight = |det: &mut irlume_auth::Detector| prepare_enrollment_ir(&ir_dev, det);
+            match engine.add_camera_group_observed(
+                &user,
+                profile.clone(),
+                want,
+                &authorization,
+                preflight,
+                diagnostics,
+                &(),
+            ) {
+                Ok(id) => Response::Ok(format!(
+                    "camera group '{id}' enrolled on this pair; it can now authenticate this account"
+                )),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        },
+    )
+}
+
+/// The daemon side of camera-group removal: authorize, then let the
+/// engine publish the revocation.
+fn remove_camera_group(
+    engine: &mut irlume_auth::Engine,
+    peer: &Peer,
+    user: &str,
+    group: &str,
+) -> irlume_common::Result<()> {
+    let operation = irlume_core::multi_camera::authz::EnrollmentOperation::RemoveGroup {
+        group: group.to_owned(),
+    };
+    let authorization = mint_group_authorization(peer, user, operation)?;
+    engine.remove_camera_group(user, group, &authorization)
 }
 
 fn set_require_eyes_open_off(
@@ -8075,6 +8257,15 @@ mod tests {
             scans: None,
             reset: false,
         },
+        AddCameraGroup => Request::AddCameraGroup {
+            user: u(),
+            profile: None,
+            scans: None,
+        },
+        RemoveCameraGroup => Request::RemoveCameraGroup {
+            user: u(),
+            group: "cam-046d-desk".into(),
+        },
         Identify => Request::Identify,
         SetCamerasIfCurrent => Request::SetCamerasIfCurrent {
             rgb: "/dev/video0".into(),
@@ -9699,6 +9890,7 @@ mod tests {
             "Enroll",
             "EnrollmentSession",
             "AddScan",
+            "AddCameraGroup",
             "DeleteProfile",
             "DeleteScan",
             "ForgetRecognizer",
@@ -14290,6 +14482,143 @@ mod tests {
         ) {
             Response::HasPassword(armed) => assert!(!armed),
             other => panic!("expected HasPassword(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_camera_group_refuses_an_unenrolled_user_before_the_camera() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("addcam-ghost");
+        let _ = &sb;
+        match dispatch(
+            Request::AddCameraGroup {
+                user: "ghost".into(),
+                profile: None,
+                scans: None,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Error(message) => assert!(message.contains("is not enrolled"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_camera_group_requires_root_or_the_target_account() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("addcam-stranger");
+        let _ = &sb;
+        match dispatch(
+            Request::AddCameraGroup {
+                user: "someone-else".into(),
+                profile: None,
+                scans: None,
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(message) => {
+                assert!(message.contains("not authorized to enroll"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_camera_group_removes_the_group_through_dispatch() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("remcam");
+        // A plaintext primary plus a secondary store holding one group.
+        let mut enr = Enrollment::new("carol");
+        enr.camera_binding = Some(irlume_core::storage::CameraBinding {
+            rgb: Some("046d:lap".into()),
+            ir: None,
+        });
+        enr.profiles.push(irlume_core::storage::FaceProfile {
+            name: "Face Profile 1".into(),
+            scans: vec![irlume_core::storage::FaceScan {
+                name: "s".into(),
+                rgb: vec![1.0, 0.0],
+                ir: None,
+                ir_space: None,
+                embed_space: None,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            }],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&sb.dir, &enr);
+        let digest = irlume_common::sha256_hex(
+            &std::fs::read(sb.dir.join("carol.json")).expect("primary bytes"),
+        );
+        let store = irlume_core::multi_camera::SecondaryStore {
+            format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+            owner: "carol".into(),
+            generation: 1,
+            primary_snapshot_sha256: digest,
+            groups: vec![irlume_core::multi_camera::SecondaryGroup {
+                id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
+                pair: irlume_core::multi_camera::GroupPair {
+                    rgb: Some("046d:desk".into()),
+                    ir: None,
+                },
+                profiles: vec![irlume_core::multi_camera::SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "Face Profile 1".into(),
+                    scans: enr.profiles[0].scans.clone(),
+                }],
+            }],
+        };
+        irlume_core::multi_camera::save_secondary(
+            &irlume_core::multi_camera::secondary_store_path("carol"),
+            &store,
+        )
+        .expect("plant secondary");
+
+        match dispatch(
+            Request::RemoveCameraGroup {
+                user: "carol".into(),
+                group: "cam-desk".into(),
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Ok(message) => assert!(message.contains("cam-desk"), "{message}"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let after = irlume_core::multi_camera::load_secondary(
+            &irlume_core::multi_camera::secondary_store_path("carol"),
+        )
+        .expect("load")
+        .expect("present");
+        assert_eq!(after.generation, 2, "the removal bumped the generation");
+        assert!(after.groups.is_empty(), "the group is gone");
+    }
+
+    #[test]
+    fn remove_camera_group_requires_root_or_the_target_account() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("remcam-stranger");
+        let _ = &sb;
+        match dispatch(
+            Request::RemoveCameraGroup {
+                user: "someone-else".into(),
+                group: "cam-desk".into(),
+            },
+            &peer(NOBODY),
+            &mut e,
+        ) {
+            Response::Error(message) => {
+                assert!(message.contains("not authorized to modify"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 }

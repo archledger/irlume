@@ -338,7 +338,9 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
     Some(match req {
         Authenticate { .. } => (K::Authentication, false),
         UnsealPassword { .. } | UnsealKeyring { .. } => (K::WalletAuthentication, false),
-        Enroll { .. } | EnrollmentSession { .. } | AddScan { .. } => (K::Enrollment, true),
+        Enroll { .. } | EnrollmentSession { .. } | AddScan { .. } | AddCameraGroup { .. } => {
+            (K::Enrollment, true)
+        }
         PositionSample { .. } | PositionSession { .. } => (K::Framing, false),
         Identify => (K::Identification, false),
         ListCameras => (K::CameraEnumeration, false),
@@ -353,6 +355,7 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
         | DeleteScan { .. }
         | ForgetRecognizer { .. }
         | RenameProfile { .. }
+        | RemoveCameraGroup { .. }
         | RenameScan { .. }
         | SetRequireEyesOpen { .. } => (K::ProfileUpdate, true),
         FaceSensorStatus { user: Some(_) } => (K::SensorReadiness, false),

@@ -35,6 +35,14 @@ All notable changes to irlume are documented here. This project adheres to
   workload. The fresh artifact is temporary and removed after comparison;
   nothing is installed or persisted.
 
+- The daemon now reads shipped per-camera profiles from
+  /usr/share/irlume/cameras.d (ADR-0023): strictly parsed (unknown keys,
+  noncanonical names, identity/filename disagreement, duplicates, symlinks
+  and unsafe permissions each reject that one file with a journaled
+  reason), evidence-only in schema v1 - no executable capture settings
+  exist yet, so loading a profile changes no behavior. A missing
+  directory is an empty set.
+
 ### Fixed
 
 - The one-shot assessment path (used by `irlume identify` and the legacy

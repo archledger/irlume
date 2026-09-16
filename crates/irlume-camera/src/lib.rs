@@ -73,6 +73,7 @@ pub fn initialize_camera_monitor() {
 pub mod measurement;
 mod media_graph;
 mod paired_processing;
+pub mod profiles;
 pub use paired_processing::process_pair_while_draining;
 mod rate_amortization;
 mod rate_gate;

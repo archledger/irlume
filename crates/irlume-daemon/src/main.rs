@@ -596,6 +596,31 @@ fn main() {
             jout_warn!("irlumed: WARNING: could not set {DAEMON_SOCKET_MODE:o} on {socket}: {e}");
         }
     }
+    // ADR-0023 shipped camera profiles: optional, read-only, evidence-only
+    // in schema v1 (zero executable tuning fields per the Phase B per-field
+    // decisions). Every refusal is named in the journal; loading changes no
+    // capture behavior. A missing directory is an empty set, not an error.
+    match irlume_auth::profiles::load_dir(std::path::Path::new("/usr/share/irlume/cameras.d")) {
+        Ok(loaded) => {
+            for ignored in &loaded.ignored {
+                jout_warn!(
+                    "irlumed: camera profile ignored ({}): {}",
+                    ignored.path.display(),
+                    ignored.reason
+                );
+            }
+            if !loaded.profiles.is_empty() {
+                jout_info!(
+                    "irlumed: {} camera profile(s) loaded (identity + evidence; \
+                     no executable fields in schema v1)",
+                    loaded.profiles.len()
+                );
+            }
+        }
+        Err(error) => {
+            jout_warn!("irlumed: camera profiles not loaded: {error}");
+        }
+    }
     jout_info!("irlumed: socket ready at {socket}; requests queue while startup finishes");
 
     // The engine is built OFF the startup path, so the socket is not merely

@@ -12,6 +12,7 @@ capture-timing = []
 irlume-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 # V4L2 capture. Chosen over nokhwa: it's the path linhello proved on this exact
 # Hello-class hardware, and builds from cache. nokhwa wraps this crate anyway.
 v4l = "0.14"

@@ -42,6 +42,26 @@ All notable changes to irlume are documented here. This project adheres to
   reason), evidence-only in schema v1 - no executable capture settings
   exist yet, so loading a profile changes no behavior. A missing
   directory is an empty set.
+- Multi-camera secondary store (ADR-0024 Phase 1 foundation): a separate,
+  versioned, strictly validated store for secondary camera groups -
+  complete role-labelled pairs with immutable group ids, per-profile scan
+  sets, account-wide bounds - whose activation is bound to a cryptographic
+  digest of the exact primary enrollment bytes it was authorized against.
+  Any primary change deactivates secondary groups (fail-closed); loading
+  rejects the whole store on any invalid record; saving is durable (file
+  and directory fsync). Data model only: nothing consumes it for
+  authentication yet.
+
+- Camera-scoped enrollment views (ADR-0024 Phase 1): composing the
+  primary enrollment with an activated secondary store yields one
+  validated view per camera group. Scoped pitch neutral, the personalized
+  IR ratio floor, RGB/IR candidate selection, and readiness predicates
+  (capture target, calibration-fit minimum, authentication-eligible
+  compatible counts - kept distinct) are computed ONLY from that group's
+  scans; foreign-group data cannot influence another group's derived
+  state. An inactive secondary store contributes nothing while the
+  primary view remains valid; an invalid secondary store refuses
+  composition with a diagnostic.
 
 ### Fixed
 

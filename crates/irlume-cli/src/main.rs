@@ -793,14 +793,39 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
             }
         },
     };
+    // ADR-0023 evidence emission: asks the daemon to write the completed
+    // arms' measurement records as a JSON artifact. An unparseable or
+    // missing path is a usage error, same discipline as --rounds.
+    let emit_record_path = match flag(args, "--emit-record") {
+        None if flag_present(args, "--emit-record") => {
+            eprintln!("[camera-tune] --emit-record requires a file path");
+            return std::process::ExitCode::from(2);
+        }
+        None => None,
+        Some(raw) if raw.trim().is_empty() => {
+            eprintln!("[camera-tune] --emit-record requires a file path");
+            return std::process::ExitCode::from(2);
+        }
+        Some(raw) => Some(raw.to_string()),
+    };
     eprintln!(
         "[camera-tune] measuring this camera under load; it fires the IR emitter \
          for up to a minute…"
     );
-    report_ok_response(
+    let result = report_ok_response(
         "camera-tune",
-        daemon_request(&Request::TuneCaptureMode { rounds }),
-    )
+        daemon_request(&Request::TuneCaptureMode {
+            rounds,
+            emit_record_path,
+        }),
+    );
+    if let Some(path) = flag(args, "--emit-record") {
+        eprintln!(
+            "[camera-tune] {path} is MEASUREMENT EVIDENCE, not a camera profile; \
+             attach it to the PR that contributes this camera's tuning"
+        );
+    }
+    result
 }
 
 /// `irlume camera census`: every video-adjacent device on the machine,

@@ -4125,7 +4125,13 @@ fn dispatch_status_with_diagnostics(
             // publishes. Serving the real load here would put a TPM command
             // and a potential template-key WRITE on a connection thread.
             match cached_enrollment_summary(user) {
-                Some(sum) => sum.into_response(),
+                Some(mut sum) => {
+                    // Hotplug and legacy rewrites since publication must
+                    // not be hidden by the cache: refresh the volatile
+                    // facts (sysfs + two file reads, no opens/TPM).
+                    refresh_camera_group_flags(user, &mut sum);
+                    sum.into_response()
+                }
                 None => return None,
             }
         }
@@ -4135,6 +4141,85 @@ fn dispatch_status_with_diagnostics(
 
 /// Read the envelope once. Only the worker's explicit diagnostic request supplies
 /// a TPM-backed observer; metadata status always supplies a no-op observer.
+/// Refreshes the VOLATILE camera-group flags on a cached summary before it
+/// is served (ADR-0024 slice E hardware finding): hotplug changes
+/// connection and selection state without touching the enrollment, so the
+/// worker-published cache would otherwise keep answering "connected" for
+/// an unplugged camera. Both recomputations are sysfs-only - no device
+/// opens, no TPM - safe on a connection thread. Store-backed facts (stale,
+/// counts, calibration, generation) stay frozen: they only change through
+/// mutations, which invalidate the cache.
+fn refresh_camera_group_flags(user: &str, summary: &mut EnrollmentSummary) {
+    if summary.camera_groups.is_empty() && summary.camera_store_error.is_none() {
+        return;
+    }
+    // A store that became unreadable or vanished since publication must
+    // not keep serving its frozen rows: report the error, or nothing.
+    let store = irlume_core::multi_camera::load_secondary(
+        &irlume_core::multi_camera::secondary_store_path(user),
+    );
+    let stale = match store {
+        Err(error) => {
+            summary.camera_groups.clear();
+            summary.camera_store_error = Some(error.to_string());
+            return;
+        }
+        Ok(None) => {
+            summary.camera_groups.clear();
+            summary.camera_store_error = None;
+            return;
+        }
+        Ok(Some(store)) => {
+            summary.camera_store_error = None;
+            // A LEGACY rewrite of the primary sends no request and
+            // invalidates nothing (the slice E live finding): re-verify
+            // the activation digest against the CURRENT primary bytes.
+            let primary = std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user))
+                .ok()
+                .map(|bytes| irlume_common::sha256_hex(&bytes));
+            primary.as_deref() != Some(store.primary_snapshot_sha256.as_str())
+        }
+    };
+    let present = irlume_auth::present_device_identities();
+    let live = {
+        let bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
+        irlume_core::multi_camera::GroupPair {
+            rgb: bits
+                .rgb_dev
+                .as_deref()
+                .and_then(irlume_auth::device_identity),
+            ir: bits
+                .ir_dev
+                .as_deref()
+                .and_then(irlume_auth::device_identity),
+        }
+    };
+    for group in &mut summary.camera_groups {
+        group.stale = stale;
+    }
+    refresh_camera_group_flags_with(summary, &present, &live);
+}
+
+/// The pure core of [`refresh_camera_group_flags`] over caller-supplied
+/// observations (testable without hardware).
+fn refresh_camera_group_flags_with(
+    summary: &mut EnrollmentSummary,
+    present: &[String],
+    live: &irlume_core::multi_camera::GroupPair,
+) {
+    for group in &mut summary.camera_groups {
+        group.connected = [&group.rgb, &group.ir]
+            .into_iter()
+            .flatten()
+            .all(|identity| present.iter().any(|p| p == identity));
+        group.selected = irlume_core::multi_camera::GroupPair {
+            rgb: group.rgb.clone(),
+            ir: group.ir.clone(),
+        }
+        .matches(live.rgb.as_deref(), live.ir.as_deref());
+    }
+}
+
 fn keyring_info(
     user: &str,
     diagnose: impl FnOnce(&irlume_core::envelope::SealedEnvelope) -> Option<bool>,
@@ -14682,6 +14767,137 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cached_group_rows_refresh_stale_after_a_legacy_primary_rewrite() {
+        let _g = env_lock();
+        let sb = sandbox("stale-refresh");
+        let mut enr = Enrollment::new("carol");
+        enr.camera_binding = Some(irlume_core::storage::CameraBinding {
+            rgb: Some("046d:lap".into()),
+            ir: None,
+        });
+        enr.profiles.push(irlume_core::storage::FaceProfile {
+            name: "Face Profile 1".into(),
+            scans: vec![irlume_core::storage::FaceScan {
+                name: "s".into(),
+                rgb: vec![1.0, 0.0],
+                ir: None,
+                ir_space: None,
+                embed_space: None,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            }],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&sb.dir, &enr);
+        let digest = irlume_common::sha256_hex(
+            &std::fs::read(sb.dir.join("carol.json")).expect("primary bytes"),
+        );
+        let store = irlume_core::multi_camera::SecondaryStore {
+            format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+            owner: "carol".into(),
+            generation: 1,
+            primary_snapshot_sha256: digest,
+            groups: vec![irlume_core::multi_camera::SecondaryGroup {
+                id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
+                pair: irlume_core::multi_camera::GroupPair {
+                    rgb: Some("046d:desk".into()),
+                    ir: None,
+                },
+                profiles: vec![irlume_core::multi_camera::SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "Face Profile 1".into(),
+                    scans: enr.profiles[0].scans.clone(),
+                }],
+            }],
+        };
+        irlume_core::multi_camera::save_secondary(
+            &irlume_core::multi_camera::secondary_store_path("carol"),
+            &store,
+        )
+        .expect("plant secondary");
+
+        let mut summary = EnrollmentSummary {
+            profiles: Vec::new(),
+            ir_ratio_calibrated: false,
+            camera_groups: vec![irlume_common::CameraGroupSummary {
+                id: "cam-desk".into(),
+                rgb: Some("046d:desk".into()),
+                ir: None,
+                connected: false,
+                selected: false,
+                stale: false,
+                generation: 1,
+                profiles: Vec::new(),
+            }],
+            camera_store_error: None,
+        };
+        // Published while active; a legacy writer then rewrites the primary
+        // with NO request in flight: the cached row must flip to stale.
+        std::fs::write(sb.dir.join("carol.json"), b"legacy-rewrite").expect("rewrite");
+        refresh_camera_group_flags("carol", &mut summary);
+        assert!(summary.camera_groups[0].stale, "the rewrite is visible");
+        assert!(summary.camera_store_error.is_none());
+
+        // A store that became unreadable reports its error and serves no
+        // frozen rows at all.
+        std::fs::write(
+            irlume_core::multi_camera::secondary_store_path("carol"),
+            b"{\"format_version\":1,\"owner\":\"carol\"}",
+        )
+        .expect("corrupt the store");
+        refresh_camera_group_flags("carol", &mut summary);
+        assert!(summary.camera_groups.is_empty());
+        assert!(summary
+            .camera_store_error
+            .as_deref()
+            .is_some_and(|e| !e.is_empty()));
+    }
+
+    #[test]
+    fn cached_group_flags_refresh_from_present_identities_and_live_pair() {
+        let _g = env_lock();
+        let mut summary = EnrollmentSummary {
+            profiles: Vec::new(),
+            ir_ratio_calibrated: false,
+            camera_groups: vec![irlume_common::CameraGroupSummary {
+                id: "cam-046d-desk".into(),
+                rgb: Some("046d:desk".into()),
+                ir: Some("046d:desk".into()),
+                connected: true,
+                selected: true,
+                stale: false,
+                generation: 1,
+                profiles: Vec::new(),
+            }],
+            camera_store_error: None,
+        };
+        // The worker froze the row while the camera was plugged in AND
+        // selected; hotplug since then: the identity is gone and the live
+        // pair moved to another camera.
+        let present: Vec<String> = vec!["046d:lap".into()];
+        let live = irlume_core::multi_camera::GroupPair {
+            rgb: Some("046d:lap".into()),
+            ir: None,
+        };
+        refresh_camera_group_flags_with(&mut summary, &present, &live);
+        let row = &summary.camera_groups[0];
+        assert!(!row.connected, "the unplugged identity is reported");
+        assert!(!row.selected, "the live pair moved");
+        // Replug: both flags recover; store-backed facts stayed frozen.
+        let present: Vec<String> = vec!["046d:desk".into()];
+        let live = irlume_core::multi_camera::GroupPair {
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+        };
+        refresh_camera_group_flags_with(&mut summary, &present, &live);
+        assert!(summary.camera_groups[0].connected);
+        assert!(summary.camera_groups[0].selected);
+        assert_eq!(summary.camera_groups[0].generation, 1);
     }
 
     #[test]

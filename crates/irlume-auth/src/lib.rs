@@ -8170,7 +8170,7 @@ impl Engine {
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         observer: &dyn EnrollmentObserver,
     ) -> irlume_common::Result<String> {
-        use irlume_core::storage::{self, FaceProfile, MAX_SCANS_PER_PROFILE};
+        use irlume_core::storage::{self, MAX_SCANS_PER_PROFILE};
         observer.check()?;
         let enr = storage::load(user)?
             .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
@@ -8263,13 +8263,11 @@ impl Engine {
         // Capture into a scratch enrollment: the group starts from
         // fresh-enrollment defaults (§3) and borrows nothing, so the
         // scratch's empty pitch neutral gives the bootstrap framing band.
-        let mut scratch = irlume_core::storage::Enrollment::new(user);
-        scratch.profiles.push(FaceProfile {
-            name: profile.clone(),
-            scans: Vec::new(),
-            ir_calib: None,
-            ir_calibs: Default::default(),
-        });
+        // The scratch carries NO profiles: the first-enroll capture path
+        // CREATES the profile it fills, and a pre-created empty profile
+        // with the same name would leave the captured scans in a duplicate
+        // (found live on hardware: the extraction then read the empty one).
+        let scratch = irlume_core::storage::Enrollment::new(user);
         let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
         let mut completed = 0;
         let (mut scratch, _) = self.capture_enrollment_observed(

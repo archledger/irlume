@@ -51,7 +51,7 @@ fn live_test_pair() -> irlume_common::CameraPairInfo {
 fn live_test_land_profiles(app: &mut App, profiles: Vec<ProfileSummary>) {
     let (tx, rx) = mpsc::channel();
     app.profiles_load = Some(rx);
-    tx.send(ProfilesOutcome::Loaded { profiles }).unwrap();
+    tx.send(ProfilesOutcome::Loaded { profiles, camera_groups: Vec::new(), camera_store_error: None }).unwrap();
     app.poll();
 }
 

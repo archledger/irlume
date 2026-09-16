@@ -305,6 +305,10 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
         Err(code) => return code,
     };
     let reset = args.iter().any(|a| a == "--reset");
+    let add_camera = args.iter().any(|a| a == "--add-camera");
+    if add_camera {
+        return enroll_add_camera(&user, name, scans);
+    }
     eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
     if reset {
         eprintln!("[enroll] --reset: replacing '{user}'s enrollment after successful capture (preserves the template key and recovery setup)");
@@ -366,6 +370,104 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// `irlume enroll --add-camera [--name P]`: enroll the CURRENT camera pair
+/// as a secondary camera group (ADR-0024 §4). Attended capture on the new
+/// pair; the daemon derives the group from the pair's USB identities and
+/// authorizes the addition through the system authentication dialog - the
+/// new camera never authorizes its own addition.
+fn enroll_add_camera(
+    user: &str,
+    profile: Option<String>,
+    scans: Option<usize>,
+) -> std::process::ExitCode {
+    use irlume_common::{Request, Response};
+    eprintln!("[add-camera] approve the system authentication dialog before capture");
+    eprintln!(
+        "[add-camera] '{user}': capturing this face on the CURRENT camera pair; stay in \
+         frame, look at the camera…"
+    );
+    eprintln!(
+        "[add-camera] an unmeasured pair is measured first (one time, up to a minute; \
+         the IR emitter fires)"
+    );
+    match daemon_request(&Request::AddCameraGroup {
+        user: user.to_owned(),
+        profile,
+        scans,
+    }) {
+        Ok(Response::Ok(message)) => {
+            println!("[add-camera] {message}");
+            println!(
+                "[add-camera] manage groups with `irlume profiles` (listing shows every \
+                 enrolled camera)"
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(Response::Error(e)) => {
+            eprintln!("add-camera failed: {e}");
+            std::process::ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("add-camera: unexpected response {other:?}");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("add-camera: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Camera-group rows for the profiles listing (ADR-0024 Phase 2): one line
+/// per secondary group with its state flags, then per-profile counts. A
+/// store that exists but cannot be summarized is reported, never silent.
+fn print_camera_groups(groups: &[irlume_common::CameraGroupSummary], store_error: Option<&str>) {
+    if let Some(error) = store_error {
+        println!("[profiles] camera groups unavailable: {error}");
+        return;
+    }
+    if groups.is_empty() {
+        return;
+    }
+    println!("[profiles] enrolled cameras:");
+    for group in groups {
+        let mut state = Vec::new();
+        if group.selected {
+            state.push("selected");
+        }
+        if group.connected {
+            state.push("connected");
+        } else {
+            state.push("disconnected");
+        }
+        if group.stale {
+            state.push("STALE (primary changed; re-add the camera)");
+        }
+        println!("  {} [{}]", group.id, state.join(", "));
+        for row in &group.profiles {
+            let calib = if row.calibrated {
+                "calibrated"
+            } else if row.calibration_fittable {
+                "uncalibrated"
+            } else {
+                "no IR calibration"
+            };
+            let target = if row.capture_target_met {
+                String::new()
+            } else {
+                format!(
+                    " (below the {}-scan target)",
+                    irlume_core::storage::DEFAULT_ENROLL_SCANS
+                )
+            };
+            println!(
+                "      {} · {} scans{target} · {calib}",
+                row.profile, row.scans
+            );
+        }
+    }
+}
+
 /// Wrap a value so a shell reads it as ONE argument, whatever it contains.
 ///
 /// Profile names are user text: the rename path accepts any string, root can
@@ -381,7 +483,14 @@ fn shell_single_quote(value: &str) -> String {
 /// The flags the profiles family reads as `--flag value` pairs. Kept beside
 /// the scanner that steps over them, and pinned against the parsers by a
 /// source-scan test, so a new valued flag cannot silently desync the scan.
-const PROFILES_VALUED: [&str; 5] = ["--user", "--profile", "--scans", "--name", "--scan"];
+const PROFILES_VALUED: [&str; 6] = [
+    "--user",
+    "--profile",
+    "--scans",
+    "--name",
+    "--scan",
+    "--group",
+];
 
 /// Scan an argument list for its subcommand: the first token that is neither
 /// a flag nor the value of a `--flag value` pair, starting after the command
@@ -522,6 +631,25 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                 None => return usage_profiles(),
             }
         }
+        Some("remove-camera") => {
+            // `irlume profiles remove-camera --group <id>`: revoke one
+            // secondary camera group (ADR-0024 §4.2). A dangling --group
+            // must not fall through to usage after the grammar scan.
+            if args.iter().any(|a| a == "--group") && flag(args, "--group").is_none() {
+                eprintln!("[profiles] --group requires a camera group id (see `irlume profiles`)");
+                return std::process::ExitCode::from(2);
+            }
+            match flag(args, "--group") {
+                Some(group) => {
+                    println!("[profiles] Removing an enrolled camera requires OS approval for a non-root user.");
+                    Request::RemoveCameraGroup {
+                        user,
+                        group: group.into(),
+                    }
+                }
+                None => return usage_profiles(),
+            }
+        }
         Some("delete") => {
             // A `--scan` with no value must not widen the deletion from one
             // scan to the whole profile. `flag` cannot tell "absent" from
@@ -588,6 +716,8 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
         Ok(Response::Enrollment {
             profiles,
             require_eyes_open,
+            camera_groups,
+            camera_store_error,
             ..
         }) => {
             if require_eyes_open {
@@ -639,6 +769,7 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                     }
                 }
             }
+            print_camera_groups(&camera_groups, camera_store_error.as_deref());
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Enrolled {
@@ -1027,9 +1158,11 @@ fn camera_mode(_args: &[String]) -> std::process::ExitCode {
 fn usage_profiles() -> std::process::ExitCode {
     eprintln!(
         "usage: irlume profiles [--user U] <subcommand>\n  \
-        (no sub) | list                         list profiles + scans\n  \
+        (no sub) | list                         list profiles + scans + cameras\n  \
         add-scan --profile P [--scans N]         add scans to P (improve recognition, or\n  \
                                                 add templates for a second model)\n  \
+        remove-camera --group ID                remove an enrolled camera group\n  \
+                                                (add one with: irlume enroll --add-camera)\n  \
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
         forget-model <model>                    remove one recognizer's scans from every\n  \
@@ -1512,6 +1645,8 @@ pub(crate) fn daemon_request(
         req,
         irlume_common::Request::Enroll { .. }
             | irlume_common::Request::AddScan { .. }
+            | irlume_common::Request::AddCameraGroup { .. }
+            | irlume_common::Request::RemoveCameraGroup { .. }
             | irlume_common::Request::RecoverySetup { .. }
             | irlume_common::Request::RecoveryForget { .. }
             | irlume_common::Request::DeleteProfile { .. }
@@ -4294,7 +4429,7 @@ fn doctor_run(
     // pam-auth-update on Debian) and dropped irlume's lines. Face still falls
     // back to the password, so this is not a lockout, but face login silently
     // stopped working. Surface it with the one-command fix.
-    let (enrolled, ir_ratio_calibrated) =
+    let (enrolled, ir_ratio_calibrated, camera_groups, camera_store_error) =
         match daemon_request(&irlume_common::Request::ListProfiles {
             user: user.clone(),
             structured_errors: false,
@@ -4302,10 +4437,48 @@ fn doctor_run(
             Ok(irlume_common::Response::Enrollment {
                 ref profiles,
                 ir_ratio_calibrated,
+                ref camera_groups,
+                ref camera_store_error,
                 ..
-            }) => (!profiles.is_empty(), ir_ratio_calibrated),
-            _ => (false, false),
+            }) => (
+                !profiles.is_empty(),
+                ir_ratio_calibrated,
+                camera_groups.clone(),
+                camera_store_error.clone(),
+            ),
+            _ => (false, false, Vec::new(), None),
         };
+    // Secondary camera groups (ADR-0024): a store that cannot be summarized
+    // or a stale/disconnected group is a Warn, never a silent absence.
+    if let Some(error) = &camera_store_error {
+        dout!(report, "[doctor] camera groups unusable: {error}");
+        report.check("camera-groups", State::Warn);
+    } else if !camera_groups.is_empty() {
+        for group in &camera_groups {
+            let mut problems = Vec::new();
+            if group.stale {
+                problems.push("stale (primary changed; re-add the camera)");
+            }
+            if !group.connected {
+                problems.push("disconnected");
+            }
+            if problems.is_empty() {
+                dout!(report, "[doctor] camera group {} is healthy", group.id);
+            } else {
+                dout!(
+                    report,
+                    "[doctor] camera group {}: {}",
+                    group.id,
+                    problems.join(", ")
+                );
+            }
+        }
+        let unhealthy = camera_groups.iter().any(|g| g.stale || !g.connected);
+        report.check(
+            "camera-groups",
+            if unhealthy { State::Warn } else { State::Pass },
+        );
+    }
     // An IR enrollment made before the per-user center/edge floor existed carries
     // no recorded ratio, so the personalized anti-print check never engages (new
     // IR enrollments fit it automatically). Nudge a re-enroll to activate it.

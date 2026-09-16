@@ -1161,6 +1161,47 @@ impl PreferencesState {
     }
 }
 
+/// One secondary camera group's listing row (ADR-0024 Phase 2): identity,
+/// connection/selection/activation state, and per-profile counts with
+/// calibration state. Frozen by the worker at summary-publish time; the
+/// connection-thread cache path serves it memory-only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraGroupSummary {
+    /// The immutable group id (as reported when it was enrolled).
+    pub id: String,
+    /// The bound RGB identity (`vid:pid[:serial]`), if any.
+    pub rgb: Option<String>,
+    /// The bound IR identity, if any.
+    pub ir: Option<String>,
+    /// Every bound side's identity is present on this machine (answered
+    /// from sysfs; no device is opened).
+    pub connected: bool,
+    /// The group's complete pair is the pair the engine would use.
+    pub selected: bool,
+    /// The store's activation binding is stale against the current
+    /// primary bytes (ADR-0024 §1.1): the group's data is retained but
+    /// cannot authenticate until explicitly re-authorized.
+    pub stale: bool,
+    pub generation: u64,
+    pub profiles: Vec<CameraGroupProfileSummary>,
+}
+
+/// One profile's row within one camera group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraGroupProfileSummary {
+    pub profile: String,
+    /// Total retained scans of this profile on this group.
+    pub scans: usize,
+    /// The add-camera capture target (DEFAULT_ENROLL_SCANS) is met.
+    pub capture_target_met: bool,
+    /// Enough compatible IR pairs exist to ATTEMPT calibration fitting.
+    pub calibration_fittable: bool,
+    pub compatible_rgb_candidates: usize,
+    pub compatible_ir_pairs: usize,
+    /// This group carries its own calibration for the live recognizer.
+    pub calibrated: bool,
+}
+
 /// Daemon response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -1275,6 +1316,14 @@ pub enum Response {
         /// new client readable by the 0.6.1 daemon, which sent `ir_depth_floored`.
         #[serde(default, alias = "ir_depth_floored")]
         ir_ratio_calibrated: bool,
+        /// Secondary camera-group rows (ADR-0024 Phase 2): absent (an
+        /// older daemon) and empty (no secondary store) both read as "no
+        /// groups"; a store that exists but cannot be summarized is
+        /// reported through `camera_store_error`, never as empty.
+        #[serde(default)]
+        camera_groups: Vec<CameraGroupSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        camera_store_error: Option<String>,
     },
     /// Generic success ack for management operations, with a human message.
     Ok(String),
@@ -1642,6 +1691,73 @@ pub(crate) mod testenv {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enrollment_response_carries_camera_group_rows_optionally() {
+        use super::{CameraGroupProfileSummary, CameraGroupSummary, ProfileSummary, Response};
+        // An older daemon's reply (no group fields) still parses: empty
+        // rows, no store error.
+        let legacy = serde_json::json!({"Enrollment": {
+            "profiles": [], "require_eyes_open": false,
+            "closure_calibrated": false, "ir_ratio_calibrated": false
+        }});
+        let decoded: Response = serde_json::from_value(legacy).unwrap();
+        match &decoded {
+            Response::Enrollment {
+                camera_groups,
+                camera_store_error,
+                ..
+            } => {
+                assert!(camera_groups.is_empty());
+                assert!(camera_store_error.is_none());
+            }
+            other => panic!("expected Enrollment, got {other:?}"),
+        }
+        // A modern reply carries rows and, separately, a store-level error.
+        let row = CameraGroupSummary {
+            id: "cam-046d-desk".into(),
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+            connected: true,
+            selected: false,
+            stale: false,
+            generation: 3,
+            profiles: vec![CameraGroupProfileSummary {
+                profile: "Face Profile 1".into(),
+                scans: 10,
+                capture_target_met: true,
+                calibration_fittable: true,
+                compatible_rgb_candidates: 10,
+                compatible_ir_pairs: 10,
+                calibrated: true,
+            }],
+        };
+        let response = Response::Enrollment {
+            profiles: vec![ProfileSummary {
+                name: "Face Profile 1".into(),
+                scans: vec![],
+                scans_by_recognizer: Default::default(),
+                live_recognizer: None,
+                ir: None,
+            }],
+            require_eyes_open: false,
+            closure_calibrated: false,
+            ir_ratio_calibrated: false,
+            camera_groups: vec![row],
+            camera_store_error: None,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded["Enrollment"]["camera_groups"][0]["id"],
+            serde_json::json!("cam-046d-desk")
+        );
+        assert!(encoded["Enrollment"].get("camera_store_error").is_none());
+        let round: Response = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            serde_json::to_value(&round).unwrap(),
+            serde_json::to_value(&response).unwrap()
+        );
+    }
+
     #[test]
     fn camera_group_requests_round_trip_with_defaulted_fields() {
         use super::Request;
@@ -2092,6 +2208,8 @@ mod tests {
             require_eyes_open: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         };
         let old: OldResponse = serde_json::from_value(
             serde_json::to_value(new).expect("serialize current enrollment response"),
@@ -2116,10 +2234,14 @@ mod tests {
             require_eyes_open,
             closure_calibrated,
             ir_ratio_calibrated,
+            camera_groups,
+            camera_store_error,
         } = current
         else {
             panic!("old enrollment reply must remain Enrollment");
         };
+        assert!(camera_groups.is_empty());
+        assert!(camera_store_error.is_none());
         assert!(profiles.is_empty());
         assert!(require_eyes_open);
         assert!(!closure_calibrated);

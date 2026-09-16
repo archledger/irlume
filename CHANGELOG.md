@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Camera-group reporting and management surface (ADR-0024 Phase 2):
+  `irlume profiles` lists every enrolled camera group with its state
+  (selected, connected/disconnected, stale-after-primary-change) and
+  per-profile scan counts and calibration state; a secondary store that
+  exists but cannot be summarized reports its diagnostic instead of
+  silently listing nothing. `irlume enroll --add-camera` captures the
+  current camera pair as a new group, `irlume profiles remove-camera
+  --group ID` removes one, and `irlume doctor` gains a camera-groups
+  check (warns on stale or disconnected groups). The TUI profiles screen
+  shows the same group rows and removes a group from its line. Group
+  removals now also invalidate the cached profile summary, which carries
+  the group rows.
+
 - Daemon camera-group surface (ADR-0024 Phase 2): the wire gains
   `AddCameraGroup` (enroll the CURRENT camera pair as a secondary group
   through the engine's attended capture; absent `scans` means the

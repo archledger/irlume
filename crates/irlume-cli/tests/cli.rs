@@ -1672,6 +1672,8 @@ fn profiles_listing_renders_profiles_and_toggle_state() {
             require_eyes_open: true,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         },
         Request::SetRequireEyesOpen { on: false, .. } => Response::Ok("eyes-open now off".into()),
         _ => Response::Error("unexpected request".into()),
@@ -1716,6 +1718,8 @@ fn profile_ir_listing_text_and_json_keep_counts_and_targeted_refresh_command() {
                 require_eyes_open: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
             }
         }
         _ => panic!("listing must not mutate or capture"),
@@ -1766,6 +1770,8 @@ fn profile_recognizer_refresh_hint_keeps_the_selected_account() {
                 require_eyes_open: false,
                 closure_calibrated: false,
                 ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
             }
         }
         _ => panic!("listing must not mutate"),
@@ -1787,6 +1793,8 @@ fn profiles_empty_listing_says_none_enrolled() {
         require_eyes_open: false,
         closure_calibrated: false,
         ir_ratio_calibrated: false,
+        camera_groups: Vec::new(),
+        camera_store_error: None,
     });
     // Bare `profiles` (no subcommand) defaults to the listing. Note: a flag
     // directly after `profiles` is read as the subcommand word, so --user
@@ -1807,6 +1815,8 @@ fn profiles_empty_legacy_listing_keeps_the_targeted_cleanup() {
         require_eyes_open: true,
         closure_calibrated: false,
         ir_ratio_calibrated: false,
+        camera_groups: Vec::new(),
+        camera_store_error: None,
     });
 
     let (code, out, _) = run(&mut sb.cmd(&["profiles", "list", "--user", "tester"]));
@@ -1929,6 +1939,8 @@ fn status_renders_the_full_dashboard_from_daemon_answers() {
             require_eyes_open: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         },
         Request::KeyringInfo { .. } => Response::KeyringInfo {
             armed: true,
@@ -2034,6 +2046,8 @@ fn setup_walks_every_step_noninteractively() {
             require_eyes_open: false,
             closure_calibrated: false,
             ir_ratio_calibrated: false,
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         },
         Request::Enroll { .. } => Response::Enrolled {
             profile: "Face Profile 1".into(),

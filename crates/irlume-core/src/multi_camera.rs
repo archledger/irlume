@@ -29,6 +29,71 @@ use crate::storage::FaceScan;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Builds the listing rows for every group in `store` (ADR-0024 Phase 2
+/// status surface): identity, connected/selected/stale state, and
+/// per-profile counts with calibration state.
+///
+/// - `connected`: every BOUND side's identity appears in `present`
+///   (callers enumerate present identities from sysfs without opening
+///   devices).
+/// - `selected`: the group's complete pair matches `live` (the pair the
+///   engine would use).
+/// - `stale`: the store-wide activation binding does not match the
+///   CURRENT primary bytes (`primary` is `None` when the primary is
+///   unreadable - that is a change, §1.1).
+#[must_use]
+pub fn group_summaries(
+    store: &SecondaryStore,
+    primary: Option<&[u8]>,
+    live: &GroupPair,
+    present: &[String],
+    embed_space: &str,
+    ir_space: &str,
+    ir_dim: usize,
+) -> Vec<irlume_common::CameraGroupSummary> {
+    let stale = !matches!(store.activation_against(primary), Activation::Active);
+    store
+        .groups
+        .iter()
+        .map(|group| {
+            let connected = [&group.pair.rgb, &group.pair.ir]
+                .into_iter()
+                .flatten()
+                .all(|identity| present.iter().any(|p| p == identity));
+            irlume_common::CameraGroupSummary {
+                id: group.id.as_str().to_owned(),
+                rgb: group.pair.rgb.clone(),
+                ir: group.pair.ir.clone(),
+                connected,
+                selected: group.pair.matches(live.rgb.as_deref(), live.ir.as_deref()),
+                stale,
+                generation: store.generation,
+                profiles: group
+                    .profiles
+                    .iter()
+                    .map(|scans| {
+                        let view = crate::multi_camera::views::ScopedProfileView {
+                            profile: scans.profile.clone(),
+                            scans: scans.scans.clone(),
+                            ir_calibs: scans.ir_calibs.clone(),
+                        };
+                        let readiness = view.readiness(embed_space, ir_space, ir_dim);
+                        irlume_common::CameraGroupProfileSummary {
+                            profile: scans.profile.clone(),
+                            scans: readiness.scan_count,
+                            capture_target_met: readiness.capture_target_met,
+                            calibration_fittable: readiness.calibration_fittable,
+                            compatible_rgb_candidates: readiness.compatible_rgb_candidates,
+                            compatible_ir_pairs: readiness.compatible_ir_pairs,
+                            calibrated: scans.ir_calibs.contains_key(embed_space),
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
 /// The secondary store's location for `user`: a `cameras/` subdirectory of
 /// the state dir, deliberately outside the legacy enrollment namespace
 /// (`{state_dir}/{user}.json` exact-name lookups, ADR-0024 §1). Legacy
@@ -726,6 +791,104 @@ mod tests {
         let bounded = derive_group_id(&base, Some(&long), None);
         assert!(bounded.as_str().len() <= MAX_ID_BYTES);
         assert!(CameraGroupId::new(bounded.as_str().to_owned()).is_ok());
+    }
+
+    #[test]
+    fn group_summaries_report_connection_selection_activation_and_counts() {
+        let mut store = store();
+        store.groups[0].pair = GroupPair {
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+        };
+        // Ten scans with IR pairs + a calibration for the live recognizer.
+        let mut scans = Vec::new();
+        for n in 0..crate::storage::DEFAULT_ENROLL_SCANS {
+            let mut s = scan();
+            s.name = format!("s{n}");
+            s.ir = Some(vec![0.25; 4]);
+            s.ir_space = Some("adapter:live".into());
+            s.embed_space = Some("embed:live".into());
+            scans.push(s);
+        }
+        store.groups[0].profiles[0] = SecondaryProfileScans {
+            ir_calibs: std::iter::once((
+                "embed:live".to_owned(),
+                crate::calib::IrCalibration {
+                    m: vec![vec![1.0]],
+                    n_rows: vec![vec![0.0]],
+                    lambda: 0.5,
+                    fitted_pairs: 3,
+                },
+            ))
+            .collect(),
+            profile: "main".into(),
+            scans,
+        };
+        let primary = b"primary-bytes";
+        store.primary_snapshot_sha256 = irlume_common::sha256_hex(primary);
+
+        let live = GroupPair {
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+        };
+        let present = vec!["046d:desk".to_owned(), "3443:c803".to_owned()];
+
+        let rows = group_summaries(
+            &store,
+            Some(primary),
+            &live,
+            &present,
+            "embed:live",
+            "adapter:live",
+            4,
+        );
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, "g1");
+        assert!(row.connected, "both bound sides are present");
+        assert!(row.selected, "the live pair is this group");
+        assert!(!row.stale, "the digest matches the primary bytes");
+        assert_eq!(row.generation, 1);
+        let profile = &row.profiles[0];
+        assert_eq!(profile.scans, crate::storage::DEFAULT_ENROLL_SCANS);
+        assert!(profile.capture_target_met);
+        assert!(profile.calibration_fittable);
+        assert_eq!(profile.compatible_rgb_candidates, 10);
+        assert_eq!(profile.compatible_ir_pairs, 10);
+        assert!(profile.calibrated, "the group has its own live-space calib");
+
+        // The same store against a DIFFERENT live pair, one side unplugged,
+        // and a rewritten primary: disconnected, unselected, stale.
+        let other_live = GroupPair {
+            rgb: Some("046d:lap".into()),
+            ir: Some("046d:lap".into()),
+        };
+        let rows = group_summaries(
+            &store,
+            Some(b"rewritten-primary"),
+            &other_live,
+            &present,
+            "embed:live",
+            "adapter:live",
+            4,
+        );
+        let row = &rows[0];
+        assert!(row.connected, "presence is about the group's own sides");
+        assert!(!row.selected);
+        assert!(row.stale, "a rewritten primary stale-marks every group");
+
+        // A group whose bound side is ABSENT from the machine: not connected.
+        let absent_present: Vec<String> = vec![];
+        let rows = group_summaries(
+            &store,
+            Some(primary),
+            &other_live,
+            &absent_present,
+            "embed:live",
+            "adapter:live",
+            4,
+        );
+        assert!(!rows[0].connected);
     }
 
     #[test]

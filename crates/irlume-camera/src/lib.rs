@@ -3705,6 +3705,23 @@ pub fn device_identity(device: &str) -> Option<String> {
     Some(id.to_lowercase())
 }
 
+/// Every USB identity currently present among the machine's video nodes,
+/// answered from sysfs alone - no device is opened, so plain (non-camera-
+/// class) request paths may call it. One entry per distinct identity
+/// (both interfaces of one camera share it).
+pub fn present_device_identities() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") else {
+        return Vec::new();
+    };
+    let mut identities: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| device_identity(&entry.file_name().to_string_lossy()))
+        .collect();
+    identities.sort();
+    identities.dedup();
+    identities
+}
+
 /// The sysfs USB-device dir shared by all interfaces (RGB + IR) of one physical
 /// camera; two `/dev/videoN` nodes with the same id are the same camera.
 fn physical_device_id(device: &str) -> Option<std::path::PathBuf> {

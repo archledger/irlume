@@ -3340,7 +3340,10 @@ fn posture(req: &Request) -> RequestPosture<'_> {
         RemoveCameraGroup { user, .. } => RequestPosture {
             privilege: RootOrTarget { verb: "modify" },
             user: Some(user.as_str()),
-            enrollment: Reads,
+            // The summary carries camera-group rows: a removal must drop
+            // it, or listings would serve the removed group until the next
+            // invalidation.
+            enrollment: Mutates,
         },
         // Recovery counts as a mutation: it changes the key material the
         // enrollment is sealed under.
@@ -3617,6 +3620,8 @@ fn publish_engine_bits(
 struct EnrollmentSummary {
     profiles: Vec<irlume_common::ProfileSummary>,
     ir_ratio_calibrated: bool,
+    camera_groups: Vec<irlume_common::CameraGroupSummary>,
+    camera_store_error: Option<String>,
 }
 
 impl EnrollmentSummary {
@@ -3627,8 +3632,44 @@ impl EnrollmentSummary {
             require_eyes_open: false,
             closure_calibrated: false,
             ir_ratio_calibrated: self.ir_ratio_calibrated,
+            camera_groups: self.camera_groups,
+            camera_store_error: self.camera_store_error,
         }
     }
+}
+
+/// Camera-group rows for the enrollment summary (ADR-0024 Phase 2):
+/// computed WORKER-side (a publish-time freeze - the connection-thread
+/// cache path serves it memory-only), from the secondary store, the
+/// CURRENT primary bytes, the engine's live pair and spaces, and the
+/// identities sysfs currently reports (no device opens). A store that
+/// exists but cannot be summarized reports its diagnostic instead of
+/// pretending to be empty.
+fn camera_group_rows(
+    user: &str,
+    engine: &irlume_auth::Engine,
+) -> (Vec<irlume_common::CameraGroupSummary>, Option<String>) {
+    let path = irlume_core::multi_camera::secondary_store_path(user);
+    let store = match irlume_core::multi_camera::load_secondary(&path) {
+        Ok(None) => return (Vec::new(), None),
+        Ok(Some(store)) => store,
+        Err(error) => return (Vec::new(), Some(error.to_string())),
+    };
+    let primary = std::fs::read(irlume_core::multi_camera::primary_enrollment_path(user)).ok();
+    let live = engine.live_pair();
+    let present = irlume_auth::present_device_identities();
+    (
+        irlume_core::multi_camera::group_summaries(
+            &store,
+            primary.as_deref(),
+            &live,
+            &present,
+            engine.embed_space(),
+            engine.ir_space(),
+            engine.ir_dim(),
+        ),
+        None,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -3678,6 +3719,8 @@ fn summarize_enrollment(
 ) -> EnrollmentSummary {
     match enr {
         Some(enr) => EnrollmentSummary {
+            camera_groups: Vec::new(),
+            camera_store_error: None,
             profiles: enr
                 .profiles
                 .iter()
@@ -3711,6 +3754,8 @@ fn summarize_enrollment(
         // the empty summary keeps an unenrolled machine's status pollers off
         // the worker instead of missing on every tick.
         None => EnrollmentSummary {
+            camera_groups: Vec::new(),
+            camera_store_error: None,
             profiles: Vec::new(),
             ir_ratio_calibrated: false,
         },
@@ -5010,12 +5055,15 @@ fn dispatch_scoped_session_inner(
                     // re-sealed the template key, which is exactly why the
                     // load lives HERE on the worker and not on a connection
                     // thread.
-                    let sum = summarize_enrollment(
+                    let mut sum = summarize_enrollment(
                         enr.as_ref(),
                         engine.embed_space(),
                         engine.ir_space(),
                         engine.ir_dim(),
                     );
+                    let (camera_groups, camera_store_error) = camera_group_rows(&user, engine);
+                    sum.camera_groups = camera_groups;
+                    sum.camera_store_error = camera_store_error;
                     publish_enrollment_summary(&user, sum.clone());
                     sum.into_response()
                 }
@@ -6023,12 +6071,7 @@ fn dispatch_scoped_session_inner(
             s.name = new_name.clone();
             Ok(format!("renamed scan to '{new_name}'"))
         }),
-        Request::SetRequireEyesOpen { user, .. } => set_require_eyes_open_off(
-            &user,
-            engine.embed_space(),
-            engine.ir_space(),
-            engine.ir_dim(),
-        ),
+        Request::SetRequireEyesOpen { user, .. } => set_require_eyes_open_off(&user, engine),
         Request::CaptureEarMedian { .. } => Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
         Request::SetClosureCalibration { .. } => {
             Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into())
@@ -6295,12 +6338,7 @@ fn remove_camera_group(
     engine.remove_camera_group(user, group, &authorization)
 }
 
-fn set_require_eyes_open_off(
-    user: &str,
-    embed_space: &str,
-    ir_space: &str,
-    ir_dim: usize,
-) -> Response {
+fn set_require_eyes_open_off(user: &str, engine: &irlume_auth::Engine) -> Response {
     let mut enrollment = match irlume_core::storage::load(user) {
         Ok(Some(enrollment)) => enrollment,
         Ok(None) => return Response::Error(format!("'{user}' is not enrolled")),
@@ -6309,7 +6347,15 @@ fn set_require_eyes_open_off(
     enrollment.require_eyes_open = false;
     match irlume_core::storage::save(&enrollment) {
         Ok(()) => {
-            let summary = summarize_enrollment(Some(&enrollment), embed_space, ir_space, ir_dim);
+            let mut summary = summarize_enrollment(
+                Some(&enrollment),
+                engine.embed_space(),
+                engine.ir_space(),
+                engine.ir_dim(),
+            );
+            let (camera_groups, camera_store_error) = camera_group_rows(user, engine);
+            summary.camera_groups = camera_groups;
+            summary.camera_store_error = camera_store_error;
             publish_enrollment_summary(user, summary);
             Response::Ok("require-eyes-open disabled".into())
         }
@@ -8878,6 +8924,8 @@ mod tests {
                             require_eyes_open: false,
                             closure_calibrated: false,
                             ir_ratio_calibrated: false,
+                            camera_groups: Vec::new(),
+                            camera_store_error: None,
                         },
                         _ => Response::Pong,
                     };
@@ -9853,6 +9901,8 @@ mod tests {
                     ir: None,
                 }],
                 ir_ratio_calibrated: true,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
             },
         );
         match dispatch_status(&req, &peer) {
@@ -9861,6 +9911,7 @@ mod tests {
                 require_eyes_open,
                 closure_calibrated,
                 ir_ratio_calibrated,
+                ..
             }) => {
                 assert_eq!(profiles.len(), 1);
                 assert!(!require_eyes_open);
@@ -9891,6 +9942,7 @@ mod tests {
             "EnrollmentSession",
             "AddScan",
             "AddCameraGroup",
+            "RemoveCameraGroup",
             "DeleteProfile",
             "DeleteScan",
             "ForgetRecognizer",
@@ -9979,6 +10031,8 @@ mod tests {
                 EnrollmentSummary {
                     profiles: Vec::new(),
                     ir_ratio_calibrated: false,
+                    camera_groups: Vec::new(),
+                    camera_store_error: None,
                 },
             );
             let response = dispatch(request, &owner, &mut engine);
@@ -10036,6 +10090,8 @@ mod tests {
             EnrollmentSummary {
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
             },
         );
         match dispatch(delete(), &peer(NOBODY), &mut e) {
@@ -12275,6 +12331,8 @@ mod tests {
                     ir: None,
                 }],
                 ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
             },
         );
         let sb = sandbox("summary-carryover");
@@ -12686,6 +12744,8 @@ mod tests {
                 EnrollmentSummary {
                     profiles: Vec::new(),
                     ir_ratio_calibrated: false,
+                    camera_groups: Vec::new(),
+                    camera_store_error: None,
                 },
             );
             match dispatch(request.clone(), &peer(NOBODY), &mut e) {
@@ -12800,6 +12860,8 @@ mod tests {
             EnrollmentSummary {
                 profiles: Vec::new(),
                 ir_ratio_calibrated: false,
+                camera_groups: Vec::new(),
+                camera_store_error: None,
             },
         );
         assert!(
@@ -14619,6 +14681,117 @@ mod tests {
                 assert!(message.contains("not authorized to modify"), "{message}")
             }
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_profiles_serves_camera_group_rows_and_store_errors() {
+        let _g = env_lock();
+        let mut e = engine();
+        let sb = sandbox("listcam");
+        let mut enr = Enrollment::new("carol");
+        enr.camera_binding = Some(irlume_core::storage::CameraBinding {
+            rgb: Some("046d:lap".into()),
+            ir: None,
+        });
+        enr.profiles.push(irlume_core::storage::FaceProfile {
+            name: "Face Profile 1".into(),
+            scans: vec![irlume_core::storage::FaceScan {
+                name: "s".into(),
+                rgb: vec![1.0, 0.0],
+                ir: None,
+                ir_space: None,
+                embed_space: None,
+                ir_center_edge_ratio: 0.0,
+                ir_brightness: 0.0,
+                pitch: 0.0,
+            }],
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        write_enrollment(&sb.dir, &enr);
+        let digest = irlume_common::sha256_hex(
+            &std::fs::read(sb.dir.join("carol.json")).expect("primary bytes"),
+        );
+        let store = irlume_core::multi_camera::SecondaryStore {
+            format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+            owner: "carol".into(),
+            generation: 1,
+            primary_snapshot_sha256: digest,
+            groups: vec![irlume_core::multi_camera::SecondaryGroup {
+                id: irlume_core::multi_camera::CameraGroupId::new("cam-desk".into()).unwrap(),
+                pair: irlume_core::multi_camera::GroupPair {
+                    rgb: Some("046d:desk".into()),
+                    ir: None,
+                },
+                profiles: vec![irlume_core::multi_camera::SecondaryProfileScans {
+                    ir_calibs: Default::default(),
+                    profile: "Face Profile 1".into(),
+                    scans: enr.profiles[0].scans.clone(),
+                }],
+            }],
+        };
+        irlume_core::multi_camera::save_secondary(
+            &irlume_core::multi_camera::secondary_store_path("carol"),
+            &store,
+        )
+        .expect("plant secondary");
+
+        match dispatch(
+            Request::ListProfiles {
+                user: "carol".into(),
+                structured_errors: false,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Enrollment {
+                camera_groups,
+                camera_store_error,
+                ..
+            } => {
+                assert!(camera_store_error.is_none());
+                assert_eq!(camera_groups.len(), 1, "the desk group is listed");
+                let row = &camera_groups[0];
+                assert_eq!(row.id, "cam-desk");
+                assert!(!row.stale, "the digest matches the planted primary");
+                assert!(!row.selected, "the engine's live pair is not the desk");
+                assert_eq!(row.profiles[0].scans, 1);
+            }
+            other => panic!("expected Enrollment, got {other:?}"),
+        }
+
+        // A corrupt secondary store reports its diagnostic instead of
+        // silently listing nothing.
+        irlume_core::multi_camera::save_secondary(
+            &irlume_core::multi_camera::secondary_store_path("carol"),
+            &store,
+        )
+        .ok();
+        std::fs::write(
+            irlume_core::multi_camera::secondary_store_path("carol"),
+            b"{\"format_version\":1,\"owner\":\"carol\",\"generation\":1,\"primary_snapshot_sha256\":\"nothex\",\"groups\":[]}",
+        )
+        .expect("plant corrupt store");
+        invalidate_enrollment_summary("carol");
+        match dispatch(
+            Request::ListProfiles {
+                user: "carol".into(),
+                structured_errors: false,
+            },
+            &peer(0),
+            &mut e,
+        ) {
+            Response::Enrollment {
+                camera_groups,
+                camera_store_error,
+                ..
+            } => {
+                assert!(camera_groups.is_empty());
+                let error = camera_store_error.expect("the store error is reported");
+                assert!(error.contains("invalid secondary store"), "{error}");
+            }
+            other => panic!("expected Enrollment, got {other:?}"),
         }
     }
 }

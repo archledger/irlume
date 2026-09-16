@@ -188,6 +188,9 @@ enum Click {
 enum Row {
     Profile(usize),
     Scan(usize, usize),
+    /// One secondary camera group (ADR-0024), then its per-profile rows.
+    CameraGroup(usize),
+    CameraGroupProfile(usize, usize),
 }
 
 enum Pending {
@@ -636,6 +639,8 @@ struct App {
     screen: usize,
     sel: usize,
     profiles: Vec<ProfileSummary>,
+    camera_groups: Vec<irlume_common::CameraGroupSummary>,
+    camera_store_error: Option<String>,
     keyring_armed: Option<bool>,
     /// Seal-tier label from envelope metadata (e.g. "pcrlock NV 0x… (Tier 2)");
     /// `None` when not armed or the daemon predates the request.
@@ -800,6 +805,8 @@ struct App {
 enum ProfilesOutcome {
     Loaded {
         profiles: Vec<ProfileSummary>,
+        camera_groups: Vec<irlume_common::CameraGroupSummary>,
+        camera_store_error: Option<String>,
     },
     /// The daemon answered with an error (corrupt enrollment, missing
     /// template key): real state, shown on Repair like the sync path did.
@@ -1763,6 +1770,8 @@ impl App {
             screen,
             sel: 0,
             profiles: Vec::new(),
+            camera_groups: Vec::new(),
+            camera_store_error: None,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -2158,7 +2167,16 @@ impl App {
                 },
                 std::time::Duration::from_secs(60),
             ) {
-                Ok(Response::Enrollment { profiles, .. }) => ProfilesOutcome::Loaded { profiles },
+                Ok(Response::Enrollment {
+                    profiles,
+                    camera_groups,
+                    camera_store_error,
+                    ..
+                }) => ProfilesOutcome::Loaded {
+                    profiles,
+                    camera_groups,
+                    camera_store_error,
+                },
                 // A corrupt/unreadable enrollment (or a missing template key
                 // for an encrypted file) surfaces as an Error, not empty;
                 // don't silently show "no face enrolled"; capture it so
@@ -3130,6 +3148,12 @@ impl App {
                 v.push(Row::Scan(pi, si));
             }
         }
+        for (gi, group) in self.camera_groups.iter().enumerate() {
+            v.push(Row::CameraGroup(gi));
+            for pri in 0..group.profiles.len() {
+                v.push(Row::CameraGroupProfile(gi, pri));
+            }
+        }
         v
     }
 
@@ -3139,6 +3163,11 @@ impl App {
             Row::Scan(pi, si) => (
                 self.profiles[pi].name.clone(),
                 Some(self.profiles[pi].scans[si].clone()),
+            ),
+            Row::CameraGroup(gi) => (self.camera_groups[gi].id.clone(), None),
+            Row::CameraGroupProfile(gi, pri) => (
+                self.camera_groups[gi].id.clone(),
+                Some(self.camera_groups[gi].profiles[pri].profile.clone()),
             ),
         }
     }
@@ -3507,7 +3536,11 @@ impl App {
                     .observation_mut(Source::Profiles)
                     .record(matches!(&outcome, ProfilesOutcome::Loaded { .. }), now);
                 match outcome {
-                    ProfilesOutcome::Loaded { profiles } => {
+                    ProfilesOutcome::Loaded {
+                        profiles,
+                        camera_groups,
+                        camera_store_error,
+                    } => {
                         let selected = self.selected_profile_identity.take().or_else(|| {
                             (self.profiles_loaded || !self.profiles.is_empty())
                                 .then(|| self.selected_profile_row())
@@ -3515,6 +3548,8 @@ impl App {
                         let selection_cleared = matches!(selected, Some(None));
                         let selected = selected.flatten();
                         self.profiles = profiles;
+                        self.camera_groups = camera_groups;
+                        self.camera_store_error = camera_store_error;
                         if let Some(selected) = selected {
                             self.sel = self.rows().iter().position(|row| self.profile_row_name(*row) == selected).unwrap_or_else(|| {
                                 self.log('·', "the selected profile or scan was removed or renamed; select a row before acting");
@@ -5184,6 +5219,7 @@ impl App {
     fn sel_profile(&self) -> Option<String> {
         match self.rows().get(self.sel)? {
             Row::Profile(pi) | Row::Scan(pi, _) => Some(self.profiles[*pi].name.clone()),
+            Row::CameraGroup(_) | Row::CameraGroupProfile(_, _) => None,
         }
     }
 
@@ -5207,6 +5243,10 @@ impl App {
                     String::new(),
                     Pending::RenameScan(p, s),
                 ));
+            }
+            // Camera rows name nothing in profile space.
+            Some(Row::CameraGroup(_) | Row::CameraGroupProfile(_, _)) => {
+                self.log('·', "camera groups are renamed by re-adding the camera")
             }
             // Nothing selected (an empty profile list, or a selection left by
             // a list that shrank). [r] is advertised, so say why it did nothing.
@@ -5243,6 +5283,24 @@ impl App {
                         scan: s,
                     }),
                 ));
+            }
+            // A camera group selection deletes the GROUP (its binding,
+            // scans and calibration go together, ADR-0024 §4.2).
+            Some(Row::CameraGroup(gi)) => {
+                let group = self.camera_groups[gi].id.clone();
+                self.confirm = Some((
+                    format!(
+                        "Remove camera group '{group}' (its scans and calibration)? OS approval is required for non-root users."
+                    ),
+                    "Remove",
+                    ConfirmAct::Daemon(Request::RemoveCameraGroup {
+                        user: self.user.clone(),
+                        group,
+                    }),
+                ));
+            }
+            Some(Row::CameraGroupProfile(_, _)) => {
+                self.log('·', "select the group line to remove an enrolled camera");
             }
             // Same as the rename above: an advertised key must answer.
             None => self.log('·', "select a profile or scan to delete"),
@@ -6637,6 +6695,41 @@ impl App {
                     "     ↳ {}",
                     self.profiles[*pi].scans[*si]
                 )))),
+                Row::CameraGroup(gi) => {
+                    let g = &self.camera_groups[*gi];
+                    let mut flags = Vec::new();
+                    if g.selected {
+                        flags.push("selected");
+                    }
+                    flags.push(if g.connected { "connected" } else { "disconnected" });
+                    if g.stale {
+                        flags.push("stale: primary changed, re-add the camera");
+                    }
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("▣ camera {}", g.id),
+                            Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("   [{}]", flags.join(", ")), Style::new().dim()),
+                    ]))
+                }
+                Row::CameraGroupProfile(gi, pri) => {
+                    let row = &self.camera_groups[*gi].profiles[*pri];
+                    let calib = if row.calibrated {
+                        "calibrated"
+                    } else if row.calibration_fittable {
+                        "uncalibrated"
+                    } else {
+                        "no IR calibration"
+                    };
+                    ListItem::new(Line::from(Span::styled(
+                        format!(
+                            "     ↳ {}: {} scans, {calib}",
+                            row.profile, row.scans
+                        ),
+                        Style::new().dim(),
+                    )))
+                }
             })
             .collect();
         // Windows-Hello-style enrollment guidance (selection never reaches
@@ -6649,6 +6742,11 @@ impl App {
         items.push(ListItem::new(
             "  [e] Add a person; [a] improve the selected person's recognition.",
         ));
+        if !self.camera_groups.is_empty() {
+            items.push(ListItem::new(
+                "  [x] on a camera row removes that enrolled camera; enroll another with `irlume enroll --add-camera`.",
+            ));
+        }
         items.push(ListItem::new(
             "  Each enrolled person can authenticate as this account.",
         ));
@@ -6698,6 +6796,8 @@ impl App {
                         + u16::from(crate::profile_ir::needs_capture(p))
                 }
                 Row::Scan(_, _) => 1,
+                Row::CameraGroup(_) => 1,
+                Row::CameraGroupProfile(_, _) => 1,
             };
             if row_y < area.y.saturating_add(area.height) {
                 self.hit(
@@ -10555,6 +10655,8 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["a1", "a2"]), profile("Bob", &["b1"])],
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         })
         .unwrap();
         app.poll();
@@ -10576,6 +10678,8 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["a1"]), profile("Carol", &["c1"])],
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         })
         .unwrap();
         app.poll();
@@ -10585,6 +10689,8 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["a1", "a2"]), profile("Carol", &["c1"])],
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         })
         .unwrap();
         app.poll();
@@ -10795,6 +10901,8 @@ mod tests {
             screen: SC_WELCOME,
             sel: 0,
             profiles: Vec::new(),
+            camera_groups: Vec::new(),
+            camera_store_error: None,
             keyring_armed: None,
             keyring_policy: None,
             keyring_drift: None,
@@ -13843,6 +13951,8 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: vec![profile("Alice", &["s1"])],
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         })
         .unwrap();
         app.poll();
@@ -13899,6 +14009,8 @@ mod tests {
         app.profiles_load = Some(rx);
         tx.send(ProfilesOutcome::Loaded {
             profiles: Vec::new(),
+            camera_groups: Vec::new(),
+            camera_store_error: None,
         })
         .unwrap();
         app.poll();

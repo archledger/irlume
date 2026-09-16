@@ -152,6 +152,11 @@ pub fn publish_with_intent(
         )));
     }
     let bytes = serde_json::to_vec(new_store).map_err(|e| CommitError::Io(e.to_string()))?;
+    // Writers create the store's directory before publication (the fixed
+    // location sits in a `cameras/` subdirectory legacy code never made).
+    if let Some(parent) = secondary_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CommitError::Io(e.to_string()))?;
+    }
     use base64::Engine as _;
     let intent = CommitIntent {
         format_version: INTENT_FORMAT_VERSION,

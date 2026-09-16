@@ -9,11 +9,49 @@
 use super::super::tests::{env_guard, unit};
 use super::*;
 use super::{pad_matching_fixture, shared};
+use irlume_core::multi_camera::authz::{
+    AuthorizationVia, EnrollmentAuthorization, EnrollmentOperation, GroupPairRef,
+};
 use irlume_core::multi_camera::{
     save_secondary, secondary_store_path, CameraGroupId, GroupPair, SecondaryGroup,
     SecondaryProfileScans, SecondaryStore, SECONDARY_STORE_VERSION,
 };
 use irlume_core::storage::{CameraBinding, Enrollment, FaceScan};
+
+fn mint(
+    user: &str,
+    operation: EnrollmentOperation,
+) -> irlume_core::multi_camera::authz::EnrollmentAuthorization {
+    EnrollmentAuthorization::mint(
+        user.into(),
+        operation,
+        1_000_000,
+        900,
+        "auth-test".into(),
+        AuthorizationVia::ElevatedPeer { uid: 0 },
+    )
+    .expect("mint")
+}
+
+fn add_desk_operation() -> EnrollmentOperation {
+    EnrollmentOperation::AddGroup {
+        group: "cam-046d-desk".into(),
+        pair: GroupPairRef {
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+        },
+    }
+}
+
+/// The `publish_camera_group` transaction's authorized profile payload.
+fn desk_profile_payload() -> SecondaryProfileScans {
+    let (enr, _) = pad_matching_fixture(0.2, false);
+    SecondaryProfileScans {
+        ir_calibs: Default::default(),
+        profile: "fixture".into(),
+        scans: vec![enr.profiles[0].scans[0].clone()],
+    }
+}
 
 /// Sandboxes `IRLUME_STATE_DIR` for one test (the env guard is held for the
 /// test's life) and plants plaintext primaries at the exact path the
@@ -354,5 +392,397 @@ fn group_calibrations_reach_ir_matching_through_the_bridge() {
         "the group's own calibration must drive the calibrated protocol"
     );
     // Shared-engine hygiene: clear the pin this test created.
+    s.engine.begin_attempt();
+}
+
+fn mint_now(
+    user: &str,
+    operation: EnrollmentOperation,
+) -> irlume_core::multi_camera::authz::EnrollmentAuthorization {
+    EnrollmentAuthorization::mint(
+        user.into(),
+        operation,
+        now_unix(),
+        900,
+        "auth-test".into(),
+        AuthorizationVia::ElevatedPeer { uid: 0 },
+    )
+    .expect("mint at the real clock")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+#[test]
+fn publish_camera_group_publishes_under_the_exact_authorized_scope() {
+    let _g = env_guard();
+    let s = shared();
+    let sandbox = Sandbox::new("publish-add");
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = Some(CameraBinding {
+        rgb: laptop_pair().0,
+        ir: laptop_pair().1,
+    });
+    let bytes = sandbox.write_primary("pad-contract", &enr);
+    let authz = mint("pad-contract", add_desk_operation());
+    let pair = GroupPair {
+        rgb: Some("046d:desk".into()),
+        ir: Some("046d:desk".into()),
+    };
+
+    let published = publish_camera_group(
+        "pad-contract",
+        &pair,
+        "cam-046d-desk",
+        &desk_profile_payload(),
+        &enr,
+        &authz,
+        1_000_300,
+    )
+    .expect("publishes");
+    assert_eq!(published, "cam-046d-desk");
+
+    let store = irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract"))
+        .expect("load")
+        .expect("present");
+    assert_eq!(store.generation, 1, "first publication bumps to 1");
+    assert_eq!(
+        store.primary_snapshot_sha256,
+        irlume_common::sha256_hex(&bytes),
+        "the store binds to the CURRENT primary bytes"
+    );
+    let group = store
+        .group_for_pair(Some("046d:desk"), Some("046d:desk"))
+        .expect("group");
+    assert_eq!(group.id.as_str(), "cam-046d-desk");
+    assert_eq!(group.profiles[0].profile, "fixture");
+    assert_eq!(group.profiles[0].scans.len(), 1);
+
+    // The store is the transaction's own evidence: a pin made BEFORE this
+    // publication would refuse at its boundary on the generation bump
+    // (proven by the removal test below); this test pins nothing.
+    drop(s);
+}
+
+#[test]
+fn publish_camera_group_refuses_a_primary_change_during_capture() {
+    let _g = env_guard();
+    let sandbox = Sandbox::new("publish-changed");
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = Some(CameraBinding {
+        rgb: laptop_pair().0,
+        ir: laptop_pair().1,
+    });
+    let _bytes = sandbox.write_primary("pad-contract", &enr);
+    // A legacy rewrite lands between capture and publication.
+    let mut rewritten = enr.clone();
+    rewritten.profiles[0].scans[0].name = "renamed".into();
+    std::fs::write(
+        sandbox.primary_path("pad-contract"),
+        serde_json::to_vec(&rewritten).expect("serialize"),
+    )
+    .expect("rewrite");
+
+    let refused = publish_camera_group(
+        "pad-contract",
+        &GroupPair {
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+        },
+        "cam-046d-desk",
+        &desk_profile_payload(),
+        &enr,
+        &mint("pad-contract", add_desk_operation()),
+        1_000_300,
+    )
+    .expect_err("a changed primary must not publish");
+    assert!(
+        refused.to_string().contains("changed during capture"),
+        "{refused}"
+    );
+    assert!(
+        irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract"))
+            .expect("load")
+            .is_none(),
+        "nothing was published"
+    );
+}
+
+#[test]
+fn publish_camera_group_refuses_wrong_scope_or_taken_pair() {
+    let _g = env_guard();
+    let sandbox = Sandbox::new("publish-scope");
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = Some(CameraBinding {
+        rgb: laptop_pair().0,
+        ir: laptop_pair().1,
+    });
+    let _bytes = sandbox.write_primary("pad-contract", &enr);
+    let pair = GroupPair {
+        rgb: Some("046d:desk".into()),
+        ir: Some("046d:desk".into()),
+    };
+
+    // A wrongly-scoped authorization (different pair) publishes nothing.
+    let wrong_pair = mint(
+        "pad-contract",
+        EnrollmentOperation::AddGroup {
+            group: "cam-046d-desk".into(),
+            pair: GroupPairRef {
+                rgb: Some("046d:other".into()),
+                ir: None,
+            },
+        },
+    );
+    let refused = publish_camera_group(
+        "pad-contract",
+        &pair,
+        "cam-046d-desk",
+        &desk_profile_payload(),
+        &enr,
+        &wrong_pair,
+        1_000_300,
+    )
+    .expect_err("wrong scope must refuse");
+    assert!(
+        refused.to_string().contains("another operation"),
+        "{refused}"
+    );
+
+    // A store that already holds the pair refuses the concurrent add.
+    let mut occupied = SecondaryStore {
+        format_version: SECONDARY_STORE_VERSION,
+        owner: "pad-contract".into(),
+        generation: 4,
+        primary_snapshot_sha256: irlume_common::sha256_hex(b"stale-does-not-matter"),
+        groups: vec![SecondaryGroup {
+            id: CameraGroupId::new("cam-046d-desk".into()).unwrap(),
+            pair: pair.clone(),
+            profiles: vec![desk_profile_payload()],
+        }],
+    };
+    save_secondary(&secondary_store_path("pad-contract"), &occupied).expect("save");
+    let refused = publish_camera_group(
+        "pad-contract",
+        &pair,
+        "cam-046d-desk-2",
+        &desk_profile_payload(),
+        &enr,
+        &mint(
+            "pad-contract",
+            EnrollmentOperation::AddGroup {
+                group: "cam-046d-desk-2".into(),
+                pair: GroupPairRef {
+                    rgb: Some("046d:desk".into()),
+                    ir: Some("046d:desk".into()),
+                },
+            },
+        ),
+        1_000_300,
+    )
+    .expect_err("an occupied pair must refuse");
+    assert!(
+        refused.to_string().contains("already enrolled"),
+        "{refused}"
+    );
+    occupied.generation = 4;
+    let reloaded =
+        irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract")).unwrap();
+    assert_eq!(reloaded.expect("present").generation, 4, "untouched");
+}
+
+#[test]
+fn add_camera_group_refuses_before_the_camera_opens() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("add-preflight");
+
+    // No primary enrollment: refuse outright.
+    let refused = s
+        .engine
+        .add_camera_group_observed(
+            "nobody",
+            None,
+            10,
+            &mint("nobody", add_desk_operation()),
+            |_det| true,
+            &(),
+            &(),
+        )
+        .expect_err("not enrolled");
+    assert!(refused.to_string().contains("is not enrolled"), "{refused}");
+
+    // An ambiguous profile set must name its profile.
+    let (mut enr, _) = pad_matching_fixture(0.2, false);
+    enr.camera_binding = Some(CameraBinding {
+        rgb: laptop_pair().0,
+        ir: laptop_pair().1,
+    });
+    enr.profiles.push(enr.profiles[0].clone());
+    enr.profiles[1].name = "Second".into();
+    let _bytes = sandbox.write_primary("pad-contract", &enr);
+    let refused = s
+        .engine
+        .add_camera_group_observed(
+            "pad-contract",
+            None,
+            10,
+            &mint("pad-contract", add_desk_operation()),
+            |_det| true,
+            &(),
+            &(),
+        )
+        .expect_err("ambiguous profile");
+    assert!(
+        refused.to_string().contains("multiple face profiles"),
+        "{refused}"
+    );
+
+    // An unknown profile name refuses.
+    let refused = s
+        .engine
+        .add_camera_group_observed(
+            "pad-contract",
+            Some("missing".into()),
+            10,
+            &mint("pad-contract", add_desk_operation()),
+            |_det| true,
+            &(),
+            &(),
+        )
+        .expect_err("unknown profile");
+    assert!(
+        refused.to_string().contains("no face profile named"),
+        "{refused}"
+    );
+
+    // A single-profile enrollment passes the profile gate but the shared
+    // engine's cameras carry no USB identity: a group cannot bind.
+    let (mut single, _) = pad_matching_fixture(0.2, false);
+    single.camera_binding = Some(CameraBinding {
+        rgb: laptop_pair().0,
+        ir: laptop_pair().1,
+    });
+    std::fs::write(
+        sandbox.primary_path("pad-single"),
+        serde_json::to_vec(&single).expect("serialize"),
+    )
+    .expect("plant");
+    let refused = s
+        .engine
+        .add_camera_group_observed(
+            "pad-single",
+            None,
+            10,
+            &mint("pad-single", add_desk_operation()),
+            |_det| true,
+            &(),
+            &(),
+        )
+        .expect_err("identityless pair");
+    assert!(refused.to_string().contains("no USB identity"), "{refused}");
+    assert!(s.engine.secondary_attempt.is_none());
+    s.engine.begin_attempt();
+}
+
+#[test]
+fn remove_camera_group_publishes_revocation_and_invalidates_pins() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("remove");
+    let (enr, _) = pinned_fixture(&sandbox);
+    let resolved = s
+        .engine
+        .resolve_attempt_enrollment("pad-contract", enr, &desk_pair())
+        .expect("pin the desk group first");
+
+    let authz = EnrollmentAuthorization::mint(
+        "pad-contract".into(),
+        EnrollmentOperation::RemoveGroup {
+            group: "desk".into(),
+        },
+        now_unix(),
+        900,
+        "auth-test".into(),
+        AuthorizationVia::ElevatedPeer { uid: 0 },
+    )
+    .expect("mint at the real clock");
+    s.engine
+        .remove_camera_group("pad-contract", "desk", &authz)
+        .expect("removal publishes");
+
+    let store = irlume_core::multi_camera::load_secondary(&secondary_store_path("pad-contract"))
+        .expect("load")
+        .expect("present");
+    assert_eq!(store.generation, 2, "removal bumps the generation");
+    assert!(store.groups.is_empty(), "the group is gone");
+
+    // The pinned attempt from BEFORE the removal now refuses at its grant
+    // boundary: revocation invalidates in-flight use (§4.2).
+    let (mut enr2, _) = pad_matching_fixture(0.2, true);
+    let _ = &mut enr2;
+    let out = s
+        .engine
+        .authenticate_qualified_assessment(
+            &resolved,
+            AuthenticationPurpose::Verify,
+            None,
+            pad_matching_fixture(0.2, false).1,
+            &(),
+        )
+        .expect("assessment");
+    assert!(!out.granted, "a removed group must not grant");
+    assert!(
+        out.reason.contains("generation changed during the attempt"),
+        "{}",
+        out.reason
+    );
+    s.engine.begin_attempt();
+}
+
+#[test]
+fn remove_camera_group_refuses_wrong_scope_and_unknown_groups() {
+    let _g = env_guard();
+    let mut s = shared();
+    let sandbox = Sandbox::new("remove-refusals");
+    let _ = pinned_fixture(&sandbox);
+
+    // Wrongly-scoped authorization (a different group id).
+    let refused = s
+        .engine
+        .remove_camera_group(
+            "pad-contract",
+            "desk",
+            &mint_now(
+                "pad-contract",
+                EnrollmentOperation::RemoveGroup {
+                    group: "lobby".into(),
+                },
+            ),
+        )
+        .expect_err("wrong scope");
+    assert!(
+        refused.to_string().contains("another operation"),
+        "{refused}"
+    );
+
+    // Correctly scoped but the group does not exist.
+    let refused = s
+        .engine
+        .remove_camera_group(
+            "pad-contract",
+            "nonexistent",
+            &mint_now(
+                "pad-contract",
+                EnrollmentOperation::RemoveGroup {
+                    group: "nonexistent".into(),
+                },
+            ),
+        )
+        .expect_err("unknown group");
+    assert!(refused.to_string().contains("no camera group"), "{refused}");
     s.engine.begin_attempt();
 }

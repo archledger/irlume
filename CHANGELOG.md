@@ -7,6 +7,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Camera-group lifecycle in the engine (ADR-0024 Phase 2):
+  `irlume enroll`-style attended capture can now enroll the CURRENT
+  camera pair as a secondary group (`add_camera_group_observed`) - the
+  captured face must match the named primary profile, the group starts
+  from fresh-enrollment defaults with its own fitted calibration, and
+  publication goes through the credential-management authorization and
+  the intent-journal commit protocol with the primary re-validated
+  byte-for-byte since capture. `remove_camera_group` revokes a group
+  (generation bump; the grant boundary refuses in-flight pinned
+  attempts) while leaving remaining groups' activation semantics
+  untouched. Group ids derive stably from the pair's device identities.
+  The pin now parses the primary through the real loader (legacy-format
+  and TPM-sealed primaries work; an unsealable envelope refuses
+  fail-closed) instead of a raw serde parse that silently broke
+  secondary auth for every non-plaintext account.
+
 - Secondary-camera authentication wiring in the matching engine (ADR-0024
   Phase 2): an attempt whose live camera pair does not match the primary
   binding now resolves through the secondary coordinator - an active group

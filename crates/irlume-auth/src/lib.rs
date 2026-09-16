@@ -365,6 +365,106 @@ struct CapturedScan {
 /// Enrollment may deliberately use the convenience-tier RGB path after a
 /// user-present emitter preflight measured this request's IR stream as dark.
 /// Physical IR presence alone must not undo that request-scoped decision.
+/// The cross-store publication transaction of an added camera group
+/// (ADR-0024 §4.1): revalidation, then atomic publication through the
+/// intent-journal commit protocol. Free of engine state so the
+/// transaction is testable without cameras.
+///
+/// Revalidates, in order: the authorization (exact scope and freshness),
+/// the pair's freedom (no concurrent add took it, and the derived id
+/// still matches the authorized one), and the primary's unchanged bytes
+/// since capture (source revision). Only then builds the next store -
+/// generation bumped, digest bound to the CURRENT primary bytes - and
+/// publishes. Failure at any step publishes nothing.
+fn publish_camera_group(
+    user: &str,
+    pair: &irlume_core::multi_camera::GroupPair,
+    group_id: &str,
+    profile: &irlume_core::multi_camera::SecondaryProfileScans,
+    start_enr: &irlume_core::storage::Enrollment,
+    authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
+    now_unix: u64,
+) -> irlume_common::Result<String> {
+    use irlume_core::multi_camera::authz::{
+        ensure_not_consumed, EnrollmentOperation, GroupPairRef,
+    };
+    let operation = EnrollmentOperation::AddGroup {
+        group: group_id.into(),
+        pair: GroupPairRef {
+            rgb: pair.rgb.clone(),
+            ir: pair.ir.clone(),
+        },
+    };
+    authorization
+        .validate_for(user, &operation, now_unix)
+        .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
+    let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+    let store = irlume_core::multi_camera::load_secondary(&secondary_path)
+        .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?
+        .unwrap_or(irlume_core::multi_camera::SecondaryStore {
+            format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+            owner: user.into(),
+            generation: 0,
+            primary_snapshot_sha256: String::new(),
+            groups: Vec::new(),
+        });
+    if let Some(existing) = store.group_for_pair(pair.rgb.as_deref(), pair.ir.as_deref()) {
+        return Err(irlume_common::Error::Protocol(format!(
+            "this camera pair is already enrolled as group '{}'; remove it first",
+            existing.id.as_str()
+        )));
+    }
+    let derived =
+        irlume_core::multi_camera::derive_group_id(&store, pair.rgb.as_deref(), pair.ir.as_deref());
+    if derived.as_str() != group_id {
+        return Err(irlume_common::Error::Protocol(
+            "the secondary store changed during capture so the authorized group id no longer applies; retry".into(),
+        ));
+    }
+    // Source revision: the primary must be byte-for-byte the enrollment the
+    // capture validated its profile against. A legacy rewrite mid-capture
+    // publishes nothing (§4.1: a conflicting mutation never partially
+    // activates a group).
+    let primary_path = irlume_core::multi_camera::primary_enrollment_path(user);
+    let primary_bytes = std::fs::read(&primary_path)
+        .map_err(|error| irlume_common::Error::Io(error.to_string()))?;
+    let current_enr = irlume_core::storage::load_path_unlocked(user, &primary_path)
+        .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?
+        .ok_or_else(|| {
+            irlume_common::Error::Protocol("the primary enrollment vanished during capture".into())
+        })?;
+    let changed = match (
+        serde_json::to_vec(start_enr),
+        serde_json::to_vec(&current_enr),
+    ) {
+        (Ok(start), Ok(current)) => start != current,
+        // A store that can no longer serialize is not "unchanged".
+        _ => true,
+    };
+    if changed {
+        return Err(irlume_common::Error::Protocol(
+            "the primary enrollment changed during capture; retry the addition".into(),
+        ));
+    }
+    let mut next = store.clone();
+    next.generation += 1;
+    next.primary_snapshot_sha256 = irlume_common::sha256_hex(&primary_bytes);
+    next.groups.push(irlume_core::multi_camera::SecondaryGroup {
+        id: derived,
+        pair: pair.clone(),
+        profiles: vec![profile.clone()],
+    });
+    ensure_not_consumed(authorization, next.generation, None)
+        .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
+    irlume_core::multi_camera::commit::publish_with_intent(
+        &secondary_path,
+        &next,
+        &next.primary_snapshot_sha256,
+    )
+    .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
+    Ok(group_id.to_owned())
+}
+
 fn enrollment_ir_enabled(ir_available: bool, force_rgb_only: bool) -> bool {
     ir_available && !force_rgb_only
 }
@@ -8027,6 +8127,282 @@ impl Engine {
     /// `user` (the account being enrolled) tunes the pitch band to that user's
     /// calibrated neutral when they already have scans, so the guide coaches to
     /// the same window the capture gate will accept.
+    /// The live camera pair as a complete
+    /// [`GroupPair`](irlume_core::multi_camera::GroupPair) of device
+    /// identities - the pair an added camera group would bind (ADR-0024
+    /// §2). Sides whose identity cannot be resolved stay unbound; a group
+    /// requires at least one bound side.
+    #[must_use]
+    pub fn live_pair(&self) -> irlume_core::multi_camera::GroupPair {
+        irlume_core::multi_camera::GroupPair {
+            rgb: irlume_camera::device_identity(&self.rgb_dev),
+            ir: irlume_camera::device_identity(&self.ir_dev),
+        }
+    }
+
+    /// Enrolls the CURRENT camera pair as a secondary camera group
+    /// (ADR-0024 §4): attended capture on the new pair, the captured face
+    /// verified against the named primary profile, and publication ONLY
+    /// through the caller's credential-management authorization under the
+    /// cross-store commit protocol. The new camera never authorizes its
+    /// own addition - the authorization is minted by the daemon from a
+    /// password verification or elevated peer, never from this flow.
+    ///
+    /// # Errors
+    /// Returns refusals for: no primary enrollment, an ambiguous or
+    /// unknown profile, an identity-less live pair, the primary's own
+    /// pair, an already-enrolled pair, an unusable secondary store, a
+    /// stale or wrongly-scoped authorization, a different face, a primary
+    /// change during capture, or any capture failure. Nothing is
+    /// published unless every step succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_camera_group_observed(
+        &mut self,
+        user: &str,
+        profile_name: Option<String>,
+        want: usize,
+        authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
+        ir_preflight: impl FnOnce(&mut irlume_vision::Detector) -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<String> {
+        use irlume_core::storage::{self, FaceProfile, MAX_SCANS_PER_PROFILE};
+        observer.check()?;
+        let enr = storage::load(user)?
+            .ok_or_else(|| irlume_common::Error::Protocol(format!("'{user}' is not enrolled")))?;
+        // The group's scans belong to ONE primary profile: resolve it now,
+        // before the camera opens. `None` is only unambiguous when the
+        // enrollment has exactly one profile.
+        let profile = match &profile_name {
+            Some(name) => {
+                if !enr.profiles.iter().any(|p| p.name == *name) {
+                    return Err(irlume_common::Error::Protocol(format!(
+                        "no face profile named '{name}' to add this camera to"
+                    )));
+                }
+                name.clone()
+            }
+            None => match enr.profiles.as_slice() {
+                [only] => only.name.clone(),
+                _ => {
+                    return Err(irlume_common::Error::Protocol(format!(
+                        "'{user}' has multiple face profiles; name which one this camera enrolls"
+                    )))
+                }
+            },
+        };
+        let pair = self.live_pair();
+        if pair.rgb.is_none() && pair.ir.is_none() {
+            return Err(irlume_common::Error::Protocol(
+                "the current cameras expose no USB identity; a camera group cannot bind to them"
+                    .into(),
+            ));
+        }
+        if enr
+            .camera_binding
+            .as_ref()
+            .is_some_and(|bind| pair.matches(bind.rgb.as_deref(), bind.ir.as_deref()))
+        {
+            return Err(irlume_common::Error::Protocol(
+                "this camera pair is already the primary camera; enroll a DIFFERENT pair as a secondary group".into(),
+            ));
+        }
+        let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+        let existing = irlume_core::multi_camera::load_secondary(&secondary_path)
+            .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?;
+        if let Some(store) = &existing {
+            if let Some(group) = store.group_for_pair(pair.rgb.as_deref(), pair.ir.as_deref()) {
+                return Err(irlume_common::Error::Protocol(format!(
+                    "this camera pair is already enrolled as group '{}'; remove it first",
+                    group.id.as_str()
+                )));
+            }
+        }
+        let group_id = irlume_core::multi_camera::derive_group_id(
+            existing
+                .as_ref()
+                .unwrap_or(&irlume_core::multi_camera::SecondaryStore {
+                    format_version: irlume_core::multi_camera::SECONDARY_STORE_VERSION,
+                    owner: user.into(),
+                    generation: 0,
+                    primary_snapshot_sha256: String::new(),
+                    groups: Vec::new(),
+                }),
+            pair.rgb.as_deref(),
+            pair.ir.as_deref(),
+        )
+        .as_str()
+        .to_owned();
+        let operation = irlume_core::multi_camera::authz::EnrollmentOperation::AddGroup {
+            group: group_id.clone(),
+            pair: irlume_core::multi_camera::authz::GroupPairRef {
+                rgb: pair.rgb.clone(),
+                ir: pair.ir.clone(),
+            },
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        authorization
+            .validate_for(user, &operation, now_unix)
+            .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
+        // A dark IR preflight downgrades to RGB-only convenience capture,
+        // which could never authenticate on this pair: refuse before any
+        // camera work (the #618 rule, applied to group enrollment too).
+        let preflight_dark = self.ir_available && !ir_preflight(&mut self.det);
+        if preflight_dark {
+            dark_ir_rgb_only_enrollment_refusal(|| {
+                pair_qualifies_concurrent(&self.rgb_dev, &self.ir_dev)
+            })?;
+        }
+        let force_rgb_only = !self.ir_available || preflight_dark;
+        // Capture into a scratch enrollment: the group starts from
+        // fresh-enrollment defaults (§3) and borrows nothing, so the
+        // scratch's empty pitch neutral gives the bootstrap framing band.
+        let mut scratch = irlume_core::storage::Enrollment::new(user);
+        scratch.profiles.push(FaceProfile {
+            name: profile.clone(),
+            scans: Vec::new(),
+            ir_calib: None,
+            ir_calibs: Default::default(),
+        });
+        let want = want.clamp(1, MAX_SCANS_PER_PROFILE);
+        let mut completed = 0;
+        let (mut scratch, _) = self.capture_enrollment_observed(
+            scratch,
+            Some(profile.clone()),
+            want,
+            |engine, count, pitch, observed| {
+                let progress = EnrollmentProgress {
+                    observer,
+                    base: completed,
+                    target: if completed == 0 {
+                        want
+                    } else {
+                        completed + count
+                    },
+                };
+                let scans = engine.capture_scans_observed(
+                    count,
+                    pitch,
+                    observed,
+                    force_rgb_only,
+                    diagnostics,
+                    &progress,
+                )?;
+                completed += scans.len();
+                Ok(scans)
+            },
+            observer,
+        )?;
+        let captured = scratch
+            .profiles
+            .iter()
+            .position(|p| p.name == profile)
+            .map(|idx| scratch.profiles.swap_remove(idx))
+            .ok_or_else(|| irlume_common::Error::Protocol("capture produced no scans".into()))?;
+        if captured.scans.is_empty() {
+            return Err(irlume_common::Error::Protocol(
+                "no live scan captured on this camera".into(),
+            ));
+        }
+        // The captured face must be the named profile's person (§4:
+        // attended capture supplements authorization; it does not replace
+        // it - and it must not silently enroll a different face).
+        let mut identity_probe = irlume_core::storage::Enrollment::new(user);
+        let primary_profile = enr
+            .profiles
+            .iter()
+            .find(|p| p.name == profile)
+            .cloned()
+            .ok_or_else(|| {
+                irlume_common::Error::Protocol(format!(
+                    "no face profile named '{profile}' to add this camera to"
+                ))
+            })?;
+        identity_probe.profiles.push(primary_profile);
+        let rgbs: Vec<&[f32]> = captured.scans.iter().map(|s| s.rgb.as_slice()).collect();
+        let matched = enroll_merge_target(
+            &identity_probe,
+            &rgbs,
+            &self.embed_space,
+            self.rgb_threshold,
+        )?;
+        if matched.as_deref() != Some(profile.as_str()) {
+            return Err(irlume_common::Error::Protocol(format!(
+                "the captured face does not match profile '{profile}'; add this camera while its owner attends"
+            )));
+        }
+        let mut group_profile = captured;
+        self.refit_profile_calib(&mut group_profile);
+        publish_camera_group(
+            user,
+            &pair,
+            &group_id,
+            &irlume_core::multi_camera::SecondaryProfileScans {
+                profile: group_profile.name.clone(),
+                scans: group_profile.scans.clone(),
+                ir_calibs: group_profile.ir_calibs.clone(),
+            },
+            &enr,
+            authorization,
+            now_unix,
+        )
+    }
+
+    /// Removes one secondary camera group (ADR-0024 §4.2): the group's
+    /// binding, scans, and derived state go together under the
+    /// credential-management authorization, the generation bumps (which
+    /// invalidates any in-flight pinned attempt at its grant boundary),
+    /// and the store's activation digest is left untouched so remaining
+    /// groups keep their exact activation semantics.
+    ///
+    /// # Errors
+    /// Returns refusals for: no secondary store, an unknown group, a
+    /// stale or wrongly-scoped authorization, or a publication failure.
+    pub fn remove_camera_group(
+        &mut self,
+        user: &str,
+        group: &str,
+        authorization: &irlume_core::multi_camera::authz::EnrollmentAuthorization,
+    ) -> irlume_common::Result<()> {
+        let operation = irlume_core::multi_camera::authz::EnrollmentOperation::RemoveGroup {
+            group: group.into(),
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        authorization
+            .validate_for(user, &operation, now_unix)
+            .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
+        let secondary_path = irlume_core::multi_camera::secondary_store_path(user);
+        let store = irlume_core::multi_camera::load_secondary(&secondary_path)
+            .map_err(|error| irlume_common::Error::Protocol(error.to_string()))?
+            .ok_or_else(|| {
+                irlume_common::Error::Protocol("no secondary cameras are enrolled".into())
+            })?;
+        if !store.groups.iter().any(|g| g.id.as_str() == group) {
+            return Err(irlume_common::Error::Protocol(format!(
+                "no camera group '{group}' is enrolled"
+            )));
+        }
+        irlume_core::multi_camera::authz::ensure_not_consumed(
+            authorization,
+            store.generation,
+            None,
+        )
+        .map_err(|error| irlume_common::Error::Policy(error.to_string()))?;
+        let mut next = store.clone();
+        next.generation += 1;
+        next.groups.retain(|g| g.id.as_str() != group);
+        irlume_core::multi_camera::commit::publish_with_intent(
+            &secondary_path,
+            &next,
+            &next.primary_snapshot_sha256,
+        )
+        .map_err(|error| irlume_common::Error::Protocol(error.to_string()))
+    }
+
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn position_sample(
         &mut self,

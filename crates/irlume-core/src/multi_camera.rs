@@ -49,6 +49,51 @@ pub fn primary_enrollment_path(user: &str) -> PathBuf {
     crate::storage::profile_path(user)
 }
 
+/// Derives a group id from the pair's device identities: stable for the
+/// same pair, unique within `existing` by suffixing. Assigned once at
+/// group creation and immutable afterwards; never a display name or list
+/// position (ADR-0024 §2). Sanitized and bounded so the result always
+/// satisfies [`CameraGroupId::new`].
+///
+/// # Panics
+///
+/// Panics only if the sanitized candidate exceeded the id bound, which the
+/// truncation above makes impossible (a proven invariant, not a recoverable
+/// condition).
+#[must_use]
+pub fn derive_group_id(
+    existing: &SecondaryStore,
+    rgb: Option<&str>,
+    ir: Option<&str>,
+) -> CameraGroupId {
+    let source = rgb.or(ir).unwrap_or("camera");
+    let mut stem: String = source
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Leave room for the prefix and any uniqueness suffix within the id bound.
+    stem.truncate(MAX_ID_BYTES.saturating_sub(16));
+    let stem = stem.trim_matches('-');
+    let stem = if stem.is_empty() { "camera" } else { stem };
+    let mut candidate = format!("cam-{stem}");
+    let mut suffix = 2;
+    while existing
+        .groups
+        .iter()
+        .any(|group| group.id.as_str() == candidate)
+    {
+        candidate = format!("cam-{stem}-{suffix}");
+        suffix += 1;
+    }
+    CameraGroupId::new(candidate).expect("sanitized bounded id")
+}
+
 /// The only secondary-store format version this code reads and writes.
 pub const SECONDARY_STORE_VERSION: u32 = 1;
 
@@ -652,6 +697,35 @@ mod tests {
         let first = doubled.groups[0].profiles[0].clone();
         doubled.groups[0].profiles.push(first);
         assert!(doubled.validate().is_err());
+    }
+
+    #[test]
+    fn group_ids_derive_stably_and_unique_within_a_store() {
+        let base = store();
+        let first = derive_group_id(&base, Some("046d:085e:e179cb54"), None);
+        assert_eq!(first.as_str(), "cam-046d-085e-e179cb54");
+        // Same pair, same id (stable); IR is used when RGB is absent.
+        assert_eq!(
+            derive_group_id(&base, Some("046d:085e:e179cb54"), Some("x")).as_str(),
+            "cam-046d-085e-e179cb54"
+        );
+        assert_eq!(
+            derive_group_id(&base, None, Some("3443:c803")).as_str(),
+            "cam-3443-c803"
+        );
+        // A store already holding the id gets a numbered suffix; the next
+        // collision continues the sequence.
+        let mut occupied = base.clone();
+        occupied.groups[0].id = derive_group_id(&occupied, Some("046d:085e"), None);
+        assert_eq!(
+            derive_group_id(&occupied, Some("046d:085e"), None).as_str(),
+            "cam-046d-085e-2"
+        );
+        // Hostile-long identities stay within the id bound.
+        let long = "x".repeat(400);
+        let bounded = derive_group_id(&base, Some(&long), None);
+        assert!(bounded.as_str().len() <= MAX_ID_BYTES);
+        assert!(CameraGroupId::new(bounded.as_str().to_owned()).is_ok());
     }
 
     #[test]

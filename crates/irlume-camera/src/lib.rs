@@ -7319,6 +7319,15 @@ pub struct PairSample {
     /// verdict needs this count to say whether the brightness collapsed with
     /// a silent metadata path or on a camera that reports nothing either way.
     pub ir_camera_classified_frames: usize,
+    /// Per-round production window facts for the RGB leg (ADR-0023
+    /// measurement records): delta count, timestamp span, drops, and the
+    /// production floor verdict, exactly as the rate gate computed them.
+    /// Stage timers and per-gap observations stay `None` until a path that
+    /// actually measures them populates them; nothing here is fabricated.
+    pub rgb_rate_rounds: Vec<measurement::RateRound>,
+    /// Per-round production window facts for the IR leg, same contract as
+    /// `rgb_rate_rounds`.
+    pub ir_rate_rounds: Vec<measurement::RateRound>,
 }
 
 impl PairSample {
@@ -8600,6 +8609,8 @@ where
         }
         report.trailing_sequential_control = true;
     }
+    journal_measurement_record("sequential", &report.sequential, rounds);
+    journal_measurement_record("concurrent", &report.concurrent, rounds);
     Ok(report)
 }
 
@@ -8975,6 +8986,106 @@ fn observe_rate_shortfall(into: &mut PairSample, error: &irlume_common::Error) {
 /// frame is the brightest lit one under the clipping limit rather than the
 /// brightest outright, so a burst that straddles the limit can shift it by a
 /// frame; both are lit-phase means, which is the property this relies on.
+/// The v1 camera-tune measurement acceptance policy: every requested round
+/// must complete, meet its floor, and no failed round is tolerated. Gap
+/// limits stay `None` because the production window evidence does not yet
+/// observe per-gap timings; enabling a limit before the observation exists
+/// would make every record unverifiable.
+#[must_use]
+pub fn tune_measurement_policy(requested_rounds: usize) -> measurement::AcceptancePolicy {
+    measurement::AcceptancePolicy {
+        policy_version: 1,
+        min_completed_rounds: u32::try_from(requested_rounds.max(1)).unwrap_or(u32::MAX),
+        max_failed_rounds: 0,
+        max_inter_frame_gap_us: None,
+        require_all_rounds_meet_floor: true,
+    }
+}
+
+/// Builds an ADR-0023 measurement record for one completed contention arm
+/// from its recorded production window facts, with the acceptance policy
+/// evaluated against the record's own copy. Roles with no completed rounds
+/// are omitted (there is nothing to aggregate); the arm-level failed-round
+/// count is carried per role.
+///
+/// # Errors
+///
+/// Returns a hardware error when the recorded rounds cannot be aggregated
+/// (invalid round data) or the record fails field validation.
+pub fn pair_sample_measurement_record(
+    arm: &'static str,
+    sample: &PairSample,
+    requested_rounds: usize,
+    tool_revision: &str,
+) -> irlume_common::Result<measurement::MeasurementRecord> {
+    let wire =
+        |error: measurement::Error| Error::Hardware(format!("measurement record: {error:?}"));
+    let mut rates = Vec::new();
+    for (role, rounds) in [
+        (measurement::MeasuredRole::Rgb, &sample.rgb_rate_rounds),
+        (measurement::MeasuredRole::Ir, &sample.ir_rate_rounds),
+    ] {
+        if rounds.is_empty() {
+            continue;
+        }
+        let evidence = measurement::RateEvidence::from_rounds(rounds, 0).map_err(wire)?;
+        rates.push((role, evidence));
+    }
+    let record = measurement::MeasurementRecord {
+        schema_version: measurement::MEASUREMENT_SCHEMA_VERSION,
+        policy: tune_measurement_policy(requested_rounds),
+        tool_revision: tool_revision.to_owned(),
+        measured_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| Error::Hardware(error.to_string()))?
+            .as_secs(),
+        method: arm.to_owned(),
+        stages: Vec::new(),
+        rates,
+        arm_failed_rounds: u32::try_from(sample.failed).unwrap_or(u32::MAX),
+        acceptance: measurement::Acceptance {
+            accepted: true,
+            failures: Vec::new(),
+        },
+    };
+    record.validate().map_err(wire)?;
+    let acceptance = record.evaluate_acceptance().map_err(wire)?;
+    Ok(measurement::MeasurementRecord {
+        acceptance,
+        ..record
+    })
+}
+
+/// Journals one arm's measurement record under debug: the acceptance verdict
+/// summary always, and the full deterministic serialization beside it so a
+/// support reader can audit every round. Journal-only by design in this
+/// slice: no wire or persistence changes.
+fn journal_measurement_record(arm: &'static str, sample: &PairSample, requested_rounds: usize) {
+    if sample.rounds == 0 {
+        return;
+    }
+    match pair_sample_measurement_record(arm, sample, requested_rounds, "irlume camera-tune") {
+        Ok(record) => {
+            irlume_common::dlog!(
+                "tune measurement record ({}): accepted={} failures={} rounds=({} rgb, {} ir)",
+                arm,
+                record.acceptance.accepted,
+                record.acceptance.failures.len(),
+                sample.rgb_rate_rounds.len(),
+                sample.ir_rate_rounds.len()
+            );
+            if let Ok(serialized) = serde_json::to_string(&record) {
+                irlume_common::dlog!("tune measurement record ({arm}): {serialized}");
+            }
+        }
+        Err(error) => {
+            irlume_common::dlog!(
+                "tune measurement record ({arm}): not built ({error}); the arm's                  counters above remain authoritative"
+            );
+        }
+    }
+}
+
 fn accumulate(
     into: &mut PairSample,
     continuity: &mut PairContinuityState,
@@ -9019,6 +9130,37 @@ fn accumulate(
     into.ir_camera_classified_frames += ir_stats.camera_classified_frames;
     into.total_ms = mix(into.total_ms, elapsed.as_millis() as f32);
     into.rounds += 1;
+
+    // ADR-0023 measurement evidence: record each completed round's
+    // production window facts verbatim. Same math by construction - the
+    // numbers ARE the rate gate's own. Unrecordable windows (zero deltas or
+    // span) are named, never silently dropped.
+    let rgb_window = rgb.provenance().rate_evidence();
+    let ir_window = ir.provenance().rate_evidence();
+    match measurement::RateRound::from_window_facts(
+        rgb_window.window_count(),
+        rgb_window.window_span_us(),
+        rgb_window.cumulative_drops(),
+        rgb_window.meets_floor(),
+    ) {
+        Ok(round) => into.rgb_rate_rounds.push(round),
+        Err(error) => irlume_common::dlog!(
+            "qualification round: RGB window not recordable ({error:?});              arm round {}",
+            into.rounds
+        ),
+    }
+    match measurement::RateRound::from_window_facts(
+        ir_window.window_count(),
+        ir_window.window_span_us(),
+        ir_window.cumulative_drops(),
+        ir_window.meets_floor(),
+    ) {
+        Ok(round) => into.ir_rate_rounds.push(round),
+        Err(error) => irlume_common::dlog!(
+            "qualification round: IR window not recordable ({error:?});              arm round {}",
+            into.rounds
+        ),
+    }
 
     let Some(context) = context else {
         return;
@@ -13844,6 +13986,8 @@ mod tests {
                 continuity_facts: Default::default(),
                 capture_failure_facts: Default::default(),
                 ir_camera_classified_frames: 0,
+                rgb_rate_rounds: Vec::new(),
+                ir_rate_rounds: Vec::new(),
             };
             ContentionReport {
                 sequential: sample(seq),
@@ -14167,7 +14311,86 @@ mod tests {
 
     #[test]
     #[allow(clippy::needless_borrows_for_generic_args)]
-    fn typed_concurrent_rate_failures_survive_the_probe_and_trailing_control() {
+    fn measurement_record_accepts_a_strong_arm() {
+        let mut sample = PairSample::default();
+        for _ in 0..6 {
+            sample
+                .rgb_rate_rounds
+                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+            sample
+                .ir_rate_rounds
+                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+            sample.rounds += 1;
+        }
+        let record = pair_sample_measurement_record("concurrent", &sample, 6, "test").unwrap();
+        assert!(record.acceptance.accepted);
+        assert_eq!(record.method, "concurrent");
+        let (_, ir) = record
+            .rates
+            .iter()
+            .find(|(role, _)| *role == measurement::MeasuredRole::Ir)
+            .expect("ir evidence");
+        assert_eq!(ir.rounds_completed, 6);
+    }
+
+    #[test]
+    fn measurement_record_refuses_shortfalls_and_failed_rounds() {
+        let mut sample = PairSample::default();
+        for _ in 0..5 {
+            sample
+                .rgb_rate_rounds
+                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+            sample
+                .ir_rate_rounds
+                .push(measurement::RateRound::from_window_facts(28, 1_000_000, 0, true).unwrap());
+            sample.rounds += 1;
+        }
+        // The sixth IR round missed the floor and one round errored outright.
+        sample
+            .ir_rate_rounds
+            .push(measurement::RateRound::from_window_facts(20, 1_000_000, 3, false).unwrap());
+        sample.rounds += 1;
+        sample.failed = 1;
+        let record = pair_sample_measurement_record("sequential", &sample, 6, "test").unwrap();
+        assert!(!record.acceptance.accepted);
+        assert!(record
+            .acceptance
+            .failures
+            .iter()
+            .any(|failure| matches!(failure, measurement::AcceptanceFailure::FloorNotMet { .. })));
+        assert!(record.acceptance.failures.iter().any(|failure| matches!(
+            failure,
+            measurement::AcceptanceFailure::TooManyFailedRounds {
+                failed: 1,
+                tolerated: 0
+            }
+        )));
+        // Continuity errors survive into the aggregate evidence.
+        let (_, ir) = record
+            .rates
+            .iter()
+            .find(|(role, _)| *role == measurement::MeasuredRole::Ir)
+            .expect("ir evidence");
+        assert_eq!(ir.continuity_errors, 3);
+    }
+
+    #[test]
+    fn measurement_record_omits_roles_without_completed_rounds() {
+        let mut sample = PairSample {
+            rounds: 1,
+            failed: 6,
+            ..PairSample::default()
+        };
+        sample
+            .ir_rate_rounds
+            .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+        let record = pair_sample_measurement_record("concurrent", &sample, 6, "test").unwrap();
+        assert_eq!(record.rates.len(), 1);
+        assert_eq!(record.rates[0].0, measurement::MeasuredRole::Ir);
+    }
+
+    #[test]
+    fn identify_respects_fingerprint_mode_and_needs_a_camera() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let rgb_calls = AtomicUsize::new(0);
         let rgb = || {
@@ -14180,7 +14403,7 @@ mod tests {
         };
         let ir = || Ok((frame(&[20; 4]), stats(60.0)));
         let mut report =
-            measure_contention_impl(&rgb, &ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+            measure_contention_impl(rgb, ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
                 .expect("typed shortfall is a measurement, not a probe abort");
         assert_eq!(report.concurrent.failed, 2);
         assert_eq!(report.concurrent.rate_shortfall_failures, 2);

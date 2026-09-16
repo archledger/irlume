@@ -82,9 +82,13 @@ pub enum PercentileBasis {
 /// One completed rate round: the three facts that must stay distinct.
 ///
 /// `deltas` and `timestamp_span_us` derive from the same production
-/// timestamp arithmetic the rate gate uses; `wall_clock_us` is the stage
+/// timestamp arithmetic the rate gate uses; `wall_clock_us` is a stage
 /// timer and MUST NOT be divided into `deltas` to claim a delivered rate;
 /// `meets_floor` is the production verdict, recorded as it was computed.
+/// `wall_clock_us` and `max_inter_frame_gap_us` are `None` unless the
+/// producing path actually observed them separately: recording a stage
+/// timer or a gap the source never measured would be fabrication, and a
+/// `None` keeps the record honest about what was observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateRound {
@@ -92,14 +96,43 @@ pub struct RateRound {
     pub deltas: u32,
     /// Span from the first to the last counted delta's timestamp, in us.
     pub timestamp_span_us: u64,
-    /// Wall-clock duration of the fill stage, >= `timestamp_span_us`.
-    pub wall_clock_us: u64,
-    /// The largest gap between consecutive counted deltas, in us.
-    pub max_inter_frame_gap_us: u64,
+    /// Wall-clock duration of the fill stage when separately staged.
+    pub wall_clock_us: Option<u64>,
+    /// Largest gap between consecutive counted deltas, when observed.
+    pub max_inter_frame_gap_us: Option<u64>,
     /// Continuity errors the production ring reported in this round.
     pub continuity_errors: u32,
     /// The production `meets_floor` verdict for this round.
     pub meets_floor: bool,
+}
+
+impl RateRound {
+    /// Records a round from the production window facts: the delta count,
+    /// the timestamp span, the ring's cumulative drops, and the production
+    /// floor verdict. Stage timers and per-gap observations are `None`
+    /// because the production evidence does not carry them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRounds`] when the deltas or span are zero.
+    pub fn from_window_facts(
+        deltas: u32,
+        timestamp_span_us: u64,
+        cumulative_drops: u64,
+        meets_floor: bool,
+    ) -> Result<Self, Error> {
+        if deltas == 0 || timestamp_span_us == 0 {
+            return Err(Error::InvalidRounds);
+        }
+        Ok(Self {
+            deltas,
+            timestamp_span_us,
+            wall_clock_us: None,
+            max_inter_frame_gap_us: None,
+            continuity_errors: u32::try_from(cumulative_drops).unwrap_or(u32::MAX),
+            meets_floor,
+        })
+    }
 }
 
 /// Aggregated delivered-rate evidence for one role.
@@ -113,8 +146,9 @@ pub struct RateEvidence {
     pub rate_p05: RateRational,
     pub rate_p50: RateRational,
     pub rate_max: RateRational,
-    /// Largest inter-frame gap observed across rounds, in us.
-    pub max_inter_frame_gap_us: u64,
+    /// Largest inter-frame gap observed across rounds, when any round
+    /// observed one.
+    pub max_inter_frame_gap_us: Option<u64>,
     /// Total continuity errors across rounds.
     pub continuity_errors: u32,
     pub basis: PercentileBasis,
@@ -144,8 +178,10 @@ pub struct AcceptancePolicy {
     pub min_completed_rounds: u32,
     /// Maximum failed rounds tolerated across roles.
     pub max_failed_rounds: u32,
-    /// Any round with a larger inter-frame gap fails acceptance.
-    pub max_inter_frame_gap_us: u64,
+    /// Any round with a larger observed inter-frame gap fails acceptance.
+    /// `None` declines to judge gaps at all; `Some` with rounds that lack
+    /// gap observations fails as unverifiable rather than silently passing.
+    pub max_inter_frame_gap_us: Option<u64>,
     /// Whether every completed round must have met the production floor.
     pub require_all_rounds_meet_floor: bool,
 }
@@ -167,6 +203,9 @@ pub enum AcceptanceFailure {
         role: MeasuredRole,
         gap_us: u64,
         limit_us: u64,
+    },
+    GapUnverifiable {
+        role: MeasuredRole,
     },
     FloorNotMet {
         role: MeasuredRole,
@@ -195,6 +234,10 @@ pub struct MeasurementRecord {
     pub method: String,
     pub stages: Vec<SpannedStage>,
     pub rates: Vec<(MeasuredRole, RateEvidence)>,
+    /// Rounds the whole arm lost to errors before either role delivered a
+    /// window. Arm-level by construction: summing per-role failed counts
+    /// would double-count one failed round.
+    pub arm_failed_rounds: u32,
     pub acceptance: Acceptance,
 }
 
@@ -235,10 +278,16 @@ impl RateEvidence {
             if round.deltas == 0 || round.timestamp_span_us == 0 {
                 return Err(Error::InvalidRounds);
             }
-            if round.wall_clock_us < round.timestamp_span_us {
+            if round
+                .wall_clock_us
+                .is_some_and(|wall| wall < round.timestamp_span_us)
+            {
                 return Err(Error::InvalidRounds);
             }
-            if round.max_inter_frame_gap_us > round.timestamp_span_us {
+            if round
+                .max_inter_frame_gap_us
+                .is_some_and(|gap| gap > round.timestamp_span_us)
+            {
                 return Err(Error::InvalidRounds);
             }
         }
@@ -279,9 +328,8 @@ impl RateEvidence {
             rate_max: sorted[sorted.len() - 1],
             max_inter_frame_gap_us: rounds
                 .iter()
-                .map(|round| round.max_inter_frame_gap_us)
-                .max()
-                .unwrap_or(0),
+                .filter_map(|round| round.max_inter_frame_gap_us)
+                .max(),
             continuity_errors: rounds.iter().map(|round| round.continuity_errors).sum(),
             basis: PercentileBasis::RoundLevelRate,
             rounds: rounds.to_vec(),
@@ -335,12 +383,24 @@ impl MeasurementRecord {
                     required: policy.min_completed_rounds,
                 });
             }
-            if evidence.max_inter_frame_gap_us > policy.max_inter_frame_gap_us {
-                failures.push(AcceptanceFailure::InterFrameGapExceeded {
-                    role: *role,
-                    gap_us: evidence.max_inter_frame_gap_us,
-                    limit_us: policy.max_inter_frame_gap_us,
-                });
+            if let Some(limit_us) = policy.max_inter_frame_gap_us {
+                let mut unverifiable = false;
+                for round in &evidence.rounds {
+                    match round.max_inter_frame_gap_us {
+                        Some(gap_us) if gap_us > limit_us => {
+                            failures.push(AcceptanceFailure::InterFrameGapExceeded {
+                                role: *role,
+                                gap_us,
+                                limit_us,
+                            });
+                        }
+                        Some(_) => {}
+                        None => unverifiable = true,
+                    }
+                }
+                if unverifiable {
+                    failures.push(AcceptanceFailure::GapUnverifiable { role: *role });
+                }
             }
             if policy.require_all_rounds_meet_floor {
                 for (index, round) in evidence.rounds.iter().enumerate() {
@@ -353,10 +413,9 @@ impl MeasurementRecord {
                 }
             }
         }
-        let failed: u32 = self.rates.iter().map(|(_, e)| e.rounds_failed).sum();
-        if failed > policy.max_failed_rounds {
+        if self.arm_failed_rounds > policy.max_failed_rounds {
             failures.push(AcceptanceFailure::TooManyFailedRounds {
-                failed,
+                failed: self.arm_failed_rounds,
                 tolerated: policy.max_failed_rounds,
             });
         }
@@ -383,11 +442,21 @@ mod tests {
         RateRound {
             deltas,
             timestamp_span_us: span_us,
-            wall_clock_us: span_us + 100,
-            max_inter_frame_gap_us: gap_us,
+            wall_clock_us: Some(span_us + 100),
+            max_inter_frame_gap_us: Some(gap_us),
             continuity_errors: 0,
             meets_floor,
         }
+    }
+
+    fn round_without_stage_observation(
+        deltas: u32,
+        span_us: u64,
+        drops: u64,
+        meets_floor: bool,
+    ) -> RateRound {
+        RateRound::from_window_facts(deltas, span_us, drops, meets_floor)
+            .expect("valid window facts")
     }
 
     #[test]
@@ -426,13 +495,13 @@ mod tests {
     fn evidence_rejects_empty_oversized_and_inconsistent_rounds() {
         assert_eq!(RateEvidence::from_rounds(&[], 0), Err(Error::InvalidRounds));
         let mut wall_below_span = round(30, 1_000_000, 100_000, true);
-        wall_below_span.wall_clock_us = 999_999;
+        wall_below_span.wall_clock_us = Some(999_999);
         assert_eq!(
             RateEvidence::from_rounds(&[wall_below_span], 0),
             Err(Error::InvalidRounds)
         );
         let mut gap_above_span = round(30, 1_000_000, 2_000_000, true);
-        gap_above_span.max_inter_frame_gap_us = 2_000_001;
+        gap_above_span.max_inter_frame_gap_us = Some(2_000_001);
         assert_eq!(
             RateEvidence::from_rounds(&[gap_above_span], 0),
             Err(Error::InvalidRounds)
@@ -448,7 +517,7 @@ mod tests {
         let mut jittery = rounds[1];
         jittery.continuity_errors = 2;
         let evidence = RateEvidence::from_rounds(&[rounds[0], jittery], 1).unwrap();
-        assert_eq!(evidence.max_inter_frame_gap_us, 625_000);
+        assert_eq!(evidence.max_inter_frame_gap_us, Some(625_000));
         assert_eq!(evidence.continuity_errors, 2);
         assert_eq!(evidence.rounds_failed, 1);
     }
@@ -472,6 +541,7 @@ mod tests {
                 accepted: true,
                 failures: Vec::new(),
             },
+            arm_failed_rounds: 0,
         }
     }
 
@@ -480,7 +550,7 @@ mod tests {
             policy_version: 1,
             min_completed_rounds: 1,
             max_failed_rounds: 0,
-            max_inter_frame_gap_us: 700_000,
+            max_inter_frame_gap_us: None,
             require_all_rounds_meet_floor: true,
         }
     }
@@ -491,7 +561,7 @@ mod tests {
             policy_version: 1,
             min_completed_rounds: 6,
             max_failed_rounds: 0,
-            max_inter_frame_gap_us: 100_000,
+            max_inter_frame_gap_us: Some(100_000),
             require_all_rounds_meet_floor: true,
         };
         let rounds = vec![
@@ -533,7 +603,7 @@ mod tests {
         let rounds = vec![round(30, 2_174_000, 625_000, false)];
         let evidence = RateEvidence::from_rounds(&rounds, 0).unwrap();
         let stored = evidence.rounds[0];
-        assert_eq!(stored.wall_clock_us, 2_174_100);
+        assert_eq!(stored.wall_clock_us, Some(2_174_100));
         assert_eq!(stored.timestamp_span_us, 2_174_000);
         assert!(!stored.meets_floor);
         // The round's rate is its deltas over its TIMESTAMP SPAN, never the
@@ -568,6 +638,41 @@ mod tests {
         let mut json: serde_json::Value = serde_json::to_value(&record).expect("serialize");
         json["rates"][0][1]["rounds"][0]["estimated_fps"] = serde_json::json!(13.8);
         assert!(serde_json::from_value::<MeasurementRecord>(json).is_err());
+    }
+
+    #[test]
+    fn from_window_facts_records_production_facts_with_unobserved_stages_none() {
+        let round = round_without_stage_observation(30, 2_174_000, 2, false);
+        assert_eq!(round.deltas, 30);
+        assert_eq!(round.timestamp_span_us, 2_174_000);
+        assert_eq!(round.continuity_errors, 2);
+        assert!(!round.meets_floor);
+        assert_eq!(round.wall_clock_us, None);
+        assert_eq!(round.max_inter_frame_gap_us, None);
+        assert_eq!(
+            RateRound::from_window_facts(0, 1_000, 0, true),
+            Err(Error::InvalidRounds)
+        );
+    }
+
+    #[test]
+    fn a_gap_limit_without_gap_observations_is_unverifiable_not_passed() {
+        let policy = AcceptancePolicy {
+            policy_version: 1,
+            min_completed_rounds: 1,
+            max_failed_rounds: 0,
+            max_inter_frame_gap_us: Some(100_000),
+            require_all_rounds_meet_floor: true,
+        };
+        let rounds = vec![round_without_stage_observation(30, 1_000_000, 0, true)];
+        let record = record_with(policy, &rounds);
+        let verdict = record.evaluate_acceptance().unwrap();
+        assert!(!verdict.accepted);
+        assert!(verdict
+            .failures
+            .contains(&AcceptanceFailure::GapUnverifiable {
+                role: MeasuredRole::Ir
+            }));
     }
 
     #[test]

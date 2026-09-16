@@ -8,7 +8,7 @@
 //! stores, composes the camera-scoped views, verifies the requested group
 //! is ACTIVE for the live pair, and records the pinned state. Capture and
 //! matching then read ONLY the group's scoped view. Before any grant
-//! decision, the daemon calls [`boundary_check_now`], which re-reads BOTH
+//! decision, the daemon calls [`SecondaryAuthContext::boundary_check_now`], which re-reads BOTH
 //! stores at the boundary (never a cached descriptor) and applies
 //! [`grant_boundary_check`].
 //!

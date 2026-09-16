@@ -3,7 +3,7 @@
 //! scoring or calibration consumer ever handles unfiltered enrollment data.
 //!
 //! Composition is the only way authentication-relevant code obtains
-//! candidates: [`compose`] takes the primary enrollment WITH its exact
+//! candidates: [`CameraScopedViews::compose`] takes the primary enrollment WITH its exact
 //! bytes and an optional secondary store, checks the activation binding,
 //! and returns one view per camera group. An INACTIVE secondary store
 //! contributes NOTHING while the primary's own view remains valid

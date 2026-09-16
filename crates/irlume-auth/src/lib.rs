@@ -26,6 +26,7 @@ pub use irlume_camera::lease;
 /// daemon's artifact writer (the contention report is already re-exported
 /// through the capture-qualification group above).
 pub use irlume_camera::measurement;
+pub use irlume_camera::profiles;
 pub use irlume_camera::{camera_inventory_snapshot, initialize_camera_monitor};
 /// Enumerate the Hello camera pairs. Re-exported for the daemon's
 /// camera-class `ListCameras` arm: clients must not enumerate for themselves

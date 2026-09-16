@@ -774,12 +774,68 @@ fn ir_setup(args: &[String]) -> std::process::ExitCode {
 /// keeps 56% of its RGB brightness), which dims the frame recognition runs on;
 /// others are unaffected and should keep the faster concurrent path. Only a
 /// measurement on the camera in front of the user can tell the two apart.
+/// One human-readable drift line per compared arm+role between a reference
+/// measurement artifact and a fresh one (ADR-0023 `--verify-record`).
+/// Rates are exact rationals in the records; the report renders them as fps
+/// for humans while every comparison stays qualitative (faster/slower/same
+/// by cross-multiplication, never float equality).
+fn measurement_drift_report(
+    reference: &[irlume_camera::measurement::MeasurementRecord],
+    fresh: &[irlume_camera::measurement::MeasurementRecord],
+) -> Vec<String> {
+    let fps = |r: irlume_camera::measurement::RateRational| {
+        r.deltas as f64 * 1_000_000.0 / r.span_us as f64
+    };
+    let mut lines = Vec::new();
+    for reference_record in reference {
+        let arm = &reference_record.method;
+        let Some(fresh_record) = fresh.iter().find(|r| r.method == *arm) else {
+            lines.push(format!("{arm}: no fresh {arm} arm ran; cannot compare"));
+            continue;
+        };
+        for (role, reference_evidence) in &reference_record.rates {
+            let Some((_, fresh_evidence)) = fresh_record.rates.iter().find(|(r, _)| r == role)
+            else {
+                lines.push(format!("{arm} {role:?}: no fresh rounds; cannot compare"));
+                continue;
+            };
+            let direction = if fresh_evidence.rate_p50.lt(&reference_evidence.rate_p50) {
+                "slower"
+            } else if reference_evidence.rate_p50.lt(&fresh_evidence.rate_p50) {
+                "faster"
+            } else {
+                "same"
+            };
+            lines.push(format!(
+                "{arm} {role:?}: p50 {:.1} -> {:.1} fps ({direction}); max gap {} -> {} us; rounds {} -> {}; accepted {} -> {}",
+                fps(reference_evidence.rate_p50),
+                fps(fresh_evidence.rate_p50),
+                reference_evidence.max_inter_frame_gap_us.unwrap_or(0),
+                fresh_evidence.max_inter_frame_gap_us.unwrap_or(0),
+                reference_evidence.rounds_completed,
+                fresh_evidence.rounds_completed,
+                reference_record.acceptance.accepted,
+                fresh_record.acceptance.accepted,
+            ));
+        }
+    }
+    for fresh_record in fresh {
+        if !reference.iter().any(|r| r.method == fresh_record.method) {
+            lines.push(format!(
+                "{}: fresh arm with no reference counterpart",
+                fresh_record.method
+            ));
+        }
+    }
+    lines
+}
+
 fn camera_tune(args: &[String]) -> std::process::ExitCode {
     use irlume_common::Request;
     // Same rule as `enroll --scans`: this command fires the IR emitter for up to
     // a minute, so an unparseable count is a usage error rather than a silent
     // substitution of the default round count.
-    let rounds = match flag(args, "--rounds") {
+    let mut rounds = match flag(args, "--rounds") {
         None if flag_present(args, "--rounds") => {
             eprintln!("[camera-tune] --rounds requires a positive integer");
             return std::process::ExitCode::from(2);
@@ -793,6 +849,38 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
             }
         },
     };
+    // ADR-0023 verification: re-measure and compare against a reference
+    // artifact. Runs the same tune with a temporary evidence artifact, then
+    // prints per-arm drift. Reference rounds win so both runs judge the
+    // same workload.
+    let verify_record_path = match flag(args, "--verify-record") {
+        None if flag_present(args, "--verify-record") => {
+            eprintln!("[camera-tune] --verify-record requires a file path");
+            return std::process::ExitCode::from(2);
+        }
+        None => None,
+        Some(raw) if raw.trim().is_empty() => {
+            eprintln!("[camera-tune] --verify-record requires a file path");
+            return std::process::ExitCode::from(2);
+        }
+        Some(raw) => Some(raw.to_string()),
+    };
+    if let Some(reference_path) = &verify_record_path {
+        if let Ok(text) = std::fs::read_to_string(reference_path) {
+            if let Ok(records) =
+                serde_json::from_str::<Vec<irlume_camera::measurement::MeasurementRecord>>(&text)
+            {
+                if let Some((_, first)) = records.iter().find_map(|r| {
+                    r.rates.first().map(|(role, evidence)| {
+                        let _ = role;
+                        (r, evidence)
+                    })
+                }) {
+                    rounds = Some(first.rounds_completed.max(1) as usize);
+                }
+            }
+        }
+    }
     // ADR-0023 evidence emission: asks the daemon to write the completed
     // arms' measurement records as a JSON artifact. An unparseable or
     // missing path is a usage error, same discipline as --rounds.
@@ -812,11 +900,17 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
         "[camera-tune] measuring this camera under load; it fires the IR emitter \
          for up to a minute…"
     );
+    let fresh_path = verify_record_path.as_ref().map(|_| {
+        std::env::temp_dir().join(format!("irlume-verify-record-{}.json", std::process::id()))
+    });
     let result = report_ok_response(
         "camera-tune",
         daemon_request(&Request::TuneCaptureMode {
             rounds,
-            emit_record_path,
+            emit_record_path: fresh_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .or(emit_record_path),
         }),
     );
     if let Some(path) = flag(args, "--emit-record") {
@@ -824,6 +918,43 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
             "[camera-tune] {path} is MEASUREMENT EVIDENCE, not a camera profile; \
              attach it to the PR that contributes this camera's tuning"
         );
+    }
+    if let (Some(reference_path), Some(fresh)) = (verify_record_path.as_ref(), fresh_path.as_ref())
+    {
+        let reference_text = match std::fs::read_to_string(reference_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("[camera-tune] cannot read {reference_path}: {error}");
+                return result;
+            }
+        };
+        let fresh_text = match std::fs::read_to_string(fresh) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!(
+                    "[camera-tune] no fresh artifact at {}: {error}",
+                    fresh.display()
+                );
+                return result;
+            }
+        };
+        let _ = std::fs::remove_file(fresh);
+        match (
+            serde_json::from_str::<Vec<irlume_camera::measurement::MeasurementRecord>>(
+                &reference_text,
+            ),
+            serde_json::from_str::<Vec<irlume_camera::measurement::MeasurementRecord>>(&fresh_text),
+        ) {
+            (Ok(reference), Ok(fresh_records)) => {
+                eprintln!("[camera-tune] drift vs {reference_path}:");
+                for line in measurement_drift_report(&reference, &fresh_records) {
+                    eprintln!("[camera-tune]   {line}");
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("[camera-tune] artifact parse failed: {error}");
+            }
+        }
     }
     result
 }
@@ -5133,5 +5264,84 @@ mod tests {
         let mut out = Vec::new();
         collect_images(std::path::Path::new("/nonexistent/irlume-imgs"), &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn drift_report_names_direction_gaps_and_missing_arms() {
+        use irlume_camera::measurement as m;
+        let round = |deltas: u32, span: u64, gap: u64, meets: bool| m::RateRound {
+            deltas,
+            timestamp_span_us: span,
+            wall_clock_us: None,
+            max_inter_frame_gap_us: Some(gap),
+            continuity_errors: 0,
+            meets_floor: meets,
+        };
+        let evidence = |rates: &[(u32, u64)]| {
+            let rounds: Vec<m::RateRound> = rates
+                .iter()
+                .map(|&(d, s)| round(d, s, 72_000, true))
+                .collect();
+            m::RateEvidence::from_rounds(&rounds, 0).expect("valid")
+        };
+        let record =
+            |method: &str, rates: Vec<(m::MeasuredRole, m::RateEvidence)>| m::MeasurementRecord {
+                schema_version: m::MEASUREMENT_SCHEMA_VERSION,
+                policy: m::AcceptancePolicy {
+                    policy_version: 1,
+                    min_completed_rounds: 2,
+                    max_failed_rounds: 0,
+                    max_inter_frame_gap_us: None,
+                    require_all_rounds_meet_floor: true,
+                },
+                tool_revision: "test".into(),
+                measured_at_unix: 1,
+                method: method.into(),
+                stages: Vec::new(),
+                rates,
+                arm_failed_rounds: 0,
+                acceptance: m::Acceptance {
+                    accepted: true,
+                    failures: Vec::new(),
+                },
+            };
+        let reference = vec![record(
+            "sequential",
+            vec![
+                (
+                    m::MeasuredRole::Rgb,
+                    evidence(&[(11, 690_000), (11, 690_000)]),
+                ),
+                (
+                    m::MeasuredRole::Ir,
+                    evidence(&[(15, 504_000), (15, 504_000)]),
+                ),
+            ],
+        )];
+        let fresh = vec![record(
+            "sequential",
+            vec![
+                (
+                    m::MeasuredRole::Rgb,
+                    evidence(&[(11, 800_000), (11, 800_000)]),
+                ),
+                (
+                    m::MeasuredRole::Ir,
+                    evidence(&[(15, 504_000), (15, 504_000)]),
+                ),
+            ],
+        )];
+        let lines = measurement_drift_report(&reference, &fresh);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Rgb") && l.contains("slower")));
+        assert!(lines.iter().any(|l| l.contains("Ir") && l.contains("same")));
+        // A reference arm missing from the fresh run is named, not silently
+        // skipped.
+        let fresh_empty: Vec<m::MeasurementRecord> = Vec::new();
+        let lines = measurement_drift_report(&reference, &fresh_empty);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("no fresh sequential arm ran")));
     }
 }

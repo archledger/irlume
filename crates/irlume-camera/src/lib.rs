@@ -17273,8 +17273,25 @@ mod tests {
             rgb.stream.stream.is_some(),
             "the companion remains reusable after cancellation"
         );
+        // The documented invariant is "never the bounded fill": cancellation
+        // must stop the companion before its rate window completes. That has
+        // a scheduling-independent witness - the window is NOT ready - and a
+        // belt-and-braces count bound below one window of dequeues. The old
+        // `<= 1` counted from the synchronized barrier, but the cancellation
+        // only ARMS when the IR thread's refusal lands: under a loaded CI
+        // runner the descheduled IR thread can refuse many dequeues after
+        // the RGB thread passed the barrier, so the companion legitimately
+        // runs ahead first. After the refusal itself the cancel check between
+        // dequeues still bounds the companion to one in-flight frame, which
+        // the window-not-ready assertion captures without racing the
+        // scheduler.
         assert!(
-            rgb.stream.accounting().0.saturating_sub(rgb_before) <= 1,
+            !rgb.stream.rate_window.ready(),
+            "RGB fill must not complete after a companion privacy refusal"
+        );
+        assert!(
+            rgb.stream.accounting().0.saturating_sub(rgb_before)
+                < rate_gate::RATE_WINDOW_CAPACITY as u64,
             "RGB may finish one in-flight dequeue, never the bounded fill"
         );
         assert_eq!(

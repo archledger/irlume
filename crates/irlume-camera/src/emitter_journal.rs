@@ -2248,10 +2248,14 @@ mod tests {
     /// The foreign records are planted FIRST and MY misfiled name is the one
     /// discovered by asking: a name is kept only when the directory really does
     /// hand back a foreign record before it. Creation-order enumerations
-    /// (tmpfs, single-block ext4) then satisfy the precondition on the first
-    /// try, because mine is created after the foreigns; hash-order
-    /// enumerations still find a name that lands late. The ordering the test
-    /// is named for is the ordering it runs against, on every filesystem.
+    /// (single-block ext4) satisfy the precondition because mine is created
+    /// after the original foreigns; reverse-creation enumerations satisfy it
+    /// because a fresh foreign is planted after every candidate (tmpfs lists
+    /// newest first, measured on Linux 7.2.3-cachyos, so without that late
+    /// foreign every candidate precedes the original ones on any name);
+    /// hash-order enumerations find a dispersed name that lands late. The
+    /// ordering the test is named for is the ordering it runs against, on
+    /// every filesystem.
     #[test]
     fn this_cameras_record_is_found_whatever_the_directory_order() {
         let _lock = env_lock();
@@ -2283,17 +2287,33 @@ mod tests {
         // a scan stopping at the first same-model record.
         let mut misfiled = None;
         for n in 0..64u32 {
-            let candidate = store_dir().join(format!("{n:064x}.json"));
+            // Dispersed, not sequential: on hash-ordered directories the old
+            // `{n:064x}` names share one hash region, so 64 correlated tries
+            // can all fail together.
+            let dispersed = (u64::from(n) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let candidate = store_dir().join(format!("{dispersed:064x}.json"));
             std::fs::write(
                 &candidate,
                 serde_json::to_string(&my_record).expect("serialize"),
             )
             .expect("plant mine misfiled");
+            // A fresh foreign planted AFTER mine: tmpfs lists newest first,
+            // so without this late foreign every candidate created after the
+            // original foreigns would ALWAYS enumerate before them and the
+            // hunt could never establish what it is named for, whatever the
+            // name.
+            let late_foreign = store_dir().join(format!("foreign-late-{dispersed:016x}.json"));
+            std::fs::write(
+                &late_foreign,
+                serde_json::to_string(&other).expect("serialize"),
+            )
+            .expect("plant late foreign");
             if first_entry() != candidate {
                 misfiled = Some(candidate);
                 break;
             }
             std::fs::remove_file(&candidate).expect("try another name");
+            std::fs::remove_file(&late_foreign).expect("try another name");
         }
         let misfiled = misfiled.expect(
             "no name of mine enumerated after a foreign record in 64 tries, so \

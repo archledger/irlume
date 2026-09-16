@@ -2247,6 +2247,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
             rate_window.count() as u32,
             rate_window.span_us(),
             rate_window.delivered_rate(),
+            rate_window.max_delta_us(),
             meets_floor,
             &sequence_observation,
             &timestamp_observation,
@@ -7368,6 +7369,11 @@ pub struct ContentionReport {
     pub concurrent: PairSample,
     /// A fresh RGB-then-IR pair captured after an all-error concurrent arm.
     pub trailing_sequential_control: bool,
+    /// The arms' ADR-0023 measurement records (evidence only; never a
+    /// capture preference), populated when an arm completed at least one
+    /// round, `None` otherwise.
+    pub sequential_measurement: Option<measurement::MeasurementRecord>,
+    pub concurrent_measurement: Option<measurement::MeasurementRecord>,
 }
 
 /// Fraction of the sequential brightness the concurrent path must retain.
@@ -8609,8 +8615,10 @@ where
         }
         report.trailing_sequential_control = true;
     }
-    journal_measurement_record("sequential", &report.sequential, rounds);
-    journal_measurement_record("concurrent", &report.concurrent, rounds);
+    report.sequential_measurement =
+        journal_measurement_record("sequential", &report.sequential, rounds);
+    report.concurrent_measurement =
+        journal_measurement_record("concurrent", &report.concurrent, rounds);
     Ok(report)
 }
 
@@ -9059,13 +9067,36 @@ pub fn pair_sample_measurement_record(
 /// Journals one arm's measurement record under debug: the acceptance verdict
 /// summary always, and the full deterministic serialization beside it so a
 /// support reader can audit every round. Journal-only by design in this
-/// slice: no wire or persistence changes.
-fn journal_measurement_record(arm: &'static str, sample: &PairSample, requested_rounds: usize) {
+/// Builds one arm's measurement record when the arm completed rounds.
+/// Returns `None` for an arm with no completed rounds.
+fn build_measurement_record(
+    arm: &'static str,
+    sample: &PairSample,
+    requested_rounds: usize,
+) -> Option<irlume_common::Result<measurement::MeasurementRecord>> {
     if sample.rounds == 0 {
-        return;
+        return None;
     }
-    match pair_sample_measurement_record(arm, sample, requested_rounds, "irlume camera-tune") {
-        Ok(record) => {
+    Some(pair_sample_measurement_record(
+        arm,
+        sample,
+        requested_rounds,
+        "irlume camera-tune",
+    ))
+}
+
+/// Journals one arm's measurement record under debug: the acceptance verdict
+/// summary always, and the full deterministic serialization beside it so a
+/// support reader can audit every round. Returns the record for the caller
+/// to surface through the report.
+fn journal_measurement_record(
+    arm: &'static str,
+    sample: &PairSample,
+    requested_rounds: usize,
+) -> Option<measurement::MeasurementRecord> {
+    match build_measurement_record(arm, sample, requested_rounds) {
+        None => None,
+        Some(Ok(record)) => {
             irlume_common::dlog!(
                 "tune measurement record ({}): accepted={} failures={} rounds=({} rgb, {} ir)",
                 arm,
@@ -9077,11 +9108,14 @@ fn journal_measurement_record(arm: &'static str, sample: &PairSample, requested_
             if let Ok(serialized) = serde_json::to_string(&record) {
                 irlume_common::dlog!("tune measurement record ({arm}): {serialized}");
             }
+            Some(record)
         }
-        Err(error) => {
+        Some(Err(error)) => {
             irlume_common::dlog!(
-                "tune measurement record ({arm}): not built ({error}); the arm's                  counters above remain authoritative"
+                "tune measurement record ({arm}): not built ({error}); the arm's \
+                 counters above remain authoritative"
             );
+            None
         }
     }
 }
@@ -9141,6 +9175,7 @@ fn accumulate(
         rgb_window.window_count(),
         rgb_window.window_span_us(),
         rgb_window.cumulative_drops(),
+        rgb_window.max_inter_frame_gap_us(),
         rgb_window.meets_floor(),
     ) {
         Ok(round) => into.rgb_rate_rounds.push(round),
@@ -9153,6 +9188,7 @@ fn accumulate(
         ir_window.window_count(),
         ir_window.window_span_us(),
         ir_window.cumulative_drops(),
+        ir_window.max_inter_frame_gap_us(),
         ir_window.meets_floor(),
     ) {
         Ok(round) => into.ir_rate_rounds.push(round),
@@ -13253,6 +13289,7 @@ mod tests {
                 30,
                 2_000_000,
                 (15, 2),
+                66_667,
                 true,
                 &sequence,
                 &timestamp,
@@ -13343,6 +13380,7 @@ mod tests {
                 30,
                 2_000_000,
                 if meets_floor { (15, 2) } else { (5, 1) },
+                66_667,
                 meets_floor,
                 &sequence,
                 &timestamp,
@@ -13906,6 +13944,8 @@ mod tests {
                 ..Default::default()
             },
             trailing_sequential_control: false,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         };
 
         // NexiGo HelloCam N930W: RGB collapses when its own IR sibling streams.
@@ -13993,6 +14033,8 @@ mod tests {
                 sequential: sample(seq),
                 concurrent: sample(concurrent),
                 trailing_sequential_control: concurrent.0 == 0 && concurrent.1 > 0,
+                sequential_measurement: None,
+                concurrent_measurement: None,
             }
         };
 
@@ -14034,6 +14076,8 @@ mod tests {
         );
         let no_control = ContentionReport {
             trailing_sequential_control: false,
+            sequential_measurement: None,
+            concurrent_measurement: None,
             ..unavailable.clone()
         };
         assert_eq!(
@@ -14063,6 +14107,8 @@ mod tests {
                 sequential: healthy.sequential.clone(),
                 concurrent: missing,
                 trailing_sequential_control: false,
+                sequential_measurement: None,
+                concurrent_measurement: None,
             };
             assert_eq!(
                 qualification_outcome(&report, 6, true),
@@ -14212,6 +14258,8 @@ mod tests {
                 ..Default::default()
             },
             trailing_sequential_control: true,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         };
         assert!(brio.concurrent_impossible());
         assert_eq!(brio.recommended_mode(), CaptureMode::Sequential);
@@ -14226,6 +14274,8 @@ mod tests {
             sequential: brio.sequential,
             concurrent: PairSample::default(),
             trailing_sequential_control: false,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         };
         assert!(!unattempted.concurrent_impossible());
     }
@@ -14314,12 +14364,12 @@ mod tests {
     fn measurement_record_accepts_a_strong_arm() {
         let mut sample = PairSample::default();
         for _ in 0..6 {
-            sample
-                .rgb_rate_rounds
-                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
-            sample
-                .ir_rate_rounds
-                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+            sample.rgb_rate_rounds.push(
+                measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+            );
+            sample.ir_rate_rounds.push(
+                measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+            );
             sample.rounds += 1;
         }
         let record = pair_sample_measurement_record("concurrent", &sample, 6, "test").unwrap();
@@ -14337,18 +14387,18 @@ mod tests {
     fn measurement_record_refuses_shortfalls_and_failed_rounds() {
         let mut sample = PairSample::default();
         for _ in 0..5 {
-            sample
-                .rgb_rate_rounds
-                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
-            sample
-                .ir_rate_rounds
-                .push(measurement::RateRound::from_window_facts(28, 1_000_000, 0, true).unwrap());
+            sample.rgb_rate_rounds.push(
+                measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+            );
+            sample.ir_rate_rounds.push(
+                measurement::RateRound::from_window_facts(28, 1_000_000, 0, 90_000, true).unwrap(),
+            );
             sample.rounds += 1;
         }
         // The sixth IR round missed the floor and one round errored outright.
-        sample
-            .ir_rate_rounds
-            .push(measurement::RateRound::from_window_facts(20, 1_000_000, 3, false).unwrap());
+        sample.ir_rate_rounds.push(
+            measurement::RateRound::from_window_facts(20, 1_000_000, 3, 625_000, false).unwrap(),
+        );
         sample.rounds += 1;
         sample.failed = 1;
         let record = pair_sample_measurement_record("sequential", &sample, 6, "test").unwrap();
@@ -14375,15 +14425,35 @@ mod tests {
     }
 
     #[test]
+    fn contention_report_carries_each_arms_measurement_record() {
+        let rgb = || Ok(frame(&[120; 4]));
+        let ir = || Ok((frame(&[20; 4]), stats(60.0)));
+        let report =
+            measure_contention_impl(rgb, ir, scripted_arm(&rgb, &ir), 2, &no_progress(), None)
+                .expect("probe");
+        let sequential = report
+            .sequential_measurement
+            .as_ref()
+            .expect("sequential record");
+        assert_eq!(sequential.method, "sequential");
+        assert!(report.concurrent_measurement.is_some());
+        // Deterministic serialization of the same completed record.
+        assert_eq!(
+            serde_json::to_string(sequential).unwrap(),
+            serde_json::to_string(sequential).unwrap()
+        );
+    }
+
+    #[test]
     fn measurement_record_omits_roles_without_completed_rounds() {
         let mut sample = PairSample {
             rounds: 1,
             failed: 6,
             ..PairSample::default()
         };
-        sample
-            .ir_rate_rounds
-            .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+        sample.ir_rate_rounds.push(
+            measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+        );
         let record = pair_sample_measurement_record("concurrent", &sample, 6, "test").unwrap();
         assert_eq!(record.rates.len(), 1);
         assert_eq!(record.rates[0].0, measurement::MeasuredRole::Ir);

@@ -17,6 +17,24 @@ All notable changes to irlume are documented here. This project adheres to
   cannot be relaxed after the fact. Data only: nothing here influences
   admission, amortization, or capture scheduling.
 
+- The delivered-rate window now observes and exposes its largest
+  inter-frame gap, carried through the frame provenance into ADR-0023
+  measurement records. A window that holds its floor on average can no
+  longer hide a single long stall; the v1 tune policy still declines to
+  judge gaps, so no behavior changes.
+
+- `irlume camera-tune --emit-record FILE` writes the completed arms'
+  measurement records as a JSON evidence artifact (0600, never overwriting),
+  for attaching to a camera-profile PR. Evidence only: nothing reads it
+  back and no capture behavior changes.
+
+- `irlume camera-tune --verify-record FILE` re-measures the camera and
+  prints per-arm drift against a reference evidence artifact (p50 direction
+  by exact rational comparison, max-gap change, rounds, and acceptance
+  verdicts), using the reference's round count so both runs judge the same
+  workload. The fresh artifact is temporary and removed after comparison;
+  nothing is installed or persisted.
+
 ### Fixed
 
 - The one-shot assessment path (used by `irlume identify` and the legacy

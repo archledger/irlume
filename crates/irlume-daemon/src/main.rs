@@ -715,6 +715,7 @@ fn main() {
                                     &ir_for_requalify,
                                     TUNE_DEFAULT_ROUNDS,
                                     ProbeStore::AutomaticIfAbsent,
+                                    None,
                                 ) {
                                     Ok(note) => jout_notice!(
                                         "irlumed: background requalification complete: {note}"
@@ -1996,6 +1997,8 @@ mod worker_engine {
                     ir_rate_rounds: Vec::new(),
                 },
                 trailing_sequential_control: true,
+                sequential_measurement: None,
+                concurrent_measurement: None,
             }
         }
 
@@ -4121,6 +4124,63 @@ fn probe_verdict_storable(
 ///
 /// One path for both callers (`camera-tune` and the enrollment probe), so the
 /// watchdog contract holds everywhere: the probe reports progress between
+/// Writes the ADR-0023 measurement-record evidence artifact for one tune:
+/// a JSON array with one record per completed arm, created 0600. Evidence
+/// only: this file is what a contributor attaches to a profile PR; it is
+/// never read back by the daemon and changes no capture behavior.
+///
+/// # Errors
+///
+/// Returns a human-readable error when the parent directory does not exist,
+/// the path resolves to a symlink, or the write fails.
+fn write_measurement_record_artifact(
+    path: &str,
+    report: &irlume_auth::ContentionReport,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let records: Vec<&irlume_auth::measurement::MeasurementRecord> = [
+        &report.sequential_measurement,
+        &report.concurrent_measurement,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if records.is_empty() {
+        return Err(format!("no completed arm to record; {path} not written"));
+    }
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".into());
+    if !std::path::Path::new(&parent).is_dir() {
+        return Err(format!(
+            "measurement record parent directory does not exist: {parent}"
+        ));
+    }
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(format!(
+            "refusing to overwrite through {path}: something already exists there"
+        ));
+    }
+    let serialized = serde_json::to_string_pretty(&records).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("cannot create {path} (0600): {e}"))?;
+    file.write_all(serialized.as_bytes())
+        .map_err(|e| format!("cannot write {path}: {e}"))?;
+    jout_info!(
+        "irlumed: measurement record evidence written to {path} ({} record(s)); \
+         evidence only, not a capture profile",
+        records.len()
+    );
+    Ok(())
+}
+
 /// captures, without which a long but healthy run reads as a wedged driver
 /// and systemd kills a working daemon (#141).
 fn run_capture_mode_probe(
@@ -4128,6 +4188,7 @@ fn run_capture_mode_probe(
     ir_dev: &str,
     rounds: usize,
     policy: ProbeStore,
+    emit_record_path: Option<&str>,
 ) -> Result<String, String> {
     let store = irlume_auth::QualificationStore::system();
     let automatic_baseline = if policy == ProbeStore::AutomaticIfAbsent {
@@ -4156,6 +4217,9 @@ fn run_capture_mode_probe(
     )
     .map_err(|e| e.to_string())?;
     let report = measurement.report();
+    if let Some(path) = emit_record_path {
+        write_measurement_record_artifact(path, report)?;
+    }
     let attempt = measurement.attempt().clone();
     // The AUTHORITATIVE verdict: what the store will hold. The message is
     // phrased from this, not from the retention-only recommendation (#586).
@@ -5222,6 +5286,7 @@ fn dispatch_scoped_session_inner(
                         &ir_dev,
                         TUNE_DEFAULT_ROUNDS,
                         ProbeStore::AutomaticIfAbsent,
+                        None,
                     )
                 },
                 || {
@@ -5247,7 +5312,10 @@ fn dispatch_scoped_session_inner(
                 },
             )
         }
-        Request::TuneCaptureMode { rounds } => {
+        Request::TuneCaptureMode {
+            rounds,
+            emit_record_path,
+        } => {
             // Holds the camera for tens of seconds and rewrites capture policy in
             // /etc/irlume, so the table makes it root-only like the other
             // camera-bearing management requests.
@@ -5258,7 +5326,13 @@ fn dispatch_scoped_session_inner(
                 engine.rgb_device().to_string(),
                 engine.ir_device().to_string(),
             );
-            match run_capture_mode_probe(&rgb_dev, &ir_dev, rounds, ProbeStore::ExplicitReplace) {
+            match run_capture_mode_probe(
+                &rgb_dev,
+                &ir_dev,
+                rounds,
+                ProbeStore::ExplicitReplace,
+                emit_record_path.as_deref(),
+            ) {
                 Ok(msg) => {
                     jout_info!("irlumed: {msg}");
                     Response::Ok(msg)
@@ -6562,6 +6636,8 @@ mod tests {
             sequential: sample(seq),
             concurrent: sample(conc),
             trailing_sequential_control,
+            sequential_measurement: None,
+            concurrent_measurement: None,
         }
     }
 
@@ -8037,7 +8113,10 @@ mod tests {
         },
         // The writing form. The dry run is an alternative shape, below.
         SetupIrEmitter => Request::SetupIrEmitter { dry_run: false },
-        TuneCaptureMode => Request::TuneCaptureMode { rounds: None },
+        TuneCaptureMode => Request::TuneCaptureMode {
+                rounds: None,
+                emit_record_path: None,
+            },
         CaptureModeStatus => Request::CaptureModeStatus,
         FaceSensorStatus => Request::FaceSensorStatus { user: Some(u()) },
         PreferencesStatus => Request::PreferencesStatus,
@@ -8377,7 +8456,13 @@ mod tests {
         let _g = env_lock();
         let stranger = peer(NOBODY);
         for (req, command) in [
-            (Request::TuneCaptureMode { rounds: None }, "camera-tune"),
+            (
+                Request::TuneCaptureMode {
+                    rounds: None,
+                    emit_record_path: None,
+                },
+                "camera-tune",
+            ),
             (
                 Request::CaptureEarMedian {
                     user: SAMPLE_USER.into(),

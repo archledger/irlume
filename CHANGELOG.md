@@ -17,6 +17,12 @@ All notable changes to irlume are documented here. This project adheres to
   cannot be relaxed after the fact. Data only: nothing here influences
   admission, amortization, or capture scheduling.
 
+- The delivered-rate window now observes and exposes its largest
+  inter-frame gap, carried through the frame provenance into ADR-0023
+  measurement records. A window that holds its floor on average can no
+  longer hide a single long stall; the v1 tune policy still declines to
+  judge gaps, so no behavior changes.
+
 ### Fixed
 
 - The one-shot assessment path (used by `irlume identify` and the legacy

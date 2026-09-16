@@ -2,207 +2,396 @@
 
 ## Status
 
-Proposed. Revised after an external design review (second revision basis:
-source verification at d4bc0f1's parent, 2026-09-16, plus the measured
-Windows observation below). Implementation phased; Phase 1 gates include
-the acceptance-test table at the end. Numbered after ADR-0023; independent
-of ADR-0022's acceptance.
+Proposed. Revised 2026-09-16 following design review. Historical source-review
+baseline: `d4bc0f1` (the parent of `bcc26a5`), as identified in the preceding
+review. The Windows observation below is maintainer-reported. This revision
+specifies intended behavior; it does not establish implementation or
+independent hardware validation.
+
+Implementation is phased. Secondary-camera authentication remains disabled
+until the Phase 1 invariants and Phase 2 integration gates pass. Numbered
+after ADR-0023; independent of ADR-0022's acceptance.
 
 ## Context
 
-An enrollment is bound to ONE physical camera pair: `CameraBinding { rgb,
-ir }` captures the pair's device identities at enroll time, and every
-authentication verifies the live cameras match exactly (anti-swap).
-`FaceScan` records no camera origin; scan selection filters by recognizer
-embedding space, not camera; `pitch_neutral` and the personalized IR
-ratio floor (`ir_center_edge_ratio_floor`, the 75%-of-minimum over ALL
-scans of ALL profiles) are pooled across everything today. The enrollment
-serialization applies no `deny_unknown_fields`, so unknown fields are
-silently ignored by older readers - which is exactly why naive additive
-fields cannot carry camera isolation (see the storage decision).
+At the reviewed baseline, an enrollment's recorded camera binding contains
+one role-labelled pair, `CameraBinding { rgb, ir }`. `FaceScan` has no camera
+origin; scan selection filters by recognizer embedding space rather than
+camera. `pitch_neutral` and the personalized IR ratio floor
+(`ir_center_edge_ratio_floor`, 75% of the minimum eligible ratio across
+profiles) are not partitioned by camera. Legacy records can lack a usable
+binding; their migration requires an explicit provenance rule.
 
-On the tested Windows configuration (2026-09-15 ThinkPad session),
-enrollment performed using one camera permitted authentication using
-another. That is recorded as a workflow observation - what it says about
-Windows' internal template representation, policy generality, or spoof
-resistance is not established. What it motivates here is the workflow:
-one account, a laptop camera and a desk camera, no re-enrollment dance.
+The reviewed enrollment readers do not reject unknown fields. Adding
+secondary scans to their existing arrays would let an old reader score
+those scans without understanding their camera tags. An old writer could
+subsequently discard the tags. Additive parsing compatibility therefore
+cannot establish camera isolation.
+
+On the tested Windows configuration (2026-09-15 ThinkPad session), enrollment
+performed using one camera permitted authentication using another. This is
+a workflow observation, not evidence of Windows' internal template
+representation, policy generality, or spoof resistance. It motivates one
+account using laptop and desk cameras without replacing its enrollment.
 
 ## Decision
 
-### 1. Storage: secondary cameras live where pre-multi-camera binaries
-never read
+### 1. Storage: keep the legacy-visible enrollment primary-only
 
-Additive fields inside today's enrollment file are REJECTED as the
-compatibility mechanism: an old binary verifies only the legacy pair (so
-secondary cameras cannot open), but its matching selects scans by
-embedding space and would score a primary-camera probe against secondary
-cameras' scans, and an old writer's round trip silently drops per-scan
-camera tags and reattributes those scans to the primary. Both holes are
-properties of the shipped readers, not of the new code.
+The existing enrollment file remains the primary camera group's complete
+store: primary scans, binding, and primary-derived state. Secondary bindings,
+scans, calibration, and derived state live in a separate, versioned store
+outside the enrollment discovery namespace used by supported legacy
+readers. The new implementation composes validated views; it never writes
+secondary templates into legacy-visible arrays or calibration slots.
 
-Instead: the existing enrollment file remains the PRIMARY camera group's
-complete store - primary scans, primary binding, primary-derived state -
-exactly as today, so old binaries read a genuinely single-camera
-enrollment. Multi-camera data (secondary groups: their bindings, scans,
-calibration, derived state) lives in a separate store the old code never
-opens. The new implementation composes the two views. Contract:
+The exact storage location and all supported legacy discovery paths must
+be verified in Phase 1. A different filename alone is not proof that an
+older reader, enumerator, or exporter will never open the store.
 
-- Legacy single-camera enrollments remain readable by the new
-  implementation (imported as the primary group with an immutable
-  legacy-group reference).
-- Pre-multi-camera readers see only primary-camera data and state;
-  secondary-camera authentication on them fails closed with password
-  fallback intact.
-- Old-writer round trips can only ever touch primary data; secondary data
-  is untouched by construction.
-- The multi-camera store carries its own format version; the new reader
-  refuses unsupported versions rather than partially loading.
+#### 1.1 Secondary activation depends on the primary snapshot
 
-### 2. Camera groups: the authorization unit is the complete role-labelled
-pair
+Physical separation prevents template mixing; it does not establish that
+secondary authorization remains valid after the primary enrollment changes.
 
-A group is a stable record of the exact `{ rgb identity, ir identity }`
-pair, each side the `device_identity` string with its role. Scans
-reference their group by an immutable group reference that resolves to
-that complete pair - never a bare single-device string (two authorized
-pairs sharing one RGB node must keep separate IR calibration domains,
-and vice versa). Authentication requires the live pair to match a group's
-COMPLETE pair: enrolling (RGB-A, IR-A) and (RGB-B, IR-B) never authorizes
-the hybrid (RGB-A, IR-B).
+The secondary store records its owner, immutable group/profile references,
+state generation, and a protected binding to the exact primary-store
+snapshot against which it was authorized. For the initial implementation,
+that binding includes a cryptographic digest of the actual primary-file
+bytes. It is not just a username, profile display name, timestamp, or camera
+model. The primary and secondary stores are read under the account's shared
+state lock and validated together.
 
-Legacy scans without provenance are attributed only through an immutable
-legacy-group reference established at import; reordering, promoting, or
-removing groups never reattributes retained scans. A legacy enrollment
-with no usable binding preserves its scans without invented provenance
-and requires attended migration or fresh capture before multi-camera
-authentication. For new records, a missing or unresolvable group
-reference is invalid data, not "use the primary".
+A missing, unreadable, replaced, or digest-mismatched primary store makes
+secondary groups inactive. Their data is preserved for diagnosis and
+explicit recovery; it is not automatically rebound, reattributed, or
+reauthorized. Even a semantically equivalent legacy rewrite may invalidate
+the digest. That conservative availability cost is accepted.
 
-### 3. A camera-scoped enrollment view feeds scoring and calibration
+A new-code mutation may preserve secondary authorization across an expected
+primary change only through the authorized transaction contract in §4. It
+must preserve or explicitly update profile associations and publish a new
+snapshot binding. Merely observing changed primary bytes never authorizes
+this update.
 
-Rather than hoping every caller remembers an optional filter, the
-implementation exposes a validated view of the enrollment scoped to
-(profile, camera group, compatible pipeline), consumed by matching and
-calibration. Required scopes:
+A deliberately retired primary group uses the explicit empty-anchor
+representation described in §4. It is not inferred from an unexpectedly
+missing file.
 
-| Derived state or operation | Scope |
+#### 1.2 Protection, parsing, and failure behavior
+
+The secondary store receives at least the primary store's applicable
+confidentiality, integrity, ownership, and permission protections. It uses
+the existing account template-key lifecycle, not a separate authentication
+credential. An encrypted enrollment cannot become plaintext because a key
+is unavailable. Owner, store type, format version, snapshot binding, and
+authorization-bearing records are validated as part of the protected state.
+
+Unsupported versions or invalid supported-version records reject the
+secondary store as a whole. Unknown fields, duplicate identifiers,
+unresolvable references, invalid dimensions, and exceeded resource limits
+are not partially accepted. Such a store is never treated as an empty file
+that a subsequent add operation may silently overwrite.
+
+An absent or rejected secondary store cannot authorize a secondary group.
+The independently valid primary enrollment may remain usable under its
+existing requirements. Failure does not silently redirect an attempt already
+pinned to a secondary group. Diagnostics distinguish absent, incompatible,
+corrupt, and stale-secondary-state conditions without exposing templates.
+
+#### 1.3 Downgrade guarantees and limitations
+
+Supported old readers see only primary-camera templates and derived state.
+Old writers cannot rewrite secondary data, but their primary changes can
+invalidate secondary activation. On re-upgrade, preserving secondary bytes
+is not equivalent to preserving their authorization.
+
+Compatibility is claimed only for binaries and operations exercised in the
+acceptance matrix. Legacy tools do not implement complete multi-camera
+account deletion, profile deletion, replacement, backup, or recovery. Those
+operations must use the new lifecycle implementation, or an explicitly
+documented migration/reset procedure covering both stores.
+
+A primary digest detects a different snapshot, not every historical write.
+Restoring byte-identical old snapshots is not detectable from that digest
+alone. This ADR does not promise irreversible revocation against external
+backup rollback or trusted-host state restoration. Supported restore flows
+must explicitly authorize restoration and validate both stores; they must
+not silently merge residual secondary state into a restored primary.
+
+### 2. Camera groups: authorize the complete role-labelled pair
+
+A group has an immutable identifier and the exact
+`{ rgb identity, ir identity }` pair, using the existing `device_identity`
+representation with explicit roles. Scans reference that group, not a bare
+single-device identity, display name, or mutable list position. Profile
+associations likewise cannot be recovered by matching a reused display name.
+
+Authentication through a pair requires that complete pair. Enrolling
+`(RGB-A, IR-A)` and `(RGB-B, IR-B)` never authorizes `(RGB-A, IR-B)`.
+Shared endpoints do not merge groups or their calibration domains. Missing
+identities are not wildcards; an ambiguous group resolution refuses the
+attempt rather than selecting a group by its biometric score.
+
+Legacy primary scans are attributed only through an unambiguous recorded
+binding and an immutable legacy-group reference. Reordering, removing, or
+explicitly promoting groups never changes retained scans' origin. A legacy
+enrollment without usable binding retains its data without invented
+provenance and requires attended migration or fresh capture before it can
+participate in multi-camera authentication.
+
+New secondary records with missing or unresolvable group references are
+invalid. The legacy primary layout may omit per-scan references because its
+entire store has one validated camera scope; that exception does not extend
+to new secondary records.
+
+This ADR creates no new single-role fallback. Any already-supported
+role-restricted authentication path needs an explicit, tested secondary-group
+resolution rule preserving its existing requirements. Until that rule is
+implemented, secondary-group authentication on that path remains disabled;
+this does not redefine the existing primary path.
+
+### 3. Camera-scoped views feed scoring and calibration
+
+A validated camera-scoped enrollment view enforces group and pipeline
+compatibility before exposing candidates. It provides profile-scoped views
+where the existing algorithm requires them. Matching, calibration, and
+derived-state consumers use these views rather than optional caller-side
+filters. Diagnostic accessors that expose unfiltered data are not available
+as authentication inputs.
+
+| Derived state or operation | Required scope |
 |---|---|
-| RGB and IR template selection | active group + existing recognizer/IR-space/dimension checks |
-| Calibration fitting and retrieval | profile, group, recognizer/pipeline, scan revision (the per-recognizer calibration map extends its key with the group; the legacy mirror slot stays primary-only) |
-| Personalized IR ratio floor | only the active group's applicable scans (today it pools every scan of every profile) |
-| Pitch neutral | per (profile, group); legacy pooled behavior only for unattributed legacy scans |
-| Centroids and template aggregates | built after group and embedding-space filtering |
-| Threshold-scaling counts | the candidates the scoring arm actually evaluates |
-| Readiness and limits | per (profile, group, pipeline); bounded overall storage |
+| RGB and IR template selection | Active group plus existing recognizer, IR-space, and dimension checks |
+| Calibration fitting and retrieval | Profile, group, recognizer/pipeline, and scan revision; the legacy mirror stays primary-only |
+| Personalized IR ratio floor | Only the active group's policy-applicable scans; existing profile-aggregation semantics remain explicit |
+| Pitch neutral | Per profile and group; legacy aggregation cannot include secondary data or supply a new group's calibration |
+| Centroids and template aggregates | Constructed after group and embedding-space filtering |
+| Threshold-scaling counts | The candidates each scoring arm actually evaluates, retaining that arm's existing count semantics |
+| Readiness and limits | Per profile, group, and compatible pipeline, with explicit account-wide resource bounds |
 
-A new group bootstraps with the existing fresh-enrollment defaults (no
-borrowed primary calibration). Eligibility predicates are stated
-explicitly: the capture target (DEFAULT_ENROLL_SCANS quality-gated
-scans), the calibration-fit minimum (MIN_FIT_PAIRS), and authentication
-readiness (compatible-template availability) are distinct - a group with
-ten scans but too few compatible IR pairs is not a fully ready group.
+Scans and cached derived state carry compatible revisions. Adding or removing
+scans invalidates or replaces affected calibration and aggregates; cached
+state from another group, model, or scan revision is never a fallback.
+The calibrated IR and personalized ratio-floor consumers are in scope, not
+just embedding selectors.
 
-### 4. Adding a camera is a credential-management operation
+A new group starts with existing fresh-enrollment defaults. It borrows no
+primary calibration, pitch neutral, or personalized signal floor.
+`DEFAULT_ENROLL_SCANS` (10 accepted quality-gated scans at the reviewed
+baseline) is the add-camera target. `IMPROVE_SCANS` remains for improving an
+established group, not bootstrapping a new one.
 
-Adding a group requires fresh authorization to modify the target
-account's biometric enrollment, independent of the proposed camera (the
-new camera never authorizes its own addition), enforced by the daemon and
-scoped to target account, profile, exact group, and operation. Attended
-capture and quality checks are additional requirements, not substitutes.
-The boundary is described in policy terms (equivalent to modifying
-biometric credentials); whether the CLI uses an elevated invocation or
-the TUI a graphical prompt is an implementation detail that must satisfy
-the same daemon-enforced policy. Machine-wide camera configuration
-(set-cameras) and account enrollment authorization stay distinct.
+The capture target, `MIN_FIT_PAIRS`, and authentication-readiness predicates
+are distinct. Ten scans do not by themselves establish usable IR evidence
+or readiness for every authentication mode. The implementation defines and
+tests readiness for each supported mode using compatible data from the
+relevant profile/group only. Lack of calibration follows the existing
+mode's policy; it neither borrows another group's fit nor invents a new
+threshold policy.
 
-Publication is atomic: new scans, binding, calibration, and readiness
-become active together, via the existing publication and locking
-facilities, with a revision check - capture runs against a defined
-enrollment revision, and a conflicting mutation during the attended
-capture never silently overwrites newer state. Removal removes the
-group's binding, scans, and derived state together without reassigning
-anything; it invalidates in-flight use so no stale cached group can
-issue a new grant. Pair selection during the flow is transaction-scoped
-(the operator's default pair selection is not silently changed by an
-interrupted flow); making a new pair the default is an explicit
-subsequent choice.
+Existing per-comparison template limits retain their meaning. Group counts,
+profile references, total templates, serialized sizes, and calibration sizes
+also have explicit account-wide bounds fixed and tested in Phase 1.
+
+### 4. Adding, removing, and restoring groups are credential operations
+
+Adding a group requires fresh authorization to modify the target account's
+biometric enrollment, independent of the proposed camera. The daemon scopes
+that authorization to the account, profile, exact group, and operation.
+The new camera never authorizes its own addition. Attended capture and
+quality checks supplement authorization; they do not replace it.
+
+The CLI and TUI invoke the same daemon-enforced policy. Whether authorization
+is presented through an elevated invocation or an interactive prompt is not
+the security boundary. Machine-wide `set-cameras` configuration remains
+separate from account-specific enrollment authorization.
+
+#### 4.1 Publication and concurrent mutation
+
+Capture uses a defined enrollment revision and transaction-scoped camera
+selection. Before publication, the daemon revalidates authorization,
+identity, source revision, profile association, and readiness. Cancellation,
+hotplug, insufficient evidence, or a conflicting mutation does not partially
+activate a group or overwrite newer state.
+
+Adding or removing a secondary group normally replaces only the secondary
+store. Its scans, binding, derived state, and activation record are published
+together. A mutation affecting both stores requires an explicit
+cross-store commit and crash-recovery protocol. Two individually atomic
+file writes are not, by themselves, one atomic enrollment transaction.
+
+Phase 1 must specify that protocol using the account's shared lock,
+snapshot/generation checks, and durable publication. Readers may expose a
+coherent committed state or refuse affected secondary groups; they may not
+combine mismatched generations. A crash may cost secondary availability,
+but cannot activate a binding against the wrong primary or silently restore
+revoked authorization. Recovery preserves uncertain state for explicit
+resolution rather than guessing. Success is reported only after the
+required durable commit; ambiguous publication is reported as such.
+
+Interrupted capture does not change the operator's default pair. Making a
+newly enrolled pair the default is an explicit subsequent operation.
+
+#### 4.2 Removal, replacement, and revocation
+
+Removing a secondary group deletes its active binding, scans, and derived
+state together. Removing an account-level face profile removes that
+profile's data and authorization across groups, not only in the primary
+file. Replacement and account reset likewise cover both stores and the
+applicable shared credential state.
+
+Removing the primary never silently promotes another group or reattributes
+its scans. To retain secondary authentication, the new implementation must
+publish an intentionally empty, legacy-readable primary anchor plus the
+corresponding secondary snapshot binding. Actual supported legacy readers
+must be proven unable to grant from that empty anchor. Unexpected primary
+absence is not this state. This operation is unavailable until its
+cross-store and legacy-reader tests pass.
+
+Promotion is a separate explicitly authorized operation, not a list reorder.
+It must produce a legacy-visible store containing only the promoted group's
+own scans and derived state while preserving immutable group references.
+It is not exposed unless its migration and interruption semantics are
+tested; it is not required to implement secondary addition and removal.
+
+Authentication validates its pinned enrollment generation at the final
+grant-decision boundary, serialized with revocation. Once removal commits,
+no subsequent grant decision may use the removed group or stale cached
+state. Removal cancels or invalidates in-flight use; it does not claim to
+undo a grant already issued or terminate an existing login session.
+
+#### 4.3 Backup, recovery, and keys
+
+Managed backup and recovery cover both stores and their snapshot relationship.
+A primary-only backup is identified as incomplete for multi-camera recovery.
+Restoring it leaves residual secondary data inactive rather than attaching
+that data automatically. Restoring secondary authorization requires the
+account's credential-management authorization and an explicitly validated
+restore transaction.
+
+Template-key rotation, recovery, account replacement, and deletion must not
+leave a secondary store active under stale ownership or key context. Key
+failure never creates a replacement key or a plaintext downgrade as an
+implicit repair. The retained-state and error behavior is tested alongside
+normal enrollment publication.
 
 ### 5. Pair selection and attempt lifecycle
 
-An explicitly configured enrolled pair takes precedence when available
-and eligible; otherwise an explicit automatic-selection policy chooses a
-complete eligible enrolled pair in a stable documented order
-(legacy-group first). The pair is pinned before scoring: no silent
-movement to another camera after a mismatch or PAD refusal, no combining
-evidence across pairs in one attempt, and all camera paths share the
-existing account-level attempt budget, retry state, and deadline
-(availability fallback is not "try every camera until one accepts").
+An explicitly configured enrolled pair takes precedence when available and
+eligible for the requested authentication mode. Otherwise, an explicitly
+enabled automatic-selection policy chooses a complete eligible pair in a
+stable documented order: active legacy primary first, then a canonical order
+of enrolled pair identities. An explicit preference is not silently
+subordinated to the number of scans.
+
+Selection and enrollment scope are pinned before capture and retained through
+the camera-operation lease and final decision. Hotplug, device re-resolution,
+or configuration changes cannot redirect the attempt or substitute another
+group's evidence.
+
+There is no automatic movement to another pair after a mismatch or PAD
+refusal, and no pooling of evidence across pairs. All paths share the
+account-level attempt budget, retry state, and deadline. Availability
+fallback before an attempt is not permission to try every camera until one
+accepts. A new attempt follows the same shared limits.
 
 ### 6. Claims, precisely
 
-Exact matching against explicitly enrolled camera-group identities is
-preserved, under the existing device-identity representation
-(vid:pid[:serial]) and trusted-host assumptions: this ADR introduces no
-cryptographic hardware attestation, and where a serial is absent the
-identity cannot distinguish same-model units - a pre-existing property
-restated here, not a regression. More authorized cameras mean more
-authorized capture paths; no claim is made that aggregate biometric error
-rates are unchanged. The rejected separate-enrollments alternative is
-rejected for UX and state-management reasons (one credential and retry
-state per account), not because N secrets are unavoidable.
+Exact membership checking is preserved under the existing identity
+representation (`vid:pid[:serial]`) and trusted-host assumptions. This ADR
+introduces no cryptographic hardware attestation. Without a serial, that
+identity alone cannot distinguish same-model physical units; this is an
+existing representation limit, not a new guarantee.
 
-### 7. Thresholds: formulas yes, policy no
+More authorized cameras mean more authorized capture paths. No claim is made
+that aggregate biometric error rates or spoof resistance are unchanged.
+Downgrade claims concern the tested primary-only reader behavior and the
+explicit mutation limitations in §1, not universal lifecycle compatibility
+with every historical binary.
 
-Computing the EXISTING threshold formulas from camera-filtered candidate
-counts is part of Phase 1 (each count keeps the meaning its scoring arm
-already assigns it). Introducing camera-specific biometric or PAD
-threshold POLICY is out of scope: it would require a separate decision
-and security evaluation (genuine users, impostors, presentation attacks,
-capture conditions). ADR-0023 capture evidence may describe experimental
-conditions; it does not authorize threshold changes.
+The separate-enrollments alternative is rejected for UX and state-management
+reasons: one account credential and shared retry state. It is not rejected
+on the claim that multiple secrets would be unavoidable.
+
+### 7. Thresholds: existing formulas, not new policy
+
+Computing existing threshold formulas from camera-filtered candidate counts
+is part of Phase 1. Each count retains the meaning assigned by its scoring
+arm. No group borrows another group's candidates to satisfy readiness or
+alter its counts.
+
+Camera-specific biometric or PAD threshold policy is out of scope. It
+requires a separate decision and security evaluation covering genuine
+users, impostors, presentation attacks, and relevant capture conditions.
+ADR-0023 capture evidence can describe those conditions; it does not
+authorize threshold changes, enroll hardware, or substitute local
+qualification or live runtime evidence.
 
 ## Phasing
 
-- Phase 1: the storage boundary (primary store + multi-camera store with
-  version refusal), group records, camera-scoped view, per-group
-  derived state, and the acceptance tests below - no UX.
-- Phase 2: the add/remove flows, authorization, atomic publication, and
-  status surfaces.
-- Phase 3: none. (Formerly "per-camera thresholds": removed per §7.)
+- **Phase 1: core invariants, no new user-facing activation.** Implement the
+  storage boundary and activation binding; the cross-store lifecycle and
+  recovery contract; group records; scoped views and derived state;
+  daemon authorization and mutation primitives; selection pinning; and
+  revocation/grant coordination. Pass the applicable acceptance tests below.
+  Authorization and atomicity are not deferred merely because the UI is.
+- **Phase 2: integrated flows and release gates.** Expose
+  `irlume enroll --add-camera`, supported removal operations, and CLI/TUI
+  parity through the tested primitives. `status`, `doctor`, and `profiles`
+  distinguish enrolled, connected, selected, ready, stale, and incompatible
+  groups, with per-group counts and calibration state. Complete end-to-end
+  authorization, lifecycle, downgrade, and hardware integration tests before
+  enabling secondary-camera authentication in a release.
+- **Phase 3: none.** Per-camera biometric threshold policy remains outside
+  this ADR.
 
-## Acceptance tests (Phase 1 gates)
+## Acceptance tests
+
+The software invariants are Phase 1 gates. Phase 2 reruns them through the
+actual user-facing flows and adds hardware integration; unit-test success
+alone does not authorize shipment.
 
 | Boundary | Required result |
 |---|---|
-| Actual legacy reader and writer | Secondary templates and derived state never affect primary-camera authentication on old binaries; downgrade/re-upgrade cannot erase provenance or reattribute scans |
-| Exact pair membership | Enrolling pairs A and B never authorizes a hybrid of their endpoints |
-| Camera and pipeline isolation | Foreign-group scans cannot influence scores, centroids, calibration, ratio floors, or threshold counts |
-| Legacy migration and primary removal | Reordering or removing the primary never changes retained scans' origin; ambiguous provenance is not invented |
-| Per-profile/group readiness | Incomplete or incompatible secondary groups cannot borrow another group's scans to satisfy eligibility |
-| Authorization and atomicity | Unauthorized, cancelled, interrupted, or conflicting additions never partially expand the binding set |
-| Selection and attempt lifecycle | Explicit preference honored; selection pinned; hotplug or configuration changes cannot silently redirect an attempt |
-| Removal and shared budgets | Removed groups cannot grant through stale state; camera switching does not reset retry limits or deadlines |
+| Actual supported legacy readers and writers | Secondary data never enters legacy matching, calibration, or discovery; primary round trips cannot erase secondary provenance |
+| Legacy primary mutation | Changed, deleted, replaced, or incompatible primary state cannot leave secondary groups implicitly authorized; equivalent rewrites may conservatively mark them stale |
+| Version, protection, and activation binding | Missing keys, wrong owner/context, unsupported versions, invalid references, corrupt records, or snapshot mismatch never activate secondary data or trigger destructive automatic repair |
+| Exact pair membership | Enrolling pairs A and B never authorizes a hybrid; shared endpoints never merge calibration groups |
+| Camera and pipeline isolation | Foreign-group data cannot influence scores, centroids, calibration, ratio floors, pitch, readiness, or threshold counts |
+| Legacy migration and primary retirement | No invented provenance; no reattribution on reorder/removal; the intentional empty primary anchor cannot grant on supported old readers |
+| Per-profile/group readiness and limits | Incomplete groups borrow no evidence; count semantics and all storage/calibration bounds hold |
+| Authorization and identity | Unauthorized, wrong-account, wrong-profile, expired, interrupted, or device-changed additions cannot activate a group |
+| Cross-store publication and recovery | Fault injection at publication, synchronization, and restart boundaries yields coherent committed state or refusal, never mixed-generation authorization |
+| Profile deletion, replacement, and restore | Account/profile lifecycle operations cover secondary authorization; primary-only restore does not silently reactivate residual groups |
+| Selection and attempt lifecycle | Explicit preference is honored; selection is pinned before capture; hotplug/configuration changes cannot redirect an attempt |
+| Removal and shared budgets | No post-revocation grant decision uses a stale group; switching cameras does not reset limits or deadlines |
 
-Hardware integration then verifies the laptop-plus-desk workflow: both
-cameras connected, disconnect/reconnect, enrollment cancellation, and
-the applicable RGB/IR authentication modes.
+Hardware integration verifies laptop-plus-desk operation, both pairs
+connected, disconnect/reconnect, interrupted enrollment, and each supported
+RGB/IR authentication mode. Modes lacking a tested secondary-group resolver
+remain disabled for secondary authentication.
 
 ## Consequences
 
-- Positive: the laptop-plus-desk workflow with one credential and retry
-  state; honest per-camera calibration; exact-pair authorization;
-  fail-closed interaction with every pre-multi-camera binary.
-- Costs: a second enrollment store and a synchronization contract; the
-  camera-scoped view touches every scoring and calibration consumer;
-  the add/remove flows are new authorization-bearing surface.
-- Risks and mitigations: group mixing (prevented by the validated view);
-  sparse secondary sets weakening security (per-group floors and the
-  ten-scan target); storage growth (bounded overall limits); downgrade
-  confusion (the storage boundary makes old-binary behavior provably
-  primary-only).
-- Alternatives considered: Windows-style sensor-agnostic templates
-  (rejected: crosses the exact-pair authorization line this design
-  keeps); N user-facing enrollments (rejected for UX and state
-  management); additive in-file fields (rejected: verified to leak
-  secondary templates into old readers' matching).
+- **Positive:** laptop-plus-desk operation with one account credential and
+  retry state; camera-specific calibration; exact-pair authorization;
+  genuinely primary-only views for supported legacy readers.
+- **Costs:** a protected second store, conservative primary-snapshot
+  invalidation, explicit cross-store recovery and lifecycle handling, and
+  scoped access across scoring/calibration consumers. Existing atomic-write
+  helpers are building blocks, not proof of multi-file atomicity.
+- **Risks and mitigations:** mixing is blocked by scoped views; stale
+  secondary authority by snapshot binding and explicit lifecycle rules;
+  sparse groups by capture/readiness requirements; unbounded state by
+  resource limits; downgrade confusion by tested compatibility and visible
+  stale-state diagnostics. External snapshot rollback remains subject to
+  the stated trusted-host and recovery limitations.
+- **Alternatives:** sensor-agnostic reuse is not selected because this design
+  deliberately keeps explicit pair authorization and camera-scoped evidence;
+  separate user-facing enrollments are rejected for UX/state management;
+  additive secondary fields in legacy arrays are rejected because reviewed
+  old readers would ignore their isolation metadata. A new format rejected
+  by old readers remains the simpler fallback if the two-store lifecycle
+  contract cannot meet its tests; it must not be replaced by an unsafe
+  compatibility shortcut.

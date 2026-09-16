@@ -108,27 +108,33 @@ pub struct RateRound {
 
 impl RateRound {
     /// Records a round from the production window facts: the delta count,
-    /// the timestamp span, the ring's cumulative drops, and the production
-    /// floor verdict. Stage timers and per-gap observations are `None`
-    /// because the production evidence does not carry them.
+    /// the timestamp span, the ring's cumulative drops, the largest
+    /// inter-frame gap the window observed, and the production floor
+    /// verdict. The stage timer stays `None` because no production path
+    /// times the fill separately from the capture yet.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidRounds`] when the deltas or span are zero.
+    /// Returns [`Error::InvalidRounds`] when the deltas or span are zero or
+    /// the observed gap exceeds the span.
     pub fn from_window_facts(
         deltas: u32,
         timestamp_span_us: u64,
         cumulative_drops: u64,
+        max_inter_frame_gap_us: u64,
         meets_floor: bool,
     ) -> Result<Self, Error> {
         if deltas == 0 || timestamp_span_us == 0 {
+            return Err(Error::InvalidRounds);
+        }
+        if max_inter_frame_gap_us > timestamp_span_us {
             return Err(Error::InvalidRounds);
         }
         Ok(Self {
             deltas,
             timestamp_span_us,
             wall_clock_us: None,
-            max_inter_frame_gap_us: None,
+            max_inter_frame_gap_us: Some(max_inter_frame_gap_us),
             continuity_errors: u32::try_from(cumulative_drops).unwrap_or(u32::MAX),
             meets_floor,
         })
@@ -455,7 +461,7 @@ mod tests {
         drops: u64,
         meets_floor: bool,
     ) -> RateRound {
-        RateRound::from_window_facts(deltas, span_us, drops, meets_floor)
+        RateRound::from_window_facts(deltas, span_us, drops, span_us / 2, meets_floor)
             .expect("valid window facts")
     }
 
@@ -648,9 +654,13 @@ mod tests {
         assert_eq!(round.continuity_errors, 2);
         assert!(!round.meets_floor);
         assert_eq!(round.wall_clock_us, None);
-        assert_eq!(round.max_inter_frame_gap_us, None);
+        assert_eq!(round.max_inter_frame_gap_us, Some(2_174_000 / 2));
         assert_eq!(
-            RateRound::from_window_facts(0, 1_000, 0, true),
+            RateRound::from_window_facts(0, 1_000, 0, 0, true),
+            Err(Error::InvalidRounds)
+        );
+        assert_eq!(
+            RateRound::from_window_facts(30, 1_000, 0, 2_000, true),
             Err(Error::InvalidRounds)
         );
     }
@@ -664,7 +674,9 @@ mod tests {
             max_inter_frame_gap_us: Some(100_000),
             require_all_rounds_meet_floor: true,
         };
-        let rounds = vec![round_without_stage_observation(30, 1_000_000, 0, true)];
+        let mut unobserved = round_without_stage_observation(30, 1_000_000, 0, true);
+        unobserved.max_inter_frame_gap_us = None;
+        let rounds = vec![unobserved];
         let record = record_with(policy, &rounds);
         let verdict = record.evaluate_acceptance().unwrap();
         assert!(!verdict.accepted);

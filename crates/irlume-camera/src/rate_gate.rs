@@ -228,6 +228,19 @@ impl RateWindow {
             .sum()
     }
 
+    /// The largest single inter-frame gap held in the window, in
+    /// microseconds. Zero when the window holds no delta yet. This is the
+    /// per-window stall observation the ADR-0023 measurement records carry:
+    /// a window can hold its floor on average while still containing one
+    /// long gap, and the average alone hides exactly that.
+    #[must_use]
+    pub(crate) fn max_delta_us(&self) -> u64 {
+        (0..self.len)
+            .map(|i| self.deltas[(self.head + i) % self.capacity])
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Exact delivered rate as a reduced `(numerator, denominator)` fraction in
     /// frames per second: `count * 1_000_000 / span_us`, reduced for reporting.
     #[must_use]
@@ -585,6 +598,18 @@ mod tests {
         }
         // 30 * 133_333 = 3_999_990 us, slightly faster than 7.5 fps -> passes.
         assert!(rgb.meets_floor(RGB_FLOOR_NUM, RGB_FLOOR_DEN, DEFAULT_TOLERANCE_PERCENT));
+    }
+
+    #[test]
+    fn max_delta_reports_the_largest_held_gap_not_the_average() {
+        let mut window = RateWindow::with_capacity(4);
+        window.observe_success(1_000).unwrap();
+        window.observe_success(35_000).unwrap();
+        window.observe_success(36_000).unwrap();
+        window.observe_success(662_000).unwrap();
+        // Deltas held: 34_000, 1_000, 626_000. The average hides the stall;
+        // the max names it.
+        assert_eq!(window.max_delta_us(), 626_000);
     }
 
     #[test]

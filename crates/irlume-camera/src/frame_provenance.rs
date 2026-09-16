@@ -1014,6 +1014,7 @@ pub struct DeliveredRateEvidence {
     window_span_us: u64,
     delivered_num: u64,
     delivered_den: u64,
+    max_inter_frame_gap_us: u64,
     meets_floor: bool,
     sequence_gap: u32,
     cumulative_drops: u64,
@@ -1034,6 +1035,7 @@ impl DeliveredRateEvidence {
         window_count: u32,
         window_span_us: u64,
         delivered: (u64, u64),
+        max_inter_frame_gap_us: u64,
         meets_floor: bool,
         sequence: &SequenceObservation,
         timestamp: &TimestampObservation,
@@ -1051,6 +1053,7 @@ impl DeliveredRateEvidence {
             window_span_us,
             delivered_num: delivered.0,
             delivered_den: delivered.1,
+            max_inter_frame_gap_us,
             meets_floor,
             sequence_gap: sequence.gap(),
             cumulative_drops: sequence.cumulative_drops(),
@@ -1099,6 +1102,13 @@ impl DeliveredRateEvidence {
     #[must_use]
     pub const fn delivered(&self) -> (u64, u64) {
         (self.delivered_num, self.delivered_den)
+    }
+
+    /// The largest single inter-frame gap inside this window, in
+    /// microseconds; zero when the window held no delta.
+    #[must_use]
+    pub const fn max_inter_frame_gap_us(&self) -> u64 {
+        self.max_inter_frame_gap_us
     }
 
     #[must_use]
@@ -1512,6 +1522,10 @@ impl AggregateFrameProvenance {
 
 /// Mandatory runtime evidence owned by every frame.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the single-frame variant carries the full delivered-rate               evidence (including the inter-frame gap observation) by value:               this is the per-frame hot path and a boxed allocation per               dequeued frame would cost more than the 8 bytes of gap it               avoids"
+)]
 pub enum RuntimeFrameProvenance {
     Single(SingleFrameProvenance),
     Aggregate(AggregateFrameProvenance),
@@ -2316,6 +2330,7 @@ mod tests {
             30,
             2_000_000,
             (15, 1),
+            66_667,
             true,
             sequence,
             timestamp,

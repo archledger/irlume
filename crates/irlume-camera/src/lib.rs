@@ -2247,6 +2247,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
             rate_window.count() as u32,
             rate_window.span_us(),
             rate_window.delivered_rate(),
+            rate_window.max_delta_us(),
             meets_floor,
             &sequence_observation,
             &timestamp_observation,
@@ -9141,6 +9142,7 @@ fn accumulate(
         rgb_window.window_count(),
         rgb_window.window_span_us(),
         rgb_window.cumulative_drops(),
+        rgb_window.max_inter_frame_gap_us(),
         rgb_window.meets_floor(),
     ) {
         Ok(round) => into.rgb_rate_rounds.push(round),
@@ -9153,6 +9155,7 @@ fn accumulate(
         ir_window.window_count(),
         ir_window.window_span_us(),
         ir_window.cumulative_drops(),
+        ir_window.max_inter_frame_gap_us(),
         ir_window.meets_floor(),
     ) {
         Ok(round) => into.ir_rate_rounds.push(round),
@@ -13253,6 +13256,7 @@ mod tests {
                 30,
                 2_000_000,
                 (15, 2),
+                66_667,
                 true,
                 &sequence,
                 &timestamp,
@@ -13343,6 +13347,7 @@ mod tests {
                 30,
                 2_000_000,
                 if meets_floor { (15, 2) } else { (5, 1) },
+                66_667,
                 meets_floor,
                 &sequence,
                 &timestamp,
@@ -14314,12 +14319,12 @@ mod tests {
     fn measurement_record_accepts_a_strong_arm() {
         let mut sample = PairSample::default();
         for _ in 0..6 {
-            sample
-                .rgb_rate_rounds
-                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
-            sample
-                .ir_rate_rounds
-                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+            sample.rgb_rate_rounds.push(
+                measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+            );
+            sample.ir_rate_rounds.push(
+                measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+            );
             sample.rounds += 1;
         }
         let record = pair_sample_measurement_record("concurrent", &sample, 6, "test").unwrap();
@@ -14337,18 +14342,18 @@ mod tests {
     fn measurement_record_refuses_shortfalls_and_failed_rounds() {
         let mut sample = PairSample::default();
         for _ in 0..5 {
-            sample
-                .rgb_rate_rounds
-                .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
-            sample
-                .ir_rate_rounds
-                .push(measurement::RateRound::from_window_facts(28, 1_000_000, 0, true).unwrap());
+            sample.rgb_rate_rounds.push(
+                measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+            );
+            sample.ir_rate_rounds.push(
+                measurement::RateRound::from_window_facts(28, 1_000_000, 0, 90_000, true).unwrap(),
+            );
             sample.rounds += 1;
         }
         // The sixth IR round missed the floor and one round errored outright.
-        sample
-            .ir_rate_rounds
-            .push(measurement::RateRound::from_window_facts(20, 1_000_000, 3, false).unwrap());
+        sample.ir_rate_rounds.push(
+            measurement::RateRound::from_window_facts(20, 1_000_000, 3, 625_000, false).unwrap(),
+        );
         sample.rounds += 1;
         sample.failed = 1;
         let record = pair_sample_measurement_record("sequential", &sample, 6, "test").unwrap();
@@ -14381,9 +14386,9 @@ mod tests {
             failed: 6,
             ..PairSample::default()
         };
-        sample
-            .ir_rate_rounds
-            .push(measurement::RateRound::from_window_facts(30, 1_000_000, 0, true).unwrap());
+        sample.ir_rate_rounds.push(
+            measurement::RateRound::from_window_facts(30, 1_000_000, 0, 80_000, true).unwrap(),
+        );
         let record = pair_sample_measurement_record("concurrent", &sample, 6, "test").unwrap();
         assert_eq!(record.rates.len(), 1);
         assert_eq!(record.rates[0].0, measurement::MeasuredRole::Ir);

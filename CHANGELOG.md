@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Latency workstream (measured on real hardware, live-verified per
+  change): the IR gate burst stops on a decided plateau (the best
+  clean camera-lit frame two unimproved frames behind the head)
+  instead of always dequeuing ten; enrollment capture carries a
+  wall-clock budget of fifteen seconds per desired scan so a
+  stalling pair or a badly-positioned user can no longer spin the
+  attempt cap for minutes; the ADR-0021 rate-evidence amortization
+  now covers the CONCURRENT pair fill (probe admission plus
+  completion recording - it previously never applied, so every
+  concurrent attempt re-paid the ~2.4s cold fill), and a probe that
+  misses at five deltas escalates to a fifteen-delta window through
+  the same exact floor arithmetic before invalidating, absorbing
+  the live-measured startup shapes (a one-shot queue-refill stall,
+  an early-delivery slope) while a genuinely slow stream still
+  falls back to the full fill. Probe misses now log their measured
+  window. Net effect on the reference concurrent pair: warm
+  authenticated attempts dropped from ~12.3s to ~10.3s; the IR
+  startup flush shrank from ten frames to five from the fleet fine
+  sweep.
+
 - Camera-group reporting and management surface (ADR-0024 Phase 2):
   `irlume profiles` lists every enrolled camera group with its state
   (selected, connected/disconnected, stale-after-primary-change) and

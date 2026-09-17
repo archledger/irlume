@@ -1,5 +1,8 @@
 use super::*;
-use crate::sequential_batch::capture_batch_with;
+use crate::sequential_batch::{
+    capture_batch_with, capture_rgb_batch_controlled_with, capture_rgb_batch_with,
+    RgbBatchRequest,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -407,6 +410,228 @@ fn capture_cancellation_releases_rgb_and_never_opens_ir_batch() {
         || now.get(),
         &control,
         || panic!("cancelled partial batch must not be validated"),
+    );
+    assert!(matches!(result, Err(Error::Preempted(_))));
+    assert_eq!(*events.borrow(), ["rgb open", "rgb close"]);
+}
+
+struct RgbBatchFixture {
+    request: RgbBatchRequest,
+    now: Cell<Instant>,
+    events: RefCell<Vec<String>>,
+    frames: VecDeque<Frame>,
+}
+
+impl RgbBatchFixture {
+    fn new(count: usize) -> Self {
+        let base = Instant::now();
+        let mut frames = VecDeque::new();
+        for n in 0..count {
+            let mut f = runtime_gate_frame(
+                contracts::StreamRole::Rgb,
+                Spectrum::Rgb,
+                contracts::IlluminationProvenance::Unknown,
+                'a',
+                1,
+                *b"RGB3",
+                true,
+                false,
+            );
+            f.data[0] = n as u8;
+            frames.push_back(f);
+        }
+        Self {
+            request: RgbBatchRequest {
+                samples: count,
+                deadline: base + Duration::from_secs(15),
+            },
+            now: Cell::new(base),
+            events: RefCell::new(Vec::new()),
+            frames,
+        }
+    }
+
+    fn run(&mut self, fault: &str) -> irlume_common::Result<Vec<Frame>> {
+        let events = &self.events;
+        let now = &self.now;
+        let deadline = self.request.deadline;
+        let open = || {
+            events.borrow_mut().push("rgb open".into());
+            if fault == "rgb open error" {
+                return Err(Error::Hardware("scripted open failure".into()));
+            }
+            if fault == "rgb open deadline" {
+                now.set(deadline);
+            }
+            Ok(Owner {
+                role: "rgb",
+                events,
+                now,
+                expire_on_drop: fault == "rgb close deadline",
+                deadline,
+            })
+        };
+        capture_rgb_batch_with(
+            self.request,
+            (
+                open,
+                |_: &mut Owner<'_>| {
+                    events.borrow_mut().push("rgb capture".into());
+                    if fault == "rgb capture error" && self.frames.len() == 3 {
+                        return Err(Error::Hardware("scripted capture failure".into()));
+                    }
+                    assert_ne!(fault, "rgb panic", "scripted panic");
+                    if fault == "rgb capture deadline" {
+                        now.set(deadline);
+                    }
+                    Ok(self.frames.pop_front().expect("bounded RGB sample"))
+                },
+            ),
+            || now.get(),
+            || {
+                events.borrow_mut().push("lease check".into());
+                if fault == "lease deadline" {
+                    now.set(deadline);
+                }
+                if fault == "lease stale" {
+                    Err(Error::Hardware("stale lease".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+}
+
+#[test]
+fn rgb_batch_collects_every_sample_from_one_session_in_order() {
+    for count in [1, 5] {
+        let mut fixture = RgbBatchFixture::new(count);
+        let result = fixture.run("").expect("valid batch");
+        assert_eq!(result.len(), count);
+        for (n, frame) in result.into_iter().enumerate() {
+            assert_eq!(frame.data[0], n as u8);
+        }
+        let events = fixture.events.borrow();
+        assert_eq!(
+            events.iter().filter(|e| **e == "rgb open").count(),
+            1,
+            "one session for the whole group"
+        );
+        assert_eq!(
+            events.iter().filter(|e| **e == "rgb capture").count(),
+            count
+        );
+        assert_eq!(&events[events.len() - 2..], ["rgb close", "lease check"]);
+    }
+}
+
+#[test]
+fn rgb_batch_rejects_unbounded_count_before_open() {
+    for count in [0, 6, usize::MAX] {
+        let mut fixture = RgbBatchFixture::new(0);
+        fixture.request.samples = count;
+        assert!(fixture.run("").is_err());
+        assert!(fixture.events.borrow().is_empty());
+    }
+}
+
+#[test]
+fn rgb_batch_deadline_equality_prevents_open() {
+    let mut fixture = RgbBatchFixture::new(5);
+    fixture.now.set(fixture.request.deadline);
+    assert!(fixture.run("").is_err());
+    assert!(fixture.events.borrow().is_empty());
+}
+
+#[test]
+fn rgb_batch_drops_owner_on_capture_error_and_never_returns_partial_samples() {
+    let mut fixture = RgbBatchFixture::new(5);
+    assert!(fixture.run("rgb capture error").is_err());
+    let events = fixture.events.borrow();
+    assert_eq!(events.last().unwrap(), "rgb close");
+    assert_eq!(events.iter().filter(|e| **e == "rgb capture").count(), 3);
+    assert!(!events.iter().any(|e| *e == "lease check"));
+}
+
+#[test]
+fn rgb_batch_drops_owner_on_panic() {
+    let mut fixture = RgbBatchFixture::new(5);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.run("rgb panic")
+    }));
+    assert!(result.is_err());
+    assert_eq!(fixture.events.borrow().last().unwrap(), "rgb close");
+}
+
+#[test]
+fn rgb_batch_checks_deadline_after_open_capture_close_and_lease() {
+    for fault in [
+        "rgb open deadline",
+        "rgb capture deadline",
+        "rgb close deadline",
+        "lease deadline",
+    ] {
+        let mut fixture = RgbBatchFixture::new(5);
+        assert!(fixture.run(fault).is_err(), "{fault}");
+        let events = fixture.events.borrow();
+        if events.contains(&"rgb open".to_string()) {
+            assert!(events.contains(&"rgb close".to_string()), "{fault}");
+        }
+        if fault == "rgb open deadline" {
+            assert!(!events.contains(&"rgb capture".to_string()), "{fault}");
+        }
+    }
+}
+
+#[test]
+fn rgb_batch_open_failure_stops_without_recovery() {
+    let mut fixture = RgbBatchFixture::new(5);
+    assert!(fixture.run("rgb open error").is_err());
+    assert_eq!(fixture.events.borrow().last().unwrap(), "rgb open");
+}
+
+#[test]
+fn rgb_batch_rejects_lease_invalidation_after_successful_captures() {
+    let mut fixture = RgbBatchFixture::new(5);
+    assert!(fixture.run("lease stale").is_err());
+    assert_eq!(fixture.events.borrow().last().unwrap(), "lease check");
+}
+
+#[test]
+fn rgb_batch_cancellation_releases_session_and_returns_no_partial() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let mut fixture = RgbBatchFixture::new(5);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    let control = CaptureControl::new(no_progress(), Arc::new(move || signal.load(Ordering::SeqCst)));
+    let events = &fixture.events;
+    let now = &fixture.now;
+    let deadline = fixture.request.deadline;
+    let result = capture_rgb_batch_controlled_with(
+        fixture.request,
+        (
+            || {
+                events.borrow_mut().push("rgb open".into());
+                Ok(Owner {
+                    role: "rgb",
+                    events,
+                    now,
+                    expire_on_drop: false,
+                    deadline,
+                })
+            },
+            |_owner| {
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(fixture.frames.pop_front().unwrap())
+            },
+        ),
+        || now.get(),
+        &control,
+        || panic!("cancelled partial batch must not be lease-checked"),
     );
     assert!(matches!(result, Err(Error::Preempted(_))));
     assert_eq!(*events.borrow(), ["rgb open", "rgb close"]);

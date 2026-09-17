@@ -79,8 +79,8 @@ mod rate_amortization;
 mod rate_gate;
 mod sequential_batch;
 pub use sequential_batch::{
-    capture_sequential_batch_with_control, capture_sequential_batch_with_progress,
-    SequentialBatchRequest,
+    capture_rgb_denoised_batch_with_control, capture_sequential_batch_with_control,
+    capture_sequential_batch_with_progress, RgbBatchRequest, SequentialBatchRequest,
 };
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code

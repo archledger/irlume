@@ -19,6 +19,17 @@ use std::time::{Duration, Instant};
 /// sole evidence (ADR-0021; the slice-8 measurement invalidated that).
 pub(crate) const CONTINUITY_PROBE_DELTAS: usize = 5;
 
+/// The escalated probe width. A first-stage miss collects up to this many
+/// deltas before the cached evidence is invalidated: live-measured startup
+/// shapes that a 5-delta point sample cannot carry are (a) one ~616 ms
+/// queue-refill stall inside the first concurrent-window frames (the RGB
+/// side of the N930W pair) and (b) a ~1.2% early-delivery slope that settles
+/// within a handful of frames (its IR side). A 15-delta window meets the
+/// same exact floor arithmetic over both measured shapes, while a genuinely
+/// slow stream still escalates to miss, invalidate, and re-establish from
+/// scratch - the probe never passes anything the full fill would not.
+pub(crate) const CONTINUITY_PROBE_ESCALATED_DELTAS: usize = 15;
+
 /// How long a completed full window stays reusable. ADR-0021's bound.
 pub(crate) const MAX_STALENESS: Duration = Duration::from_secs(300);
 

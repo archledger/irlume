@@ -2083,21 +2083,37 @@ impl<S: ValidatedStream> TrackedStream<S> {
                     attempts += 1;
                 }
                 let policy = self.rate_config.policy();
-                if self.rate_window.count() >= rate_amortization::CONTINUITY_PROBE_DELTAS
-                    && self.rate_window.meets_floor(
+                // Escalation before invalidation, mirroring the concurrent
+                // site: a first-stage miss widens to the escalated width
+                // through the same exact floor arithmetic, absorbing the
+                // live-measured startup shapes (a queue-refill stall; an
+                // early-delivery slope) that a 5-delta point sample cannot
+                // carry, while a genuinely slow stream still misses,
+                // invalidates, and re-establishes from scratch.
+                while self.rate_window.count()
+                    < rate_amortization::CONTINUITY_PROBE_ESCALATED_DELTAS
+                    && !self.rate_window.meets_floor(
                         policy.floor_num(),
                         policy.floor_den(),
                         policy.tolerance_percent(),
                     )
                 {
+                    self.next_discarded()?;
+                }
+                if self.rate_window.meets_floor(
+                    policy.floor_num(),
+                    policy.floor_den(),
+                    policy.tolerance_percent(),
+                ) {
                     self.health_admitted = true;
                     return Ok(());
                 }
-                // The probe missed: the current session is not delivering at
-                // floor, so the cached evidence is stale in the harmful
-                // direction. Drop it and re-establish from scratch. The
-                // measured window is logged for the same reason as the
-                // concurrent site: miss distance decides the fix shape.
+                // The escalated probe missed: the current session is not
+                // delivering at floor, so the cached evidence is stale in
+                // the harmful direction. Drop it and re-establish from
+                // scratch. The measured window is logged for the same
+                // reason as the concurrent site: miss distance is the
+                // design input for any future widening.
                 let (num, den) = self.rate_window.delivered_rate();
                 irlume_common::dlog!(
                     "[rate-fill] probe missed: {} deltas, rate {}/{} us (floor {}/{} @ {}%), max delta {} us",
@@ -2581,13 +2597,32 @@ fn drain_until_both_ready<S: ValidatedStream>(
             attempts += 1;
         }
         let policy = stream.rate_config.policy();
-        if stream.rate_window.count() >= rate_amortization::CONTINUITY_PROBE_DELTAS
-            && stream.rate_window.meets_floor(
+        // Escalation before invalidation: a first-stage miss collects up to
+        // the escalated width, re-judging through the same exact floor
+        // arithmetic. The live-measured startup shapes (one ~616 ms
+        // queue-refill stall; a ~1.2% early-delivery slope) both pass a
+        // 15-delta window and both miss a 5-delta point sample; a genuinely
+        // slow stream escalates to a miss here and takes the full path.
+        while stream.rate_window.count() < rate_amortization::CONTINUITY_PROBE_ESCALATED_DELTAS
+            && !stream.rate_window.meets_floor(
                 policy.floor_num(),
                 policy.floor_den(),
                 policy.tolerance_percent(),
             )
         {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(paired_rate_cancel_error());
+            }
+            if let Err(error) = stream.next_discarded() {
+                cancelled.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        if stream.rate_window.meets_floor(
+            policy.floor_num(),
+            policy.floor_den(),
+            policy.tolerance_percent(),
+        ) {
             stream.health_admitted = true;
             ready_count.fetch_add(1, Ordering::AcqRel);
             reported = true;
@@ -2596,12 +2631,11 @@ fn drain_until_both_ready<S: ValidatedStream>(
                 stream.rate_window.count()
             );
         } else {
-            // The probe missed: this session is not delivering at floor, so
-            // the cached evidence is stale in the harmful direction. Drop it
-            // and re-establish from scratch. The measured window is logged
-            // because "how close was the miss" decides whether the fix is a
-            // wider probe window (variance), a retry (one bad delta), or a
-            // genuinely slow stream (leave it cold).
+            // The escalated probe missed: this session is not delivering at
+            // floor, so the cached evidence is stale in the harmful
+            // direction. Drop it and re-establish from scratch. The measured
+            // window is logged because miss distance is the design input for
+            // any future widening.
             let (num, den) = stream.rate_window.delivered_rate();
             irlume_common::dlog!(
                 "[rate-fill] concurrent probe missed: {} deltas, rate {}/{} us (floor {}/{} @ {}%), max delta {} us",
@@ -18516,6 +18550,66 @@ mod tests {
                 panic!("concurrent fill thread panicked")
             }
         }
+    }
+
+    #[test]
+    fn a_probe_that_misses_at_five_admits_escalated_at_fifteen() {
+        // The live-measured N930W startup shapes: the IR side delivers its
+        // first frames on a ~1.2% slope (69.6 us/ms-frame vs the 67.6
+        // steady) that a 5-delta point sample scores just under the floor,
+        // and the RGB side carries one ~616 ms queue-refill stall. Both pass
+        // a 15-delta window through the SAME floor arithmetic, so the
+        // escalation admits them without ever letting a genuinely slow
+        // stream through (it still misses, invalidates, and re-fills).
+        let node = "/dev/video-probe-escalation";
+        // IR shape: first 6 frames sloped, then steady. A 5-delta window
+        // inside the slope measures 14.37 fps < the 14.55 floor.
+        let mut ir =
+            rate_fill_fixture(contracts::StreamRole::Ir, 120, 66_667).with_rate_amortization(node);
+        for (i, metadata) in ir
+            .stream_mut()
+            .unwrap()
+            .metadata
+            .iter_mut()
+            .take(6)
+            .enumerate()
+        {
+            let micros = 1_000_000 + (i as i64 + 1) * 69_600;
+            metadata.timestamp =
+                v4l::timestamp::Timestamp::new(micros / 1_000_000, micros % 1_000_000);
+        }
+        rate_amortization::test_support::force_completion(
+            rate_amortization::Key::new(node, contracts::StreamRole::Ir),
+            Some(std::time::Instant::now()),
+        );
+        // A slow overall stream (all frames at the sloped interval) must
+        // still MISS, invalidate, and fall back to the full fill.
+        let slow_node = "/dev/video-probe-escalation-slow";
+        let mut slow = rate_fill_fixture(contracts::StreamRole::Ir, 120, 70_000)
+            .with_rate_amortization(slow_node);
+        rate_amortization::test_support::force_completion(
+            rate_amortization::Key::new(slow_node, contracts::StreamRole::Ir),
+            Some(std::time::Instant::now()),
+        );
+
+        // SLOPED-THEN-STEADY admits on the escalated window.
+        ir.fill_rate_evidence().expect("escalated admission");
+        assert!(ir.health_admitted, "the sloped startup admits at width 15");
+
+        // GENUINELY SLOW misses even escalated, invalidates, and takes the
+        // full fill (70ms/frame = 14.29 fps < 14.55 everywhere).
+        slow.fill_rate_evidence().expect("full fill after the miss");
+        assert!(
+            slow.rate_window.ready(),
+            "the fallback re-established a full window"
+        );
+        assert!(
+            !rate_amortization::amortizable(&rate_amortization::Key::new(
+                slow_node,
+                contracts::StreamRole::Ir
+            )),
+            "the miss invalidated the cached evidence"
+        );
     }
 
     #[test]

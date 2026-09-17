@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-17
+
 ### Added
 
 - `irlume doctor` now reports the `pam_faillock` tally for the target

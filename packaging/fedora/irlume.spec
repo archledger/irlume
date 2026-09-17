@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.12.1
+Version:        0.13.0
 Release:        1%{?dist}
 Summary:        Windows Hello-style face login for Linux
 
@@ -294,6 +294,14 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/selinux/packages/irlume.pp
 
 %changelog
+* Thu Sep 17 2026 archledger <archledger236@gmail.com> - 0.13.0-1
+- Multi-camera enrollment (ADR-0024): secondary camera groups, per-group
+  stores and management surfaces; grouped RGB-only convenience capture
+- Latency workstream: plateau exit, enrollment inactivity budget,
+  concurrent amortization, probe escalation, IR flush reduction
+- Uninstall coverage (every state root, database-less lane files),
+  doctor pam_faillock check, camera-profile evidence layer (ADR-0023)
+
 * Sat Aug 29 2026 archledger <archledger236@gmail.com> - 0.11.3-1
 - AppArmor: emitter-journal ancestor-fsync reads and the qualification-store
   file lock are granted in both profiles (set-cameras persist, camera-tune and

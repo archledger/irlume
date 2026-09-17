@@ -7053,7 +7053,7 @@ impl Engine {
                 },
                 &operation,
                 observed,
-                std::time::Instant::now() + Self::enrollment_capture_budget(want),
+                std::time::Instant::now(),
             ) {
                 Ok(scans) => return Ok(scans),
                 Err(CapturePathError::ConcurrentPair(error)) => {
@@ -7091,19 +7091,19 @@ impl Engine {
             },
             &operation,
             observed,
-            std::time::Instant::now() + Self::enrollment_capture_budget(want),
+            std::time::Instant::now(),
         )
         .map_err(CapturePathError::into_inner)
     }
 
-    /// The wall-clock budget for one enrollment capture call: fifteen
-    /// seconds per desired scan, the auth grace window's per-attempt
-    /// scale. Generous for slow sequential pairs, finite for a stalling
-    /// camera or a badly-positioned user; a partial result flows into the
-    /// caller's existing short-capture handling exactly like
-    /// attempt-cap exhaustion.
-    fn enrollment_capture_budget(want: usize) -> std::time::Duration {
-        std::time::Duration::from_secs(15 * want.clamp(1, 30) as u64)
+    /// The wall-clock INACTIVITY budget for an enrollment capture:
+    /// thirty seconds without an admitted scan. Must exceed a cold PAD
+    /// vote window (five rounds at the slowest fleet pace plus fills,
+    /// ~13s measured) because enrollment admission waits for the complete
+    /// vote; stays finite for a stalling camera or a badly-positioned
+    /// user, and each admission resets it.
+    fn enrollment_capture_budget() -> std::time::Duration {
+        std::time::Duration::from_secs(30)
     }
 
     /// The enrolment loop arms fresh paired streams per assessment when
@@ -7121,7 +7121,7 @@ impl Engine {
         policy: EnrollmentCapturePolicy<'_>,
         operation: &irlume_camera::lease::CameraOperationSession,
         observed: &mut CaptureShape,
-        deadline: std::time::Instant,
+        mut last_progress: std::time::Instant,
     ) -> Result<Vec<CapturedScan>, CapturePathError> {
         let mut out = Vec::new();
         // Read once, before the loop: `cameras` is borrowed per iteration but
@@ -7137,14 +7137,21 @@ impl Engine {
             if out.len() >= want {
                 break;
             }
-            // Wall-clock budget: the attempt cap alone lets a stalling pair
-            // (or a badly-positioned user) spin `want * 10` full
-            // assessments - minutes on a sequential pair. Fifteen seconds
-            // per desired scan is generous for slow pairs and finite for
-            // everyone; checked at the same safe boundary as cancellation,
-            // and a partial result flows into the caller's existing
+            // Wall-clock INACTIVITY budget: the attempt cap alone lets a
+            // stalling pair (or a badly-positioned user) spin `want * 10`
+            // full assessments - minutes on a sequential pair. The bound
+            // must exceed a COLD PAD vote window, because enrollment
+            // admission waits for the complete five-score decision: at the
+            // measured slowest fleet round (~2.2s with fills) that is
+            // ~11-13s before the FIRST scan can admit, so fifteen seconds
+            // still killed a fully-Live cold probe (found live, twice).
+            // Thirty seconds without an admitted scan covers the warm-up
+            // with margin and stays finite; each admitted scan RESETS the
+            // clock, because a capture making progress is not stalling.
+            // Checked at the same safe boundary as cancellation, and a
+            // partial result flows into the caller's existing
             // short-capture handling exactly like attempt-cap exhaustion.
-            if std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= last_progress + Self::enrollment_capture_budget() {
                 irlume_common::dlog!(
                     "[enroll] capture budget elapsed with {} of {want} scans",
                     out.len()
@@ -7195,6 +7202,9 @@ impl Engine {
             // the countdown. Same bounds (and neutral) the enrollment guide uses.
             if let Some(scan) = self.enrollment_scan(a, policy.use_ir, pitch_neutral)? {
                 out.push(scan);
+                // Progress resets the inactivity clock: a capture that keeps
+                // admitting scans is not stalling, however slow the pair.
+                last_progress = std::time::Instant::now();
                 policy
                     .observer
                     .progress(out.len(), want)
@@ -13378,19 +13388,14 @@ mod engine_tests {
     }
 
     #[test]
-    fn the_enrollment_capture_budget_scales_with_want_and_is_clamped() {
+    fn the_enrollment_capture_budget_is_the_inactivity_bound() {
+        // Thirty seconds WITHOUT an admitted scan, flat: enough to cover a
+        // cold PAD vote window at the slowest fleet round pace, and a
+        // capture that keeps admitting scans resets the clock and never
+        // meets it.
         assert_eq!(
-            Engine::enrollment_capture_budget(1),
-            std::time::Duration::from_secs(15)
-        );
-        assert_eq!(
-            Engine::enrollment_capture_budget(10),
-            std::time::Duration::from_secs(150)
-        );
-        assert_eq!(
-            Engine::enrollment_capture_budget(0),
-            std::time::Duration::from_secs(15),
-            "a zero want is clamped to one scan's budget"
+            Engine::enrollment_capture_budget(),
+            std::time::Duration::from_secs(30)
         );
     }
 

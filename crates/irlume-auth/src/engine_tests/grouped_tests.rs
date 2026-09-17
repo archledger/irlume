@@ -1160,3 +1160,202 @@ fn grouped_deadline_classification_survives_the_real_engine_scope() {
         matches!(result, Ok(PreparedGroup::Refused(ref outcome)) if outcome.kind == OutcomeKind::DeadlineExpired)
     );
 }
+
+/// One convenience-tier RGB sample: a live fixture face whose PAD score is
+/// pushed into the vote, identity carried as the deferred RGB image.
+fn rgb_only_sample(e: &mut Engine, score: f32) -> DeferredAssessment<PairIdentity> {
+    let deny = e.vit_pad_votes_deny(score);
+    let (_, mut assessment) = pad_matching_fixture(score, deny);
+    assessment.signals.rgb_face = Some(irlume_liveness::FaceBox {
+        cx: 0.5,
+        cy: 0.5,
+        score: 0.9,
+    });
+    let identity_image = assessment.embedding.take().map(|_| IdentityImage {
+        data: vec![128u8; 16],
+        width: 4,
+        height: 4,
+        face: Detection {
+            bbox: [0.0, 0.0, 1.0, 1.0],
+            score: 0.9,
+            landmarks: [(0.0, 0.0); 5],
+        },
+    });
+    DeferredAssessment {
+        assessment,
+        identity: (identity_image, None),
+    }
+}
+
+/// An RGB sample with no face: no PAD score is contributed.
+fn rgb_only_no_face_sample() -> DeferredAssessment<PairIdentity> {
+    let (_, mut assessment) = pad_matching_fixture(0.2, false);
+    assessment.signals.rgb_face = None;
+    assessment.rgb_pad = PadEvidence::NotApplicable;
+    DeferredAssessment {
+        assessment,
+        identity: (None, None),
+    }
+}
+
+#[test]
+fn rgb_only_group_completes_the_vote_and_never_marks_a_pair() {
+    let _guard = env_guard();
+    let mut s = shared();
+    let materialized = Cell::new(0);
+    let result = s
+        .engine
+        .evaluate_grouped_rgb_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, _i| Ok(rgb_only_sample(e, 0.2)),
+            |_, mut evidence| {
+                materialized.set(materialized.get() + 1);
+                assert!(
+                    !evidence.assessment.sequential_pair,
+                    "RGB-only identity inputs are never a pair"
+                );
+                evidence.assessment.embedding = Some([0.0; EMBED_DIM]);
+                Ok(evidence.assessment)
+            },
+            Instant::now,
+        )
+        .unwrap();
+    assert_eq!(materialized.get(), 1, "identity only on the final sample");
+    let PreparedGroup::Ready(a) = result else {
+        panic!("complete live rgb group refused")
+    };
+    assert!(!a.sequential_pair);
+    assert_eq!(a.rgb_pad, PadEvidence::Score(0.2));
+}
+
+#[test]
+fn rgb_only_group_spoof_median_denies_before_identity() {
+    let _guard = env_guard();
+    let mut s = shared();
+    let result = s.engine.evaluate_grouped_rgb_samples_with(
+        (0..5).collect(),
+        Instant::now() + Duration::from_secs(15),
+        |e, _i| Ok(rgb_only_sample(e, 0.99)),
+        |_, _| panic!("spoof group reached identity"),
+        Instant::now,
+    );
+    let Ok(PreparedGroup::Refused(outcome)) = result else {
+        panic!("spoof group must refuse")
+    };
+    assert_eq!(outcome.kind, OutcomeKind::Spoof);
+    assert!(s.engine.vit_scores.is_empty());
+}
+
+#[test]
+fn rgb_only_group_missing_face_sample_leaves_the_vote_pending() {
+    let _guard = env_guard();
+    let mut s = shared();
+    let result = s
+        .engine
+        .evaluate_grouped_rgb_samples_with(
+            vec![0, 1, 2, 3, 4],
+            Instant::now() + Duration::from_secs(15),
+            |e, i| {
+                if i == 2 {
+                    Ok(rgb_only_no_face_sample())
+                } else {
+                    Ok(rgb_only_sample(e, 0.2))
+                }
+            },
+            |_, _| panic!("pending group reached identity"),
+            Instant::now,
+        )
+        .unwrap();
+    let PreparedGroup::Refused(outcome) = result else {
+        panic!("incomplete group must refuse")
+    };
+    assert_eq!(outcome.kind, OutcomeKind::RgbPadPending);
+    assert_eq!(outcome.reason, "collecting RGB PAD evidence");
+    assert!(presence_retryable(&outcome));
+    assert!(s.engine.vit_scores.is_empty());
+}
+
+#[test]
+fn rgb_only_group_dark_sample_refuses_with_the_rgb_reason() {
+    let _guard = env_guard();
+    let mut s = shared();
+    let result = s
+        .engine
+        .evaluate_grouped_rgb_samples_with(
+            (0..5).collect(),
+            Instant::now() + Duration::from_secs(15),
+            |e, _i| {
+                let mut v = rgb_only_sample(e, 0.2);
+                v.assessment.verdict = Verdict::Uncertain;
+                v.assessment.reason =
+                    "too dark: add light on your face (RGB-only mode needs a lit face)".into();
+                Ok(v)
+            },
+            |_, _| panic!("dark group reached identity"),
+            Instant::now,
+        )
+        .unwrap();
+    let PreparedGroup::Refused(outcome) = result else {
+        panic!("dark group must refuse")
+    };
+    assert_eq!(outcome.kind, OutcomeKind::Uncertain);
+    assert!(outcome.reason.contains("too dark"));
+}
+
+#[test]
+fn rgb_only_grouped_route_requires_convenience_shape() {
+    use crate::grouped_auth::rgb_only_eligible;
+    use AuthenticationPurpose::*;
+    let ready =
+        |ir, pad, window, service, purpose| rgb_only_eligible(ir, pad, window, purpose, service);
+    // The admitted shape: convenience tier, PAD cue loaded, default-or-longer
+    // window, and the engine's local-session scope.
+    assert!(ready(false, true, 15_000, Some("kde"), Verify));
+    assert!(ready(false, true, 15_000, Some("sddm"), Verify));
+    assert!(ready(false, true, 15_000, None, Verify));
+    assert!(ready(
+        false,
+        true,
+        15_000,
+        Some("omarchy-lock-face"),
+        CredentialRelease
+    ));
+    // Every single requirement is load-bearing.
+    assert!(
+        !ready(true, true, 15_000, Some("kde"), Verify),
+        "IR box: not this route"
+    );
+    assert!(
+        !ready(false, false, 15_000, Some("kde"), Verify),
+        "PAD model absent"
+    );
+    assert!(
+        !ready(false, true, 0, Some("kde"), Verify),
+        "one-shot window"
+    );
+    assert!(
+        !ready(false, true, 14_999, Some("kde"), Verify),
+        "short window"
+    );
+    assert!(
+        !ready(false, true, 15_000, Some("sudo"), Verify),
+        "elevation"
+    );
+    assert!(
+        !ready(false, true, 15_000, Some("polkit-1"), AppConsent),
+        "app consent"
+    );
+    assert!(!ready(false, true, 15_000, Some("sshd"), Verify), "remote");
+    // Unknown service names mirror the pair route's Verify default: the
+    // engine admits them and the daemon's tier gate stays the fail-closed
+    // authority that never routes them here on RGB-only hardware.
+    assert!(
+        ready(false, true, 15_000, Some("mystery-service"), Verify),
+        "unknown"
+    );
+    assert!(
+        !ready(false, true, 15_000, Some("sudo"), CredentialRelease),
+        "credential release needs a local login or lock service"
+    );
+}

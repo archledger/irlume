@@ -102,6 +102,46 @@ fn expired() -> Outcome {
     )
 }
 
+/// Which evidence a grouped collection evaluates: the cross-spectrum pair
+/// group or the convenience-tier RGB-only group. Pair groups run the pair
+/// gates and mark every rgb-visible sample a sequential pair; RGB-only groups
+/// run the rgb-only gates and never mark a pair (no pair exists, and the
+/// matching schedule keys on that flag).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum GroupModality {
+    Pair,
+    RgbOnly,
+}
+
+/// The convenience-tier route's eligibility: no IR pair at all, the ViT RGB
+/// PAD cue loaded (its five-score median is the collection's whole purpose),
+/// a default-or-longer presence window (the group must fit inside it), and
+/// the same local-session scope as the pair group minus the privileged
+/// opt-in, which stays pair-only. The daemon's tier gate remains the outer
+/// authority: on RGB-only hardware face may only satisfy a screen unlock.
+pub(super) fn rgb_only_eligible(
+    has_ir: bool,
+    has_rgb_pad: bool,
+    window: u64,
+    purpose: AuthenticationPurpose,
+    service: Option<&str>,
+) -> bool {
+    let service_kind = service.and_then(irlume_common::pam_service::classify);
+    let local_session = matches!(
+        service_kind,
+        Some(
+            irlume_common::pam_service::ServiceKind::Greeter
+                | irlume_common::pam_service::ServiceKind::ScreenUnlock
+        )
+    );
+    let in_scope = match purpose {
+        AuthenticationPurpose::Verify => local_session || service_kind.is_none(),
+        AuthenticationPurpose::CredentialRelease => local_session,
+        AuthenticationPurpose::AppConsent => false,
+    };
+    !has_ir && has_rgb_pad && window >= GRACE_WINDOW_MS && in_scope
+}
+
 impl Engine {
     fn begin_grouped_attempt(&mut self) {
         self.vit_scores.clear();
@@ -172,9 +212,84 @@ impl Engine {
         None
     }
 
+    /// Pre-identity gates for the convenience tier's RGB-only group, mirroring
+    /// the eager single-attempt refusals in their producing order: PAD
+    /// execution failures are terminal, a non-Live verdict with a face is the
+    /// liveness refusal (too dark, not facing, spoof), and the vote policy is
+    /// the RGB-only requirement. A frame with no face is the retryable NoFace
+    /// outcome; there is no dark route to preserve because no IR face exists.
+    fn grouped_rgb_only_evidence_refusal(&self, a: &Assessment) -> Option<Outcome> {
+        let rgb = a.signals.rgb_face.is_some();
+        for (modality, required, evidence) in [(PadModality::Rgb, rgb, a.rgb_pad)] {
+            if !required {
+                continue;
+            }
+            let failure = match evidence {
+                PadEvidence::Unavailable | PadEvidence::InferenceFailed => Some(evidence),
+                PadEvidence::Score(p) if !p.is_finite() => Some(PadEvidence::InferenceFailed),
+                _ => None,
+            };
+            if let Some(failure) = failure {
+                return pad_evidence_refusal(modality, failure);
+            }
+        }
+        if uncertain_short_circuits(a.verdict, rgb, false) || (rgb && a.verdict != Verdict::Live) {
+            return Some(Outcome::deny(
+                liveness_deny_kind(a.verdict, a.deny_cause),
+                format!("liveness {:?}: {}", a.verdict, a.reason),
+            ));
+        }
+        if rgb {
+            return pad_policy_refusal(PadRequirements::RgbOnly, a.rgb_pad, a.ir_pad);
+        }
+        Some(Outcome::deny(OutcomeKind::NoFace, "no face detected"))
+    }
+
     /// Clock and inference boundaries are replaceable for behavioral tests;
     /// PAD qualification and readiness decisions remain production code.
     pub(super) fn evaluate_grouped_samples_with<T, I>(
+        &mut self,
+        samples: Vec<T>,
+        deadline: Instant,
+        assess: impl FnMut(&mut Self, T) -> irlume_common::Result<DeferredAssessment<I>>,
+        materialize: impl FnMut(&mut Self, DeferredAssessment<I>) -> irlume_common::Result<Assessment>,
+        now: impl Fn() -> Instant,
+    ) -> irlume_common::Result<PreparedGroup> {
+        self.evaluate_grouped_samples_ex(
+            samples,
+            deadline,
+            assess,
+            materialize,
+            now,
+            GroupModality::Pair,
+        )
+    }
+
+    /// [`Self::evaluate_grouped_samples_with`] for the convenience tier's
+    /// RGB-only group: rgb-only gates, identity deferred exactly like the
+    /// pair group, and never a sequential-pair marking.
+    pub(super) fn evaluate_grouped_rgb_samples_with<T>(
+        &mut self,
+        samples: Vec<T>,
+        deadline: Instant,
+        assess: impl FnMut(&mut Self, T) -> irlume_common::Result<DeferredAssessment<PairIdentity>>,
+        materialize: impl FnMut(
+            &mut Self,
+            DeferredAssessment<PairIdentity>,
+        ) -> irlume_common::Result<Assessment>,
+        now: impl Fn() -> Instant,
+    ) -> irlume_common::Result<PreparedGroup> {
+        self.evaluate_grouped_samples_ex(
+            samples,
+            deadline,
+            assess,
+            materialize,
+            now,
+            GroupModality::RgbOnly,
+        )
+    }
+
+    fn evaluate_grouped_samples_ex<T, I>(
         &mut self,
         samples: Vec<T>,
         deadline: Instant,
@@ -184,6 +299,7 @@ impl Engine {
             DeferredAssessment<I>,
         ) -> irlume_common::Result<Assessment>,
         now: impl Fn() -> Instant,
+        modality: GroupModality,
     ) -> irlume_common::Result<PreparedGroup> {
         self.begin_grouped_attempt();
         // The closure makes all errors and refusals share the evidence reset.
@@ -210,11 +326,21 @@ impl Engine {
                 // including gaps inside the legacy concurrent skew ceiling.
                 // Preserve this identity requirement before deferred inputs can
                 // materialize; the legacy single-pair classifier is unchanged.
-                evidence.assessment.sequential_pair |=
-                    evidence.assessment.signals.rgb_face.is_some();
+                // RGB-only groups never mark a pair: no pair exists, and the
+                // matching schedule keys on this flag.
+                if modality == GroupModality::Pair {
+                    evidence.assessment.sequential_pair |=
+                        evidence.assessment.signals.rgb_face.is_some();
+                }
                 self.qualify_rgb_pad_evidence(&mut evidence.assessment);
                 let final_sample = index + 1 == VIT_PAD_VOTE_N;
-                if let Some(outcome) = self.grouped_evidence_refusal(&evidence.assessment) {
+                let refusal = match modality {
+                    GroupModality::Pair => self.grouped_evidence_refusal(&evidence.assessment),
+                    GroupModality::RgbOnly => {
+                        self.grouped_rgb_only_evidence_refusal(&evidence.assessment)
+                    }
+                };
+                if let Some(outcome) = refusal {
                     if final_sample || !presence_retryable(&outcome) {
                         return Ok(PreparedGroup::Refused(outcome));
                     }
@@ -307,6 +433,65 @@ impl Engine {
                     )
                     .map_err(CapturePathError::into_inner)
             },
+            |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
+            Instant::now,
+        )?;
+        match prepared {
+            PreparedGroup::Refused(outcome) => Ok(outcome),
+            PreparedGroup::Ready(a) => {
+                if Instant::now() >= deadline {
+                    self.vit_scores.clear();
+                    return Ok(expired());
+                }
+                let outcome =
+                    self.authenticate_qualified_assessment(enr, purpose, service, *a, diagnostics);
+                self.vit_scores.clear();
+                if Instant::now() >= deadline {
+                    return Ok(expired());
+                }
+                outcome
+            }
+        }
+    }
+
+    /// The convenience tier's grouped attempt: collect the whole five-sample
+    /// ViT PAD vote from ONE armed RGB session (the per-sample stream setup
+    /// of the eager loop is what made the vote unreachable inside the default
+    /// presence window on slow RGB sensors, measured 2026-09-17), assess each
+    /// sample, and materialize identity only on the final admissible sample.
+    /// Vote arithmetic, thresholds and the grant boundary are unchanged.
+    pub(super) fn authenticate_grouped_rgb_only_once(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        rgb: &irlume_camera::RgbCamera,
+        deadline: Instant,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        self.begin_grouped_attempt();
+        if Instant::now() >= deadline {
+            return Ok(expired());
+        }
+        let control = self.capture_control();
+        let started = Instant::now();
+        let frames = irlume_camera::capture_rgb_denoised_batch_with_control(
+            rgb,
+            irlume_camera::RgbBatchRequest {
+                samples: VIT_PAD_VOTE_N,
+                deadline,
+            },
+            &control,
+        )?;
+        irlume_common::dlog!(
+            "[assessment-stage] grouped-rgb-capture: samples={} elapsed={}ms",
+            frames.len(),
+            started.elapsed().as_millis()
+        );
+        let prepared = self.evaluate_grouped_rgb_samples_with(
+            frames,
+            deadline,
+            |engine, frame| engine.assess_rgb_only_frame_deferred(frame, diagnostics),
             |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
             Instant::now,
         )?;

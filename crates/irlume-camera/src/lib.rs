@@ -2095,7 +2095,20 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 }
                 // The probe missed: the current session is not delivering at
                 // floor, so the cached evidence is stale in the harmful
-                // direction. Drop it and re-establish from scratch.
+                // direction. Drop it and re-establish from scratch. The
+                // measured window is logged for the same reason as the
+                // concurrent site: miss distance decides the fix shape.
+                let (num, den) = self.rate_window.delivered_rate();
+                irlume_common::dlog!(
+                    "[rate-fill] probe missed: {} deltas, rate {}/{} us (floor {}/{} @ {}%), max delta {} us",
+                    self.rate_window.count(),
+                    num,
+                    den,
+                    policy.floor_num(),
+                    policy.floor_den(),
+                    policy.tolerance_percent(),
+                    self.rate_window.max_delta_us()
+                );
                 rate_amortization::invalidate(&key);
                 self.rate_window.reset();
             }
@@ -2585,7 +2598,21 @@ fn drain_until_both_ready<S: ValidatedStream>(
         } else {
             // The probe missed: this session is not delivering at floor, so
             // the cached evidence is stale in the harmful direction. Drop it
-            // and re-establish from scratch.
+            // and re-establish from scratch. The measured window is logged
+            // because "how close was the miss" decides whether the fix is a
+            // wider probe window (variance), a retry (one bad delta), or a
+            // genuinely slow stream (leave it cold).
+            let (num, den) = stream.rate_window.delivered_rate();
+            irlume_common::dlog!(
+                "[rate-fill] concurrent probe missed: {} deltas, rate {}/{} us (floor {}/{} @ {}%), max delta {} us",
+                stream.rate_window.count(),
+                num,
+                den,
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+                stream.rate_window.max_delta_us()
+            );
             rate_amortization::invalidate(&key);
             stream.rate_window.reset();
         }

@@ -4254,6 +4254,41 @@ impl Engine {
             stage: irlume_common::diagnostics::TraceStage::RgbCapture,
             elapsed_us: u64::try_from(capture_started.elapsed().as_micros()).unwrap_or(u64::MAX),
         });
+        let DeferredAssessment {
+            mut assessment,
+            identity: (rgb_image, _),
+        } = self.assess_rgb_only_frame_deferred(rgb, diagnostics)?;
+        self.check_request_active()?;
+        let embedding = match rgb_image {
+            Some(image) => {
+                let view = align::RgbView {
+                    data: &image.data,
+                    width: image.width,
+                    height: image.height,
+                };
+                Some(
+                    self.emb
+                        .embed_tta(&align::align_to_arcface(&view, &image.face.landmarks)?)?,
+                )
+            }
+            None => None,
+        };
+        self.check_request_active()?;
+        assessment.embedding = embedding;
+        Ok(assessment)
+    }
+
+    /// Frame-level RGB-only assessment with the identity input DEFERRED: the
+    /// convenience tier's grouped collector assesses every sample's liveness
+    /// and PAD evidence before any identity inference, mirroring the pair
+    /// group's deferral contract. The eager single-attempt path materializes
+    /// immediately above. Liveness, PAD vote arithmetic and diagnostics are
+    /// byte-identical to the former inline body.
+    fn assess_rgb_only_frame_deferred(
+        &mut self,
+        rgb: irlume_camera::Frame,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<DeferredAssessment<PairIdentity>> {
         let rgb_view = align::RgbView {
             data: &rgb.data,
             width: rgb.width,
@@ -4364,20 +4399,13 @@ impl Engine {
             _ => (verdict, reason, deny_cause),
         };
         self.check_request_active()?;
-        let embedding = match &rgb_top {
-            Some(f) => Some(
-                self.emb
-                    .embed_tta(&align::align_to_arcface(&rgb_view, &f.landmarks)?)?,
-            ),
-            None => None,
-        };
-        self.check_request_active()?;
-        Ok(Assessment {
+        let rgb_frame_mean = irlume_camera::frame_mean(&rgb.data);
+        let assessment = Assessment {
             verdict,
             reason,
             deny_cause,
-            embedding,
-            rgb_frame_mean: irlume_camera::frame_mean(&rgb.data),
+            embedding: None,
+            rgb_frame_mean,
             ir_embedding: None,
             signals,
             ir_center_edge_ratio: 0.0,
@@ -4387,6 +4415,18 @@ impl Engine {
             rgb_pad,
             ir_pad: PadEvidence::NotApplicable,
             sequential_pair: false, // RGB-only path: no pair exists
+        };
+        Ok(DeferredAssessment {
+            assessment,
+            identity: (
+                rgb_top.map(|face| IdentityImage {
+                    data: rgb.data,
+                    width: rgb.width,
+                    height: rgb.height,
+                    face,
+                }),
+                None,
+            ),
         })
     }
 

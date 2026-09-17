@@ -11695,7 +11695,7 @@ mod tests {
         let (_, discarded, _) = second.accounting();
         // IR flush is 10, then seed + 5 probe deltas: never the adaptive
         // full-window walk.
-        assert_eq!(discarded, 16, "adaptive probe pays flush + seed + 5");
+        assert_eq!(discarded, 11, "adaptive probe pays flush + seed + 5");
     }
 
     #[test]
@@ -11922,14 +11922,14 @@ mod tests {
 
     #[test]
     fn rate_fill_preserves_ir_startup_exclusion() {
-        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 49, 66_667);
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 44, 66_667);
         for _ in 0..7 {
             stream.next_discarded().unwrap();
         }
-        // Seven prior frames, ten excluded startup frames, 31 measurement
+        // Seven prior frames, five excluded startup frames, 31 measurement
         // frames, then the delivered frame. IR must not reuse startup timing.
         let (_, facts, _, _, evidence) = stream.next().unwrap();
-        assert_eq!(facts.sequence_raw(), 49);
+        assert_eq!(facts.sequence_raw(), 44);
         assert_eq!(evidence.window_count(), 30);
         assert_eq!(evidence.window_span_us(), 30 * 66_667);
         assert!(evidence.meets_floor());
@@ -12058,7 +12058,7 @@ mod tests {
     #[test]
     fn individual_ir_startup_keeps_full_windows_and_fixed_startup_work() {
         for (startup, expected_observations) in [
-            (IrSessionStartup::Fixed, 42),
+            (IrSessionStartup::Fixed, 37),
             (IrSessionStartup::Adaptive, 31),
         ] {
             let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
@@ -12073,9 +12073,11 @@ mod tests {
     fn adaptive_ir_retained_seed_preserves_the_last_recoverable_startup_window() {
         let make = || {
             let mut stream = rate_fill_fixture(contracts::StreamRole::Ir, 100, 66_667);
-            // The final long interval ends at sequence12. It leaves the full
-            // window at42, the old path's last allowed startup observation.
-            for metadata in stream.stream_mut().unwrap().metadata.iter_mut().skip(11) {
+            // The final long interval ends at sequence 7 (five frames
+            // earlier than under the ten-frame flush, matching the reduced
+            // exclusion). It leaves the full window at the path's last
+            // allowed startup observation.
+            for metadata in stream.stream_mut().unwrap().metadata.iter_mut().skip(6) {
                 let micros = 1_800_000 + i64::from(metadata.sequence) * 66_667;
                 metadata.timestamp =
                     v4l::timestamp::Timestamp::new(micros / 1_000_000, micros % 1_000_000);
@@ -12091,9 +12093,9 @@ mod tests {
                 stream.rate_window.reset();
             }
             IrSessionStartup::Adaptive.fill(&mut stream).unwrap();
-            assert_eq!(stream.observations, 42);
+            assert_eq!(stream.observations, 37);
             let (_, facts, _, _, evidence) = stream.next().unwrap();
-            assert_eq!(facts.sequence_raw(), 43);
+            assert_eq!(facts.sequence_raw(), 38);
             assert_eq!(evidence.window_count(), 30);
             assert!(evidence.meets_floor());
         }
@@ -12122,7 +12124,7 @@ mod tests {
                 stream.rate_window.reset();
             }
             IrSessionStartup::Adaptive.fill(&mut stream).unwrap();
-            assert_eq!(stream.observations, 1 + MAX_RATE_FILL_ATTEMPTS as u64 + 10);
+            assert_eq!(stream.observations, 1 + MAX_RATE_FILL_ATTEMPTS as u64 + 5);
             assert_eq!(stream.rate_window.count(), 30);
             assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
         }
@@ -12180,7 +12182,7 @@ mod tests {
             let result = stream.next();
             if interval_us == 66_667 {
                 let (_, facts, _, _, evidence) = result.unwrap();
-                assert_eq!(facts.sequence_raw(), 42);
+                assert_eq!(facts.sequence_raw(), 37);
                 assert_eq!(evidence.window_count(), 30);
                 assert!(evidence.meets_floor());
             } else {
@@ -12248,7 +12250,7 @@ mod tests {
                 }
             }
             stream.fill_rate_evidence_with_startup(true).unwrap();
-            assert_eq!(stream.observations, 41);
+            assert_eq!(stream.observations, 36);
             // Preserve the existing typed rate refusal on attempted delivery.
             assert!(matches!(stream.next(), Err(DeliveryError::BelowFloor(_))));
         }

@@ -69,7 +69,12 @@ pub(crate) const DEFAULT_TOLERANCE_PERCENT: u32 = 97;
 /// loudly, rather than passing on unaudited evidence.
 pub(crate) const fn startup_flush(role: StreamRole) -> usize {
     match role {
-        StreamRole::Ir => 10,
+        // Fleet-measured worst transient is the NexiGo IR at <=4 frames
+        // (fine sweep: dequeue 3 is the tail, dequeue 4+ settled at
+        // >=14.734 fps); 5 keeps one frame of margin and lands on the auth
+        // critical path twice less often than the previous 10, which
+        // carried 2x headroom over the same measurement.
+        StreamRole::Ir => 5,
         StreamRole::Rgb => 0,
     }
 }
@@ -648,7 +653,7 @@ mod tests {
         // IR: the NexiGo N930W's startup transient is settled from dequeue 4
         // (window seeded earlier measures 14.018-14.705 fps against the 14.7
         // floor); 10 covers that tail with 2.5x margin.
-        assert_eq!(startup_flush(StreamRole::Ir), 10);
+        assert_eq!(startup_flush(StreamRole::Ir), 5);
         // RGB: every measured fleet node needs no flush at all (windows
         // seeded at dequeue 0 deliver 2x-4x the 7.5 fps floor).
         assert_eq!(startup_flush(StreamRole::Rgb), 0);

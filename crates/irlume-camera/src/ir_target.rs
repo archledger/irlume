@@ -996,7 +996,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            stream.observations, 42,
+            stream.observations, 37,
             "slow startup retains the bounded extra work"
         );
         assert!(matches!(

@@ -5,6 +5,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `irlume doctor` now reports the `pam_faillock` tally for the target
+  account: once the deny threshold is tripped, every password (the correct
+  one included) is refused until the unlock window passes, and the lock
+  screen shows that as a plain failure - after failed face rounds push a
+  user to the password, a couple of mistypes can escalate into what looks
+  like a broken password. The check names the state and the remedy
+  (`faillock --user <you> --reset`); root-only, silently omitted where
+  pam_faillock is absent. Born from a live lockout incident during the
+  2026-09-17 hardware audit.
+
 ### Fixed
 
 - The template-retag progress marker under the state directory is now

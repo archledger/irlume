@@ -3826,6 +3826,59 @@ fn selected_stream_minimum_checks(
 /// `args` carries `--user`, which doctor reports on in eight per-user lines.
 /// Resolving with an empty slice ignored the flag silently, while
 /// `docs/COMMANDS.md` documents `--user U` as a global convention.
+/// Count the VALID failure records in `faillock --user` output. The tally
+/// format is `When Type Source Valid` rows; a header-only output is zero.
+/// Pure so the parsing is unit-testable against the live incident's shape.
+fn count_faillock_records(text: &str) -> usize {
+    text.lines()
+        .filter(|l| {
+            let t = l.trim_end();
+            // A record row ends in the Valid column; the header ends in
+            // "Valid" itself and the tally title line ends in ':'.
+            t.ends_with(" V") || t.ends_with("\tV")
+        })
+        .count()
+}
+
+/// Report the pam_faillock tally for `user` when doctor can read it (root and
+/// the binary present). Clean emits a quiet pass; any recorded failure warns
+/// with the remedy, because above the deny threshold every password - the
+/// right one included - is refused for the unlock window and the lock screen
+/// shows only a generic failure.
+fn report_faillock_state(report: &mut crate::doctor_report::Report, user: &str) {
+    use crate::doctor_report::State;
+    if !is_root() {
+        return;
+    }
+    let output = match std::process::Command::new("faillock")
+        .args(["--user", user])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        // Absent binary (no pam_faillock on this box) or a refused read:
+        // nothing this check can say.
+        _ => return,
+    };
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let failures = count_faillock_records(&text);
+    if failures == 0 {
+        dout!(
+            report,
+            "[doctor] pam_faillock ({user}): no recorded failures"
+        );
+        report.check("pam-faillock", State::Pass);
+        return;
+    }
+    dout!(
+        report,
+        "  ⠿ pam_faillock ({user}): {failures} recent failed login(s) recorded. Above the \
+         deny threshold EVERY password, the correct one included, is refused until the \
+         unlock window passes - the lock screen shows that as a plain failure. Clear it: \
+         faillock --user {user} --reset"
+    );
+    report.check("pam-faillock", State::Warn);
+}
+
 fn doctor_run(
     report: &mut crate::doctor_report::Report,
     args: &[String],
@@ -4292,6 +4345,13 @@ fn doctor_run(
 
     // Template encryption + recovery come from the daemon (root-only store).
     let user = user_arg(args);
+    // pam_faillock tally for this account (root-only read; the check is
+    // silently omitted for non-root and absent binaries). A tripped lock
+    // refuses even CORRECT passwords for the unlock window, and the lock
+    // screen surfaces that as a generic failure - after failed face rounds
+    // pushed the user to the password, a mistype or two can escalate into
+    // what looks like a broken password (live incident, 2026-09-17).
+    report_faillock_state(report, &user);
     match daemon_request(&irlume_common::Request::RecoveryStatus { user: user.clone() }) {
         Ok(irlume_common::Response::RecoveryStatus {
             encrypted,
@@ -4794,6 +4854,25 @@ fn selftest_align(args: &[String]) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn faillock_record_counting_matches_the_tally_format() {
+        // Header only: a clean account answers with just the title + header.
+        assert_eq!(
+            count_faillock_records("archledger:\nWhen                Type  Source     Valid\n"),
+            0
+        );
+        // The live 2026-09-17 incident's shape: three valid records.
+        let incident = "archledger:\nWhen                Type  Source                                           Valid\n\
+            2026-09-17 15:10:17 TTY   /dev/tty4                                            V\n\
+            2026-09-17 15:10:40 TTY   /dev/tty4                                            V\n\
+            2026-09-17 15:11:07 TTY   /dev/tty4                                            V\n";
+        assert_eq!(count_faillock_records(incident), 3);
+        // Only VALID records count; an invalidated row is not a lock.
+        let mixed = "u:\nWhen Type Source Valid\n2026-09-17 15:10:17 TTY /dev/tty4 V\n2026-09-17 15:10:40 TTY /dev/tty4 R\n";
+        assert_eq!(count_faillock_records(mixed), 1);
+        assert_eq!(count_faillock_records(""), 0);
+    }
 
     #[test]
     fn doctor_check_flag_is_an_expact_match_not_a_prefix() {

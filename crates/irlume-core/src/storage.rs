@@ -853,7 +853,11 @@ pub fn mark_retag_done(space: &str) {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let _ = fs::write(&path, format!("{space}\n"));
+    // 0600 like every other state file: the content is only a space tag, but
+    // a state-dir override can point at a looser directory than production's
+    // root-only /var/lib/irlume, and a plain `fs::write` lands 0644 there
+    // (found by the 2026-09-17 sandbox battery).
+    let _ = irlume_common::write_0600_atomic(&path, format!("{space}\n").as_bytes());
 }
 
 fn retag_marker_path() -> PathBuf {
@@ -888,6 +892,29 @@ pub fn list_users_at(dir: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retag_marker_is_written_no_looser_than_0600() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("retag-marker-mode"));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        mark_retag_done("embed:test");
+        std::env::remove_var("IRLUME_STATE_DIR");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir.join(".ir-retag-space"))
+            .expect("marker written")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the retag marker must not be group/world readable"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn list_users_at_reads_only_the_named_dir() {
         let dir = PathBuf::from(crate::test_tmp_dir("list-users-at"));

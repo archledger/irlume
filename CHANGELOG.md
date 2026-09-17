@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The template-retag progress marker under the state directory is now
+  written 0600 like every other state file; a plain write left it 0644,
+  which only mattered under a state-dir override into a looser directory
+  (found by the 2026-09-17 keyring/recovery/template-encryption sandbox
+  audit; the marker's content is a non-secret space tag).
+
 - `irlume uninstall` coverage gaps found by the 2026-09-17 audit: the
   GNOME-keyring-token refusal guard and the per-user disarm now sweep EVERY
   state root on the host (the packaged `/var/lib/irlume` plus each human

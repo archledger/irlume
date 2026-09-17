@@ -6057,6 +6057,31 @@ impl IrSession<'_> {
             let data = dec.decode(buf, w, h);
             means.push(data.iter().map(|&p| p as f64).sum::<f64>() / data.len().max(1) as f64);
             frames.push(data);
+            // Early exit on a decided plateau: once the best CLEAN,
+            // camera-lit frame is two frames behind the head with nothing
+            // improving on it, the rest of the burst cannot produce a
+            // better gate frame - it only delays the attempt. Needs both
+            // the clip ceiling and the camera's flags; the newest frame's
+            // record can lag one drain, which at worst delays the exit by
+            // one frame (the tail's authoritative drain still makes the
+            // final selection).
+            if let Some(w) = white_level {
+                let flags_now: Vec<Option<ir_metadata::Illumination>> = match meta.as_mut() {
+                    Some(log) => stamps.iter().map(|&t| log.illumination_at(t)).collect(),
+                    None => vec![None; stamps.len()],
+                };
+                let clipped_now: Vec<f64> = frames
+                    .iter()
+                    .map(|f| ir_probe::saturated_fraction(f, w))
+                    .collect();
+                if ir_metadata::burst_plateau_reached(&means, &flags_now, Some(&clipped_now)) {
+                    irlume_common::dlog!(
+                        "[ir-burst] plateau after {} frames (cap {IR_BURST}); the gate frame is decided",
+                        frames.len()
+                    );
+                    break;
+                }
+            }
         }
         let flags: Vec<Option<ir_metadata::Illumination>> = match meta {
             Some(log) => {

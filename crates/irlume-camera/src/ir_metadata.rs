@@ -392,6 +392,53 @@ pub(crate) fn best_gate_frame(
     clean.map(|(i, _)| i).or(least.map(|(i, _, _)| i))
 }
 
+/// The IR gate burst's early-exit rule: once the brightest CLEAN,
+/// camera-flagged-lit frame is at least two frames behind the head and
+/// nothing since has improved on it, the emitter is on a steady plateau
+/// (or the strobe's lit phase has already passed) - the remaining frames
+/// of the burst cannot produce a better gate frame; they only delay the
+/// attempt. The two trailing frames also preserve the ambient-pair window
+/// around the chosen frame, so the pairing and saturation evidence keep
+/// the neighbors [`ambient_partner`] wants.
+///
+/// Fires only when BOTH the camera's illumination flags and the format's
+/// clip ceiling are measurable: without them "clean" and "lit" are
+/// guesses, and the burst must complete exactly as it always did.
+pub(crate) fn burst_plateau_reached(
+    means: &[f64],
+    flags: &[Option<Illumination>],
+    clipped: Option<&[f64]>,
+) -> bool {
+    let Some(clipped) = clipped else {
+        return false;
+    };
+    if means.len() < 3 || flags.len() != means.len() || clipped.len() != means.len() {
+        return false;
+    }
+    let mut best: Option<(usize, f64)> = None;
+    for (i, &m) in means.iter().enumerate() {
+        if !matches!(flags[i], Some(Illumination::Lit)) {
+            continue;
+        }
+        if clipped[i] <= CLIPPED_FRAC_MAX && best.is_none_or(|(_, b)| m > b) {
+            best = Some((i, m));
+        }
+    }
+    let Some((best_i, best_mean)) = best else {
+        return false;
+    };
+    // Two frames after the best exist, and none of them improves on it
+    // (a later clean, camera-lit frame with a strictly higher mean would).
+    means.len() >= best_i + 3
+        && means[best_i + 1..]
+            .iter()
+            .zip(&flags[best_i + 1..])
+            .zip(&clipped[best_i + 1..])
+            .all(|((&m, flag), &c)| {
+                !(matches!(flag, Some(Illumination::Lit)) && c <= CLIPPED_FRAC_MAX && m > best_mean)
+            })
+}
+
 /// Pick the ambient partner for `lit_i`: an adjacent frame the camera flagged
 /// dark, else the darker of the two neighbours.
 ///
@@ -1421,6 +1468,81 @@ mod tests {
         let flags = [Some(Illumination::Lit); 3];
         let clipped = [0.0, 0.0, 0.0];
         assert_eq!(best_gate_frame(&means, &flags, Some(&clipped)), Some(1));
+    }
+
+    #[test]
+    fn burst_plateau_exits_a_steady_emitter_after_two_flat_frames() {
+        let flags = [Some(Illumination::Lit); 10];
+        let clipped = [0.0; 10];
+        // Frame 0 is the best clean lit frame; two equal frames follow.
+        let means = [150.0, 150.0, 150.0];
+        assert!(
+            burst_plateau_reached(&means, &flags[..3], Some(&clipped[..3])),
+            "a steady plateau is decided after three frames"
+        );
+        // One frame after the best is not enough: the ambient pair still
+        // wants the neighbour behind the best frame.
+        assert!(!burst_plateau_reached(
+            &means[..2],
+            &flags[..2],
+            Some(&clipped[..2])
+        ));
+        // A brightening burst keeps the loop going: something later could
+        // still beat the current best.
+        let rising = [100.0, 120.0, 145.0];
+        assert!(!burst_plateau_reached(
+            &rising,
+            &flags[..3],
+            Some(&clipped[..3])
+        ));
+        // Once two frames fail to improve a strong best, the answer flips.
+        let settled = [100.0, 120.0, 145.0, 144.0, 100.0];
+        assert!(burst_plateau_reached(
+            &settled,
+            &flags[..5],
+            Some(&clipped[..5])
+        ));
+    }
+
+    #[test]
+    fn burst_plateau_never_fires_without_camera_flags_or_clip_ceilings() {
+        let means = [150.0, 150.0, 150.0];
+        let lit = [Some(Illumination::Lit); 3];
+        let clipped = [0.0; 3];
+        // No clip ceiling -> "clean" is not measurable.
+        assert!(!burst_plateau_reached(&means, &lit, None));
+        // No camera classification -> "lit" is not measurable.
+        let unsaid = [None, None, None];
+        assert!(!burst_plateau_reached(&means, &unsaid, Some(&clipped)));
+        // Too few frames to have both a best and its trailing pair.
+        assert!(!burst_plateau_reached(
+            &[150.0, 150.0],
+            &lit[..2],
+            Some(&clipped[..2])
+        ));
+    }
+
+    #[test]
+    fn burst_plateau_ignores_clipped_and_unlit_frames_as_improvements() {
+        // A brighter but CLIPPED lit frame cannot become the best, and does
+        // not count as an improvement either.
+        let means = [150.0, 220.0, 149.0, 148.0];
+        let flags = [Some(Illumination::Lit); 4];
+        let clipped = [0.0, 0.4, 0.0, 0.0];
+        assert!(burst_plateau_reached(&means, &flags, Some(&clipped)));
+        // A dark frame with a huge mean is not an improvement.
+        let strobe_means = [180.0, 5.0, 178.0];
+        let strobe_flags = [
+            Some(Illumination::Lit),
+            Some(Illumination::Dark),
+            Some(Illumination::Lit),
+        ];
+        let clean = [0.0; 3];
+        assert!(burst_plateau_reached(
+            &strobe_means,
+            &strobe_flags,
+            Some(&clean)
+        ));
     }
 
     #[test]

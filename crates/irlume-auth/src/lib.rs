@@ -7053,6 +7053,7 @@ impl Engine {
                 },
                 &operation,
                 observed,
+                std::time::Instant::now() + Self::enrollment_capture_budget(want),
             ) {
                 Ok(scans) => return Ok(scans),
                 Err(CapturePathError::ConcurrentPair(error)) => {
@@ -7090,8 +7091,19 @@ impl Engine {
             },
             &operation,
             observed,
+            std::time::Instant::now() + Self::enrollment_capture_budget(want),
         )
         .map_err(CapturePathError::into_inner)
+    }
+
+    /// The wall-clock budget for one enrollment capture call: fifteen
+    /// seconds per desired scan, the auth grace window's per-attempt
+    /// scale. Generous for slow sequential pairs, finite for a stalling
+    /// camera or a badly-positioned user; a partial result flows into the
+    /// caller's existing short-capture handling exactly like
+    /// attempt-cap exhaustion.
+    fn enrollment_capture_budget(want: usize) -> std::time::Duration {
+        std::time::Duration::from_secs(15 * want.clamp(1, 30) as u64)
     }
 
     /// The enrolment loop arms fresh paired streams per assessment when
@@ -7100,6 +7112,7 @@ impl Engine {
     /// Split out from [`Self::capture_scans_observed`] so the per-frame path runs with
     /// the held cameras already dropped: the two capture strategies must never
     /// have the devices open at the same time (#187).
+    #[allow(clippy::too_many_arguments)]
     fn capture_scan_loop(
         &mut self,
         want: usize,
@@ -7108,6 +7121,7 @@ impl Engine {
         policy: EnrollmentCapturePolicy<'_>,
         operation: &irlume_camera::lease::CameraOperationSession,
         observed: &mut CaptureShape,
+        deadline: std::time::Instant,
     ) -> Result<Vec<CapturedScan>, CapturePathError> {
         let mut out = Vec::new();
         // Read once, before the loop: `cameras` is borrowed per iteration but
@@ -7121,6 +7135,20 @@ impl Engine {
         // retries that a brief drift near the capture moment doesn't abort enroll.
         for _ in 0..(want * 10) {
             if out.len() >= want {
+                break;
+            }
+            // Wall-clock budget: the attempt cap alone lets a stalling pair
+            // (or a badly-positioned user) spin `want * 10` full
+            // assessments - minutes on a sequential pair. Fifteen seconds
+            // per desired scan is generous for slow pairs and finite for
+            // everyone; checked at the same safe boundary as cancellation,
+            // and a partial result flows into the caller's existing
+            // short-capture handling exactly like attempt-cap exhaustion.
+            if std::time::Instant::now() >= deadline {
+                irlume_common::dlog!(
+                    "[enroll] capture budget elapsed with {} of {want} scans",
+                    out.len()
+                );
                 break;
             }
             // The safe boundary: between whole captures, before the next one
@@ -13346,6 +13374,23 @@ mod engine_tests {
         assert!(
             shipped_match.centroid.is_some(),
             "the shipped recognizer's preserved calibration must still apply"
+        );
+    }
+
+    #[test]
+    fn the_enrollment_capture_budget_scales_with_want_and_is_clamped() {
+        assert_eq!(
+            Engine::enrollment_capture_budget(1),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            Engine::enrollment_capture_budget(10),
+            std::time::Duration::from_secs(150)
+        );
+        assert_eq!(
+            Engine::enrollment_capture_budget(0),
+            std::time::Duration::from_secs(15),
+            "a zero want is clamped to one scan's budget"
         );
     }
 

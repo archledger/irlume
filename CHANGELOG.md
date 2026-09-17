@@ -5,6 +5,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- `irlume uninstall` coverage gaps found by the 2026-09-17 audit: the
+  GNOME-keyring-token refusal guard and the per-user disarm now sweep EVERY
+  state root on the host (the packaged `/var/lib/irlume` plus each human
+  account's `~/.local/share/irlume`, where source installs keep state a root
+  shell cannot see), so the wipe can no longer destroy a keyring token the
+  guard never examined; the source/database-less removal now also removes the
+  `irlume-password-verify` helper, the `irlume-retry-reset` PAM service, the
+  `/usr/lib` systemd unit copies, the tmpfiles rule and the AppArmor profile
+  file that outlive a lost package database; the tmpfiles-created
+  `/run/lock/irlume` is removed with the daemon; and the automatic Arch
+  removal uses `pacman -Rns` like the printed hint, so no `.pacsave` of the
+  retry-reset file remains. Known, deliberately unchanged leave-behinds
+  (persistent TPM SRK handle, the irlume-placed Bitwarden polkit action,
+  journald) are documented in the audit.
+
 ### Added
 
 - Convenience-tier (RGB-only) authentication now collects the whole

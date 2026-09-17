@@ -11,7 +11,7 @@ use crate::{crypto, template_key};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Max face profiles per account, one per person (e.g. self / a partner / a
@@ -864,8 +864,15 @@ fn retag_marker_path() -> PathBuf {
 /// state dir), sorted. For 1:N identify and status reporting. Returns an empty
 /// list if the state dir doesn't exist yet.
 pub fn list_users() -> Vec<String> {
+    list_users_at(&state_dir())
+}
+
+/// [`list_users`] against an explicit state directory, for callers that sweep
+/// state the process environment does not carry (the uninstaller's
+/// source-install roots under `~/.local/share/irlume`).
+pub fn list_users_at(dir: &Path) -> Vec<String> {
     let mut users = Vec::new();
-    if let Ok(rd) = fs::read_dir(state_dir()) {
+    if let Ok(rd) = fs::read_dir(dir) {
         for ent in rd.flatten() {
             let p = ent.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -881,6 +888,22 @@ pub fn list_users() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn list_users_at_reads_only_the_named_dir() {
+        let dir = PathBuf::from(crate::test_tmp_dir("list-users-at"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("cameras")).unwrap();
+        fs::write(dir.join("bob.json"), b"{}").unwrap();
+        fs::write(dir.join("cameras/bob.json"), b"{}").unwrap();
+        fs::write(dir.join("note.txt"), b"").unwrap();
+        assert_eq!(list_users_at(&dir), vec!["bob".to_string()]);
+        assert!(
+            list_users_at(&dir.join("nonexistent")).is_empty(),
+            "a missing dir is no users, never an error"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn read_only_plaintext_load_preserves_enrollment_and_missing_state() {
         let _env = crate::testenv::ENV_LOCK

@@ -17,7 +17,7 @@
 use crate::envelope::{SealedEnvelope, SecretKind};
 use crate::tpm;
 use irlume_common::{Error, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// Root-only directory for sealed-password envelopes.
@@ -225,8 +225,23 @@ pub fn sealed_kind(user: &str) -> Option<SecretKind> {
 /// a login keyring is encrypted under.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn list_sealed_kinds() -> Result<Vec<(String, SecretKind)>> {
-    let dir = keyring_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    sealed_kinds_at(&keyring_dir())
+}
+
+/// [`list_sealed_kinds`] against an explicit state root, for callers that
+/// sweep state the process environment does not carry (the uninstaller's
+/// source-install roots under `~/.local/share/irlume`). Resolution mirrors
+/// the default minus the environment override: the root's `keyring` dir.
+///
+/// # Errors
+/// Same conditions as [`list_sealed_kinds`]: an unreadable directory, an
+/// unreadable envelope name, or an envelope that fails to load.
+pub fn list_sealed_kinds_in(state_root: &Path) -> Result<Vec<(String, SecretKind)>> {
+    sealed_kinds_at(&state_root.join("keyring"))
+}
+
+fn sealed_kinds_at(dir: &Path) -> Result<Vec<(String, SecretKind)>> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         // A machine that never armed anything has no directory, which is a
         // real answer: nothing is sealed.
@@ -521,6 +536,20 @@ pub fn forget_password(user: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`forget_password`] against an explicit state root (the uninstaller's
+/// source-install sweep; same resolution rule as [`list_sealed_kinds_in`]).
+///
+/// # Errors
+/// The envelope exists and its removal fails (same conditions as
+/// [`forget_password`]).
+pub fn forget_password_in(state_root: &Path, user: &str) -> Result<()> {
+    let path = state_root.join("keyring").join(format!("{user}.json"));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| Error::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -546,13 +575,36 @@ mod tests {
 
     #[test]
     fn envelope_path_under_keyring_dir() {
-        let _g = crate::testenv::ENV_LOCK.lock().unwrap();
+        let _g = crate::testenv::ENV_LOCK.lock().expect("env lock");
         std::env::set_var("IRLUME_KEYRING_DIR", crate::test_tmp_dir("kr-test"));
         assert_eq!(
             envelope_path("alice"),
             PathBuf::from(format!("{}/alice.json", crate::test_tmp_dir("kr-test")))
         );
         std::env::remove_var("IRLUME_KEYRING_DIR");
+    }
+
+    #[test]
+    fn in_variants_read_and_forget_the_named_state_root() {
+        let _g = crate::testenv::ENV_LOCK.lock().expect("env lock");
+        let root = PathBuf::from(crate::test_tmp_dir("kr-in-variant"));
+        let _ = std::fs::remove_dir_all(&root);
+        // No keyring dir at the named root: a real "nothing sealed" answer.
+        assert!(list_sealed_kinds_in(&root).unwrap().is_empty());
+        // An envelope the loader cannot parse at the named root must SURFACE
+        // as an error from that root: the uninstaller treats a read failure
+        // as refusal grounds, never as "no envelope" (its own contract).
+        let keyring = root.join("keyring");
+        std::fs::create_dir_all(&keyring).unwrap();
+        std::fs::write(keyring.join("alice.json"), b"not an envelope").unwrap();
+        assert!(list_sealed_kinds_in(&root).is_err());
+        // Disarm removes exactly the named root's envelope, and a named root
+        // without one stays a success.
+        forget_password_in(&root, "alice").unwrap();
+        assert!(list_sealed_kinds_in(&root).unwrap().is_empty());
+        assert!(!keyring.join("alice.json").exists());
+        forget_password_in(&root, "alice").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Full arm → unseal round-trip through the keyring layer on the real TPM.

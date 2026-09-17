@@ -88,11 +88,16 @@ pub fn run(args: &[String]) -> ExitCode {
     // envelope that holds no token; the enumerator errors rather than skipping,
     // because guessing here erases the only copy of the secret a login keyring
     // is encrypted under.
-    let sealed = match irlume_core::keyring::list_sealed_kinds() {
-        Ok(s) => s,
-        Err(e) => {
+    // The sweep covers EVERY state root, not just the one this process's
+    // environment resolves: a source install (install-host.sh) points the
+    // daemon at the admin's ~/.local/share/irlume, which a root shell never
+    // sees, and the homes wipe below would delete that envelope without this
+    // refusal ever firing (2026-09-17 uninstall audit).
+    let token_users = match sealed_token_holders() {
+        Ok(users) => users,
+        Err(store) => {
             eprintln!(
-                "[uninstall] refusing: could not read the sealed-envelope store ({e}). \
+                "[uninstall] refusing: could not read the sealed-envelope store ({store}). \
                  One of these may hold a GNOME keyring token, and deleting it would \
                  leave that keyring encrypted under a secret nothing can reproduce. \
                  Fix the store (or move it aside deliberately) and re-run."
@@ -100,11 +105,6 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let token_users: Vec<&str> = sealed
-        .iter()
-        .filter(|(_, kind)| *kind == irlume_core::envelope::SecretKind::GnomeKeyringToken)
-        .map(|(u, _)| u.as_str())
-        .collect();
     if !token_users.is_empty() {
         eprintln!(
             "[uninstall] refusing: the login keyring of {} is keyed to an irlume-held \
@@ -246,7 +246,9 @@ fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
         InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
             run_pkg("apt-get", &["purge", "-y", "irlume"])
         }
-        InstallOrigin::ArchPkg => run_pkg("pacman", &["-R", "--noconfirm", "irlume"]),
+        // -Rns to match the manual hint: without -n, pacman keeps a .pacsave
+        // of the backup-marked /etc/pam.d/irlume-retry-reset.
+        InstallOrigin::ArchPkg => run_pkg("pacman", arch_remove_args()),
         InstallOrigin::Source => remove_source_files(),
     }
 }
@@ -261,10 +263,22 @@ fn run_pkg(bin: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// The pacman removal arguments, pure so the hint parity is pinned by a test.
+fn arch_remove_args() -> &'static [&'static str] {
+    &["-Rns", "--noconfirm", "irlume"]
+}
+
 /// Delete the files a source install placed: the two binaries (this one and its
 /// sibling irlumed), the PAM module, the systemd unit + drop-ins, and the model
 /// tree. The state/config dirs are already gone from the teardown. Best-effort;
 /// reports the count removed.
+///
+/// This also sweeps files only a PACKAGE lane places (the libexec helpers, the
+/// retry-reset PAM service, the /usr/lib unit copies, the tmpfiles rule, the
+/// AppArmor profile file): `install_origin()` reaches this function only when
+/// the package database has no irlume entry, so by construction no package
+/// owns those paths here and nothing else would ever remove them
+/// (2026-09-17 uninstall audit).
 fn remove_source_files() -> Result<String, String> {
     let mut targets: Vec<PathBuf> = Vec::new();
 
@@ -275,6 +289,35 @@ fn remove_source_files() -> Result<String, String> {
         }
         targets.push(exe);
     }
+    targets.extend(source_file_targets());
+    let _ = std::fs::remove_dir_all("/etc/systemd/system/irlumed.service.d");
+    // The model tree (the two common source-install prefixes).
+    for d in ["/usr/share/irlume", "/usr/local/share/irlume"] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    // The wallet handoff helpers' directory (package lanes fill it; the
+    // password-verify helper beside it is in the target list above).
+    let _ = std::fs::remove_dir_all("/usr/libexec/irlume");
+
+    let desktop_removed = remove_source_desktop_files(Path::new("/usr/local/share"))
+        .map_err(|e| format!("could not remove the source-installed desktop entry: {e}"))?;
+    let removed = desktop_removed
+        + targets
+            .iter()
+            .filter(|p| p.exists() && std::fs::remove_file(p).is_ok())
+            .count();
+    let _ = systemctl(&["daemon-reload"]);
+    if removed == 0 {
+        return Err("found no source-installed files to remove (already gone?)".into());
+    }
+    Ok(format!("removed {removed} source-installed file(s)"))
+}
+
+/// The constant file targets of a source removal (everything except the
+/// running binary and its sibling, which depend on `current_exe`). Pure so a
+/// test can pin every lane artifact this must cover.
+fn source_file_targets() -> Vec<PathBuf> {
+    let mut targets: Vec<PathBuf> = Vec::new();
     // The PAM module, wherever the loader keeps modules on this distro.
     for d in [
         "/usr/lib/security",
@@ -290,26 +333,33 @@ fn remove_source_files() -> Result<String, String> {
     targets.push(PathBuf::from(
         "/usr/share/polkit-1/actions/org.irlume.recovery-manage.policy",
     ));
-    // The systemd unit and any drop-ins.
     targets.push(PathBuf::from("/etc/systemd/system/irlumed.service"));
-    let _ = std::fs::remove_dir_all("/etc/systemd/system/irlumed.service.d");
-    // The model tree (the two common source-install prefixes).
-    for d in ["/usr/share/irlume", "/usr/local/share/irlume"] {
-        let _ = std::fs::remove_dir_all(d);
+    // Package-path unit copies: orphaned whenever this function runs (a
+    // package entry would have routed removal through the package manager).
+    for d in ["/usr/lib/systemd/system", "/lib/systemd/system"] {
+        for unit in [
+            "irlumed.service",
+            "irlumed.socket",
+            "irlume-reconcile.path",
+            "irlume-reconcile.service",
+            "irlume-reconcile.timer",
+            "irlume-runner-prune.service",
+            "irlume-runner-prune.timer",
+        ] {
+            targets.push(PathBuf::from(d).join(unit));
+        }
     }
-
-    let desktop_removed = remove_source_desktop_files(Path::new("/usr/local/share"))
-        .map_err(|e| format!("could not remove the source-installed desktop entry: {e}"))?;
-    let removed = desktop_removed
-        + targets
-            .iter()
-            .filter(|p| p.exists() && std::fs::remove_file(p).is_ok())
-            .count();
-    let _ = systemctl(&["daemon-reload"]);
-    if removed == 0 {
-        return Err("found no source-installed files to remove (already gone?)".into());
+    // The tmpfiles rule (packaged location plus the admin override location)
+    // and the AppArmor profile file; the profile itself is unloaded by the
+    // teardown before this runs.
+    for d in ["/usr/lib/tmpfiles.d", "/etc/tmpfiles.d"] {
+        targets.push(PathBuf::from(d).join("irlume.conf"));
     }
-    Ok(format!("removed {removed} source-installed file(s)"))
+    targets.push(PathBuf::from("/etc/apparmor.d/usr.bin.irlumed"));
+    // The privileged-verification helper and irlume's PAM service file.
+    targets.push(PathBuf::from("/usr/libexec/irlume-password-verify"));
+    targets.push(PathBuf::from("/etc/pam.d/irlume-retry-reset"));
+    targets
 }
 
 /// Only the two files placed by install-host.sh. Leave system package entries,
@@ -572,6 +622,10 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         if sock.exists() {
             let _ = std::fs::remove_file(sock);
         }
+        // The tmpfiles-created IR-emitter lock directory (#542): tmpfs, but
+        // the uninstall's own cleanliness standard removed the stale socket
+        // for exactly this residue class (0.11.0rc1 audit).
+        let _ = std::fs::remove_dir_all("/run/lock/irlume");
     }
     // `systemctl enable` copies units into /etc/systemd/system/ (Arch's
     // systemd does this for units with [Install] aliases) — files pacman/apt
@@ -638,6 +692,18 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
             }
         }
     }
+    // Source-lane roots: disarm their seals too. The wipe below takes the
+    // whole tree, but a --keep-data uninstall must still disarm, and the
+    // count must reflect every user this teardown actually disarmed (the
+    // default-root enumeration above is blind to these roots for the same
+    // environment reason as the token guard; 2026-09-17 audit).
+    let mut users_cleared = users.len();
+    for root in extra_state_roots() {
+        for user in irlume_core::storage::list_users_at(&root) {
+            let _ = irlume_core::keyring::forget_password_in(&root, &user);
+            users_cleared += 1;
+        }
+    }
 
     // 4 (cont). Remove the state and config trees: third-party models, any
     //    remaining sealed envelopes, cameras.conf/settings.conf. Guarded so
@@ -673,7 +739,7 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     TeardownReport {
         pam_unwired,
         service_stopped,
-        users_cleared: users.len(),
+        users_cleared,
         data_wipe_requested,
         data_wiped: data_wipe_requested && data_left.is_empty(),
         data_left,
@@ -700,6 +766,65 @@ fn human_homes() -> Vec<std::path::PathBuf> {
             }
         })
         .collect()
+}
+
+/// State roots outside the environment-resolved default: each human account's
+/// `~/.local/share/irlume`, where a source install keeps the machine state
+/// (`install-host.sh` writes `IRLUME_STATE_DIR` into the unit, not the shell)
+/// and the login runner keeps its records. Only existing directories are
+/// named, and the default root is never duplicated into the list.
+fn extra_state_roots() -> Vec<PathBuf> {
+    extra_state_roots_with(&human_homes(), &irlume_common::state_dir())
+}
+
+/// [`extra_state_roots`] with the homes and default root injected, so the
+/// selection rules are testable without touching `/etc/passwd`.
+fn extra_state_roots_with(homes: &[PathBuf], default_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for home in homes {
+        let root = home.join(".local/share/irlume");
+        if root.is_dir() && root != default_root && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Users whose sealed envelope anywhere on this host is a GNOME keyring
+/// token, or the store description on a read failure. Read failures are
+/// errors, never skips: an envelope this cannot read is not an envelope that
+/// holds no token (the guard's own contract).
+fn sealed_token_holders() -> Result<Vec<String>, String> {
+    sealed_token_holders_with(
+        irlume_core::keyring::list_sealed_kinds(),
+        &extra_state_roots(),
+    )
+}
+
+/// [`sealed_token_holders`] with the default-root enumeration and the extra
+/// roots injected, so the sweep and the failure contract are unit-testable.
+fn sealed_token_holders_with(
+    default: irlume_common::Result<Vec<(String, irlume_core::envelope::SecretKind)>>,
+    roots: &[PathBuf],
+) -> Result<Vec<String>, String> {
+    let mut holders: Vec<String> = Vec::new();
+    let mut collect = |sealed: Vec<(String, irlume_core::envelope::SecretKind)>| {
+        for (user, kind) in sealed {
+            if kind == irlume_core::envelope::SecretKind::GnomeKeyringToken
+                && !holders.contains(&user)
+            {
+                holders.push(user);
+            }
+        }
+    };
+    collect(default.map_err(|e| format!("{e}"))?);
+    for root in roots {
+        collect(
+            irlume_core::keyring::list_sealed_kinds_in(root)
+                .map_err(|e| format!("{}: {e}", root.join("keyring").display()))?,
+        );
+    }
+    Ok(holders)
 }
 
 /// Delete the given data trees and return the ones that still exist afterwards.
@@ -1194,5 +1319,96 @@ mod tests {
         assert!(nonzero.contains("false exited with"), "{nonzero}");
         let missing = run_pkg("irlume-no-such-pkg-manager-xyz", &[]).unwrap_err();
         assert!(missing.contains("could not run"), "{missing}");
+    }
+
+    // ---- 2026-09-17 uninstall-audit coverage --------------------------------
+
+    #[test]
+    fn arch_removal_matches_the_manual_hint() {
+        // The automatic path and the printed hint must agree; without -n,
+        // pacman leaves a .pacsave of the backup-marked retry-reset file.
+        assert_eq!(arch_remove_args(), &["-Rns", "--noconfirm", "irlume"]);
+        assert!(removal_hint(&InstallOrigin::ArchPkg).contains("-Rns"));
+    }
+
+    #[test]
+    fn source_targets_cover_every_source_and_dbless_lane_file() {
+        let targets = source_file_targets();
+        let has = |p: &str| targets.iter().any(|t| t == &PathBuf::from(p));
+        // The original source lane.
+        for p in [
+            "/usr/lib64/security/pam_irlume.so",
+            "/usr/share/polkit-1/actions/org.irlume.enroll.policy",
+            "/etc/systemd/system/irlumed.service",
+        ] {
+            assert!(has(p), "missing source target {p}");
+        }
+        // The package-lane files that outlive a lost package database (the
+        // audit's F2): only this function removes them when no package owns
+        // them, so every one must be named here.
+        for p in [
+            "/usr/libexec/irlume-password-verify",
+            "/etc/pam.d/irlume-retry-reset",
+            "/usr/lib/systemd/system/irlumed.service",
+            "/usr/lib/systemd/system/irlumed.socket",
+            "/usr/lib/systemd/system/irlume-reconcile.timer",
+            "/usr/lib/systemd/system/irlume-runner-prune.timer",
+            "/lib/systemd/system/irlumed.service",
+            "/usr/lib/tmpfiles.d/irlume.conf",
+            "/etc/tmpfiles.d/irlume.conf",
+            "/etc/apparmor.d/usr.bin.irlumed",
+        ] {
+            assert!(has(p), "missing dbless-lane target {p}");
+        }
+    }
+
+    #[test]
+    fn extra_state_roots_name_existing_home_state_only() {
+        let base = std::env::temp_dir().join(format!("irlume-extra-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let with_state = base.join("a");
+        let without = base.join("b");
+        let duplicated = base.join("a");
+        let default = base.join("default-state");
+        std::fs::create_dir_all(with_state.join(".local/share/irlume")).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        // Existing home state is named once; a home without it and the
+        // default root (however the environment resolved it) never appear.
+        let roots = extra_state_roots_with(&[with_state.clone(), without, duplicated], &default);
+        assert_eq!(roots, vec![with_state.join(".local/share/irlume")]);
+        // The default root is excluded even when a home points at it.
+        let as_default = with_state.join(".local/share/irlume");
+        assert!(extra_state_roots_with(std::slice::from_ref(&with_state), &as_default).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn token_guard_sweeps_extra_roots_and_fails_closed_on_unreadable_ones() {
+        // A source-lane root holding an envelope the loader cannot parse must
+        // surface as a REFUSAL-grade error naming that root: skipping it is
+        // what let the homes wipe destroy a token nobody examined (audit F1).
+        let base = std::env::temp_dir().join(format!("irlume-token-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("home/.local/share/irlume");
+        std::fs::create_dir_all(root.join("keyring")).unwrap();
+        std::fs::write(root.join("keyring/carol.json"), b"not an envelope").unwrap();
+        let err =
+            sealed_token_holders_with(Ok(Vec::new()), std::slice::from_ref(&root)).unwrap_err();
+        assert!(
+            err.contains(root.join("keyring").to_str().unwrap()),
+            "error must name the swept root: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        // An empty sweep is an empty holder list, and non-token kinds in the
+        // default root stay irrelevant.
+        let holders = sealed_token_holders_with(
+            Ok(vec![(
+                "alice".into(),
+                irlume_core::envelope::SecretKind::LoginPassword,
+            )]),
+            &[],
+        )
+        .unwrap();
+        assert!(holders.is_empty());
     }
 }

@@ -5909,12 +5909,25 @@ impl Engine {
         // cannot overflow queues retained from an earlier capture.
         self.check_request_active()?;
         let camera_open_started = std::time::Instant::now();
-        let resolved_cams = match (
-            camera_operation.open_rgb(&rgb_dev),
-            camera_operation.open_ir(&ir_dev),
-        ) {
-            (Ok(rgb), Ok(ir)) => Some((rgb, ir)),
-            _ => None,
+        // On an RGB-only (convenience-tier) box the IR node may still OPEN
+        // (forced-off is an engine tier, not device absence), so keying the
+        // pair match on open success would consume the RGB handle into a pair
+        // nobody can use. When no IR is available, never open the IR node and
+        // keep the negotiated RGB handle for the grouped convenience
+        // collector; otherwise the pair semantics are unchanged.
+        let (resolved_cams, rgb_only_cam) = if self.ir_available {
+            match (
+                camera_operation.open_rgb(&rgb_dev),
+                camera_operation.open_ir(&ir_dev),
+            ) {
+                (Ok(rgb), Ok(ir)) => (Some((rgb, ir)), None),
+                _ => (None, None),
+            }
+        } else {
+            match camera_operation.open_rgb(&rgb_dev) {
+                Ok(rgb) => (None, Some(rgb)),
+                Err(_) => (None, None),
+            }
         };
         self.check_request_active()?;
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
@@ -5945,6 +5958,15 @@ impl Engine {
             purpose,
             service,
         );
+        let grouped_rgb_only = !grouped
+            && rgb_only_cam.is_some()
+            && grouped_auth::rgb_only_eligible(
+                self.ir_available,
+                self.has_vit_pad(),
+                window,
+                purpose,
+                service,
+            );
         let (grouped_cams, resolved_cams) = if grouped {
             (resolved_cams, None)
         } else {
@@ -6030,6 +6052,36 @@ impl Engine {
         }
         if held_cams.is_none() || !self.ir_available {
             drop(held_cams);
+            // Convenience tier: the grouped RGB-only collector completes the
+            // five-sample PAD vote inside one camera session, where the eager
+            // per-attempt loop pays full stream setup per sample and cannot
+            // finish inside the presence window on slow RGB sensors.
+            if let Some(rgb_cam) = rgb_only_cam.as_ref().filter(|_| grouped_rgb_only) {
+                let mut costliest_attempt = std::time::Duration::ZERO;
+                return self
+                    .authentication_attempt_loop_with(
+                        deadline,
+                        window,
+                        &mut costliest_attempt,
+                        |engine| {
+                            (
+                                Self::run_camera_operation(&camera_operation, || {
+                                    engine.authenticate_grouped_rgb_only_once(
+                                        &enr,
+                                        purpose,
+                                        service,
+                                        rgb_cam,
+                                        deadline,
+                                        diagnostics,
+                                    )
+                                }),
+                                false,
+                            )
+                        },
+                        std::time::Instant::now,
+                    )
+                    .0;
+            }
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self
                 .authentication_attempt_loop(

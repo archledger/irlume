@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Convenience-tier (RGB-only) authentication now collects the whole
+  five-sample ViT PAD vote from one armed camera session instead of one
+  sample per grace attempt that each reopened the stream. Measured on the
+  built-in RGB camera of a UX5406S (15 fps sensor): the eager loop needed
+  ~3.3s per sample, so the vote never finished inside the default 15s
+  presence window and screen unlock silently fell back to the password
+  (raising the window to 30s completed the vote at ~19s per unlock). The
+  grouped route completes in one session; per-sample liveness and PAD
+  gates, the vote arithmetic, thresholds and the grant boundary are
+  unchanged, and the eager path still serves every excluded shape
+  (missing PAD cue, one-shot or short window, out-of-scope services).
+
 - Latency workstream (measured on real hardware, live-verified per
   change): the IR gate burst stops on a decided plateau (the best
   clean camera-lit frame two unimproved frames behind the head)

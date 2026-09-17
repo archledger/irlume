@@ -2538,7 +2538,58 @@ fn drain_until_both_ready<S: ValidatedStream>(
         }
     }
     stream.rate_window.reset();
+    // ADR-0021 continuity probe for the CONCURRENT path, in parity with the
+    // single-stream fill: a full floor-passing window completed recently on
+    // this node and role may admit the session after seed + a handful of
+    // deltas, instead of re-owing all 30. The probe measures post-flush
+    // exactly like the single-stream path, a miss invalidates the cached
+    // evidence and falls back to the full fill below, and the per-frame
+    // sliding judgment keeps running for the whole burst either way - the
+    // amortization never weakens the floor arithmetic, it only stops a warm
+    // pair from paying the cold fill on every attempt (measured ~4.4s per
+    // concurrent attempt before this).
     let mut reported = false;
+    if let Some(key) = stream
+        .amort_key
+        .clone()
+        .filter(rate_amortization::amortizable)
+    {
+        let mut attempts = 0;
+        while stream.rate_window.count() < rate_amortization::CONTINUITY_PROBE_DELTAS
+            && attempts < MAX_PROBE_FILL_ATTEMPTS
+        {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(paired_rate_cancel_error());
+            }
+            if let Err(error) = stream.next_discarded() {
+                cancelled.store(true, Ordering::Release);
+                return Err(error);
+            }
+            attempts += 1;
+        }
+        let policy = stream.rate_config.policy();
+        if stream.rate_window.count() >= rate_amortization::CONTINUITY_PROBE_DELTAS
+            && stream.rate_window.meets_floor(
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+            )
+        {
+            stream.health_admitted = true;
+            ready_count.fetch_add(1, Ordering::AcqRel);
+            reported = true;
+            irlume_common::dlog!(
+                "[rate-fill] concurrent probe admitted after {} deltas",
+                stream.rate_window.count()
+            );
+        } else {
+            // The probe missed: this session is not delivering at floor, so
+            // the cached evidence is stale in the harmful direction. Drop it
+            // and re-establish from scratch.
+            rate_amortization::invalidate(&key);
+            stream.rate_window.reset();
+        }
+    }
     let mut attempts = 0usize;
     // Fill (bounded) plus the trailing drain while the twin finishes, itself
     // bounded by the twin's worst-case fill.
@@ -2557,10 +2608,27 @@ fn drain_until_both_ready<S: ValidatedStream>(
         }
         attempts += 1;
     }
-    if !stream.rate_window.ready() {
+    // A probe-admitted session carries a partial window by design; the
+    // per-frame sliding judgment governs from here, exactly as after the
+    // single-stream probe admission.
+    if !stream.rate_window.ready() && !stream.health_admitted {
         return Err(std::io::Error::other(
             "could not establish delivered-rate evidence within the bounded fill",
         ));
+    }
+    // A completed floor-passing window is reusable evidence for the NEXT
+    // session's probe (ADR-0021, same rule as the single-stream fill): the
+    // concurrent path used to never record, so its keys never amortized -
+    // every attempt re-owed the full fill.
+    if let Some(key) = &stream.amort_key {
+        let policy = stream.rate_config.policy();
+        if stream.rate_window.meets_floor(
+            policy.floor_num(),
+            policy.floor_den(),
+            policy.tolerance_percent(),
+        ) {
+            rate_amortization::record_completion(key.clone());
+        }
     }
     Ok(())
 }
@@ -18419,6 +18487,55 @@ mod tests {
                 panic!("concurrent fill thread panicked")
             }
         }
+    }
+
+    #[test]
+    fn concurrent_pair_admits_on_probes_after_recent_full_windows() {
+        // ADR-0021 parity for the CONCURRENT path: both roles completed a
+        // floor-passing window recently, so each side admits on seed + a
+        // handful of probe deltas instead of re-owing all 30. The measured
+        // cost was ~4.4s of joint fill on EVERY concurrent attempt; with
+        // probes, a warm pair pays its role flush plus a few frames.
+        let node = "/dev/video-pair-amort";
+        rate_amortization::test_support::force_completion(
+            rate_amortization::Key::new(node, contracts::StreamRole::Rgb),
+            Some(std::time::Instant::now()),
+        );
+        rate_amortization::test_support::force_completion(
+            rate_amortization::Key::new(node, contracts::StreamRole::Ir),
+            Some(std::time::Instant::now()),
+        );
+        // Enough frames for the bounded worst case (the trailing drain's
+        // budget is 128 per side) so scheduling variance cannot exhaust the
+        // fixture; the assertions below test the ESSENTIAL property.
+        let mut rgb =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 260, 66_667).with_rate_amortization(node);
+        let mut ir =
+            rate_fill_fixture(contracts::StreamRole::Ir, 260, 66_667).with_rate_amortization(node);
+        establish_concurrent_rate(&mut rgb, &mut ir).expect("probe admission");
+        assert!(
+            rgb.health_admitted,
+            "rgb admitted on its probe (window count {})",
+            rgb.rate_window.count()
+        );
+        assert!(
+            ir.health_admitted,
+            "ir admitted on its probe (window count {})",
+            ir.rate_window.count()
+        );
+        assert!(
+            rate_amortization::amortizable(&rate_amortization::Key::new(
+                node,
+                contracts::StreamRole::Rgb
+            )),
+            "a passing probe leaves the cached evidence reusable"
+        );
+        // Frame-count accounting is deliberately NOT asserted: the trailing
+        // drain's depth is the twin thread's report latency, which instant
+        // fixtures make CPU-paced (a real camera paces it at frame arrival).
+        // The latency win is a consequence of admission itself - the fill
+        // owed drops from 31 deltas to seed + 5 per side - and is verified
+        // on hardware.
     }
 
     #[test]

@@ -5926,7 +5926,16 @@ impl Engine {
         } else {
             match camera_operation.open_rgb(&rgb_dev) {
                 Ok(rgb) => (None, Some(rgb)),
-                Err(_) => (None, None),
+                Err(error) => {
+                    // Named, not swallowed: on a host where this open fails
+                    // while the eager path's own device-path open succeeds,
+                    // the convenience tier silently loses the grouped
+                    // collector (found live on archhost, 2026-09-17).
+                    irlume_common::dlog!(
+                        "grouped-rgb route: RGB open under the camera operation failed: {error}"
+                    );
+                    (None, None)
+                }
             }
         };
         self.check_request_active()?;
@@ -6056,6 +6065,18 @@ impl Engine {
             // five-sample PAD vote inside one camera session, where the eager
             // per-attempt loop pays full stream setup per sample and cannot
             // finish inside the presence window on slow RGB sensors.
+            // The decision is NAMED: a host where the route silently degrades
+            // to eager is indistinguishable from a working one without this.
+            if !grouped && !self.ir_available {
+                irlume_common::dlog!(
+                    "grouped-rgb route: {} (cam_open={} vit_pad={} window={} service={:?})",
+                    if grouped_rgb_only { "TAKEN" } else { "skipped" },
+                    rgb_only_cam.is_some(),
+                    self.has_vit_pad(),
+                    window,
+                    service,
+                );
+            }
             if let Some(rgb_cam) = rgb_only_cam.as_ref().filter(|_| grouped_rgb_only) {
                 let mut costliest_attempt = std::time::Duration::ZERO;
                 return self

@@ -1,5 +1,6 @@
 # Packit: build irlume RPMs in Copr from signed GitHub tags (the linhello
-# pipeline). Model weights are release assets (Source2-5 in the spec, fetched
+# pipeline). Model weights are release assets (Source2-5 and Source7-9 in the
+# spec, fetched
 # with net-on), not Git LFS, so there is nothing to pull at clone time.
 specfile_path: packaging/fedora/irlume.spec
 upstream_package_name: irlume

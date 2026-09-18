@@ -2,7 +2,8 @@
 
 A passing pull request is one prerequisite. Release a reviewed, uniquely versioned
 candidate only after its packages and upgrade behavior have been checked. Do not
-replace v0.11.3 assets with unreleased source still labeled 0.11.3.
+replace an already-published release's assets with unreleased source that still
+carries that release's version label.
 
 ## Candidate checks
 
@@ -29,7 +30,7 @@ recovery phrases, templates or camera frames in release evidence.
 | Transaction | Required evidence |
 |---|---|
 | Clean install | Daemon starts; CLI, PAM module, models, runtime, wallet helpers, password verifier, dedicated PAM service and polkit policies are installed at the expected paths. |
-| Upgrade from v0.11.3 | Matching components installed together, daemon restarted into the candidate, existing configuration and enrollment retained, password login available. |
+| Upgrade from the previous release | Matching components installed together, daemon restarted into the candidate, existing configuration and enrollment retained, password login available. (The upgrade harness currently pins v0.11.3 -> v0.12.0; bump its assertions per [UPGRADE-VALIDATION.md](UPGRADE-VALIDATION.md) when the pair moves.) |
 | Authorization/recovery | Enrollment and recovery management require their configured OS approval; denial/cancellation changes no managed state. Qualify retry reset with synthetic local accounts on supported systems. |
 | Retry persistence | Existing counters survive upgrade and restart; password login alone does not reset them. Successful explicit recovery follows the documented budgets. |
 | Rollback | Restore the previous complete package set and restart the daemon; keep enrollment, recovery envelopes and retry records intact. Check password login and document which newer authorization checks the older daemon lacks. |
@@ -38,7 +39,10 @@ Restore disposable VM snapshots between destructive fixture scenarios. Do not
 clear production retry records to make an upgrade test pass. Actual attended
 camera/PAM qualification remains a separate test from package structure checks.
 
-## Changes users need to understand after v0.11.3
+## Changes users need to understand after the previous release
+
+The list below is the v0.11.3 -> v0.12.0 example set; re-derive it from the
+CHANGELOG for each release.
 
 - Upgrade the daemon, CLI, PAM module and helpers together, then restart the
   daemon. Wallet-salt lookup moved into the account-scoped helper; partial

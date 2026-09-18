@@ -314,7 +314,7 @@ the daemon); they measure, and hold no privileged path:
 | `selftest` | liveness self-test; `selftest align` for the aligner |
 | `capture` / `calcapture` | save frames / run a calibrated capture campaign |
 | `eval` / `irbench` / `genuine` | accuracy benchmarks over captured sets (see [VERIFY.md](VERIFY.md)) |
-| `normprobe` / `meshprobe` | embedding-norm and FaceMesh probes |
+| `normprobe` | embedding-norm probe (`meshprobe` is retired; it answers "unknown command" even with `IRLUME_DEV=1`) |
 | `padcapture` / `padreport` | presentation-attack (spoof) capture + report (see [PAD_SELFTEST.md](PAD_SELFTEST.md)) |
 
 ### Measuring capture overlap

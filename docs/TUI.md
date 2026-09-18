@@ -92,7 +92,9 @@ without live-status support is shown as unavailable for that source.
 
 The Cameras page automatically follows connected devices. New UVC candidates
 appear from the daemon's passive connection monitor, and disconnected choices
-are removed. When the page is open and idle, a changed inventory triggers a
+are removed. Enrolled secondary camera groups (ADR-0024) are listed on the
+Faces page as camera rows: `[x]` removes one, and `irlume enroll --add-camera`
+adds another. When the page is open and idle, a changed inventory triggers a
 camera-role inspection; that inspection can open device nodes to identify RGB
 and infrared endpoints. It does not repeatedly run capture qualification.
 Inspection failure is shown separately from an empty device list. Selection
@@ -183,7 +185,8 @@ A profile represents one person. An account supports up to **three people**;
 any enrolled person can authenticate as that account. Scans represent that
 person's appearances or conditions, such as glasses or different lighting.
 Use **Improve Recognition** (`a`) on that person's profile to add scans.
-The current limit is 30 scans per profile for each recognizer.
+The current limits are 30 scans per profile for each recognizer, 30 per
+camera group, and 64 scans account-wide across camera groups (ADR-0024).
 
 **Enroll Face** (`e`) also handles a face that is already enrolled:
 
@@ -251,8 +254,10 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `deps`, `version` | F2: runtime dependencies and version |
 | `enroll` | Faces: Enroll Face (`e`); matching faces offer improvement |
 | `enroll --scans`, `enroll --reset` | F2: chosen scan count or Replace face enrollment |
+| `enroll --add-camera` | Faces lists every enrolled camera group; adding a second camera is the CLI command (`[x]` on a camera row removes one) |
 | `profiles list` | Faces; F2 lists full recognizer tags |
 | `profiles add-scan` | Faces: Improve Recognition (`a`); F2 accepts a chosen scan count |
+| `profiles remove-camera --group ID` | Faces: `[x]` on an enrolled camera row removes that camera group (with confirmation) |
 | `profiles rename`, `profiles delete` | Faces: select profile/scan, then Rename/Delete; F2 also works without camera navigation |
 | `profiles forget-model`, `profiles eyes-open off` | F2: remove recognizer scans or clear the legacy blocker |
 | `identify` | Overview / Test Recognition |

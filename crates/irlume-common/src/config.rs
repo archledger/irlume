@@ -341,7 +341,8 @@ pub fn write_kvs(file: &str, updates: &[(&str, &str)]) -> std::io::Result<()> {
 
     // Published atomically, not truncated in place. Truncate-then-write means a
     // full disk or a power loss mid-write leaves a partial file, and these hold
-    // the camera binding and the third-party model selection: on a full tmpfs
+    // the camera binding (and, pre-ADR-0015, the third-party model selection):
+    // on a full tmpfs
     // this left cameras.conf as 4096 bytes of half a config. `write_0600_atomic`
     // creates the temp at the final mode, fsyncs it, renames, then fsyncs the
     // directory, so a reader sees either the whole old file or the whole new

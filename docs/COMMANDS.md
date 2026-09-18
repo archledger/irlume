@@ -27,18 +27,20 @@ Conventions that apply everywhere:
 | `irlume setup` | scripted onboarding: enroll, keyring, recovery, PAM wiring, each step prompted y/N |
 | `irlume status` | health dashboard: daemon, enrollment, keyring, cameras; `status --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume detect` | script-friendly probe; exit `0` = ready, `10` = partial, `20` = absent |
-| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones); `doctor --json` uses the read-only public [machine API](MACHINE-API.md) |
+| `irlume doctor` | platform checks in one pass: TPM, Secure Boot, camera, models, polkit app prompts, login-keyring lock state + provider (ksecretd/kwalletd/gnome-keyring), the authselect/pam-auth-update regeneration guard, the pam_faillock tally for the target account (root-only; warns above the threshold with the reset remedy), camera-group health, and install hygiene (leftover backup files next to the managed binaries, hand-installed builds overlaying the packaged ones); `doctor --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume deps` | verify runtime dependencies (onnxruntime, models, TPM) |
 | `irlume version` | print the installed version (`--version` / `-V` also work); `version --json` uses the public [machine API](MACHINE-API.md) |
 | `irlume auth sensor <status\|preflight [user]\|dual\|ir-only --yes>` | inspect or select the machine-wide face sensor policy. `ir-only --yes` is a root-only experimental opt-in; `dual` restores the default. `preflight` is camera-free and reports prerequisites only, never capture success, login readiness, or qualification |
+| `irlume auth consent <status\|required\|hands-free --yes>` | privileged-prompt consent policy (ADR-0018): `required` (default) asks for the literal `yes` before a face attempt on sudo/polkit-class services; `hands-free --yes` is the root-only owner opt-out that waives it |
 
 ## Enrollment and profiles
 
 | Command | What it does |
 |---|---|
-| `irlume enroll [--name N] [--scans K] [--reset]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup |
+| `irlume enroll [--name N] [--scans K] [--reset] [--add-camera]` | capture a face profile; `--reset` replaces profiles and camera binding after successful capture, keeping the template key and recovery setup. `--add-camera` (ADR-0024) enrolls a SECOND camera as its own group with a separate store: the daemon measures the new pair and the existing enrollment is untouched |
 | `irlume profiles` (or `profiles list`) | list profiles and their scans; `profiles list --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume profiles add-scan --profile P [--scans N]` | add scans to profile P: improves recognition in new conditions, and adds templates for a second recognizer without re-enrolling as a new person (scans belong to the recognizer the daemon has loaded). If authentication reports no scans for the current recognition model, add scans to an existing profile; retained scans from other models are preserved |
+| `irlume profiles remove-camera --group ID` | remove one enrolled camera group (its store and scans); the primary enrollment and other groups are untouched. Find the group ID in `profiles list`, which shows every enrolled camera |
 | `irlume profiles rename --profile P [--scan S] --name N` | rename a profile, or one scan inside it |
 | `irlume profiles delete --profile P [--scan S]` | delete a profile, or one scan inside it |
 | `irlume profiles forget-model <model>` | remove one recognizer's scans (and the calibrations fitted from them) from every profile of a user. `<model>` is `shipped` or an `embed:<sha256>` tag as `profiles list` prints it (used to clean scans left by the removed third-party lane, ADR-0015). A profile left with no scans is deleted with them |
@@ -52,6 +54,7 @@ Conventions that apply everywhere:
 | `irlume keyring <arm\|status\|forget>` | TPM-sealed secret so a login also unlocks the wallet/keyring. What is sealed depends on the backend: the login password, the KDE wallet key, or a random token this re-keys a GNOME keyring to. `status` names which; `forget` re-keys a token back and takes `--force` to skip that |
 | `irlume reseal` | re-bind the sealed secret to the current PCRs after a firmware or kernel update; prompts for the password, safe to re-run. A GNOME keyring token re-binds itself on the next password login, so this reports that and does nothing |
 | `irlume recovery <status\|setup\|restore\|forget>` | recovery passphrase + profile encryption |
+| `irlume retry <status\|reset> [--user U]` | face-attempt retry throttle: `status` shows the failure budget and cooldown state (and the separate reset-password budget); `reset` clears the tally for your own account (root can pass `--user` for any account). Does not touch the pam_faillock OS counter; `irlume doctor` reports that one |
 | `irlume diag` | Separate keyring-credential and face-template-key seal/PCR-drift diagnostics; run with `sudo` for full detail |
 
 ## System integration
@@ -60,7 +63,7 @@ Conventions that apply everywhere:
 |---|---|---|
 | `irlume login <status\|enable\|disable\|reconcile> [--with-sudo] [--with-polkit] [--apply]` | yes | PAM wiring for the greeter and lock screen; `--with-sudo` adds face-`sudo`, `--with-polkit` adds app prompts (Bitwarden unlock, pkexec; see docs/APP-INTEGRATION.md); `reconcile` re-applies the wiring after a distro PAM regeneration (also run by the `irlume-reconcile.path` unit); without `--apply` it previews; `login status --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume logs [-f] [--since T]` | sometimes | the face-auth journal in one view (daemon, PAM, keyring); `-f` follows live, `--since "10 min ago"` widens the window |
-| `irlume support-report [--output FILE.txt] [--since 10m] [--probe]` | only for `--probe` | create a mode-0600, no-replace, inspect-before-sharing report from structurally share-safe facts. The default is read-only and never opens a camera; `--probe` explicitly performs one bounded daemon-owned capture |
+| `irlume support-report [--output FILE.txt] [--since 10m] [--probe]` | only for `--probe` | create a mode-0600, no-replace, inspect-before-sharing report from structurally share-safe facts. The default is read-only and never opens a camera; `--probe` explicitly performs one bounded daemon-owned capture. `support-report --json [--since N] [--contract 1]` emits the same privacy-bounded object as the machine API (`support-report-json` capability) instead of writing a file; `--json` does not combine with `--output`/`--probe` |
 | `sudo irlume trace [record] [--duration 60s] [--output FILE.jsonl]` | yes | record one root-authorized, non-persistent typed diagnostic stream (default 60s; cap 5m/50,000 events/16 MiB). One subscriber; no frames, embeddings, credentials, identities, or raw emitter payloads. A final file is published only after a clean terminal record |
 | `irlume trace explain FILE.jsonl [--output FILE.txt]` | no | validate a complete trace offline and render its typed timeline grouped by daemon-generated operation ID; malformed, oversized, sequence-gapped, or truncated traces are refused |
 | `irlume logs debug <on\|off>` | yes | legacy persistent journal tracing. Still compatible, but new investigations should use bounded `irlume trace` so the daemon is not restarted and tracing cannot be left enabled |
@@ -70,7 +73,7 @@ Conventions that apply everywhere:
 | `sudo irlume biopolicy <on\|off\|status>` | for on/off | the operation-class gate: when ENFORCING, a face match is accepted only for the operations its camera tier is trusted for (login and sudo require the Secure IR tier; screen unlock and app prompts stay allowed); off by default, and the password is always available either way |
 | `irlume ir-setup [--dry-run]` | yes | configure the IR emitter; rarely needed, and only ever run when you ask. Writes to the camera, so read the warning in SETUP.md. `--dry-run` lists the camera's extension units and writes nothing |
 | `irlume set-cameras <rgb> <ir>` | yes | persist the RGB+IR camera pair, e.g. `/dev/video0 /dev/video2`; the TUI camera picker runs this for you |
-| `irlume camera-tune [--rounds N]` | yes | qualify the daemon's exact RGB+IR pair, accepted stream contracts, USB connection, delivered rates, continuity, illumination provenance, and concurrent signal retention. The versioned record selects concurrent only for that exact context; missing or changed evidence stays sequential. A successful explicit tune also clears this daemon generation's runtime degradation breaker |
+| `irlume camera-tune [--rounds N] [--emit-record FILE] [--verify-record FILE]` | yes | qualify the daemon's exact RGB+IR pair, accepted stream contracts, USB connection, delivered rates, continuity, illumination provenance, and concurrent signal retention. The versioned record selects concurrent only for that exact context; missing or changed evidence stays sequential. A successful explicit tune also clears this daemon generation's runtime degradation breaker. `--emit-record FILE` writes the share-safe measurement evidence (not a camera profile; ADR-0023), `--verify-record FILE` checks a record against the machine |
 | `irlume camera-mode` | no | ask the daemon which schedule is active for its exact open pair. Reports qualified concurrent, measured sequential and its reason, no authority, changed/unreadable context, an environment override, or generation-scoped runtime degradation and its cause. It also prints the exact requested/accepted stream and USB context used by v2. RGB-only hosts report `no_ir_pair` without trying to open IR. The CLI does not read legacy `capture_mode.*` entries from `cameras.conf` or open cameras itself |
 | `irlume camera census [--json]` | no | classify every camera-like device on the machine (UVC RGB/IR pairs, metadata-only nodes, Y8-only sensors, dummies, MIPI pipelines and bridges, unreadable nodes, USB camera-class devices with no driver), printing the evidence each classification keyed on (#575). `--json` is the machine API document; the hardware-report template asks for it as an attachment |
 | `irlume camera diagnostics --json` | no | machine-readable delivered-rate evidence for the configured pair: exact requested/accepted/delivered rationals per role, sequence gaps and drops, timestamp clock/source, RGB/IR skew, and the MS-XU illumination stream state (node present/absent, frames classified/lit, ambient observed). An under-rate stream is a measured `fail` object, never prose. See [MACHINE-API.md](MACHINE-API.md) |
@@ -104,6 +107,10 @@ Each prints its own usage line when run without arguments. `padcapture` /
 `padreport` are the presentation-attack self-test pair documented in
 [PAD_SELFTEST.md](PAD_SELFTEST.md); `suncal` is the outdoor/sunlight
 calibration analyzer.
+
+Two diagnostics are NOT dev-gated: `irlume selftest liveness` (goes through
+the daemon; the TUI ships it as Diagnostics -> Test Infrared Camera) and the
+`irlume detect` probe above.
 
 ## Where to go next
 

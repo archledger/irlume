@@ -1,6 +1,8 @@
 # Cumulative face-attempt limits and verified recovery
 
-Status: proposed design, ready for review; not implemented or enabled.
+Status: implemented (#683); shipped since 0.11.x - `irlume retry status`,
+`irlume retry reset`, the 50/50 budget and cooldown are live (see
+docs/DISABLE.md).
 Agent: codex. Date: 2026-09-08.
 Source baseline: `feat/privileged-consent-controls` at
 `fe7339c18bf44a08bc1736b1300c7c04cf9d91fb`, including the existing local
@@ -140,7 +142,7 @@ and tested as such. No claim of exact response-delivery accounting is made.
 
 ## Verified recovery and user experience
 
-Proposed commands, not currently available:
+Commands (implemented in #683, live since the 0.11.x era):
 
 - `irlume retry status`: explain ready, cooling down, recovery required or state
   unavailable; show own-account counts and wait where appropriate.

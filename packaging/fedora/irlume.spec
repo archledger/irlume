@@ -302,6 +302,20 @@ restorecon /run/irlume.sock 2>/dev/null || :
 - Uninstall coverage (every state root, database-less lane files),
   doctor pam_faillock check, camera-profile evidence layer (ADR-0023)
 
+* Mon Sep 14 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.12.1-1
+- Update the audited native TFLite binding to 0.10.1; reject offset-stored
+  model buffers after SHA verification and before runtime loading
+
+* Fri Sep 11 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.12.0-1
+- Head-gesture consent gestures removed; typed yes confirmation for
+  privileged prompts with the documented owner opt-out
+- TUI: desktop launcher, Sections chooser (F3), keyboard page controls (F6),
+  current observations (F4), bounded activity history, 80x24 minimum size
+- Durable 50-request face failure limit with password-verified self-service
+  and administrative retry reset; experimental IR-only sensor policy
+  (`irlume auth sensor ir-only --yes`); grouped sequential and managed
+  concurrent PAD evidence collection
+
 * Sat Aug 29 2026 archledger <archledger236@gmail.com> - 0.11.3-1
 - AppArmor: emitter-journal ancestor-fsync reads and the qualification-store
   file lock are granted in both profiles (set-cameras persist, camera-tune and

@@ -23,8 +23,10 @@ cannot turn into a green run that validated nothing.
 
 ## Fixtures
 
-`fixtures/v1/` holds documents captured from a real engine: the five read-only
-commands, a status document with the daemon unreachable, and the three refusals
+`fixtures/v1/` holds documents captured from a real engine: eight command
+families (version, status - including one with the daemon unreachable -,
+doctor, profiles.list with and without IR scans, login.status, models.list,
+camera.census, and the auth.test NDJSON event stream) plus the three refusals
 (`daemon-unavailable`, `unsupported-contract`, `usage-error`). They exist so a
 consumer can build against documents irlume actually wrote rather than documents
 someone imagined, which is a mistake that has already reached a downstream

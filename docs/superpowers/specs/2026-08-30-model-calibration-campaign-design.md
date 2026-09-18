@@ -1,6 +1,6 @@
 # Model Calibration Campaign: Design
 
-Status: approved design, pending implementation plan
+Status: implemented; phases 0-4 recorded in docs/research/ and docs/superpowers/plans/
 Date: 2026-08-30
 Agent: opencode
 Scope: benchmarks/ + docs/research/ only. No daemon, CLI, or model-file changes in this campaign.

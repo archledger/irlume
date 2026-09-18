@@ -13,20 +13,25 @@ should, open an [issue](https://github.com/archledger/irlume/issues) or a
 
 ## 1. Your face is stored encrypted, never as an image · ~2 min
 
-**Claim:** templates are 512-D embeddings (never images), AES-256-GCM encrypted
-under a TPM-sealed key, root-only at rest.
+**Claim:** templates are 512-D embeddings (never images); the primary store is
+AES-256-GCM encrypted under a TPM-sealed key, root-only at rest.
 
 After enrolling a face, look at the stored profile:
 
 ```sh
 sudo head -c 200 /var/lib/irlume/*.json
 sudo stat -c '%a %U:%G' /var/lib/irlume/*.json
+sudo ls /var/lib/irlume/cameras/ 2>/dev/null || true
+sudo head -c 200 /var/lib/irlume/cameras/*.json 2>/dev/null || true
 ```
 
 New encrypted writes use version `3`, with a public `key_id` and an `enc`
 ciphertext field; legacy encrypted version `2` remains readable. Expect mode
 `600 root:root`. The biometric data is an encrypted blob, not readable embeddings,
-and no image is ever written.
+and no image is ever written. If you enrolled a secondary camera (0.13.0+), its
+`cameras/<user>.json` store is root-only plaintext JSON today - a known
+deviation from ADR-0024 s1.2 - so that file *will* read as fields and floats
+(still embeddings, never images).
 
 On a machine **without** a TPM the daemon stores the same embeddings root-only
 but unencrypted. The TUI says so on the Keyring tab, and the cross-machine
@@ -78,7 +83,7 @@ cd irlume && bash scripts/fetch-models.sh
 cargo test --workspace
 ```
 
-Around 1,700 tests pass; the ones that need camera or TPM hardware are
+Around 2,700 tests pass; the ones that need camera or TPM hardware are
 marked `ignored`.
 
 ## 4. The liveness gate is self-tested against ISO/IEC 30107-3 · deeper (needs your own spoofs)

@@ -48,7 +48,7 @@ lane was later removed outright
   fixes it; verified by a real-TPM seal→unseal round-trip landing on
   `PolicyKind::Authorized`.
 - cargo-vet with the Mozilla and Google shared audit sets for the
-  174-crate dependency tree.
+  dependency tree (359 lockfile packages at 0.13.0).
 - Hardware reports: more IR camera modules, NixOS on bare metal, Fedora
   Atomic, Ubuntu derivatives. [docs/PLATFORMS.md](PLATFORMS.md) tracks the
   matrix.

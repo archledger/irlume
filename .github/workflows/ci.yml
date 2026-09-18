@@ -48,19 +48,21 @@ concurrency:
 # control plane to receive a job, and archhost's lane failed at "Set up job"
 # during the 2026-08-06 incident exactly like the hosted lanes did.
 #
-# Branch protection on `main` requires these SIX job names as status checks,
-# verified against the live ruleset 2026-08-10:
+# Branch protection on `main` requires these job names as status checks
+# (classic protection and the active ruleset together; verified against the
+# live configuration 2026-09-18):
 #   "fmt · clippy · build · test"
 #   "test (stable)"
 #   "fuzz (untrusted-input parsers)"
 #   "cargo-deny (advisories · licenses · duplicate versions)"
 #   "systemd units (verify + exposure ratchet)"
 #   "nix flake check"
+#   "DCO (exactly one trailer)"
 # Renaming a job below without updating the protection rule leaves a PR waiting
 # on a check that never reports, so it can never merge. Change both together,
 # and note that "the protection rule" is TWO settings: classic branch protection
-# lists all six, the active ruleset (id 19429289) lists five of them, and the
-# effective requirement is the union. Editing one alone does not drop a check.
+# and the active ruleset, and the effective requirement is the union of both.
+# Editing one alone does not drop a check.
 #
 # All seven run on `ubuntu-24.04`. Nothing required for a merge runs on a
 # self-hosted machine, which is the fork-PR rule in hardware-checks.yml holding:
@@ -89,7 +91,8 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
-      # The ONNX weights (~257 MB) are fetched from the models-v1 release, not
+      # The ONNX weights (~614 MB: the five recognizers/landmarkers plus the
+      # two PAD models) are fetched from the models-v1 release, not
       # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
       # weights do) so a warm run skips the download (fetch-models.sh verifies
       # the cached copies and no-ops).

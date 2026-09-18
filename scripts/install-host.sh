@@ -20,7 +20,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 for b in irlumed irlume irlume-password-verify; do
     [[ -f "$REPO/target/release/$b" ]] || { echo "missing $REPO/target/release/$b; build first" >&2; exit 1; }
 done
-for m in face_detection_yunet_2023mar.onnx glintr100.onnx face_landmark.onnx blaze_face_short_range.onnx; do
+for m in face_detection_yunet_2023mar.onnx glintr100.onnx face_landmark.onnx blaze_face_short_range.onnx liveness_vit.onnx flir.onnx; do
     [[ -f "$REPO/models/$m" ]] || { echo "missing $REPO/models/$m" >&2; exit 1; }
 done
 
@@ -89,6 +89,8 @@ Environment="IRLUME_DET_MODEL=$REPO/models/face_detection_yunet_2023mar.onnx"
 Environment="IRLUME_MODEL=$REPO/models/glintr100.onnx"
 Environment="IRLUME_MESH_MODEL=$MESH"
 Environment="IRLUME_BLAZE_MODEL=$REPO/models/blaze_face_short_range.onnx"
+Environment="IRLUME_VIT_PAD_MODEL=$REPO/models/liveness_vit.onnx"
+Environment="IRLUME_PAD_IR_MODEL=$REPO/models/flir.onnx"
 Environment="IRLUME_SOCKET=/run/irlume.sock"
 Environment="IRLUME_STATE_DIR=$STATE_HOME/.local/share/irlume"
 Restart=on-failure

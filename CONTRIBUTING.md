@@ -88,9 +88,10 @@ is back to one; `git commit --amend -s --no-edit` fixes a missing one.
   default setup for code scanning does not analyse fork pull requests, so an
   external contribution reaches review with the ordinary CI behind it (clippy as
   `-D warnings`, cargo-deny, the fuzz corpus, zizmor and actionlint over
-  workflows) but without CodeQL. Measured on this repo: of the last 30 merged
+  workflows) but without CodeQL. Measured on this repo (as of 2026-07, the
+  measurement's date): of the last 30 merged
   pull requests, the 29 from repo branches each ran CodeQL and the one from a
-  fork ran none. main is analysed straight after the merge, so the code is
+  fork ran none. Re-measure before relying on the counts. main is analysed straight after the merge, so the code is
   scanned, later than a maintainer would want. A maintainer who wants CodeQL on
   a fork contribution first can push the branch into this repository and open
   the pull request from there, which is the same shape as every scanned PR.

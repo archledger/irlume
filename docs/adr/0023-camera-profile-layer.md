@@ -2,20 +2,21 @@
 
 ## Status
 
-Proposed. Revised 2026-09-15 after two external design reviews; runtime
-profile shipment remains gated on Phase B per-field evidence, while the
-measurement instrumentation and calibration needed to obtain that evidence
-may be implemented first. The listed v1 tuning fields are candidates until
-individually validated; a field without a demonstrated benefit or
-correctness need is omitted from schema v1, not left unused in a larger
-schema. Implementation PRs cite this ADR. Numbered after ADR-0022 (NPU
-inference, drafted on an unpushed branch); independent of that ADR's
-acceptance.
+Accepted for the evidence-only schema v1 and the shipped profile loader
+(#730, in v0.13.0: `/usr/share/irlume/cameras.d`, strict parsing,
+`camera-tune --emit-record/--verify-record`); runtime tuning fields remain
+Phase-B-gated per-field evidence. Originally proposed 2026-09-10, revised
+2026-09-15 after two external design reviews. The listed v1 tuning fields are
+candidates until individually validated; a field without a demonstrated
+benefit or correctness need is omitted from schema v1, not left unused in a
+larger schema. Numbered after ADR-0022 (NPU inference, drafted on an unpushed
+branch); independent of that ADR's acceptance.
 
 ## Context
 
 Every camera-timing behavior that is not a stored schedule verdict is a
-compiled fleet constant: the role startup flush (RGB 0 / IR 10), the
+compiled fleet constant: the role startup flush (RGB 0 / IR 5 at drafting it
+was 10; the fleet fine sweep measured it down), the
 30-delta delivered-rate window and its floors (ADR-0014), the amortization
 bounds (ADR-0021), and the interval negotiated after format. Cameras differ
 measurably (BRIO IR ~30 fps while fleet-floor hosts sit at ~15 fps; the

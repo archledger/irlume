@@ -5,21 +5,24 @@ abstract: >-
   irlume is a Linux PAM face-authentication daemon that uses a paired
   infrared and RGB camera for a Windows Hello-style credential: it seals the
   login secret in the TPM under a measured-boot policy and releases it only on
-  a live infrared face match. Templates are stored as 512-D embeddings,
-  encrypted at rest under a TPM-sealed key; anti-spoofing is algorithmic
-  (infrared face detection, reflectance, and centre/edge relief ratio, with
-  corneal glint recorded as a supporting cue) with no third-party
-  anti-spoof weights in the default stack.
+  a live infrared face match. Templates are stored as 512-D embeddings, never
+  images; the primary enrollment store is encrypted at rest (AES-256-GCM
+  under a TPM-sealed key; secondary multi-camera stores are root-only
+  plaintext today). Anti-spoofing ships two learned PAD models on by default
+  (ViT on RGB, FLIR IR on the infrared path) alongside algorithmic infrared
+  gates (reflectance and centre/edge relief ratio, with corneal glint
+  recorded as a supporting cue).
 type: software
 authors:
-  - name: archledger
+  - given-names: Wisbendji
+    family-names: Fimerlus
     email: archledger236@gmail.com
     website: "https://github.com/archledger"
 repository-code: "https://github.com/archledger/irlume"
 url: "https://github.com/archledger/irlume"
 license: GPL-3.0-or-later
-version: 0.10.0
-date-released: 2026-08-12
+version: 0.13.0
+date-released: 2026-09-17
 keywords:
   - face-authentication
   - infrared

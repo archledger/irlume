@@ -143,8 +143,9 @@ impl ServiceKind {
     }
 
     /// Whether this service uses app-consent decline semantics in PAM.
-    /// A deliberate shake aborts polkit's attempt when its optional gesture is
-    /// enabled; other services retain ordinary password fallback.
+    /// An explicit decline aborts polkit's attempt (legacy daemons produced
+    /// it from the optional head-shake gesture); other services retain
+    /// ordinary password fallback.
     #[must_use]
     pub fn wants_consent_instruction(self) -> bool {
         matches!(self, ServiceKind::AppConsent)

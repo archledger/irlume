@@ -2,15 +2,18 @@
 
 ## Status
 
-Proposed. Revised 2026-09-16 following design review. Historical source-review
+Accepted (implementation reality recorded 2026-09-18). Originally proposed
+2026-09-10, revised 2026-09-16 following design review. Historical source-review
 baseline: `d4bc0f1` (the parent of `bcc26a5`), as identified in the preceding
-review. The Windows observation below is maintainer-reported. This revision
-specifies intended behavior; it does not establish implementation or
-independent hardware validation.
+review. The Windows observation below is maintainer-reported.
 
-Implementation is phased. Secondary-camera authentication remains disabled
-until the Phase 1 invariants and Phase 2 integration gates pass. Numbered
-after ADR-0023; independent of ADR-0022's acceptance.
+Implementation status: Phase 1 (secondary store foundation) merged in #732 and
+Phase 2 (secondary authentication wiring, `enroll --add-camera`,
+`profiles remove-camera`) shipped in v0.13.0. **Known deviation from s1.2:** the
+secondary store is currently persisted as root-only plaintext JSON (see the
+note in section 1.2); either the confidentiality clause is implemented or the
+deviation is formally accepted, but the shipped state is as described there.
+Numbered after ADR-0023; independent of ADR-0022's acceptance.
 
 ## Context
 
@@ -86,6 +89,16 @@ the existing account template-key lifecycle, not a separate authentication
 credential. An encrypted enrollment cannot become plaintext because a key
 is unavailable. Owner, store type, format version, snapshot binding, and
 authorization-bearing records are validated as part of the protected state.
+
+> **Deviation note (2026-09-18, still open):** the shipped implementation
+> satisfies the integrity, ownership, parsing, and failure clauses above, but
+> NOT the confidentiality clause: `save_secondary` persists plain
+> `serde_json` bytes under `cameras/<user>.json` (0640 root:root inside the
+> 0700 state dir) with no sealing layer, and the commit journal carries the
+> same bytes. Primary-store embeddings remain AES-256-GCM under the
+> TPM-sealed key. Closing this gap (encrypting the secondary store under the
+> account template key) or formally accepting the deviation is a pending
+> maintainer decision; the ADR text above remains the requirement.
 
 Unsupported versions or invalid supported-version records reject the
 secondary store as a whole. Unknown fields, duplicate identifiers,

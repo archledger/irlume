@@ -14,10 +14,12 @@
 //! }
 //! ```
 //!
-//! The sealed object's `authPolicy` is a literal `PolicyPCR` digest over `pcrs`
-//! (here PCR 7, the UEFI Secure Boot state). The TPM rejects unseal the moment
-//! any bound PCR drifts. `pcr_values` is diagnostics only; the TPM itself
-//! enforces policy via the digest baked into `public`.
+//! The sealed object's `authPolicy` for the literal tier shown here is a
+//! `PolicyPCR` digest over `pcrs` (here PCR 7, the UEFI Secure Boot state):
+//! the TPM rejects unseal the moment any bound PCR drifts. The other
+//! `PolicyKind` tiers (signed, pcrlock) deliberately survive different kinds
+//! of drift; see `PolicyKind` below. `pcr_values` is diagnostics only; the
+//! TPM itself enforces policy via the digest baked into `public`.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use irlume_common::{Error, Result};

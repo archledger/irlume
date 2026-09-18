@@ -480,10 +480,10 @@ fn build_engine_from_config(
         .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
         .and_then(|engine| engine.with_ir_adapter(&config.adapter))
         .map(|engine| engine.with_ir_adapter_required(config.adapter_required))
-        // FaceMesh load failure disables rescue alignment but not head
-        // consent, which uses detector landmarks. Outside strict mode the
-        // daemon therefore stays available; strict mode retains the explicit
-        // operator-requested refusal.
+        // FaceMesh load failure disables rescue alignment only; recognition
+        // and the PAM-conversation intent confirmation do not need the mesh.
+        // Outside strict mode the daemon therefore stays available; strict
+        // mode retains the explicit operator-requested refusal.
         .and_then(|engine| {
             if strict_requested(
                 std::env::var("IRLUME_MODELS_STRICT").ok().as_deref(),
@@ -496,7 +496,7 @@ fn build_engine_from_config(
                 jout_warn!(
                     "irlumed: FaceMesh did not load ({error}); continuing WITHOUT \
                      the mesh: BlazeFace detection-rescue alignment is unavailable; \
-                     head nod approval and head-shake decline still work. Fix the \
+                     recognition and PAM intent confirmation are unaffected. Fix the \
                      TFLite runtime (doctor: tflite-runtime) or \
                      set IRLUME_MESH_MODEL to the ONNX mesh."
                 );
@@ -11929,7 +11929,8 @@ mod tests {
             } => {
                 assert!(!granted && !live);
                 assert_eq!(score, 0.0);
-                // A policy refusal is never a gesture decline: only a shake sets it.
+                // A policy refusal is never a gesture decline: gestures are
+                // gone and current daemons always emit false here.
                 assert!(!declined_by_gesture);
                 // …and it IS a policy refusal, which is what tells `auth test`
                 // to stop reporting it as a liveness verdict.

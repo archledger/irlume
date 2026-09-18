@@ -2,7 +2,11 @@
 
 ## Status
 
-Proposed (implementation PR cites this ADR).
+Accepted; implemented in #717 and shipped in v0.13.0
+(`crates/irlume-camera/src/rate_amortization.rs`). Amendment after ship: a
+probe miss now escalates to a 15-delta window before the full 30-delta fill,
+and amortization was extended to the concurrent pair fill; see
+`CONTINUITY_PROBE_ESCALATED_DELTAS`.
 
 ## Context
 
@@ -39,8 +43,9 @@ probe when ALL of the following hold:
 4. The role startup flush still runs (the probe measures THIS session).
 5. A probe of exactly 5 positive deltas, judged by the same exact integer
    `meets_floor` arithmetic used everywhere else, clears the same floor
-   with the same tolerance. On probe failure the session falls back to the
-   full 30-delta fill and the cached entry is invalidated.
+   with the same tolerance. On probe failure the session escalates to a
+   15-delta window (shipped amendment) and then falls back to the full
+   30-delta fill, and the cached entry is invalidated.
 
 After a probe admission, every subsequent dequeued frame continues to be
 judged per-frame by the sliding ring exactly as before; the ring simply

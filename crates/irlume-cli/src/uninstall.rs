@@ -12,7 +12,7 @@
 //!   1. un-wire PAM from every stack (greeters, sudo, lock screen)
 //!   2. stop and disable the daemon
 //!   3. disarm every enrolled user's TPM keyring seal
-//!   4. wipe enrolled templates, sealed secrets, third-party models, and config
+//!   4. wipe enrolled templates, sealed secrets, and config
 //!
 //! Only then does it remove irlume itself: the package through its manager (so
 //! the package database stays consistent), or the hand-placed files for a
@@ -130,7 +130,7 @@ pub fn run(args: &[String]) -> ExitCode {
         println!("  3. keep your enrolled faces and sealed secrets (--keep-data)");
     } else {
         println!("  3. disarm the keyring seal, then delete every enrolled face,");
-        println!("     sealed secret, third-party model, and config file");
+        println!("     sealed secret, and config file");
     }
     println!("  4. remove irlume itself (the package, or the installed files)");
     println!();
@@ -719,9 +719,10 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         }
     }
 
-    // 4 (cont). Remove the state and config trees: third-party models, any
-    //    remaining sealed envelopes, cameras.conf/settings.conf. Guarded so
-    //    --keep-data leaves them for a later reinstall.
+    // 4 (cont). Remove the state and config trees: any
+    //    remaining sealed envelopes, cameras.conf/settings.conf (and any
+    //    legacy third-party-model leftovers from pre-ADR-0015 installs).
+    //    Guarded so --keep-data leaves them for a later reinstall.
     if !keep_data {
         // Through `state_dir()`, not the bare constant: the user enumeration
         // above already honors IRLUME_STATE_DIR, so deleting the literal path

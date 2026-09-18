@@ -31,7 +31,7 @@ GRADE."** Three specific gaps made that true:
 What already exists and is kept unchanged: the per-user IR calibration
 (ADR-0004: local, ridge-regularized, space-bound, no threshold relaxation),
 the native IR physics gates, the per-user center/edge floor, FLIR PAD
-(ADR-0003/0013, deny-only, consulted on the dark path), the camera binding
+(ADR-0006/0013, deny-only, consulted on the dark path), the camera binding
 (anti-swap), emitter privacy-bounded control with journaling, lit-phase
 selection, and blown-frame quality skips.
 

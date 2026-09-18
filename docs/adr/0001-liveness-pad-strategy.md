@@ -3,11 +3,16 @@
 **Status:** Accepted (V1.0)
 **Date:** 2026-06-28
 
-> **Current disposition (2026-08-19):** The dated PAD evidence and threshold
-> conclusions below remain authoritative. User-performed eye mechanisms are
-> retired by [ADR-0009](0009-head-gesture-only-consent.md); current consent is
-> head-only and remains separate from passive PAD. See the approved
-> [retirement design](../superpowers/specs/2026-08-19-head-gesture-only-retirement-design.md).
+> **Current disposition (updated 2026-09-18):** The dated PAD evidence and
+> threshold conclusions below remain authoritative. User-performed eye
+> mechanisms are retired by [ADR-0009](0009-head-gesture-only-consent.md),
+> and head-gesture consent itself was removed outright in 0.12.0
+> ([HEAD-GESTURE-REMOVAL.md](../HEAD-GESTURE-REMOVAL.md)); privileged intent
+> now uses conventional PAM keyboard confirmation
+> ([ADR-0010](0010-conventional-face-intent-confirmation.md)). The opt-in
+> model offer/lane described in the 2026-08-04 update below was removed by
+> [ADR-0015](0015-remove-thirdparty-model-lane.md); the shipped cues are
+> default-on per [ADR-0013](0013-ship-pad-models-default-on.md).
 
 > **Shipped-cue amendment (2026-08-22):** [ADR-0013](0013-ship-pad-models-default-on.md)
 > tiers the shipped-weights bar by blast radius: DENY-ONLY PAD cues may ship

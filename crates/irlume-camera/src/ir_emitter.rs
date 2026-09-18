@@ -27,8 +27,9 @@
 //!
 //! **Every one of those passes the descriptor check.** The override used to
 //! skip it: it was written before identity was even read, so arbitrary bytes
-//! went to an arbitrary unit on whichever device was open, and because [`enable`]
-//! runs every eighth frame of every capture, one variable in the daemon's
+//! went to an arbitrary unit on whichever device was open, and because
+//! [`enable`] then ran on every eighth frame of every capture (the pre-#168
+//! cadence; today it runs once per stream open), one variable in the daemon's
 //! environment repeated that write for the life of the process. Naming a control
 //! is consent to write it; it is not consent to write to a control the camera
 //! has never said it has, and it is not consent to keep writing it forever. See
@@ -2623,8 +2624,10 @@ type OverrideMemo = std::sync::Mutex<std::collections::HashMap<OverrideKey, Over
 /// Whether the override has already been decided for one control on one open
 /// camera in this process, and what was decided.
 ///
-/// The override used to be re-sent on every [`enable`], which is every eighth
-/// frame of every capture: one variable in `irlumed`'s environment became an
+/// The override used to be re-sent on every [`enable`], which was every
+/// eighth frame of every capture at the time (the pre-#168 cadence; today
+/// [`enable`] runs once per stream open): one variable in `irlumed`'s
+/// environment became an
 /// unbounded stream of firmware writes lasting as long as the daemon. Repeated
 /// writes are what #159 ended in, so the answer is computed once and reused,
 /// including when it was a refusal or a failed write. A control that self-clears

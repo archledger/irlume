@@ -214,10 +214,14 @@ platform family.
 for matching. A consumer that branches on that text has reintroduced the problem
 this command removes.
 
-**The array is complete.** Every check reports on every run, including checks
-that do not apply to this machine, so a consumer may read an id it knows about
-and cannot find as "this engine version does not run that check" rather than as
-"it passed". A check never disappears because it had nothing to say.
+**The array is complete for the always-on checks.** Every check below reports
+on every run, including checks that do not apply to this machine, so a consumer
+may read an id it knows about and cannot find as "this engine version does not
+run that check" rather than as "it passed". A check never disappears because it
+had nothing to say. Two later additions are conditionally present instead:
+`camera-groups` (emitted when camera groups exist or the secondary store cannot
+be read) and `pam-faillock` (emitted only when running as root and the
+`faillock` tool answers; see their rows).
 
 `id` values are public API. The list may grow; an id is never renamed and never
 reused for a different meaning. The registry as of this contract:
@@ -239,7 +243,7 @@ reused for a different meaning. The registry as of this contract:
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
 | `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
-| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: BlazeFace detection-rescue alignment is unavailable. Head consent uses the primary detector's five landmarks and is unaffected |
+| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: BlazeFace detection-rescue alignment is unavailable; recognition and PAM intent confirmation are unaffected |
 | `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
@@ -256,6 +260,8 @@ reused for a different meaning. The registry as of this contract:
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
 | `keyring-secrets` | the login keyring's lock state and provider |
+| `camera-groups` | enrolled secondary-camera groups (ADR-0024): present and healthy, stale, or the secondary store unreadable. Conditionally present: emitted only when groups exist or the store cannot be read |
+| `pam-faillock` | the `pam_faillock` tally for the target account (the OS-level lockout counter, distinct from irlume's own retry throttle): quiet when clean, `warn` with the count and the `faillock --reset` remedy at/above the threshold. Conditionally present: root-only and requires the `faillock` binary |
 
 `CaptureModeStatus` includes `qualification_state` (`qualified_concurrent`,
 `measured_sequential`, `unqualified_no_authority`,
@@ -510,6 +516,7 @@ observation rather than absent records.
 | `not-authorized` | The caller may not act on the named account. | no |
 | `operation-failed` | The engine could not carry out a well-formed request. | no |
 | `camera-busy` | The camera driver reported contention. Close apps using the camera, then retry. Auth tests include a fixed human-readable `message`. | yes |
+| `deadline-expired` | The authentication window elapsed before a decision; the attempt ended without a verdict. Not retryable as this transaction; a fresh attempt starts a new window. | no |
 | `protocol-error` | The daemon replied with something this command did not expect. | no |
 
 `not-authorized` and `operation-failed` are distinct so a consumer can tell "you

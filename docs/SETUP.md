@@ -85,13 +85,17 @@ On a fresh install it shows what still needs doing:
 
 ```
 irlume status for 'you'
+  face sensors  : daemon observed: dual (default)
   daemon        : running ✅
   auth method   : Auto
   enrollment    : none ⚠ (run `irlume enroll`)
   keyring unlock: not armed (run `irlume keyring arm`)
   templates     : plaintext ⚠ (run `irlume recovery setup`)
   recovery pass : not set ⚠
+  preferences   : daemon observed
+  hands-free    : ON
   biopolicy     : off (default)
+  external cams : allowed (default)
   cameras       : rgb=/dev/video0 ir=/dev/video2
   fingerprint   : none
 ```
@@ -169,7 +173,9 @@ Look at the camera. It captures ten scans and saves a profile:
 
 <!-- mirrors the enroll output in crates/irlume-cli/src/main.rs; keep in sync -->
 ```
+[enroll] approve the system authentication dialog before capture; each additional scan request needs approval
 [enroll] 'you': capturing a new face profile; stay in frame, look at the camera…
+[enroll] if this camera pair has no measured capture mode yet, irlume measures it first (one time, up to a minute; the IR emitter fires)
 [enroll] enrolled 'Face Profile 1' with 10 scans
 ```
 
@@ -587,7 +593,7 @@ measured defence is the SHIPPED PAD pair (ADR-0013): the FLIR IR cue denied
 that print at `p_fake` 0.999 and above, and the ViT RGB cue catches the
 print/banner species at login distance. Both ship default-on and verified
 against `models/SHA256SUMS` at daemon startup; kill switches if a cue misfires
-on your hardware: `IRLUME_PAD_IR=0` (service env `pad_ir=0`) and
+on your hardware: `IRLUME_PAD_IR=0` (settings.conf key `pad_ir=0`) and
 `IRLUME_PAD_VIT=0` (`pad_vit=0`), then `sudo systemctl restart irlumed`.
 These switches are password-only controls: the daemon, diagnostics, and
 password fallback remain available, but no face grant that requires the
@@ -640,7 +646,8 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_PRIVILEGED_FACE_CONSENT` | same switch as `privileged_face_consent` in `settings.conf`; the env var wins. `0` waives the literal `yes` on privileged services | on |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |
-| `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` |
+| `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` (packaged units set `/usr/share/irlume/models/…`) |
+| `IRLUME_VIT_PAD_MODEL` / `IRLUME_PAD_IR_MODEL` | paths to the shipped PAD weights (ViT RGB / FLIR IR) | `/etc/irlume/liveness_vit.onnx`, `/etc/irlume/flir.onnx` (packaged units set `/usr/share/irlume/models/…`) |
 | `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |
 | `IRLUME_RGB_DEVICE` / `IRLUME_IR_DEVICE` | camera-pair override; both must be set | auto |
 | `IRLUME_IR_EMITTER` | emitter control override: `off`, or `unit:selector:b,b,..` (decimal or `0x` hex bytes); writes to camera firmware, checked against the descriptor first, applied once per camera per process; bypasses `ir_emitter.conf` | conf, else known-module table |
@@ -668,6 +675,7 @@ A fully set-up secure-tier machine reads:
 
 ```
 irlume status for 'you'
+  face sensors  : daemon observed: dual (default)
   daemon        : running ✅
   auth method   : Auto
   enrollment    : 1 profile(s), 10 scan(s) ✅
@@ -675,7 +683,10 @@ irlume status for 'you'
   keyring unlock: armed ✅
   templates     : encrypted at rest ✅
   recovery pass : set ✅
+  preferences   : daemon observed
+  hands-free    : ON
   biopolicy     : off (default)
+  external cams : allowed (default)
   cameras       : rgb=/dev/video0 ir=/dev/video2
   fingerprint   : none
 ```

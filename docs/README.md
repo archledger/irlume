@@ -12,6 +12,7 @@ points at.
 | [FAQ.md](FAQ.md) | Common questions |
 | [LIMITATIONS.md](LIMITATIONS.md) | What irlume does not do, with the measurements |
 | [DEBUGGING.md](DEBUGGING.md) | Trace a failing login, stage by stage |
+| [TUI.md](TUI.md) | The interactive interface, screen by screen |
 | [PLATFORMS.md](PLATFORMS.md) | Distro and desktop coverage |
 | [NIXOS.md](NIXOS.md) | The NixOS module |
 | [APP-INTEGRATION.md](APP-INTEGRATION.md) | Face-approving app prompts (Bitwarden, pkexec) |
@@ -34,6 +35,7 @@ points at.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the daemon, CLI and PAM module fit together |
 | [INTEGRATION.md](INTEGRATION.md) | Driving irlume from your own software |
 | [MACHINE-API.md](MACHINE-API.md) | The versioned machine API, field by field |
+| [DESKTOP-AUTH.md](DESKTOP-AUTH.md) | Face auth for desktop apps and lock screens |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Dev shell, tests, and the local loop |
 | [CREDITS.md](CREDITS.md) | The projects irlume builds on |
 | [ROADMAP.md](ROADMAP.md) | What is planned |
@@ -45,7 +47,7 @@ that produced it and the dataset it ran on.
 
 | | |
 |:--|:--|
-| [`adr/`](adr/) | Architecture decision records, numbered |
+| [`adr/`](adr/) | Architecture decision records, numbered (0022 is reserved for the unpushed NPU design; see ADR-0023's status) |
 | [`pad-results/`](pad-results/) | Presentation-attack measurements |
 | [`recognition-results/`](recognition-results/) | Recognizer accuracy and demographic spread |
 | [`validation/`](validation/) | End-to-end grant-path validation runs |

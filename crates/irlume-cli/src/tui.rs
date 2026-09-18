@@ -1871,8 +1871,8 @@ impl App {
                 SC_PROFILES | SC_RECOVERY => caps.rgb,
                 // Diagnostics/tuning: advanced view only.
                 SC_CAMERAS | SC_IDENTIFY => advanced && caps.rgb,
-                // Settings holds user preferences (biopolicy,
-                // third-party models), not diagnostics, so it is always
+                // Settings holds user preferences (biopolicy, consent),
+                // not diagnostics, so it is always
                 // reachable; hiding config behind "advanced" both buries it and
                 // creates dead-end pointers (a Repair fix references Settings).
                 SC_SETTINGS => true,
@@ -2952,17 +2952,11 @@ impl App {
             ));
         }
 
-        // A third-party model enabled but with a CHECKSUM MISMATCH, reported
-        // PER ENTRY: a joined string smeared one model's failure across every
-        // enabled stage (#285 review). The consequence differs by stage — a
-        // refused PAD cue is silently OFF, a refused recognizer means the
-        // daemon will not start with it selected. Only flag a stage the
-        // daemon did not actually load (Health proves loaded weights fine).
-        //
-        // NOT gated on the daemon being up: a refused recognizer or detector
-        // EXITS the daemon at startup, so the gate switched this check off in
-        // exactly the state it exists to explain. With the daemon down,
-        // `health` is None, `loaded` is false, and the row is emitted.
+        // (Historical: a third-party model enabled but with a CHECKSUM
+        // MISMATCH used to be reported here PER ENTRY: a joined string
+        // smeared one model's failure across every enabled stage (#285
+        // review). The third-party lane was removed by ADR-0015; no such
+        // row is emitted today.)
 
         // Keyring seal: the wallet-unlock feature is core, and "not armed" was
         // only visible on the Password Wallet screen — Diagnostics is where a
@@ -7898,7 +7892,7 @@ impl App {
     /// self-test. Covers the `irlume doctor`/`diag`/`deps` checks that have a
     /// remediation or that a TUI-only user would otherwise miss (daemon, models,
     /// cameras, SELinux/AppArmor, wiring drift, keyring drift, login-keyring
-    /// locked, recovery, TPM, third-party-model checksum). The full text
+    /// locked, recovery, TPM). The full text
     /// readout (incl. info-only lines) is one key away via the `[d]` key. Some
     /// advisory-only doctor lines (fingerprint
     /// vendor-stack, polkit sandbox, install hygiene) stay in `doctor`.

@@ -382,11 +382,26 @@ fn every_doctor_check_id_is_documented_and_every_documented_id_exists() {
         undocumented.is_empty(),
         "these check ids ship without a row in the MACHINE-API.md registry: {undocumented:?}"
     );
-    let missing: Vec<_> = documented.difference(&emitted).collect();
+    // Two documented ids are conditionally present rather than always
+    // emitted (the registry table says so): `pam-faillock` only under root
+    // with the faillock binary answering, `camera-groups` only when groups
+    // exist or the secondary store cannot be read. They are allowed to be
+    // absent from a run; an id NOT in that allowlist must report every time.
+    const CONDITIONALLY_PRESENT: &[&str] = &["camera-groups", "pam-faillock"];
+    let missing: Vec<_> = documented
+        .difference(&emitted)
+        .filter(|id| !CONDITIONALLY_PRESENT.contains(id))
+        .collect();
     assert!(
         missing.is_empty(),
         "these ids are documented but no longer emitted: {missing:?}"
     );
+    for id in CONDITIONALLY_PRESENT {
+        assert!(
+            documented.contains(id),
+            "{id} is allowed to be conditional but must stay documented"
+        );
+    }
 }
 
 /// The registry says the `onnxruntime` check carries the resolved path and

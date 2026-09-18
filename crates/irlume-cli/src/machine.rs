@@ -2249,9 +2249,9 @@ fn valid_profiles_list_args(args: &[String]) -> bool {
 ///
 /// Each stage's model CANDIDATE — the file this process's search order lands
 /// on, with its origin and whether it opened as a regular file — plus whether
-/// the stage is open to third-party models, and for the open PAD stage the
-/// catalog with each entry's tier (fetched by irlume vs user-supplied) and
-/// weight state. Needs no daemon, so it still answers when the daemon will
+/// the stage is open to third-party models (it is not, since ADR-0015), and
+/// for the PAD stage the built-in cue marker. Needs no daemon, so it still
+/// answers when the daemon will
 /// not start. It deliberately does not say "active": the daemon's service
 /// unit (or an administrator's drop-in) sets its own environment, which this
 /// process cannot observe, so an authoritative loaded-model report can only

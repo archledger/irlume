@@ -364,8 +364,10 @@ pub(super) fn wire_verify_service(content: &str) -> (String, bool) {
 }
 
 /// Wire the polkit consent dialog. Identical to [`wire_verify_service`] except it
-/// installs [`POLKIT_VERIFY_STANZA`] (the `abort=die` control) so a head-shake
-/// closes the dialog rather than falling through to the password. Migration of an
+/// installs [`POLKIT_VERIFY_STANZA`] (the `abort=die` control) so an explicit
+/// decline from the module terminates the dialog rather than falling through to
+/// the password (legacy daemons produced that decline from a head shake;
+/// current daemons cancel only via the wire's explicit-cancel arm). Migration of an
 /// older plain-`sufficient` install to the abort=die control is handled UPSTREAM by
 /// [`super::wire_service`], which strips every irlume line with [`unwire_lines`] and
 /// then calls this on the clean base, so this only ever INSERTS. There is

@@ -2460,10 +2460,11 @@ fn finish_hidden_rate_fill<E>(
 /// stream's rate: on the ASUS dual the RGB stream runs 30 fps and IR 15 fps,
 /// so a round-robin dequeues RGB at 15 fps, its V4L2 buffer overflows, and the
 /// shared-USB contention drops IR frames, pushing IR's measured rate below the
-/// floor (measured 14.5 Hz vs the 14.7 Hz floor). The 98 % tolerance was
-/// calibrated against a CONCURRENT probe measuring 14.714 Hz (see
-/// `DEFAULT_TOLERANCE_PERCENT`), so the fill must be concurrent — the same
-/// schedule production uses. Each stream's own serial fill is naturally paced
+/// floor (measured 14.5 Hz vs the then-14.7 Hz floor). The 98 % tolerance of
+/// that era was calibrated against a CONCURRENT probe measuring 14.714 Hz
+/// (today `DEFAULT_TOLERANCE_PERCENT` is 97, IR floor 14.55), so the fill must
+/// be concurrent (the same
+/// schedule production uses). Each stream's own serial fill is naturally paced
 /// by its frame arrival (a blocking DQBUF cannot outrun the camera), so two
 /// threads filling in parallel cannot starve each other the way one thread
 /// alternating between them does.
@@ -7076,12 +7077,13 @@ pub struct IrStreamFrame {
 /// the `max_frames` attempt budget is spent. Returns the break value, or `None`
 /// if the budget ran out first.
 ///
-/// This is the rolling-capture core the burst helpers and the live consumers
-/// share: it owns the device, the V4L2 mmap stream, and the emitter guard, so a
-/// consumer only decides what to do with each frame
-/// and when to stop. The consent watch can therefore return the instant it
-/// sees an accepted gesture instead of always draining a fixed window, and a
-/// preview can pull frames continuously; both get the same blown-frame filtering.
+/// This is the rolling-capture core the burst helpers historically shared
+/// with live consumers: it owns the device, the V4L2 mmap stream, and the
+/// emitter guard, so a consumer only decides what to do with each frame
+/// and when to stop (a preview can pull frames continuously; both get the
+/// same blown-frame filtering). The gesture consent watch that motivated it
+/// was removed in 0.12.0; no in-repo caller remains today, it is kept as the
+/// public rolling-capture API.
 ///
 /// Usable = the same set [`capture_ir_sequence`] historically kept: emitter-off
 /// (dark) frames ARE delivered, because a consumer classifying the strobe needs
@@ -7212,16 +7214,17 @@ pub fn capture_ir_streaming<B>(
     Ok(None)
 }
 
-/// Capture a time-ordered sequence of IR frames in a single stream session for
-/// temporal head-pose evidence. Unlike [`capture_ir`], head movement across the
-/// window must survive, so this returns every sample rather than only the
-/// brightest. Each of `samples` frames is the brightest of a `burst`-frame
+/// Capture a time-ordered sequence of IR frames in a single stream session.
+/// Unlike [`capture_ir`], frame-to-frame change across the window must
+/// survive, so this returns every sample rather than only the brightest.
+/// Each of `samples` frames is the brightest of a `burst`-frame
 /// mini-burst: `burst=1` yields raw frames (to reveal whether the emitter
 /// strobes); `burst>=2` de-strobes locally while retaining temporal resolution.
 ///
 /// This keeps its own burst/de-strobe loop rather than delegating to
-/// [`capture_ir_streaming`], which delivers raw single frames; the consent
-/// watch uses the streaming core, this stays for the `burst>=2` diagnostic path.
+/// [`capture_ir_streaming`], which delivers raw single frames. The temporal
+/// head-pose consumers it was built for were removed in 0.12.0; today this is
+/// the `burst>=2` diagnostic/research sequence path.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn capture_ir_sequence(
     device: &str,
@@ -7390,13 +7393,13 @@ pub fn capture_ir_sequence(
     }
     // A short return is a CAPTURE fault, not a quiet fact about the scene: the
     // attempt budget ran out because frames arrived blown out or too
-    // slowly. Callers read this sequence as temporal head-pose evidence, so a
-    // silent shortfall leaves the downstream head-pose window incomplete. Say
+    // slowly. Callers read this sequence as ordered temporal evidence, so a
+    // silent shortfall leaves the downstream window incomplete. Say
     // so; the caller decides whether a partial window is still worth judging.
     if frames.len() < samples {
         irlume_common::dlog!(
             "{device}: IR sequence delivered {}/{samples} frames in {max_attempts} attempts; \
-             temporal head-pose evidence is incomplete",
+             the temporal sequence is incomplete",
             frames.len()
         );
     }

@@ -53,10 +53,12 @@ pub(crate) const DEFAULT_TOLERANCE_PERCENT: u32 = 97;
 ///   starvation, a concurrent-mode failure this gate never sees in
 ///   sequential capture.
 /// - The transient that IS real is the NexiGo IR's slow first frames: a
-///   window seeded at dequeue 0 measures 14.018 fps (floor 14.7,
-///   fail-closed), at dequeue 3 it is marginal (14.676-14.705 across runs),
-///   and from dequeue 4 it is settled (>=14.734). Ten dequeues cover that
-///   observed 4-frame tail with 2.5x margin.
+///   window seeded at dequeue 0 measures 14.018 fps (against the then-98%
+///   floor of 14.7, fail-closed), at dequeue 3 it is marginal (14.676-14.705
+///   across runs, floor 14.55 today), and from dequeue 4 it is settled
+///   (>=14.734). Five dequeues cover that observed 4-frame tail with one
+///   frame of margin (the original 10 carried 2x headroom; the fleet fine
+///   sweep measured it down).
 /// - No RGB node measured needs any flush: windows seeded at dequeue 0
 ///   deliver 14.88-29.64 fps against the 7.5 fps RGB floor, 2x-4x margin.
 ///
@@ -651,8 +653,8 @@ mod tests {
     #[test]
     fn startup_flush_is_the_fleet_measured_per_role_value() {
         // IR: the NexiGo N930W's startup transient is settled from dequeue 4
-        // (window seeded earlier measures 14.018-14.705 fps against the 14.7
-        // floor); 10 covers that tail with 2.5x margin.
+        // (window seeded earlier measures 14.018-14.705 fps); 5 covers that
+        // tail with one frame of margin.
         assert_eq!(startup_flush(StreamRole::Ir), 5);
         // RGB: every measured fleet node needs no flush at all (windows
         // seeded at dequeue 0 deliver 2x-4x the 7.5 fps floor).

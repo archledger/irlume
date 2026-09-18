@@ -745,7 +745,7 @@
     "event": {
       "type": "object",
       "title": "Machine event",
-      "description": "One line of an NDJSON event stream, emitted by a streaming capability such as auth-test-events. This is NOT the single-document envelope: a streaming command emits many of these, one per line, and exactly one has terminal true. Validate stream lines against this definition, not against the root.",
+      "description": "One line of an NDJSON event stream, emitted by a streaming capability such as auth-test-events. This is NOT the single-document envelope: a streaming command emits many of these, one per line, and exactly one has terminal true. Validate stream lines against this definition, not against the root. NOTE: this definition uses $defs-internal references, so a standalone copy will not resolve them; validate in the context of the full document (e.g. re-root as {\"$ref\": \"#/$defs/event\", \"$defs\": <this document's $defs>}, which is what scripts/machine-api-conformance.py does).",
       "required": [
         "contract_version",
         "engine_version",

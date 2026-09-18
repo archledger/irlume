@@ -573,7 +573,7 @@ fn path_regressed(etc: &Path) -> bool {
 /// Whether the polkit file carries the module on an OLD control that ignores
 /// PAM_ABORT. The current stanza is `[success=done new_authtok_reqd=done
 /// abort=die default=ignore]`; anything else with the module is a pre-#424
-/// wiring whose head-shake decline silently does nothing.
+/// wiring under which a module decline is silently ignored.
 fn polkit_stanza_stale(etc: &Path) -> bool {
     std::fs::read_to_string(etc).is_ok_and(|c| {
         c.lines().any(|l| {
@@ -606,8 +606,9 @@ fn surfaces_regressed(
     // polkit is materialized from a vendor copy on Fedora, so a DELETED /etc
     // override is a regression there exactly as it is for the lock screen.
     // A STALE stanza shape counts as regressed too: an older irlume wired
-    // polkit with a plain `sufficient` line, under which a head shake's
-    // PAM_ABORT is `default=ignore`d and the decline does nothing, while the
+    // polkit with a plain `sufficient` line, under which the module's
+    // PAM_ABORT (a decline; historically a head shake) is `default=ignore`d
+    // and the decline does nothing, while the
     // line still contains the module so the presence test alone said "not
     // regressed" and every packaging lane's post-upgrade `login reconcile`
     // no-opped. Treating the old shape as a regression is what makes the

@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: irlume
-Upstream-Contact: archledger <archledger236@gmail.com>
+Upstream-Contact: Wisbendji Fimerlus <archledger236@gmail.com>
 Source: https://github.com/archledger/irlume
 
 Files: *

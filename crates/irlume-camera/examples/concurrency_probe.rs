@@ -2,7 +2,8 @@
 // Copyright the irlume contributors.
 
 //! Measure whether this Hello module really starves when the RGB and IR
-//! streams run at the same time (the module doc's "never concurrently" claim).
+//! streams run at the same time (the question the crate doc's sequential
+//! default raises; measured capture-qualification can override it).
 //!
 //! Runs the crate's real capture paths: 3 sequential rounds (RGB then IR,
 //! production order) and 3 concurrent rounds (RGB and IR on two threads),

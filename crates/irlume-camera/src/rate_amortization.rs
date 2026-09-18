@@ -118,7 +118,8 @@ mod tests {
     use super::*;
 
     // The kill switch reads the process environment, so env-sensitive tests
-    // serialize on this lock (the camera crate has no shared env lock).
+    // serialize on this lock (kept local; the crate-wide lock lives in
+    // `crate::testenv`, this module predates it).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn key() -> Key {

@@ -30,10 +30,11 @@ irlume status --json --contract 1
 Call `irlume version --json` once at startup:
 
 ```json
-{ "contract_version": 1, "engine_version": "0.11.0", "command": "version", "ok": true,
+{ "contract_version": 1, "engine_version": "0.13.0", "command": "version", "ok": true,
   "data": { "capabilities": ["version-json", "profiles-list-json", "status-json",
                              "doctor-json", "login-status-json", "auth-test-events",
-                             "login-plan-json", "login-transactions", "models-list-json"],
+                             "login-plan-json", "login-transactions", "models-list-json",
+                             "camera-diagnostics", "camera-census", "support-report-json"],
             "contract_versions": { "min": 1, "max": 1 },
             "limits": { "max_profiles": 3 } } }
 ```
@@ -60,12 +61,15 @@ behaviour. The version string is not.
 
 ## What contract 1 offers
 
-Nine capabilities. Seven of them only read: they never enroll, wire PAM, write
-to the system, or capture an image, and the camera facts in `status --json`
-come from enumerating device nodes, not from opening a stream. The other two
-are the exceptions a consumer should know before invoking them: `auth test
---events=jsonl` opens the camera for a live capture, and `login apply` (with
-`login rollback --apply`) rewrites the PAM stack.
+Twelve capabilities. Nine of them only read: they never enroll, wire PAM,
+write to the system, or capture an image, and the camera facts in
+`status --json` come from enumerating device nodes, not from opening a stream.
+The exceptions a consumer should know before invoking them: `auth test
+--events/jsonl` and `camera diagnostics --json` each open the camera for a
+bounded, gated capture, and `login apply` (with `login rollback --apply`)
+rewrites the PAM stack. (`support-report --json` itself is read-only and
+accepts only `--since`; the human `--probe` capture flag is not part of the
+machine API.)
 
 | Command | Capability | Answers |
 |---|---|---|

@@ -3,13 +3,25 @@
 How irlume stores your face and how hard it is for an attacker to get it.
 Live-tested on real hardware (Fedora TPM box + Arch TPM box); results below.
 
+> **Update 2026-09-18 (multi-camera stores):** since 0.13.0 a secondary
+> enrolled camera lives in its own group with a separate store file,
+> `/var/lib/irlume/cameras/<user>.json`. That secondary store is written as
+> **root-only plaintext JSON** (inside the `0700` state dir), not under the
+> TPM-sealed key; only the primary `<user>.json` is AES-256-GCM encrypted.
+> This is a known, accepted-for-now deviation from ADR-0024 s1.2 (see the
+> note in that ADR). Everything below that says "encrypted" means the
+> **primary** store.
+
 ## What is stored and what is NOT
 
 **Never an image.** irlume stores only **L2-normalized 512-D face embeddings**
 (AuraFace output): a list of floats, one vector per enrolled scan, plus IR
 embeddings and a few liveness calibration scalars. No JPEG/PNG/raw frame ever
 touches disk (`storage.rs`: "We store L2-normalized embeddings, never raw
-images"; verified by grep, there is no image-write path).
+images"; verified by grep, there is no image-write path). This is true of both
+stores: the primary `/var/lib/irlume/<user>.json` and the secondary
+`/var/lib/irlume/cameras/<user>.json` hold embeddings and calibration scalars
+only, never images.
 
 Why this matters: an embedding is a one-way projection. You cannot re-render the
 enrollment photo from it, and it is not a fingerprint/photo an attacker can
@@ -22,11 +34,12 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
 1. **Filesystem: root-only.** Enrollment `…/irlume/<user>.json` and the sealed
    key `/var/lib/irlume/template-keys/<user>.json` are `0600 root:root`.
    *Tested:* a normal user `cat` → **Permission denied** (both files).
-2. **Encryption at rest: AES-256-GCM.** On a TPM host the embeddings are
-   encrypted (random 96-bit nonce per write, GCM auth tag). *Tested:* the
-   on-disk file's `enc` field is opaque base64; grepping it for `rgb`,
-   `embedding`, `scans`, or any `NN.NNNN` float → **nothing** (no plaintext
-   leak).
+2. **Encryption at rest: AES-256-GCM.** On a TPM host the **primary-store**
+   embeddings are encrypted (random 96-bit nonce per write, GCM auth tag).
+   *Tested:* the on-disk file's `enc` field is opaque base64; grepping it for
+   `rgb`, `embedding`, `scans`, or any `NN.NNNN` float → **nothing** (no
+   plaintext leak). The secondary `cameras/<user>.json` store is currently
+   plaintext (see the update note above).
 3. **Key custody: TPM-sealed, never on disk in the clear.** The AES key is a
    random 32 bytes sealed by the TPM. The stored key envelope holds only the
    TPM `public`/`private` blobs; the `private` is wrapped under the TPM's
@@ -93,7 +106,7 @@ So the realistic attacks and their outcomes:
 | Attacker capability | Outcome |
 |---|---|
 | Normal user account on the box | Can't read either file (0600 root) |
-| Steals the disk / backup image (**TPM host**) | Ciphertext only; key won't unseal on any other TPM → **no data** |
+| Steals the disk / backup image (**TPM host**) | Primary store: ciphertext only, key won't unseal on any other TPM → **no data**. Secondary `cameras/<user>.json`: recoverable plaintext embeddings |
 | Steals the disk / backup image (**no-TPM host**) | Templates are root-only but **plaintext** (see "Degraded hosts" below): recoverable 512-D embeddings, not an image |
 | Steals disk AND has the physical machine, no root | Must defeat the TPM's PCR policy + get root to run the daemon path |
 | Root on the live original machine | Game over: root can ask the daemon to unseal (true of any at-rest scheme; root is the trust boundary) |

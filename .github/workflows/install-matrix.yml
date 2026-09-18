@@ -26,7 +26,8 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
-      # Same model cache as ci.yml (shared key): the ~257 MB weights are
+      # Same model cache as ci.yml (shared key): the ~614 MB weights
+      # (incl. both PAD models) are
       # fetched from the models-v1 release, cached so warm runs skip the pull.
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Signed releases now carry per-binary CycloneDX SBOMs and an OpenVEX
+  document: `scripts/generate-release-sbom.sh` and
+  `scripts/generate-vex.py` produce them from the release tag,
+  `scripts/verify-release-assets.py` validates their structure and
+  coverage, and v0.13.0's release was updated to carry the full set.
+  `SUPPORT.md` documents where to ask for help; `RELEASING.md` records the
+  SBOM/VEX publication steps.
 - `irlume uninstall` now evicts irlume's persisted TPM storage root key
   (owner-hierarchy handle `0x81010002`) after a fully completed data wipe,
   closing the residue gap the 2026-09-17 uninstall audit found: the key was
@@ -16,6 +23,21 @@ All notable changes to irlume are documented here. This project adheres to
   irlume's at the handle is never touched. The uninstall output also names
   the one deliberate leave-behind, the Bitwarden polkit action written by
   `irlume bitwarden setup --apply`.
+
+### Changed
+
+- The `rsa` crate is no longer a dependency (RUSTSEC-2023-0071): the
+  PCR-signing public key is parsed with `der`/`spki`, validating the
+  RSA encryption algorithm identifier before the modulus is read. The
+  advisory ignore list in `deny.toml` is empty again and the VEX document
+  records the clean scan.
+- Documentation accuracy pass over the whole repo: encryption-at-rest
+  claims are scoped to the primary store (the secondary multi-camera
+  store is root-only plaintext today, recorded as an open deviation in
+  ADR-0024 s1.2), removed features (head gestures, the third-party model
+  lane) are no longer described as live anywhere, ADR statuses match the
+  shipped implementation, and stale counts, commands, and version
+  references were corrected.
 
 ## [0.13.0] - 2026-09-17
 

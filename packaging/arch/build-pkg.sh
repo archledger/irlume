@@ -11,9 +11,12 @@
 #
 # It matters because the inline PKGBUILD below is not at parity with
 # packaging/arch/PKGBUILD: it omits irlumed.socket, both keyring helpers
-# (irlume-kwallet-init, irlume-gkr-unlock), the TFLite runtime, the machine-API
-# schema, and the AppArmor profile. A package built from it installs a daemon
-# with no socket activation, no wallet unlock, and no confinement.
+# (irlume-kwallet-init, irlume-gkr-unlock), irlume-password-verify, the TFLite
+# runtime, the machine-API schema, the AppArmor profile, both polkit policies,
+# the desktop entry and icon, /etc/pam.d/irlume-retry-reset, the tmpfiles rule,
+# the docs, and the two PAD models (liveness_vit.onnx, flir.onnx). A package
+# built from it installs a daemon with no socket activation, no wallet unlock,
+# no default-on PAD cues, and no confinement.
 # check-packaging-parity.sh does not look at this file, so nothing catches that.
 #
 # Kept for local experiments, behind an explicit opt-in so nobody publishes

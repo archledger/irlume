@@ -6,7 +6,8 @@
 //! Commercially-clean, GPL-3.0-compatible bill of materials (all permissive):
 //!   * Detection:   YuNet  (MIT)      `face_detection_yunet_2023mar.onnx`
 //!     bbox + 5 landmarks; runs at the fixed 640x640 letterbox (INPUT_SIZE in
-//!     detect.rs); see `examples/mp_latency_bench.rs` for current numbers.
+//!     detect.rs); see the `mp_latency_bench` example in `irlume-auth` for
+//!     current numbers.
 //!   * Recognition: AuraFace (Apache) `glintr100.onnx`, ResNet100/ArcFace,
 //!     512-D embedding, 112x112 input, standard 5-point alignment.
 //!
@@ -41,7 +42,8 @@ pub struct Detection {
 /// keypoints. Model output is untrusted numerics, and Rust's saturating
 /// float→int cast turns a NaN coordinate into pixel (0,0), so a NaN eye
 /// landmark makes the glint cues sample the frame corner as if it were an eye
-/// (measured: `examples/landmark_failure_probe.rs`, where it read a corner
+/// (measured: the `landmark_failure_probe` example in `irlume-auth`, where it
+/// read a corner
 /// hotspot as an open eye). Dropped at the source, because guarding every
 /// consumer is the pattern that misses one.
 pub fn detection_is_finite(d: &Detection) -> bool {
@@ -580,7 +582,7 @@ mod onnx {
         /// Sub/Mul nodes (this artifact; first nodes are raw Conv/PRelu)
         /// computes /127.5. The divergence is measured and accepted: on
         /// 19,526 genuine pairs (suncal corpus, ORT 1.28.0, 2026-08-20;
-        /// `norm_ab_bench`) the mean cosine shift is +0.00028 with +0.0005 on
+        /// the `norm_ab_bench` example in `irlume-auth`) the mean cosine shift is +0.00028 with +0.0005 on
         /// cross-scene pairs — under 0.2% of the ~0.18 match-threshold margin,
         /// and uniform on both sides. Thresholds and every stored template are
         /// coherent with /128.0; do NOT "correct" the constant without
@@ -1064,10 +1066,10 @@ mod onnx {
     /// YuNet detector (ONNX). Loaded once in the daemon.
     pub struct Detector {
         session: Session,
-        /// Reused letterbox scratch (~4.9 MB at INPUT_SIZE 640). The consent
-        /// watch feeds the detector ~120 IR frames per authentication; the
-        /// zeroed tail (letterbox bars) is re-zeroed only where the previous
-        /// frame wrote, so steady state does no full zero-fill.
+        /// Reused letterbox scratch (~4.9 MB at INPUT_SIZE 640). Every
+        /// `detect_any` call clears and re-fills the whole buffer
+        /// (letterbox bars included), so the allocation is reused but the
+        /// zero-fill is not incremental.
         input_scratch: Vec<f32>,
     }
 
@@ -2432,7 +2434,8 @@ mod model_tests {
     /// code around them changed.
     ///
     /// What it does NOT cover is the runtime it runs against. The required
-    /// lanes download the version hardcoded at `ci.yml:118`, while Nix, Fedora,
+    /// lanes download the version hardcoded in ci.yml's required-lane setup,
+    /// while Nix, Fedora,
     /// Debian and the PPA each pin their own copy and Arch takes the rolling
     /// system package. Nothing makes those agree (#411), so a packaging lane
     /// moving to a newer runtime does not turn this test red. It also runs on

@@ -17,7 +17,8 @@ formal certification stays optional.
   See [`FAIRNESS.md`](FAIRNESS.md) for the per-group table and policy.
 - **PAD mandatory**; target **IAPAR < 0.07** (ISO/IEC 30107-3 Clause 13).
 - **Biometric is one MFA factor only**, with a mandatory non-biometric fallback.
-- No network calls in the auth loop; templates/secrets local, root-owned 0600.
+- No network calls in the auth loop; templates/secrets local, root-owned 0600
+  (secondary multi-camera stores: 0640 root:root inside the 0700 state dir).
 
 ## Acceptance-rule evidence limits
 

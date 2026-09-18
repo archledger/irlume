@@ -117,7 +117,7 @@ strip = true
 # to main 2024-01-23) but never backported it to a 7.x release, so 7.6.0/7.7.0 both
 # ship `// Missing function: PolicyAuthorizeNV`. It only lands in 8.0, whose stable
 # release is the open tracking issue #495 (opened Feb 2024, still only alphas out,
-# latest 8.0.0-alpha.2 in Feb 2026, a large breaking change set pending). So "just
+# latest 8.0.0-alpha.3 in Aug 2026, a large breaking change set pending). So "just
 # wait for a release" is not a near-term option; we maintain the fork branch instead.
 #
 # Branch model: our fork's `main` mirrors upstream `main` for reference only. The

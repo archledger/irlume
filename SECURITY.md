@@ -22,7 +22,8 @@ branch; security fixes land on `main` and ship in the next release.
 | **Critical** | `irlume-pam` (auth path), `irlume-daemon` (privileged) | A flaw grants login or root |
 | **High** | `irlume-vision` (inference + match), `irlume-liveness` (PAD), bundled model integrity | Bypass of recognition or anti-spoofing |
 | **Medium** | `irlume-camera` (device/IR control), `irlume-core` (TPM/storage), packaging/systemd units | Trust boundary + secret handling |
-| **Low** | `irlume-cli` | Unprivileged client |
+| **Medium** | `irlume-gkr-unlock`, `irlume-kwallet-init`, `irlume-password-verify` (privileged helpers) | Run elevated during login/unlock flows |
+| **Low** | `irlume-cli` (unprivileged client), `irlume-auth` (engine library, exercised by the daemon's tests), `irlume-common` (IPC schema), `irlume-fingerprint` (fingerprint tooling wrapper) | Client-side or library surfaces behind the above |
 
 ## Threat model (summary)
 

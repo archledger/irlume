@@ -1897,8 +1897,9 @@ SETUP & STATUS
   deps                  verify runtime dependencies (onnxruntime, models, TPM)
 
 ENROLLMENT & AUTH
-  enroll [--name N] [--scans K] [--reset]   capture a face profile
-  profiles [list|add-scan|rename|delete|forget-model|eyes-open off]   manage profiles
+  enroll [--name N] [--scans K] [--reset] [--add-camera]   capture a face
+                        profile (or a second camera group: ADR-0024)
+  profiles [list|add-scan|remove-camera|rename|delete|forget-model|eyes-open off]   manage profiles
                         (one-release migration only: clears the retired gate;
                         it cannot be turned on, see issue #386)
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
@@ -1954,7 +1955,8 @@ SYSTEM INTEGRATION
   update [--check]                update via the channel this was installed from
                         (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
   uninstall [--keep-data] [--yes] un-wire PAM, stop the daemon, wipe enrolled
-                        data, then show the package-removal command (sudo)
+                        data, then remove the package through its own manager
+                        (sudo)
   version                         print the installed irlume version
 
 MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)

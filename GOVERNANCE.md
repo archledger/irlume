@@ -5,7 +5,8 @@ nobody has to guess.
 
 ## Decision making
 
-The maintainer (archledger) decides what merges and what ships. Proposals,
+The maintainer (Wisbendji Fimerlus, GitHub `archledger`) decides what merges
+and what ships. Proposals,
 bug reports, and design discussion happen in public on
 [issues](https://github.com/archledger/irlume/issues) and
 [discussions](https://github.com/archledger/irlume/discussions); anyone can
@@ -14,7 +15,7 @@ body. If the project grows more maintainers, this file changes first.
 
 ## Roles
 
-**Maintainer** (currently: archledger)
+**Maintainer** (currently: Wisbendji Fimerlus, GitHub `archledger`)
 - reviews and merges pull requests
 - cuts releases: signs the release tag and the checksum file (signing key
   fingerprint `F350 5339 8E3C 80FE 2089 1B82 C10B 8492 BD7F 30C6`, published

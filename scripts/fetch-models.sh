@@ -6,7 +6,8 @@
 # (they do not change between releases) and are hosted as release assets, which
 # are NOT counted against the account's Git LFS bandwidth quota. So CI, the AUR
 # PKGBUILD, and the .deb/PPA builds get the models without draining the 10 GB/mo
-# LFS bandwidth (a full pull is ~266 MB, so a few dozen builds exhausted it).
+# LFS bandwidth (a full pull is ~614 MB since the PAD pair shipped, so a few
+# dozen builds exhausted it even at the old ~266 MB).
 #
 # Idempotent: a model already present with the right hash is left untouched, so
 # a local dev tree that already has the weights does no network at all.

@@ -1,5 +1,6 @@
-# Nightly hardware-in-the-loop suite on either capable self-hosted runner:
-# minihost or archhost, with a real TPM at /dev/tpmrm0 via the tss group
+# Nightly hardware-in-the-loop suite on the self-hosted runner carrying the
+# `ir-camera` label (archhost; both cameras live there), with a real TPM at
+# /dev/tpmrm0 via the tss group
 # and an IR camera via the video group. Software fakes have proven blind spots:
 # the Tier-1 signed-PCR bug passed swtpm-based CI completely and only failed
 # on a real TPM, and the camera paths excluded from coverage are exactly the

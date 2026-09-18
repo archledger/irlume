@@ -104,8 +104,9 @@ Target mode exercises the strict experimental IR-only target topology. A
 refusal there must not be treated as missing hardware or trigger an automatic
 fallback. Sequential mode explicitly selects the existing general sequential-IR
 capture path, with RGB stopped; keep its results separate. BRIO's shared-interface
-RGB/IR topology, for example, is supported by the general path but currently
-refused by the stricter target resolver.
+RGB/IR topology was once supported only by the general path; since #707 the
+stricter target resolver accepts exactly that four-node single-interface layout
+(RGB image/meta + IR image/meta) and refuses other shared-interface member sets.
 
 Adaptive startup can reuse one validated warm-up timestamp as the seed for its
 full 30-delta window. Warm-up pixels are still discarded. Slow startup can spend

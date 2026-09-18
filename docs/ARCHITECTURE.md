@@ -121,7 +121,9 @@ or prove physical camera/emitter shutdown.
 Seven model files ship with every package (five recognizers/landmarkers plus
 the two PAD models below), loaded once by `irlumed` at startup
 and checksum-verified against a built-in manifest (a mismatch warns;
-`IRLUME_MODELS_STRICT=1` refuses to start instead). Four are ONNX; the
+`IRLUME_MODELS_STRICT=1` refuses to start instead). Six of the seven are
+ONNX (all five recognizers/landmarkers except the mesh, plus both PAD
+models); the
 landmark mesh is Google's published `.tflite`, run on the TFLite C runtime the
 FHS packages bundle at `/usr/share/irlume/tflite` (NixOS has no packaged
 runtime yet and keeps the pinned ONNX conversion as its production mesh,

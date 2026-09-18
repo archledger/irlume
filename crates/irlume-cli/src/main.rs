@@ -1166,7 +1166,7 @@ fn usage_profiles() -> std::process::ExitCode {
         rename --profile P [--scan S] --name N  rename a profile or a scan\n  \
         delete --profile P [--scan S]           delete a profile or a scan\n  \
         forget-model <model>                    remove one recognizer's scans from every\n  \
-                                                profile (shipped | a catalog name | embed:<sha256>)\n  \
+                                                profile (shipped | embed:<sha256>)\n  \
         eyes-open off                           one-release migration: clear the retired gate\n  \
         \x20                                       (it cannot be turned on; see issue #386)"
     );

@@ -13,7 +13,7 @@ body:
     attributes:
       label: irlume version and install channel
       description: "`irlume version`, plus how you installed (Copr, PPA, .deb, AUR, Nix, source)"
-      placeholder: "0.4.0, Fedora Copr"
+      placeholder: "0.13.0, Fedora Copr"
     validations:
       required: true
   - type: input
@@ -36,9 +36,9 @@ body:
       description: >
         Easiest: run `irlume support-report --since 10m` and attach the file
         it writes; it is sanitized and safe to share. Otherwise paste
-        `journalctl -u irlumed` excerpts. Never attach raw captures,
-        embeddings, or template files.
-      description: "`irlume logs --since \"10 min ago\"` around the failure; doctor output helps too"
+        `journalctl -u irlumed` excerpts (`irlume logs --since "10 min ago"`
+        around the failure; doctor output helps too). Never attach raw
+        captures, embeddings, or template files.
       render: text
     validations:
       required: false

@@ -56,9 +56,9 @@ irlume adopted the methodology rather than the certificate:
   ([same day, daemon path](pad-results/2026-07-01-passive-ear-realworld-nonresponse.md):
   11 of 11 genuine sudo attempts got no blink verdict), so it was retired. This
   is historical PAD evidence, not a current user action. Privileged intent now
-  requires conventional PAM keyboard confirmation; optional nod approval and
-  shake decline remain experimental and separate from passive PAD
-  ([ADR-0010](adr/0010-conventional-face-intent-confirmation.md)).
+  requires conventional PAM keyboard confirmation (the nod/shake gestures were
+  removed outright in 0.12.0;
+  [HEAD-GESTURE-REMOVAL.md](HEAD-GESTURE-REMOVAL.md)).
 
 What that adds up to, stated plainly: the algorithmic credential-releasing
 gate is single-frame IR physics. It stopped every emissive
@@ -121,11 +121,14 @@ confidentiality, renewability, and irreversibility. The irlume implementation
 and its live audit are in [SECURITY_AT_REST.md](SECURITY_AT_REST.md) (tested
 2026-07-02 on two TPM machines):
 
-- **Confidentiality.** Templates are AES-256-GCM encrypted under a random key
-  sealed by the TPM (PCR-bound, three-tier policy), files are `0600 root:root`,
-  and the daemon releases profile data only to the owning user or root
-  (`SO_PEERCRED`). The audit's disk-theft test found only ciphertext: no
-  plaintext floats, no field names, no image data.
+- **Confidentiality.** The primary template store is AES-256-GCM encrypted
+  under a random key sealed by the TPM (PCR-bound, three-tier policy), files
+  are `0600 root:root`, and the daemon releases profile data only to the
+  owning user or root (`SO_PEERCRED`). The audit's disk-theft test found only
+  ciphertext: no plaintext floats, no field names, no image data. Known gap:
+  the secondary multi-camera store (`cameras/<user>.json`, 0.13.0+) is
+  root-only plaintext JSON today (see
+  [SECURITY_AT_REST.md](SECURITY_AT_REST.md)).
 - **Renewability.** Profiles and individual scans can be deleted and
   re-enrolled at any time. The honest limit: templates are embeddings from a
   fixed public model, not a revocable transform, so this is re-enrollment, not

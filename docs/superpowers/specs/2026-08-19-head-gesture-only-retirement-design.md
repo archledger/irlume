@@ -2,7 +2,7 @@
 
 Date: 2026-08-19
 
-Status: approved design, awaiting implementation plan
+Status: implemented; head-gesture authentication removed in #676
 
 Research basis: [Head-gesture-only removal impact](../../research/2026-08-18-head-gesture-only-removal-impact.md)
 

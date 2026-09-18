@@ -22,6 +22,10 @@ IR camera. Stored as an embedding, never an image. Password always works.
 
 <img src="docs/assets/irlume-demo.gif" alt="irlume demo: install, guided face enrollment in the TUI, wiring the greeter and lock screen, and opt-in face-sudo" width="760">
 
+<sub>Demo recorded on v0.3.0 (July 2026); the interface and flows have
+evolved since - [COMMANDS.md](docs/COMMANDS.md) and [TUI.md](docs/TUI.md)
+document the current ones.</sub>
+
 </div>
 
 ---
@@ -45,11 +49,11 @@ IR camera. Stored as an embedding, never an image. Password always works.
 | 🌑 **Works in the dark** | Infrared recognition, no ambient light needed |
 | 🔓 **Unlocks everything** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/LIMITATIONS.md)), `sudo`, polkit prompts |
 | 🗝️ **Opens your wallet** | A face match TPM-unseals your keyring secret |
-| 🧬 **No face images** | 512-D embeddings, AES-256-GCM under a TPM-sealed key |
+| 🧬 **No face images** | 512-D embeddings, never images; the primary store is AES-256-GCM under a TPM-sealed key |
 | 🙋 **Consent before camera** | `yes` for a face attempt; typing your password never starts a scan, and both work in the same prompt (the field accepts either, so you never wait for one path to time out) |
 | 🛡️ **Refuses photos and screens** | Two anti-spoofing models run by default: print attacks on RGB, screens/phones on IR (Howdy's own README warns a printed photo can defeat it) |
 | 🔁 **Survives real life** | Suspend/resume verified on hardware; a failed scan or a crashed component falls back to your password, never a lockout |
-| 📦 **Installs boring** | One Rust binary per package, no Python, no dlib, no pip. The class of install breakage that dominates other face-unlock trackers does not exist here |
+| 📦 **Installs boring** | Rust binaries only, no Python, no dlib, no pip. The class of install breakage that dominates other face-unlock trackers does not exist here |
 | 🩺 **Repairs itself** | A live TUI fixes faults; PAM wiring survives updates |
 
 </div>

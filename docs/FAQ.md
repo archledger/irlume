@@ -11,7 +11,8 @@ Yes, that's the bar. irlume brings Windows Hello-style face login to Linux:
 face-unlock the login screen, lock screen, `sudo`, and your keyring/wallet,
 using the same IR (Windows Hello) camera your laptop already has. And it aims
 past Hello where Hello is weak: real anti-spoof liveness, encrypted
-TPM-sealed templates, and a fully open stack.
+TPM-sealed templates (primary store; secondary multi-camera stores are
+root-only plaintext today), and a fully open stack.
 </details>
 
 <details>
@@ -31,7 +32,8 @@ presentation-attack-detection models (RGB and IR cues) run on every capture
 and refuse print, phone, and screen species by default, with the
 [ISO/IEC 30107-3 self-test published](PAD_SELFTEST.md) so the claim is
 reproducible, not adjectival. Beyond that: an IR liveness gate,
-AES-256-GCM-encrypted templates under a TPM-sealed key, camera pinning, and
+AES-256-GCM-encrypted templates under a TPM-sealed key (primary store),
+camera pinning, and
 TPM keyring unlock at login, with tiers, so RGB-only face match is
 deliberately limited to screen unlock. That gate has a documented hole of its
 own, though: read [Limits](LIMITATIONS.md) before
@@ -93,8 +95,9 @@ never triggers the camera on any lock.
 <summary><b>Can I verify these claims myself?</b></summary>
 
 That's the point of [`docs/VERIFY.md`](VERIFY.md). Each claim maps to a
-command you can run: see your own camera's anti-spoof score, confirm the stored
-template is encrypted ciphertext (not an image), run the presentation-attack
+command you can run: see your own camera's anti-spoof score, confirm the
+primary store's template is encrypted ciphertext (not an image; the secondary
+multi-camera store is root-only plaintext today), run the presentation-attack
 self-test against your own spoofs, reproduce the real-face FAR on LFW, and build
 and run the test suite. Some checks take two minutes, some take real effort, but
 every one is runnable.

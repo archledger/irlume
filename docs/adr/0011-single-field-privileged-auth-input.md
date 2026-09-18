@@ -1,6 +1,6 @@
 # ADR-0011: Use one hidden field for privileged face intent or password
 
-**Status:** Accepted
+**Status:** Accepted; amended by [ADR-0018](0018-owner-opt-in-privileged-consent-waiver.md) (owner opt-in waiver)
 **Date:** 2026-08-19
 **Implementation:** `9fdfcb09d16fefbbe89815c7d2c7ad98c3a8ef01`
 (verified and merged in PR #502 as

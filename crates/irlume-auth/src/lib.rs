@@ -73,10 +73,10 @@ pub struct Engine {
     /// weights. Stamped onto every scan enrolled and required to match at
     /// verification: cosine scores are only meaningful inside one space.
     embed_space: String,
-    /// The RGB match threshold for THIS recognizer. The shipped constant for
-    /// the shipped model; a third-party recognizer brings its own measured
-    /// value (#276), because a threshold is a property of one model's cosine
-    /// scale and applying another model's number to it is a guess.
+    /// The RGB match threshold for THIS recognizer. Always the shipped
+    /// constant for the shipped model (the third-party recognizer lane was
+    /// removed by ADR-0015); a threshold is a property of one model's cosine
+    /// scale, so it is never transplanted from another model.
     rgb_threshold: f32,
     /// Optional MediaPipe FaceMesh: dense landmarks used to refine a BlazeFace
     /// rescue box into alignment points. Loaded iff the model file is present.
@@ -89,7 +89,7 @@ pub struct Engine {
     /// Shipped ViT RGB PAD cue (`liveness_vit.onnx`, ADR-0013, default-on
     /// with the daemon's password-only switch): scores the RGB face chip whenever the
     /// gate verdicted Live and downgrades to Spoof when the rolling median of
-    /// the last `VIT_VOTE_N` scores clears `VIT_THRESHOLD`. DENY-ONLY.
+    /// the last `VIT_PAD_VOTE_N` scores clears `VIT_PAD_THRESHOLD`. DENY-ONLY.
     vit_pad: Option<irlume_vision::PadVit>,
     /// Rolling per-request ViT scores for the 5-frame-median vote. Reset at
     /// the start of each authentication (`authenticate_for`), because voting
@@ -1724,11 +1724,11 @@ fn pad_policy_refusal(
     }
 }
 
-/// Deny-only rule for the opt-in third-party PAD cue: fires (downgrades to
+/// Deny-only rule for the shipped PAD cues: fires (downgrades to
 /// Spoof) ONLY when the built-in gate already said Live AND the cue's P(fake)
 /// clears the threshold. A non-Live verdict is never touched, and an absent
 /// score never fires, so the cue cannot rescue an attack or mask a gate
-/// rejection; enabling it can only tighten.
+/// rejection; a loaded cue can only tighten.
 pub fn pad_downgrades(verdict: Verdict, p_fake: Option<f32>, threshold: f32) -> bool {
     verdict == Verdict::Live && p_fake.is_some_and(|p| p >= threshold)
 }
@@ -3716,9 +3716,8 @@ impl Engine {
 
     /// The RGB grant threshold for a comparison against `n_templates`
     /// templates: this recognizer's measured base, scaled for best-of-N FAR
-    /// inflation. The ONE place both RGB match paths get their bar, so a
-    /// third-party recognizer's threshold cannot reach one path and miss the
-    /// other.
+    /// inflation. The ONE place both RGB match paths get their bar, so the
+    /// threshold cannot reach one path and miss the other.
     fn rgb_grant_threshold(&self, n_templates: usize) -> f32 {
         irlume_core::scaled_threshold(self.rgb_threshold, n_templates)
     }
@@ -6852,7 +6851,6 @@ impl Engine {
                     ));
                 }
             }
-            // Opt-in third-party PAD cue, deny-only (scored in assess_full on
             // Shipped IR PAD cue (ADR-0013): the dark path's own consult of
             // the same lit-frame score computed in assess_full. Same
             // deny-only contract, same threshold.
@@ -11000,9 +10998,10 @@ mod tests {
 
     #[test]
     fn collision_uses_the_engines_threshold_not_the_shipped_constant() {
-        // A third-party recognizer brings its own measured threshold, and the
-        // enrollment anti-mixing decision must use it: a pair that counts as
-        // "same person" on the shipped scale may be strangers on another
+        // The engine's threshold (in principle per-recognizer; since
+        // ADR-0015 only the shipped recognizer exists) is what the
+        // enrollment anti-mixing decision must use: a pair that counts as
+        // "same person" on one scale may be strangers on another
         // model's scale. cos(a,b) here is ~0.6: a collision at the shipped
         // 0.55, not a collision at a stricter 0.8.
         // Exact by construction: cos(a,b) = 0.65 for unit a=[1,0,0] and
@@ -12201,9 +12200,9 @@ mod engine_tests {
             );
             // A mesh file that EXISTS but will not load must hand the engine
             // back beside the error, not consume it: the daemon degrades on
-            // this (nod still works) where a fatal treatment turned "mesh
-            // gates off" into "face auth dead" on hosts whose bundled TFLite
-            // runtime does not load.
+            // this (recognition still works) where a fatal treatment turned
+            // "mesh gates off" into "face auth dead" on hosts whose bundled
+            // TFLite runtime does not load.
             let bogus = std::env::temp_dir()
                 .join(format!("irlume-bogus-mesh-{}.tflite", std::process::id()));
             std::fs::write(&bogus, b"TFL3 this is not a model").unwrap();

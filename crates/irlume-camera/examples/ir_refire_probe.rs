@@ -3,10 +3,12 @@
 
 //! How long does the IR emitter stay lit after ONE control write?
 //!
-//! The capture paths re-fire the emitter control on a schedule nobody measured:
-//! `capture_ir` fires again halfway through its burst, `capture_ir_sequence`
-//! every 8 attempts. Those cadences are guesses about how fast the vendor
-//! control self-clears, and they decide whether a stream can be held open across
+//! Written when the capture paths re-fired the emitter control on a schedule
+//! nobody had measured: `capture_ir` fired again halfway through its burst,
+//! `capture_ir_sequence` every 8 attempts (#168 removed those cadences; the
+//! control is now written once per stream open). This probe measures the
+//! self-clear behavior those cadences guessed at, and it decides whether a
+//! stream can be held open across
 //! a whole transaction (enrollment, one auth with retries) instead of being torn
 //! down and rebuilt per capture.
 //!

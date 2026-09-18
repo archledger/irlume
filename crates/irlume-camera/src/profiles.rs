@@ -13,9 +13,9 @@
 //!
 //! Strictness is the contract: unknown keys at any level, unknown values,
 //! noncanonical filenames, identity/filename disagreement, duplicate
-//! identities, oversized files, symlinks, and untrusted ownership each
-//! reject that one file (recorded with a reason); the rest of the set
-//! still loads. Loading is startup-only.
+//! identities, oversized files, symlinks, and group- or world-writable
+//! permission bits each reject that one file (recorded with a reason); the
+//! rest of the set still loads. Loading is startup-only.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -157,7 +157,8 @@ pub fn load_dir(dir: &Path) -> Result<LoadedProfiles, LoadError> {
 /// Loads and validates one file. The checks, in order: the filename is the
 /// canonical `<vid>-<pid>.toml` (no traversal shape survives this), the
 /// file is a regular non-symlink file within the trusted tree with sane
-/// size and ownership, the TOML parses with no unknown keys at any level,
+/// size and no group/world-write permission bits, the TOML parses with no
+/// unknown keys at any level,
 /// the schema version is supported, field bounds hold, and the identity
 /// agrees with the filename.
 fn load_one(path: &Path) -> Result<CameraProfile, String> {

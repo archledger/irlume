@@ -20,12 +20,17 @@
 //!     `pam_kwallet5` / `pam_gnome_keyring` unlocks the wallet. Use for login
 //!     (SDDM/GDM) and the lock screen after a cold boot.
 //!
-//! An additional `wait` argument (combinable with either mode) makes the module
-//! keep retrying for ~20s instead of doing a single capture. This is what the
+//! Further module arguments (combinable with either mode): `wait` keeps the
+//! module retrying for ~20s instead of doing a single capture. This is what the
 //! KDE lock screen needs: kscreenlocker starts the non-interactive auth stack
 //! the moment the screen appears, so the window is what lets the user sit back
 //! down and be recognized without touching a key. A one-shot capture fires long
-//! before they return and is useless there.
+//! before they return and is useless there. `reseal` re-seals the keyring
+//! secret under a new PAM-verified password, `keyring`/`kr` route a keyring
+//! (not login) secret, `facefirst` orders face before the password provider,
+//! and `ondemand` restricts the module to explicitly requested attempts (see
+//! the per-argument docs in `parse_module_args` and the wiring recipes in
+//! irlume-cli's `pamwire`).
 //!
 //! Per NIST SP 800-63B-4, face is one factor and a non-biometric fallback MUST
 //! always exist: on any decline/timeout we return `PAM_IGNORE` so the stack
@@ -401,7 +406,7 @@ impl PamServiceModule for IrlumePam {
             // deliberate exception handled just below: a polkit shake-decline returns
             // ABORT to close the dialog, because the user explicitly declined and no
             // fallback is wanted for THAT attempt (a timeout or no-match still
-            // IGNOREs, so the password box still appears when the user did not shake).
+            // IGNOREs, so the password box still appears when the user did not decline).
             let deadline = Instant::now() + WAIT_BUDGET;
             loop {
                 let (attempt, delivered) = if unseal {
@@ -424,13 +429,15 @@ impl PamServiceModule for IrlumePam {
                         Released::Failed,
                     )
                 };
-                // A polkit shake-decline is terminal: try_verify returned ABORT, so
+                // A polkit decline is terminal (legacy daemons produced it from a
+                // head shake; current daemons from an explicit cancel):
+                // try_verify returned ABORT, so
                 // abort the whole PAM stack instead of cascading to the password. The
                 // attempt then fails with no password prompt, and the polkit agent
                 // decides what to show (polkit-kde re-prompts and closes after its own
                 // retry count; see POLKIT_VERIFY_STANZA in irlume-cli). Never retried,
-                // even in `wait` mode: the user said no. Only a shake on a polkit
-                // dialog reaches this; every other non-SUCCESS falls to IGNORE below.
+                // even in `wait` mode: the user said no. Only an explicit decline on a
+                // polkit dialog reaches this; every other non-SUCCESS falls to IGNORE below.
                 if attempt == PamError::ABORT {
                     return PamError::ABORT;
                 }
@@ -827,8 +834,9 @@ fn situation_prompt(situation: &str) -> Option<&'static str> {
 }
 
 /// One verify attempt (sudo / polkit / in-session unlock): no password released.
-/// Returns `SUCCESS` on a live match; `ABORT` on a DELIBERATE head-shake decline
-/// at a polkit consent dialog, so the whole stack aborts and the agent closes its
+/// Returns `SUCCESS` on a live match; `ABORT` on a DELIBERATE decline
+/// at a polkit consent dialog (legacy head-shake daemon, or an explicit cancel),
+/// so the whole stack aborts and the agent closes its
 /// window; and `IGNORE` on anything else so the password fallback survives. Passes
 /// the PAM service so the daemon can apply tier×operation-class gating (an RGB-only
 /// convenience device honours only a screen-unlock service).

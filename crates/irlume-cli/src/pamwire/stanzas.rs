@@ -97,7 +97,9 @@ pub(super) const VERIFY_STANZA: &str = "auth       sufficient                   
 /// stack falls through to the password, so the dialog never closes. `abort=die`
 /// terminates the stack on that ABORT, which polkit reports as one failed attempt.
 /// SUCCESS still grants and every other result (IGNORE on a timeout, no-match, or a
-/// panicked module) still cascades to the password, so ONLY a shake changes
+/// panicked module) still cascades to the password, so ONLY an explicit decline
+/// (legacy head-shake daemon; current daemons cancel via the explicit-cancel
+/// arm) changes
 /// behaviour. Confirmed against pam.conf(5) on this platform, which defines
 /// `sufficient` as `[success=done new_authtok_reqd=done default=ignore]` and `die` as
 /// terminating the stack. sudo keeps the plain [`VERIFY_STANZA`]: pam_irlume never
@@ -108,9 +110,11 @@ pub(super) const VERIFY_STANZA: &str = "auth       sufficient                   
 /// `pam_authenticate` once and reports a single FAILURE (polkitagenthelper-pam.c),
 /// and the agent decides whether to open a fresh session. Measured on Plasma 6
 /// (2026-08-11): polkit-kde re-prompts and closes the window after roughly three
-/// failed attempts, so a shake reliably DECLINES every time but does not close the
-/// dialog on the first one. Escape and the window's close button stay the immediate
-/// manual close. One-shake closing would need a change in polkit-kde, a separate
+/// failed attempts, so an explicit decline reliably DECLINES every time but does
+/// not close
+/// the dialog on the first one. Escape and the window's close button stay the
+/// immediate
+/// manual close. One-decline closing would need a change in polkit-kde, a separate
 /// upstream project, so the instruction irlume prints says "decline", not "closes".
 pub(super) const POLKIT_VERIFY_STANZA: &str =
     "auth       [success=done new_authtok_reqd=done abort=die default=ignore]   pam_irlume.so";

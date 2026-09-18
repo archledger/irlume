@@ -148,7 +148,10 @@ class HarnessTests(unittest.TestCase):
                 while state.exists():
                     try:
                         status = state.read_text().split(")", 1)[1].split()[0]
-                    except FileNotFoundError:
+                    # The task can vanish between exists() and read(): the
+                    # kernel surfaces that race as ENOENT or ESRCH (seen live
+                    # on the hosted runner 2026-09-18, PR #757's rerun).
+                    except (FileNotFoundError, ProcessLookupError):
                         break
                     if status in {"Z", "X"}:
                         break

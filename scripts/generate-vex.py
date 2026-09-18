@@ -150,7 +150,7 @@ def build_vex(version, entries, live):
     doc = {
         "@context": "https://openvex.dev/ns",
         "@id": doc_id,
-        "author": "irlume maintainers <archledger236@gmail.com>",
+        "author": "Wisbendji Fimerlus <archledger236@gmail.com>",
         "timestamp": now.isoformat(),
         "version": 1,
         "tooling": (

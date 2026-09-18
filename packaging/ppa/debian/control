@@ -1,7 +1,7 @@
 Source: irlume
 Section: admin
 Priority: optional
-Maintainer: archledger <archledger236@gmail.com>
+Maintainer: Wisbendji Fimerlus <archledger236@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cargo,
                rustc (>= 1.88),

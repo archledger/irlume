@@ -109,7 +109,7 @@ irlume (${DEBVER}) ${SERIES}; urgency=medium
     Self-contained source: vendored crates, bundled onnxruntime ${ORT_VER},
     bundled model weights (see debian/copyright and the README model BOM).
 
- -- archledger <archledger236@gmail.com>  $(date -R)
+ -- Wisbendji Fimerlus <archledger236@gmail.com>  $(date -R)
 EOF
 
 echo "==> building source package"

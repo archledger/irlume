@@ -9,7 +9,7 @@ platform: linux
 version: 0.13.0
 section: admin
 priority: optional
-maintainer: archledger <archledger236@gmail.com>
+maintainer: Wisbendji Fimerlus <archledger236@gmail.com>
 description: |
   Face authentication for Linux.
   IR (Windows Hello) cameras get the secure tier: login, sudo, and TPM-sealed

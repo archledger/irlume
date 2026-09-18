@@ -27,7 +27,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/archledger/irlume"
-authors = ["archledger <archledger236@gmail.com>"]
+authors = ["Wisbendji Fimerlus <archledger236@gmail.com>"]
 
 # Documentation lints for a crate that authenticates people. All three are
 # `allow` in stock clippy, so the coding standard requiring documented panics,

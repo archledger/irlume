@@ -299,10 +299,11 @@ fn rsa_modulus(public: &Public) -> Option<&[u8]> {
 /// is provably gone, because envelopes are children of this key: evicting
 /// while any remain would orphan secrets nothing could unseal again.
 ///
-/// Identity is exact, not shape-level: [`is_irlume_srk`] (attributes + empty
-/// policy + RSA-2048) also matches another stack's plain RSA-2048 primary,
-/// which is acceptable when choosing a parent to USE but not when destroying a
-/// key. `create_primary` over [`srk_template`] is deterministic on a given
+/// Identity is exact, not shape-level: the shape check used for parent
+/// selection (`is_irlume_srk`: attributes + empty policy + RSA-2048) also
+/// matches another stack's plain RSA-2048 primary, which is acceptable when
+/// choosing a parent to USE but not when destroying a key. `create_primary`
+/// over our SRK template is deterministic on a given
 /// TPM, so our persisted SRK's modulus equals a fresh derivation bit-for-bit;
 /// the eviction compares those moduli. The cost is one extra primary
 /// derivation (seconds; the same one-time cost first use pays), acceptable at

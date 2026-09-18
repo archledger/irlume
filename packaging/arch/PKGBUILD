@@ -15,7 +15,7 @@ optdepends=('fprintd: fingerprint companion factor')
 backup=('etc/pam.d/irlume-retry-reset')
 # clang: v4l2-sys-mit generates its V4L2 bindings with bindgen, which needs
 # libclang at build time; without it makepkg fails on a clean system.
-makedepends=('rust' 'cargo' 'gcc' 'clang' 'cmake' 'extra-cmake-modules' 'qt6-base' 'qt6-declarative' 'kf6-kcmutils' 'kf6-kcoreaddons' 'kf6-kio')
+makedepends=('rust' 'cargo' 'gcc' 'clang' 'cmake' 'extra-cmake-modules' 'qt6-base' 'qt6-declarative' 'kcmutils' 'kcoreaddons' 'kio')
 # The code comes from the signed git tag. The ONNX model weights are NOT in the
 # tag; they are hosted as release assets on the version-independent `models-v1`
 # release (kept out of Git LFS so builds do not consume the account's LFS
@@ -138,7 +138,7 @@ package() {
 
 package_irlume-kcm() {
     pkgdesc="Plasma System Settings module for irlume: read-only status, health and launch actions"
-    depends=('irlume' 'qt6-declarative' 'kf6-kcmutils' 'kf6-kio' 'kirigami')
+    depends=('irlume' 'qt6-declarative' 'kcmutils' 'kio' 'kirigami')
     cd "$srcdir/irlume"
     DESTDIR="$pkgdir" cmake --install kcm-build
 }

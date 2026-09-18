@@ -543,6 +543,9 @@ mod tests {
     #[test]
     fn guard_disabled_by_new_or_missing_runtime_dir() {
         let _env = crate::testenv::ENV_LOCK.lock().unwrap();
+        // Restore whatever the runner had: removing the variable without
+        // restoring leaks "no runtime dir" into every later test.
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
         let dir = std::env::temp_dir().join(format!("irlume-tui-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -559,6 +562,10 @@ mod tests {
         std::env::remove_var("XDG_RUNTIME_DIR");
         assert!(matches!(acquire_guard(None, false), GuardOutcome::Disabled));
 
+        match saved {
+            Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

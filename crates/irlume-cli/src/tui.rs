@@ -9921,6 +9921,12 @@ mod tests {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 
+        // Navigation side effects are production behavior: landing on Faces
+        // polls the daemon. Take the same dead-socket + env isolation every
+        // other screen-navigating test uses, or this poll races whichever
+        // concurrent test owns IRLUME_SOCKET and corrupts its mock server
+        // (observed as the guided-enrollment test's sequence check failing).
+        let _socket = dead_socket();
         let mut app = test_app();
         let name = format!("irlume-tui-test-{}", std::process::id());
         let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();

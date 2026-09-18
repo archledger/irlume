@@ -751,13 +751,20 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
 
     let data_wipe_requested = !keep_data;
     let data_wiped = data_wipe_requested && data_left.is_empty();
-    // The persisted SRK is evicted only once every envelope is provably gone
-    // (the wipe was requested and nothing failed): sealed envelopes are
-    // children of that key, so evicting under kept or leftover data would
-    // orphan secrets the wipe was supposed to be the last consumer of. Absent
-    // and Foreign are successes; a TPM error is non-fatal (the key is a
-    // benign orphan; audit F4, 2026-09-17).
-    let srk_eviction = if data_wiped {
+    // The persisted SRK is evicted only when NO sealed envelope can still
+    // exist anywhere (audit F4 + the #757 review): `data_wiped` proves the
+    // wiped trees are gone, but sealed data can live under the env overrides
+    // (`IRLUME_KEYRING_DIR`, `IRLUME_RECOVERY_DIR`,
+    // `IRLUME_TEMPLATE_KEY_DIR`) that the wipe never touched, so an active
+    // override blocks eviction outright - and the multi-root envelope
+    // enumeration must re-run EMPTY after the wipe (an unreadable store also
+    // blocks it; the guard's own contract). Absent and Foreign are successes;
+    // a TPM error is non-fatal (the key is a benign orphan).
+    let srk_eviction = if may_evict_srk(
+        data_wiped,
+        srk_override_dirs_active(),
+        sealed_token_holders(),
+    ) {
         match irlume_core::tpm::evict_persistent_srk() {
             Ok(irlume_core::tpm::SrkEviction::Evicted) => SrkOutcome::Evicted,
             Ok(irlume_core::tpm::SrkEviction::Absent) => SrkOutcome::Absent,
@@ -776,6 +783,33 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
         data_left,
         srk_eviction,
     }
+}
+
+/// True when any of the env overrides that can hold sealed data OUTSIDE the
+/// wiped trees is set for this process (the #757 review): the uninstaller can
+/// enumerate and re-check its own roots, but it cannot know where an
+/// overridden keyring/recovery/template-key dir points on a unit's behalf, so
+/// the destructive TPM step stays off whenever one is visible.
+fn srk_override_dirs_active() -> bool {
+    [
+        "IRLUME_KEYRING_DIR",
+        "IRLUME_RECOVERY_DIR",
+        "IRLUME_TEMPLATE_KEY_DIR",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some())
+}
+
+/// The eviction gate, pure so its contract is testable: a completed wipe
+/// alone is NOT sufficient - an active override means out-of-tree envelopes
+/// may survive, and a non-empty or unreadable post-wipe enumeration means
+/// sealed data is still there. Every blocker keeps the key.
+fn may_evict_srk(
+    data_wiped: bool,
+    override_active: bool,
+    token_holders: Result<Vec<String>, String>,
+) -> bool {
+    data_wiped && !override_active && matches!(token_holders, Ok(holders) if holders.is_empty())
 }
 
 /// HOME directories of human accounts (uid >= 1000, below the nobody range),
@@ -948,11 +982,9 @@ fn srk_outcome_line(outcome: &SrkOutcome) -> String {
         SrkOutcome::Foreign => {
             "left in place: the persistent handle holds a key that is not irlume's".to_string()
         }
-        SrkOutcome::Kept => {
-            "kept: sealed data was kept or the wipe was incomplete, and it may still \
-             need the key"
-                .to_string()
-        }
+        SrkOutcome::Kept => "kept: sealed data was kept, the wipe was incomplete, or not every \
+             envelope's location could be proven empty - the key survives for it"
+            .to_string(),
         SrkOutcome::Failed(e) => {
             format!("could not check or evict ({e}); a benign orphan unless removed by hand")
         }
@@ -1096,6 +1128,35 @@ mod tests {
             "must say why it is left in place"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The eviction gate keeps the key on every blocker (#757 review): a
+    /// completed wipe alone would miss envelopes under the env overrides, and
+    /// a non-empty or unreadable post-wipe enumeration means sealed data is
+    /// still on the host.
+    #[test]
+    fn srk_eviction_requires_proof_that_no_envelope_survives() {
+        let holders = |v: Result<Vec<String>, String>| v;
+        assert!(
+            super::may_evict_srk(true, false, holders(Ok(Vec::new()))),
+            "completed wipe + no overrides + empty enumeration = evict"
+        );
+        assert!(
+            !super::may_evict_srk(false, false, holders(Ok(Vec::new()))),
+            "kept data or an incomplete wipe keeps the key"
+        );
+        assert!(
+            !super::may_evict_srk(true, true, holders(Ok(Vec::new()))),
+            "an active override dir means out-of-tree envelopes may exist"
+        );
+        assert!(
+            !super::may_evict_srk(true, false, holders(Ok(vec!["alice".to_string()]))),
+            "a surviving envelope holder keeps the key"
+        );
+        assert!(
+            !super::may_evict_srk(true, false, holders(Err("unreadable".to_string()))),
+            "an unreadable store is not proof of emptiness"
+        );
     }
 
     #[test]

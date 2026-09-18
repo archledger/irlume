@@ -115,10 +115,21 @@ unlock · **fingerprint** → companion factor.
 
 ## Status
 
-**v0.11.3**, working on real hardware across Fedora, Ubuntu and Arch. Self-tested
-against ISO/IEC 30107-3, not lab-certified. Interfaces may shift before 1.0.
-Validated cameras are listed in [Hardware compatibility](docs/HARDWARE.md)
-(generated from measured evidence, never hand-edited).
+**v0.13.0**, working on real hardware across Fedora, Arch, Debian and Ubuntu,
+with a NixOS module in this flake. Self-tested against ISO/IEC 30107-3, not
+lab-certified. Interfaces may shift before 1.0. Validated cameras are listed
+in [Hardware compatibility](docs/HARDWARE.md) (generated from measured
+evidence, never hand-edited).
+
+Since 0.11: multi-camera enrollment, where a secondary camera becomes its own
+group with a separate encrypted store
+([ADR-0024](docs/adr/0024-multi-camera-enrollment.md)); a measured latency
+workstream, about two seconds off warm concurrent attempts and roughly three
+seconds for an IR-only unlock; grouped RGB-only capture, which collects the
+five-sample anti-spoofing vote in one camera session, so screen unlock
+completes in about five seconds on a 15 fps RGB sensor that previously could
+not finish the vote at all; and signed releases carrying per-binary
+CycloneDX SBOMs and an OpenVEX document ([Verify](docs/VERIFY.md)).
 
 Hardware reports from laptops with IR cameras, working or not, are the most
 useful contribution right now:
@@ -126,8 +137,9 @@ useful contribution right now:
 [Issues](https://github.com/archledger/irlume/issues) ·
 [Security](SECURITY.md)
 
-If irlume is useful to you and you feel like it, there is a Ko-fi. No
-obligation; the project stays free and GPL either way.
+If irlume is useful to you and you feel like it, there is a Ko-fi, or PayPal
+through the Sponsor button. No obligation; the project stays free and GPL
+either way.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O3J824YGEK)
 

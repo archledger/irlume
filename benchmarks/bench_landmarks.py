@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Landmark bench: the 478-point face mesh vs sparse GT landmarks.
 
 Datasets: WFLW test split (2,500 annotation rows over 2,118 images, 98-pt),

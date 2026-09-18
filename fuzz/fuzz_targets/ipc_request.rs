@@ -1,4 +1,6 @@
 #![no_main]
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 //! The daemon's IPC request parser.
 //!
 //! Any unprivileged local process can connect to /run/irlume.sock and write

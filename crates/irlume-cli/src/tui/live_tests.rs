@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 // Synthetic observation, generation, and selection regressions. No I/O.
 
 fn live_test_snapshot() -> irlume_common::live::LiveStatusSnapshot {

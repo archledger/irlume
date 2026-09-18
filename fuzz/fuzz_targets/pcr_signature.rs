@@ -1,4 +1,6 @@
 #![no_main]
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 //! The PCR-policy signature parser.
 //!
 //! systemd writes `.pcrsig` files; irlume parses them at unseal time with

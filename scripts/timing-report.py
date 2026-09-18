@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Report camera capture timings from legacy irlume daemon debug logs.
 
 New investigations should record a bounded structured trace with `sudo irlume

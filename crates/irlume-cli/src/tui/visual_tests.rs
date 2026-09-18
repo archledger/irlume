@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 // Included inside tui::tests. Only synthetic state and TestBackend rendering:
 // never App::new, poll, enter_screen, or an operation/command dispatch.
 

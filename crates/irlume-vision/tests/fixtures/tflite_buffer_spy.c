@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
  * Test-only forwarding shim. All inference still runs in the real library.
  */
 #include <dlfcn.h>

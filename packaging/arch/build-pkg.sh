@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # NOT A RELEASE LANE. Arch users get irlume from the AUR.
 #
 # The header here used to say AUR registration was disabled and that

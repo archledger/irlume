@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 //! Private, non-setuid local-password verifier. Linux-PAM ABI follows
 //! security/pam_appl.h and pam_conv(3). The root daemon bounds its lifetime,
 //! supplies a cleared environment, and owns stdin/stdout/stderr pipes.

@@ -1,4 +1,6 @@
 #![no_main]
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 //! The sealed-envelope parser.
 //!
 //! The envelope holds the TPM-wrapped release secret and lives on disk as

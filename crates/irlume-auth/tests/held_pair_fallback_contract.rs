@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 
 fn function<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source.find(start).expect("start function");

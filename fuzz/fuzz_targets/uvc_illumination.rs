@@ -1,4 +1,6 @@
 #![no_main]
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 //! The UVC MS-XU illumination metadata parser.
 //!
 //! uvcvideo hands the daemon whatever bytes the camera appended to its UVC

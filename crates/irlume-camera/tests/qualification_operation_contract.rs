@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
 
 #[test]
 fn qualification_owns_one_operation_across_context_and_both_arms() {

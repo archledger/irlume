@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Bounded authentication checks for the marked disposable upgrade guests only.
 
 Never invoke this on an installed host. The guard runs before any mutation.

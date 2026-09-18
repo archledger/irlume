@@ -16,6 +16,7 @@ points at.
 | [PLATFORMS.md](PLATFORMS.md) | Distro and desktop coverage |
 | [NIXOS.md](NIXOS.md) | The NixOS module |
 | [APP-INTEGRATION.md](APP-INTEGRATION.md) | Face-approving app prompts (Bitwarden, pkexec) |
+| [KCM.md](KCM.md) | The Plasma System Settings module |
 
 ## Security
 

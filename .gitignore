@@ -36,3 +36,4 @@ __pycache__/
 # harness had files out, which put a 1938-line copy of a source file in a commit.
 *.rs.bak
 .aider*
+kcm/build/

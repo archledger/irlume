@@ -1,0 +1,14 @@
+{
+    "KPlugin": {
+        "Description": "Face authentication status and health",
+        "FormFactors": [
+            "desktop"
+        ],
+        "Icon": "io.github.archledger.Irlume",
+        "Id": "kcm_irlume",
+        "Name": "irlume",
+        "Version": "0.13.0"
+    },
+    "X-KDE-Keywords": "face,login,authentication,biometric,camera,IR",
+    "X-KDE-System-Settings-Parent-Category": "personalization"
+}

@@ -38,6 +38,15 @@ Source6:        %{url}/releases/download/tflite-runtime-%{tflite_ver}/libtensorf
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
+# Plasma System Settings module (subpackage irlume-kcm): CMake + KF6/Qt6.
+BuildRequires:  cmake
+BuildRequires:  extra-cmake-modules
+BuildRequires:  cmake(Qt6Core)
+BuildRequires:  cmake(Qt6Gui)
+BuildRequires:  cmake(Qt6Quick)
+BuildRequires:  cmake(KF6CoreAddons)
+BuildRequires:  cmake(KF6KCMUtils)
+BuildRequires:  cmake(KF6KIO)
 BuildRequires:  pam-devel
 BuildRequires:  dbus-devel
 BuildRequires:  tpm2-tss-devel
@@ -86,6 +95,21 @@ BuildArch:      noarch
 SELinux module letting the confined display-manager greeter reach the irlume
 daemon socket. Only needed on SELinux-enforcing systems (Fedora default).
 
+%package kcm
+Summary:        Plasma System Settings module for %{name}
+Requires:       %{name}%{?_isa} = %{version}-%{release}
+Requires:       kf6-kcmutils%{?_isa}
+Requires:       kf6-kio%{?_isa}
+Requires:       kf6-kirigami%{?_isa}
+Requires:       qt6-qtdeclarative%{?_isa}
+
+%description kcm
+Read-only status and health for %{name} inside Plasma's System Settings,
+plus launch buttons into the %{name} TUI. The module renders machine-API
+documents over the same versioned contract as external integrations; it
+holds no policy and performs no privileged action. Requires a Plasma 6
+session.
+
 %prep
 %autosetup -n %{name}-%{version}
 # Verify the bundled onnxruntime (Source1) before unpacking: the .so runs in
@@ -114,8 +138,12 @@ cargo build --release --locked
 # Compile the SELinux policy module from source (the .pp is a build artifact,
 # not committed to git).
 make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux irlume.pp
+# Plasma System Settings module.
+%cmake -S kcm -B kcm-build
+%cmake_build
 
 %install
+DESTDIR=%{buildroot} %__cmake --install kcm-build
 install -Dm0644 packaging/polkit/org.irlume.enroll.policy %{buildroot}%{_datadir}/polkit-1/actions/org.irlume.enroll.policy
 install -Dm0644 packaging/polkit/org.irlume.recovery-manage.policy %{buildroot}%{_datadir}/polkit-1/actions/org.irlume.recovery-manage.policy
 install -Dm0755 target/release/irlumed %{buildroot}%{_bindir}/irlumed
@@ -292,6 +320,11 @@ restorecon /run/irlume.sock 2>/dev/null || :
 
 %files selinux
 %{_datadir}/selinux/packages/irlume.pp
+
+%files kcm
+%{_qt6_plugindir}/plasma/kcms/systemsettings/kcm_irlume.so
+%{_datadir}/applications/kcm_irlume.desktop
+
 
 %changelog
 * Thu Sep 17 2026 archledger <archledger236@gmail.com> - 0.13.0-1

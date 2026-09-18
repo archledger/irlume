@@ -23,7 +23,7 @@ branch; security fixes land on `main` and ship in the next release.
 | **High** | `irlume-vision` (inference + match), `irlume-liveness` (PAD), bundled model integrity | Bypass of recognition or anti-spoofing |
 | **Medium** | `irlume-camera` (device/IR control), `irlume-core` (TPM/storage), packaging/systemd units | Trust boundary + secret handling |
 | **Medium** | `irlume-gkr-unlock`, `irlume-kwallet-init`, `irlume-password-verify` (privileged helpers) | Run elevated during login/unlock flows |
-| **Low** | `irlume-cli` (unprivileged client), `irlume-auth` (engine library, exercised by the daemon's tests), `irlume-common` (IPC schema), `irlume-fingerprint` (fingerprint tooling wrapper) | Client-side or library surfaces behind the above |
+| **Low** | `irlume-cli` (unprivileged client), `irlume-auth` (engine library, exercised by the daemon's tests), `irlume-common` (IPC schema), `irlume-fingerprint` (fingerprint tooling wrapper), `kcm/irlume-kcm` (Plasma System Settings module: unprivileged view over the machine API + TUI launcher; no privileged helper) | Client-side or library surfaces behind the above |
 
 ## Threat model (summary)
 

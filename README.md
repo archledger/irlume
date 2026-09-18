@@ -137,9 +137,9 @@ useful contribution right now:
 [Issues](https://github.com/archledger/irlume/issues) ·
 [Security](SECURITY.md)
 
-If irlume is useful to you and you feel like it, there is a Ko-fi, or PayPal
-through the Sponsor button. No obligation; the project stays free and GPL
-either way.
+If irlume is useful to you and you feel like it, star the repository to help
+others find it; there is also a Ko-fi, or PayPal through the Sponsor button.
+No obligation; the project stays free and GPL either way.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O3J824YGEK)
 

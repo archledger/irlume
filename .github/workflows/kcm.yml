@@ -74,12 +74,12 @@ jobs:
           # hardware and in the packaging lanes.)
           cat > /usr/bin/irlume <<'STUB'
           #!/bin/sh
-          case "$1" in
-            version) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"version","ok":true,"data":{"capabilities":["version-json","status-json","doctor-json","camera-census","login-status-json"],"contract_versions":{"min":1,"max":1},"limits":{"max_profiles":3}}}' ;;
-            status) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"status","ok":true,"data":{"daemon":"running"}}' ;;
-            doctor) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"doctor","ok":true,"data":{"checks":[{"id":"platform","state":"info","detail":"stub"}]}}' ;;
-            census) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"camera.census","ok":true,"data":{"entries":[]}}' ;;
-            login) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"login.status","ok":true,"data":{"surfaces":[]}}' ;;
+          case "$1 ${2:-}" in
+            "version "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"version","ok":true,"data":{"capabilities":["version-json","status-json","doctor-json","camera-census","login-status-json"],"contract_versions":{"min":1,"max":1},"limits":{"max_profiles":3}}}' ;;
+            "status "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"status","ok":true,"data":{"daemon":"running"}}' ;;
+            "doctor "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"doctor","ok":true,"data":{"checks":[{"id":"platform","state":"info","detail":"stub"}]}}' ;;
+            "camera census") printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"camera.census","ok":true,"data":{"entries":[]}}' ;;
+            "login "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"login.status","ok":true,"data":{"surfaces":[]}}' ;;
             *) exit 2 ;;
           esac
           STUB

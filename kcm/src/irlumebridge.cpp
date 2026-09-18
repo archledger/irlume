@@ -130,7 +130,10 @@ bool IrlumeBridge::tuiProbablyRunning()
     }
     QString user = QString::fromLatin1(pw->pw_name);
     for (QChar &ch : user) {
-        if (!(ch.isLetterOrNumber() || ch == u'-' || ch == u'_' || ch == u'.')) {
+        // Must match the Rust guard's target_key exactly: ASCII
+        // alphanumerics only (Unicode letters are underscores there).
+        if (!((ch.unicode() < 128) && ch.isLetterOrNumber())
+            && ch != u'-' && ch != u'_' && ch != u'.') {
             ch = u'_';
         }
     }
@@ -147,16 +150,34 @@ bool IrlumeBridge::tuiProbablyRunning()
     return rc != 0; // EWOULDBLOCK: someone holds it -> a TUI is live
 }
 
-bool IrlumeBridge::handoffTuiDetached(const QString &page)
+IrlumeBridge::HandoffResult IrlumeBridge::handoffTuiAndWait(const QString &page, int timeoutMs)
 {
     if (m_irlumePath.isEmpty()) {
-        return false;
+        return HandoffResult::Unknown;
     }
     QStringList args{QStringLiteral("tui")};
     if (!page.isEmpty()) {
         args << QStringLiteral("--page") << page;
     }
-    return QProcess::startDetached(m_irlumePath, args);
+    QProcess child;
+    child.setProgram(m_irlumePath);
+    child.setArguments(args);
+    child.setProcessChannelMode(QProcess::SeparateChannels);
+    child.start(QIODevice::ReadOnly);
+    if (!child.waitForStarted(2000)) {
+        return HandoffResult::Unknown;
+    }
+    if (!child.waitForFinished(timeoutMs)) {
+        child.kill();
+        child.waitForFinished(1000);
+        return HandoffResult::Unknown;
+    }
+    if (child.exitStatus() != QProcess::NormalExit) {
+        return HandoffResult::Unknown;
+    }
+    // Exit 0 is the TUI's documented "handed off to the running instance"
+    // outcome; any other code means no live TUI accepted the handoff.
+    return child.exitCode() == 0 ? HandoffResult::Done : HandoffResult::NotAccepted;
 }
 
 bool IrlumeBridge::launchTuiDetached(const QString &page)

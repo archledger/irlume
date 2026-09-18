@@ -115,14 +115,15 @@ unlock · **fingerprint** → companion factor.
 
 ## Status
 
-**v0.13.0**, working on real hardware across Fedora, Arch, Debian and Ubuntu,
-with a NixOS module in this flake. Self-tested against ISO/IEC 30107-3, not
+**v0.13.0**, working on real hardware on Fedora and Ubuntu; packaged and
+install-tested on Arch and Debian, with a NixOS module in this flake.
+Self-tested against ISO/IEC 30107-3, not
 lab-certified. Interfaces may shift before 1.0. Validated cameras are listed
 in [Hardware compatibility](docs/HARDWARE.md) (generated from measured
 evidence, never hand-edited).
 
 Since 0.11: multi-camera enrollment, where a secondary camera becomes its own
-group with a separate encrypted store
+group with a separate store
 ([ADR-0024](docs/adr/0024-multi-camera-enrollment.md)); a measured latency
 workstream, about two seconds off warm concurrent attempts and roughly three
 seconds for an IR-only unlock; grouped RGB-only capture, which collects the

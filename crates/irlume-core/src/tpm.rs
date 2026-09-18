@@ -2061,6 +2061,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     #[test]
     #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
     fn evict_persistent_srk_never_touches_a_same_template_foreign_key() {
+        // The CI lane serializes many irlume tests through one swtpm, and an
+        // earlier test (any seal) may already have persisted OUR SRK at the
+        // handle; the fixture below must own the handle, so clear our key
+        // first. Every occupant this lane can produce is irlume's own, so a
+        // Foreign here means the fixture cannot run, not a product defect.
+        match evict_persistent_srk().expect("pre-test handle probe") {
+            SrkEviction::Evicted | SrkEviction::Absent => {}
+            SrkEviction::Foreign => panic!("handle already holds a foreign key"),
+        }
         let mut ctx = open_context().expect("context");
         let parent = create_srk(&mut ctx).expect("transient SRK parent");
         // Child creation and loading run under the parent's (empty) auth, the

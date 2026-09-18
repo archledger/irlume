@@ -643,6 +643,11 @@ struct App {
     /// Polled each event-loop tick for handoff navigation from a later
     /// `irlume tui` launch.
     handoff_listener: Option<std::os::unix::net::UnixListener>,
+    /// A pending deep-link destination (`--page` or a handoff): (screen the
+    /// TUI started on, requested screen). Applied by `recompute_visible`
+    /// once the requested screen is actually visible; ANY user input
+    /// cancels it. Capability-gated screens therefore never yank the user.
+    launch_destination: Option<(usize, usize)>,
     profiles: Vec<ProfileSummary>,
     camera_groups: Vec<irlume_common::CameraGroupSummary>,
     camera_store_error: Option<String>,
@@ -1181,8 +1186,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     // Single-instance guard BEFORE the TTY check: handing off to the
     // running TUI needs no terminal of its own (a script or a launcher can
     // navigate it), while a failed acquisition before the TTY error just
-    // releases the kernel-held lock with the process.
-    let guard = match launch::acquire_guard(launch.page, launch.new_instance) {
+    // releases the kernel-held lock with the process. The guard is keyed by
+    // the TARGET ACCOUNT the TUI manages, so `irlume tui --user bob` never
+    // hands bob's page to alice's running window.
+    let target_user = crate::user_arg(args);
+    let guard = match launch::acquire_guard(&target_user, launch.page, launch.new_instance) {
         launch::GuardOutcome::Acquired(guard) => Some(guard),
         launch::GuardOutcome::HandedOff(message) => {
             println!("{message}");
@@ -1206,7 +1214,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     );
     let mut app = App::new(crate::user_arg(args));
     if let Some(page) = launch.page {
-        app.enter_screen(page);
+        // Applied by recompute_visible once the screen is visible (a
+        // capability- or advanced-gated page waits instead of being
+        // snapped away), and cancelled by any user input.
+        let start = app.screen;
+        app.launch_destination = Some((start, page));
     }
     if let Some(guard) = guard {
         app.handoff_listener = Some(guard.listener().try_clone()?);
@@ -1814,6 +1826,7 @@ impl App {
             screen,
             sel: 0,
             handoff_listener: None,
+            launch_destination: None,
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
@@ -1989,6 +2002,14 @@ impl App {
         let rows = self.hub_rows().len();
         if rows > 0 && self.hub_sel >= rows {
             self.hub_sel = rows - 1;
+        }
+        // A launch deep link lands as soon as its screen is visible and the
+        // user has not navigated anywhere in the meantime.
+        if let Some((start, dest)) = self.launch_destination {
+            if self.screen == start && self.visible.contains(&dest) {
+                self.launch_destination = None;
+                self.enter_screen(dest);
+            }
         }
     }
 
@@ -3864,6 +3885,9 @@ impl App {
     /// Terminal boundary: keep hidden controls inactive until this exact size
     /// has been drawn. Internal page handlers retain their ordinary behavior.
     fn on_window_event(&mut self, input: Event, area: Rect) {
+        // Any user input cancels a pending launch deep link: from here on,
+        // the user owns the navigation.
+        self.launch_destination = None;
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
         if !window_fits(area) || self.window_area.get() != Some(area) {
             self.click_targets.borrow_mut().clear();
@@ -9902,12 +9926,101 @@ mod tests {
     use ratatui::Terminal;
     use std::sync::atomic::AtomicUsize;
 
+    /// A `--page` deep link is a REQUEST, not a command: it lands when the
+    /// screen is actually visible, waits when capability-gated, and any
+    /// user input cancels it. Nothing yanks the user to a hidden screen.
+    #[test]
+    fn launch_destination_lands_only_when_visible_and_input_cancels_it() {
+        let _socket = dead_socket();
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let start = app.screen;
+        // test_app reports no camera and no fingerprint reader, so the
+        // Faces screen (needs RGB) is invisible.
+        assert!(!app.visible.contains(&SC_PROFILES));
+        app.launch_destination = Some((start, SC_PROFILES));
+        app.recompute_visible();
+        assert_eq!(app.screen, start, "an invisible destination does not yank");
+
+        // Capability lands: the destination applies on the next recompute.
+        app.caps = irlume_camera::Caps {
+            ir_pair: true,
+            rgb: true,
+        };
+        app.recompute_visible();
+        assert_eq!(
+            app.screen, SC_PROFILES,
+            "the destination lands when visible"
+        );
+
+        // User input cancels a still-pending destination.
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let start = app.screen;
+        app.launch_destination = Some((start, SC_REPAIR));
+        use ratatui::crossterm::event::{KeyCode as TestKeyCode, KeyEvent, KeyModifiers};
+        app.on_window_event(
+            Event::Key(KeyEvent::new(TestKeyCode::Esc, KeyModifiers::NONE)),
+            Rect::new(0, 0, 80, 24),
+        );
+        app.recompute_visible();
+        assert_eq!(app.screen, start, "input owns the navigation from then on");
+
+        // A visible destination with no interference lands on recompute.
+        let mut app = test_app();
+        inert_workers(&mut app);
+        let start = app.screen;
+        app.launch_destination = Some((start, SC_REPAIR));
+        app.recompute_visible();
+        assert_eq!(app.screen, SC_REPAIR);
+    }
+
     /// The TUI must resolve its target account the way the rest of the CLI does.
     ///
     /// Reading $USER here pointed every request in this file at `root` under
     /// `sudo irlume tui`, which is the documented way to see root-only settings.
     /// That meant an empty dashboard for a configured user, and `[a]`/`[e]`
     /// sealing a password and enrolling a face under the wrong account. The rule
+    /// lives in `user_arg`; this pins the TUI to it.
+    #[test]
+    fn settings_has_no_gesture_controls_or_actions() {
+        let mut app = test_app();
+        app.screen = SC_SETTINGS;
+        let text = draw_text(&app);
+        assert!(text.contains("Face authentication at privileged prompts"));
+        for removed in [
+            "head gesture",
+            "keyring gesture",
+            "nodding",
+            "shake your head",
+        ] {
+            assert!(!text.contains(removed), "{text}");
+        }
+        for key in [KeyCode::Char('c'), KeyCode::Char('g'), KeyCode::Enter] {
+            app.on_key(key);
+            assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
+        }
+    }
+
+    /// Make navigation side-effect-free in tests: `enter_screen` fires
+    /// refresh workers (light poll, probes, profiles, cameras, keyring
+    /// diagnostic) that send REAL daemon requests on background threads,
+    /// which can outlive this test's isolation window and land on a later
+    /// test's mock socket (observed as its server loop breaking early).
+    /// Pre-filling each worker receiver makes every refresh early-return.
+    fn inert_workers(app: &mut App) {
+        let (_t, r) = mpsc::channel();
+        app.light_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.probes_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.profiles_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.camera_load = Some(r);
+        let (_t, r) = mpsc::channel();
+        app.keyring_load = Some(r);
+    }
+
     /// The single-instance guard's listener: a later `irlume tui --page X`
     /// hands its page over this channel and the running TUI navigates.
     /// Anything outside the navigate-only vocabulary (including an unknown
@@ -9928,6 +10041,7 @@ mod tests {
         // (observed as the guided-enrollment test's sequence check failing).
         let _socket = dead_socket();
         let mut app = test_app();
+        inert_workers(&mut app);
         let name = format!("irlume-tui-test-{}", std::process::id());
         let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&addr).unwrap();
@@ -9958,27 +10072,6 @@ mod tests {
         // No pending connection: draining is a no-op.
         app.drain_handoff();
         assert_eq!(app.screen, SC_RECOVERY);
-    }
-
-    /// lives in `user_arg`; this pins the TUI to it.
-    #[test]
-    fn settings_has_no_gesture_controls_or_actions() {
-        let mut app = test_app();
-        app.screen = SC_SETTINGS;
-        let text = draw_text(&app);
-        assert!(text.contains("Face authentication at privileged prompts"));
-        for removed in [
-            "head gesture",
-            "keyring gesture",
-            "nodding",
-            "shake your head",
-        ] {
-            assert!(!text.contains(removed), "{text}");
-        }
-        for key in [KeyCode::Char('c'), KeyCode::Char('g'), KeyCode::Enter] {
-            app.on_key(key);
-            assert!(app.suspend.is_none() && app.op.is_none() && app.confirm.is_none());
-        }
     }
 
     #[test]
@@ -11054,6 +11147,7 @@ mod tests {
             screen: SC_WELCOME,
             sel: 0,
             handoff_listener: None,
+            launch_destination: None,
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,

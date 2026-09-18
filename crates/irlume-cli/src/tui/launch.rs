@@ -83,9 +83,14 @@ pub(crate) fn parse_launch(args: &[String]) -> Result<LaunchOptions, String> {
                 if inline_value.is_some() {
                     idx += 1;
                 } else {
-                    // Consume the value; a dangling `--user` is reported by
-                    // the user-argument parser itself, not here.
-                    idx += 2;
+                    // Consume the value only when it cannot be a flag: an
+                    // option-looking token stays for its own parsing, and a
+                    // dangling `--user` is reported by the user-argument
+                    // parser itself, not here.
+                    match args.get(idx + 1) {
+                        Some(value) if !value.starts_with('-') => idx += 2,
+                        _ => idx += 1,
+                    }
                 }
             }
             "--page" => {
@@ -195,27 +200,49 @@ impl Guard {
     }
 }
 
-/// The lock file path under the (per-user, 0700) runtime directory.
-fn guard_paths(runtime_dir: &std::path::Path) -> std::path::PathBuf {
-    runtime_dir.join("irlume").join("tui.lock")
+/// Filesystem-safe encoding of the TARGET ACCOUNT the TUI manages. The
+/// guard is keyed by it, not just the uid: `irlume tui --user bob` while a
+/// TUI for alice runs is a separate instance, not a handoff to alice's
+/// window.
+fn target_key(user: &str) -> String {
+    let mut key = String::with_capacity(user.len());
+    for ch in user.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            key.push(ch);
+        } else {
+            key.push('_');
+        }
+    }
+    if key.is_empty() {
+        key.push('_');
+    }
+    key
 }
 
-/// The abstract socket name carrying the current uid, so users never
-/// collide. Abstract names have no permission bits; `peer_is_self` on
-/// accept is the access control.
-fn abstract_name() -> String {
+/// The lock file path under the (per-user, 0700) runtime directory, keyed
+/// by the target account.
+fn guard_paths(runtime_dir: &std::path::Path, user: &str) -> std::path::PathBuf {
+    runtime_dir
+        .join("irlume")
+        .join(format!("tui-{}.lock", target_key(user)))
+}
+
+/// The abstract socket name carrying the current uid and the target
+/// account, so neither users nor target accounts collide. Abstract names
+/// have no permission bits; `peer_is_self` on accept is the access control.
+fn abstract_name(user: &str) -> String {
     // SAFETY: getuid cannot fail and touches no memory.
     let uid = unsafe { libc::getuid() };
-    format!("irlume-tui-{uid}")
+    format!("irlume-tui-{uid}-{}", target_key(user))
 }
 
-fn connect_handoff_listener() -> std::io::Result<std::os::unix::net::UnixStream> {
+fn connect_handoff_listener(user: &str) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixStream};
     // SAFETY: getuid cannot fail and touches no memory.
     let uid = unsafe { libc::getuid() };
     let _ = uid;
-    let addr = SocketAddr::from_abstract_name(abstract_name().as_bytes())
+    let addr = SocketAddr::from_abstract_name(abstract_name(user).as_bytes())
         .map_err(std::io::Error::other)?;
     let stream = UnixStream::connect_addr(&addr)?;
     // The listener accepts only same-uid peers; that check lives there.
@@ -223,8 +250,29 @@ fn connect_handoff_listener() -> std::io::Result<std::os::unix::net::UnixStream>
     Ok(stream)
 }
 
-/// Tries to become the single TUI instance under `$XDG_RUNTIME_DIR/irlume`.
-pub(crate) fn acquire_guard(page: Option<usize>, new_instance: bool) -> GuardOutcome {
+/// Sends the handoff message to the running instance for this same target
+/// account, retrying briefly: the holder may be between taking the lock
+/// and binding the listener.
+fn try_handoff(user: &str, message: &str) -> Result<(), ()> {
+    use std::io::Write;
+    for attempt in 0..3 {
+        if let Ok(mut stream) = connect_handoff_listener(user) {
+            if stream.write_all(message.as_bytes()).is_ok() {
+                let _ = stream.flush();
+                return Ok(());
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    }
+    Err(())
+}
+
+/// Tries to become the single TUI instance for `user` (the TARGET ACCOUNT
+/// the TUI manages, not just the invoking uid) under
+/// `$XDG_RUNTIME_DIR/irlume`.
+pub(crate) fn acquire_guard(user: &str, page: Option<usize>, new_instance: bool) -> GuardOutcome {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::DirBuilderExt;
     if new_instance {
@@ -235,7 +283,7 @@ pub(crate) fn acquire_guard(page: Option<usize>, new_instance: bool) -> GuardOut
         return GuardOutcome::Disabled;
     };
 
-    let guard_dir = guard_paths(&runtime_dir)
+    let guard_dir = guard_paths(&runtime_dir, user)
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| runtime_dir.clone());
@@ -250,7 +298,7 @@ pub(crate) fn acquire_guard(page: Option<usize>, new_instance: bool) -> GuardOut
         }
     }
 
-    let lock_path = guard_paths(&runtime_dir);
+    let lock_path = guard_paths(&runtime_dir, user);
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -274,10 +322,11 @@ pub(crate) fn acquire_guard(page: Option<usize>, new_instance: bool) -> GuardOut
     // SAFETY: fd is owned by `file` and outlives the call.
     let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if locked != 0 {
-        // Someone else is (or was) the single instance: hand off to it.
+        // Someone else is (or was) the single instance for this target
+        // account: hand off to it.
         drop(file);
         let message = handoff_message(page);
-        let handed = try_handoff(&message);
+        let handed = try_handoff(user, &message);
         let target = page.and_then(page_name).unwrap_or("the running instance");
         return match handed {
             Ok(()) => GuardOutcome::HandedOff(format!(
@@ -289,7 +338,7 @@ pub(crate) fn acquire_guard(page: Option<usize>, new_instance: bool) -> GuardOut
         };
     }
 
-    match bind_listener() {
+    match bind_listener(user) {
         Ok(listener) => GuardOutcome::Acquired(Guard {
             listener,
             _file: file,
@@ -300,28 +349,10 @@ pub(crate) fn acquire_guard(page: Option<usize>, new_instance: bool) -> GuardOut
     }
 }
 
-/// Sends the handoff message to the running instance, retrying briefly:
-/// the holder may be between taking the lock and binding the listener.
-fn try_handoff(message: &str) -> Result<(), ()> {
-    use std::io::Write;
-    for attempt in 0..3 {
-        if let Ok(mut stream) = connect_handoff_listener() {
-            if stream.write_all(message.as_bytes()).is_ok() {
-                let _ = stream.flush();
-                return Ok(());
-            }
-        }
-        if attempt < 2 {
-            std::thread::sleep(std::time::Duration::from_millis(60));
-        }
-    }
-    Err(())
-}
-
-fn bind_listener() -> std::io::Result<UnixListener> {
+fn bind_listener(user: &str) -> std::io::Result<UnixListener> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::SocketAddr;
-    let addr = SocketAddr::from_abstract_name(abstract_name().as_bytes())
+    let addr = SocketAddr::from_abstract_name(abstract_name(user).as_bytes())
         .map_err(std::io::Error::other)?;
     UnixListener::bind_addr(&addr)
 }
@@ -415,6 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_launch_never_consumes_an_option_looking_user_value() {
+        // `--user --new` must not swallow `--new` as the account name: the
+        // flags still parse, and the dangling `--user` is reported by the
+        // user-argument parser itself (same as every other subcommand).
+        let parsed = parse_launch(&argv(&["--user", "--new"])).expect("flags parse");
+        assert!(parsed.new_instance, "{parsed:?}");
+        let parsed = parse_launch(&argv(&["--user", "--page=faces"])).expect("flags parse");
+        assert_eq!(parsed.page, Some(SC_PROFILES), "{parsed:?}");
+    }
+
+    #[test]
     fn parse_launch_accepts_new() {
         let parsed = parse_launch(&argv(&["--new"])).expect("--new parses");
         assert!(parsed.new_instance);
@@ -478,13 +520,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
 
-        let first = match acquire_guard(None, false) {
+        let first = match acquire_guard("test-user", None, false) {
             GuardOutcome::Acquired(g) => g,
             other => panic!("first acquire must succeed: {other:?}"),
         };
 
-        // The second instance hands its page off and exits.
-        match acquire_guard(Some(SC_PROFILES), false) {
+        // A TUI for a DIFFERENT target account is a separate instance: no
+        // handoff, its own guard.
+        assert!(matches!(
+            acquire_guard("other-user", Some(SC_PROFILES), false),
+            GuardOutcome::Acquired(_)
+        ));
+
+        // The second instance for the SAME account hands its page off.
+        match acquire_guard("test-user", Some(SC_PROFILES), false) {
             GuardOutcome::HandedOff(msg) => {
                 assert!(msg.contains("faces"), "{msg}");
             }
@@ -520,7 +569,7 @@ mod tests {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join("irlume").join("tui.lock"))
+            .open(dir.join("irlume").join("tui-test-user.lock"))
             .unwrap();
         assert_eq!(
             // SAFETY: fd is owned by `file` and outlives the call.
@@ -528,7 +577,7 @@ mod tests {
             0
         );
 
-        match acquire_guard(None, false) {
+        match acquire_guard("test-user", None, false) {
             GuardOutcome::ProceedWithoutLock(msg) => {
                 assert!(!msg.is_empty());
             }
@@ -552,7 +601,10 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
 
         // --new never touches the filesystem.
-        assert!(matches!(acquire_guard(None, true), GuardOutcome::Disabled));
+        assert!(matches!(
+            acquire_guard("test-user", None, true),
+            GuardOutcome::Disabled
+        ));
         assert!(
             !dir.join("irlume").exists(),
             "--new must not create the guard dir"
@@ -560,7 +612,10 @@ mod tests {
 
         // No runtime directory: guard off, same behavior as before.
         std::env::remove_var("XDG_RUNTIME_DIR");
-        assert!(matches!(acquire_guard(None, false), GuardOutcome::Disabled));
+        assert!(matches!(
+            acquire_guard("test-user", None, false),
+            GuardOutcome::Disabled
+        ));
 
         match saved {
             Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),

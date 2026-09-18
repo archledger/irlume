@@ -103,7 +103,7 @@ KCMUtils.SimpleKCM {
                         }
                         Controls.Label {
                             text: modelData.class
-                            color: Kirigami.Theme.secondaryTextColor
+                            color: Kirigami.Theme.disabledTextColor
                         }
                         Controls.Label {
                             visible: modelData.verdict !== undefined
@@ -122,7 +122,7 @@ KCMUtils.SimpleKCM {
                             Layout.fillWidth: true
                             text: "· " + modelData
                             wrapMode: Text.Wrap
-                            color: Kirigami.Theme.secondaryTextColor
+                            color: Kirigami.Theme.disabledTextColor
                         }
                     }
                     Controls.Label {

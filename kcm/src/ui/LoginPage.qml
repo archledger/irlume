@@ -107,12 +107,12 @@ KCMUtils.SimpleKCM {
                     Controls.Label {
                         Layout.fillWidth: true
                         text: modelData.role
-                        color: Kirigami.Theme.secondaryTextColor
+                        color: Kirigami.Theme.disabledTextColor
                     }
                     Controls.Label {
                         visible: modelData.mode !== undefined
                         text: modelData.mode
-                        color: Kirigami.Theme.secondaryTextColor
+                        color: Kirigami.Theme.disabledTextColor
                     }
                     Controls.Label {
                         text: modelData.wired ? "wired" : "not wired"

@@ -17,8 +17,8 @@ KCMUtils.SimpleKCM {
     property bool pending: false
     property string failure: ""
 
-    readonly property bool contractOk: versionDoc && versionDoc.ok
-        && versionDoc.contract_version === 1
+    readonly property bool contractOk: versionDoc !== undefined
+        && versionDoc.ok === true && versionDoc.contract_version === 1
     readonly property var caps: root.contractOk ? versionDoc.data.capabilities : []
 
     function refresh() {
@@ -95,7 +95,6 @@ KCMUtils.SimpleKCM {
             visible: root.statusDoc.ok === true
             contentItem: Kirigami.FormLayout {
                 id: statusForm
-                twinFormLabelText: ""
 
                 Repeater {
                     model: {
@@ -143,16 +142,17 @@ KCMUtils.SimpleKCM {
                         return rows;
                     }
                     delegate: RowLayout {
-                        Kirigami.FormData.label: modelData.label + ":"
+                        Kirigami.FormData.label: modelData ? modelData.label + ":" : ""
                         spacing: Kirigami.Units.smallSpacing
                         Controls.Label {
-                            text: modelData.good ? "●" : "○"
-                            color: modelData.good ? Kirigami.Theme.positiveTextColor
-                                                  : Kirigami.Theme.neutralTextColor
+                            text: modelData && modelData.good ? "●" : "○"
+                            color: modelData && modelData.good
+                                  ? Kirigami.Theme.positiveTextColor
+                                  : Kirigami.Theme.neutralTextColor
                         }
                         Controls.Label {
-                            text: modelData.value
-                            color: Kirigami.Theme.secondaryTextColor
+                            text: modelData ? modelData.value : ""
+                            color: Kirigami.Theme.disabledTextColor
                         }
                     }
                 }

@@ -86,6 +86,22 @@ jobs:
           chmod +x /usr/bin/irlume
           ./kcm-build/bin/kcm_loadtest "$(pwd)/kcm-build/bin/plasma/kcms/systemsettings/kcm_irlume.so"
 
+      - name: Runtime QML instantiation check (offscreen kcmshell6)
+        run: |
+          # A qmllint pass does not catch runtime QML errors (a nonexistent
+          # property or an undefined binding reached the user's System
+          # Settings that way once). Instantiate the real module offscreen
+          # and fail on any QML error it reports.
+          cmake --install kcm-build
+          command -v kcmshell6 || { echo "kcmshell6 not available; skipped"; exit 0; }
+          log="$(mktemp)"
+          timeout 15 env QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1 \
+            kcmshell6 kcm_irlume 2>&1 | tee "$log"
+          if grep -aqE "qrc:|Unable to assign|Cannot assign|Error loading QML" "$log"; then
+            echo "::error::the module reported QML errors on instantiation"
+            exit 1
+          fi
+
       - name: QML syntax check
         run: |
           if [ -x /usr/lib64/qt6/bin/qmllint ]; then

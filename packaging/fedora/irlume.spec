@@ -138,9 +138,11 @@ cargo build --release --locked
 # Compile the SELinux policy module from source (the .pp is a build artifact,
 # not committed to git).
 make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux irlume.pp
-# Plasma System Settings module.
-%cmake -S kcm -B kcm-build
-%cmake_build
+# Plasma System Settings module. Plain cmake, deliberately not the %%cmake
+# macros: this project builds from a subdirectory with its own build dir, and
+# %%cmake_build would build %%{_vpath_builddir} instead.
+cmake -S kcm -B kcm-build
+cmake --build kcm-build --parallel
 
 %install
 DESTDIR=%{buildroot} %__cmake --install kcm-build

@@ -19,6 +19,8 @@ KCMUtils.ScrollViewKCM {
     property string failure: ""
 
     readonly property var entries: doc && doc.ok ? doc.data.entries : []
+    readonly property string listingError: doc && doc.ok && doc.data.listing_error
+        ? String(doc.data.listing_error) : ""
 
     function refresh() {
         failure = "";
@@ -55,9 +57,31 @@ KCMUtils.ScrollViewKCM {
             text: root.failure
         }
 
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: !root.pending && root.doc.ok === false
+            type: Kirigami.MessageType.Warning
+            text: root.doc && root.doc.error
+                  ? (root.doc.error.message || root.doc.error.code)
+                  : "irlume did not answer"
+        }
+
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: root.listingError.length > 0
+            type: Kirigami.MessageType.Warning
+            text: "The census may be incomplete: " + root.listingError
+        }
+
         Controls.BusyIndicator {
             visible: root.pending
             running: root.pending
+        }
+
+        Controls.Label {
+            visible: root.doc.ok === true && root.entries.length === 0 && root.listingError.length === 0
+            enabled: false
+            text: "No camera-like devices were classified."
         }
 
         Repeater {
@@ -78,6 +102,11 @@ KCMUtils.ScrollViewKCM {
                             text: modelData.class
                             font.family: "monospace"
                             color: Kirigami.Theme.secondaryTextColor
+                        }
+                        Controls.Label {
+                            visible: modelData.verdict !== undefined
+                            text: modelData.verdict
+                            font.family: "monospace"
                         }
                         Item { Layout.fillWidth: true }
                         Controls.Label {

@@ -55,10 +55,10 @@ jobs:
           if command -v dnf >/dev/null; then
             dnf install -y -q cmake extra-cmake-modules gcc-c++ \
               qt6-qtbase-devel qt6-qtdeclarative-devel \
-              kf6-kcmutils-devel kf6-kcoreaddons-devel kf6-kio-devel
+              kf6-kcmutils-devel kf6-kcoreaddons-devel kf6-kio-devel kf6-kirigami
           else
             pacman -Sy --noconfirm cmake extra-cmake-modules gcc \
-              qt6-base qt6-declarative kcmutils kcoreaddons kio
+              qt6-base qt6-declarative kcmutils kcoreaddons kio kirigami
           fi
 
       - name: Build the module and its load test
@@ -98,8 +98,15 @@ jobs:
           fi
           status=0
           for f in kcm/src/ui/*.qml; do
-            if "$QMLLINT" "$f" | grep -E "Error|Warning: .*:(missing-property|syntax)"; then
+            # GitHub Actions runs steps with pipefail: piping qmllint into
+            # grep would mask a nonzero linter exit behind || handling, so
+            # capture first, judge the exit code, then scan the output.
+            if ! out="$("$QMLLINT" "$f" 2>&1)"; then
               status=1
+            fi
+            if printf '%s\n' "$out" | grep -qE "Error|Warning: .*:(missing-property|syntax)"; then
+              status=1
+              printf '%s\n' "$out"
             fi
           done
           exit $status

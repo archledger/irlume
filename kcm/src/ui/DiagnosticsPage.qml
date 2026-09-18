@@ -25,7 +25,10 @@ KCMUtils.ScrollViewKCM {
             {title: "Failing", states: ["fail"], color: Kirigami.Theme.negativeTextColor},
             {title: "Warnings", states: ["warn"], color: Kirigami.Theme.neutralTextColor},
             {title: "Passing", states: ["pass"], color: Kirigami.Theme.positiveTextColor},
-            {title: "Informational", states: ["info", "unknown"], color: Kirigami.Theme.secondaryTextColor},
+            {title: "Informational", states: ["info"], color: Kirigami.Theme.secondaryTextColor},
+            // "unknown" is a contract state of its own: the check could not be
+            // performed, and presenting that as an informational fact lies.
+            {title: "Not determined", states: ["unknown"], color: Kirigami.Theme.disabledTextColor},
         ];
         const checks = doc.data.checks;
         const out = [];

@@ -55,6 +55,15 @@ KCMUtils.ScrollViewKCM {
             text: root.failure
         }
 
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: !root.pending && root.doc.ok === false
+            type: Kirigami.MessageType.Warning
+            text: root.doc && root.doc.error
+                  ? (root.doc.error.message || root.doc.error.code)
+                  : "irlume did not answer"
+        }
+
         Controls.BusyIndicator {
             visible: root.pending
             running: root.pending

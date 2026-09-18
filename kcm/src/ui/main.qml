@@ -17,7 +17,9 @@ KCMUtils.ScrollViewKCM {
     property bool pending: false
     property string failure: ""
 
-    readonly property var caps: versionDoc && versionDoc.ok ? versionDoc.data.capabilities : []
+    readonly property bool contractOk: versionDoc && versionDoc.ok
+        && versionDoc.contract_version === 1
+    readonly property var caps: root.contractOk ? versionDoc.data.capabilities : []
 
     function refresh() {
         failure = "";
@@ -67,7 +69,7 @@ KCMUtils.ScrollViewKCM {
 
         Kirigami.AbstractCard {
             Layout.fillWidth: true
-            visible: root.versionDoc.ok === true
+            visible: root.contractOk
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
                 Controls.Label {
@@ -96,10 +98,12 @@ KCMUtils.ScrollViewKCM {
                 }
                 add("Daemon", d.daemon, d.daemon === "running");
                 add("Enrollment",
-                    d.enrollment.known
-                        ? (d.enrollment.profiles + " profile(s), " + d.enrollment.scans + " scan(s)")
-                        : "none yet",
-                    d.enrollment.known && d.enrollment.profiles > 0);
+                    d.enrollment.known === false
+                        ? "unknown"
+                        : (d.enrollment.profiles > 0
+                            ? (d.enrollment.profiles + " profile(s), " + d.enrollment.scans + " scan(s)")
+                            : "none yet"),
+                    d.enrollment.known === true && d.enrollment.profiles > 0);
                 add("Keyring unlock",
                     d.keyring.armed === true ? "armed"
                       : d.keyring.armed === false ? "not armed"
@@ -175,19 +179,19 @@ KCMUtils.ScrollViewKCM {
             Controls.Button {
                 text: "Diagnostics"
                 icon.name: "tools-report-bug"
-                enabled: root.caps.indexOf("doctor-json") >= 0
+                visible: root.caps.indexOf("doctor-json") >= 0
                 onClicked: kcm.push("DiagnosticsPage.qml")
             }
             Controls.Button {
                 text: "Cameras"
                 icon.name: "camera-video"
-                enabled: root.caps.indexOf("camera-census") >= 0
+                visible: root.caps.indexOf("camera-census") >= 0
                 onClicked: kcm.push("CamerasPage.qml")
             }
             Controls.Button {
                 text: "Login wiring"
                 icon.name: "preferences-system-users"
-                enabled: root.caps.indexOf("login-status-json") >= 0
+                visible: root.caps.indexOf("login-status-json") >= 0
                 onClicked: kcm.push("LoginPage.qml")
             }
             Item { Layout.fillWidth: true }

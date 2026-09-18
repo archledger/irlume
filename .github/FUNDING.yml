@@ -1,3 +1,4 @@
-# Renders the repo's Sponsor button. Ko-fi is the one channel that exists;
-# adding a platform here is a maintainer decision, not a housekeeping edit.
+# Renders the repo's Sponsor button. Ko-fi and PayPal are the channels that
+# exist; adding a platform here is a maintainer decision, not a housekeeping edit.
 ko_fi: archledger
+paypal: WisbendjiFimerlus

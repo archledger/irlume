@@ -922,6 +922,7 @@ fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle
 /// timing-side-channel advisory, whose risk lived entirely in private-key
 /// operations this project never performs.
 fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
+    use der::asn1::ObjectIdentifier;
     use der::asn1::UintRef;
     use der::{Decode, DecodePem, Sequence};
     use spki::SubjectPublicKeyInfoOwned;
@@ -935,6 +936,24 @@ fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
 
     let spki = SubjectPublicKeyInfoOwned::from_pem(pubkey_pem)
         .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
+    // The previous decoder (the rsa crate) rejected non-RSA AlgorithmIdentifiers;
+    // keep that strictness: a non-RSA SPKI whose BIT STRING happened to hold a
+    // PKCS#1 sequence must never load as an RSA TPM key. RFC 3279 requires
+    // rsaEncryption parameters to be NULL (absent-or-NULL is what the
+    // RustCrypto decoders accept).
+    const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    if spki.algorithm.oid != RSA_ENCRYPTION {
+        return Err(Error::Policy(
+            "PCR public key is not an RSA key (unexpected algorithm OID)".into(),
+        ));
+    }
+    if let Some(params) = &spki.algorithm.parameters {
+        if !params.is_null() {
+            return Err(Error::Policy(
+                "PCR public key has non-NULL rsaEncryption parameters".into(),
+            ));
+        }
+    }
     let key = RsaPublicKey::from_der(spki.subject_public_key.raw_bytes())
         .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
     let e = key.e.as_bytes();
@@ -1581,9 +1600,16 @@ awIDAQAB\n\
         let (modulus, exponent) = rsa_spki_parts(RSA_PUB_FIXTURE).expect("fixture parses");
         assert_eq!(modulus.len(), 256, "2048-bit key has a 256-byte modulus");
         assert_eq!(exponent, 65537, "the conventional RSA exponent");
-        // The modulus is the big-endian integer; a DER re-encode must start
-        // with the standard RSA SEQUENCE marker for the key size.
-        assert_eq!(modulus[0] & 0x80, 0x80, "top bit set: full-width modulus");
+        // Pin the EXACT modulus: sha256 of its big-endian bytes (openssl
+        // "Modulus=" hex for this fixture). Length and top bit alone would
+        // let a regression in the central extraction logic pass unnoticed.
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&modulus);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "bada6228f1aa0d2473962e0b416fb151261b2427bba568c6c48aa6be822e9c9c",
+            "modulus bytes changed"
+        );
     }
 
     #[test]
@@ -1591,6 +1617,18 @@ awIDAQAB\n\
         assert!(rsa_spki_parts("not a pem").is_err());
         assert!(
             rsa_spki_parts("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n").is_err()
+        );
+        // A structurally valid EC P-256 SPKI must be refused by the algorithm
+        // check even though the container decodes. (openssl-generated fixture.)
+        const EC_PUB_FIXTURE: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE7egDfPRHj1TgRtw9ppW19+K1I/7j
+UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
+-----END PUBLIC KEY-----
+";
+        let err = rsa_spki_parts(EC_PUB_FIXTURE).unwrap_err();
+        assert!(
+            err.to_string().contains("not an RSA key"),
+            "EC key must be refused by the algorithm check: {err}"
         );
     }
 

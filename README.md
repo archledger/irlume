@@ -49,7 +49,7 @@ document the current ones.</sub>
 | 🌑 **Works in the dark** | Infrared recognition, no ambient light needed |
 | 🔓 **Unlocks everything** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/LIMITATIONS.md)), `sudo`, polkit prompts |
 | 🗝️ **Opens your wallet** | A face match TPM-unseals your keyring secret |
-| 🧬 **No face images** | 512-D embeddings, never images; the primary store is AES-256-GCM under a TPM-sealed key |
+| 🧬 **No face images** | 512-D embeddings, never images; the primary store is AES-256-GCM under a TPM-sealed key on TPM hosts (root-only plaintext without one) |
 | 🙋 **Consent before camera** | `yes` for a face attempt; typing your password never starts a scan, and both work in the same prompt (the field accepts either, so you never wait for one path to time out) |
 | 🛡️ **Refuses photos and screens** | Two anti-spoofing models run by default: print attacks on RGB, screens/phones on IR (Howdy's own README warns a printed photo can defeat it) |
 | 🔁 **Survives real life** | Suspend/resume verified on hardware; a failed scan or a crashed component falls back to your password, never a lockout |

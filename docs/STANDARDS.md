@@ -122,7 +122,9 @@ and its live audit are in [SECURITY_AT_REST.md](SECURITY_AT_REST.md) (tested
 2026-07-02 on two TPM machines):
 
 - **Confidentiality.** The primary template store is AES-256-GCM encrypted
-  under a random key sealed by the TPM (PCR-bound, three-tier policy), files
+  under a random key sealed by the TPM (PCR-bound, three-tier policy) on TPM
+  hosts (without a TPM it is root-only plaintext, per the degraded-host
+  policy), files
   are `0600 root:root`, and the daemon releases profile data only to the
   owning user or root (`SO_PEERCRED`). The audit's disk-theft test found only
   ciphertext: no plaintext floats, no field names, no image data. Known gap:

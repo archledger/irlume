@@ -93,8 +93,10 @@ authorization-bearing records are validated as part of the protected state.
 > **Deviation note (2026-09-18, still open):** the shipped implementation
 > satisfies the integrity, ownership, parsing, and failure clauses above, but
 > NOT the confidentiality clause: `save_secondary` persists plain
-> `serde_json` bytes under `cameras/<user>.json` (0640 root:root inside the
-> 0700 state dir) with no sealing layer, and the commit journal carries the
+> `serde_json` bytes under `cameras/<user>.json` (mode is umask-dependent:
+> 0640 under the shipped unit's `UMask=0027`, typically 0644 under a plain
+> root shell; the 0700 state dir still blocks ordinary users) with no
+> sealing layer, and the commit journal carries the
 > same bytes. Primary-store embeddings remain AES-256-GCM under the
 > TPM-sealed key. Closing this gap (encrypting the secondary store under the
 > account template key) or formally accepting the deviation is a pending

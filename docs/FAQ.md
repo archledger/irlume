@@ -11,8 +11,9 @@ Yes, that's the bar. irlume brings Windows Hello-style face login to Linux:
 face-unlock the login screen, lock screen, `sudo`, and your keyring/wallet,
 using the same IR (Windows Hello) camera your laptop already has. And it aims
 past Hello where Hello is weak: real anti-spoof liveness, encrypted
-TPM-sealed templates (primary store; secondary multi-camera stores are
-root-only plaintext today), and a fully open stack.
+TPM-sealed templates (primary store, on TPM hosts; without a TPM the store
+is root-only plaintext, as are secondary multi-camera stores today), and a
+fully open stack.
 </details>
 
 <details>
@@ -32,7 +33,8 @@ presentation-attack-detection models (RGB and IR cues) run on every capture
 and refuse print, phone, and screen species by default, with the
 [ISO/IEC 30107-3 self-test published](PAD_SELFTEST.md) so the claim is
 reproducible, not adjectival. Beyond that: an IR liveness gate,
-AES-256-GCM-encrypted templates under a TPM-sealed key (primary store),
+AES-256-GCM-encrypted templates under a TPM-sealed key (primary store, on
+TPM hosts),
 camera pinning, and
 TPM keyring unlock at login, with tiers, so RGB-only face match is
 deliberately limited to screen unlock. That gate has a documented hole of its

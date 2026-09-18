@@ -18,7 +18,8 @@ formal certification stays optional.
 - **PAD mandatory**; target **IAPAR < 0.07** (ISO/IEC 30107-3 Clause 13).
 - **Biometric is one MFA factor only**, with a mandatory non-biometric fallback.
 - No network calls in the auth loop; templates/secrets local, root-owned 0600
-  (secondary multi-camera stores: 0640 root:root inside the 0700 state dir).
+  (secondary multi-camera stores: umask-dependent mode, 0640 under the
+  shipped unit's UMask=0027, inside the 0700 state dir).
 
 ## Acceptance-rule evidence limits
 

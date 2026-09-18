@@ -6,9 +6,10 @@ abstract: >-
   infrared and RGB camera for a Windows Hello-style credential: it seals the
   login secret in the TPM under a measured-boot policy and releases it only on
   a live infrared face match. Templates are stored as 512-D embeddings, never
-  images; the primary enrollment store is encrypted at rest (AES-256-GCM
-  under a TPM-sealed key; secondary multi-camera stores are root-only
-  plaintext today). Anti-spoofing ships two learned PAD models on by default
+  images; the primary enrollment store is encrypted at rest on TPM hosts
+  (AES-256-GCM under a TPM-sealed key; without a TPM it is root-only
+  plaintext, as are secondary multi-camera stores today). Anti-spoofing
+  ships two learned PAD models on by default
   (ViT on RGB, FLIR IR on the infrared path) alongside algorithmic infrared
   gates (reflectance and centre/edge relief ratio, with corneal glint
   recorded as a supporting cue).

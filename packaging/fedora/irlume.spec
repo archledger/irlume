@@ -4,7 +4,7 @@
 Name:           irlume
 Version:        0.13.0
 Release:        1%{?dist}
-Summary:        Windows Hello-style face login for Linux
+Summary:        Face authentication for Linux
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/archledger/irlume

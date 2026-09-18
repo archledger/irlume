@@ -53,7 +53,7 @@ cat > "$BUILD/PKGBUILD" <<PKGB
 pkgname=irlume
 pkgver=${PKGVER}
 pkgrel=1
-pkgdesc="Windows Hello-style face login for Linux"
+pkgdesc="Face authentication for Linux: IR cameras, consent-gated, photo-spoofing resistant, TPM-sealed, password always works"
 arch=('x86_64')
 url="https://github.com/archledger/irlume"
 license=('GPL-3.0-or-later')

@@ -38,14 +38,12 @@ allow = ["CDLA-Permissive-2.0"]
 
 [advisories]
 version = 2
-ignore = [
-    # RUSTSEC-2023-0071 ("Marvin" RSA timing side-channel): no fixed release
-    # exists upstream. irlume uses the rsa crate only to parse the systemd
-    # PCR-signing PUBLIC key and verify signatures (crates/irlume-core/src/
-    # pcrsig.rs); no private-key operations run, so the side channel has no
-    # secret to leak here. Re-check when rsa publishes a fixed version.
-    "RUSTSEC-2023-0071",
-]
+# Empty on purpose: the rsa crate (RUSTSEC-2023-0071) was replaced by the
+# der/spki parsers in crates/irlume-core/src/tpm.rs, so the advisory no
+# longer applies. Any future entry here must carry its rationale in a
+# comment: scripts/generate-vex.py maps that comment to an OpenVEX
+# justification and refuses unmapped wording.
+ignore = []
 
 [bans]
 # Duplicate crate versions cost compile time and binary size but are not errors.

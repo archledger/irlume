@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! camera-tune measurement records (ADR-0023): evidence-grade observations,
 //! distinct from any executable capture preference.
 //!

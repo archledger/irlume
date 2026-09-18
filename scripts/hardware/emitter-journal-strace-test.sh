@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Prove, from syscalls, that the undo record is DURABLE before the camera is
 # written to.
 #

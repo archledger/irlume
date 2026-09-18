@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Build the Ubuntu PPA *source* package (Launchpad builds the binaries).
 #
 # Launchpad builders have NO network, so the orig tarball must be

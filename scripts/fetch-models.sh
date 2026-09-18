@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Fetch irlume's ONNX model weights from the `models-v1` GitHub release and
 # verify them by sha256. This replaces `git lfs pull`: the weights are static
 # (they do not change between releases) and are hosted as release assets, which

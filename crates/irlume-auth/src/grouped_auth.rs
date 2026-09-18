@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Bounded sequential evidence evaluation. Unfinished identity inputs remain
 //! private and only the final admissible sample can reach identity inference.
 

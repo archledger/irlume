@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Install the irlume daemon + CLI on this host from a built repo checkout.
 # Cross-distro (Fedora/Arch/Debian-family): binaries + systemd unit only; PAM
 # wiring is a separate, distro-specific step. Run as root from the repo root:

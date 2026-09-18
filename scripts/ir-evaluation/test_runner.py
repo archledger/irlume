@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Real ledger and trace supervision; host/camera boundaries are substituted."""
 
 import contextlib

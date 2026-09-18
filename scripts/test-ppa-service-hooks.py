@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Generate real PPA maintainer hooks and execute them without host service access.
 
 Requires Debian's debhelper and init-system-helpers. Generation uses the recipe's

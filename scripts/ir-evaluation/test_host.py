@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Configuration and persistence failures must fail before camera access."""
 
 import copy

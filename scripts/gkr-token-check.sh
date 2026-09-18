@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Prove the GNOME keyring token handoff (#250) against a REAL
 # gnome-keyring-daemon, without touching the caller's own login keyring.
 #

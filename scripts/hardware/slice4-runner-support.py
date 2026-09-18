@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Process-isolated locking and durability primitives for the slice-4 runner."""
 
 import fcntl

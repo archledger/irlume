@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Reproduce TPM2_RC_PCR_CHANGED in a software TPM and prove the retry rescues
 # it.
 #

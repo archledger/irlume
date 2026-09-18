@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Does an IRLUME_IR_EMITTER override reach the camera on EVERY stream, or only
 # the first one after a daemon start? (#168)
 #

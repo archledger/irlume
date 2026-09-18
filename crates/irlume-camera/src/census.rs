@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! The camera census (#575): every video-adjacent device on the machine,
 //! classified once, each classification printing the evidence it keyed on.
 //!

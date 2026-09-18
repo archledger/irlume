@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Secret Service (login keyring) diagnostics for `irlume doctor`.
 //!
 //! Bitwarden's biometric unlock, and any app that stores secrets, needs a

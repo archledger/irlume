@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Shared profile IR guidance for the CLI and Faces view.
 use irlume_common::ProfileSummary;
 

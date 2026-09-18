@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Official-runtime BlazeFace bench over the stage-3 corpus (#294 review).
 
 Runs Google's own mediapipe Tasks FaceDetector, so no hand-rolled decode can

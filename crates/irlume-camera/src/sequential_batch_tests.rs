@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 use super::*;
 use crate::sequential_batch::{
     capture_batch_with, capture_rgb_batch_controlled_with, capture_rgb_batch_with,

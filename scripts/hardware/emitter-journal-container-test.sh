@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Exercise the IR emitter's undo record against a throwaway state directory.
 #
 #   podman run --rm -v "$PWD/scripts:/s:z" \

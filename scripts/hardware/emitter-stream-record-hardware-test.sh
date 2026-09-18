@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # The per-stream leftover record (#188), against a real camera.
 #
 #   sudo bash scripts/emitter-stream-record-hardware-test.sh <worktree> <ir-node> [rgb-node]

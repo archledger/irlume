@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Build irlume's bundled TFLite C runtime (libtensorflowlite_c.so) from a
 # pinned TensorFlow tag, for the #295 packaging lane.
 #

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Offline behavior tests for the passive upgrade service-state checker."""
 import copy
 import contextlib

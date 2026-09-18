@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Loader for shipped per-camera-model profiles (ADR-0023): read-only data
 //! under `cameras.d/`, strictly parsed, evidence-only in schema v1.
 //!

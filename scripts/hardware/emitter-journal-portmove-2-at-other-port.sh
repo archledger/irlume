@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Stage 2: the camera is now at a DIFFERENT device path. Its descriptors and its
 # (absent) serial are unchanged, so this is byte-for-byte what a second unit of
 # the same model looks like to irlume.

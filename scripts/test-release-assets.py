@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Release gate regressions using actual signatures and disposable packages."""
 import base64
 import hashlib

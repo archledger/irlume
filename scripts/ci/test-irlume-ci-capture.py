@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Pure validation fixtures; no root commands or camera operations."""
 import importlib.util
 import os

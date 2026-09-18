@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Linux host checks and an exclusive, durable attempt ledger.
 
 Private host paths and service state stay in memory, never in result records.

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # irlume one-step installer.
 #
 #   curl -fsSL https://raw.githubusercontent.com/archledger/irlume/main/scripts/install.sh | sh

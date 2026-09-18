@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # capture-seg.sh <repo> <out_root> <segment> [rgb_dev] [ir_dev]
 # One stage-3 corpus segment: 8s positioning lead-in, 8 RGB frames, a
 # 24-frame IR strobe burst. The daemon must already be stopped (the tools

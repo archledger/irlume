@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Two IR cameras on one machine: does either one's setup destroy the other's
 # undo data?
 #

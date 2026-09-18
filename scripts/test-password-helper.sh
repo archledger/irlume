@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Exercise actual libpam using only private synthetic fixtures, never host PAM.
 set -euo pipefail
 cd "$(dirname "$0")/.."

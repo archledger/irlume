@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! While the daemon runs, it is the authority on cameras; nobody else opens a
 //! video node to find out what it is.
 //!

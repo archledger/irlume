@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Deploy irlume keyring-unlock + face login/lock: install the rebuilt
 # daemon/PAM/CLI, load the SELinux policy that lets the greeter reach the
 # daemon socket, then wire face auth into the plasmalogin login greeter AND the

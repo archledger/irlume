@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Offline desktop payload checks; never launch irlume or a terminal."""
 import configparser
 from pathlib import Path

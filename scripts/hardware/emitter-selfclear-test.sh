@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Does a face-auth control set once before streaming STAY set for a whole
 # capture window? (#168)
 #

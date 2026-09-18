@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Run scripts/build-tflite-runtime.sh inside ubuntu:22.04, the oldest system
 # the universal .deb advertises (glibc 2.35, GCC-12-era libstdc++). The
 # artifact's symbol-version floor is set by the BUILD environment, and the

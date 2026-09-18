@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! IR capture diagnostics, with whole-image evidence kept distinct from face quality.
 //!
 //! `capture_with_stats` used to answer every dark burst with one hint: "no

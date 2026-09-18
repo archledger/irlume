@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Independently verified retry recovery; face policy is unchanged.
 use super::*;
 

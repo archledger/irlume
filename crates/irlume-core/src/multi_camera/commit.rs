@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Cross-store commit and grant-boundary validation (ADR-0024 Phase 1,
 //! §4.1/§4.2): the explicit protocol that makes two durable file writes one
 //! transaction, and the serialized final check every secondary grant must

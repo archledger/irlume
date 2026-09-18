@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """One attended, non-granting IR experiment. See README.md before root execution."""
 
 import argparse

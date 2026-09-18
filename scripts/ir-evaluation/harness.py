@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Attended diagnostic runner; persist categories/timings and video-open metadata only."""
 
 import os

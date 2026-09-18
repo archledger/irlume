@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 use super::*;
 use crate::grouped_auth::PreparedGroup;
 use std::cell::Cell;

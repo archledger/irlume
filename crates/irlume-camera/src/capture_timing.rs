@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Numeric and categorical developer measurements. No camera data or error payloads.
 
 /// Payload-free failure observed while establishing an IR startup rate window.

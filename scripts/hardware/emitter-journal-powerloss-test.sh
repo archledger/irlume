@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Does the undo record survive a real power loss?
 #
 # `echo b > /proc/sysrq-trigger` reboots the kernel IMMEDIATELY: no sync, no

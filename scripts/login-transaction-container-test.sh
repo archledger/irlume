@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Exercise login apply / verify / rollback against a throwaway PAM tree.
 #
 #   podman run --rm -v "$PWD/scripts:/s:z" \

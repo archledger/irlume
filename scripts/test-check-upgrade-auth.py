@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Pure and refusal regressions: never run PAM, accounts, or guest checks."""
 import contextlib
 import importlib.util

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! ADR-0024 Phase 2 engine wiring: a secondary-camera attempt pins its
 //! group, matches against exactly that group's scoped view, and re-valid
 //!ates BOTH stores at the grant-decision boundary. No camera is opened:

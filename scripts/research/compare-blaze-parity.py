@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """The full-range BlazeFace parity GATE (#295 stage 2): fail-closed.
 
 Compares irlume's decoder output (examples/blaze_full_parity.rs) against the

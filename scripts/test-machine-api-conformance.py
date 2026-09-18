@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Contract regressions that do not require a camera or running daemon."""
 import copy
 import importlib.util

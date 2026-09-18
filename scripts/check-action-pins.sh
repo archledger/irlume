@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Enforce SHA-pinning of every GitHub Action `uses:` reference, with ONE
 # documented, scoped exception: the SLSA provenance generator.
 #

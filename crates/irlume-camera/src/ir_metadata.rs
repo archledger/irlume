@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! The camera's own answer to "was the illuminator on for this frame?".
 //!
 //! irlume used to decide which IR frames were lit by averaging pixels and

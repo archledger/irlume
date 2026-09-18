@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 use crate::Progress;
 use irlume_common::{Error, Result};
 use std::sync::Arc;

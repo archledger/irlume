@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Physical acceptance gate for #492.
 #
 #   sudo bash scripts/hardware/ir-setup-evidence-hardware-test.sh \

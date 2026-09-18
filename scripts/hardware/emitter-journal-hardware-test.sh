@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Hardware validation for the IR emitter undo record (#181, PR #183).
 #
 #   sudo bash hw-validate-emitter-journal.sh <worktree> <ir-node> [rgb-node]

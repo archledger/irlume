@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Wait until a daemon with an early-bound socket can serve camera-bearing work.
 #
 # Usage after sourcing:

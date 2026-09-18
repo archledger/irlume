@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 use std::time::{Duration, Instant};
 
 /// One presence window, retained through the daemon's response admission.

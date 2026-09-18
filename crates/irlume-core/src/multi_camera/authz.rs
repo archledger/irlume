@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Enrollment authorization primitives (ADR-0024 Phase 1, §4): the
 //! credential-management token that alone may expand (or shrink) an
 //! account's camera-group set.

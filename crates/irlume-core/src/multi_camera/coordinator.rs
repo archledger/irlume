@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Secondary-authentication coordinator (ADR-0024 Phase 1): the object the
 //! daemon holds for one authentication attempt on a secondary camera
 //! group, tying the four foundations together - store loading with

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Run one command against fresh software TPM state. Never fall back to hardware.
 set -euo pipefail
 if [ "$#" -eq 0 ]; then

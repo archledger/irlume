@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Camera-scoped enrollment views (ADR-0024 Phase 1, §3): validated
 //! per-(profile, camera group) candidate sets and derived state, so no
 //! scoring or calibration consumer ever handles unfiltered enrollment data.

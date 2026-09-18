@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Actual helper + libpam tests. Explicit root-only synthetic fixture suite:
 //! cargo test -p irlume-password-verify --test pam --no-run
 //! sudo -n <test-binary> --ignored --nocapture

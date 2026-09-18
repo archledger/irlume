@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Supervisor-owned normalized camera inventory.
 #![cfg_attr(
     not(test),

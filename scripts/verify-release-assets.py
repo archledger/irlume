@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Verify a complete downloaded release; optionally emit SLSA subjects.
 
 Requires GnuPG, dpkg-deb, tar/zstd, and rpm if an RPM is present. Packages are

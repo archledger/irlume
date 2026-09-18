@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Strict 0.11.3 -> 0.12.0 -> 0.11.3 -> 0.12.0 disposable QEMU test.
 
 Run inside a fresh root-owned guest only. Prepare dependencies/package inputs

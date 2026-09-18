@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 thread_local! { static TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(100) }; }

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 """Execute package hooks with isolated command shims; never change host services.
 
 Requires dpkg and vercmp so migration decisions use the native comparators.

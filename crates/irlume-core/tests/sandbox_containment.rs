@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Every state path must honor the `IRLUME_STATE_DIR` sandbox override.
 //!
 //! The behavioral tests in `template_key.rs` and `keyring.rs` pin the three

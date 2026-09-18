@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! Multi-camera secondary store (ADR-0024 Phase 1): the separate, versioned
 //! home for secondary camera groups, never read by pre-multi-camera
 //! binaries.

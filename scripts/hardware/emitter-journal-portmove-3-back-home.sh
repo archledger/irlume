@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
 # Stage 3: the camera is back at the address its record was written at.
 #
 # The refusal in stage 2 is only defensible if the promise attached to it is

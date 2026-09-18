@@ -48,9 +48,22 @@ public:
 
     /// Launch `irlume tui` (optionally deep-linked to a page) via
     /// xdg-terminal-exec. Returns false when that launcher is unavailable
-    /// (the caller then falls back to the desktop entry, without a deep
-    /// link).
+    /// (the caller then falls back to the shipped desktop entry, without a
+    /// deep link).
     bool launchTuiDetached(const QString &page);
+
+    /// Whether a TUI for this user's target account appears to be running:
+    /// the single-instance guard's lock file exists and its kernel lock is
+    /// held by someone. A UX probe only (the guard stays authoritative in
+    /// the TUI; a stale guess worst case opens a terminal that hands off).
+    bool tuiProbablyRunning();
+
+    /// Start a detached `irlume tui --page <page>` WITHOUT a terminal.
+    /// When a TUI is already running this performs the handoff silently
+    /// (the child navigates it and exits instantly, so no window flashes);
+    /// when none is running the child exits with the TTY error and nothing
+    /// happens. Returns true when the process was started.
+    bool handoffTuiDetached(const QString &page);
 
 Q_SIGNALS:
     /// `doc` is the parsed machine-API envelope, including ok/data/error.

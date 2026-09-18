@@ -11,7 +11,7 @@ import QtQuick.Controls as Controls
 import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCMUtils
 
-KCMUtils.ScrollViewKCM {
+KCMUtils.SimpleKCM {
     id: root
 
     property var doc: ({})
@@ -46,6 +46,10 @@ KCMUtils.ScrollViewKCM {
     }
 
     ColumnLayout {
+        // Same centered column as the Overview page.
+        width: Math.min(parent.width - 2 * Kirigami.Units.largeSpacing,
+                        Kirigami.Units.gridUnit * 46)
+        x: Math.round((parent.width - width) / 2)
         spacing: Kirigami.Units.largeSpacing
 
         Kirigami.InlineMessage {
@@ -98,7 +102,6 @@ KCMUtils.ScrollViewKCM {
                     spacing: Kirigami.Units.largeSpacing
                     Controls.Label {
                         text: modelData.id
-                        font.family: "monospace"
                         font.weight: Font.DemiBold
                     }
                     Controls.Label {

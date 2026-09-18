@@ -9,7 +9,7 @@ import QtQuick.Controls as Controls
 import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCMUtils
 
-KCMUtils.ScrollViewKCM {
+KCMUtils.SimpleKCM {
     id: root
 
     property var versionDoc: ({})
@@ -48,6 +48,11 @@ KCMUtils.ScrollViewKCM {
     }
 
     ColumnLayout {
+        // The Colors & Themes pattern: a comfortable, centered content
+        // column that fills small windows and caps on wide ones.
+        width: Math.min(parent.width - 2 * Kirigami.Units.largeSpacing,
+                        Kirigami.Units.gridUnit * 46)
+        x: Math.round((parent.width - width) / 2)
         spacing: Kirigami.Units.largeSpacing
 
         Kirigami.InlineMessage {
@@ -85,68 +90,70 @@ KCMUtils.ScrollViewKCM {
             }
         }
 
-        Repeater {
-            model: {
-                const doc = root.statusDoc;
-                if (!doc || !doc.ok) {
-                    return [];
-                }
-                const d = doc.data;
-                const rows = [];
-                function add(label, value, good) {
-                    rows.push({label: label, value: value, good: good});
-                }
-                add("Daemon", d.daemon, d.daemon === "running");
-                add("Enrollment",
-                    d.enrollment.known === false
-                        ? "unknown"
-                        : (d.enrollment.profiles > 0
-                            ? (d.enrollment.profiles + " profile(s), " + d.enrollment.scans + " scan(s)")
-                            : "none yet"),
-                    d.enrollment.known === true && d.enrollment.profiles > 0);
-                add("Keyring unlock",
-                    d.keyring.armed === true ? "armed"
-                      : d.keyring.armed === false ? "not armed"
-                      : "unknown",
-                    d.keyring.armed === true);
-                add("Templates at rest",
-                    d.templates === "encrypted" ? "encrypted"
-                      : d.templates === "plaintext" ? "not encrypted yet"
-                      : String(d.templates),
-                    d.templates === "encrypted");
-                add("Recovery passphrase",
-                    d.recovery.passphrase_set === true ? "set"
-                      : d.recovery.passphrase_set === false ? "not set"
-                      : "unknown",
-                    d.recovery.passphrase_set === true);
-                add("Face sensors",
-                    d.face_disabled ? "face disabled"
-                      : (d.camera.known
-                          ? (d.camera.rgb && d.camera.ir ? "RGB + IR (secure tier)"
-                             : d.camera.ir ? "IR"
-                             : d.camera.rgb ? "RGB only"
-                             : "none classified")
-                          : "unknown"),
-                    !d.face_disabled);
-                return rows;
-            }
+        Kirigami.AbstractCard {
+            Layout.fillWidth: true
+            visible: root.statusDoc.ok === true
+            contentItem: Kirigami.FormLayout {
+                id: statusForm
+                twinFormLabelText: ""
 
-            delegate: Kirigami.AbstractCard {
-                Layout.fillWidth: true
-                contentItem: RowLayout {
-                    spacing: Kirigami.Units.largeSpacing
-                    Controls.Label {
-                        text: modelData.good ? "●" : "○"
-                        color: modelData.good ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.neutralTextColor
+                Repeater {
+                    model: {
+                        const doc = root.statusDoc;
+                        if (!doc || !doc.ok) {
+                            return [];
+                        }
+                        const d = doc.data;
+                        const rows = [];
+                        function add(label, value, good) {
+                            rows.push({label: label, value: value, good: good});
+                        }
+                        add("Daemon", d.daemon, d.daemon === "running");
+                        add("Enrollment",
+                            d.enrollment.known === false
+                                ? "unknown"
+                                : (d.enrollment.profiles > 0
+                                    ? (d.enrollment.profiles + " profile(s), " + d.enrollment.scans + " scan(s)")
+                                    : "none yet"),
+                            d.enrollment.known === true && d.enrollment.profiles > 0);
+                        add("Keyring unlock",
+                            d.keyring.armed === true ? "armed"
+                              : d.keyring.armed === false ? "not armed"
+                              : "unknown",
+                            d.keyring.armed === true);
+                        add("Templates at rest",
+                            d.templates === "encrypted" ? "encrypted"
+                              : d.templates === "plaintext" ? "not encrypted yet"
+                              : String(d.templates),
+                            d.templates === "encrypted");
+                        add("Recovery passphrase",
+                            d.recovery.passphrase_set === true ? "set"
+                              : d.recovery.passphrase_set === false ? "not set"
+                              : "unknown",
+                            d.recovery.passphrase_set === true);
+                        add("Face sensors",
+                            d.face_disabled ? "face disabled"
+                              : (d.camera.known
+                                  ? (d.camera.rgb && d.camera.ir ? "RGB + IR (secure tier)"
+                                     : d.camera.ir ? "IR"
+                                     : d.camera.rgb ? "RGB only"
+                                     : "none classified")
+                                  : "unknown"),
+                            !d.face_disabled);
+                        return rows;
                     }
-                    Controls.Label {
-                        text: modelData.label
-                        Layout.fillWidth: true
-                        font.weight: Font.DemiBold
-                    }
-                    Controls.Label {
-                        text: modelData.value
-                        color: Kirigami.Theme.secondaryTextColor
+                    delegate: RowLayout {
+                        Kirigami.FormData.label: modelData.label + ":"
+                        spacing: Kirigami.Units.smallSpacing
+                        Controls.Label {
+                            text: modelData.good ? "●" : "○"
+                            color: modelData.good ? Kirigami.Theme.positiveTextColor
+                                                  : Kirigami.Theme.neutralTextColor
+                        }
+                        Controls.Label {
+                            text: modelData.value
+                            color: Kirigami.Theme.secondaryTextColor
+                        }
                     }
                 }
             }

@@ -33,6 +33,12 @@ void IrlumeKcm::request(const QString &name)
 
 void IrlumeKcm::launchTui(const QString &page)
 {
+    // When a TUI is already running, hand the page over WITHOUT opening a
+    // terminal: the detached child performs the handoff and exits
+    // instantly, so no window flashes open and closed.
+    if (m_bridge.tuiProbablyRunning() && m_bridge.handoffTuiDetached(page)) {
+        return;
+    }
     if (m_bridge.launchTuiDetached(page)) {
         return;
     }

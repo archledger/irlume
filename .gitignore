@@ -37,3 +37,4 @@ __pycache__/
 *.rs.bak
 .aider*
 kcm/build/
+kcm/build-release/

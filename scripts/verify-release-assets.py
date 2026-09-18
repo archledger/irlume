@@ -10,6 +10,7 @@ manual finalization. Python 3.11+; no third-party Python dependencies.
 import argparse
 import base64
 import hashlib
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -38,12 +39,14 @@ def package_format(name):
         return "deb"
     if name.startswith("irlume-") and name.endswith(".pkg.tar.zst"):
         return "arch"
+    if name.endswith(".cdx.json") or name.endswith("vex.json"):
+        return "metadata"
     if name.startswith("irlume-selinux-") and name.endswith(".rpm"):
         return "rpm"
     raise ValueError(f"unsupported package: {name}")
 
 
-def verify(directory, key, fingerprint, required):
+def verify(directory, key, fingerprint, required, require_metadata=True, allow_no_metadata=False):
     directory = directory.resolve(strict=True)
     manifest = directory / "SHA256SUMS"
     signature = directory / "SHA256SUMS.asc"
@@ -77,6 +80,11 @@ def verify(directory, key, fingerprint, required):
         packages[name] = digest
     if not set(required) <= formats:
         raise ValueError("required package formats missing: " + ", ".join(sorted(set(required) - formats)))
+    if require_metadata and "metadata" not in formats and not allow_no_metadata:
+        raise ValueError(
+            "no SBOM/VEX metadata assets in the manifest; every current release ships "
+            "them (use --allow-no-metadata only for historical releases)"
+        )
 
     for path in directory.iterdir():
         regular(path)
@@ -89,6 +97,22 @@ def verify(directory, key, fingerprint, required):
         path = str(directory / name)
         failure = f"package structure check failed: {name}"
         kind = package_format(name)
+        if kind == "metadata":
+            # SBOM/VEX assets: valid UTF-8 JSON with the expected toplevel
+            # shape. Deeper schema validation happens on the consumer side;
+            # here we guarantee the asset is parseable and self-describing.
+            try:
+                doc = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise ValueError(failure + f" (invalid JSON: {e})")
+            if not isinstance(doc, dict):
+                raise ValueError(failure + f" (top-level {type(doc).__name__}, expected object)")
+            if name.endswith(".cdx.json"):
+                if doc.get("bomFormat") != "CycloneDX":
+                    raise ValueError(failure + " (missing CycloneDX bomFormat)")
+            elif doc.get("@context") != "https://openvex.dev/ns":
+                raise ValueError(failure + " (missing OpenVEX @context)")
+            continue
         if kind == "deb":
             command(["dpkg-deb", "--info", path], failure)
             command(["dpkg-deb", "--contents", path], failure)
@@ -110,9 +134,14 @@ def main():
     parser.add_argument("--require", action="append", choices=["deb", "arch", "rpm"],
                         help="required format (repeatable); default: deb and arch; historical releases may use --require deb")
     parser.add_argument("--subjects", action="store_true", help="emit base64 SHA256 subjects after full verification")
+    parser.add_argument("--allow-no-metadata", action="store_true",
+                        help="permit a manifest without SBOM/VEX metadata assets "
+                             "(historical releases predating the metadata policy only)")
     args = parser.parse_args()
     try:
-        packages = verify(args.directory, args.key, args.fingerprint, args.require or ["deb", "arch"])
+        packages = verify(args.directory, args.key, args.fingerprint,
+                          args.require or ["deb", "arch"],
+                          allow_no_metadata=args.allow_no_metadata)
     except (ValueError, OSError, UnicodeError) as error:
         print(f"release verification failed: {error}", file=sys.stderr)
         return 1

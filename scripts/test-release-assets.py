@@ -70,12 +70,21 @@ printf fixture > %{buildroot}/usr/share/irlume-fixture/policy
         self.arch_name = "irlume-99.0.0-1-x86_64.pkg.tar.zst"
         (self.assets / self.deb_name).write_bytes(self.deb.read_bytes())
         (self.assets / self.arch_name).write_bytes(self.arch.read_bytes())
+        self.sbom_name = "irlume-99.0.0-sbom-daemon.cdx.json"
+        (self.assets / self.sbom_name).write_text(json.dumps({
+            "bomFormat": "CycloneDX", "specVersion": "1.3",
+            "components": [{"name": "fixture", "version": "99.0.0"}],
+        }) + "\n")
+        self.vex_name = "irlume-99.0.0-vex.json"
+        (self.assets / self.vex_name).write_text(json.dumps({
+            "@context": "https://openvex.dev/ns", "statements": [],
+        }) + "\n")
         self.sign()
 
     def sign(self, manifest=None):
         if manifest is None:
             manifest = "".join(hashlib.sha256(p.read_bytes()).hexdigest() + "  " + p.name + "\n"
-                               for p in sorted(self.assets.iterdir()) if p.suffix in {".deb", ".zst", ".rpm"})
+                               for p in sorted(self.assets.iterdir()) if p.suffix in {".deb", ".zst", ".rpm"} or p.name.endswith((".cdx.json", "vex.json")))
         (self.assets / "SHA256SUMS").write_text(manifest)
         subprocess.run(self.gpg + ["--yes", "--armor", "--detach-sign", str(self.assets / "SHA256SUMS")], check=True, capture_output=True)
 
@@ -92,14 +101,37 @@ printf fixture > %{buildroot}/usr/share/irlume-fixture/policy
     def test_complete_release_passes(self):
         got = self.verify()
         self.assertEqual(got.returncode, 0, got.stderr)
-        self.assertIn("2 packages", got.stdout)
+        self.assertIn("4 packages", got.stdout)
+
+    def test_metadata_missing_is_refused_for_current_releases(self):
+        (self.assets / self.sbom_name).unlink()
+        (self.assets / self.vex_name).unlink()
+        self.sign()
+        self.refuses("no SBOM/VEX metadata assets")
+        got = self.verify("--allow-no-metadata")
+        self.assertEqual(got.returncode, 0, got.stderr)
+
+    def test_metadata_non_object_json_is_refused(self):
+        (self.assets / self.vex_name).write_text("[1, 2, 3]\n")
+        self.sign()
+        self.refuses("top-level list, expected object")
+
+    def test_cdx_without_bomformat_is_refused(self):
+        (self.assets / self.sbom_name).write_text(json.dumps({"specVersion": "1.3"}) + "\n")
+        self.sign()
+        self.refuses("missing CycloneDX bomFormat")
+
+    def test_vex_without_openvex_context_is_refused(self):
+        (self.assets / self.vex_name).write_text(json.dumps({"statements": []}) + "\n")
+        self.sign()
+        self.refuses("missing OpenVEX @context")
 
     def test_subjects_cover_both_exact_package_digests(self):
         got = self.verify("--subjects")
         self.assertEqual(got.returncode, 0, got.stderr)
         rows = base64.b64decode(got.stdout.strip(), validate=True).decode().splitlines()
         expected = [hashlib.sha256((self.assets / n).read_bytes()).hexdigest() + "  " + n
-                    for n in sorted([self.deb_name, self.arch_name])]
+                    for n in sorted([self.deb_name, self.arch_name, self.sbom_name, self.vex_name])]
         self.assertEqual(rows, expected)
 
     def assert_subjects(self, names):
@@ -113,13 +145,13 @@ printf fixture > %{buildroot}/usr/share/irlume-fixture/policy
         name = "irlume-selinux-99.0.0-1.noarch.rpm"
         (self.assets / name).write_bytes(self.rpm.read_bytes())
         self.sign()
-        self.assert_subjects([self.deb_name, self.arch_name, name])
+        self.assert_subjects([self.deb_name, self.arch_name, self.sbom_name, self.vex_name, name])
 
     def test_multiple_packages_of_one_format_are_attested(self):
         name = "irlume_99.0.0_arm64.deb"
         (self.assets / name).write_bytes(self.deb.read_bytes())
         self.sign()
-        self.assert_subjects([self.deb_name, self.arch_name, name])
+        self.assert_subjects([self.deb_name, self.arch_name, self.sbom_name, self.vex_name, name])
 
     def test_corrupt_but_signed_rpm_fails_structure_check(self):
         (self.assets / "irlume-selinux-99.0.0-1.noarch.rpm").write_bytes(b"not an rpm")

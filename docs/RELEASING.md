@@ -65,6 +65,24 @@ camera/PAM qualification remains a separate test from package structure checks.
 
 ## Signed assets and publication
 
+### SBOM and VEX per release
+
+Every release ships machine-readable composition data alongside the packages:
+
+1. **SBOM set** (CycloneDX 1.3, JSON): from the release tag checkout run
+   `bash scripts/generate-release-sbom.sh <version> <asset-dir>` (requires
+   `cargo install cargo-cyclonedx --locked`). One SBOM per crate that builds
+   a shipped binary; files are named `irlume-<version>-sbom-<crate>.cdx.json`.
+2. **VEX document** (OpenVEX): `python3 scripts/generate-vex.py --version
+   <version>` emits `irlume-<version>-vex.json` with one `not_affected`
+   statement per advisory suppressed in `deny.toml`, carrying the documented
+   rationale; a clean ignore list yields an empty-statement record of the
+   clean scan.
+3. Add both to `SHA256SUMS`, re-sign, upload with the packages;
+   `scripts/verify-release-assets.py` validates coverage and JSON structure
+   (CycloneDX `bomFormat`, OpenVEX `@context`) like any other asset.
+
+
 Only after candidate approval, create the signed release tag and a **draft**
 release. Upload all Debian and Arch packages, any intended SELinux RPM,
 `SHA256SUMS`, and its detached `SHA256SUMS.asc` signature. Use plain package

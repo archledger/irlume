@@ -254,6 +254,11 @@ fn main() -> std::process::ExitCode {
         (Some("help" | "--help" | "-h"), _) => commands::help(),
         (Some("tui"), _) => match tui::run(&args) {
             Ok(()) => std::process::ExitCode::SUCCESS,
+            // Usage errors print their own text (with the page list) and
+            // use the CLI-wide exit code 2, not the generic TUI failure.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                std::process::ExitCode::from(2)
+            }
             Err(e) => {
                 eprintln!("tui: {e}");
                 std::process::ExitCode::FAILURE

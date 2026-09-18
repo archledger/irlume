@@ -23,7 +23,7 @@ Conventions that apply everywhere:
 
 | Command | What it does |
 |---|---|
-| `irlume tui` | guided setup + live dashboard; enroll and configure here |
+| `irlume tui` | guided setup + live dashboard; enroll and configure here. `--page P` starts on a named screen (`overview`, `diagnostics`, `cameras`, `faces`, `identify`, `wallet`, `recovery`, `fingerprint`, `login`, `settings`); `--new` skips the single-instance guard |
 | `irlume setup` | scripted onboarding: enroll, keyring, recovery, PAM wiring, each step prompted y/N |
 | `irlume status` | health dashboard: daemon, enrollment, keyring, cameras; `status --json` uses the read-only public [machine API](MACHINE-API.md) |
 | `irlume detect` | script-friendly probe; exit `0` = ready, `10` = partial, `20` = absent |

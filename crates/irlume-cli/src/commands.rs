@@ -1884,7 +1884,10 @@ irlume - local face authentication
 USAGE: irlume <command> [options]   (default user = $USER; override with --user U)
 
 SETUP & STATUS
-  tui                   guided setup + live dashboard (enroll & configure here)
+  tui [--page P] [--new]  guided setup + live dashboard (enroll & configure here);
+                        --page starts on a named screen (overview, diagnostics,
+                        cameras, faces, identify, wallet, recovery, fingerprint,
+                        login, settings); --new skips the single-instance guard
   setup                 scripted onboarding (enroll, keyring, recovery, wiring)
   status                health dashboard (daemon, enrollment, keyring, cameras)
   detect                script probe; exit 0=ready / 10=partial / 20=absent

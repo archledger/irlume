@@ -7,6 +7,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume tui --page <name>` starts the TUI on a named screen (`overview`,
+  `diagnostics`, `cameras`, `faces`, `identify`, `wallet`, `recovery`,
+  `fingerprint`, `login`, `settings`); the System Settings module this
+  repo's KCM design specifies uses it for deep links. Usage errors print
+  the page list and exit 2.
+- A single-instance guard for the TUI: launching `irlume tui` while
+  another is running switches the running instance to the requested screen
+  and exits instead of piling up terminals (kernel-held `flock` under
+  `$XDG_RUNTIME_DIR/irlume`, navigate-only same-uid handoff channel;
+  `--new` starts a parallel instance; the guard is off without a runtime
+  directory and never blocks startup).
 - Signed releases now carry per-binary CycloneDX SBOMs and an OpenVEX
   document: `scripts/generate-release-sbom.sh` and
   `scripts/generate-vex.py` produce them from the release tag,

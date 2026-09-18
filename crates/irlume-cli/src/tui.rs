@@ -13,6 +13,7 @@
 mod actions;
 mod activity;
 mod freshness;
+mod launch;
 use freshness::{Freshness, Source, Worker};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -638,6 +639,10 @@ struct App {
     identify_checked_at: Option<Instant>,
     screen: usize,
     sel: usize,
+    /// Bound by the single-instance guard; `None` when the guard is off.
+    /// Polled each event-loop tick for handoff navigation from a later
+    /// `irlume tui` launch.
+    handoff_listener: Option<std::os::unix::net::UnixListener>,
     profiles: Vec<ProfileSummary>,
     camera_groups: Vec<irlume_common::CameraGroupSummary>,
     camera_store_error: Option<String>,
@@ -1161,6 +1166,34 @@ impl LightState {
 
 pub fn run(args: &[String]) -> std::io::Result<()> {
     use std::io::IsTerminal;
+    // Argument errors come first so `irlume tui --page bogus` prints usage
+    // (and exits 2) even where the TUI could never draw. Drop the leading
+    // "tui" subcommand word the dispatcher passed along.
+    let tui_args: &[String] = if args.first().is_some_and(|a| a == "tui") {
+        args.get(1..).unwrap_or(&[])
+    } else {
+        args
+    };
+    let launch = launch::parse_launch(tui_args).map_err(|usage| {
+        eprintln!("{usage}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage")
+    })?;
+    // Single-instance guard BEFORE the TTY check: handing off to the
+    // running TUI needs no terminal of its own (a script or a launcher can
+    // navigate it), while a failed acquisition before the TTY error just
+    // releases the kernel-held lock with the process.
+    let guard = match launch::acquire_guard(launch.page, launch.new_instance) {
+        launch::GuardOutcome::Acquired(guard) => Some(guard),
+        launch::GuardOutcome::HandedOff(message) => {
+            println!("{message}");
+            return Ok(());
+        }
+        launch::GuardOutcome::ProceedWithoutLock(message) => {
+            eprintln!("irlume: {message}");
+            None
+        }
+        launch::GuardOutcome::Disabled => None,
+    };
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(std::io::Error::other(
             "irlume tui needs an interactive terminal (TTY). Run it directly in a terminal.",
@@ -1172,6 +1205,17 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         ratatui::crossterm::event::EnableMouseCapture
     );
     let mut app = App::new(crate::user_arg(args));
+    if let Some(page) = launch.page {
+        app.enter_screen(page);
+    }
+    if let Some(guard) = guard {
+        app.handoff_listener = Some(guard.listener().try_clone()?);
+        // The guard must outlive the terminal session: its flock IS the
+        // single-instance property, so it is intentionally never dropped
+        // (the kernel releases both the flock and the abstract socket when
+        // the process exits).
+        std::mem::forget(guard);
+    }
     app.log('·', format!("irlume: managing '{}' (live)", app.user));
     app.refresh();
     let res = app.main_loop(&mut terminal);
@@ -1769,6 +1813,7 @@ impl App {
             identify_checked_at: None,
             screen,
             sel: 0,
+            handoff_listener: None,
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,
@@ -3742,6 +3787,8 @@ impl App {
                 let size = terminal.size()?;
                 self.on_window_event(input, Rect::new(0, 0, size.width, size.height));
             }
+            // Serve any pending single-instance handoff (navigate-only).
+            self.drain_handoff();
             self.spin = (self.spin + 1) % SPIN.len();
             self.poll();
             self.refresh_due(self.now());
@@ -4713,6 +4760,66 @@ impl App {
         }
         if self.screen == SC_REPAIR || self.screen == SC_KEYRING {
             self.refresh_keyring_diagnostic();
+        }
+    }
+
+    /// Serves pending handoff connections from the single-instance guard's
+    /// listener. One message per connection, navigate-only vocabulary,
+    /// same-uid peers only.
+    fn drain_handoff(&mut self) {
+        let Some(listener) = self.handoff_listener.take() else {
+            return;
+        };
+        // Lazy so every install site (run, tests) needs no ordering
+        // agreement; repeated calls are cheap no-ops.
+        let _ = listener.set_nonblocking(true);
+        loop {
+            let Ok((stream, _)) = listener.accept() else {
+                break; // EWOULDBLOCK: nothing pending
+            };
+            self.serve_handoff(stream);
+        }
+        self.handoff_listener = Some(listener);
+    }
+
+    /// One accepted handoff connection: check the peer's credentials, read
+    /// one bounded message, navigate if it parses. Never errors: a bad or
+    /// unreadable peer is dropped, the TUI keeps running.
+    fn serve_handoff(&mut self, mut stream: std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        if !launch::stream_peer_is_self(&stream) {
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(150)));
+        let mut buf = [0u8; 128];
+        let mut len = 0usize;
+        loop {
+            match stream.read(&mut buf[len..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    len += n;
+                    if len == buf.len() || buf[..len].contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let Ok(message) = std::str::from_utf8(&buf[..len]) else {
+            return;
+        };
+        match launch::parse_handoff(message) {
+            Some(launch::Navigation::Goto(screen)) => {
+                self.enter_screen(screen);
+                self.log(
+                    '·',
+                    format!(
+                        "another irlume launch switched to {}",
+                        launch::page_name(screen).unwrap_or("?")
+                    ),
+                );
+            }
+            Some(launch::Navigation::Focus) | None => {}
         }
     }
 
@@ -9801,6 +9908,52 @@ mod tests {
     /// `sudo irlume tui`, which is the documented way to see root-only settings.
     /// That meant an empty dashboard for a configured user, and `[a]`/`[e]`
     /// sealing a password and enrolling a face under the wrong account. The rule
+    /// The single-instance guard's listener: a later `irlume tui --page X`
+    /// hands its page over this channel and the running TUI navigates.
+    /// Anything outside the navigate-only vocabulary (including an unknown
+    /// page name) must leave the screen untouched. The same-uid credential
+    /// check on accept is the channel's access control; its cross-uid
+    /// rejection cannot run in-process and is unit-pinned in
+    /// `launch::peer_credentials_must_match_the_current_user`.
+    #[test]
+    fn handoff_listener_navigates_and_ignores_non_navigation_messages() {
+        use std::io::Write;
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+        let mut app = test_app();
+        let name = format!("irlume-tui-test-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        app.handoff_listener = Some(listener);
+
+        let send = |payload: &str| {
+            let mut stream = UnixStream::connect_addr(&addr).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        };
+
+        send("goto:faces\n");
+        app.drain_handoff();
+        assert_eq!(app.screen, SC_PROFILES, "a handoff navigates");
+
+        send("goto:bogus\n");
+        send("enroll:faces\n");
+        app.drain_handoff();
+        assert_eq!(
+            app.screen, SC_PROFILES,
+            "non-navigation and unknown pages leave the screen alone"
+        );
+
+        send("goto:recovery\n");
+        app.drain_handoff();
+        assert_eq!(app.screen, SC_RECOVERY, "navigation works again after junk");
+
+        // No pending connection: draining is a no-op.
+        app.drain_handoff();
+        assert_eq!(app.screen, SC_RECOVERY);
+    }
+
     /// lives in `user_arg`; this pins the TUI to it.
     #[test]
     fn settings_has_no_gesture_controls_or_actions() {
@@ -10894,6 +11047,7 @@ mod tests {
             user: "testuser".into(),
             screen: SC_WELCOME,
             sel: 0,
+            handoff_listener: None,
             profiles: Vec::new(),
             camera_groups: Vec::new(),
             camera_store_error: None,

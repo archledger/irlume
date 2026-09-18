@@ -81,6 +81,19 @@ can use the camera or TPM and change configuration. F2 provides
 existing system/login history, diagnostics and explicit trace tools when more
 detail is needed; camera diagnostics explicitly discloses that it captures.
 
+**One TUI at a time.** Launching `irlume tui` while another is running does
+not open a second terminal: the new launch switches the running TUI to its
+requested screen (`irlume tui --page faces` -> the Faces screen) and exits,
+printing `irlume TUI is already running; switching it to faces`. The
+handoff channel is navigate-only (it can change the visible screen,
+nothing else) and accepts only your own user's processes. If the running
+instance cannot be reached, the new one starts anyway rather than refusing.
+`irlume tui --new` skips the guard and starts a parallel instance (for a
+second session or debugging). The guard needs `$XDG_RUNTIME_DIR`; without
+it (a bare SSH session, say) the guard is off and every launch opens its
+own TUI. A handoff navigates the running TUI but cannot raise or focus its
+terminal window; bring the window forward yourself.
+
 Status fields carry observation freshness. A failed or expired check becomes
 unavailable; it does not mean OFF, an empty profile list, or an idle daemon.
 Each source is checked separately, so a successful camera refresh cannot make

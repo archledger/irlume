@@ -44,6 +44,10 @@ pub struct TeardownReport {
     /// The paths that still hold data after a failed wipe, for the output to
     /// name; empty when the wipe succeeded or was never requested.
     pub data_left: Vec<String>,
+    /// What happened to the persisted TPM storage root key. Only attempted
+    /// after a fully completed wipe: sealed envelopes are children of that
+    /// key, so kept or leftover data must keep it (audit F4, 2026-09-17).
+    pub srk_eviction: SrkOutcome,
 }
 
 /// The first argument `uninstall` does not accept, if any.
@@ -188,6 +192,10 @@ pub fn run(args: &[String]) -> ExitCode {
         "[uninstall] users disarmed: {} ({data_status})",
         report.users_cleared
     );
+    println!(
+        "[uninstall] TPM storage root key: {}",
+        srk_outcome_line(&report.srk_eviction)
+    );
 
     // Now actually remove irlume: the package via its manager, or the
     // hand-placed files for a source install. Done last, because it deletes the
@@ -199,6 +207,12 @@ pub fn run(args: &[String]) -> ExitCode {
     // Clean the leftovers a package `remove` doesn't (drop-in, empty dirs, repo)
     // regardless of whether the package removal itself succeeded.
     clean_residuals(&origin);
+    // Name the one deliberate leave-behind the audit found (F6): the polkit
+    // action file `irlume bitwarden setup --apply` wrote serves Bitwarden, not
+    // irlume, so it survives the uninstall - but never as a surprise.
+    if let Some(notice) = bitwarden_polkit_notice() {
+        println!("[uninstall] {notice}");
+    }
     // Snapshot tooling keeps copies of everything the wipe just deleted: on the
     // #335 audit box, snapper's pacman hooks had snapshotted the templates, the
     // sealed keyring blob, and the recovery envelope. Detection is evidence-only
@@ -736,13 +750,31 @@ pub fn perform_teardown(keep_data: bool) -> TeardownReport {
     }
 
     let data_wipe_requested = !keep_data;
+    let data_wiped = data_wipe_requested && data_left.is_empty();
+    // The persisted SRK is evicted only once every envelope is provably gone
+    // (the wipe was requested and nothing failed): sealed envelopes are
+    // children of that key, so evicting under kept or leftover data would
+    // orphan secrets the wipe was supposed to be the last consumer of. Absent
+    // and Foreign are successes; a TPM error is non-fatal (the key is a
+    // benign orphan; audit F4, 2026-09-17).
+    let srk_eviction = if data_wiped {
+        match irlume_core::tpm::evict_persistent_srk() {
+            Ok(irlume_core::tpm::SrkEviction::Evicted) => SrkOutcome::Evicted,
+            Ok(irlume_core::tpm::SrkEviction::Absent) => SrkOutcome::Absent,
+            Ok(irlume_core::tpm::SrkEviction::Foreign) => SrkOutcome::Foreign,
+            Err(e) => SrkOutcome::Failed(e.to_string()),
+        }
+    } else {
+        SrkOutcome::Kept
+    };
     TeardownReport {
         pam_unwired,
         service_stopped,
         users_cleared,
         data_wipe_requested,
-        data_wiped: data_wipe_requested && data_left.is_empty(),
+        data_wiped,
         data_left,
+        srk_eviction,
     }
 }
 
@@ -887,6 +919,69 @@ fn stdin_is_tty() -> bool {
     }
 }
 
+/// What the teardown did - or deliberately did not - about irlume's persisted
+/// TPM storage root key (audit F4, 2026-09-17: the persistent SRK handle was
+/// live residue only irlume could name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SrkOutcome {
+    /// A full, completed wipe: our SRK was evicted from its persistent handle.
+    Evicted,
+    /// A full wipe, and no key occupied the handle (already clean).
+    Absent,
+    /// A full wipe, but the handle holds a key that is not ours; never touched.
+    Foreign,
+    /// No attempt: data was kept or the wipe did not complete, and sealed
+    /// data that still exists may be a child of that key.
+    Kept,
+    /// Attempted but the TPM could not be reached. Non-fatal: the teardown
+    /// still removed everything on disk; the key is a benign orphan.
+    Failed(String),
+}
+
+/// One honest line per [`SrkOutcome`]. `Kept` and `Failed` must never read as
+/// "cleaned": the exit code and the operator's next decision both hang on the
+/// difference.
+fn srk_outcome_line(outcome: &SrkOutcome) -> String {
+    match outcome {
+        SrkOutcome::Evicted => "evicted from its persistent handle".to_string(),
+        SrkOutcome::Absent => "not present (already clean)".to_string(),
+        SrkOutcome::Foreign => {
+            "left in place: the persistent handle holds a key that is not irlume's".to_string()
+        }
+        SrkOutcome::Kept => {
+            "kept: sealed data was kept or the wipe was incomplete, and it may still \
+             need the key"
+                .to_string()
+        }
+        SrkOutcome::Failed(e) => {
+            format!("could not check or evict ({e}); a benign orphan unless removed by hand")
+        }
+    }
+}
+
+/// The uninstaller's leave-behind notice for the Bitwarden polkit action
+/// (audit F6, 2026-09-17): `irlume bitwarden setup --apply` writes Bitwarden's
+/// own polkit policy file, and the uninstaller deliberately leaves it - it
+/// serves Bitwarden, not irlume. Named in the output when present so the
+/// residue is never a surprise.
+fn bitwarden_polkit_notice_at(path: &std::path::Path) -> Option<String> {
+    if path.exists() {
+        Some(format!(
+            "left in place (serves Bitwarden, not irlume): {}. Remove it by hand if \
+             Bitwarden is not used on this machine.",
+            path.display()
+        ))
+    } else {
+        None
+    }
+}
+
+fn bitwarden_polkit_notice() -> Option<String> {
+    bitwarden_polkit_notice_at(std::path::Path::new(
+        "/usr/share/polkit-1/actions/com.bitwarden.Bitwarden.policy",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -935,6 +1030,74 @@ mod tests {
     /// reason this exists: it used to be ignored, and with `--yes` beside it the
     /// run wiped every enrolled face, sealed secret and recovery envelope the
     /// flag was there to keep.
+    /// Every SRK outcome line must say what actually happened, and the two
+    /// non-cleaned outcomes (`Kept`, `Failed`) must never be mistakable for a
+    /// cleaned one (the PR #337 rule, applied to the TPM key: a state that
+    /// leaves residue may not borrow the success phrasing).
+    #[test]
+    fn srk_outcome_lines_are_distinct_and_honest() {
+        let evicted = super::srk_outcome_line(&super::SrkOutcome::Evicted);
+        let absent = super::srk_outcome_line(&super::SrkOutcome::Absent);
+        let foreign = super::srk_outcome_line(&super::SrkOutcome::Foreign);
+        let kept = super::srk_outcome_line(&super::SrkOutcome::Kept);
+        let failed =
+            super::srk_outcome_line(&super::SrkOutcome::Failed("no TPM device".to_string()));
+        for (name, line) in [
+            ("evicted", &evicted),
+            ("absent", &absent),
+            ("foreign", &foreign),
+            ("kept", &kept),
+            ("failed", &failed),
+        ] {
+            assert!(!line.is_empty(), "{name} line must exist");
+        }
+        let lines = [&evicted, &absent, &foreign, &kept, &failed];
+        for i in 0..lines.len() {
+            for j in (i + 1)..lines.len() {
+                assert_ne!(lines[i], lines[j], "outcome lines must be distinct");
+            }
+        }
+        assert!(evicted.contains("evicted"));
+        assert!(
+            kept.contains("kept") && !kept.contains("evicted"),
+            "Kept must read as kept, not cleaned"
+        );
+        assert!(
+            failed.contains("no TPM device") && !failed.contains("evicted from"),
+            "Failed must carry the error and not read as cleaned"
+        );
+        assert!(
+            foreign.contains("not irlume's"),
+            "Foreign must say the key is not ours"
+        );
+    }
+
+    /// The Bitwarden polkit notice names the exact file only when it exists,
+    /// so the leave-behind is a named fact, never a surprise (audit F6).
+    #[test]
+    fn bitwarden_notice_names_the_file_only_when_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-bw-notice-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let absent = dir.join("com.bitwarden.Bitwarden.policy");
+        assert!(super::bitwarden_polkit_notice_at(&absent).is_none());
+
+        std::fs::write(&absent, b"<policykit-policy/>").unwrap();
+        let notice = super::bitwarden_polkit_notice_at(&absent).unwrap();
+        assert!(
+            notice.contains(absent.to_str().unwrap()),
+            "must name the exact path"
+        );
+        assert!(
+            notice.contains("serves Bitwarden"),
+            "must say why it is left in place"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn uninstall_refuses_an_argument_it_does_not_know() {
         let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -1103,6 +1266,11 @@ mod tests {
             data_wipe_requested: requested,
             data_wiped: wiped,
             data_left: left.iter().map(|s| s.to_string()).collect(),
+            srk_eviction: if wiped {
+                SrkOutcome::Absent
+            } else {
+                SrkOutcome::Kept
+            },
         }
     }
 

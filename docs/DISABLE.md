@@ -253,6 +253,16 @@ sudo pacman -R irlume      # Arch / AUR
 sudo apt remove irlume     # Ubuntu / PPA
 ```
 
+Two things are left behind on purpose, and the uninstall output names them:
+the Bitwarden polkit action (`irlume bitwarden setup --apply` writes
+Bitwarden's own policy file, which serves Bitwarden, not irlume - remove it
+by hand if Bitwarden is not used), and, after a full wipe, nothing else -
+with `--keep-data`, the enrolled faces and sealed secrets stay, and so does
+the TPM storage root key they are sealed under (a full, completed wipe
+evicts it). Contributor camera profiles live in the program tree, so they
+are removed even with `--keep-data`; journald logs and filesystem snapshots
+also survive, as the closing line notes.
+
 ## Verify
 
 After any change here, confirm with `irlume login status` (nothing should

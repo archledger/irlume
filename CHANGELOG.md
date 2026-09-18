@@ -5,6 +5,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `irlume uninstall` now evicts irlume's persisted TPM storage root key
+  (owner-hierarchy handle `0x81010002`) after a fully completed data wipe,
+  closing the residue gap the 2026-09-17 uninstall audit found: the key was
+  live on every machine and only irlume could name it. The eviction is
+  strictly conditional - kept when data was kept or the wipe was incomplete
+  (sealed envelopes are children of that key), and a key that is not
+  irlume's at the handle is never touched. The uninstall output also names
+  the one deliberate leave-behind, the Bitwarden polkit action written by
+  `irlume bitwarden setup --apply`.
+
 ## [0.13.0] - 2026-09-17
 
 ### Added

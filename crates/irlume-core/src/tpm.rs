@@ -272,6 +272,62 @@ fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
     PersistentTpmHandle::new(raw).map_err(tpm_err)
 }
 
+/// Outcome of an uninstall-time attempt to evict the persisted SRK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrkEviction {
+    /// Nothing occupies our persistent handle (already clean).
+    Absent,
+    /// Our SRK was there and has been evicted.
+    Evicted,
+    /// The handle is occupied by a key that is not ours (another stack
+    /// squatting irlume's handle); left untouched.
+    Foreign,
+}
+
+/// Evict irlume's persisted SRK from its owner-hierarchy persistent handle.
+///
+/// The uninstall path calls this only after every sealed envelope on the host
+/// is provably gone, because envelopes are children of this key: evicting
+/// while any remain would orphan secrets nothing could unseal again. A key
+/// that is not ours at our handle is never evicted, and a missing handle is a
+/// success (the clean state), not an error.
+///
+/// # Errors
+///
+/// `Error::Tpm` when the TPM cannot be opened, its capabilities cannot be
+/// read, or the eviction command itself is refused; callers treat this as a
+/// non-fatal orphan (the key is harmless without irlume's data).
+pub fn evict_persistent_srk() -> Result<SrkEviction> {
+    let mut ctx = open_context()?;
+    let persistent = persistent_srk_handle()?;
+    let wanted = TpmHandle::Persistent(persistent);
+    if !tpm_handle_exists(&mut ctx, TPM2_HR_PERSISTENT, wanted)? {
+        return Ok(SrkEviction::Absent);
+    }
+    let object = ctx.tr_from_tpm_public(wanted).map_err(tpm_err)?;
+    let key_handle = KeyHandle::from(ESYS_TR::from(object));
+    let ours = match ctx.read_public(key_handle) {
+        Ok((public, _, _)) => is_irlume_srk(&public)?,
+        Err(_) => false,
+    };
+    if !ours {
+        // A persistent object is never flushed (the load path's rule); the
+        // ESYS reference goes away with the context.
+        return Ok(SrkEviction::Foreign);
+    }
+    ctx.execute_with_nullauth_session(|ctx| {
+        ctx.evict_control(
+            Provision::Owner,
+            key_handle.into(),
+            Persistent::Persistent(persistent),
+        )
+    })
+    .map_err(tpm_err)?;
+    // No flush: evict_control already destroyed the object, so an ESYS flush
+    // of the stale handle would log the exact ERROR noise #601 removed.
+    Ok(SrkEviction::Evicted)
+}
+
 /// True iff `public` is irlume's own SRK: RSA, our [`srk_template`] attributes,
 /// SHA-256 name hash, an empty authPolicy, and a 2048-bit key. A non-match means
 /// another stack's key is squatting our persistent handle (clevis /
@@ -1933,6 +1989,31 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let env = seal_with_pcrs(secret, &[7]).expect("seal");
         let got = unseal(&env).expect("unseal");
         assert_eq!(&*got, secret, "round-trip must match");
+    }
+
+    /// The uninstall path's TPM cleanup (audit F4, 2026-09-17): after a seal
+    /// persisted the SRK, eviction must remove exactly our key, and a second
+    /// call must report the already-clean state. The Foreign arm (another
+    /// stack's key squatting our handle) is the load path's discriminated
+    /// scenario and is not fabricated here; the discriminator itself
+    /// ([`is_irlume_srk`]) has its own tests.
+    #[test]
+    #[ignore = "requires a TPM: real /dev/tpmrm0 (root), or swtpm via IRLUME_TCTI (CI does this)"]
+    fn evict_persistent_srk_removes_ours_then_reports_absent() {
+        // Persist the SRK the way production does: first seal derives and
+        // evict-controls it to the persistent handle.
+        let env = seal_with_pcrs(b"srk-eviction-probe", &[7]).expect("seal to persist the SRK");
+        drop(unseal(&env).expect("unseal probe"));
+        assert_eq!(
+            evict_persistent_srk().expect("evict after persisting"),
+            SrkEviction::Evicted,
+            "our persisted SRK must be evicted"
+        );
+        assert_eq!(
+            evict_persistent_srk().expect("second evict"),
+            SrkEviction::Absent,
+            "a clean handle must report Absent, not an error"
+        );
     }
 
     #[test]

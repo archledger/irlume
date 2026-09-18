@@ -76,7 +76,7 @@ Conventions that apply everywhere:
 | `irlume camera diagnostics --json` | no | machine-readable delivered-rate evidence for the configured pair: exact requested/accepted/delivered rationals per role, sequence gaps and drops, timestamp clock/source, RGB/IR skew, and the MS-XU illumination stream state (node present/absent, frames classified/lit, ambient observed). An under-rate stream is a measured `fail` object, never prose. See [MACHINE-API.md](MACHINE-API.md) |
 | `irlume models list --json` | no | the one surviving models subcommand (ADR-0015): the machine model listing. All other models subcommands are removed and answer with a notice. Check installed weights with `irlume doctor` |
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); `--check` only reports |
-| `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, then print the package-removal command |
+| `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, evict the persisted TPM storage root key after a fully completed wipe (kept with `--keep-data` or an incomplete wipe; a non-irlume key at the handle is never touched), name the Bitwarden polkit leave-behind if present, then print the package-removal command |
 
 ## TUI access
 

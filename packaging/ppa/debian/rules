@@ -37,8 +37,11 @@ override_dh_clean:
 # flags: --no-start alone also suppresses the default restart-after-upgrade.
 # Keep the reconcile oneshot/path/timer's existing upgrade activation.
 override_dh_installsystemd:
-	dh_installsystemd --no-start --restart-after-upgrade irlumed.service irlumed.socket
-	dh_installsystemd irlume-reconcile.path irlume-reconcile.service irlume-reconcile.timer
+	# Scoped to -pirlume: with a second binary package (irlume-kcm) in the
+	# tree, unscoped dh_installsystemd errors because irlume-kcm does not
+	# install the units. Only irlume ships systemd units.
+	dh_installsystemd -pirlume --no-start --restart-after-upgrade irlumed.service irlumed.socket
+	dh_installsystemd -pirlume irlume-reconcile.path irlume-reconcile.service irlume-reconcile.timer
 
 override_dh_auto_install:
 	install -D -m0644 packaging/desktop/io.github.archledger.Irlume.desktop \

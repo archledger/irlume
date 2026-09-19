@@ -17,12 +17,15 @@ override_dh_auto_build:
 	# parse v4 AND can't compile our ort/edition-2024 deps anyway; those users
 	# get the universal .deb from the GitHub release, not the PPA.)
 	cargo build --release --frozen --offline
+	# Plasma System Settings module (binary package irlume-kcm).
+	cmake -S kcm -B debian/kcm-build
+	cmake --build debian/kcm-build
 
 override_dh_auto_test:
 	# Tests need camera/TPM hardware; not runnable on builders.
 
 override_dh_auto_clean:
-	rm -rf target debian/cargo_home
+	rm -rf target debian/cargo_home debian/kcm-build
 
 # dh_clean's default cruft sweep deletes *.orig / *~ recursively, which
 # nukes vendored files (vendor/*/Cargo.toml.orig) that cargo's checksum
@@ -116,6 +119,15 @@ override_dh_auto_install:
 		debian/irlume/usr/lib/tmpfiles.d/irlume.conf
 	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
 		debian/irlume/etc/apparmor.d/usr.bin.irlumed
+	# Plasma System Settings module -> the irlume-kcm binary package. The
+	# plugin installs under the multiarch qt6 plugin dir systemsettings
+	# scans; the QML is bundled inside the plugin (KF6 QRC), and the
+	# generated desktop file lands in share/applications.
+	install -d debian/irlume-kcm/usr/lib/$(DEB_HOST_MULTIARCH)/qt6/plugins/plasma/kcms/systemsettings
+	install -m0755 debian/kcm-build/bin/plasma/kcms/systemsettings/kcm_irlume.so \
+		debian/irlume-kcm/usr/lib/$(DEB_HOST_MULTIARCH)/qt6/plugins/plasma/kcms/systemsettings/kcm_irlume.so
+	install -D -m0644 debian/kcm-build/src/kcm_irlume.desktop \
+		debian/irlume-kcm/usr/share/applications/kcm_irlume.desktop
 
 # Resolve intra-bundle links between the onnxruntime libs without turning
 # them into package dependencies.

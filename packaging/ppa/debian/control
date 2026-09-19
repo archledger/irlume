@@ -12,7 +12,14 @@ Build-Depends: debhelper-compat (= 13),
                libtss2-dev,
                libudev-dev,
                libdbus-1-dev,
-               linux-libc-dev
+               linux-libc-dev,
+               cmake,
+               extra-cmake-modules,
+               qt6-base-dev,
+               qt6-declarative-dev,
+               libkf6kcmutils-dev,
+               libkf6coreaddons-dev,
+               libkf6kio-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/archledger/irlume
 Vcs-Git: https://github.com/archledger/irlume.git
@@ -34,3 +41,22 @@ Description: Face authentication for Linux
  Bundles onnxruntime (>= 1.24) under /opt/irlume because irlume needs a newer
  runtime than the Ubuntu archive ships. Model weights install to
  /usr/share/irlume/models.
+
+Package: irlume-kcm
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, irlume (= ${binary:Version}),
+         qml6-module-org-kde-kcmutils,
+         qml6-module-org-kde-kirigami,
+         qml6-module-qtquick-controls,
+         qml6-module-qtquick-layouts,
+         qml6-module-qtquick-templates,
+         qml6-module-qtquick-window,
+         qml6-module-qtqml-workerscript
+Description: Plasma System Settings module for irlume
+ Read-only status, diagnostics, camera census and login-wiring pages for
+ irlume inside Plasma's System Settings, plus launch buttons that
+ delegate every interactive or privileged change to the irlume terminal
+ interface (with its own confirmations and authorizations). The module
+ renders the same versioned machine API that external integrations use;
+ it holds no policy and performs no privileged action. Requires a
+ Plasma 6 session.

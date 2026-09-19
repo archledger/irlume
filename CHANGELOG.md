@@ -10,9 +10,13 @@ All notable changes to irlume are documented here. This project adheres to
 - A KDE Plasma System Settings module (KCM): read-only status, diagnostics,
   camera census and login-wiring pages rendered from the machine API, plus
   launch buttons that hand interactive work to the TUI (deep-linked when
-  the session provides xdg-terminal-exec). Fedora ships it as the
-  `irlume-kcm` subpackage, Arch as a split package; the module holds no
-  policy and performs no privileged action (docs/KCM.md).
+  the session provides xdg-terminal-exec). Packaging: Fedora ships it as
+  the `irlume-kcm` subpackage, Arch as a split package, the PPA as an
+  `irlume-kcm` binary package (Ubuntu 26.04), and the Nix flake exposes
+  `packages.irlume-kcm` plus a `services.irlume.kcm.enable` module option.
+  The universal .deb does not carry it (its Debian 12 base has no KF6).
+  The module holds no policy and performs no privileged action
+  (docs/KCM.md).
 - `irlume tui --page <name>` starts the TUI on a named screen (`overview`,
   `diagnostics`, `cameras`, `faces`, `identify`, `wallet`, `recovery`,
   `fingerprint`, `login`, `settings`); the System Settings module this

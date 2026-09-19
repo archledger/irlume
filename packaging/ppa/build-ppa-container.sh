@@ -72,7 +72,9 @@ podman run --rm \
     apt-get install -y -qq --no-install-recommends \
       ca-certificates curl rsync git xz-utils \
       build-essential dpkg-dev debhelper devscripts fakeroot linux-libc-dev \
-      cargo rustc pkg-config clang libclang-dev libtss2-dev libpam0g-dev libudev-dev libdbus-1-dev dbus-daemon >/dev/null
+      cargo rustc pkg-config clang libclang-dev libtss2-dev libpam0g-dev libudev-dev libdbus-1-dev dbus-daemon \
+      cmake extra-cmake-modules qt6-base-dev qt6-declarative-dev \
+      libkf6kcmutils-dev libkf6coreaddons-dev libkf6kio-dev >/dev/null
     cd /work
     export BUILDROOT=/work/ppa-build
     bash scripts/build-ppa-source.sh

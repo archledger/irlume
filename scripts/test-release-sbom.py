@@ -119,6 +119,16 @@ class GraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "local filesystem"):
             validate_sbom(doc)
 
+    def test_local_vcs_qualifiers_are_refused_instead_of_discarded(self):
+        for source in ("git+file:///private/repo", "git%2Bfile%3A%2F%2Fprivate%2Frepo",
+                       "hg+file:///private/repo", "custom+git+file:///private/repo"):
+            with self.subTest(source=source):
+                doc = normalize_sbom(cargo_bom())
+                doc["components"][1]["purl"] = "pkg:cargo/remote@1?vcs_url=" + source
+                for operation in (validate_sbom, normalize_sbom):
+                    with self.assertRaisesRegex(ValueError, "local filesystem"):
+                        operation(doc)
+
     def test_opaque_native_components_and_nested_services_are_valid(self):
         doc = {"bomFormat": "CycloneDX", "specVersion": "1.3",
                "components": [{"bom-ref": "native", "name": "qt"}],

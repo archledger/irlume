@@ -32,7 +32,8 @@ def strings(node):
 
 
 def local_reference(value):
-    return re.search(r"(?<![A-Za-z0-9+.-])(?:path\+)?file:", unquote(value), re.IGNORECASE) is not None
+    return re.search(r"(?<![A-Za-z0-9_+.-])(?:[A-Za-z][A-Za-z0-9+.-]*\+)?file:",
+                     unquote(value), re.IGNORECASE) is not None
 
 
 def clean_purl(value):

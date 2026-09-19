@@ -126,6 +126,31 @@ printf fixture > %{buildroot}/usr/share/irlume-fixture/policy
         self.sign()
         self.refuses("missing OpenVEX @context")
 
+    def test_signed_sbom_duplicate_nested_identity_is_refused(self):
+        (self.assets / self.sbom_name).write_text(json.dumps({
+            "bomFormat": "CycloneDX", "specVersion": "1.3",
+            "metadata": {"component": {"bom-ref": "app", "components": [{"bom-ref": "app"}]}},
+        }))
+        self.sign()
+        self.refuses("duplicate bom-ref")
+
+    def test_signed_sbom_dangling_dependency_is_refused(self):
+        (self.assets / self.sbom_name).write_text(json.dumps({
+            "bomFormat": "CycloneDX", "specVersion": "1.3",
+            "components": [{"bom-ref": "app"}],
+            "dependencies": [{"ref": "app", "dependsOn": ["missing"]}],
+        }))
+        self.sign()
+        self.refuses("undefined dependsOn ref")
+
+    def test_signed_sbom_local_package_url_is_refused(self):
+        (self.assets / self.sbom_name).write_text(json.dumps({
+            "bomFormat": "CycloneDX", "specVersion": "1.3",
+            "components": [{"bom-ref": "app", "purl": "pkg:cargo/app@1?download_url=file%3A%2F%2Fprivate"}],
+        }))
+        self.sign()
+        self.refuses("local filesystem reference")
+
     def test_subjects_cover_both_exact_package_digests(self):
         got = self.verify("--subjects")
         self.assertEqual(got.returncode, 0, got.stderr)

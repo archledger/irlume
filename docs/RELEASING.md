@@ -75,8 +75,15 @@ Every release ships machine-readable composition data alongside the packages:
 
 1. **SBOM set** (CycloneDX 1.3, JSON): from the release tag checkout run
    `bash scripts/generate-release-sbom.sh <version> <asset-dir>` (requires
-   `cargo install cargo-cyclonedx --locked`). One SBOM per crate that builds
+   `cargo install cargo-cyclonedx --version 0.5.9 --locked`). One SBOM per crate that builds
    a shipped binary; files are named `irlume-<version>-sbom-<crate>.cdx.json`.
+   The generator exports the committed revision to a temporary directory and
+   invokes cargo-cyclonedx once for the whole workspace. It checks the release
+   version and locked dependency graph, rejects lockfile drift, and validates
+   unique component identifiers, resolvable dependency edges, and absence of
+   local filesystem references. Outputs are resolved relative to the caller.
+   Use `--revision <tag>` to regenerate a historical release with the current
+   tooling. See [SBOM-INTEGRITY.md](SBOM-INTEGRITY.md) for the contract and audit.
 2. **VEX document** (OpenVEX): `python3 scripts/generate-vex.py --version
    <version>` emits `irlume-<version>-vex.json` with one `not_affected`
    statement per advisory suppressed in `deny.toml`, carrying the documented

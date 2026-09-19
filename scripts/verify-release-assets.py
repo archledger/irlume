@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 
+from release_sbom import validate_sbom
+
 ROOT = Path(__file__).resolve().parent.parent
 FINGERPRINT = "F35053398E3C80FE20891B82C10B8492BD7F30C6"
 LINE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)")
@@ -98,9 +100,8 @@ def verify(directory, key, fingerprint, required, require_metadata=True, allow_n
         failure = f"package structure check failed: {name}"
         kind = package_format(name)
         if kind == "metadata":
-            # SBOM/VEX assets: valid UTF-8 JSON with the expected toplevel
-            # shape. Deeper schema validation happens on the consumer side;
-            # here we guarantee the asset is parseable and self-describing.
+            # Check signed metadata as data, including SBOM graph integrity.
+            # This is not full JSON Schema validation.
             try:
                 doc = json.loads(Path(path).read_text(encoding="utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -108,8 +109,10 @@ def verify(directory, key, fingerprint, required, require_metadata=True, allow_n
             if not isinstance(doc, dict):
                 raise ValueError(failure + f" (top-level {type(doc).__name__}, expected object)")
             if name.endswith(".cdx.json"):
-                if doc.get("bomFormat") != "CycloneDX":
-                    raise ValueError(failure + " (missing CycloneDX bomFormat)")
+                try:
+                    validate_sbom(doc)
+                except ValueError as error:
+                    raise ValueError(failure + f" ({error})") from error
             elif doc.get("@context") != "https://openvex.dev/ns":
                 raise ValueError(failure + " (missing OpenVEX @context)")
             continue

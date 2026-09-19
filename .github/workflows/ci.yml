@@ -235,6 +235,7 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends gnupg dpkg rpm zstd
           python3 scripts/test-release-assets.py
+          python3 scripts/test-release-sbom.py
 
       - name: Disposable TPM wrapper lifecycle (no hardware)
         run: python3 scripts/test-with-swtpm.py

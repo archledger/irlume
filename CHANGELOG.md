@@ -5,6 +5,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Release SBOM generation now runs once in an isolated committed source tree,
+  preserves versioned component and binary-target identities, rewrites dependency
+  edges consistently, and removes local filesystem URLs. The release verifier
+  rejects duplicate identifiers and dangling references even in signed metadata.
+  Lockfile drift fails generation, and intermediate BOMs stay out of the checkout.
+- The KCM design now records the v0.14.0 implementation and validation status,
+  including the optional scope of future native controls and the default-off
+  NixOS loading limitation.
+
 ## [0.14.0] - 2026-09-19
 
 ### Added

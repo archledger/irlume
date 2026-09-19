@@ -1,12 +1,33 @@
 # KCM: a Plasma System Settings module for irlume
 
-Status: proposed design, ready for review; nothing implemented. Tracks issue
-#762. Agent: opencode. Date: 2026-09-18. Revision 2: incorporates the
+Status: the agreed dashboard and TUI launch-action scope shipped in v0.14.0.
+Tracks issue #762. Agent: opencode. Date: 2026-09-18. Revision 2 incorporates the
 adversarial review pass (target naming, flock-based guard, contract-correct
 Cameras page, pkexec path pinning, dependency and packaging corrections).
 Research baseline: `artifacts/irlume/2026-09-18-kcm-research/RESEARCH.md`
 (shared ledger artifacts; the KF6/KCM facts are from develop.kde.org's KCM
 tutorial and KF6 porting guide, fetched 2026-09-18).
+
+## Implementation status (2026-09-19)
+
+- Phase 0 shipped in PR #763: TUI page deep links and the single-instance guard.
+- Phase 1 shipped in PR #764, with hands-on and API corrections in #765 and #766.
+  Fedora, Arch, and Ubuntu 26.04 PPA packages shipped in v0.14.0; #767 added PPA
+  and Nix packaging, and #771 corrected the Arch split-package function.
+- The Phase 2 hands-on polish is delivered. English-only UI remains the chosen
+  default, matching the rest of the application.
+- The original issue's broader proposal was narrowed by this reviewed design:
+  capture, enrollment, wallet, recovery, and login mutations use the existing TUI.
+  Native privileged controls in optional Phase 3 are not an outstanding delivery
+  requirement. A concrete usage need and a separate ADR would reopen that work.
+- NixOS exposes `services.irlume.kcm.enable`, default off. Runtime loading still
+  needs a NixOS host; this documented limitation was accepted for v0.14.0.
+- Validation includes the user-accepted Fedora walkthrough, installed Arch KCM
+  loadtest against the real daemon, hosted Fedora/Arch loadtests, and clean
+  Ubuntu 26.04 package installation and QML loading. See [KCM.md](../../KCM.md)
+  for the supported interaction model.
+
+The design below records the reviewed architecture and optional future scope.
 
 ## Objective
 
@@ -65,7 +86,7 @@ Everything visible is QML (`ui/`), built and bundled by
 The CMake target name IS the plugin name: `kcm_irlume.so`,
 `kcm_irlume.json` (the desktop-file generator requires the JSON basename to
 match the target), and `kcmshell6 kcm_irlume` for standalone testing.
-Root components: `ScrollViewKCM` + Kirigami form layouts (Kirigami is an
+Root components: `SimpleKCM` + Kirigami form layouts (Kirigami is an
 explicit runtime dependency on every lane; kcmutils' QML sits on it).
 
 ### Differences from the research phase plan
@@ -80,8 +101,8 @@ here, after the launch-action model landed in between.
 ### Pages (Phase 1)
 
 1. **Overview** - `irlume status --json`: daemon, enrollment, keyring,
-   templates, recovery, sensor-policy rows rendered as a Kirigami card
-   list; "Fix in irlume" launch buttons where a row is unhealthy.
+   templates, recovery, sensor-policy rows rendered as a Kirigami form;
+   launch buttons open the corresponding TUI screens.
 2. **Diagnostics** - `irlume doctor --json`: checks grouped pass/warn/fail
    with remediation text verbatim from the document; conditionally-present
    ids (camera-groups, pam-faillock) rendered only when present. The
@@ -224,7 +245,7 @@ fixes double-launching from the application menu.
   exists today; the CI lane gains a fedora:44 + arch KCM build first, and
   the deb-family KCM stays PPA-only until that container exists).
 - **Nix**: package `irlume-kcm` built against `kdePackages`; module option
-  `programs.irlume.kcm.enable` (default off initially). Known caveat
+   `services.irlume.kcm.enable` (default off initially). Known caveat
   nixpkgs#296999 (KCMs built outside the plasma-desktop set had environment
   issues) - in-module verification is a Phase 1 gate on NixOS.
 - **Parity + SBOM**: check-packaging-parity.sh gains a KCM section that

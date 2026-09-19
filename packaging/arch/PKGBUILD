@@ -63,7 +63,7 @@ build() {
     cmake --build kcm-build
 }
 
-package() {
+package_irlume() {
     cd "$srcdir/irlume"
     install -Dm0755 target/release/irlumed "$pkgdir/usr/bin/irlumed"
     install -Dm0755 target/release/irlume  "$pkgdir/usr/bin/irlume"

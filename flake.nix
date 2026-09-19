@@ -73,6 +73,10 @@
         # points the daemon at them. `src = self` uses the flake's own tree.
         packages.default = pkgs.callPackage ./nix/package.nix { src = self; };
         packages.irlume = self.packages.${system}.default;
+        # Plasma System Settings module (optional; see docs/KCM.md). Not part
+        # of packages.default: loading on NixOS needs the nixpkgs#296999
+        # caveat verified on a real host first.
+        packages.irlume-kcm = pkgs.callPackage ./nix/package-kcm.nix { src = self; };
         # Exposed so CI can realize this fixed-output fetch and catch a stale
         # hash; nix/module.nix carries the same URL+hash pair (keep them in
         # step when bumping ortVersion).

@@ -79,6 +79,8 @@ sudo irlume keyring arm
 | `services.irlume.irDevice` | `/dev/video2` | V4L2 node for the IR camera. |
 | `services.irlume.sequentialCapture` | `false` | Capture RGB then IR instead of both at once. Set this only inside a VM (see below). |
 | `services.irlume.pam.services.<name>` | `{}` | Adds face auth to PAM service `<name>`; picks the control flag from the name. |
+| `services.irlume.kcm.enable` | `false` | Installs the Plasma System Settings module (read-only status and launch actions; see [KCM.md](KCM.md)). Requires a Plasma 6 session; off by default pending a NixOS loading verification (nixpkgs#296999). |
+| `services.irlume.kcm.package` | source build | The irlume-kcm package (override to pin your own). |
 | `services.irlume.pam.services.<name>.profile` | auto | `"login"` or `"lock"`; override when a service name is not recognised. |
 
 ### How a service gets its control flag

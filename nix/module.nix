@@ -146,6 +146,17 @@ in
       description = "The irlume package providing irlumed, the PAM module, and the model weights.";
     };
 
+    kcm = {
+      enable = lib.mkEnableOption "the irlume Plasma System Settings module (read-only status and launch actions; requires a Plasma 6 session; see docs/KCM.md)";
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.callPackage ./package-kcm.nix { src = lib.cleanSource ../.; };
+        defaultText = lib.literalExpression "pkgs.callPackage ./package-kcm.nix { src = lib.cleanSource ../.; }";
+        description = "The irlume-kcm Plasma System Settings module package.";
+      };
+    };
+
     rgbDevice = lib.mkOption {
       type = lib.types.str;
       default = "/dev/video0";
@@ -199,7 +210,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.kcm.enable cfg.kcm.package;
     security.polkit.enable = true;
     # polkit links /share/polkit-1 from environment.systemPackages.
 

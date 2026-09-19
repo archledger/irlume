@@ -36,9 +36,14 @@ requested screen.
 
 - Fedora (Copr): the `irlume-kcm` subpackage.
 - Arch (AUR): the `irlume-kcm` split package.
-- The universal .deb and NixOS do not carry the module yet (Debian 12 has
-  no KF6; the NixOS module needs an in-module verification first). It is
-  optional everywhere: the daemon, CLI and PAM module work without it.
+- PPA (Ubuntu 26.04): the `irlume-kcm` binary package (installs on
+  resolute and resolute-based derivatives such as Linux Mint 23;
+  verified in containers).
+- NixOS: `services.irlume.kcm.enable` in the flake module (off by
+  default pending a NixOS loading verification, nixpkgs#296999).
+- The universal .deb does not carry the module (its Debian 12 base has
+  no KF6). It is optional everywhere: the daemon, CLI and PAM module
+  work without it.
 
 ## Security posture
 

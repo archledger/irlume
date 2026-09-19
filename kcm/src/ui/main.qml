@@ -103,39 +103,46 @@ KCMUtils.SimpleKCM {
                             return [];
                         }
                         const d = doc.data;
+                        // Sub-objects are guaranteed by the contract, but a
+                        // short or malformed document must degrade to
+                        // "unknown" rows, never a TypeError.
+                        const e = d.enrollment || {};
+                        const k = d.keyring || {};
+                        const r = d.recovery || {};
+                        const cam = d.camera || {};
                         const rows = [];
                         function add(label, value, good) {
                             rows.push({label: label, value: value, good: good});
                         }
                         add("Daemon", d.daemon, d.daemon === "running");
                         add("Enrollment",
-                            d.enrollment.known === false
+                            e.known === false
                                 ? "unknown"
-                                : (d.enrollment.profiles > 0
-                                    ? (d.enrollment.profiles + " profile(s), " + d.enrollment.scans + " scan(s)")
+                                : (e.profiles > 0
+                                    ? (e.profiles + " profile(s), " + e.scans + " scan(s)")
                                     : "none yet"),
-                            d.enrollment.known === true && d.enrollment.profiles > 0);
+                            e.known === true && e.profiles > 0);
                         add("Keyring unlock",
-                            d.keyring.armed === true ? "armed"
-                              : d.keyring.armed === false ? "not armed"
+                            k.armed === true ? "armed"
+                              : k.armed === false ? "not armed"
                               : "unknown",
-                            d.keyring.armed === true);
+                            k.armed === true);
                         add("Templates at rest",
                             d.templates === "encrypted" ? "encrypted"
                               : d.templates === "plaintext" ? "not encrypted yet"
                               : String(d.templates),
                             d.templates === "encrypted");
                         add("Recovery passphrase",
-                            d.recovery.passphrase_set === true ? "set"
-                              : d.recovery.passphrase_set === false ? "not set"
+                            r.passphrase_set === true ? "set"
+                              : r.passphrase_set === false ? "not set"
                               : "unknown",
-                            d.recovery.passphrase_set === true);
+                            r.passphrase_set === true);
                         add("Face sensors",
                             d.face_disabled ? "face disabled"
-                              : (d.camera.known
-                                  ? (d.camera.rgb && d.camera.ir ? "RGB + IR (secure tier)"
-                                     : d.camera.ir ? "IR"
-                                     : d.camera.rgb ? "RGB only"
+                              : (cam.known
+                                  ? (cam.rgb && cam.ir ? "RGB + IR (secure tier)"
+                                     : cam.ir ? "IR"
+                                     : cam.rgb ? "RGB only"
                                      : "none classified")
                                   : "unknown"),
                             !d.face_disabled);

@@ -51,10 +51,12 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "cannot load plugin: %s\n", qUtf8Printable(loader.errorString()));
         return 1;
     }
-    check(loader.metaData().value(QLatin1String("MetaData")).toObject()
-              .value(QLatin1String("KPlugin")).toObject()
-              .value(QLatin1String("Id")).toString() == QStringLiteral("kcm_irlume"),
-          QStringLiteral("plugin metadata Id is kcm_irlume"));
+    // pluginId comes from the target name; the JSON carries no Id field
+    // (KCoreAddons warns when it does). This is the same query path a
+    // plugin lookup by Id uses.
+    const KPluginMetaData metadata(app.arguments().at(1));
+    check(metadata.isValid() && metadata.pluginId() == QStringLiteral("kcm_irlume"),
+          QStringLiteral("plugin resolves by Id kcm_irlume"));
     check(loader.metaData().value(QLatin1String("MetaData")).toObject()
               .value(QLatin1String("X-KDE-System-Settings-Parent-Category")).toString()
               == QStringLiteral("personalization"),

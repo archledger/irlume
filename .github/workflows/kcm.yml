@@ -76,7 +76,7 @@ jobs:
           #!/bin/sh
           case "$1 ${2:-}" in
             "version "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"version","ok":true,"data":{"capabilities":["version-json","status-json","doctor-json","camera-census","login-status-json"],"contract_versions":{"min":1,"max":1},"limits":{"max_profiles":3}}}' ;;
-            "status "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"status","ok":true,"data":{"daemon":"running"}}' ;;
+            "status "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"status","ok":true,"data":{"daemon":"running","auth_method":"auto","face_disabled":false,"fingerprint":false,"fingerprint_known":true,"camera":{"known":true,"rgb":true,"ir":true},"enrollment":{"known":true,"profiles":1,"scans":10},"keyring":{"known":true,"armed":true},"recovery":{"known":true,"passphrase_set":true,"key_present":true},"templates":"encrypted"}}' ;;
             "doctor "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"doctor","ok":true,"data":{"checks":[{"id":"platform","state":"info","detail":"stub"}]}}' ;;
             "camera census") printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"camera.census","ok":true,"data":{"entries":[]}}' ;;
             "login "*) printf '%s\n' '{"contract_version":1,"engine_version":"0.13.0","command":"login.status","ok":true,"data":{"surfaces":[]}}' ;;
@@ -102,25 +102,24 @@ jobs:
             exit 1
           fi
 
-      - name: QML syntax check
+      - name: QML lint with resolved Kirigami/KCMUtils types
         run: |
+          # With the qml import path, qmllint RESOLVES Kirigami and KCMUtils
+          # types, so a nonexistent property (twinFormLabelText,
+          # Theme.secondaryTextColor - both shipped once) fails here at
+          # build time instead of in the user's System Settings.
           if [ -x /usr/lib64/qt6/bin/qmllint ]; then
             QMLLINT=/usr/lib64/qt6/bin/qmllint
           elif [ -x /usr/lib/qt6/bin/qmllint ]; then
             QMLLINT=/usr/lib/qt6/bin/qmllint
           else
-            echo "qmllint not available; skipped"
-            exit 0
+            echo "::error::qmllint not available"
+            exit 1
           fi
           status=0
           for f in kcm/src/ui/*.qml; do
-            # GitHub Actions runs steps with pipefail: piping qmllint into
-            # grep would mask a nonzero linter exit behind || handling, so
-            # capture first, judge the exit code, then scan the output.
-            if ! out="$("$QMLLINT" "$f" 2>&1)"; then
-              status=1
-            fi
-            if printf '%s\n' "$out" | grep -qE "Error|Warning: .*:(missing-property|syntax)"; then
+            out="$("$QMLLINT" -I /usr/lib64/qt6/qml -I /usr/lib/qt6/qml "$f" 2>&1)" || status=1
+            if printf '%s\n' "$out" | grep -qE "Warning: .*:(missing-property|unqualified|syntax)|Error"; then
               status=1
               printf '%s\n' "$out"
             fi

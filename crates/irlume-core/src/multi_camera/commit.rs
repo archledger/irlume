@@ -167,7 +167,7 @@ pub fn publish_with_intent(
         secondary_path,
         new_store,
         primary_snapshot_sha256,
-        Some(&key),
+        key.as_deref().map(|v| &**v),
     )
 }
 
@@ -180,7 +180,7 @@ pub fn publish_with_intent(
 /// Returns [`CommitError`] when validation or any durable step fails. A
 /// failure before the commit point leaves the previous store authoritative
 /// and the journal for [`resolve_commit`] to finish or discard.
-pub fn publish_with_intent_key(
+pub(crate) fn publish_with_intent_key(
     secondary_path: &Path,
     new_store: &SecondaryStore,
     primary_snapshot_sha256: &str,
@@ -274,6 +274,31 @@ pub fn resolve_commit(secondary_path: &Path) -> Result<CommitResolution, CommitE
         .get("format_version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| CommitError::Io("journal payload has no format_version".into()))?;
+    if declared == super::SECONDARY_ENC_ENVELOPE_VERSION {
+        // A truncated or fabricated envelope must never overwrite the last
+        // good store: require the key binding and a decodable ciphertext of
+        // plausible length (nonce + tag at minimum). The store itself is
+        // validated on the next load.
+        use base64::Engine as _;
+        let key_id = doc
+            .get("key_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CommitError::Io("journal envelope has no usable key_id".into()))?;
+        let enc = doc
+            .get("enc")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CommitError::Io("journal envelope has no enc field".into()))?;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(enc)
+            .map_err(|e| CommitError::Io(format!("journal enc is not base64: {e}")))?;
+        if blob.len() <= 12 + 16 || key_id.is_empty() {
+            return Err(CommitError::Io(
+                "journal envelope ciphertext is implausibly short".into(),
+            ));
+        }
+        let _ = key_id;
+    }
     if declared != super::SECONDARY_ENC_ENVELOPE_VERSION {
         let store: SecondaryStore = serde_json::from_slice(&bytes)
             .map_err(|e| CommitError::Io(format!("journal payload corrupt: {e}")))?;

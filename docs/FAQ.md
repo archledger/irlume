@@ -12,8 +12,8 @@ face-unlock the login screen, lock screen, `sudo`, and your keyring/wallet,
 using the same IR (Windows Hello) camera your laptop already has. And it aims
 past Hello where Hello is weak: real anti-spoof liveness, encrypted
 TPM-sealed templates (primary store, on TPM hosts; without a TPM the store
-is root-only plaintext, as are secondary multi-camera stores today), and a
-fully open stack.
+is root-only plaintext, as are secondary multi-camera stores on hosts that
+have not yet upgraded from 0.13.0-era writes), and a fully open stack.
 </details>
 
 <details>
@@ -99,7 +99,8 @@ never triggers the camera on any lock.
 That's the point of [`docs/VERIFY.md`](VERIFY.md). Each claim maps to a
 command you can run: see your own camera's anti-spoof score, confirm the
 primary store's template is encrypted ciphertext (not an image; the secondary
-multi-camera store is root-only plaintext today), run the presentation-attack
+multi-camera store is encrypted the same way once your installation includes
+the fix for this), run the presentation-attack
 self-test against your own spoofs, reproduce the real-face FAR on LFW, and build
 and run the test suite. Some checks take two minutes, some take real effort, but
 every one is runnable.

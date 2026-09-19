@@ -9,10 +9,10 @@ review. The Windows observation below is maintainer-reported.
 
 Implementation status: Phase 1 (secondary store foundation) merged in #732 and
 Phase 2 (secondary authentication wiring, `enroll --add-camera`,
-`profiles remove-camera`) shipped in v0.13.0. **Known deviation from s1.2:** the
-secondary store is currently persisted as root-only plaintext JSON (see the
-note in section 1.2); either the confidentiality clause is implemented or the
-deviation is formally accepted, but the shipped state is as described there.
+`profiles remove-camera`) shipped in v0.13.0. The s1.2 confidentiality clause
+was initially shipped unimplemented (v0.13.0 wrote plaintext secondary stores)
+and is now implemented: secondary stores persist as an encrypted envelope
+under the account template key (see the note in section 1.2).
 Numbered after ADR-0023; independent of ADR-0022's acceptance.
 
 ## Context

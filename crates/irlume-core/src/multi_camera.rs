@@ -500,7 +500,7 @@ pub fn load_secondary(path: &Path) -> Result<Option<SecondaryStore>, SecondarySt
 /// naming the key.
 pub fn load_secondary_resolved(
     path: &Path,
-    key_for: impl Fn(&str) -> Result<Zeroizing<Vec<u8>>, SecondaryStoreError>,
+    key_for: impl Fn(&str) -> Result<Option<Zeroizing<Vec<u8>>>, SecondaryStoreError>,
 ) -> Result<Option<SecondaryStore>, SecondaryStoreError> {
     // The key is only requested for an ENCRYPTED store: a missing file and a
     // legacy plaintext store never touch the TPM, so pre-encryption stores
@@ -523,8 +523,8 @@ pub fn load_secondary_resolved(
         .ok_or_else(|| SecondaryStoreError::Corrupt("no format_version".into()))?;
     if declared == SECONDARY_ENC_ENVELOPE_VERSION {
         let user = store_user(path)?;
-        let key = key_for(&user)?.to_vec();
-        return load_secondary_with_key(path, Some(&key));
+        let key = key_for(&user)?;
+        return load_secondary_with_key(path, key.as_deref().map(|v| &**v));
     }
     load_secondary_with_key(path, None)
 }
@@ -536,15 +536,27 @@ pub fn load_secondary_resolved(
 ///
 /// Returns [`SecondaryStoreError::Invalid`] when no TPM is present or the
 /// account template key cannot be unsealed.
-pub fn production_key_for(user: &str) -> Result<Zeroizing<Vec<u8>>, SecondaryStoreError> {
+/// The production key resolver: the account template key when a TPM is
+/// present; `Ok(None)` on a no-TPM host, which writes the documented
+/// root-only plaintext legacy format - exactly how the primary store
+/// behaves there. On a TPM host an unseal failure is an error (fail
+/// closed; never a silent plaintext downgrade).
+///
+/// # Errors
+///
+/// Returns [`SecondaryStoreError::Invalid`] when the TPM is present but the
+/// account template key cannot be unsealed.
+pub fn production_key_for(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, SecondaryStoreError> {
     if !crate::template_key::tpm_available() {
-        return Err(SecondaryStoreError::Invalid(
-            "no TPM: the account template key is unavailable".into(),
-        ));
+        return Ok(None);
     }
-    crate::template_key::ensure_key_unlocked(user).map_err(|error| {
-        SecondaryStoreError::Invalid(format!("the account template key is unavailable: {error}"))
-    })
+    crate::template_key::ensure_key_unlocked(user)
+        .map(Some)
+        .map_err(|error| {
+            SecondaryStoreError::Invalid(format!(
+                "the account template key is unavailable: {error}"
+            ))
+        })
 }
 
 /// The account name a secondary store belongs to: the fixed layout is
@@ -602,6 +614,21 @@ fn parse_store_bytes(
                     "the secondary store is encrypted and its template key is unavailable".into(),
                 )
             })?;
+            // The envelope's key_id binds the ciphertext to this account's
+            // key; a mismatch means the store was sealed by a different key
+            // (wrong account, rotated key, or tampering) and must not be
+            // silently opened with this one.
+            let claimed = version
+                .get("key_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    SecondaryStoreError::Corrupt("encrypted store has no key_id".into())
+                })?;
+            if claimed != irlume_common::sha256_hex(key) {
+                return Err(SecondaryStoreError::Corrupt(
+                    "the store was encrypted with a different template key".into(),
+                ));
+            }
             let enc = version
                 .get("enc")
                 .and_then(serde_json::Value::as_str)
@@ -641,10 +668,10 @@ fn parse_store_bytes(
 pub fn save_secondary_resolved(
     path: &Path,
     store: &SecondaryStore,
-    key_for: impl Fn(&str) -> Result<Zeroizing<Vec<u8>>, SecondaryStoreError>,
+    key_for: impl Fn(&str) -> Result<Option<Zeroizing<Vec<u8>>>, SecondaryStoreError>,
 ) -> Result<(), SecondaryStoreError> {
     let key = key_for(&store_user(path)?)?;
-    save_secondary_with_key(path, store, Some(&key))
+    save_secondary_with_key(path, store, key.as_ref().map(|v| v.as_slice()))
 }
 
 /// Durably saves the secondary store: write to a sibling temporary, fsync
@@ -669,7 +696,7 @@ pub fn save_secondary(path: &Path, store: &SecondaryStore) -> Result<(), Seconda
 ///
 /// Returns [`SecondaryStoreError`] when validation, encryption or any
 /// durable step fails; invalid data is never persisted.
-pub fn save_secondary_with_key(
+pub(crate) fn save_secondary_with_key(
     path: &Path,
     store: &SecondaryStore,
     key: Option<&[u8]>,
@@ -849,9 +876,15 @@ mod tests {
         save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
         let other = Zeroizing::new(vec![9u8; 32]);
         let error = load_secondary_with_key(&path, Some(&other)).expect_err("must fail");
+        // The key_id check rejects a different key before decryption is
+        // even attempted, naming the binding rather than a generic
+        // decryption failure.
         assert!(
-            error.to_string().to_lowercase().contains("decrypt"),
-            "wrong key reports a decryption failure: {error}"
+            error
+                .to_string()
+                .to_lowercase()
+                .contains("different template key"),
+            "wrong key reports the binding: {error}"
         );
         let _ = std::fs::remove_file(&path);
     }

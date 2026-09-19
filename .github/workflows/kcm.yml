@@ -95,8 +95,16 @@ jobs:
           cmake --install kcm-build
           command -v kcmshell6 || { echo "kcmshell6 not available; skipped"; exit 0; }
           log="$(mktemp)"
+          rc=0
           timeout 15 env QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1 \
-            kcmshell6 kcm_irlume 2>&1 | tee "$log"
+            kcmshell6 kcm_irlume 2>&1 | tee "$log" || rc=$?
+          # 124 = timeout killed the event loop, which is the clean-load
+          # outcome (kcmshell6 otherwise runs until terminated). Any other
+          # nonzero status is a real failure and exits here (the step runs
+          # with -e -o pipefail).
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+            exit "$rc"
+          fi
           if grep -aqE "qrc:|Unable to assign|Cannot assign|Error loading QML" "$log"; then
             echo "::error::the module reported QML errors on instantiation"
             exit 1

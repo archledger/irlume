@@ -19,7 +19,7 @@ KCMUtils.SimpleKCM {
     property bool pending: false
     property string failure: ""
 
-    readonly property var surfaces: doc && doc.ok ? doc.data.surfaces : []
+    readonly property var surfaces: doc && doc.ok ? (doc.data || {}).surfaces || [] : []
 
     function refresh() {
         failure = "";
@@ -68,10 +68,10 @@ KCMUtils.SimpleKCM {
         RowLayout {
             Kirigami.FormData.label: "Login manager:"
             Controls.Label {
-                text: root.doc.ok && root.doc.data.login_manager.known
+                text: root.doc.ok && (root.doc.data || {}).login_manager !== undefined && root.doc.data.login_manager.known
                       ? root.doc.data.login_manager.name
                       : "not recognized"
-                color: root.doc.ok && root.doc.data.login_manager.known
+                color: root.doc.ok && (root.doc.data || {}).login_manager !== undefined && root.doc.data.login_manager.known
                       ? Kirigami.Theme.textColor
                       : Kirigami.Theme.disabledTextColor
             }
@@ -80,7 +80,7 @@ KCMUtils.SimpleKCM {
         RowLayout {
             Kirigami.FormData.label: "SELinux module:"
             Controls.Label {
-                text: root.doc.ok ? String(root.doc.data.selinux_module) : ""
+                text: root.doc.ok ? String((root.doc.data || {}).selinux_module) : ""
                 color: Kirigami.Theme.disabledTextColor
             }
         }

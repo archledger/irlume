@@ -13,7 +13,7 @@ body:
     attributes:
       label: irlume version and install channel
       description: "`irlume version`, plus how you installed (Copr, PPA, .deb, AUR, Nix, source)"
-      placeholder: "0.13.0, Fedora Copr"
+      placeholder: "0.14.0, Fedora Copr"
     validations:
       required: true
   - type: input

@@ -97,6 +97,11 @@ normal user in the terminal selected by your desktop. Privileged changes ask
 for authorization when you choose them. If your desktop cannot select a
 terminal, run `irlume tui` in one you opened yourself.
 
+On KDE Plasma 6, install the optional `irlume-kcm` package for an Irlume page
+in System Settings. It shows status, diagnostics, cameras, and login wiring;
+interactive changes open the TUI. See [KDE System Settings](docs/KCM.md) for
+package availability and the optional NixOS configuration.
+
 **You need** x86-64 Linux with systemd and PAM. A TPM 2.0 is strongly recommended.
 Most cameras work and set your tier (an IR node must offer an 8-bit grey format; see [Platforms](docs/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
 unlock · **fingerprint** → companion factor.
@@ -119,7 +124,7 @@ unlock · **fingerprint** → companion factor.
 
 ## Status
 
-**v0.13.0**, working on real hardware on Fedora and Ubuntu; packaged and
+**v0.14.0**, working on real hardware on Fedora and Ubuntu; packaged and
 install-tested on Arch and Debian, with a NixOS module in this flake.
 Self-tested against ISO/IEC 30107-3, not
 lab-certified. Interfaces may shift before 1.0. Validated cameras are listed
@@ -135,6 +140,11 @@ five-sample anti-spoofing vote in one camera session, so screen unlock
 completes in about five seconds on a 15 fps RGB sensor that previously could
 not finish the vote at all; and signed releases carrying per-binary
 CycloneDX SBOMs and an OpenVEX document ([Verify](docs/VERIFY.md)).
+
+New in 0.14: a Plasma System Settings module, TUI page deep links and
+single-instance navigation, and encryption for secondary camera stores under
+the account template key. Existing plaintext secondary stores migrate on
+their next write; hosts without a TPM retain root-only plaintext storage.
 
 Hardware reports from laptops with IR cameras, working or not, are the most
 useful contribution right now:

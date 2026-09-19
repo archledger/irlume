@@ -1,6 +1,6 @@
 # Maintainer: Wisbendji Fimerlus <archledger236@gmail.com>
 pkgname=(irlume irlume-kcm)
-pkgver=0.13.0
+pkgver=0.14.0
 pkgrel=1
 pkgdesc="Face authentication for Linux: IR cameras, consent-gated, photo-spoofing resistant, TPM-sealed, password always works"
 arch=('x86_64')

@@ -6,9 +6,10 @@ abstract: >-
   infrared and RGB camera for a Windows Hello-style credential: it seals the
   login secret in the TPM under a measured-boot policy and releases it only on
   a live infrared face match. Templates are stored as 512-D embeddings, never
-  images; the primary enrollment store is encrypted at rest on TPM hosts
-  (AES-256-GCM under a TPM-sealed key; without a TPM it is root-only
-  plaintext, as are secondary multi-camera stores today). Anti-spoofing
+  images; primary and secondary enrollment stores are encrypted at rest on
+  TPM hosts (AES-256-GCM under a TPM-sealed key; existing plaintext secondary
+  stores migrate on their next write). Without a TPM, stores are root-only
+  plaintext. Anti-spoofing
   ships two learned PAD models on by default
   (ViT on RGB, FLIR IR on the infrared path) alongside algorithmic infrared
   gates (reflectance and centre/edge relief ratio, with corneal glint
@@ -22,8 +23,8 @@ authors:
 repository-code: "https://github.com/archledger/irlume"
 url: "https://github.com/archledger/irlume"
 license: GPL-3.0-or-later
-version: 0.13.0
-date-released: 2026-09-17
+version: 0.14.0
+date-released: 2026-09-19
 keywords:
   - face-authentication
   - infrared

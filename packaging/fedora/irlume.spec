@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.13.0
+Version:        0.14.0
 Release:        1%{?dist}
 Summary:        Face authentication for Linux
 
@@ -329,6 +329,13 @@ restorecon /run/irlume.sock 2>/dev/null || :
 
 
 %changelog
+* Sat Sep 19 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.14.0-1
+- Encrypt secondary camera stores under the account template key
+- Add the optional irlume-kcm Plasma System Settings module
+- TUI page deep links and single-instance navigation
+- Safely evict the owned TPM storage root key after a complete data wipe
+- Remove the rsa dependency and ship release SBOMs and VEX
+
 * Thu Sep 17 2026 archledger <archledger236@gmail.com> - 0.13.0-1
 - Multi-camera enrollment (ADR-0024): secondary camera groups, per-group
   stores and management surfaces; grouped RGB-only convenience capture

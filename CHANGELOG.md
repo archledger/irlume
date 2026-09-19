@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-19
+
 ### Added
 
 - Secondary multi-camera stores are now encrypted at rest under the
@@ -60,9 +62,8 @@ All notable changes to irlume are documented here. This project adheres to
   advisory ignore list in `deny.toml` is empty again and the VEX document
   records the clean scan.
 - Documentation accuracy pass over the whole repo: encryption-at-rest
-  claims are scoped to the primary store (the secondary multi-camera
-  store is root-only plaintext today, recorded as an open deviation in
-  ADR-0024 s1.2), removed features (head gestures, the third-party model
+  claims describe the TPM requirement and upgrade-on-write migration for
+  secondary stores; removed features (head gestures, the third-party model
   lane) are no longer described as live anywhere, ADR statuses match the
   shipped implementation, and stale counts, commands, and version
   references were corrected.

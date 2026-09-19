@@ -28,9 +28,11 @@
 //! Nothing in this module authorizes authentication: Phase 1 exposes
 //! validated data and the activation predicate only.
 
-use crate::storage::FaceScan;
+use crate::{crypto, storage::FaceScan};
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Builds the listing rows for every group in `store` (ADR-0024 Phase 2
 /// status surface): identity, connected/selected/stale state, and
@@ -164,6 +166,12 @@ pub fn derive_group_id(
 
 /// The only secondary-store format version this code reads and writes.
 pub const SECONDARY_STORE_VERSION: u32 = 1;
+
+/// Envelope format for a key-encrypted secondary store (ADR-0024 s1.2): the
+/// `enc` field decrypts (AES-256-GCM under the account template key) to the
+/// exact version-1 store JSON, and `key_id` records the key identity
+/// (sha256 of the key material, matching the primary envelope's convention).
+pub const SECONDARY_ENC_ENVELOPE_VERSION: u64 = 2;
 
 /// Account-wide bounds (ADR-0024 §3: fixed and tested in Phase 1).
 pub const MAX_GROUPS: usize = 8;
@@ -477,6 +485,26 @@ impl SecondaryStore {
 /// Returns [`SecondaryStoreError`] with the diagnostic kind; never a
 /// partial store.
 pub fn load_secondary(path: &Path) -> Result<Option<SecondaryStore>, SecondaryStoreError> {
+    load_secondary_resolved(path, production_key_for)
+}
+
+/// [`load_secondary`] with an explicit key: `Some` decrypts an envelope (or
+/// reads a legacy plaintext store unchanged); `None` reads legacy plaintext
+/// and FAILS CLOSED on an encrypted store (the key-holder must not be
+/// bypassed).
+///
+/// # Errors
+///
+/// Same contract as [`load_secondary`]; an encrypted store plus a missing or
+/// wrong key is [`SecondaryStoreError::Corrupt`]/[`SecondaryStoreError::Invalid`]
+/// naming the key.
+pub fn load_secondary_resolved(
+    path: &Path,
+    key_for: impl Fn(&str) -> Result<Zeroizing<Vec<u8>>, SecondaryStoreError>,
+) -> Result<Option<SecondaryStore>, SecondaryStoreError> {
+    // The key is only requested for an ENCRYPTED store: a missing file and a
+    // legacy plaintext store never touch the TPM, so pre-encryption stores
+    // keep loading on hosts where the account key is locked.
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -493,15 +521,130 @@ pub fn load_secondary(path: &Path) -> Result<Option<SecondaryStore>, SecondarySt
         .get("format_version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| SecondaryStoreError::Corrupt("no format_version".into()))?;
-    if declared != u64::from(SECONDARY_STORE_VERSION) {
-        return Err(SecondaryStoreError::IncompatibleVersion(
-            u32::try_from(declared).unwrap_or(u32::MAX),
+    if declared == SECONDARY_ENC_ENVELOPE_VERSION {
+        let user = store_user(path)?;
+        let key = key_for(&user)?.to_vec();
+        return load_secondary_with_key(path, Some(&key));
+    }
+    load_secondary_with_key(path, None)
+}
+
+/// The production key resolver: the account template key, only when a TPM is
+/// present (degraded no-TPM hosts run the legacy plaintext store, matching
+/// the primary store's documented behavior there).
+/// # Errors
+///
+/// Returns [`SecondaryStoreError::Invalid`] when no TPM is present or the
+/// account template key cannot be unsealed.
+pub fn production_key_for(user: &str) -> Result<Zeroizing<Vec<u8>>, SecondaryStoreError> {
+    if !crate::template_key::tpm_available() {
+        return Err(SecondaryStoreError::Invalid(
+            "no TPM: the account template key is unavailable".into(),
         ));
     }
-    let store: SecondaryStore = serde_json::from_slice(&bytes)
+    crate::template_key::ensure_key_unlocked(user).map_err(|error| {
+        SecondaryStoreError::Invalid(format!("the account template key is unavailable: {error}"))
+    })
+}
+
+/// The account name a secondary store belongs to: the fixed layout is
+/// `cameras/<user>.json`, so the file stem is the account.
+fn store_user(path: &Path) -> Result<String, SecondaryStoreError> {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| SecondaryStoreError::Invalid("secondary store path has no file stem".into()))
+}
+
+/// [`load_secondary`] with an explicit key: `Some` decrypts an envelope (or
+/// reads a legacy plaintext store unchanged); `None` reads legacy plaintext
+/// and FAILS CLOSED on an encrypted store (the key-holder must not be
+/// bypassed).
+///
+/// # Errors
+///
+/// Same contract as [`load_secondary`]; an encrypted store plus a missing or
+/// wrong key is [`SecondaryStoreError::Corrupt`]/[`SecondaryStoreError::Invalid`]
+/// naming the key.
+pub fn load_secondary_with_key(
+    path: &Path,
+    key: Option<&[u8]>,
+) -> Result<Option<SecondaryStore>, SecondaryStoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SecondaryStoreError::Io(error.to_string())),
+    };
+    if bytes.len() > MAX_STORE_BYTES {
+        return Err(SecondaryStoreError::Invalid(format!(
+            "store larger than {MAX_STORE_BYTES} bytes"
+        )));
+    }
+    parse_store_bytes(&bytes, key).map(Some)
+}
+
+/// Parses persisted store bytes: legacy plaintext v1, or the encrypted v2
+/// envelope decrypted under `key` (`None` + encrypted = fail closed).
+fn parse_store_bytes(
+    bytes: &[u8],
+    key: Option<&[u8]>,
+) -> Result<SecondaryStore, SecondaryStoreError> {
+    let version: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| SecondaryStoreError::Corrupt(error.to_string()))?;
+    let declared = version
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| SecondaryStoreError::Corrupt("no format_version".into()))?;
+    let store_bytes = match declared {
+        v if v == u64::from(SECONDARY_STORE_VERSION) => bytes.to_vec(),
+        v if v == SECONDARY_ENC_ENVELOPE_VERSION => {
+            let key = key.ok_or_else(|| {
+                SecondaryStoreError::Invalid(
+                    "the secondary store is encrypted and its template key is unavailable".into(),
+                )
+            })?;
+            let enc = version
+                .get("enc")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    SecondaryStoreError::Corrupt("encrypted store has no enc field".into())
+                })?;
+            use base64::Engine as _;
+            let blob = base64::engine::general_purpose::STANDARD
+                .decode(enc)
+                .map_err(|error| {
+                    SecondaryStoreError::Corrupt(format!("enc is not base64: {error}"))
+                })?;
+            crypto::decrypt(key, &blob)
+                .map_err(|error| {
+                    SecondaryStoreError::Corrupt(format!("store failed to decrypt: {error}"))
+                })?
+                .to_vec()
+        }
+        other => {
+            return Err(SecondaryStoreError::IncompatibleVersion(
+                u32::try_from(other).unwrap_or(u32::MAX),
+            ));
+        }
+    };
+    let store: SecondaryStore = serde_json::from_slice(&store_bytes)
         .map_err(|error| SecondaryStoreError::Corrupt(error.to_string()))?;
     store.validate()?;
-    Ok(Some(store))
+    Ok(store)
+}
+
+/// [`save_secondary`] with a key resolver (production passes
+/// [`production_key_for`]; tests inject fakes).
+/// # Errors
+///
+/// Returns [`SecondaryStoreError`] when the resolver fails or any durable
+/// write step fails.
+pub fn save_secondary_resolved(
+    path: &Path,
+    store: &SecondaryStore,
+    key_for: impl Fn(&str) -> Result<Zeroizing<Vec<u8>>, SecondaryStoreError>,
+) -> Result<(), SecondaryStoreError> {
+    let key = key_for(&store_user(path)?)?;
+    save_secondary_with_key(path, store, Some(&key))
 }
 
 /// Durably saves the secondary store: write to a sibling temporary, fsync
@@ -515,9 +658,40 @@ pub fn load_secondary(path: &Path) -> Result<Option<SecondaryStore>, SecondarySt
 /// Returns [`SecondaryStoreError::Io`] when any step fails, or
 /// [`SecondaryStoreError::Invalid`] when the store fails validation.
 pub fn save_secondary(path: &Path, store: &SecondaryStore) -> Result<(), SecondaryStoreError> {
+    save_secondary_resolved(path, store, production_key_for)
+}
+
+/// [`save_secondary`] with an explicit key: `Some` writes the encrypted
+/// envelope (owner-only mode, ADR-0024 s1.2 confidentiality); `None` writes
+/// the legacy plaintext format (no-TPM degraded hosts, documented).
+///
+/// # Errors
+///
+/// Returns [`SecondaryStoreError`] when validation, encryption or any
+/// durable step fails; invalid data is never persisted.
+pub fn save_secondary_with_key(
+    path: &Path,
+    store: &SecondaryStore,
+    key: Option<&[u8]>,
+) -> Result<(), SecondaryStoreError> {
     store.validate()?;
-    let bytes =
+    let json =
         serde_json::to_vec(store).map_err(|error| SecondaryStoreError::Io(error.to_string()))?;
+    let bytes = match key {
+        Some(key) => {
+            let blob = crate::crypto::encrypt(key, &json)
+                .map_err(|error| SecondaryStoreError::Io(error.to_string()))?;
+            use base64::Engine as _;
+            let envelope = serde_json::json!({
+                "format_version": SECONDARY_ENC_ENVELOPE_VERSION,
+                "key_id": irlume_common::sha256_hex(key),
+                "enc": base64::engine::general_purpose::STANDARD.encode(&blob),
+            });
+            serde_json::to_vec(&envelope)
+                .map_err(|error| SecondaryStoreError::Io(error.to_string()))?
+        }
+        None => json,
+    };
     if bytes.len() > MAX_STORE_BYTES {
         return Err(SecondaryStoreError::Invalid(
             "serialized store exceeds the size bound".into(),
@@ -536,7 +710,12 @@ pub fn save_secondary(path: &Path, store: &SecondaryStore) -> Result<(), Seconda
     ));
     use std::io::Write;
     let write_all = |temp: &Path| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(temp)?;
+        // Owner-only regardless of umask (ADR-0024 s1.2 permission clause).
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         Ok(())
@@ -605,13 +784,188 @@ mod tests {
         ))
     }
 
+    // ---- Secondary-store encryption (ADR-0024 s1.2) --------------------
+    //
+    // A synthetic key stands in for the account template key: the store
+    // never invents key material, it encrypts with what it is given.
+
+    fn test_key() -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(vec![7u8; 32])
+    }
+
+    #[test]
+    fn a_keyed_save_writes_an_encrypted_envelope_not_plaintext() {
+        let path = temp_path("enc-envelope");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        let bytes = std::fs::read(&path).expect("read");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope parses");
+        assert_eq!(
+            doc["format_version"].as_u64(),
+            Some(SECONDARY_ENC_ENVELOPE_VERSION),
+            "envelope format_version"
+        );
+        assert!(doc["enc"].is_string(), "ciphertext present");
+        assert!(doc["key_id"].is_string(), "key id present");
+        // The plaintext field names of the version-1 store must not leak.
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(!raw.contains("primary_snapshot_sha256"));
+        assert!(!raw.contains("profiles"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_keyed_save_round_trips_through_the_same_key() {
+        let path = temp_path("enc-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        let loaded = load_secondary_with_key(&path, Some(&test_key()))
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            serde_json::to_vec(&loaded).unwrap(),
+            serde_json::to_vec(&store()).unwrap()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_encrypted_store_without_the_key_fails_closed() {
+        let path = temp_path("enc-nokey");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        let error = load_secondary_with_key(&path, None).expect_err("must fail closed");
+        assert!(
+            error.to_string().to_lowercase().contains("key"),
+            "the refusal must name the key: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_wrong_key_fails_closed() {
+        let path = temp_path("enc-wrongkey");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        let other = Zeroizing::new(vec![9u8; 32]);
+        let error = load_secondary_with_key(&path, Some(&other)).expect_err("must fail");
+        assert!(
+            error.to_string().to_lowercase().contains("decrypt"),
+            "wrong key reports a decryption failure: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_closed() {
+        let path = temp_path("enc-tamper");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        // Flip a byte INSIDE the ciphertext blob: the envelope's JSON tail is
+        // not the secret, and corrupting it would test JSON parsing instead.
+        use base64::Engine as _;
+        let bytes = std::fs::read(&path).expect("read");
+        let mut doc: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope parses");
+        let enc = doc["enc"].as_str().expect("enc is a string");
+        let mut blob = base64::engine::general_purpose::STANDARD
+            .decode(enc)
+            .expect("enc is base64");
+        let last = blob.len() - 1; // the GCM tag's final byte
+        blob[last] ^= 0x01;
+        doc["enc"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&blob));
+        let bytes = serde_json::to_vec(&doc).expect("re-encode");
+        std::fs::write(&path, &bytes).expect("rewrite");
+        let error = load_secondary_with_key(&path, Some(&test_key())).expect_err("must fail");
+        assert!(
+            error.to_string().to_lowercase().contains("decrypt"),
+            "tampering reports a decryption failure: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_keyless_save_stays_legacy_plaintext_for_no_tpm_hosts() {
+        let path = temp_path("legacy-write");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), None).expect("save");
+        let bytes = std::fs::read(&path).expect("read");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("plaintext parses");
+        assert_eq!(
+            doc["format_version"].as_u64(),
+            Some(u64::from(SECONDARY_STORE_VERSION)),
+            "legacy format stays version 1"
+        );
+        let loaded = load_secondary_with_key(&path, None)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            serde_json::to_vec(&loaded).unwrap(),
+            serde_json::to_vec(&store()).unwrap()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_legacy_plaintext_store_still_loads_when_a_key_is_offered() {
+        // Migration readability: pre-encryption stores (0.13.0 era) keep
+        // loading unchanged; the upgrade happens on the next write.
+        let path = temp_path("legacy-read");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), None).expect("legacy save");
+        let loaded = load_secondary_with_key(&path, Some(&test_key()))
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded.owner, "alice");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_envelope_records_the_key_id_and_the_layout_stays_nonce_first() {
+        let path = temp_path("enc-layout");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        let bytes = std::fs::read(&path).expect("read");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope parses");
+        use base64::Engine as _;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(doc["enc"].as_str().expect("enc is a string"))
+            .expect("enc is base64");
+        assert!(blob.len() > 12 + 16, "nonce + ciphertext + tag");
+        let plain = crate::crypto::decrypt(&test_key(), &blob).expect("decrypts");
+        let inner: serde_json::Value = serde_json::from_slice(&plain).expect("inner store JSON");
+        assert_eq!(inner["format_version"].as_u64(), Some(1), "inner is v1");
+        assert_eq!(
+            doc["key_id"].as_str(),
+            Some(irlume_common::sha256_hex(&test_key()).as_str()),
+            "key_id binds the key identity"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keyed_saves_pin_the_file_owner_only_mode() {
+        let path = temp_path("enc-mode");
+        let _ = std::fs::remove_file(&path);
+        save_secondary_with_key(&path, &store(), Some(&test_key())).expect("save");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the store must be owner-only");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_valid_store_round_trips_and_a_missing_file_is_none() {
         let path = temp_path("valid");
         let _ = std::fs::remove_file(&path);
         assert!(matches!(load_secondary(&path), Ok(None)));
         let original = store();
-        save_secondary(&path, &original).expect("save");
+        // Legacy plaintext write: this test pins the version-1 format that
+        // no-TPM hosts (and pre-encryption stores) use.
+        save_secondary_with_key(&path, &original, None).expect("save");
         let loaded = load_secondary(&path).expect("load").expect("present");
         // FaceScan carries no PartialEq (legacy type); equality by
         // deterministic serialization.
@@ -645,16 +999,16 @@ mod tests {
     #[test]
     fn whole_store_rejection_unsupported_version_corrupt_and_invalid() {
         let path = temp_path("reject");
-        // Unsupported version.
+        // Unsupported version (2 is the encrypted-envelope version now).
         let bytes = serde_json::to_vec(&SecondaryStore {
-            format_version: 2,
+            format_version: 99,
             ..store()
         })
         .unwrap();
         std::fs::write(&path, &bytes).unwrap();
         assert!(matches!(
             load_secondary(&path),
-            Err(SecondaryStoreError::IncompatibleVersion(2))
+            Err(SecondaryStoreError::IncompatibleVersion(99))
         ));
         // Corrupt.
         std::fs::write(&path, b"{not json").unwrap();
@@ -723,7 +1077,7 @@ mod tests {
             .insert("embed:test".into(), calib.clone());
         let path = temp_path("calib");
         let _ = std::fs::remove_file(&path);
-        save_secondary(&path, &with_calib).expect("save");
+        save_secondary_with_key(&path, &with_calib, None).expect("save");
         let loaded = load_secondary(&path).expect("load").expect("present");
         assert_eq!(
             serde_json::to_vec(&loaded.groups[0].profiles[0].ir_calibs.get("embed:test")).unwrap(),
@@ -914,7 +1268,9 @@ mod tests {
         assert!(many.validate().is_err());
         let path = temp_path("bounds");
         let _ = std::fs::remove_file(&path);
-        assert!(save_secondary(&path, &many).is_err());
+        // The rejection must be the VALIDATION failure, not key resolution:
+        // pin it through the explicit-key write.
+        assert!(save_secondary_with_key(&path, &many, None).is_err());
         assert!(matches!(load_secondary(&path), Ok(None)));
         let _ = std::fs::remove_file(&path);
     }

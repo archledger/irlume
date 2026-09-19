@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Secondary multi-camera stores are now encrypted at rest under the
+  account template key (AES-256-GCM, owner-only files), closing the gap
+  against ADR-0024 s1.2 that 0.13.0 shipped: 0.13.0-era plaintext
+  `cameras/<user>.json` stores upgrade to encrypted on their next write,
+  the commit journal carries only encrypted bytes, and an unavailable key
+  fails closed instead of downgrading. Keyless (no-TPM) hosts keep the
+  documented root-only plaintext behavior.
 - A KDE Plasma System Settings module (KCM): read-only status, diagnostics,
   camera census and login-wiring pages rendered from the machine API, plus
   launch buttons that hand interactive work to the TUI (deep-linked when

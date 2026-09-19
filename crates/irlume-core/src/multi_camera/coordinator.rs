@@ -173,7 +173,7 @@ mod integration {
         ensure_not_consumed, AuthorizationVia, EnrollmentAuthorization, EnrollmentOperation,
     };
     use super::super::commit::{
-        publish_with_intent, resolve_commit, CommitResolution, GrantDecision as Boundary,
+        publish_with_intent_key, resolve_commit, CommitResolution, GrantDecision as Boundary,
     };
     use super::super::{
         CameraGroupId, GroupPair, SecondaryGroup, SecondaryProfileScans, SecondaryStore,
@@ -253,7 +253,8 @@ mod integration {
                 }],
             };
             let digest = store.primary_snapshot_sha256.clone();
-            publish_with_intent(&self.secondary_path(), &store, &digest).expect("publish");
+            publish_with_intent_key(&self.secondary_path(), &store, &digest, None)
+                .expect("publish");
             (rgb.to_string(), ir.to_string())
         }
     }
@@ -313,7 +314,7 @@ mod integration {
                 }],
             }],
         };
-        publish_with_intent(&rig.secondary_path(), &store, &digest).expect("publish");
+        publish_with_intent_key(&rig.secondary_path(), &store, &digest, None).expect("publish");
         let context = SecondaryAuthContext::pin(
             &rig.secondary_path(),
             &rig.primary_path(),
@@ -353,7 +354,7 @@ mod integration {
                 }],
             }],
         };
-        publish_with_intent(&rig.secondary_path(), &store, &digest).expect("publish");
+        publish_with_intent_key(&rig.secondary_path(), &store, &digest, None).expect("publish");
         let refused = SecondaryAuthContext::pin(
             &rig.secondary_path(),
             &rig.primary_path(),
@@ -448,7 +449,8 @@ mod integration {
         )
         .expect("mint");
         ensure_not_consumed(&auth, removed.generation, None).expect("fresh");
-        publish_with_intent(&rig.secondary_path(), &removed, &digest).expect("publish removal");
+        publish_with_intent_key(&rig.secondary_path(), &removed, &digest, None)
+            .expect("publish removal");
         // The pinned attempt now refuses: revoked group, changed generation.
         assert!(matches!(
             context.boundary_check_now(),
@@ -472,7 +474,8 @@ mod integration {
         bumped.generation = 2;
         let primary_bytes = std::fs::read(rig.primary_path()).unwrap();
         let digest = irlume_common::sha256_hex(&primary_bytes);
-        publish_with_intent(&rig.secondary_path(), &bumped, &digest).expect("clean publish");
+        publish_with_intent_key(&rig.secondary_path(), &bumped, &digest, None)
+            .expect("clean publish");
         // pin resolves cleanly (nothing pending) and sees generation 2.
         let context = SecondaryAuthContext::pin(
             &rig.secondary_path(),

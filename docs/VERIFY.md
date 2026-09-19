@@ -29,9 +29,9 @@ New encrypted writes use version `3`, with a public `key_id` and an `enc`
 ciphertext field; legacy encrypted version `2` remains readable. Expect mode
 `600 root:root`. The biometric data is an encrypted blob, not readable embeddings,
 and no image is ever written. If you enrolled a secondary camera (0.13.0+), its
-`cameras/<user>.json` store is root-only plaintext JSON today - a known
-deviation from ADR-0024 s1.2 - so that file *will* read as fields and floats
-(still embeddings, never images).
+`cameras/<user>.json` store uses the same encryption as the primary
+(upgraded on its next write after updating from 0.13.0), so it also reads
+as an opaque `enc` blob - never as fields and floats.
 
 On a machine **without** a TPM the daemon stores the same embeddings root-only
 but unencrypted. The TUI says so on the Keyring tab, and the cross-machine

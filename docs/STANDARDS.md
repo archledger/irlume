@@ -127,9 +127,9 @@ and its live audit are in [SECURITY_AT_REST.md](SECURITY_AT_REST.md) (tested
   policy), files
   are `0600 root:root`, and the daemon releases profile data only to the
   owning user or root (`SO_PEERCRED`). The audit's disk-theft test found only
-  ciphertext: no plaintext floats, no field names, no image data. Known gap:
-  the secondary multi-camera store (`cameras/<user>.json`, 0.13.0+) is
-  root-only plaintext JSON today (see
+  ciphertext: no plaintext floats, no field names, no image data. Secondary
+  multi-camera stores carry the same encryption and owner-only treatment
+  (0.13.0-era plaintext stores upgrade on their next write; see
   [SECURITY_AT_REST.md](SECURITY_AT_REST.md)).
 - **Renewability.** Profiles and individual scans can be deleted and
   re-enrolled at any time. The honest limit: templates are embeddings from a

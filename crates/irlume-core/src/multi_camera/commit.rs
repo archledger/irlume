@@ -37,6 +37,7 @@
 
 use super::{load_secondary, Activation, SecondaryStore, SecondaryStoreError};
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// One recorded two-store intent. The journal carries everything recovery
@@ -122,7 +123,12 @@ fn durable_write(path: &Path, bytes: &[u8]) -> Result<(), CommitError> {
             .unwrap_or_else(|| "store".into()),
         std::process::id()
     ));
-    let mut file = std::fs::File::create(&temp).map_err(|e| CommitError::Io(e.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|e| CommitError::Io(e.to_string()))?;
     file.write_all(bytes)
         .map_err(|e| CommitError::Io(e.to_string()))?;
     file.sync_all()
@@ -148,13 +154,59 @@ pub fn publish_with_intent(
     new_store: &SecondaryStore,
     primary_snapshot_sha256: &str,
 ) -> Result<(), CommitError> {
+    // Production key resolution: the account template key of the store's
+    // owner (the file stem), mirroring the primary store's at-write
+    // resolution. Journal and store both carry the ENCRYPTED bytes, so no
+    // plaintext embeddings ever touch the intent journal.
+    let user = secondary_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| CommitError::Io("secondary path has no file stem".into()))?;
+    let key = super::production_key_for(&user)?;
+    publish_with_intent_key(
+        secondary_path,
+        new_store,
+        primary_snapshot_sha256,
+        Some(&key),
+    )
+}
+
+/// [`publish_with_intent`] with an explicit key: `Some` journals and writes
+/// the encrypted envelope; `None` writes the legacy plaintext format
+/// (no-TPM degraded hosts, documented).
+///
+/// # Errors
+///
+/// Returns [`CommitError`] when validation or any durable step fails. A
+/// failure before the commit point leaves the previous store authoritative
+/// and the journal for [`resolve_commit`] to finish or discard.
+pub fn publish_with_intent_key(
+    secondary_path: &Path,
+    new_store: &SecondaryStore,
+    primary_snapshot_sha256: &str,
+    key: Option<&[u8]>,
+) -> Result<(), CommitError> {
     new_store.validate()?;
     if new_store.primary_snapshot_sha256 != primary_snapshot_sha256 {
         return Err(CommitError::Store(SecondaryStoreError::Invalid(
             "store binding disagrees with the transaction's primary digest".into(),
         )));
     }
-    let bytes = serde_json::to_vec(new_store).map_err(|e| CommitError::Io(e.to_string()))?;
+    let plaintext = serde_json::to_vec(new_store).map_err(|e| CommitError::Io(e.to_string()))?;
+    let bytes: Vec<u8> = match key {
+        Some(key) => {
+            let blob = crate::crypto::encrypt(key, &plaintext)
+                .map_err(|e| CommitError::Io(e.to_string()))?;
+            use base64::Engine as _;
+            let envelope = serde_json::json!({
+                "format_version": super::SECONDARY_ENC_ENVELOPE_VERSION,
+                "key_id": irlume_common::sha256_hex(key),
+                "enc": base64::engine::general_purpose::STANDARD.encode(&blob),
+            });
+            serde_json::to_vec(&envelope).map_err(|e| CommitError::Io(e.to_string()))?
+        }
+        None => plaintext,
+    };
     // Writers create the store's directory before publication (the fixed
     // location sits in a `cameras/` subdirectory legacy code never made).
     if let Some(parent) = secondary_path.parent() {
@@ -210,15 +262,29 @@ pub fn resolve_commit(secondary_path: &Path) -> Result<CommitResolution, CommitE
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&intent.new_secondary_b64)
         .map_err(|e| CommitError::Io(format!("journal payload undecodable: {e}")))?;
-    let store: SecondaryStore = serde_json::from_slice(&bytes)
+    // The payload may be a plaintext v1 store (legacy journals) or the
+    // encrypted envelope (keyed publications). Recovery is verbatim either
+    // way - the envelope is never decrypted here (no key is needed to
+    // complete a publication that was already authorized) - so validation
+    // is structural only: the envelope's fields were checked at publish
+    // time and the store is fully validated on the next load.
+    let doc: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| CommitError::Io(format!("journal payload corrupt: {e}")))?;
-    store.validate()?;
-    if store.generation != intent.generation
-        || store.primary_snapshot_sha256 != intent.primary_snapshot_sha256
-    {
-        return Err(CommitError::Io(
-            "journal payload disagrees with its own metadata".into(),
-        ));
+    let declared = doc
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CommitError::Io("journal payload has no format_version".into()))?;
+    if declared != super::SECONDARY_ENC_ENVELOPE_VERSION {
+        let store: SecondaryStore = serde_json::from_slice(&bytes)
+            .map_err(|e| CommitError::Io(format!("journal payload corrupt: {e}")))?;
+        store.validate()?;
+        if store.generation != intent.generation
+            || store.primary_snapshot_sha256 != intent.primary_snapshot_sha256
+        {
+            return Err(CommitError::Io(
+                "journal payload disagrees with its own metadata".into(),
+            ));
+        }
     }
     // Recover-forward: complete the publication from the journal's payload.
     durable_write(secondary_path, &bytes)?;
@@ -371,7 +437,7 @@ mod tests {
         let (secondary_path, _) = paths("clean");
         let primary_digest = irlume_common::sha256_hex(b"primary-v1");
         let store = store_for(&primary_digest, 1);
-        publish_with_intent(&secondary_path, &store, &primary_digest).expect("publish");
+        publish_with_intent_key(&secondary_path, &store, &primary_digest, None).expect("publish");
         assert!(matches!(
             resolve_commit(&secondary_path),
             Ok(CommitResolution::Clean)
@@ -416,7 +482,7 @@ mod tests {
     fn a_binding_disagreement_refuses_publication_before_any_write() {
         let (secondary_path, _) = paths("disagree");
         let store = store_for(&"a".repeat(64), 1);
-        let error = publish_with_intent(&secondary_path, &store, &"b".repeat(64))
+        let error = publish_with_intent_key(&secondary_path, &store, &"b".repeat(64), None)
             .expect_err("disagreement refuses");
         assert!(error.to_string().contains("disagrees"));
         // Nothing was written, journal included.
@@ -482,7 +548,7 @@ mod tests {
         std::fs::write(&primary_path, primary).expect("primary");
         let digest = irlume_common::sha256_hex(primary);
         let store = store_for(&digest, 3);
-        publish_with_intent(&secondary_path, &store, &digest).expect("publish");
+        publish_with_intent_key(&secondary_path, &store, &digest, None).expect("publish");
         let pinned = GrantContext {
             secondary_generation: 3,
             primary_snapshot_sha256: digest,

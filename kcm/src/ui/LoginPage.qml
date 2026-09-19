@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Login wiring page: the login-status document. Changing the wiring is a
-// transactional flow in the TUI (plan/apply/verify/rollback); this page
-// only reports state. The pam-regeneration-guard state lives in the
-// Diagnostics doctor document, not here.
+// Login wiring: the login-status document as native form rows. Changing
+// the wiring is a transactional flow in the TUI
+// (plan/apply/verify/rollback); this page only reports state. The
+// pam-regeneration-guard state lives in the Diagnostics doctor document,
+// not here.
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls as Controls
@@ -45,12 +46,8 @@ KCMUtils.SimpleKCM {
         }
     }
 
-    ColumnLayout {
-        // Same centered column as the Overview page.
-        width: Math.min(parent.width - 2 * Kirigami.Units.largeSpacing,
-                        Kirigami.Units.gridUnit * 46)
-        x: Math.round((parent.width - width) / 2)
-        spacing: Kirigami.Units.largeSpacing
+    Kirigami.FormLayout {
+        wideMode: true
 
         Kirigami.InlineMessage {
             Layout.fillWidth: true
@@ -68,71 +65,82 @@ KCMUtils.SimpleKCM {
                   : "irlume did not answer"
         }
 
-        Controls.BusyIndicator {
-            visible: root.pending
-            running: root.pending
-        }
-
-        Kirigami.AbstractCard {
-            Layout.fillWidth: true
-            visible: root.doc.ok === true
-            contentItem: ColumnLayout {
-                spacing: Kirigami.Units.smallSpacing
-                Controls.Label {
-                    text: root.doc.ok && root.doc.data.login_manager.known
-                          ? ("Login manager: " + root.doc.data.login_manager.name)
-                          : "Login manager: not recognized"
-                    font.weight: Font.DemiBold
-                }
-                Controls.Label {
-                    visible: root.doc.ok && root.doc.data.selinux_module !== undefined
-                    enabled: false
-                    text: "SELinux module: " + root.doc.data.selinux_module
-                }
+        RowLayout {
+            Kirigami.FormData.label: "Login manager:"
+            Controls.Label {
+                text: root.doc.ok && root.doc.data.login_manager.known
+                      ? root.doc.data.login_manager.name
+                      : "not recognized"
+                color: root.doc.ok && root.doc.data.login_manager.known
+                      ? Kirigami.Theme.textColor
+                      : Kirigami.Theme.disabledTextColor
             }
         }
 
-        Repeater {
-            model: root.surfaces
+        RowLayout {
+            Kirigami.FormData.label: "SELinux module:"
+            Controls.Label {
+                text: root.doc.ok ? String(root.doc.data.selinux_module) : ""
+                color: Kirigami.Theme.disabledTextColor
+            }
+        }
 
-            delegate: Kirigami.AbstractCard {
-                Layout.fillWidth: true
-                visible: modelData.present === true || modelData.wired === true
-                contentItem: RowLayout {
-                    spacing: Kirigami.Units.largeSpacing
-                    Controls.Label {
-                        text: modelData.id
-                        font.weight: Font.DemiBold
-                    }
-                    Controls.Label {
-                        Layout.fillWidth: true
-                        text: modelData.role
-                        color: Kirigami.Theme.disabledTextColor
-                    }
-                    Controls.Label {
-                        visible: modelData.mode !== undefined
-                        text: modelData.mode
-                        color: Kirigami.Theme.disabledTextColor
-                    }
-                    Controls.Label {
-                        text: modelData.wired ? "wired" : "not wired"
-                        color: modelData.wired ? Kirigami.Theme.positiveTextColor
-                                              : Kirigami.Theme.neutralTextColor
-                    }
+        Kirigami.Separator {
+            Layout.fillWidth: true
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: "Surfaces"
+        }
+
+        Repeater {
+            model: root.surfaces.filter(s => s.present === true || s.wired === true)
+
+            delegate: RowLayout {
+                Kirigami.FormData.label: modelData.id + ":"
+                Controls.Label {
+                    text: modelData.role
+                    color: Kirigami.Theme.disabledTextColor
+                }
+                Controls.Label {
+                    visible: modelData.mode !== undefined
+                    text: modelData.mode
+                    color: Kirigami.Theme.disabledTextColor
+                }
+                Controls.Label {
+                    text: modelData.wired ? "wired" : "present, not wired"
+                    color: modelData.wired ? Kirigami.Theme.positiveTextColor
+                                          : Kirigami.Theme.neutralTextColor
                 }
             }
         }
 
         RowLayout {
+            Kirigami.FormData.label: "Change:"
             Controls.Button {
                 text: "Change wiring in irlume"
                 icon.name: "utilities-terminal"
                 visible: root.doc.ok === true
                 onClicked: kcm.launchTui("login")
             }
-            Item { Layout.fillWidth: true }
+        }
+    }
+
+    footer: Item {
+        implicitHeight: footerRow.implicitHeight + 2 * Kirigami.Units.smallSpacing
+        RowLayout {
+            id: footerRow
+            anchors.fill: parent
+            anchors.leftMargin: Kirigami.Units.largeSpacing
+            anchors.rightMargin: Kirigami.Units.largeSpacing
+            anchors.topMargin: Kirigami.Units.smallSpacing
+            anchors.bottomMargin: Kirigami.Units.smallSpacing
+            Controls.Label {
+                text: root.pending ? "Working…" : ""
+                enabled: false
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+            }
             Controls.Button {
-                text: root.pending ? "Working…" : "Refresh"
+                text: "Refresh"
                 icon.name: "view-refresh"
                 enabled: !root.pending
                 onClicked: root.refresh()

@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Cameras page: the census document (read-only capability: node opens for
-// classification, no streaming, no daemon). The CONFIGURED pair is not
-// shown: contract 1 publishes camera capability without identity; picking
-// the pair happens in the TUI.
+// Cameras: the census document as native form rows. Read-only capability
+// (node opens for classification, no streaming, no daemon). The CONFIGURED
+// pair is not shown: contract 1 publishes camera capability without
+// identity; picking the pair happens in the TUI.
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls as Controls
@@ -47,12 +47,8 @@ KCMUtils.SimpleKCM {
         }
     }
 
-    ColumnLayout {
-        // Same centered column as the Overview page.
-        width: Math.min(parent.width - 2 * Kirigami.Units.largeSpacing,
-                        Kirigami.Units.gridUnit * 46)
-        x: Math.round((parent.width - width) / 2)
-        spacing: Kirigami.Units.largeSpacing
+    Kirigami.FormLayout {
+        wideMode: true
 
         Kirigami.InlineMessage {
             Layout.fillWidth: true
@@ -77,74 +73,86 @@ KCMUtils.SimpleKCM {
             text: "The census may be incomplete: " + root.listingError
         }
 
-        Controls.BusyIndicator {
-            visible: root.pending
-            running: root.pending
-        }
-
         Controls.Label {
             visible: root.doc.ok === true && root.entries.length === 0 && root.listingError.length === 0
             enabled: false
-            text: "No camera-like devices were classified."
+            text: root.pending ? "Classifying camera devices…" : "No camera-like devices were classified."
         }
 
         Repeater {
             model: root.entries
 
-            delegate: Kirigami.AbstractCard {
-                Layout.fillWidth: true
-                contentItem: ColumnLayout {
-                    spacing: Kirigami.Units.smallSpacing
-                    RowLayout {
-                        spacing: Kirigami.Units.largeSpacing
-                        Controls.Label {
-                            text: modelData.node
-                            font.weight: Font.DemiBold
-                        }
-                        Controls.Label {
-                            text: modelData.class
-                            color: Kirigami.Theme.disabledTextColor
-                        }
-                        Controls.Label {
-                            visible: modelData.verdict !== undefined
-                            text: modelData.verdict
-                        }
-                        Item { Layout.fillWidth: true }
-                        Controls.Label {
-                            visible: modelData.privacy_engaged === true
-                            text: "privacy shutter"
-                            color: Kirigami.Theme.neutralTextColor
-                        }
-                    }
-                    Repeater {
-                        model: modelData.evidence
-                        delegate: Controls.Label {
-                            Layout.fillWidth: true
-                            text: "· " + modelData
-                            wrapMode: Text.Wrap
-                            color: Kirigami.Theme.disabledTextColor
-                        }
+            delegate: ColumnLayout {
+                spacing: Kirigami.Units.smallSpacing
+
+                RowLayout {
+                    spacing: Kirigami.Units.largeSpacing
+                    Controls.Label {
+                        Kirigami.FormData.label: "Device:"
+                        text: modelData.node
+                        font.weight: Font.DemiBold
                     }
                     Controls.Label {
-                        visible: modelData.note !== undefined && modelData.note !== null && modelData.note !== ""
-                        Layout.fillWidth: true
-                        text: modelData.note === undefined ? "" : String(modelData.note)
-                        wrapMode: Text.Wrap
+                        text: modelData.verdict
+                        color: modelData.verdict === "supported"
+                              ? Kirigami.Theme.positiveTextColor
+                              : Kirigami.Theme.disabledTextColor
                     }
+                }
+                Controls.Label {
+                    Kirigami.FormData.label: "Class:"
+                    text: modelData.class
+                    color: Kirigami.Theme.disabledTextColor
+                }
+                Repeater {
+                    model: modelData.evidence
+                    delegate: Controls.Label {
+                        Layout.fillWidth: true
+                        text: modelData
+                        wrapMode: Text.Wrap
+                        color: Kirigami.Theme.disabledTextColor
+                    }
+                }
+                Controls.Label {
+                    visible: modelData.note !== undefined && modelData.note !== null && modelData.note !== ""
+                    Layout.fillWidth: true
+                    text: modelData.note === undefined ? "" : String(modelData.note)
+                    wrapMode: Text.Wrap
+                }
+                Kirigami.Separator {
+                    Layout.fillWidth: true
                 }
             }
         }
 
         RowLayout {
+            Kirigami.FormData.label: "Pair:"
             Controls.Button {
                 text: "Pick the camera pair in irlume"
                 icon.name: "utilities-terminal"
                 visible: root.doc.ok === true
                 onClicked: kcm.launchTui("cameras")
             }
-            Item { Layout.fillWidth: true }
+        }
+    }
+
+    footer: Item {
+        implicitHeight: footerRow.implicitHeight + 2 * Kirigami.Units.smallSpacing
+        RowLayout {
+            id: footerRow
+            anchors.fill: parent
+            anchors.leftMargin: Kirigami.Units.largeSpacing
+            anchors.rightMargin: Kirigami.Units.largeSpacing
+            anchors.topMargin: Kirigami.Units.smallSpacing
+            anchors.bottomMargin: Kirigami.Units.smallSpacing
+            Controls.Label {
+                text: root.pending ? "Working…" : ""
+                enabled: false
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+            }
             Controls.Button {
-                text: root.pending ? "Working…" : "Refresh"
+                text: "Refresh"
                 icon.name: "view-refresh"
                 enabled: !root.pending
                 onClicked: root.refresh()

@@ -6,7 +6,7 @@
         ],
         "Icon": "io.github.archledger.Irlume",
         "Name": "irlume",
-        "Version": "0.13.0"
+        "Version": "0.14.0"
     },
     "X-KDE-Keywords": "face,login,authentication,biometric,camera,IR",
     "X-KDE-System-Settings-Parent-Category": "personalization"

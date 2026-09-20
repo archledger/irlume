@@ -3,8 +3,9 @@
 Irlume's desktop direction is on-demand consent through stock authentication
 interfaces. Select a face attempt explicitly; ordinary password authentication
 remains available. Experimental automatic desktop integration has been retired.
-Contributors may propose future frontend support, but it is not an active
-Irlume implementation target or a promised upstream feature.
+Provider-neutral start/cancel and password concurrency are the next frontend
+design candidate in the [roadmap](ROADMAP.md), not a shipped integration or a
+promised upstream feature.
 
 ## Existing desktop flow
 
@@ -18,6 +19,12 @@ Existing greeter compatibility remains supported: the established `facefirst`,
 `ondemand`, and legacy `wait` arguments are retained where existing deployments
 use them. The standard on-demand desktop setup does not use `wait`. This cleanup
 does not migrate existing PAM files or change credential-release behavior.
+
+Automatic wiring chooses on-demand for detected GNOME 46+ (measured on GNOME
+50; 46–49 remain inferred), and face-first for older or undetected GNOME.
+Unknown greeters can also receive face-first wiring. Separately, a stale capture
+qualification can trigger a delayed background camera measurement without a
+fresh user action; see [the automatic-capture exception](LIMITATIONS.md).
 
 The separate `irlume auth consent` setting controls typed confirmation for
 privileged sudo/polkit requests. Its existing owner opt-in is retained and does
@@ -46,7 +53,10 @@ for login, lock, and unknown services; 5 seconds for short privileged services
 including sudo, doas, and polkit. These are maximum admission windows, not
 required scan durations. A completed denial or a retry that cannot fit may finish
 earlier. `IRLUME_GRACE_MS` remains the explicit 0–60000 ms override; zero retains
-legacy single-attempt behavior. A measured
+legacy single-attempt behavior. The separate owner opt-in
+`privileged_grouped_pad_evidence` can extend a default five-second privileged
+window to 15 seconds when the eligible sequential grouped-PAD route needs it.
+An explicit `IRLUME_GRACE_MS` still wins. A measured
 fixed-startup empty-view IR capture on one Minihost took about 5.5 seconds before
 identity work, so prerequisite-ready does not imply the five-second services can
 complete. The target-bound IR route now uses adaptive startup while retaining the
@@ -97,6 +107,11 @@ worker lifecycle; cancellation of a queued PAM conversation does not itself
 interrupt a synchronous daemon request or invalidate a queued success.
 Supported frontend lifecycle integration would need separate contributor and
 upstream work. No integration is enabled based solely on a service name.
+
+Password fallback means Irlume returns to the password provider on face
+refusal. It does not guarantee simultaneous password entry during an active
+scan, or override OS account policy. For example, `pam_faillock` can reject
+passwords independently of Irlume's face-retry counter.
 
 ## Validation scope
 

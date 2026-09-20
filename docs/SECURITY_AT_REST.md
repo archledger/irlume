@@ -9,8 +9,10 @@ Live-tested on real hardware (Fedora TPM box + Arch TPM box); results below.
 > root-only plaintext JSON - a gap against this page's own bar, recorded in
 > ADR-0024 and since closed: secondary stores are now AES-256-GCM encrypted
 > under the same account template key as the primary (owner-only files,
-> upgrade-on-write from 0.13.0-era plaintext). Everything below that says
-> "encrypted" covers both stores on TPM hosts.
+> upgrade-on-write from 0.13.0-era plaintext). Encryption claims below cover
+> secondary stores only after that migration. Installing v0.14.0 or reading an
+> existing store does not encrypt it; the next authorized write does. Older
+> plaintext files and backups retain their earlier exposure.
 
 ## What is stored and what is NOT
 
@@ -36,9 +38,9 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    *Tested:* a normal user `cat` → **Permission denied** (both files).
 2. **Encryption at rest: AES-256-GCM.** On a TPM host the embeddings are
    encrypted (random 96-bit nonce per write, GCM auth tag) - in the primary
-   store AND in the secondary multi-camera stores (same account template
-   key, separate envelope). *Tested:* the on-disk file's `enc` field is
-   opaque base64; grepping it for `rgb`, `embedding`, `scans`, or any
+   store and in new or migrated secondary multi-camera stores (same account
+   template key, separate envelope). *Original primary-store test:* the
+   on-disk file's `enc` field is opaque base64; grepping it for `rgb`, `embedding`, `scans`, or any
    `NN.NNNN` float → **nothing** (no plaintext leak).
 3. **Key custody: TPM-sealed, never on disk in the clear.** The AES key is a
    random 32 bytes sealed by the TPM. The stored key envelope holds only the
@@ -106,7 +108,7 @@ So the realistic attacks and their outcomes:
 | Attacker capability | Outcome |
 |---|---|
 | Normal user account on the box | Can't read either file (0600 root) |
-| Steals the disk / backup image (**TPM host**) | Ciphertext only (primary and secondary stores); key won't unseal on any other TPM → **no data** |
+| Steals the disk / backup image (**TPM host**) | Encrypted primary and migrated secondary ciphertext will not unseal on another TPM; unmigrated v0.13.0 secondary files and old plaintext backups remain exposed |
 | Steals the disk / backup image (**no-TPM host**) | Templates are root-only but **plaintext** (see "Degraded hosts" below): recoverable 512-D embeddings, not an image |
 | Steals disk AND has the physical machine, no root | Must defeat the TPM's PCR policy + get root to run the daemon path |
 | Root on the live original machine | Game over: root can ask the daemon to unseal (true of any at-rest scheme; root is the trust boundary) |

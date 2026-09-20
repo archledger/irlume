@@ -114,8 +114,10 @@ authentication**. `irlume doctor` confirms the action is registered.
 - Browser-extension biometric unlock rides the same desktop app via native
   messaging; enable "biometric unlock in browser" in the desktop settings.
 
-There is no Bitwarden-specific code in irlume. Any app using polkit this way
-works the same day it ships.
+The action installer above is Bitwarden-specific. Authentication uses Irlume's
+generic polkit path and returns a verdict, not a vault key. Other applications
+need their own compatible polkit flow and qualification; Bitwarden's result
+does not establish KeePassXC or 1Password vault support.
 
 ## Security stance
 

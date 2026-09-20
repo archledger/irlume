@@ -17,13 +17,32 @@ decision: both PAD models ship default-on and bundled, verified at startup
 lane was later removed outright
 ([ADR-0015](adr/0015-remove-thirdparty-model-lane.md)).
 
+The shipped recognizer now loads from the same bytes checked at startup;
+ONNX Runtime workers no longer spin while idle. Multi-camera enrollment,
+grouped capture and latency improvements shipped in v0.13.0. v0.14.0 adds
+secondary-store encryption and the KDE System Settings dashboard with TUI
+launch buttons. Native privileged KCM controls remain optional future work.
+
 ## Still open: footprint
 
 - Convert the recognizer model to external-data ONNX so onnxruntime maps it
-  from disk instead of copying it; the daemon currently holds about 617 MB
-  resident for 260 MB of weights.
-- Read each model once at startup (checksum and load from the same buffer)
-  and stop onnxruntime worker threads from spin-waiting.
+  from disk instead of copying it, subject to measured benefit and model-load
+  compatibility. The original audit's about 617 MB resident for 260 MB of
+  weights is a historical observation, not a current memory budget.
+- Measure current cold/warm latency, idle and peak RSS, idle CPU and energy
+  per attempt on named hardware. Preserve the full PAD admission protocol.
+
+## Recommended next work
+
+The September 2026 review puts protocol correctness and support accuracy first,
+followed by a provider-neutral frontend lifecycle contract, current-release
+upgrade/rollback qualification, and explicit docking/camera-choice behavior.
+Frontend work needs selected-user binding, an independently usable password
+path, explicit start/cancel and no grant after cancellation; it is a design
+candidate, not a shipped integration. Targeted model-interface tests, MIPI/IPU
+diagnostics, accessibility and localization follow their own evidence and user
+needs. Compile-only NPU experiments do not establish inference parity or a
+shipped acceleration guarantee.
 
 ## Ongoing
 
@@ -32,9 +51,11 @@ lane was later removed outright
   that can be tested without hardware. With the Tier-1 signed-PCR unseal now
   working (see below), the `seal_unseal_signed_pcr_roundtrip_real_hardware`
   test on a systemd-boot/UKI host covers `seal_authorized` / `unseal_authorized`
-  and the full suite reaches ~80.1% line coverage. The remaining points are
-  hardware-only paths (live-face match, camera streaming, the TTY main loops)
-  that CI cannot exercise. swtpm still cannot run the signed-PCR test: it
+  and an earlier full suite reached ~80.1% line coverage. The v0.14.0
+  [September 19 nightly run](https://github.com/archledger/irlume/actions/runs/35447111819)
+  recorded 83.03% line coverage; neither figure is a timeless coverage claim.
+  Remaining gaps include attended live-face and TTY interaction paths beyond
+  the unattended camera/TPM lanes. swtpm still cannot run the signed-PCR test: it
   rejects the `TPM2_PolicyAuthorize` ticket from `TPM2_VerifySignature`
   (`TPM_RC_VALUE`), so that test stays `#[ignore]` and runs on real signed-UKI
   hardware; do not re-attempt a swtpm signed-PCR test.
@@ -49,9 +70,9 @@ lane was later removed outright
   `PolicyKind::Authorized`.
 - cargo-vet with the Mozilla and Google shared audit sets for the
   dependency tree (359 lockfile packages at 0.13.0).
-- Hardware reports: more IR camera modules, NixOS on bare metal, Fedora
-  Atomic, Ubuntu derivatives. [docs/PLATFORMS.md](PLATFORMS.md) tracks the
-  matrix.
+- Hardware reports: more IR camera modules, NixOS on bare metal, and live-face
+  qualification beyond the recorded Silverblue/Pop!_OS installation and password
+  tests. [docs/PLATFORMS.md](PLATFORMS.md) tracks the matrix and its dates.
 - IR exposure control where cameras support it, to attack the documented
   outdoor/backlit failure mode.
 

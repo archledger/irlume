@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Microsoft Face Authentication payloads now use the specified eight-byte
+  interface entries in both mode selection and readback evidence. Valid
+  multi-interface controls are accepted; truncated or compact entries,
+  reserved flag bits, duplicate interfaces and nonzero padding are refused.
+  The measured single-interface nine-byte payload is unchanged.
+- Public support guidance distinguishes shipped v0.14.0 behavior from dated
+  hardware validation, frontend-dependent password/cancel behavior, and
+  secondary-store migration on the next authorized write.
 - Release SBOM generation now runs once in an isolated committed source tree,
   preserves versioned component and binary-target identities, rewrites dependency
   edges consistently, and removes local filesystem URLs. The release verifier

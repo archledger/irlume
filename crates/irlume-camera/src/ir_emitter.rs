@@ -4817,8 +4817,13 @@ fn try_documented_control<
 /// On both of those cameras this produces `01 03 02`, byte for byte the payload
 /// separately validated on each of them.
 ///
-/// Layout, confirmed against both: `bNumEntries`, then two bytes per entry,
-/// `bStreamingInterface` and `bmControlFlags`, zero-padded to `GET_LEN`.
+/// The [Microsoft payload table] defines `bNumEntries`, then eight bytes per
+/// entry: one `bInterfaceNumber` and seven `bmControlFlags` bytes. D3 through
+/// D55 are reserved zero. Both measured cameras use one complete nine-byte
+/// payload; the three-byte prefixes above omit the six reserved bytes.
+/// Vendor-specific `GET_LEN` padding beyond the entries must also be zero.
+///
+/// [Microsoft payload table]: https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/images/uvc-1-15-07.png
 ///
 /// Every structural contradiction is a refusal rather than a repair. The point
 /// is not to get a payload out of the camera; it is to write nothing when the
@@ -4846,13 +4851,14 @@ pub(crate) fn face_auth_payload(def: &[u8], max: &[u8]) -> std::result::Result<V
             def.len()
         ));
     }
-    // One count byte, then whole two-byte entries.
-    if len < 3 || !(len - 1).is_multiple_of(2) {
+    // One count byte, then complete eight-byte entries. wLength is
+    // vendor-specific: any remaining zero bytes are padding, not entries.
+    if len < 9 {
         return Err(format!("a {len}-byte payload cannot hold whole entries"));
     }
 
     let entries = usize::from(max[0]);
-    let capacity = (len - 1) / 2;
+    let capacity = (len - 1) / 8;
     if entries == 0 {
         return Err("it advertises no interface capable of face authentication".into());
     }
@@ -4879,13 +4885,20 @@ pub(crate) fn face_auth_payload(def: &[u8], max: &[u8]) -> std::result::Result<V
     let mut seen: Vec<u8> = Vec::with_capacity(entries);
 
     for i in 0..entries {
-        let at = 1 + i * 2;
+        let at = 1 + i * 8;
         let interface = max[at];
         let flags = max[at + 1];
 
         if flags & !DEFINED != 0 {
             return Err(format!(
                 "interface {interface} advertises flags {flags:#04x}, which sets bits the specification does not define"
+            ));
+        }
+        if max[at + 2..at + 8].iter().any(|&b| b != 0)
+            || def[at + 2..at + 8].iter().any(|&b| b != 0)
+        {
+            return Err(format!(
+                "interface {interface} sets reserved bits in its seven-byte control flags"
             ));
         }
         // GET_MAX lists only interfaces capable of D1 or D2, and no interface
@@ -4936,7 +4949,7 @@ pub(crate) fn face_auth_payload(def: &[u8], max: &[u8]) -> std::result::Result<V
 
     // Bytes past the entries are not described by anything and must be zero in
     // both answers; a control putting data there is not the layout being parsed.
-    let tail = 1 + entries * 2;
+    let tail = 1 + entries * 8;
     if max[tail..].iter().any(|&b| b != 0) || def[tail..].iter().any(|&b| b != 0) {
         return Err("it reports data past the interfaces it listed".into());
     }
@@ -4962,24 +4975,32 @@ pub(crate) fn face_auth_mode_evidence(payload: &[u8]) -> Option<String> {
     const DEFINED: u8 = D0_GENERAL | D1_ALTERNATIVE_ILLUMINATION | D2_BACKGROUND_SUBTRACTION;
 
     let len = payload.len();
-    if len < 3 || !(len - 1).is_multiple_of(2) {
+    if len < 9 {
         return None;
     }
     let entries = usize::from(payload[0]);
-    let capacity = (len - 1) / 2;
+    let capacity = (len - 1) / 8;
     if entries == 0 || entries > capacity {
         return None;
     }
-    let tail = 1 + entries * 2;
+    let tail = 1 + entries * 8;
     if payload[tail..].iter().any(|&b| b != 0) {
         return None;
     }
     let mut parts = Vec::with_capacity(entries);
+    let mut seen = Vec::with_capacity(entries);
     for i in 0..entries {
-        let at = 1 + i * 2;
+        let at = 1 + i * 8;
         let interface = payload[at];
+        if seen.contains(&interface) {
+            return None;
+        }
+        seen.push(interface);
         let flags = payload[at + 1];
         if flags & !DEFINED != 0 || flags.count_ones() != 1 {
+            return None;
+        }
+        if payload[at + 2..at + 8].iter().any(|&b| b != 0) {
             return None;
         }
         let mode = match flags {
@@ -5591,10 +5612,8 @@ mod tests {
         (outcome, fake_camera::log(), fake_camera::current(), dir)
     }
 
-    /// A camera shaped like the two this module was validated against: they
-    /// report `GET_MAX 01 03 03` and `GET_DEF 01 03 01`, from which
-    /// `face_auth_payload` derives `01 03 02`. Using the real numbers means the
-    /// run reaches a write for the same reason a real one does.
+    /// An opaque three-byte control for the raw write/journal tests. It is not
+    /// a complete Face Authentication control; protocol tests use the fixture below.
     fn a_working_camera() -> fake_camera::Camera {
         fake_camera::Camera {
             current: vec![1, 3, 1],
@@ -5606,6 +5625,20 @@ mod tests {
             min: vec![0, 0, 0],
             res: vec![1, 1, 1],
             ..Default::default()
+        }
+    }
+
+    /// The full nine-byte Face Authentication control measured on both built-in
+    /// table cameras: one interface and seven flag bytes, not a compact prefix.
+    fn a_face_auth_camera() -> fake_camera::Camera {
+        fake_camera::Camera {
+            current: vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            len: 9,
+            def: vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            max: vec![1, 3, 3, 0, 0, 0, 0, 0, 0],
+            min: vec![0; 9],
+            res: vec![0; 9],
+            ..a_working_camera()
         }
     }
 
@@ -5640,7 +5673,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
-        let _fake = fake_camera::install(a_working_camera());
+        let _fake = fake_camera::install(a_face_auth_camera());
         let id = identity(0x3277, 0x0059);
         let mut readings = [48.0, 52.0, 48.0].into_iter();
         let mut permit = || Ok(());
@@ -5657,7 +5690,7 @@ mod tests {
         assert!(!message.contains("no usable emitter control"), "{message}");
         assert_eq!(
             fake_camera::current(),
-            vec![1, 3, 1],
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
             "the exact original value must be restored"
         );
         let sets = fake_camera::log()
@@ -5682,7 +5715,7 @@ mod tests {
     #[test]
     fn exploratory_d1_is_read_back_before_any_d1_measurement() {
         let _lock = crate::testenv::env_lock();
-        let mut camera = a_working_camera();
+        let mut camera = a_face_auth_camera();
         camera.ignore_set_at = Some(1);
         let mut measurements: usize = 0;
 
@@ -5696,14 +5729,18 @@ mod tests {
             measurements, 1,
             "only the pre-write baseline may be measured when D1 was not retained"
         );
-        assert_eq!(current, vec![1, 3, 1], "the exact original remains active");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the exact original remains active"
+        );
         assert!(
             log.windows(2).any(|requests| matches!(
                 requests,
                 [
                     fake_camera::Request::Set(value),
                     fake_camera::Request::Get { query: UVC_GET_CUR, .. }
-                ] if value == &[1, 3, 2]
+                ] if value == &[1, 3, 2, 0, 0, 0, 0, 0, 0]
             )),
             "the exploratory write must be read back immediately: {log:?}"
         );
@@ -5728,7 +5765,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
-        let _fake = fake_camera::install(a_working_camera());
+        let _fake = fake_camera::install(a_face_auth_camera());
         let id = identity(0x3277, 0x0059);
         let mut readings = [10.0, 40.0, 35.0].into_iter();
         let mut permit = || Ok(());
@@ -5742,7 +5779,7 @@ mod tests {
         );
         let message = error.to_string();
         assert!(message.contains("stayed bright"), "{message}");
-        assert_eq!(fake_camera::current(), vec![1, 3, 1]);
+        assert_eq!(fake_camera::current(), vec![1, 3, 1, 0, 0, 0, 0, 0, 0]);
         let sets = fake_camera::log()
             .iter()
             .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
@@ -5765,13 +5802,17 @@ mod tests {
         let mut brightness = [10.0f32, 40.0, 10.0].into_iter();
 
         let (outcome, log, current, dir) =
-            run_discovery(a_working_camera(), "one-triplet", || brightness.next());
+            run_discovery(a_face_auth_camera(), "one-triplet", || brightness.next());
 
         assert!(
             matches!(outcome, Ok(Attempt::Inconclusive(_))),
             "a triplet without alternating-frame evidence must not prove D1: {outcome:?}"
         );
-        assert_eq!(current, vec![1, 3, 1], "the exact original is restored");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the exact original is restored"
+        );
         assert_eq!(
             log.iter()
                 .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
@@ -5798,12 +5839,16 @@ mod tests {
         .into_iter();
 
         let (outcome, log, current, dir) =
-            run_discovery(a_working_camera(), "optical-periodicity", || {
+            run_discovery(a_face_auth_camera(), "optical-periodicity", || {
                 measurements.next()
             });
 
         assert!(matches!(outcome, Ok(Attempt::Lit(..))), "{outcome:?}");
-        assert_eq!(current, vec![1, 3, 2], "proven D1 remains applied");
+        assert_eq!(
+            current,
+            vec![1, 3, 2, 0, 0, 0, 0, 0, 0],
+            "proven D1 remains applied"
+        );
         assert_eq!(
             log.iter()
                 .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
@@ -5844,7 +5889,7 @@ mod tests {
         .into_iter();
 
         let (outcome, _log, current, dir) =
-            run_discovery(a_working_camera(), "optical-invalid-baseline", || {
+            run_discovery(a_face_auth_camera(), "optical-invalid-baseline", || {
                 measurements.next()
             });
 
@@ -5852,7 +5897,7 @@ mod tests {
             matches!(outcome, Ok(Attempt::Inconclusive(_))),
             "{outcome:?}"
         );
-        assert_eq!(current, vec![1, 3, 1]);
+        assert_eq!(current, vec![1, 3, 1, 0, 0, 0, 0, 0, 0]);
         drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5869,7 +5914,7 @@ mod tests {
         .into_iter();
 
         let (outcome, _log, current, dir) =
-            run_discovery(a_working_camera(), "optical-ambiguous-baseline", || {
+            run_discovery(a_face_auth_camera(), "optical-ambiguous-baseline", || {
                 measurements.next()
             });
 
@@ -5877,7 +5922,7 @@ mod tests {
             matches!(outcome, Ok(Attempt::Inconclusive(_))),
             "{outcome:?}"
         );
-        assert_eq!(current, vec![1, 3, 1]);
+        assert_eq!(current, vec![1, 3, 1, 0, 0, 0, 0, 0, 0]);
         drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5917,7 +5962,7 @@ mod tests {
         .into_iter();
 
         let (outcome, _log, current, dir) =
-            run_discovery(a_working_camera(), "metadata-invalid-baseline", || {
+            run_discovery(a_face_auth_camera(), "metadata-invalid-baseline", || {
                 measurements.next()
             });
 
@@ -5925,7 +5970,7 @@ mod tests {
             matches!(outcome, Ok(Attempt::Inconclusive(_))),
             "{outcome:?}"
         );
-        assert_eq!(current, vec![1, 3, 1]);
+        assert_eq!(current, vec![1, 3, 1, 0, 0, 0, 0, 0, 0]);
         drop(outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5960,7 +6005,7 @@ mod tests {
         .into_iter();
 
         let (outcome, log, current, dir) =
-            run_discovery(a_working_camera(), "metadata-proves-weak-optical", || {
+            run_discovery(a_face_auth_camera(), "metadata-proves-weak-optical", || {
                 measurements.next()
             });
 
@@ -5970,7 +6015,11 @@ mod tests {
             0,
             "metadata success must observe baseline, applied D1, and exact restore"
         );
-        assert_eq!(current, vec![1, 3, 2], "proven D1 is left applied");
+        assert_eq!(
+            current,
+            vec![1, 3, 2, 0, 0, 0, 0, 0, 0],
+            "proven D1 is left applied"
+        );
         let sets = log
             .iter()
             .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
@@ -6014,7 +6063,7 @@ mod tests {
         .into_iter();
 
         let (outcome, log, current, dir) =
-            run_discovery(a_working_camera(), "metadata-predates-control", || {
+            run_discovery(a_face_auth_camera(), "metadata-predates-control", || {
                 measurements.next()
             });
 
@@ -6022,7 +6071,11 @@ mod tests {
             matches!(outcome, Ok(Attempt::Inconclusive(_))),
             "pre-existing alternation cannot prove this selector: {outcome:?}"
         );
-        assert_eq!(current, vec![1, 3, 1], "the exact original is restored");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the exact original is restored"
+        );
         let sets = log
             .iter()
             .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
@@ -6054,7 +6107,7 @@ mod tests {
         .into_iter();
 
         let (outcome, log, current, dir) =
-            run_discovery(a_working_camera(), "metadata-contradicts-optical", || {
+            run_discovery(a_face_auth_camera(), "metadata-contradicts-optical", || {
                 measurements.next()
             });
 
@@ -6062,7 +6115,11 @@ mod tests {
             matches!(outcome, Ok(Attempt::Inconclusive(_))),
             "{outcome:?}"
         );
-        assert_eq!(current, vec![1, 3, 1], "the exact original is restored");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the exact original is restored"
+        );
         let sets = log
             .iter()
             .filter(|request| matches!(request, fake_camera::Request::Set { .. }))
@@ -6080,18 +6137,18 @@ mod tests {
     fn capture_default_proof_reads_validated_current_default_without_writes() {
         let _lock = crate::testenv::env_lock();
         let _fake = fake_camera::install(fake_camera::Camera {
-            current: vec![1, 2, 2],
-            def: vec![1, 2, 2],
-            max: vec![1, 2, 3],
-            len: 3,
+            current: vec![1, 2, 2, 0, 0, 0, 0, 0, 0],
+            def: vec![1, 2, 2, 0, 0, 0, 0, 0, 0],
+            max: vec![1, 2, 3, 0, 0, 0, 0, 0, 0],
+            len: 9,
             info: 3,
             ..Default::default()
         });
         let control = read_capture_default(-1, &identity(0x046d, 0x085e))
             .unwrap()
             .unwrap();
-        assert_eq!(control.payload, vec![1, 2, 2]);
-        assert_eq!(fake_camera::current(), vec![1, 2, 2]);
+        assert_eq!(control.payload, vec![1, 2, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(fake_camera::current(), vec![1, 2, 2, 0, 0, 0, 0, 0, 0]);
         let log = fake_camera::log();
         assert_eq!(
             log.iter()
@@ -6141,19 +6198,19 @@ mod tests {
         let _lock = crate::testenv::env_lock();
         for case in 0..6 {
             let mut camera = fake_camera::Camera {
-                current: vec![1, 2, 2],
-                def: vec![1, 2, 2],
-                max: vec![1, 2, 3],
-                len: 3,
+                current: vec![1, 2, 2, 0, 0, 0, 0, 0, 0],
+                def: vec![1, 2, 2, 0, 0, 0, 0, 0, 0],
+                max: vec![1, 2, 3, 0, 0, 0, 0, 0, 0],
+                len: 9,
                 info: 3,
                 ..Default::default()
             };
             match case {
-                0 => camera.def = vec![1, 2, 1], // active, but not the default
-                1 => camera.current = vec![1, 2, 1],
-                2 => camera.max = vec![1, 2, 5], // D2 is not D1
-                3 => camera.info = 0x23,         // disabled by commit state
-                4 => camera.change_after_gets = Some((1, vec![1, 2, 1])),
+                0 => camera.def[2] = 1, // active, but not the default
+                1 => camera.current[2] = 1,
+                2 => camera.max[2] = 5,  // D2 is not D1
+                3 => camera.info = 0x23, // disabled by commit state
+                4 => camera.change_after_gets = Some((1, vec![1, 2, 1, 0, 0, 0, 0, 0, 0])),
                 _ => camera.fail_get_cur = Some(libc::EIO),
             }
             let _fake = fake_camera::install(camera);
@@ -6220,11 +6277,11 @@ mod tests {
     fn a_face_auth_d1_device_default_is_already_active_without_a_write() {
         let _lock = crate::testenv::env_lock();
         let camera = fake_camera::Camera {
-            current: vec![1, 2, 0b010],
-            len: 3,
+            current: vec![1, 2, 0b010, 0, 0, 0, 0, 0, 0],
+            len: 9,
             info: 0b0000_0011,
-            def: vec![1, 2, 0b010],
-            max: vec![1, 2, 0b011],
+            def: vec![1, 2, 0b010, 0, 0, 0, 0, 0, 0],
+            max: vec![1, 2, 0b011, 0, 0, 0, 0, 0, 0],
             ..Default::default()
         };
         let mut measurements = 0;
@@ -6239,13 +6296,13 @@ mod tests {
                 unit: 14,
                 selector: 6,
                 payload,
-            })) if payload == vec![1, 2, 0b010]
+            })) if payload == vec![1, 2, 0b010, 0, 0, 0, 0, 0, 0]
         ));
         assert_eq!(
             measurements, 0,
             "an unchanged device default needs no optical experiment"
         );
-        assert_eq!(current, vec![1, 2, 0b010]);
+        assert_eq!(current, vec![1, 2, 0b010, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
             log,
             vec![
@@ -6259,19 +6316,19 @@ mod tests {
                 },
                 fake_camera::Request::Get {
                     query: UVC_GET_CUR,
-                    size: 3,
+                    size: 9,
                 },
                 fake_camera::Request::Get {
                     query: UVC_GET_DEF,
-                    size: 3,
+                    size: 9,
                 },
                 fake_camera::Request::Get {
                     query: UVC_GET_MAX,
-                    size: 3,
+                    size: 9,
                 },
                 fake_camera::Request::Get {
                     query: UVC_GET_CUR,
-                    size: 3,
+                    size: 9,
                 },
             ],
             "the ready path must contain reads only"
@@ -6289,11 +6346,11 @@ mod tests {
     fn a_transient_face_auth_d1_is_not_promoted_to_device_default_success() {
         let _lock = crate::testenv::env_lock();
         let camera = fake_camera::Camera {
-            current: vec![1, 3, 0b010],
-            len: 3,
+            current: vec![1, 3, 0b010, 0, 0, 0, 0, 0, 0],
+            len: 9,
             info: 0b0000_0011,
-            def: vec![1, 3, 0b001],
-            max: vec![1, 3, 0b011],
+            def: vec![1, 3, 0b001, 0, 0, 0, 0, 0, 0],
+            max: vec![1, 3, 0b011, 0, 0, 0, 0, 0, 0],
             ..Default::default()
         };
         let mut measurements = 0;
@@ -6304,7 +6361,7 @@ mod tests {
 
         assert!(matches!(outcome, Ok(Attempt::AlreadyApplied)));
         assert_eq!(measurements, 0);
-        assert_eq!(current, vec![1, 3, 0b010]);
+        assert_eq!(current, vec![1, 3, 0b010, 0, 0, 0, 0, 0, 0]);
         assert!(
             log.iter()
                 .all(|request| !matches!(request, fake_camera::Request::Set(_))),
@@ -6335,14 +6392,14 @@ mod tests {
             crate::emitter_journal::record_path(&crate::emitter_journal::filing_key(&id))
         };
 
-        let mut camera = a_working_camera();
+        let mut camera = a_face_auth_camera();
         camera.at_first_write = Some(Box::new(move || {
             let body = std::fs::read_to_string(&expected)
                 .map_err(|e| format!("no record at {} yet: {e}", expected.display()))?;
             let record: crate::emitter_journal::PendingWrite = serde_json::from_str(&body)
                 .map_err(|e| format!("the record is not complete json: {e}"))?;
             // The bytes that make it an undo record, not just a file.
-            if record.original != "010301" {
+            if record.original != "010301000000000000" {
                 return Err(format!("original is {}", record.original));
             }
             Ok(())
@@ -6883,7 +6940,7 @@ mod tests {
         // Accept the exploratory write, then fail every write after it.
         let camera = fake_camera::Camera {
             fail_set_from: Some((2, libc::EIO)),
-            ..a_working_camera()
+            ..a_face_auth_camera()
         };
         // Bright, then the stream dies, which is the path that restores.
         let mut brightness = [10.0f32].into_iter();
@@ -6919,7 +6976,7 @@ mod tests {
         let _lock = crate::testenv::env_lock();
         let camera = fake_camera::Camera {
             fail_set_from: Some((1, libc::EIO)),
-            ..a_working_camera()
+            ..a_face_auth_camera()
         };
         let mut brightness = [10.0f32].into_iter();
         let (outcome, log, current, dir) =
@@ -6934,7 +6991,11 @@ mod tests {
             writes, 1,
             "exactly one write, which the camera refused: {log:?}"
         );
-        assert_eq!(current, vec![1, 3, 1], "the control was never changed");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the control was never changed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6956,7 +7017,7 @@ mod tests {
         );
 
         let (outcome, log, current, dir) =
-            run_discovery(a_working_camera(), "abort-first", || Some(10.0));
+            run_discovery(a_face_auth_camera(), "abort-first", || Some(10.0));
 
         // Take the flag back before the guard drops, so nothing is re-raised at
         // the test binary.
@@ -6972,7 +7033,7 @@ mod tests {
                 .any(|r| matches!(r, fake_camera::Request::Set(_))),
             "no write may reach a camera after a stop signal: {log:?}"
         );
-        assert_eq!(current, vec![1, 3, 1]);
+        assert_eq!(current, vec![1, 3, 1, 0, 0, 0, 0, 0, 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8952,7 +9013,7 @@ mod tests {
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
         let file = std::fs::File::open("/dev/null").expect("stable fake fd");
         let id = identity(0x3277, 0x0059);
-        let control = || ctrl(14, 6, vec![1, 3, 2]);
+        let control = || ctrl(14, 6, vec![1, 3, 2, 0, 0, 0, 0, 0, 0]);
         let actions = [
             CaptureAction::Override(control()),
             CaptureAction::DeviceDefault {
@@ -8963,7 +9024,7 @@ mod tests {
         ];
 
         for action in actions {
-            let _fake = fake_camera::install(a_working_camera());
+            let _fake = fake_camera::install(a_face_auth_camera());
             let error = apply_capture_action_guarded(file.as_raw_fd(), &id, action, &mut || {
                 Err("late privacy refusal".into())
             })
@@ -9057,10 +9118,10 @@ mod tests {
     fn discovery_refuses_when_the_control_moved_while_it_was_measuring() {
         let _lock = crate::testenv::env_lock();
         let camera = fake_camera::Camera {
-            // The first GET_CUR answers [1,3,1] and THEN the control moves, so
+            // The first GET_CUR answers D0 and THEN the control moves, so
             // the re-read immediately before the write is what sees it.
-            change_after_gets: Some((1, vec![1, 3, 3])),
-            ..a_working_camera()
+            change_after_gets: Some((1, vec![1, 3, 3, 0, 0, 0, 0, 0, 0])),
+            ..a_face_auth_camera()
         };
         let (outcome, log, current, dir) =
             run_discovery(camera, "moved-while-measuring", || Some(50.0));
@@ -9086,7 +9147,7 @@ mod tests {
         );
         assert_eq!(
             current,
-            vec![1, 3, 3],
+            vec![1, 3, 3, 0, 0, 0, 0, 0, 0],
             "the other writer's value must be left exactly as it was found"
         );
         // The re-read has to have actually happened, or this passed for the
@@ -9124,7 +9185,7 @@ mod tests {
     fn a_guard_refusal_before_the_first_write_sends_nothing() {
         let _lock = crate::testenv::env_lock();
         let (outcome, log, current, dir) = run_discovery_guarded(
-            a_working_camera(),
+            a_face_auth_camera(),
             "guard-first",
             || Some(50.0),
             || Err("the hardware privacy shutter is engaged".to_string()),
@@ -9138,7 +9199,11 @@ mod tests {
                 .any(|r| matches!(r, fake_camera::Request::Set { .. })),
             "a refused run may not write: {log:?}"
         );
-        assert_eq!(current, vec![1, 3, 1], "the control is untouched");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the control is untouched"
+        );
         let left: Vec<_> = std::fs::read_dir(dir.join("ir-emitter-journal"))
             .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -9159,7 +9224,7 @@ mod tests {
         let mut readings = optically_proven_d1_triplet().into_iter();
         let mut calls = 0;
         let (outcome, log, current, dir) = run_discovery_guarded(
-            a_working_camera(),
+            a_face_auth_camera(),
             "guard-final",
             || readings.next(),
             || {
@@ -9184,7 +9249,11 @@ mod tests {
             2,
             "exactly the measurement's apply and restore, nothing after the refusal: {log:?}"
         );
-        assert_eq!(current, vec![1, 3, 1], "the control ends where it began");
+        assert_eq!(
+            current,
+            vec![1, 3, 1, 0, 0, 0, 0, 0, 0],
+            "the control ends where it began"
+        );
         let left: Vec<_> = std::fs::read_dir(dir.join("ir-emitter-journal"))
             .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -10519,11 +10588,114 @@ mod tests {
 
     #[test]
     fn several_interfaces_advertising_alternating_illumination_are_all_selected() {
-        let def = vec![2, 3, 1, 5, 1, 0, 0, 0, 0];
-        let max = [2, 3, 0b011, 5, 0b011, 0, 0, 0, 0];
+        // Microsoft UVC extensions 1.5, Face Authentication payload table:
+        // count at 0; interfaces at 1 and 9; seven-byte flags at 2 and 10.
+        // Interface 3 supports D0/D1; interface 11 supports only D1, as in
+        // the specification's worked example. Expectations are literal wire bytes.
+        let def = [2, 3, 1, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+        let max = [2, 3, 3, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             face_auth_payload(&def, &max),
-            Ok(vec![2, 3, 0b010, 5, 0b010, 0, 0, 0, 0])
+            Ok(vec![2, 3, 2, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn face_auth_rejects_the_old_compact_multi_entry_layout() {
+        let def = [2, 3, 1, 5, 1, 0, 0, 0, 0];
+        let max = [2, 3, 3, 5, 3, 0, 0, 0, 0];
+        assert!(face_auth_payload(&def, &max).is_err());
+        assert!(face_auth_mode_evidence(&[2, 3, 2, 5, 2, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn truncated_face_auth_discovery_never_measures_or_writes() {
+        let _lock = crate::testenv::env_lock();
+        let mut measurements = 0;
+        let (outcome, log, current, dir) = run_discovery(
+            a_working_camera(), // Deliberately truncated three-byte control.
+            "truncated-face-auth",
+            || {
+                measurements += 1;
+                Some(50.0)
+            },
+        );
+        assert!(matches!(outcome, Ok(Attempt::NotUsable(_))), "{outcome:?}");
+        assert_eq!(measurements, 0);
+        assert_eq!(current, vec![1, 3, 1]);
+        assert!(log
+            .iter()
+            .all(|r| matches!(r, fake_camera::Request::Get { .. })));
+        assert!(!dir.exists(), "refusal must not create an undo journal");
+    }
+
+    #[test]
+    fn face_auth_requires_all_eight_bytes_of_every_declared_entry() {
+        let def = [2, 3, 1, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+        let max = [2, 3, 3, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+        for len in 0..17 {
+            assert!(
+                face_auth_payload(&def[..len], &max[..len]).is_err(),
+                "{len}"
+            );
+            assert!(face_auth_mode_evidence(&def[..len]).is_none(), "{len}");
+        }
+        let def = [1, 3, 1, 0, 0, 0, 0, 0, 0];
+        let max = [1, 3, 3, 0, 0, 0, 0, 0, 0];
+        for len in 0..9 {
+            assert!(
+                face_auth_payload(&def[..len], &max[..len]).is_err(),
+                "{len}"
+            );
+            assert!(face_auth_mode_evidence(&def[..len]).is_none(), "{len}");
+        }
+    }
+
+    #[test]
+    fn face_auth_rejects_every_reserved_flag_bit_in_every_entry() {
+        let def = [2, 3, 1, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+        let max = [2, 3, 3, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+        for flag_start in [2, 10] {
+            for bit in 3..56 {
+                let mut bad_def = def;
+                let mut bad_max = max;
+                bad_def[flag_start + bit / 8] |= 1 << (bit % 8);
+                bad_max[flag_start + bit / 8] |= 1 << (bit % 8);
+                assert!(face_auth_payload(&bad_def, &max).is_err());
+                assert!(face_auth_payload(&def, &bad_max).is_err());
+                assert!(face_auth_mode_evidence(&bad_def).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn face_auth_preserves_zero_padding_but_refuses_unexplained_tail_data() {
+        // wLength is vendor-specific; padding is not another interface entry.
+        for len in 17..=26 {
+            let mut def = vec![2, 3, 1, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+            let mut max = vec![2, 3, 3, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+            let mut expected = vec![2, 3, 2, 0, 0, 0, 0, 0, 0, 11, 2, 0, 0, 0, 0, 0, 0];
+            def.resize(len, 0);
+            max.resize(len, 0);
+            expected.resize(len, 0);
+            assert_eq!(face_auth_payload(&def, &max), Ok(expected));
+            assert!(face_auth_mode_evidence(&def).is_some());
+            for tail in 17..len {
+                def[tail] = 1;
+                assert!(face_auth_payload(&def, &max).is_err());
+                assert!(face_auth_mode_evidence(&def).is_none());
+                def[tail] = 0;
+                max[tail] = 1;
+                assert!(face_auth_payload(&def, &max).is_err());
+                max[tail] = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn face_auth_evidence_refuses_duplicate_interfaces() {
+        assert!(
+            face_auth_mode_evidence(&[2, 3, 2, 0, 0, 0, 0, 0, 0, 3, 2, 0, 0, 0, 0, 0, 0]).is_none()
         );
     }
 
@@ -10544,8 +10716,11 @@ mod tests {
         // More entries than the buffer can hold.
         assert!(face_auth_payload(&def, &[9, 3, 0b011, 0, 0, 0, 0, 0, 0]).is_err());
         // The same interface twice.
-        let dup = vec![2, 3, 0b011, 3, 0b011, 0, 0, 0, 0];
-        assert!(face_auth_payload(&[2, 3, 1, 3, 1, 0, 0, 0, 0], &dup).is_err());
+        let dup = [2, 3, 3, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0];
+        let def_dup = [2, 3, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0];
+        assert!(face_auth_payload(&def_dup, &dup)
+            .unwrap_err()
+            .contains("more than once"));
         // Default and maximum describing different-sized controls.
         assert!(face_auth_payload(&[1, 3, 1], &[1, 3, 3, 0]).is_err());
         // A length that cannot hold whole entries.
@@ -10569,8 +10744,9 @@ mod tests {
     /// A multi-interface payload names each interface and its own mode.
     #[test]
     fn evidence_names_each_interface_and_mode() {
-        let evidence = face_auth_mode_evidence(&[2, 3, 2, 5, 4, 0, 0, 0, 0])
-            .expect("two whole entries, zero tail");
+        let evidence =
+            face_auth_mode_evidence(&[2, 3, 2, 0, 0, 0, 0, 0, 0, 5, 4, 0, 0, 0, 0, 0, 0])
+                .expect("two whole entries, zero tail");
         assert!(
             evidence.contains("0x03") && evidence.contains("0x05"),
             "{evidence}"

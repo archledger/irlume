@@ -5,7 +5,7 @@
 ### Your face or fingerprint unlocks Linux
 
 Login, lock screen, `sudo`, and app prompts like Bitwarden. In the dark, with an
-IR camera. Stored as an embedding, never an image. Password always works.
+IR camera. Enrollment stores embeddings, never images. Password fallback stays available.
 
 [![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-1f2328)
@@ -46,14 +46,14 @@ document the current ones.</sub>
 
 |  |  |
 |:--|:--|
-| 🌑 **Works in the dark** | Infrared recognition, no ambient light needed |
-| 🔓 **Unlocks everything** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/LIMITATIONS.md)), `sudo`, polkit prompts |
+| 🌑 **Works in the dark** | Infrared recognition with a working emitter; camera and lighting limits are documented in [Platforms](docs/PLATFORMS.md) |
+| 🔓 **Login and app prompts** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/LIMITATIONS.md)), `sudo`, polkit prompts |
 | 🗝️ **Opens your wallet** | A face match TPM-unseals your keyring secret |
-| 🧬 **No face images** | 512-D embeddings, never images; the primary store is AES-256-GCM under a TPM-sealed key on TPM hosts (root-only plaintext without one) |
-| 🙋 **Consent before camera** | `yes` for a face attempt; typing your password never starts a scan, and both work in the same prompt (the field accepts either, so you never wait for one path to time out) |
-| 🛡️ **Refuses photos and screens** | Two anti-spoofing models run by default: print attacks on RGB, screens/phones on IR (Howdy's own README warns a printed photo can defeat it) |
-| 🔁 **Survives real life** | Suspend/resume verified on hardware; a failed scan or a crashed component falls back to your password, never a lockout |
-| 📦 **Installs boring** | Rust binaries only, no Python, no dlib, no pip. The class of install breakage that dominates other face-unlock trackers does not exist here |
+| 🧬 **No enrollment images** | 512-D embeddings; primary and secondary stores use AES-256-GCM on TPM hosts, with secondary migration on write. No-TPM storage is root-only plaintext ([details](docs/SECURITY_AT_REST.md)) |
+| 🙋 **Choose face or password** | Privileged prompts accept `yes` for face or your password before scanning. On-demand desktops use empty Enter; automatic-capture exceptions and active-scan cancellation depend on the [desktop flow](docs/DESKTOP-AUTH.md) |
+| 🛡️ **Anti-spoofing by default** | RGB and IR PAD models plus cross-spectrum checks; measured print and screen refusals, with [explicit test limits](docs/LIMITATIONS.md) |
+| 🔁 **Password fallback** | Face refusal returns to the password provider. Frontend delays and OS account lockouts remain possible; see [support boundaries](docs/PLATFORMS.md#v0140-behavior-and-support-boundaries) |
+| 📦 **Packaged native authentication** | Rust authentication binaries without a Python/dlib/pip recognition stack; distro, driver and package dependencies still need validation |
 | 🩺 **Repairs itself** | A live TUI fixes faults; PAM wiring survives updates |
 
 </div>
@@ -103,7 +103,7 @@ interactive changes open the TUI. See [KDE System Settings](docs/KCM.md) for
 package availability and the optional NixOS configuration.
 
 **You need** x86-64 Linux with systemd and PAM. A TPM 2.0 is strongly recommended.
-Most cameras work and set your tier (an IR node must offer an 8-bit grey format; see [Platforms](docs/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
+Camera support sets your tier (usable IR requires an 8-bit grey stream and qualified illumination; see [Platforms](docs/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
 unlock · **fingerprint** → companion factor.
 
 ## Documentation
@@ -124,12 +124,13 @@ unlock · **fingerprint** → companion factor.
 
 ## Status
 
-**v0.14.0**, working on real hardware on Fedora and Ubuntu; packaged and
-install-tested on Arch and Debian, with a NixOS module in this flake.
+**v0.14.0**, with recorded face-authentication results on Fedora, Ubuntu and
+Arch; Debian install checks and a NixOS module are also available. Build and
+test dates differ: see the [versioned support matrix](docs/PLATFORMS.md).
 Self-tested against ISO/IEC 30107-3, not
 lab-certified. Interfaces may shift before 1.0. Validated cameras are listed
 in [Hardware compatibility](docs/HARDWARE.md) (generated from measured
-evidence, never hand-edited).
+evidence, never hand-edited), with [newer validation records](docs/validation/2026-09-19-support-baseline.md).
 
 Since 0.11: multi-camera enrollment, where a secondary camera becomes its own
 group with a separate store

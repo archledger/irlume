@@ -10345,7 +10345,7 @@ mod tests {
         let message = active_by_device_default_message(&ir_emitter::EmitterControl {
             unit: 12,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
-            payload: vec![1, 2, 0b010],
+            payload: vec![1, 2, 0b010, 0, 0, 0, 0, 0, 0],
         });
 
         assert!(message.contains("active by device default"), "{message}");

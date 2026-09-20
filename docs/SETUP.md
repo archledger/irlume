@@ -239,12 +239,19 @@ every login, which is half the point.
 irlume keyring arm
 ```
 
-It prompts for your **login password** (typed twice, to catch a typo) and
-verifies it is actually your login password before sealing it in the TPM, so a
-mistyped password can't be sealed and leave the wallet failing to unlock; the
-password is never stored in plaintext. Re-run it after you change your login
-password. On a fingerprint machine a fingerprint login unseals the wallet the
-same way (see [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
+It prompts for your **login password** (twice in a terminal) and verifies it
+before arming. Depending on the backend, the TPM seals the login password,
+the KDE wallet key, or a random GNOME keyring token. `irlume keyring status`
+reports which kind is armed. No sealed secret is stored in plaintext.
+
+GNOME token arming rekeys the login keyring: your password alone no longer
+opens it directly. Use `irlume keyring forget` to rekey it back before
+removing the integration; deleting the token envelope can strand that keyring.
+Password-backed and KDE-key arms should be checked and re-armed after a
+password change if needed. PAM also has a best-effort reseal path after
+independently verified password authentication; a failed reseal does not fail
+the login. Fingerprint login can use the same backend-specific handoff
+([ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
 For KDE, the CLI or PAM session asks the packaged `irlume-kwallet-init` helper
 to read the fixed-size wallet salt after permanently entering the target account.
@@ -256,13 +263,15 @@ does not fail that login.
 
 #### KDE Plasma: what has to be in place for KWallet
 
-On Plasma the chain is: `plasmalogin` runs irlume's `unseal` line, which sets the
-released password as `PAM_AUTHTOK`; `pam_kwallet5.so`'s **auth** line reads that
+For a login-password arm on Plasma, `plasmalogin` runs irlume's `unseal` line,
+which sets the released password as `PAM_AUTHTOK`; `pam_kwallet5.so`'s **auth** line reads that
 token and stashes the derived key; its **session** line starts the wallet daemon
 (`ksecretd` on Plasma 6, `kwalletd6`/`kwalletd5` before it) and hands the key
 over. Both halves are required: kwallet-pam stashes with `pam_set_data` during
 auth and only acts on it in `pam_sm_open_session`. irlume owns only the first
-step, so two things must be true of the rest:
+step. A `KdeWalletKey` arm instead sends the derived key to the packaged wallet
+session helper; that key must never be used as `PAM_AUTHTOK`. For the
+login-password path, two things must be true of the rest:
 
 - **kwallet-pam is installed**: the module is `pam_kwallet5.so`, still that name
   under Plasma 6 (upstream's CMake sets `library_name "pam_kwallet5"` on the KF6
@@ -303,10 +312,11 @@ respectively. (openSUSE's greeter is otherwise wired correctly: irlume anchors
 its face line on that `common-auth` substack, leaving `pam_nologin.so` ahead of
 it.)
 
-One more requirement is outside PAM: your **wallet password must equal your login
-password**, since that is the password `keyring arm` seals. A wallet created with
-a different password cannot be opened on this path; change it under *System
-Settings → KDE Wallet*, or remove and recreate the wallet.
+One more requirement is outside PAM: the wallet must accept the credential
+derived from your login password. A login-password arm seals that password;
+a KDE-key arm derives the wallet key from it and the wallet salt. A wallet
+using a different password cannot be opened on these paths. Align the passwords
+under *System Settings → KDE Wallet* before arming.
 
 **Fingerprint on KDE.** Plasma's login greeter runs ONE PAM stack for user
 authentication: plasma-login-manager's PAM backend selects only `plasmalogin`
@@ -325,11 +335,15 @@ meets a wallet the login already opened.
 
 #### GNOME: what has to be in place for the login keyring
 
-Same shape, different module. `gdm-password` runs irlume's `unseal` line, which
+For a login-password arm, `gdm-password` runs irlume's `unseal` line, which
 sets `PAM_AUTHTOK`; `pam_gnome_keyring.so`'s **auth** line reads it and stashes it
 under `gkr_system_authtok`; its **session** line unlocks the keyring and starts
 the daemon. Both halves are required, for the same reason as KWallet:
 `pam_sm_authenticate` only stashes, and `pam_sm_open_session` is what acts.
+For a GNOME-token arm, Irlume's token-aware handoff supplies the random keyring
+credential instead; the account password is not that keyring's direct key.
+Inspect both the armed kind and `irlume login status` when diagnosing a wallet
+that remains locked after a successful login.
 
 Two differences from KDE are worth knowing:
 

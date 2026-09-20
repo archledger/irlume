@@ -96,10 +96,13 @@ is RGB/selfie-trained, so rescue behavior on IR-grey frames must be validated.
   and no documented training data** (verified 2026-06-30; the re-export disclaims
   training and gives no warranty). Weights ≠ code: an Apache `LICENSE` on the source
   does not license weights whose provenance is unwarrantable. **Fails the clean-BOM
-  bar**; do not bundle. Built-in anti-spoofing stays algorithmic IR physics;
-  head consent is a separate intent gate
-  ([ADR-0009](../docs/adr/0009-head-gesture-only-consent.md)) until a
-  clean-licensed PAD model or own-IR-rig data exists.
+  bar**; do not bundle. The shipped stack instead includes the default-on ViT
+  RGB and FLIR IR PAD models under
+  [ADR-0013](../docs/adr/0013-ship-pad-models-default-on.md), alongside the
+  algorithmic checks. Head-gesture consent from
+  [ADR-0009](../docs/adr/0009-head-gesture-only-consent.md) was subsequently
+  [removed](../docs/HEAD-GESTURE-REMOVAL.md); privileged confirmation uses typed
+  `yes` by default.
 
 ## Verification
 

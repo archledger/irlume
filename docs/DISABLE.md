@@ -89,12 +89,13 @@ sudo irlume fingerprint disable
   password path before the camera powers up: probing greeters (SDDM,
   plasmalogin style, COSMIC's on-demand mode) treat any typed characters as
   "password", and privileged prompts (`sudo`, polkit) treat anything other
-  than the literal `yes` as "password". GNOME wires its greeter face-first
-  (the camera checks once your account is selected), so there the way out is
-  canceling or escaping the dialog; a typed password still wins afterwards.
+  than the literal `yes` as "password". Automatic GNOME wiring is on-demand
+  for detected GNOME 46+ (measured on 50, inferred for 46–49). Older or
+  undetected GNOME uses face-first and scans on account selection. Once a
+  scan starts, typing is not a universal immediate switch to password.
 - **Desktop cancellation depends on the frontend.** Stock KDE installations do
   not automatically provide a parallel face lane that stops on typing. The
-  development frontend integration is not enabled by this package; see
+  proposed frontend integration is not shipped by this package; see
   [desktop authentication boundaries](DESKTOP-AUTH.md).
 - **Close or cancel whatever asked.** Escape, a dialog's Cancel button, or
   Ctrl+C can end the request when the frontend closes its PAM worker or socket.
@@ -104,10 +105,12 @@ sudo irlume fingerprint disable
   capture operation. There is no universal quarter-second stop guarantee.
 - **In `irlume tui`:** Esc cancels guided enrollment immediately; q or Esc
   backs out of a stalled identify or self-test instead of trapping you.
-- **If you just wait:** every scan window is bounded. The login/lock screen
-  keeps looking for about 15 seconds (~10 attempts), `sudo` and `su` give up
-  after about 5 seconds, then the password takes over. `IRLUME_GRACE_MS`
-  overrides this if you want shorter.
+- **If you just wait:** default admission windows are 15 seconds for login/lock
+  and 5 seconds for short privileged services. The optional
+  `privileged_grouped_pad_evidence` route can extend the latter to 15 seconds;
+  `IRLUME_GRACE_MS` overrides either. These are admission deadlines, not fixed
+  attempt counts or physical camera-off guarantees. See [bounded attempts and
+  cleanup](DESKTOP-AUTH.md#bounded-attempts-and-cleanup).
 
 Face verification and face-gated credential release share a durable limit of
 50 consecutive unsuccessful requests per account. Each request reserves one

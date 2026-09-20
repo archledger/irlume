@@ -387,6 +387,15 @@ jobs:
       - name: test (PAM FFI, against pam_wrapper)
         run: ./scripts/run-tests-guarded.sh --min 16 -- cargo test -p irlume-pam --locked -- --include-ignored --test-threads=1
 
+      - name: test (shared-greeter daemon and PAM admission)
+        run: |
+          cargo build -p irlume-pam --locked
+          ./scripts/run-tests-guarded.sh \
+            --require shared_greeter_real_daemon_and_pam_refuse_cold_login_with_runtime \
+            --require shared_greeter_real_daemon_and_pam_preserve_bound_unlock_and_password \
+            --require shared_greeter_real_daemon_and_pam_recheck_before_grant_and_delivery \
+            -- cargo test -p irlume-daemon --locked -- --ignored shared_greeter_real_daemon --test-threads=1
+
       - name: test (root-only password helper, private synthetic PAM)
         run: |
           sudo apt-get install -y --no-install-recommends libpam-wrapper libpam0g-dev gcc util-linux

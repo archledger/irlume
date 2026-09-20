@@ -199,6 +199,14 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
        member={CheckAuthorization,CancelCheckAuthorization}
        peer=(name=org.freedesktop.PolicyKit1),
 
+  # Read-only, request-bound COSMIC screen-unlock context.
+  dbus (send) bus=system path=/org/freedesktop/login1
+       interface=org.freedesktop.login1.Manager member=GetSessionByPID
+       peer=(name=org.freedesktop.login1),
+  dbus (send) bus=system path=/org/freedesktop/login1/session/*
+       interface=org.freedesktop.DBus.Properties member=GetAll
+       peer=(name=org.freedesktop.login1),
+
   # The daemon reads its OWN confinement label + whether AppArmor is live so it
   # can report real confinement in Health (the TUI shows enforce/complain/
   # unconfined instead of guessing from the on-disk profile file). Under enforce

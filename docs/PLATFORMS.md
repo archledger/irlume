@@ -12,7 +12,7 @@ anywhere not listed, an issue report with your distro, camera, and
 | Surface | Shipped behavior | Qualification or limit |
 |---|---|---|
 | Login, lock, sudo and polkit | IR-backed face authentication on supported PAM surfaces; fingerprint is an fprintd companion | Per-desktop wiring and hardware evidence below. Face plus fingerprint means either factor, not required two-factor authentication |
-| RGB-only cameras | Face may satisfy recognized live-session screen unlock | Login, elevation, polkit and secret release refuse, independently of the optional `biopolicy` setting |
+| RGB-only cameras | Face is intended only for recognized live-session screen unlock, independently of optional `biopolicy` | The shared-greeter runtime-directory check can misclassify cold login; see the unreleased correction below. Elevation, polkit and secret release refuse |
 | Start and consent | On-demand desktop empty Enter; privileged literal `yes` by default | Older/undetected GNOME and unknown greeters can use face-first; the owner can waive privileged confirmation; stale capture qualification can trigger delayed background measurement ([limits](LIMITATIONS.md)) |
 | Password and cancellation | Face refusal returns to the separate password provider; daemon deadlines and disconnect checks bound admission | No universal simultaneous password lane or Esc/typing-to-cancel during a synchronous request. Frontend lifecycle and OS `pam_faillock` remain independent ([desktop contract](DESKTOP-AUTH.md)) |
 | Stored enrollment | Primary and secondary embeddings use AES-256-GCM under the account template key on TPM hosts | v0.13.0 plaintext secondary stores migrate on the next authorized write, not install/read. No-TPM hosts and old plaintext backups remain plaintext ([storage](SECURITY_AT_REST.md)) |
@@ -21,6 +21,24 @@ anywhere not listed, an issue report with your distro, camera, and
 | KDE settings | Shipped KCM dashboard and deep-linked TUI actions | Native privileged controls are optional future work; NixOS KCM runtime loading remains unverified and default-off ([KCM](KCM.md)) |
 | MIPI/IPU and other cameras | Census can identify unsupported pipelines | Detection is not a qualified capture/illumination backend. Usable UVC IR needs an accepted 8-bit grey stream and illumination evidence |
 | Optional acceleration | CPU default; optional execution-provider builds | Compile success, including external NPU research, does not establish device execution, inference parity or end-to-end speedup |
+
+## Unreleased: RGB-only shared-greeter admission
+
+The current source no longer infers unlock purpose from `/run/user/<uid>`.
+Dedicated locker services keep their existing policy. For `cosmic-greeter`,
+RGB-only face requires the requesting process itself to belong to the selected
+user's active, local graphical logind session. The process/session binding is
+checked again before a grant is delivered. Missing or ambiguous session evidence
+uses password fallback.
+
+GDM's separate worker does not expose a qualified transaction-purpose binding
+through Irlume's current protocol. **RGB-only GDM requests now use the password,
+including GDM screen unlock.** Other ambiguous greeter services also refuse
+RGB-only verification. IR-backed authentication retains its existing policy.
+This source change has camera-free daemon/PAM coverage; actual COSMIC process
+placement and logind visibility still require desktop qualification. A locker
+running outside a logind session falls back rather than borrowing another
+session. See the [request-purpose evidence](research/2026-09-20-shared-greeter-purpose.md).
 
 ## Install lane per distro
 

@@ -472,6 +472,7 @@ mod cumulative {
             completion: Some(crate::FaceCompletion {
                 attempt: start_attempt(f).unwrap().unwrap(),
                 window: irlume_auth::AuthenticationWindow::for_service(None),
+                shared_unlock: None,
             }),
         }
     }

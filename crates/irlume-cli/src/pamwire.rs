@@ -1543,8 +1543,10 @@ fn act_holding_lock(enable: bool, apply: bool, with_sudo: bool, with_polkit: boo
         // cosmic-greeter and gdm-password each drive BOTH the cold login and the
         // live lock screen through ONE service, so they carry the face line
         // whenever face login OR face lock is wanted; an RGB (convenience) box
-        // still gets face LOCK there (a cold login on that tier stays denied by
-        // the daemon's credential-release gate).
+        // still gets a face line there. Credential release alone cannot enforce
+        // cold-login policy because PAM can fall back to identity verification.
+        // The daemon separately admits only request-bound RGB unlock contexts;
+        // ambiguous shared-greeter requests use the password.
         let unified_login_lock =
             s.etc.ends_with("/cosmic-greeter") || s.etc.ends_with("/gdm-password");
         let face = want_face_login || (unified_login_lock && want_face_lock);

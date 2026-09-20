@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- RGB-only verification no longer treats a user's runtime directory as proof
+  that a shared-greeter request unlocks an existing session. COSMIC requests
+  require a live peer bound to the selected user's active local graphical
+  logind session, rechecked before grant delivery. Ambiguous GDM and other
+  greeter requests fall back to the password. Dedicated locker services retain
+  their existing policy; IR-backed authentication is unchanged.
 - Frame illumination metadata is assembled across USB payload headers before
   records are interpreted. Complete 16-byte illumination records are required;
   opaque custom payloads, incomplete streams, conflicting records and reported

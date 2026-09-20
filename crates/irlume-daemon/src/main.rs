@@ -66,6 +66,7 @@ mod operation_authorization;
 mod position_session;
 mod retry_recovery;
 mod retry_throttle;
+mod shared_unlock;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -1398,11 +1399,11 @@ fn forbid_external_cameras() -> bool {
 #[derive(Clone)]
 struct Peer {
     uid: u32,
-    // gid/pid are unread today; kept for future audit logging, since
     // SO_PEERCRED delivers all three fields in the same getsockopt call.
+    // PID binds OS approval and shared-greeter requests to the caller process;
+    // GID is retained for diagnostics but does not confer authority.
     #[allow(dead_code)]
     gid: u32,
-    #[allow(dead_code)]
     pid: i32,
 }
 
@@ -1543,6 +1544,7 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 struct FaceCompletion {
     attempt: retry_throttle::FaceAttempt,
     window: irlume_auth::AuthenticationWindow,
+    shared_unlock: Option<std::sync::Arc<shared_unlock::Binding>>,
 }
 
 struct WorkerReply {
@@ -1647,6 +1649,10 @@ impl WorkerReply {
             }
             // Last admission check, after serialization and before the first
             // byte. A partial write cannot be retracted if expiry arrives later.
+            completion.window.check().map_err(std::io::Error::other)?;
+            if let Some(binding) = &completion.shared_unlock {
+                binding.validate().map_err(std::io::Error::other)?;
+            }
             completion.window.check().map_err(std::io::Error::other)
         });
         if result.is_ok() && completion.attempt.delivered().is_err() {
@@ -4974,6 +4980,30 @@ fn dispatch_scoped_session(
     }
 }
 
+fn authenticate_for_dispatch(
+    engine: &mut irlume_auth::Engine,
+    user: &str,
+    service: Option<&str>,
+    window: irlume_auth::AuthenticationWindow,
+    policy: irlume_common::config::FaceSensorPolicy,
+    scope: &diagnostics::OperationScope,
+) -> irlume_common::Result<irlume_auth::Outcome> {
+    // Only the test binary can replace the biometric result. Request policy,
+    // completion checks and socket delivery remain the production code path.
+    #[cfg(test)]
+    if let Some(outcome) = tests::shared_greeter::biometric_outcome() {
+        return Ok(outcome);
+    }
+    engine.authenticate_for_in_window_with_policy(
+        user,
+        service,
+        irlume_auth::AuthenticationPurpose::for_service(service),
+        window,
+        policy,
+        scope,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_scoped_session_inner(
     req: Request,
@@ -5215,25 +5245,26 @@ fn dispatch_scoped_session_inner(
             // match may ONLY satisfy a screen unlock; never login, elevation, or
             // a remote/unknown service (those keep the password). Always-on for
             // RGB-only hardware (independent of the opt-in biopolicy for IR boxes).
+            let mut shared_unlock = None;
             if tier == irlume_core::biopolicy::Tier::Convenience {
                 use irlume_core::biopolicy::{classify, OperationClass, SessionState};
-                // Warm = the user already has a running session (their systemd
-                // runtime dir exists); then an ambiguous greeter service (GDM
-                // drives cold login AND the lock screen through gdm-password) is
-                // a screen unlock, not a login. Caveat: lingering user services
-                // also create /run/user/<uid>; acceptable for the convenience
-                // tier where the worst case is unlocking a lock screen.
-                let session = users::uid_for_name(&user)
-                    .map(|uid| std::path::Path::new(&format!("/run/user/{uid}")).exists())
-                    .map(|has_runtime_dir| {
-                        if has_runtime_dir {
-                            SessionState::Warm
-                        } else {
-                            SessionState::Cold
+                let svc = service.as_deref().unwrap_or("");
+                // Runtime directories, lingering managers and somebody else's
+                // session never establish the purpose of this request. Only
+                // COSMIC's source-established in-process PAM path can use the
+                // kernel peer/session seam without guessing a worker's caller.
+                // Other shared greeters (including GDM's separate worker) keep
+                // the password until their transaction purpose can be bound.
+                let mut class = classify(svc, SessionState::Cold);
+                if svc.trim().eq_ignore_ascii_case("cosmic-greeter") {
+                    match shared_unlock::Binding::capture(&user, peer) {
+                        Ok(binding) => {
+                            shared_unlock = Some(std::sync::Arc::new(binding));
+                            class = OperationClass::ScreenUnlock;
                         }
-                    })
-                    .unwrap_or(SessionState::Cold);
-                let class = classify(service.as_deref().unwrap_or(""), session);
+                        Err(reason) => return retry_verify_refusal(reason),
+                    }
+                }
                 if class != OperationClass::ScreenUnlock {
                     jout_notice!(
                         "irlumed: convenience(RGB-only) denies face for '{}' ({class:?}) -> password",
@@ -5294,10 +5325,10 @@ fn dispatch_scoped_session_inner(
             };
             let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
-            let auth_result = engine.authenticate_for_in_window_with_policy(
+            let auth_result = authenticate_for_dispatch(
+                engine,
                 &user,
                 service.as_deref(),
-                irlume_auth::AuthenticationPurpose::for_service(service.as_deref()),
                 window,
                 sensor_policy,
                 scope,
@@ -5312,7 +5343,15 @@ fn dispatch_scoped_session_inner(
             match auth_result {
                 Ok(o) => bounded_face_response(
                     o.granted,
-                    || engine.check_authentication_completion(window),
+                    || {
+                        engine.check_authentication_completion(window)?;
+                        if let Some(binding) = &shared_unlock {
+                            binding
+                                .validate()
+                                .map_err(|reason| irlume_common::Error::Policy(reason.into()))?;
+                        }
+                        engine.check_authentication_completion(window)
+                    },
                     || {
                         if convenience || irlume_common::dbglog::on() {
                             // Denied score + reason measurements quantized/redacted
@@ -5357,6 +5396,7 @@ fn dispatch_scoped_session_inner(
                             *completion = Some(FaceCompletion {
                                 attempt: retry_attempt,
                                 window,
+                                shared_unlock: shared_unlock.clone(),
                             });
                             Ok(())
                         } else {
@@ -6613,6 +6653,7 @@ fn do_unseal_password_scoped(
                 *completion = Some(FaceCompletion {
                     attempt: retry_attempt,
                     window,
+                    shared_unlock: None,
                 });
                 Ok(())
             } else {
@@ -7974,8 +8015,13 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 11] = [
+        let sources: [(&str, &str); 13] = [
             ("main.rs", include_str!("main.rs")),
+            ("shared_unlock.rs", include_str!("shared_unlock.rs")),
+            (
+                "shared_greeter_tests.rs",
+                include_str!("shared_greeter_tests.rs"),
+            ),
             ("live.rs", include_str!("live.rs")),
             ("users.rs", include_str!("users.rs")),
             (
@@ -8030,6 +8076,8 @@ mod tests {
             "account(",
             "uid_for_name(",
             "name_for_uid(",
+            "shared_unlock::Binding::capture(",
+            "Harness::new(",
             "identify_scope(",
             "serve(",
         ];
@@ -11330,6 +11378,8 @@ mod tests {
     /// A uid outside any account database (same sentinel the identify-scope
     /// test uses): authorized_for() is false for every user.
     const NOBODY: u32 = 0xfffe_fffe;
+
+    include!("shared_greeter_tests.rs");
 
     /// A waiver is a claim about the machine's policy, not about the caller, so
     /// the daemon has to agree with it independently. A root PAM client saying

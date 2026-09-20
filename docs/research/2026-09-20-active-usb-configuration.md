@@ -89,6 +89,28 @@ must be measured again. No new optional persisted field can be silently ignored
 by an older reader. The digest's changed meaning for multi-configuration devices
 is deliberate and documented.
 
+Legacy multi-configuration undo data remains discoverable. Before considering
+a current journal key, the loader checks the old raw-descriptor key and scans
+for its digest, including records filed under a previous serial observation.
+A matching legacy journal blocks recovery, discovery and capture writes. The
+stream store protects legacy records on this port (or with no recorded port),
+even if a new scoped record also exists. Malformed or unreadable legacy checks
+refuse rather than falling back to an unrecorded write. Records keep their
+original paths and bytes; no configuration is guessed or automatically migrated.
+Diagnostics name the protected record for operator inspection.
+
+Locks retain their historical raw-descriptor identity. An old process holding
+the journal or stream lock therefore excludes a new process before any record
+has been published, and active configurations share that exclusion. Locking
+does not grant authority to restore an old record.
+
+Copilot review exposed the missing migration check. Persisted-fixture regressions
+first reproduced `NothingPending` for an old journal, a new stream write over
+an unresolved legacy change, and successful acquisition beside an old live lock.
+The corrected tests also cover prepared/applied records, serial-read changes,
+coexisting scoped records, damaged stores, record preservation, zero transport
+calls on refusal, and unrelated-camera stream records that must not block.
+
 An initial implementation hashed only the filtered view. A final-review
 regression changed only an inactive configuration and demonstrated that this
 would discard existing identity evidence. It was corrected before publication:

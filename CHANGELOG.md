@@ -12,7 +12,10 @@ All notable changes to irlume are documented here. This project adheres to
   capture qualification distinguish configurations, and UVC queries recheck
   that the opened interface still belongs to the active configuration. Existing
   single-configuration descriptor bytes and keys are preserved. Compiled emitter
-  payloads are not extrapolated to multi-configuration devices.
+  payloads are not extrapolated to multi-configuration devices. Legacy
+  multi-configuration recovery records remain visible and block conflicting
+  writes without authorizing a restore; live locks remain compatible across
+  the identity change.
 - RGB-only verification no longer treats a user's runtime directory as proof
   that a shared-greeter request unlocks an existing session. COSMIC requests
   require a live peer bound to the selected user's active local graphical

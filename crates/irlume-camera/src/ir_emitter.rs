@@ -1343,6 +1343,10 @@ fn write_if_different_inner(
             );
             return Ok(CaptureWrite::refused());
         }
+        Err(crate::stream_record::AcquireError::Protected(why)) => {
+            eprintln!("irlume: not driving unit{unit}/sel{selector}: {why}");
+            return Ok(CaptureWrite::refused());
+        }
         // Machine trouble, nobody contesting: proceed without bookkeeping,
         // the same degradation as an unwritable record.
         Err(crate::stream_record::AcquireError::Unavailable(why)) => {
@@ -5223,6 +5227,259 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    fn legacy_configuration_record(
+        id: &crate::uvc_descriptor::CameraIdentity,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "engine_version": "pre-configuration-binding",
+            "descriptor_sha256": irlume_common::sha256_hex(&id.descriptors),
+            "usb_id": id.usb_id(), "interface_number": id.interface_number,
+            "unit": 14, "selector": 6, "len": 9,
+            "original": "010001000000000000", "attempted": "010002000000000000",
+            "state": "applied", "displaced": "010001000000000000",
+            "applied": "010002000000000000", "restore_attempts": 0,
+            "serial": id.serial, "usb_devpath": id.usb_devpath,
+        })
+    }
+
+    fn multi_configuration_identity() -> crate::uvc_descriptor::CameraIdentity {
+        let mut id = identity(0x3277, 0x0059);
+        let mut second = id.descriptors[18..].to_vec();
+        second[5] = 2;
+        id.descriptors[17] = 2;
+        id.descriptors.extend(second);
+        assert!(id.microsoft_xu().is_some());
+        id
+    }
+
+    #[test]
+    fn legacy_configuration_journal_blocks_recovery_and_new_capture_plans() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-journal");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let _locks = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &fixture.root);
+        let mut id = multi_configuration_identity();
+        let legacy: journal::PendingWrite =
+            serde_json::from_value(legacy_configuration_record(&id)).unwrap();
+        let path = journal::save(&legacy).unwrap();
+        let body = std::fs::read(&path).unwrap();
+        let _fake = fake_camera::install(a_working_camera());
+        for coexist in [false, true] {
+            if coexist {
+                let mut scoped = legacy.clone();
+                scoped.descriptor_sha256 = id.descriptor_fingerprint();
+                journal::save(&scoped).unwrap();
+                // The scan must still find the legacy record after a serial
+                // observation changes, even with a current-key record present.
+                id.serial = None;
+                scoped.serial = None;
+                journal::save(&scoped).unwrap();
+            }
+            let outcome = recover_pending_write(-1, &id);
+            assert!(
+                matches!(&outcome, RecoveryOutcome::Unresolved(why) if why.contains("legacy")),
+                "{outcome:?}"
+            );
+            assert!(outcome.blocks_discovery());
+            assert!(!outcome.permits_capture_write());
+            assert_eq!(
+                planned_action(&outcome, Some(ctrl(14, 6, vec![1; 9])), &id),
+                CaptureAction::Nothing
+            );
+            assert_eq!(planned_action(&outcome, None, &id), CaptureAction::Nothing);
+            assert!(fake_camera::log().is_empty(), "no recovery query or write");
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_stream_blocks_forward_writes_without_claiming() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-stream");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let mut id = multi_configuration_identity();
+        let mut legacy = legacy_configuration_record(&id);
+        let pending: journal::PendingWrite = serde_json::from_value(legacy.clone()).unwrap();
+        let dir = fixture.root.join("ir-emitter-stream");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", pending.filing_key()));
+        let wanted = [1, 0, 2, 0, 0, 0, 0, 0, 0];
+        for state in ["prepared", "applied"] {
+            legacy["state"] = state.into();
+            let body = serde_json::to_vec(&legacy).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            for current in [vec![1, 0, 1, 0, 0, 0, 0, 0, 0], wanted.to_vec()] {
+                let _fake = fake_camera::install(fake_camera::Camera {
+                    len: 9,
+                    info: 3,
+                    current,
+                    ..Default::default()
+                });
+                let write =
+                    write_if_different_guarded(-1, 14, 6, 9, &wanted, &id, &mut || Ok(())).unwrap();
+                assert_eq!(write.outcome, Applied::Nothing);
+                assert!(
+                    fake_camera::log().is_empty(),
+                    "no claim, query or forward write"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), body);
+            }
+            id.serial = None;
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_stream_protects_coexisting_scoped_save_and_claim() {
+        use crate::{emitter_journal as journal, stream_record as stream};
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-coexisting");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let id = multi_configuration_identity();
+        let applied = [1, 0, 2, 0, 0, 0, 0, 0, 0];
+        let displaced = [1, 0, 1, 0, 0, 0, 0, 0, 0];
+        let scoped_path = plant_record(&fixture.root, &id, 14, 6, &applied, &displaced, true);
+        let scoped_body = std::fs::read(&scoped_path).unwrap();
+        let legacy = legacy_configuration_record(&id);
+        let pending: journal::PendingWrite = serde_json::from_value(legacy.clone()).unwrap();
+        let path = fixture
+            .root
+            .join("ir-emitter-stream")
+            .join(format!("{}.json", pending.filing_key()));
+        let body = serde_json::to_vec(&legacy).unwrap();
+        for claim in [false, true] {
+            // Exercise each store entry point even if a caller already holds
+            // the lock when a legacy record is put back on disk.
+            let lock = stream::acquire(&id).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            if claim {
+                assert!(stream::claim(lock, &id, 14, 6, &applied).is_none());
+            } else {
+                assert!(matches!(
+                    stream::save(lock, &id, 14, 6, &applied, &displaced),
+                    Err(stream::SaveError::Protected { .. })
+                ));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+            assert_eq!(std::fs::read(&scoped_path).unwrap(), scoped_body);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_damaged_records_never_allow_unrecorded_writes() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-damaged");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let id = multi_configuration_identity();
+        let pending: journal::PendingWrite =
+            serde_json::from_value(legacy_configuration_record(&id)).unwrap();
+        let dir = fixture.root.join("ir-emitter-stream");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exact = dir.join(format!("{}.json", pending.filing_key()));
+        let misfiled = dir.join("misfiled.json");
+        for (path, unreadable) in [(&exact, false), (&misfiled, false), (&misfiled, true)] {
+            if unreadable {
+                std::fs::create_dir(path).unwrap();
+            } else {
+                std::fs::write(path, b"{").unwrap();
+            }
+            let _fake = fake_camera::install(a_working_camera());
+            let result =
+                write_if_different_guarded(-1, 14, 6, 3, &[1, 3, 2], &id, &mut || Ok(())).unwrap();
+            assert_eq!(result.outcome, Applied::Nothing);
+            assert!(fake_camera::log().is_empty());
+            if unreadable {
+                assert!(path.is_dir());
+                std::fs::remove_dir(path).unwrap();
+            } else {
+                assert_eq!(std::fs::read(path).unwrap(), b"{");
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_other_cameras_stream_records_do_not_block() {
+        use crate::emitter_journal as journal;
+        let _lock = crate::testenv::env_lock();
+        for different_port in [false, true] {
+            let fixture = ConfigurationFixture::new(if different_port {
+                "legacy-other-port"
+            } else {
+                "legacy-other-model"
+            });
+            let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+            let id = multi_configuration_identity();
+            let mut other = multi_configuration_identity();
+            if different_port {
+                other.usb_devpath.push_str("-other");
+            } else {
+                other.descriptors[12] ^= 1;
+            }
+            let legacy = legacy_configuration_record(&other);
+            let pending: journal::PendingWrite = serde_json::from_value(legacy.clone()).unwrap();
+            let dir = fixture.root.join("ir-emitter-stream");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{}.json", pending.filing_key()));
+            let body = serde_json::to_vec(&legacy).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            let _fake = fake_camera::install(a_working_camera());
+            let result =
+                write_if_different_guarded(-1, 14, 6, 3, &[1, 3, 2], &id, &mut || Ok(())).unwrap();
+            assert_eq!(result.outcome, Applied::Wrote);
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn legacy_configuration_live_locks_still_exclude_new_writers() {
+        use crate::emitter_journal as journal;
+        use std::os::fd::AsRawFd as _;
+        let _lock = crate::testenv::env_lock();
+        let fixture = ConfigurationFixture::new("legacy-locks");
+        let _state = EnvGuard::set("IRLUME_STATE_DIR", &fixture.root);
+        let _locks = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &fixture.root);
+        let mut id = multi_configuration_identity();
+        let legacy: journal::PendingWrite =
+            serde_json::from_value(legacy_configuration_record(&id)).unwrap();
+        let sync_key = irlume_common::sha256_hex(
+            format!(
+                "descriptors:{}|devpath:{}:{}",
+                legacy.descriptor_sha256,
+                id.usb_devpath.len(),
+                id.usb_devpath
+            )
+            .as_bytes(),
+        );
+        let journal_lock = fixture.root.join(format!("irlume-emitter-{sync_key}.lock"));
+        let stream_dir = fixture.root.join("ir-emitter-stream");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        let stream_lock = stream_dir.join(format!("{}.lock", legacy.filing_key()));
+        let files = [journal_lock, stream_lock].map(|path| {
+            let file = std::fs::File::create(path).unwrap();
+            assert_eq!(
+                // SAFETY: the file owns the descriptor and is kept alive below.
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            file
+        });
+        for active in [1, 2] {
+            id.active_configuration = active;
+            assert!(journal::lock_camera(None, &id).unwrap().is_none());
+            assert!(matches!(
+                crate::stream_record::acquire(&id),
+                Err(crate::stream_record::AcquireError::Busy)
+            ));
+        }
+        drop(files);
+        assert!(journal::lock_camera(None, &id).unwrap().is_some());
+        assert!(crate::stream_record::acquire(&id).is_ok());
+    }
+
     struct ConfigurationFixture {
         root: std::path::PathBuf,
         device: std::path::PathBuf,

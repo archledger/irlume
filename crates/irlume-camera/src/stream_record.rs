@@ -217,9 +217,10 @@ pub fn pending_summary() -> crate::emitter_journal::PendingSummary {
 /// serial that reads at write time and not at claim time (or the reverse)
 /// makes the claim MISS; that fails toward not restoring, which is the
 /// pre-#188 status quo for a leftover, and the identity check would refuse
-/// such a claim anyway. No scan fallback, deliberately: a stream record is
+/// such a claim anyway. Claims have no scan fallback: a stream record is
 /// bookkeeping for the machine's own camera, not undo data for exploratory
-/// bytes, and the cost of a miss is bounded where the journal's was not.
+/// bytes. Legacy multi-configuration records are scanned separately to BLOCK
+/// changes, never to authorize a claim under the new identity.
 fn record_path(id: &CameraIdentity) -> PathBuf {
     store_dir().join(format!("{}.json", filing_key(id)))
 }
@@ -231,7 +232,25 @@ fn record_path(id: &CameraIdentity) -> PathBuf {
 /// and two "exclusive" locks. The store directory is root-only, so the lock
 /// is too.
 fn lock_path(id: &CameraIdentity) -> PathBuf {
-    store_dir().join(format!("{}.lock", filing_key(id)))
+    // Coordinate with pre-configuration-binding writers and other active
+    // configurations. The record's authority remains configuration-bound.
+    store_dir().join(format!(
+        "{}.lock",
+        crate::emitter_journal::legacy_filing_key(id)
+    ))
+}
+
+fn protect_legacy_records(id: &CameraIdentity) -> Result<(), String> {
+    for (path, port) in crate::emitter_journal::legacy_records(id, &store_dir())? {
+        if port.is_empty() || port == id.usb_devpath {
+            return Err(format!(
+                "legacy multi-configuration stream record {} does not identify the active \
+                 configuration; preserving it without claiming or writing over its change",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The per-camera stream lock, held from before the control is read until the
@@ -246,16 +265,20 @@ pub(crate) struct StreamLock {
     _file: std::fs::File,
 }
 
-/// Why the stream lock was not acquired. The two answers demand OPPOSITE
+/// Why the stream lock was not acquired. Contention and unavailability demand OPPOSITE
 /// responses, and collapsing them was review round 4's finding: a busy lock
 /// is a LIVE irlume writer whose restore bookkeeping a second, unrecorded
 /// write would silently invalidate, so the write must be refused; an
 /// unavailable store is machine trouble with nobody contesting the camera,
 /// where refusing would turn a full disk into dark IR at every login.
+/// Legacy records, or failure to examine them, require a protected refusal.
 #[derive(Debug)]
 pub(crate) enum AcquireError {
     /// Another live irlume guard holds this camera's lock.
     Busy,
+    /// Legacy undo data may still describe a live change. This must refuse,
+    /// never degrade into an unrecorded write like an unavailable lock.
+    Protected(String),
     /// The lock could not be created, opened or taken for a reason other
     /// than contention.
     Unavailable(String),
@@ -271,6 +294,9 @@ pub(crate) fn acquire(id: &CameraIdentity) -> Result<StreamLock, AcquireError> {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::io::AsRawFd as _;
 
+    // Check before any lock error can permit the unrecorded fallback, and
+    // again under the lock to close the window for a pre-upgrade writer.
+    protect_legacy_records(id).map_err(AcquireError::Protected)?;
     let dir = store_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| AcquireError::Unavailable(format!("create {}: {e}", dir.display())))?;
@@ -295,6 +321,7 @@ pub(crate) fn acquire(id: &CameraIdentity) -> Result<StreamLock, AcquireError> {
             ))),
         };
     }
+    protect_legacy_records(id).map_err(AcquireError::Protected)?;
     Ok(StreamLock { _file: file })
 }
 
@@ -499,6 +526,7 @@ pub(crate) fn save(
     applied: &[u8],
     displaced: &[u8],
 ) -> Result<StreamRecord, SaveError> {
+    protect_legacy_records(id).map_err(|why| SaveError::Protected { why })?;
     let path = record_path(id);
     // What already sits at this camera's path decides whether writing is
     // allowed at all. The ONLY record that may be replaced is one that is
@@ -716,6 +744,10 @@ pub(crate) fn claim(
     selector: u8,
     current: &[u8],
 ) -> Option<(Vec<u8>, StreamRecord)> {
+    if let Err(why) = protect_legacy_records(id) {
+        eprintln!("irlume: not claiming the stream record: {why}");
+        return None;
+    }
     let path = record_path(id);
     let body = match std::fs::read_to_string(&path) {
         Ok(body) => body,

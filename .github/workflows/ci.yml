@@ -122,7 +122,7 @@ jobs:
         run: bash scripts/ci-bubblewrap.sh
 
       - name: Install Rust 1.88 (MSRV) with rustfmt + clippy
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           # Pinned to a SHA, the action can't read the version from the tag, so
           # name the toolchain explicitly (it is a required input then).
@@ -154,7 +154,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy (warnings are errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
@@ -433,7 +433,7 @@ jobs:
       - name: Install stable Rust
         # @master (declares the `toolchain` input); the version tag branches
         # (e.g. @1.88.0) have no such input and ignore `with: toolchain:`.
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
 
@@ -698,7 +698,7 @@ jobs:
       - name: Install nightly Rust (cargo-fuzz needs it)
         # @master so `toolchain: nightly-...` is honored (the version-branch pin
         # ignored it; nightly only worked via the RUSTUP_TOOLCHAIN env fallback).
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: nightly-2026-07-15
 
@@ -742,6 +742,9 @@ jobs:
       - name: Fuzz the IPC, envelope, PCR-signature, and UVC-illumination parsers
         working-directory: fuzz
         run: |
+          # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
+          # before its build can silently update shared path dependencies.
+          cargo fetch --locked
           for t in ipc_request pcr_signature sealed_envelope uvc_illumination; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"

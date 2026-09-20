@@ -210,6 +210,8 @@ impl ConnectionContext {
 /// Persistent identity of one endpoint, collected from its opened fd.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CameraEndpoint {
+    // Configuration-bound hash of the complete descriptor blob. Configurations
+    // must not reuse each other's qualification; single-configuration keys are stable.
     descriptor_sha256: String,
     vid: u16,
     pid: u16,
@@ -230,7 +232,7 @@ impl CameraEndpoint {
             return None;
         }
         Self::new(
-            irlume_common::sha256_hex(&identity.descriptors),
+            identity.descriptor_fingerprint(),
             identity.vid,
             identity.pid,
             identity.serial,
@@ -302,7 +304,7 @@ impl CameraEndpoint {
             backend.to_owned(),
         )?;
         Self::new(
-            irlume_common::sha256_hex(&identity.descriptors),
+            identity.descriptor_fingerprint(),
             identity.vid,
             identity.pid,
             identity.serial,

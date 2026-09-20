@@ -48,7 +48,7 @@ fn parse_byte(s: &str) -> Result<u8, String> {
 }
 
 fn identity_token(id: &uvc_descriptor::CameraIdentity, sysfs_instance: (u64, u64)) -> String {
-    let descriptor_sha256 = irlume_common::sha256_hex(&id.descriptors);
+    let descriptor_sha256 = id.descriptor_fingerprint();
     let serial = id.serial.as_deref().unwrap_or("");
     irlume_common::sha256_hex(
         format!(
@@ -216,6 +216,7 @@ mod tests {
     fn identity() -> irlume_camera::uvc_descriptor::CameraIdentity {
         irlume_camera::uvc_descriptor::CameraIdentity {
             descriptors: vec![1, 2, 3, 4],
+            active_configuration: 1,
             interface_number: 1,
             vid: 0x3277,
             pid: 0x0059,

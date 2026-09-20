@@ -76,8 +76,8 @@ pub(crate) struct PendingWrite {
     pub(crate) schema_version: u32,
     /// Which build wrote the record. Descriptive, not a gate.
     pub(crate) engine_version: String,
-    /// Hex sha256 of the camera's USB descriptor blob, and this record's
-    /// filename.
+    /// Configuration-bound digest of all USB descriptor bytes, used in this
+    /// record's filing key. Single-configuration cameras retain their raw SHA.
     ///
     /// The descriptor is what `override_is_published` and `control_is_documented`
     /// already reason about, so binding the record to it means a record can only
@@ -289,14 +289,17 @@ pub(crate) fn record_path(descriptor_sha256: &str) -> PathBuf {
     store_dir().join(format!("{descriptor_sha256}.json"))
 }
 
-/// The digest of the camera's PUBLISHED DESCRIPTION: model, not unit.
+/// The digest of the complete published description and its active
+/// configuration, not physical unit. Single-configuration observations keep
+/// the historical full-blob digest; multi-configuration digests additionally
+/// bind the selected value and cannot authorize one another's control records.
 ///
 /// Two units of one model produce the same value, by construction. That is what
 /// makes it the right key for "is this record about a camera like the one in
 /// front of me" and the wrong key for "is this record about THIS camera", which
 /// is [`filing_key`].
 pub(crate) fn fingerprint(id: &CameraIdentity) -> String {
-    irlume_common::sha256_hex(&id.descriptors)
+    id.descriptor_fingerprint()
 }
 
 /// The name a record for this exact camera is filed under.
@@ -1685,6 +1688,7 @@ mod tests {
     fn identity() -> CameraIdentity {
         CameraIdentity {
             descriptors: include_bytes!("../tests/fixtures/asus-3277-0059.descriptors").to_vec(),
+            active_configuration: 1,
             interface_number: 2,
             vid: 0x3277,
             pid: 0x0059,
@@ -1857,9 +1861,9 @@ mod tests {
 
         let first = identity();
         let mut second = identity();
-        // A different descriptor blob is a different camera, which is the whole
-        // basis of the filing.
-        second.descriptors.push(0x00);
+        // A different firmware revision changes the descriptor digest without
+        // introducing malformed trailing data into the control fixture.
+        second.descriptors[12] ^= 1; // bcdDevice, low byte
 
         save(&record_for(&first)).expect("save first");
         save(&record_for(&second)).expect("save second");

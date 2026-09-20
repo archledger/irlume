@@ -13,6 +13,9 @@
 //! byte string, and burst selection must stay inside the burst and never let
 //! a camera-flagged-dark frame beat a flagged-lit one while a lit one exists.
 use irlume_camera::ir_metadata::{brightest_lit, parse_illumination, Illumination};
+use irlume_camera::uvc_descriptor::{
+    active_descriptor_view, extension_units_for_interface, CameraIdentity, MS_CAMERA_CONTROL_XU,
+};
 use libfuzzer_sys::fuzz_target;
 
 // Encode the same frame-level bytes with different USB payload boundaries.
@@ -30,6 +33,15 @@ fn frame_bytes(items: &[u8], chunk: usize, flags: u8) -> Vec<u8> {
     frame
 }
 
+fn usb_configuration(value: u8, unit: u8, total: [u8; 2]) -> Vec<u8> {
+    let mut descriptor = vec![9, 2, total[0], total[1], 1, value, 0, 0x80, 50];
+    descriptor.extend_from_slice(&[9, 4, 0, 0, 0, 0x0e, 1, 0, 0]);
+    descriptor.extend_from_slice(&[26, 0x24, 6, unit]);
+    descriptor.extend_from_slice(&MS_CAMERA_CONTROL_XU);
+    descriptor.extend_from_slice(&[1, 1, 1, 1, 0x20, 0]);
+    descriptor
+}
+
 fuzz_target!(|data: &[u8]| {
     // Parsing is deterministic: identical bytes must classify identically,
     // whatever the ring state around them.
@@ -38,6 +50,52 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
+    // USB configuration scope is also externally supplied data. Arbitrary
+    // inputs must remain bounded and deterministic; the constructed valid
+    // case checks meaning even when random input mostly fails framing.
+    let arbitrary_view = active_descriptor_view(data, data[0]);
+    assert_eq!(arbitrary_view, active_descriptor_view(data, data[0]));
+    if let Some(view) = arbitrary_view {
+        assert!(view.len() <= data.len());
+        let _ = extension_units_for_interface(&view, data[0]);
+    }
+    let active = data[0] % 2 + 1;
+    let total = [data[0], *data.get(1).unwrap_or(&0)];
+    let mut usb = vec![
+        18, 1, 0, 2, 0, 0, 0, 64, 0x77, 0x32, 0x59, 0, 0, 1, 0, 0, 0, 2,
+    ];
+    usb.extend(usb_configuration(1, 14, total));
+    usb.extend(usb_configuration(2, 4, total));
+    let view =
+        active_descriptor_view(&usb, active).expect("valid bLength-framed USB configurations");
+    let units = extension_units_for_interface(&view, 0);
+    assert_eq!(
+        units.len(),
+        1,
+        "inactive duplicate Microsoft units are not visible"
+    );
+    assert_eq!(units[0].unit_id, if active == 1 { 14 } else { 4 });
+    assert!(units[0].advertises(6));
+    assert!(
+        extension_units_for_interface(&usb, 0).is_empty(),
+        "unscoped input carries no selection authority"
+    );
+    let mut identity = CameraIdentity {
+        descriptors: usb,
+        active_configuration: 1,
+        interface_number: 0,
+        vid: 0x3277,
+        pid: 0x0059,
+        serial: None,
+        usb_devpath: "/devices/synthetic".into(),
+    };
+    let first = identity.descriptor_fingerprint();
+    identity.active_configuration = 2;
+    assert_ne!(first, identity.descriptor_fingerprint());
+    identity.active_configuration = 1;
+    // Change the inactive configuration's GUID, retaining the active view.
+    identity.descriptors[18 + 44 + 9 + 9 + 4] ^= 1;
+    assert_ne!(first, identity.descriptor_fingerprint());
     let chunk = usize::from(data[0]) % 243 + 1;
     let flags = 0x80 | (data[0] & 0x0c);
     // Malformed as well as valid item streams must be partition-independent.

@@ -45,6 +45,8 @@ pub const MSXU_FACE_AUTHENTICATION: u8 = 0x06;
 /// `MSXU_CONTROL_IR_TORCH`. Direct control of the IR lamp's power and mode.
 pub const MSXU_IR_TORCH: u8 = 0x0A;
 
+const DESC_DEVICE: u8 = 0x01;
+const DESC_CONFIGURATION: u8 = 0x02;
 const DESC_INTERFACE: u8 = 0x04;
 const DESC_CS_INTERFACE: u8 = 0x24;
 const SUBTYPE_EXTENSION_UNIT: u8 = 0x06;
@@ -110,36 +112,133 @@ impl ExtensionUnit {
 /// unit while inside the requested VideoControl interface. It never scans for
 /// the `0x24 0x06` byte pair directly, because those bytes occur inside other
 /// descriptors' payloads.
+///
+/// The input must contain exactly one configuration, obtained from the active
+/// descriptor view returned by this module. An unscoped multi-configuration
+/// blob has no authority to select a unit. Malformed tails invalidate the whole
+/// result rather than allowing a previously seen prefix to authorize a control.
 pub fn extension_units_for_interface(desc: &[u8], interface_number: u8) -> Vec<ExtensionUnit> {
     let mut out = Vec::new();
     let mut in_target_vc = false;
     let mut i = 0usize;
+    let mut configurations = 0;
 
-    while i + 2 <= desc.len() {
-        let len = usize::from(desc[i]);
+    while i < desc.len() {
+        let Some(header_end) = i.checked_add(2) else {
+            return Vec::new();
+        };
+        let Some(header) = desc.get(i..header_end) else {
+            return Vec::new();
+        };
+        let len = usize::from(header[0]);
         // A zero length would not advance, and anything overrunning the buffer
-        // means the chain is malformed. Either way, stop rather than guess.
-        if len < 2 || i + len > desc.len() {
-            break;
+        // means the chain is malformed. Refuse the whole stream, not its tail.
+        let Some(end) = i.checked_add(len) else {
+            return Vec::new();
+        };
+        if len < 2 || end > desc.len() {
+            return Vec::new();
         }
-        let d = &desc[i..i + len];
+        let d = &desc[i..end];
 
         match d[1] {
-            DESC_INTERFACE if len >= 7 => {
+            DESC_CONFIGURATION => {
+                configurations += 1;
+                if configurations != 1 || len < 9 || d[5] == 0 {
+                    return Vec::new();
+                }
+                in_target_vc = false;
+            }
+            DESC_INTERFACE => {
+                if len < 9 {
+                    return Vec::new();
+                }
                 in_target_vc = d[2] == interface_number
+                    && configurations == 1
                     && d[5] == CLASS_VIDEO
                     && d[6] == SUBCLASS_VIDEOCONTROL;
             }
-            DESC_CS_INTERFACE if in_target_vc && len >= 3 && d[2] == SUBTYPE_EXTENSION_UNIT => {
-                if let Some(unit) = parse_extension_unit(d) {
+            DESC_CS_INTERFACE if in_target_vc => {
+                if len < 3 {
+                    return Vec::new();
+                }
+                if d[2] == SUBTYPE_EXTENSION_UNIT {
+                    let Some(unit) = parse_extension_unit(d) else {
+                        return Vec::new();
+                    };
                     out.push(unit);
                 }
             }
             _ => {}
         }
-        i += len;
+        i = end;
     }
     out
+}
+
+/// Select only bytes belonging to the active configuration, retaining the
+/// original device prefix. `bNumConfigurations` in that prefix still describes
+/// the physical device; this is an observation view, not a replacement USB blob.
+/// Single-configuration devices retain their exact historical descriptor bytes.
+/// Exposed only for the untrusted-input fuzz harness; this pure parser does not
+/// establish which configuration is active on an actual device.
+#[doc(hidden)]
+pub fn active_descriptor_view(raw: &[u8], active: u8) -> Option<Vec<u8>> {
+    if active == 0 || raw.len() < 18 || raw[0] != 18 || raw[1] != DESC_DEVICE {
+        return None;
+    }
+    let mut seen = [false; 256];
+    let mut count = 0usize;
+    let mut prefix_end = None;
+    let mut selected = None;
+    let mut current = None;
+    let mut at = 18;
+    while at < raw.len() {
+        let header = raw.get(at..at.checked_add(2)?)?;
+        let length = usize::from(header[0]);
+        if length < 2 {
+            return None;
+        }
+        let end = at.checked_add(length)?;
+        let descriptor = raw.get(at..end)?;
+        match header[1] {
+            DESC_DEVICE => return None,
+            DESC_CONFIGURATION => {
+                if length < 9 {
+                    return None;
+                }
+                if let Some((value, start)) = current {
+                    if value == active {
+                        selected = Some(start..at);
+                    }
+                }
+                let value = descriptor[5];
+                if value == 0 || seen[usize::from(value)] {
+                    return None;
+                }
+                seen[usize::from(value)] = true;
+                count += 1;
+                prefix_end.get_or_insert(at);
+                current = Some((value, at));
+            }
+            DESC_INTERFACE if length < 9 || current.is_none() => return None,
+            _ => {}
+        }
+        // wTotalLength is explicitly not trustworthy in the Linux sysfs ABI.
+        at = end;
+    }
+    if let Some((value, start)) = current {
+        if value == active {
+            selected = Some(start..raw.len());
+        }
+    }
+    if count != usize::from(raw[17]) {
+        return None;
+    }
+    let range = selected?;
+    let mut view = raw[..prefix_end?].to_vec();
+    view.extend_from_slice(&raw[range]);
+    Some(view)
 }
 
 /// Layout from UVC 1.5 section 3.7.2.7:
@@ -188,7 +287,7 @@ fn read_hex_u16(path: &Path) -> Option<u16> {
     u16::from_str_radix(std::fs::read_to_string(path).ok()?.trim(), 16).ok()
 }
 
-/// The USB configuration descriptors and VideoControl interface number backing
+/// The active USB descriptor view and VideoControl interface number backing
 /// `video_device` (for example `/dev/video2`).
 ///
 /// uvcvideo binds a video node to its VideoControl interface, so the interface
@@ -200,14 +299,13 @@ fn read_hex_u16(path: &Path) -> Option<u16> {
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn usb_context(video_device: &str) -> std::io::Result<(Vec<u8>, u8)> {
     let iface_dir = interface_dir(video_device)?;
-    let interface_number = read_hex_u8(&iface_dir.join("bInterfaceNumber")).ok_or_else(|| {
-        bad(format!(
-            "{} has no bInterfaceNumber; not a USB interface",
-            iface_dir.display()
-        ))
-    })?;
-    let descriptors = usb_device_dir(video_device)?.join("descriptors");
-    Ok((std::fs::read(descriptors)?, interface_number))
+    let dev_dir = ancestor_with(&iface_dir, "descriptors")
+        .ok_or_else(|| bad("no USB descriptor parent for the interface".into()))?;
+    let (descriptors, configuration, interface_number) =
+        descriptor_context_from_dirs(&iface_dir, &dev_dir)?;
+    let view = active_descriptor_view(&descriptors, configuration)
+        .ok_or_else(|| bad("invalid active USB descriptor view".into()))?;
+    Ok((view, interface_number))
 }
 
 /// Everything needed to decide whether a control may be written, resolved from
@@ -220,7 +318,12 @@ pub fn usb_context(video_device: &str) -> std::io::Result<(Vec<u8>, u8)> {
 /// kernel object. `/sys/dev/char/<major>:<minor>` turns that back into the exact
 /// sysfs node, so the answer describes the device being written to.
 pub struct CameraIdentity {
+    /// Complete cached USB descriptor blob, including inactive configurations.
+    /// All of these bytes remain identity evidence. Use descriptor_fingerprint
+    /// to bind that evidence to the separately observed active configuration.
     pub descriptors: Vec<u8>,
+    /// bConfigurationValue observed and checked against the fd's interface.
+    pub active_configuration: u8,
     pub interface_number: u8,
     pub vid: u16,
     pub pid: u16,
@@ -324,15 +427,19 @@ fn usb_dirs_for_numbers(major: u32, minor: u32) -> std::io::Result<(PathBuf, Pat
 }
 
 fn identity_from_dirs(iface_dir: &Path, dev_dir: &Path) -> std::io::Result<CameraIdentity> {
-    let interface_number = read_hex_u8(&iface_dir.join("bInterfaceNumber")).ok_or_else(|| {
-        bad(format!(
-            "{} has an unreadable bInterfaceNumber",
-            iface_dir.display()
-        ))
-    })?;
+    identity_from_dirs_with(iface_dir, dev_dir, || {})
+}
 
-    Ok(CameraIdentity {
-        descriptors: std::fs::read(dev_dir.join("descriptors"))?,
+fn identity_from_dirs_with(
+    iface_dir: &Path,
+    dev_dir: &Path,
+    after_read: impl FnOnce(),
+) -> std::io::Result<CameraIdentity> {
+    let (descriptors, configuration, interface_number) =
+        descriptor_context_from_dirs(iface_dir, dev_dir)?;
+    let identity = CameraIdentity {
+        descriptors,
+        active_configuration: configuration,
         interface_number,
         vid: read_hex_u16(&dev_dir.join("idVendor"))
             .ok_or_else(|| bad(format!("{} has no idVendor", dev_dir.display())))?,
@@ -356,7 +463,84 @@ fn identity_from_dirs(iface_dir: &Path, dev_dir: &Path) -> std::io::Result<Camer
             .unwrap_or_else(|_| dev_dir.to_path_buf())
             .to_string_lossy()
             .into_owned(),
-    })
+    };
+    after_read();
+    if configuration_from_dirs(iface_dir, dev_dir)? != (configuration, interface_number) {
+        return Err(bad(
+            "USB configuration changed while collecting identity".into()
+        ));
+    }
+    Ok(identity)
+}
+
+fn descriptor_context_from_dirs(
+    iface_dir: &Path,
+    dev_dir: &Path,
+) -> std::io::Result<(Vec<u8>, u8, u8)> {
+    let (configuration, interface) = configuration_from_dirs(iface_dir, dev_dir)?;
+    let raw = std::fs::read(dev_dir.join("descriptors"))?;
+    active_descriptor_view(&raw, configuration).ok_or_else(|| {
+        bad("USB descriptors do not contain one complete active configuration".into())
+    })?;
+    if configuration_from_dirs(iface_dir, dev_dir)? != (configuration, interface) {
+        return Err(bad(
+            "USB configuration changed while reading descriptors".into()
+        ));
+    }
+    Ok((raw, configuration, interface))
+}
+
+/// Read the active configuration and require the fd-resolved interface to
+/// belong to it. USB core names interfaces `<device>:<configuration>.<number>`
+/// using decimal numbers; bInterfaceNumber itself is a hexadecimal attribute.
+pub(crate) fn configuration_from_dirs(
+    iface_dir: &Path,
+    dev_dir: &Path,
+) -> std::io::Result<(u8, u8)> {
+    let decimal = |raw: &str| -> Option<u8> {
+        let raw = raw.trim();
+        (!raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| raw.parse().ok())
+            .flatten()
+    };
+    let active_path = dev_dir.join("bConfigurationValue");
+    let raw = std::fs::read_to_string(&active_path)?;
+    let active = decimal(&raw).filter(|value| *value != 0).ok_or_else(|| {
+        bad(format!(
+            "{} has no valid active configuration",
+            active_path.display()
+        ))
+    })?;
+    let interface = read_hex_u8(&iface_dir.join("bInterfaceNumber")).ok_or_else(|| {
+        bad(format!(
+            "{} has an unreadable bInterfaceNumber",
+            iface_dir.display()
+        ))
+    })?;
+    let device_name = dev_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| bad("USB device has no directory name".into()))?;
+    let suffix = iface_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&format!("{device_name}:")))
+        .and_then(|name| name.split_once('.'));
+    if iface_dir.parent() != Some(dev_dir)
+        || suffix
+            .and_then(|(configuration, number)| Some((decimal(configuration)?, decimal(number)?)))
+            != Some((active, interface))
+    {
+        return Err(bad(
+            "USB interface does not belong to the active configuration".into(),
+        ));
+    }
+    Ok((active, interface))
+}
+
+pub(crate) fn validate_fd_configuration(fd: std::os::raw::c_int) -> std::io::Result<()> {
+    let (interface, device) = fd_usb_dirs(fd)?;
+    configuration_from_dirs(&interface, &device).map(|_| ())
 }
 
 fn connection_facts_from_dirs(
@@ -448,8 +632,31 @@ fn parse_speed_millimbps(raw: &str) -> Option<u64> {
 }
 
 impl CameraIdentity {
+    /// The observed active configuration, when it exists in the complete blob.
+    pub(crate) fn configuration_value(&self) -> Option<u8> {
+        active_descriptor_view(&self.descriptors, self.active_configuration)
+            .map(|_| self.active_configuration)
+    }
+
+    /// Configuration-bound digest retaining every published descriptor byte.
+    ///
+    /// A valid single-configuration device keeps its historical plain SHA-256.
+    /// Otherwise hash a fixed domain, the one-byte configuration value, and the
+    /// complete blob. Filtering inactive bytes here would weaken device identity.
+    pub fn descriptor_fingerprint(&self) -> String {
+        if self.descriptors.get(17) == Some(&1) && self.configuration_value().is_some() {
+            return irlume_common::sha256_hex(&self.descriptors);
+        }
+        let mut material = b"irlume-usb-configuration-v1\0".to_vec();
+        material.push(self.active_configuration);
+        material.extend_from_slice(&self.descriptors);
+        irlume_common::sha256_hex(&material)
+    }
+
     pub fn extension_units(&self) -> Vec<ExtensionUnit> {
-        extension_units_for_interface(&self.descriptors, self.interface_number)
+        active_descriptor_view(&self.descriptors, self.active_configuration)
+            .map(|view| extension_units_for_interface(&view, self.interface_number))
+            .unwrap_or_default()
     }
 
     /// The Microsoft camera-control unit, if this camera has exactly one.
@@ -691,6 +898,342 @@ mod tests {
     /// against, so the parser is exercised against bytes a real camera emitted
     /// rather than bytes written to match the parser.
     const ASUS: &[u8] = include_bytes!("../tests/fixtures/asus-3277-0059.descriptors");
+
+    struct UsbFixture {
+        root: PathBuf,
+        device: PathBuf,
+        interface: PathBuf,
+    }
+
+    impl UsbFixture {
+        fn new(label: &str, configuration: u8, interface: u8, descriptors: &[u8]) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("irlume-ms02-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let device = root.join("3-5");
+            let interface_path = device.join(format!("3-5:{configuration}.{interface}"));
+            std::fs::create_dir_all(&interface_path).unwrap();
+            std::fs::write(
+                interface_path.join("bInterfaceNumber"),
+                format!("{interface:02x}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                device.join("bConfigurationValue"),
+                format!("{configuration}\n"),
+            )
+            .unwrap();
+            std::fs::write(device.join("idVendor"), "3277\n").unwrap();
+            std::fs::write(device.join("idProduct"), "0059\n").unwrap();
+            std::fs::write(device.join("descriptors"), descriptors).unwrap();
+            Self {
+                root,
+                device,
+                interface: interface_path,
+            }
+        }
+
+        fn identity(&self) -> std::io::Result<CameraIdentity> {
+            identity_from_dirs(&self.interface, &self.device)
+        }
+    }
+
+    impl Drop for UsbFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn configuration(value: u8, guid: [u8; 16]) -> Vec<u8> {
+        // USB configuration, VC interface 0, XU unit 14 advertising FaceAuth.
+        let mut bytes = vec![9, 2, 44, 0, 1, value, 0, 0x80, 50];
+        bytes.extend_from_slice(&[9, 4, 0, 0, 0, 0x0e, 1, 0, 0]);
+        bytes.extend_from_slice(&[26, 0x24, 6, 14]);
+        bytes.extend_from_slice(&guid);
+        bytes.extend_from_slice(&[1, 1, 1, 1, 0x20, 0]);
+        bytes
+    }
+
+    fn usb_descriptors(configurations: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = vec![
+            18,
+            1,
+            0,
+            2,
+            0,
+            0,
+            0,
+            64,
+            0x77,
+            0x32,
+            0x59,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            configurations.len() as u8,
+        ];
+        for configuration in configurations {
+            bytes.extend_from_slice(configuration);
+        }
+        bytes
+    }
+
+    #[test]
+    fn inactive_configuration_never_supplies_the_microsoft_unit() {
+        let raw = usb_descriptors(&[
+            configuration(1, [0x42; 16]),
+            configuration(2, MS_CAMERA_CONTROL_XU),
+        ]);
+        let fixture = UsbFixture::new("inactive", 1, 0, &raw);
+        assert!(fixture.identity().unwrap().microsoft_xu().is_none());
+    }
+
+    #[test]
+    fn inactive_duplicate_does_not_hide_the_active_microsoft_unit() {
+        let raw = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, MS_CAMERA_CONTROL_XU),
+        ]);
+        let fixture = UsbFixture::new("duplicate", 1, 0, &raw);
+        let unit = fixture
+            .identity()
+            .unwrap()
+            .microsoft_xu()
+            .expect("one active Microsoft unit");
+        assert_eq!(unit.unit_id, 14);
+        assert!(unit.advertises(MSXU_FACE_AUTHENTICATION));
+    }
+
+    #[test]
+    fn configuration_observations_have_distinct_persistent_fingerprints() {
+        let raw = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, MS_CAMERA_CONTROL_XU),
+        ]);
+        let first = UsbFixture::new("fingerprint-one", 1, 0, &raw)
+            .identity()
+            .unwrap();
+        let second = UsbFixture::new("fingerprint-two", 2, 0, &raw)
+            .identity()
+            .unwrap();
+        assert_ne!(
+            crate::emitter_journal::fingerprint(&first),
+            crate::emitter_journal::fingerprint(&second)
+        );
+        assert_eq!(
+            first.descriptors, second.descriptors,
+            "retain the entire physical descriptor evidence"
+        );
+        assert_ne!(
+            first.descriptor_fingerprint(),
+            second.descriptor_fingerprint()
+        );
+    }
+
+    #[test]
+    fn configuration_binding_retains_inactive_descriptor_identity_evidence() {
+        let first = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, [0x42; 16]),
+        ]);
+        let second = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, [0x33; 16]),
+        ]);
+        let fixture = UsbFixture::new("whole-identity", 1, 0, &first);
+        let first = fixture.identity().unwrap();
+        std::fs::write(fixture.device.join("descriptors"), second).unwrap();
+        let second = fixture.identity().unwrap();
+        assert_eq!(first.usb_devpath, second.usb_devpath);
+        assert_eq!(first.active_configuration, second.active_configuration);
+        assert_eq!(first.extension_units(), second.extension_units());
+        assert_ne!(
+            crate::emitter_journal::fingerprint(&first),
+            crate::emitter_journal::fingerprint(&second),
+            "adding configuration scope must not discard existing whole-device identity evidence"
+        );
+    }
+
+    #[test]
+    fn configuration_must_be_readable_nonzero_and_match_the_bound_interface() {
+        let raw = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, MS_CAMERA_CONTROL_XU),
+        ]);
+        let fixture = UsbFixture::new("configuration-read", 1, 0, &raw);
+        for value in ["", "0\n", "-1\n", "256\n", "garbage", "2\n"] {
+            std::fs::write(fixture.device.join("bConfigurationValue"), value).unwrap();
+            assert!(
+                fixture.identity().is_err(),
+                "must refuse active configuration {value:?}"
+            );
+        }
+        std::fs::remove_file(fixture.device.join("bConfigurationValue")).unwrap();
+        assert!(fixture.identity().is_err());
+    }
+
+    #[test]
+    fn configuration_truncated_chain_does_not_authorize_a_valid_prefix() {
+        let mut raw = usb_descriptors(&[configuration(1, MS_CAMERA_CONTROL_XU)]);
+        raw.extend_from_slice(&[9, 2, 44]);
+        let fixture = UsbFixture::new("truncated", 1, 0, &raw);
+        assert!(fixture.identity().is_err());
+    }
+
+    #[test]
+    fn configuration_single_camera_preserves_the_existing_descriptor_bytes() {
+        let fixture = UsbFixture::new("single-asus", 1, 2, ASUS);
+        assert_eq!(fixture.identity().unwrap().descriptors, ASUS);
+        assert_eq!(
+            fixture.identity().unwrap().descriptor_fingerprint(),
+            irlume_common::sha256_hex(ASUS)
+        );
+        let raw = usb_descriptors(&[configuration(10, MS_CAMERA_CONTROL_XU)]);
+        let fixture = UsbFixture::new("decimal", 10, 0, &raw);
+        assert_eq!(fixture.identity().unwrap().descriptors, raw);
+        assert!(fixture.identity().unwrap().microsoft_xu().is_some());
+    }
+
+    #[test]
+    fn configuration_total_length_never_selects_or_skips_a_configuration() {
+        let mut inactive = configuration(1, [0x42; 16]);
+        inactive[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        let mut active = configuration(2, MS_CAMERA_CONTROL_XU);
+        active[2..4].copy_from_slice(&0u16.to_le_bytes());
+        let raw = usb_descriptors(&[inactive, active.clone()]);
+        let fixture = UsbFixture::new("total-length", 2, 0, &raw);
+        let id = fixture.identity().unwrap();
+        assert_eq!(id.descriptors, raw);
+        assert_eq!(
+            active_descriptor_view(&raw, 2).unwrap(),
+            [raw[..18].to_vec(), active].concat()
+        );
+        assert_eq!(id.configuration_value(), Some(2));
+        assert_eq!(id.microsoft_xu().unwrap().unit_id, 14);
+        assert!(
+            extension_units_for_interface(&raw, 0).is_empty(),
+            "unscoped raw input must not guess which configuration is active"
+        );
+    }
+
+    #[test]
+    fn configuration_duplicate_missing_and_truncated_layouts_refuse() {
+        let duplicate = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(1, MS_CAMERA_CONTROL_XU),
+        ]);
+        assert!(active_descriptor_view(&duplicate, 1).is_none());
+        let raw = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, MS_CAMERA_CONTROL_XU),
+        ]);
+        assert!(active_descriptor_view(&raw, 3).is_none());
+        assert!(active_descriptor_view(&raw, 0).is_none());
+        let mut at = 0;
+        while at < raw.len() {
+            let end = at + usize::from(raw[at]);
+            for cut in at + 1..end {
+                assert!(
+                    active_descriptor_view(&raw[..cut], 1).is_none(),
+                    "incomplete descriptor at {cut}"
+                );
+            }
+            at = end;
+        }
+        for (offset, value) in [(18, 0), (18, 2), (19, DESC_DEVICE), (23, 0)] {
+            let mut broken = raw.clone();
+            broken[offset] = value;
+            assert!(active_descriptor_view(&broken, 1).is_none());
+        }
+    }
+
+    #[test]
+    fn configuration_change_or_disappearance_during_collection_refuses_identity() {
+        let raw = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, MS_CAMERA_CONTROL_XU),
+        ]);
+        let fixture = UsbFixture::new("changed", 1, 0, &raw);
+        let result = identity_from_dirs_with(&fixture.interface, &fixture.device, || {
+            std::fs::write(fixture.device.join("bConfigurationValue"), "2\n").unwrap();
+        });
+        assert!(result.is_err());
+        std::fs::write(fixture.device.join("bConfigurationValue"), "1\n").unwrap();
+        let result = identity_from_dirs_with(&fixture.interface, &fixture.device, || {
+            std::fs::remove_file(fixture.device.join("bConfigurationValue")).unwrap();
+        });
+        assert!(result.is_err());
+        std::fs::write(fixture.device.join("bConfigurationValue"), "1\n").unwrap();
+        std::fs::write(fixture.interface.join("bInterfaceNumber"), "01\n").unwrap();
+        assert!(
+            fixture.identity().is_err(),
+            "interface attribute must match its fd-derived path"
+        );
+    }
+
+    #[test]
+    fn configuration_scoped_records_cannot_restore_in_another_configuration() {
+        let raw = usb_descriptors(&[
+            configuration(1, MS_CAMERA_CONTROL_XU),
+            configuration(2, [0x42; 16]),
+        ]);
+        let mut fixture = UsbFixture::new("record-scope", 1, 0, &raw);
+        let first = fixture.identity().unwrap();
+        let original = "010001000000000000";
+        let applied = "010002000000000000";
+        let pending: crate::emitter_journal::PendingWrite = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "engine_version": "fixture", "descriptor_sha256": crate::emitter_journal::fingerprint(&first),
+            "usb_id": first.usb_id(), "interface_number": 0, "unit": 14, "selector": 6,
+            "len": 9, "original": original, "attempted": applied, "restore_attempts": 0,
+            "usb_devpath": first.usb_devpath,
+        })).unwrap();
+        let stream: crate::stream_record::StreamWrite = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "engine_version": "fixture", "descriptor_sha256": crate::emitter_journal::fingerprint(&first),
+            "usb_id": first.usb_id(), "interface_number": 0, "unit": 14, "selector": 6,
+            "state": "applied", "applied": applied, "displaced": original, "restore_attempts": 0,
+            "usb_devpath": first.usb_devpath,
+        })).unwrap();
+        let current = crate::emitter_journal::from_hex(applied).unwrap();
+        assert!(crate::emitter_journal::record_applies(&pending, &first).is_ok());
+        assert!(crate::stream_record::record_claims(&stream, &first, 14, 6, &current).is_ok());
+        fixture.interface = fixture.device.join("3-5:2.0");
+        std::fs::create_dir(&fixture.interface).unwrap();
+        std::fs::write(fixture.interface.join("bInterfaceNumber"), "00\n").unwrap();
+        std::fs::write(fixture.device.join("bConfigurationValue"), "2\n").unwrap();
+        let second = fixture.identity().unwrap();
+        assert_eq!(first.usb_devpath, second.usb_devpath);
+        assert!(second.microsoft_xu().is_none());
+        assert!(crate::emitter_journal::record_applies(&pending, &second).is_err());
+        assert!(crate::stream_record::record_claims(&stream, &second, 14, 6, &current).is_err());
+        assert!(
+            !crate::emitter_journal::identity_authorizes(
+                &irlume_common::sha256_hex(&raw),
+                &first.usb_devpath,
+                None,
+                &first
+            ),
+            "legacy unscoped multi-configuration records must not acquire restore authority"
+        );
+    }
+
+    #[test]
+    fn configuration_parser_rejects_malformed_tails_and_opaque_payload_matches() {
+        let mut view = usb_descriptors(&[configuration(1, MS_CAMERA_CONTROL_XU)]);
+        view.extend_from_slice(&[2, DESC_CS_INTERFACE]);
+        assert!(extension_units_for_interface(&view, 0).is_empty());
+        let mut view = usb_descriptors(&[configuration(1, MS_CAMERA_CONTROL_XU)]);
+        view.push(0);
+        assert!(extension_units_for_interface(&view, 0).is_empty());
+        // Bytes resembling configuration/interface headers inside an unknown
+        // descriptor are payload, never a reason to restart the chain walk.
+        let mut active = configuration(1, MS_CAMERA_CONTROL_XU);
+        active.extend_from_slice(&[8, 0xff, 9, 2, 44, 0, 1, 2]);
+        let view = usb_descriptors(&[active]);
+        assert_eq!(extension_units_for_interface(&view, 0).len(), 1);
+    }
 
     #[test]
     fn finds_the_microsoft_xu_on_the_interface_that_owns_it() {

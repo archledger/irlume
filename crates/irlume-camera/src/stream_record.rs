@@ -115,7 +115,7 @@ pub(crate) struct StreamWrite {
     pub(crate) schema_version: u32,
     /// Which build wrote the record. Descriptive, not a gate.
     pub(crate) engine_version: String,
-    /// Hex sha256 of the camera's USB descriptor blob: the model.
+    /// Configuration-bound digest of the complete USB descriptor blob.
     pub(crate) descriptor_sha256: String,
     /// `vid:pid`, human-readable, checked against the digest's camera.
     pub(crate) usb_id: String,
@@ -798,6 +798,7 @@ mod tests {
     fn identity_with(descriptors: Vec<u8>) -> CameraIdentity {
         CameraIdentity {
             descriptors,
+            active_configuration: 1,
             interface_number: 0,
             vid: 0x3443,
             pid: 0xc803,

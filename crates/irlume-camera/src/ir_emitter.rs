@@ -712,7 +712,20 @@ impl std::fmt::Display for XuError {
 
 type XuResult<T> = std::result::Result<T, XuError>;
 
+fn validate_query_configuration(fd: c_int) -> XuResult<()> {
+    #[cfg(test)]
+    if let Some(result) = fake_camera::check_configuration() {
+        return result;
+    }
+    crate::uvc_descriptor::validate_fd_configuration(fd)
+        .map_err(|_| XuError::Unresponsive(libc::ESTALE))
+}
+
 fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> XuResult<()> {
+    // A unit/interface number is meaningful only in the fd's active USB
+    // configuration. Recheck before every ioctl, including restoration reads
+    // and writes, so a configuration transition cannot reuse earlier evidence.
+    validate_query_configuration(fd)?;
     // Every read is traced HERE, not in `get_of`, because `get_len` and
     // `get_info` have fixed widths and call this directly. The trace used to sit
     // in `get_of` under a comment calling it "the single choke point for every
@@ -800,6 +813,9 @@ pub(crate) mod fake_camera {
     // needs it to.
     #[derive(Default)]
     pub(crate) struct Camera {
+        /// A fake sysfs observation at the same pre-ioctl boundary as production.
+        /// None preserves the ordinary valid-configuration fixture.
+        pub(crate) configuration_check: Option<Box<dyn FnMut() -> XuResult<()>>>,
         /// What `GET_CUR` answers. Updated by an accepted `SET_CUR`, like a real
         /// control, so a read-back reflects what was written.
         pub(crate) current: Vec<u8>,
@@ -861,6 +877,19 @@ pub(crate) mod fake_camera {
 
     pub(crate) fn installed() -> bool {
         CAMERA.with(|camera| camera.borrow().is_some())
+    }
+
+    pub(crate) fn check_configuration() -> Option<XuResult<()>> {
+        CAMERA.with(|camera| {
+            let mut camera = camera.borrow_mut();
+            let camera = camera.as_mut()?;
+            Some(
+                camera
+                    .configuration_check
+                    .as_mut()
+                    .map_or(Ok(()), |check| check()),
+            )
+        })
     }
 
     /// Install a fake for the rest of this test, and take it back at the end.
@@ -1080,6 +1109,7 @@ fn validate_write_lease(fd: c_int) -> XuResult<()> {
 
 fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     validate_write_lease(fd)?;
+    validate_query_configuration(fd)?;
     if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
         eprintln!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}");
     }
@@ -1117,7 +1147,11 @@ pub(crate) fn info_allows_set(info: u8) -> bool {
         && info & DISABLED_BY_COMMIT_STATE == 0
 }
 
-/// Raw, guard-free extension-unit access, for TEST TOOLING ONLY.
+/// Raw extension-unit access, for TEST TOOLING ONLY.
+///
+/// Payload and restoration policy are the caller's responsibility. The fd must
+/// still name an interface in the active USB configuration, and writes require
+/// the existing camera-operation lease.
 ///
 /// Hidden from the documented API on purpose. Everything else in this module
 /// wraps a write in evidence and an undo path; these wrappers exist so
@@ -1621,8 +1655,12 @@ pub fn microsoft_xu_report(device: &str) -> irlume_common::Result<String> {
     let id = crate::uvc_descriptor::identity_from_fd(fd)
         .map_err(|e| crate::Error::Hardware(format!("{device}: identity: {e}")))?;
     let mut out = format!(
-        "{device}: vid {:04x} pid {:04x}, interface {}\n",
-        id.vid, id.pid, id.interface_number
+        "{device}: vid {:04x} pid {:04x}, configuration {}, interface {}\n",
+        id.vid,
+        id.pid,
+        id.configuration_value()
+            .map_or_else(|| "unknown".into(), |value| value.to_string()),
+        id.interface_number
     );
     let units = id.extension_units();
     if units.is_empty() {
@@ -2449,7 +2487,13 @@ fn planned_action(
         }
     }
 
-    match known_control(id.vid, id.pid).filter(|c| control_is_documented(id, c)) {
+    // The literal recipes carry no configuration selector. Disambiguating a
+    // multi-configuration descriptor must not silently extend their scope.
+    // Its current device-default path can be discovered
+    // and validated instead; no compiled payload is extrapolated to it.
+    match known_control(id.vid, id.pid)
+        .filter(|c| id.descriptors.get(17) == Some(&1) && control_is_documented(id, c))
+    {
         Some(ctrl) => CaptureAction::KnownPayload(ctrl),
         None => CaptureAction::Nothing,
     }
@@ -2600,6 +2644,7 @@ pub(crate) fn override_is_published(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct OverrideKey {
     rdev: libc::dev_t,
+    configuration: u8,
     interface_number: u8,
     vid: u16,
     pid: u16,
@@ -2678,6 +2723,12 @@ fn override_key(
     }
     Ok(OverrideKey {
         rdev: st.st_rdev,
+        configuration: id.configuration_value().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unscoped USB configuration",
+            )
+        })?,
         interface_number: id.interface_number,
         vid: id.vid,
         pid: id.pid,
@@ -5172,6 +5223,158 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    struct ConfigurationFixture {
+        root: std::path::PathBuf,
+        device: std::path::PathBuf,
+        interface: std::path::PathBuf,
+    }
+
+    impl ConfigurationFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "irlume-xu-configuration-{label}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let device = root.join("3-5");
+            let interface = device.join("3-5:1.0");
+            std::fs::create_dir_all(&interface).unwrap();
+            std::fs::write(device.join("bConfigurationValue"), "1\n").unwrap();
+            std::fs::write(interface.join("bInterfaceNumber"), "00\n").unwrap();
+            Self {
+                root,
+                device,
+                interface,
+            }
+        }
+
+        fn probe(&self) -> Box<dyn FnMut() -> XuResult<()>> {
+            let device = self.device.clone();
+            let interface = self.interface.clone();
+            Box::new(move || {
+                crate::uvc_descriptor::configuration_from_dirs(&interface, &device)
+                    .map(|_| ())
+                    .map_err(|_| XuError::Unresponsive(libc::ESTALE))
+            })
+        }
+    }
+
+    impl Drop for ConfigurationFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn configuration_change_refuses_reads_forward_writes_and_restore_io() {
+        let fixture = ConfigurationFixture::new("transition");
+        let original = vec![1, 0, 1, 0, 0, 0, 0, 0, 0];
+        let applied = vec![1, 0, 2, 0, 0, 0, 0, 0, 0];
+        let _camera = fake_camera::install(fake_camera::Camera {
+            configuration_check: Some(fixture.probe()),
+            current: original.clone(),
+            len: 9,
+            info: 3,
+            ..Default::default()
+        });
+        assert_eq!(get_cur(-1, 14, 6, 9).unwrap(), original);
+        let before = fake_camera::log();
+        std::fs::write(fixture.device.join("bConfigurationValue"), "2\n").unwrap();
+        assert!(get_cur(-1, 14, 6, 9).is_err());
+        assert!(set_cur(-1, 14, 6, &applied).is_err());
+        let mut mode = UvcMode {
+            handle: None,
+            unit: 14,
+            selector: 6,
+            restore: original,
+            applied,
+            armed: true,
+            active: true,
+            record: None,
+            _lock: None,
+        };
+        assert!(mode.restore().is_err());
+        assert_eq!(
+            fake_camera::log(),
+            before,
+            "stale configuration must reach no ioctl"
+        );
+    }
+
+    #[test]
+    fn configuration_is_rechecked_at_the_final_ioctl_boundary() {
+        let fixture = ConfigurationFixture::new("last-boundary");
+        let device = fixture.device.clone();
+        let mut probe = fixture.probe();
+        let mut first = true;
+        let _camera = fake_camera::install(fake_camera::Camera {
+            configuration_check: Some(Box::new(move || {
+                let result = probe();
+                if first {
+                    first = false;
+                    std::fs::write(device.join("bConfigurationValue"), "2\n").unwrap();
+                }
+                result
+            })),
+            current: vec![1, 0, 1, 0, 0, 0, 0, 0, 0],
+            len: 9,
+            info: 3,
+            ..Default::default()
+        });
+        assert!(set_cur(-1, 14, 6, &[1, 0, 2, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(
+            fake_camera::log().is_empty(),
+            "configuration moved after preflight; no SET_CUR may reach transport"
+        );
+    }
+
+    #[test]
+    fn configuration_scopes_the_override_memo() {
+        use std::os::fd::AsRawFd;
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut first = identity(0x3277, 0x0059);
+        let mut other_configuration = first.descriptors[18..].to_vec();
+        other_configuration[5] = 2;
+        first.descriptors[17] = 2;
+        first.descriptors.extend(other_configuration);
+        let mut second = identity(0x3277, 0x0059);
+        second.descriptors = first.descriptors.clone();
+        second.active_configuration = 2;
+        let control = ctrl(14, 6, vec![1, 3, 2, 0, 0, 0, 0, 0, 0]);
+        assert_ne!(
+            override_key(fd.as_raw_fd(), &first, &control).unwrap(),
+            override_key(fd.as_raw_fd(), &second, &control).unwrap()
+        );
+    }
+
+    #[test]
+    fn configuration_disambiguation_does_not_expand_literal_payload_qualification() {
+        let _lock = crate::testenv::env_lock();
+        let _env = EnvGuard::set(
+            "IRLUME_IR_EMITTER_CONF",
+            "/definitely/missing/ms02-emitter.conf",
+        );
+        let mut id = identity(0x3277, 0x0059);
+        assert!(matches!(
+            planned_action(&RecoveryOutcome::NothingPending, None, &id),
+            CaptureAction::KnownPayload(_)
+        ));
+        // Both configurations publish the same MS unit. Selecting one must
+        // not extend a literal recipe that has no configuration selector.
+        let mut other_configuration = id.descriptors[18..].to_vec();
+        other_configuration[5] = 2;
+        id.descriptors[17] = 2;
+        id.descriptors.extend(other_configuration);
+        assert!(control_is_documented(
+            &id,
+            &known_control(id.vid, id.pid).unwrap()
+        ));
+        assert_eq!(
+            planned_action(&RecoveryOutcome::NothingPending, None, &id),
+            CaptureAction::Nothing
+        );
+    }
+
     #[cfg(feature = "capture-timing")]
     #[test]
     fn teardown_timing_records_failed_restore_without_error_payload() {
@@ -9565,6 +9768,7 @@ mod tests {
     fn identity(vid: u16, pid: u16) -> crate::uvc_descriptor::CameraIdentity {
         crate::uvc_descriptor::CameraIdentity {
             descriptors: include_bytes!("../tests/fixtures/asus-3277-0059.descriptors").to_vec(),
+            active_configuration: 1,
             interface_number: 2,
             vid,
             pid,
@@ -9905,6 +10109,7 @@ mod tests {
         // guessed payloads to both of them.
         let no_ms = crate::uvc_descriptor::CameraIdentity {
             descriptors: include_bytes!("../tests/fixtures/asus-3277-0059.descriptors").to_vec(),
+            active_configuration: 1,
             interface_number: 0,
             vid: 0x3277,
             pid: 0x0059,

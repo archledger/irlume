@@ -154,7 +154,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy (warnings are errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
@@ -742,6 +742,9 @@ jobs:
       - name: Fuzz the IPC, envelope, PCR-signature, and UVC-illumination parsers
         working-directory: fuzz
         run: |
+          # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
+          # before its build can silently update shared path dependencies.
+          cargo fetch --locked
           for t in ipc_request pcr_signature sealed_envelope uvc_illumination; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"

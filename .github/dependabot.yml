@@ -57,6 +57,14 @@ updates:
       # lockfile alone leaves the root --locked build inconsistent.
       argon2:
         patterns: ["argon2"]
+      # der and spki share RustCrypto traits and must use the same generation.
+      # Group across both directories so root and fuzz locks move together.
+      asn1:
+        patterns: ["der", "spki"]
+      # TOML is also inherited from the root manifest by path dependencies in
+      # the detached fuzz workspace. Major bumps need both lockfiles updated.
+      toml:
+        patterns: ["toml"]
       cargo-minor:
         update-types: ["minor", "patch"]
     commit-message:

@@ -34,7 +34,7 @@ ort = { workspace = true, optional = true }
 # docs/research/tflite-0.10.1-audit.md. Default-off drops ZIP/metadata features,
 # but FlatBuffers is now unconditional. Our post-hash layout guard refuses
 # offset-stored buffers before the loader can repack the verified allocation.
-edgefirst-tflite = { version = "=0.10.1", optional = true, default-features = false }
+edgefirst-tflite = { version = "=0.10.2", optional = true, default-features = false }
 rustfft.workspace = true
 
 [dev-dependencies]

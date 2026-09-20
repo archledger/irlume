@@ -15,6 +15,21 @@
 use irlume_camera::ir_metadata::{brightest_lit, parse_illumination, Illumination};
 use libfuzzer_sys::fuzz_target;
 
+// Encode the same frame-level bytes with different USB payload boundaries.
+// Chunk size is bounded by bHeaderLength, not metadata item boundaries.
+fn frame_bytes(items: &[u8], chunk: usize, flags: u8) -> Vec<u8> {
+    let standard = usize::from(flags & 4 != 0) * 4 + usize::from(flags & 8 != 0) * 6;
+    let mut frame = Vec::new();
+    for part in items.chunks(chunk) {
+        frame.extend_from_slice(&[0; 10]);
+        frame.push((2 + standard + part.len()) as u8);
+        frame.push(flags);
+        frame.resize(frame.len() + standard, 0);
+        frame.extend_from_slice(part);
+    }
+    frame
+}
+
 fuzz_target!(|data: &[u8]| {
     // Parsing is deterministic: identical bytes must classify identically,
     // whatever the ring state around them.
@@ -23,6 +38,37 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
+    let chunk = usize::from(data[0]) % 243 + 1;
+    let flags = 0x80 | (data[0] & 0x0c);
+    // Malformed as well as valid item streams must be partition-independent.
+    // Limit transport expansion when the fuzzer chooses one-byte fragments.
+    let items = &data[..data.len().min(4096)];
+    assert_eq!(
+        parse_illumination(&frame_bytes(items, 243, 0x8c)),
+        parse_illumination(&frame_bytes(items, chunk, flags)),
+    );
+
+    // An independent expected-value oracle prevents "always unknown" from
+    // satisfying equivalence. Opaque custom bytes may themselves look like
+    // records; the only actual illumination item follows the custom item.
+    let payload_len = items.len().div_ceil(8) * 8;
+    let mut valid = 0x8000_0000u32.to_le_bytes().to_vec();
+    valid.extend_from_slice(&((8 + payload_len) as u32).to_le_bytes());
+    valid.extend_from_slice(items);
+    valid.resize(8 + payload_len, 0);
+    valid.extend_from_slice(&[6, 0, 0, 0, 16, 0, 0, 0]);
+    valid.extend_from_slice(&u32::from(data[0] & 1).to_le_bytes());
+    valid.extend_from_slice(&[0; 4]);
+    let expected = Some(if data[0] & 1 != 0 {
+        Illumination::Lit
+    } else {
+        Illumination::Dark
+    });
+    assert_eq!(
+        parse_illumination(&frame_bytes(&valid, chunk, flags)),
+        expected
+    );
+
     // Derive a small selection problem from the bytes so the invariant runs
     // on fuzzer-shaped inputs rather than only the unit fixtures.
     let n = usize::from(data[data.len() - 1]) % 8 + 1;

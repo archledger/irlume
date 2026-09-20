@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Frame illumination metadata is assembled across USB payload headers before
+  records are interpreted. Complete 16-byte illumination records are required;
+  opaque custom payloads, incomplete streams, conflicting records and reported
+  buffer errors cannot supply illumination evidence. Missing metadata keeps the
+  existing frame-selection fallback.
 - Microsoft Face Authentication payloads now use the specified eight-byte
   interface entries in both mode selection and readback evidence. Valid
   multi-interface controls are accepted; truncated or compact entries,

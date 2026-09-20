@@ -12,7 +12,7 @@
 //! reporter's camera; 0.7.1 removed the writing, and this removes the guess.
 //!
 //! Microsoft's UVC 1.5 extensions define `MetadataId_FrameIllumination`, a
-//! 16-byte record appended to the payload header of every frame, whose first
+//! 16-byte record carried across a frame's payload headers, whose first
 //! flag bit says whether the illuminator fired. In D1 (alternative frame
 //! illumination), the mode `ir_emitter` selects, the camera is required to
 //! strobe the illuminator and mark each frame. irlume already asks for that
@@ -232,12 +232,15 @@ pub enum Illumination {
 /// `bmHeaderInfo`, so `buf` carries the remaining `length - 2` bytes. The
 /// standard part of the header is 2 bytes plus 4 for a presentation timestamp
 /// and 6 for a source clock reference, each present only if `bmHeaderInfo`
-/// says so; Microsoft's records are concatenated after it, each an 8-byte
-/// little-endian `{id, size}` followed by its body.
+/// says so. Concatenate the extra bytes from all payload headers in this
+/// frame before reading Microsoft's records, each an 8-byte little-endian
+/// `{id, size}` followed by its body (Microsoft UVC extensions, section 2.2.3.2).
 ///
-/// A buffer may hold several entries when a frame arrived as several USB
-/// payloads. They describe the same frame, so the first illumination record
-/// found is the answer.
+/// A record may cross any payload boundary. Unknown items are skipped by their
+/// whole size, including opaque bytes that resemble an illumination item.
+/// Validate the entire stream before returning evidence: malformed tails, UVC
+/// errors and contradictory illumination records make the frame unknown.
+/// Assembly is local to this call, never shared across V4L2 frame buffers.
 ///
 /// Returns `None` when the buffer carries no illumination record, which is
 /// normal for the first frame after `STREAMON` and must not be read as "dark".
@@ -247,63 +250,85 @@ pub enum Illumination {
 /// buffers" series), and a camera is external hardware, so this parses
 /// attacker-reachable bytes for a root daemon and must never panic.
 pub fn parse_illumination(buf: &[u8]) -> Option<Illumination> {
+    const PTS: u8 = 1 << 2;
+    const SCR: u8 = 1 << 3;
+    const ERR: u8 = 1 << 6;
+    // Allocation is bounded by supplied bytes, never by a device-declared item
+    // size. Production passes at most one mapped metadata buffer.
+    let mut extra = Vec::new();
+    extra.try_reserve_exact(buf.len()).ok()?;
     let mut at = 0usize;
-    while at + UVC_META_BUF_HEADER <= buf.len() {
+    while at < buf.len() {
+        let body_start = at.checked_add(UVC_META_BUF_HEADER)?;
+        if body_start > buf.len() {
+            return None;
+        }
         let length = usize::from(buf[at + 10]);
         let flags = buf[at + 11];
         // A header shorter than its own two mandatory bytes is not a header.
-        if length < 2 {
+        if length < 2 || flags & ERR != 0 {
             return None;
         }
-        let body_start = at + UVC_META_BUF_HEADER;
         let body_end = body_start.checked_add(length - 2)?;
-        if body_end > buf.len() {
-            return None;
-        }
-        if let Some(illum) = illumination_in_header(&buf[body_start..body_end], flags) {
-            return Some(illum);
-        }
+        let body = buf.get(body_start..body_end)?;
+        let standard =
+            (if flags & PTS != 0 { 4 } else { 0 }) + (if flags & SCR != 0 { 6 } else { 0 });
+        extra.extend_from_slice(body.get(standard..)?);
         at = body_end;
     }
-    None
+    illumination_in_frame(&extra)
 }
 
 /// Size of uvcvideo's own per-buffer header, before the UVC payload header's
 /// third byte.
 const UVC_META_BUF_HEADER: usize = 12;
 
-/// Walk the Microsoft records appended after the standard UVC payload header.
+/// Walk the assembled Microsoft metadata item stream for one frame.
 ///
-/// `body` is the payload header from its third byte onward; `flags` is
-/// `bmHeaderInfo`, whose PTS (bit 2) and SCR (bit 3) bits decide how much of
-/// `body` is standard header rather than appended records.
-fn illumination_in_header(body: &[u8], flags: u8) -> Option<Illumination> {
-    const PTS: u8 = 1 << 2;
-    const SCR: u8 = 1 << 3;
-    let standard = (if flags & PTS != 0 { 4 } else { 0 }) + (if flags & SCR != 0 { 6 } else { 0 });
-    let extra = body.get(standard..)?;
-
+/// Require the complete 16-byte FrameIllumination structure and eight-byte
+/// item alignment. Preserve compatibility with aligned extensions and unknown
+/// flag/reserved bits: only the defined illumination bit is interpreted.
+fn illumination_in_frame(extra: &[u8]) -> Option<Illumination> {
     let mut at = 0usize;
-    while at + 8 <= extra.len() {
-        let id = u32::from_le_bytes(extra[at..at + 4].try_into().ok()?);
-        let size = u32::from_le_bytes(extra[at + 4..at + 8].try_into().ok()?) as usize;
+    let mut found = None;
+    while at < extra.len() {
+        let header = extra.get(at..at.checked_add(8)?)?;
+        let id = u32::from_le_bytes(header[..4].try_into().ok()?);
+        let size = u32::from_le_bytes(header[4..].try_into().ok()?) as usize;
         // A record must at least contain its own header, and must fit. Either
         // failure means this is not a record stream, so stop rather than
         // resynchronise onto whatever the bytes happen to look like.
-        if size < 8 || at + size > extra.len() {
+        if size < 8 || size % 8 != 0 {
             return None;
         }
-        if id == METADATA_ID_FRAME_ILLUMINATION && size >= 12 {
-            let raw = u32::from_le_bytes(extra[at + 8..at + 12].try_into().ok()?);
-            return Some(if raw & 1 != 0 {
+        let end = at.checked_add(size)?;
+        let item = extra.get(at..end)?;
+        if id == METADATA_ID_FRAME_ILLUMINATION {
+            if size < 16 {
+                return None;
+            }
+            let raw = u32::from_le_bytes(item[8..12].try_into().ok()?);
+            let illumination = if raw & 1 != 0 {
                 Illumination::Lit
             } else {
                 Illumination::Dark
-            });
+            };
+            if found.is_some_and(|previous| previous != illumination) {
+                return None;
+            }
+            found = Some(illumination);
         }
-        at += size;
+        at = end;
     }
-    None
+    found
+}
+
+fn illumination_in_dequeued_buffer(bytes: &[u8], flags: u32) -> Option<Illumination> {
+    const V4L2_BUF_FLAG_ERROR: u32 = 0x0040;
+    if flags & V4L2_BUF_FLAG_ERROR != 0 {
+        return None;
+    }
+    parse_illumination(bytes)
 }
 
 /// Pick the frame to hand downstream, given what the camera said about each.
@@ -760,7 +785,10 @@ impl IlluminationLog {
                 // not touch it until it is re-queued below; `used` is within
                 // the mapping.
                 let bytes = unsafe { std::slice::from_raw_parts(mapped.ptr as *const u8, used) };
-                if let Some(illum) = parse_illumination(bytes) {
+                if let Some(illum) = (buf.bytesused as usize <= mapped.len)
+                    .then(|| illumination_in_dequeued_buffer(bytes, buf.flags))
+                    .flatten()
+                {
                     let us = buf.timestamp.sec * 1_000_000 + buf.timestamp.usec;
                     self.by_timestamp.insert(us, illum);
                 }
@@ -1289,6 +1317,196 @@ mod tests {
     /// end-of-header, SCR, PTS, and the frame id toggling.
     const LIT_FLAGS: u8 = 0x8d;
     const DARK_FLAGS: u8 = 0x8c;
+
+    // Independent wire fixtures: Microsoft UVC extensions sections 2.2.3.2
+    // (concatenated partial blobs) and 2.2.3.4.4 (four u32 fields).
+    fn illumination_item(lit: bool) -> Vec<u8> {
+        let mut item = vec![6, 0, 0, 0, 16, 0, 0, 0];
+        item.extend_from_slice(&u32::from(lit).to_le_bytes());
+        item.extend_from_slice(&[0; 4]);
+        item
+    }
+
+    fn metadata_fragment(extra: &[u8], flags: u8) -> Vec<u8> {
+        let standard = usize::from(flags & 4 != 0) * 4 + usize::from(flags & 8 != 0) * 6;
+        let mut block = vec![0; 10]; // Linux host timestamp and SOF
+        block.push(u8::try_from(2 + standard + extra.len()).unwrap());
+        block.push(flags);
+        block.resize(12 + standard, 0);
+        block.extend_from_slice(extra);
+        block
+    }
+
+    #[test]
+    fn metadata_record_survives_every_split_and_optional_timestamp_layout() {
+        for lit in [false, true] {
+            let item = illumination_item(lit);
+            let expected = Some(if lit {
+                Illumination::Lit
+            } else {
+                Illumination::Dark
+            });
+            for first_flags in [0x80, 0x84, 0x88, 0x8c] {
+                for last_flags in [0x80, 0x84, 0x88, 0x8c] {
+                    for split in 1..item.len() {
+                        let mut frame = metadata_fragment(&item[..split], first_flags);
+                        frame.extend(metadata_fragment(&[], 0x8c));
+                        frame.extend(metadata_fragment(&item[split..], last_flags));
+                        assert_eq!(
+                            parse_illumination(&frame),
+                            expected,
+                            "split {split}, flags {first_flags:x}/{last_flags:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_custom_continuation_is_never_illumination_evidence() {
+        let mut items = vec![0, 0, 0, 0x80, 24, 0, 0, 0];
+        items.extend(illumination_item(true)); // opaque custom payload
+        items.extend(illumination_item(false)); // actual frame evidence
+        assert_eq!(
+            parse_illumination(&metadata_fragment(&items, 0x8c)),
+            Some(Illumination::Dark)
+        );
+        for split in 1..items.len() {
+            let mut frame = metadata_fragment(&items[..split], 0x8c);
+            frame.extend(metadata_fragment(&items[split..], 0x8c));
+            assert_eq!(
+                parse_illumination(&frame),
+                Some(Illumination::Dark),
+                "split {split}"
+            );
+        }
+        let frame: Vec<_> = items
+            .chunks(1)
+            .flat_map(|part| metadata_fragment(part, 0x80))
+            .collect();
+        assert_eq!(parse_illumination(&frame), Some(Illumination::Dark));
+    }
+
+    #[test]
+    fn metadata_illumination_requires_the_complete_sixteen_byte_record() {
+        let mut item = illumination_item(true);
+        item[4..8].copy_from_slice(&12u32.to_le_bytes());
+        item.truncate(12);
+        assert_eq!(parse_illumination(&metadata_fragment(&item, 0x80)), None);
+    }
+
+    #[test]
+    fn metadata_conflicting_duplicates_are_unknown_in_either_order() {
+        for lit in [true, false] {
+            let mut items = illumination_item(lit);
+            items.extend(illumination_item(!lit));
+            assert_eq!(parse_illumination(&metadata_fragment(&items, 0x80)), None);
+        }
+        let items = illumination_item(true).repeat(2);
+        assert_eq!(
+            parse_illumination(&metadata_fragment(&items, 0x80)),
+            Some(Illumination::Lit)
+        );
+    }
+
+    #[test]
+    fn metadata_valid_prefix_does_not_hide_malformed_trailing_data() {
+        let good = metadata_fragment(&illumination_item(true), 0x80);
+        for tail in [vec![0], vec![0; 11], metadata_fragment(&[1], 0x80)] {
+            let mut frame = good.clone();
+            frame.extend(tail);
+            assert_eq!(parse_illumination(&frame), None);
+        }
+        for size in [0u32, 4, 9, u32::MAX] {
+            let mut items = illumination_item(true);
+            items.extend_from_slice(&0x8000_0000u32.to_le_bytes());
+            items.extend_from_slice(&size.to_le_bytes());
+            items.push(0);
+            assert_eq!(parse_illumination(&metadata_fragment(&items, 0x80)), None);
+        }
+    }
+
+    #[test]
+    fn metadata_error_header_invalidates_the_whole_frame() {
+        let good = metadata_fragment(&illumination_item(true), 0x80);
+        let bad = metadata_fragment(&[], 0xc0); // UVC ERR
+        for frame in [[good.clone(), bad.clone()].concat(), [bad, good].concat()] {
+            assert_eq!(parse_illumination(&frame), None);
+        }
+    }
+
+    #[test]
+    fn metadata_dequeue_error_discards_even_a_complete_lit_record() {
+        let frame = metadata_fragment(&illumination_item(true), 0x80);
+        assert_eq!(
+            illumination_in_dequeued_buffer(&frame, 0x2000),
+            Some(Illumination::Lit)
+        );
+        assert_eq!(illumination_in_dequeued_buffer(&frame, 0x2040), None);
+    }
+
+    #[test]
+    fn metadata_complete_extensions_keep_the_defined_bit_semantics() {
+        let mut item = illumination_item(true);
+        item[4..8].copy_from_slice(&24u32.to_le_bytes());
+        item[8..12].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+        item[12..16].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        item.extend_from_slice(&[0xff; 8]);
+        assert_eq!(
+            parse_illumination(&metadata_fragment(&item, 0x80)),
+            Some(Illumination::Lit)
+        );
+        item[8] = 0;
+        assert_eq!(
+            parse_illumination(&metadata_fragment(&item, 0x80)),
+            Some(Illumination::Dark)
+        );
+    }
+
+    #[test]
+    fn metadata_large_custom_item_is_skipped_across_many_fragments() {
+        let mut items = vec![0, 0, 0, 0x80, 0, 4, 0, 0]; // Size = 1024
+        items.resize(1024, 0xff);
+        items.extend(illumination_item(true));
+        for chunk in [1, 7, 127, 243] {
+            let frame: Vec<_> = items
+                .chunks(chunk)
+                .flat_map(|part| metadata_fragment(part, 0x8c))
+                .collect();
+            assert_eq!(parse_illumination(&frame), Some(Illumination::Lit));
+        }
+    }
+
+    #[test]
+    fn metadata_incomplete_optional_timestamp_is_not_a_new_record_start() {
+        let good = metadata_fragment(&illumination_item(true), 0x80);
+        for flags in [0x84, 0x88, 0x8c] {
+            let mut broken = metadata_fragment(&[], flags);
+            broken.pop();
+            broken[10] -= 1;
+            assert_eq!(parse_illumination(&[good.clone(), broken].concat()), None);
+        }
+    }
+
+    #[test]
+    fn metadata_incomplete_frames_are_not_joined_across_calls() {
+        let item = illumination_item(true);
+        for split in 1..item.len() {
+            assert_eq!(
+                parse_illumination(&metadata_fragment(&item[..split], 0x80)),
+                None
+            );
+            assert_eq!(
+                parse_illumination(&metadata_fragment(&item[split..], 0x80)),
+                None
+            );
+        }
+        assert_eq!(
+            parse_illumination(&metadata_fragment(&item, 0x80)),
+            Some(Illumination::Lit)
+        );
+    }
 
     #[test]
     fn reads_the_illumination_flag_from_a_real_buffer() {

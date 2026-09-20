@@ -341,9 +341,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tflite"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1ad179564e9705f067a9835b39ad9af13e6d04e102b9abd240a22d0a954d1d8"
+checksum = "04572c5bb8674557ffad483fa278829b933e98ad584290ed331f791b3ecd80c3"
 dependencies = [
  "edgefirst-tflite-sys",
  "flatbuffers",

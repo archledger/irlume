@@ -71,8 +71,8 @@ zeroize    = { version = "1", features = ["derive"] }
 tss-esapi  = "7.5"      # TPM 2.0 seal/unseal of the keyring secret
 base64     = { version = "0.23", default-features = false, features = ["std"] }  # envelope blob encoding
 sha2       = "0.11"     # PolicyAuthorize digest math (signed-PCR path)
-der        = { version = "0.8", features = ["derive", "pem", "alloc"] }  # parse systemd PCR-signing pubkey (SPKI/PKCS#1)
-spki       = { version = "0.7", features = ["alloc", "pem"] }  # SubjectPublicKeyInfo container for the PCR signing key
+der        = { version = "0.8", features = ["derive", "pem", "alloc", "oid"] }  # parse systemd PCR-signing pubkey (SPKI/PKCS#1)
+spki       = { version = "0.8", features = ["alloc", "pem"] }  # SubjectPublicKeyInfo container for the PCR signing key
 aes-gcm    = "0.11"     # AES-256-GCM for template-at-rest encryption
 argon2     = "0.6"      # Argon2id KDF for the recovery passphrase
 pbkdf2     = { version = "0.13", default-features = false, features = ["hmac"] }  # PBKDF2-HMAC-SHA512: the KDE wallet key ksecretd expects

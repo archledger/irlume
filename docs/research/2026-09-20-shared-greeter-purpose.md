@@ -92,6 +92,16 @@ A private synthetic password provider verifies both usable correct-password
 fallback and wrong-password refusal. Separate tests cover D-Bus property
 decoding, malformed/missing facts and process exit.
 
+The review follow-up also replays the complete matrix inside a fresh user/PID/
+mount namespace with a real `/run/user/0` directory on a private tmpfs. The child
+asserts its namespace identity and the directory's existence before exercising
+the production dispatcher. The host filesystem stays read-only apart from the
+child's private `/tmp` and `/run`. This pins the original filesystem condition
+without relying on the runner's login state or creating a host runtime directory.
+Temporarily restoring the old runtime-directory promotion made this test fail
+on the GDM on-demand cold-login case. Removing that mutation restored the pass;
+the old heuristic is not part of the submitted change.
+
 Run the cross-component regression with a freshly built PAM module:
 
 ```sh
@@ -100,12 +110,14 @@ scripts/run-tests-guarded.sh \
   --require shared_greeter_real_daemon_and_pam_refuse_cold_login_with_runtime \
   --require shared_greeter_real_daemon_and_pam_preserve_bound_unlock_and_password \
   --require shared_greeter_real_daemon_and_pam_recheck_before_grant_and_delivery \
+  --require shared_greeter_real_daemon_and_pam_with_real_runtime_directory \
   -- cargo test -p irlume-daemon --locked -- --ignored shared_greeter_real_daemon --test-threads=1
 ```
 
-The host needs pam_wrapper, PAM development headers and a C compiler. Missing
-prerequisites fail the explicitly requested tests; they do not silently skip.
-CI enforces the three named tests. Default workspace runs leave them ignored.
+The host needs pam_wrapper, PAM development headers, a C compiler and bubblewrap
+with user namespaces available. Missing prerequisites fail the explicitly
+requested tests; they do not silently skip.
+CI enforces the four named tests. Default workspace runs leave them ignored.
 All service files, socket paths and password fixtures are private to the test;
 the installed PAM stack and real credentials are not touched.
 

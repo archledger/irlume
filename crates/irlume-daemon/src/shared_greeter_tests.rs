@@ -461,6 +461,86 @@ pub(super) mod shared_greeter {
     }
 
     #[test]
+    #[ignore = "requires bubblewrap, freshly built irlume-pam, pam_wrapper and a C compiler"]
+    fn shared_greeter_real_daemon_and_pam_with_real_runtime_directory() {
+        let _guard = env_lock();
+        let parent_namespace = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+        let result = Command::new("/usr/bin/timeout")
+            .args(["--kill-after=5", "90", "/usr/bin/bwrap"])
+            .args([
+                "--die-with-parent",
+                "--unshare-user",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--unshare-pid",
+                "--unshare-net",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--ro-bind",
+                "/",
+                "/",
+                "--tmpfs",
+                "/run",
+                "--dir",
+                "/run/user/0",
+                "--tmpfs",
+                "/tmp",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::shared_greeter::shared_greeter_namespace_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("IRLUME_TEST_SHARED_GREETER_PARENT_MNT", parent_namespace)
+            .env("TMPDIR", "/tmp")
+            .output()
+            .expect("timeout and bubblewrap are required for the runtime-directory regression");
+        assert!(
+            result.status.success(),
+            "namespace regression failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("MS04_REAL_RUNTIME_DIRECTORY_CHECKED"),
+            "child must execute the directory assertions and complete the PAM matrix"
+        );
+    }
+
+    #[test]
+    #[ignore = "child entry point for the isolated runtime-directory regression"]
+    fn shared_greeter_namespace_child() {
+        let Some(parent_namespace) = std::env::var_os("IRLUME_TEST_SHARED_GREETER_PARENT_MNT")
+        else {
+            return;
+        };
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/mnt").unwrap(),
+            PathBuf::from(parent_namespace)
+        );
+        // SAFETY: getuid only reads this process's real UID.
+        assert_eq!(unsafe { libc::getuid() }, 0);
+        // This is the exact path the old heuristic read for the selected root
+        // account, created by bubblewrap inside a private /run tmpfs. The host's
+        // runtime directories are never created, mounted over or removed.
+        assert!(Path::new("/run/user/0").is_dir());
+        shared_greeter_real_daemon_and_pam_refuse_cold_login_with_runtime();
+        shared_greeter_real_daemon_and_pam_preserve_bound_unlock_and_password();
+        shared_greeter_real_daemon_and_pam_recheck_before_grant_and_delivery();
+        println!("MS04_REAL_RUNTIME_DIRECTORY_CHECKED");
+    }
+
+    #[test]
     fn shared_unlock_binding_refuses_an_exited_process_and_wrong_peer_identity() {
         let _guard = env_lock();
         // SAFETY: getuid only reads this process's real UID.

@@ -113,7 +113,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor
+              build-essential pkg-config clang libclang-dev libpam0g-dev libpam-wrapper pamtester libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
@@ -294,15 +294,15 @@ jobs:
           # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
           # kernel's V4L2 API and fails to load; build upstream at a pinned
           # commit instead. videodev (its dependency) lives in modules-extra.
-          # v4l2loopback (built from a pinned upstream commit because Ubuntu's
-          # 0.12.x won't load on the runner kernel) plus pam_wrapper/pamtester
-          # for the PAM FFI tests. video8/9 are fed by ffmpeg; video10 is a
-          # spare the camera streaming tests feed themselves.
+          # PAM test prerequisites are installed in the initial dependency step,
+          # independently of whether virtual camera nodes already exist.
+          # video8/9 are fed by ffmpeg; video10 is a spare the camera streaming
+          # tests feed themselves.
           # The self-hosted runner provisions video8/9/10 persistently
           # (v4l2loopback-dkms + modules-load.d + a udev rule granting group
           # video); build-from-source only on a runner without them.
           if [ ! -e /dev/video8 ]; then
-          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg libpam-wrapper pamtester
+          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg
           git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
           git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
           make -C /tmp/v4l2loopback -j"$(nproc)"
@@ -394,6 +394,7 @@ jobs:
             --require shared_greeter_real_daemon_and_pam_refuse_cold_login_with_runtime \
             --require shared_greeter_real_daemon_and_pam_preserve_bound_unlock_and_password \
             --require shared_greeter_real_daemon_and_pam_recheck_before_grant_and_delivery \
+            --require shared_greeter_real_daemon_and_pam_with_real_runtime_directory \
             -- cargo test -p irlume-daemon --locked -- --ignored shared_greeter_real_daemon --test-threads=1
 
       - name: test (root-only password helper, private synthetic PAM)

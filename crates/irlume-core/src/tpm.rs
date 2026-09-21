@@ -1015,7 +1015,7 @@ fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle
 fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
     use der::asn1::ObjectIdentifier;
     use der::asn1::UintRef;
-    use der::{Decode, DecodePem, Sequence};
+    use der::{Decode, Sequence};
     use spki::SubjectPublicKeyInfoOwned;
 
     /// PKCS#1 RSAPublicKey: SEQUENCE { modulus INTEGER, publicExponent INTEGER }
@@ -1025,7 +1025,17 @@ fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
         e: UintRef<'a>,
     }
 
-    let spki = SubjectPublicKeyInfoOwned::from_pem(pubkey_pem)
+    // der 0.8.2's streaming PEM reader does not enforce complete nested values.
+    // Decode the envelope first, then use the strict DER reader so an illicit
+    // AlgorithmIdentifier field cannot be consumed as the outer public key.
+    let (label, bytes) = der::pem::decode_vec(pubkey_pem.as_bytes())
+        .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
+    if label != "PUBLIC KEY" {
+        return Err(Error::Policy(
+            "PCR public key must use the PUBLIC KEY PEM label".into(),
+        ));
+    }
+    let spki = SubjectPublicKeyInfoOwned::from_der(&bytes)
         .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
     // The previous decoder (the rsa crate) rejected non-RSA AlgorithmIdentifiers;
     // keep that strictness: a non-RSA SPKI whose BIT STRING happened to hold a
@@ -1045,7 +1055,11 @@ fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
             ));
         }
     }
-    let key = RsaPublicKey::from_der(spki.subject_public_key.raw_bytes())
+    let key_bytes = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| Error::Policy("PCR public key bit string is not byte aligned".into()))?;
+    let key = RsaPublicKey::from_der(key_bytes)
         .map_err(|e| Error::Policy(format!("parse PCR public key: {e}")))?;
     let e = key.e.as_bytes();
     if e.is_empty() || e.len() > 4 {
@@ -1685,6 +1699,118 @@ WoTuNvyFOHwal/HAnsZ3agxc0OsF45deIAmduBgkmIWw+Ygz40oT1B6na1fht+JK\n\
 D14jcv73sDp39RHVWoW+y2rcpDZL9RQUJ3gFraMptBVpK8zlVEkQWkqH35cjKZJ1\n\
 awIDAQAB\n\
 -----END PUBLIC KEY-----\n";
+
+    // Hand-built ASN.1 fixtures keep malformed nesting independent of the
+    // decoder under test. These contain synthetic public integers only.
+    fn key_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(body.len()).expect("small public-key fixture");
+        let mut out = vec![tag];
+        if length < 128 {
+            out.push(length as u8);
+        } else if length <= 255 {
+            out.extend_from_slice(&[0x81, length as u8]);
+        } else {
+            out.push(0x82);
+            out.extend_from_slice(&length.to_be_bytes());
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn key_bits(fill: u8, unused: u8) -> Vec<u8> {
+        let mut modulus = vec![0, 0x80];
+        modulus.extend(std::iter::repeat_n(fill, 255));
+        let mut key = key_tlv(2, &modulus);
+        key.extend_from_slice(&[2, 3, 1, 0, 1]); // exponent = 65537
+        let mut bits = vec![unused];
+        bits.extend(key_tlv(0x30, &key));
+        key_tlv(3, &bits)
+    }
+
+    fn rsa_algorithm(with_null: bool) -> Vec<u8> {
+        let mut fields = vec![6, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
+        if with_null {
+            fields.extend_from_slice(&[5, 0]);
+        }
+        fields
+    }
+
+    fn public_key_pem(bytes: &[u8]) -> String {
+        der::pem::encode_string("PUBLIC KEY", der::pem::LineEnding::LF, bytes).unwrap()
+    }
+
+    #[test]
+    fn rsa_spki_rejects_keys_hidden_inside_algorithm_identifier() {
+        for outer_key in [false, true] {
+            let mut algorithm = rsa_algorithm(true);
+            algorithm.extend(key_bits(0xb7, 0)); // An illegal field in AlgorithmIdentifier.
+            let mut fields = key_tlv(0x30, &algorithm);
+            if outer_key {
+                fields.extend(key_bits(0xa5, 0));
+            }
+            let pem = public_key_pem(&key_tlv(0x30, &fields));
+            assert!(
+                rsa_spki_parts(&pem).is_err(),
+                "accepted inner key, outer={outer_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rsa_spki_rejects_trailing_data_inside_and_after_the_container() {
+        let mut fields = key_tlv(0x30, &rsa_algorithm(true));
+        fields.extend(key_bits(0xa5, 0));
+        let mut outer_tail = key_tlv(0x30, &fields);
+        outer_tail.extend_from_slice(&[5, 0]);
+        fields.extend_from_slice(&[5, 0]);
+        let inner_tail = key_tlv(0x30, &fields);
+        for bytes in [inner_tail, outer_tail] {
+            assert!(rsa_spki_parts(&public_key_pem(&bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn rsa_spki_requires_byte_aligned_public_key_bits() {
+        use der::Decode;
+
+        for unused in [1, 7] {
+            let mut fields = key_tlv(0x30, &rsa_algorithm(true));
+            fields.extend(key_bits(0xa5, unused));
+            assert!(rsa_spki_parts(&public_key_pem(&key_tlv(0x30, &fields))).is_err());
+        }
+        // Legal zero padding is still not a byte-aligned PKCS#1 payload.
+        // Unlike the cases above, DER's generic BIT STRING decoder accepts it;
+        // the application must explicitly require as_bytes() to succeed.
+        let mut bits = key_bits(0xa5, 1);
+        *bits.last_mut().unwrap() &= !1;
+        let mut fields = key_tlv(0x30, &rsa_algorithm(true));
+        fields.extend(bits);
+        let bytes = key_tlv(0x30, &fields);
+        assert!(spki::SubjectPublicKeyInfoOwned::from_der(&bytes).is_ok());
+        assert!(rsa_spki_parts(&public_key_pem(&bytes)).is_err());
+    }
+
+    #[test]
+    fn rsa_spki_preserves_null_and_absent_rsa_parameters() {
+        for with_null in [false, true] {
+            let mut fields = key_tlv(0x30, &rsa_algorithm(with_null));
+            fields.extend(key_bits(0xa5, 0));
+            let (modulus, exponent) =
+                rsa_spki_parts(&public_key_pem(&key_tlv(0x30, &fields))).unwrap();
+            assert_eq!(modulus.len(), 256);
+            assert_eq!(modulus[0], 0x80);
+            assert!(modulus[1..].iter().all(|byte| *byte == 0xa5));
+            assert_eq!(exponent, 65537);
+        }
+    }
+
+    #[test]
+    fn rsa_spki_requires_the_public_key_pem_label() {
+        for label in ["CERTIFICATE", "RSA PUBLIC KEY"] {
+            let pem = RSA_PUB_FIXTURE.replace("PUBLIC KEY", label);
+            assert!(rsa_spki_parts(&pem).is_err());
+        }
+    }
 
     #[test]
     fn rsa_spki_parts_extracts_modulus_and_exponent() {

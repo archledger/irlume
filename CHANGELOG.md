@@ -7,6 +7,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PCR-signing public keys are decoded from complete DER containers after PEM
+  label validation. Keys hidden inside the algorithm identifier, trailing DER
+  fields and non-byte-aligned key bits are rejected. Valid RSA keys with NULL
+  or absent algorithm parameters retain their existing interpretation.
 - Metadata capture restores both the observed format and buffer size, including
   when the node was already using UVCM. Failed initial reads and uncertain format
   writes cannot authorize a guessed restore. Cleanup checks the current format

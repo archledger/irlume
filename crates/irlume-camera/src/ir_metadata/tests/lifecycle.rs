@@ -41,6 +41,7 @@ impl FakeDevice {
     }
 
     pub(crate) fn unmapped(&mut self) {
+        assert!(self.mapped > 0, "unmap without a live metadata mapping");
         self.mapped -= 1;
         self.events.push("unmap".into());
     }
@@ -114,7 +115,7 @@ pub(crate) fn map_buffer(
     if state.fail == Some("map") || state.map_failure_at == Some(buf.index) {
         return Err("injected map failure".into());
     }
-    if buf.length == 0 || buf.length > 1024 * 1024 {
+    if buf.length == 0 || buf.length > MAX_META_BUFFER_SIZE {
         return Err("fake refuses an unsafe test allocation".into());
     }
     // SAFETY: independent anonymous mapping with a positive fake-driver length;
